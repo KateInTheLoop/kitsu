@@ -20,6 +20,21 @@ use chrono::{SecondsFormat, Utc};
 use kitsu_providers::ChatMessage;
 use serde::{Deserialize, Serialize};
 
+// Cycles 058-061 compile the physical-v1 records, immutable candidate I/O,
+// fenced HEAD CAS, and closed canonical/migration payloads before a migration
+// card mounts them. Keeping these modules private prevents paths, locks,
+// provider wire records, or file records from becoming the neutral API.
+#[allow(dead_code)]
+mod canonical;
+#[allow(dead_code)]
+mod identity;
+#[allow(dead_code)]
+mod mount;
+#[allow(dead_code)]
+mod physical;
+#[allow(dead_code)]
+mod transaction;
+
 const SESSION_VERSION: u32 = 1;
 const MAX_SESSION_BYTES: u64 = 16 * 1024 * 1024;
 const ARCHIVED_DIR_NAME: &str = "archived";
@@ -92,6 +107,84 @@ pub struct SessionStore {
     lease: SessionLease,
 }
 
+/// Production owner for one durable active session. Today it delegates only to
+/// the current-v1 store, preserving existing bytes and behavior while giving
+/// the runtime one ownership slot that can later receive an activated canonical
+/// live store. Static catalog/lifecycle operations remain on [`SessionStore`].
+#[derive(Debug)]
+pub struct ActiveSessionStore {
+    inner: ActiveSessionStoreInner,
+}
+
+/// Coupled handoff for one exact resume value and the active owner that
+/// revalidated it under the relevant leases. Product routing must pass an
+/// explicit source-aware admission before consuming either half.
+#[derive(Debug)]
+pub struct ActiveSessionResume {
+    store: ActiveSessionStore,
+    saved: SavedSession,
+}
+
+impl ActiveSessionResume {
+    fn saved(&self) -> &SavedSession {
+        &self.saved
+    }
+
+    #[cfg(test)]
+    fn into_current_v1_parts(self) -> Result<(ActiveSessionStore, SavedSession), String> {
+        if !matches!(&self.store.inner, ActiveSessionStoreInner::CurrentV1(_)) {
+            return Err("bound local resume requires explicit product admission".to_string());
+        }
+        Ok((self.store, self.saved))
+    }
+}
+
+#[derive(Debug)]
+enum ActiveSessionStoreInner {
+    CurrentV1(SessionStore),
+    BoundLocal(BoundLocalActiveSessionStore),
+}
+
+#[derive(Debug)]
+struct BoundLocalActiveSessionStore {
+    sessions_dir: PathBuf,
+    id: String,
+    name: Option<String>,
+    live: std::cell::RefCell<mount::LocalSessionLiveStoreV1>,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum BoundActiveSessionResumeErrorV1 {
+    InvalidSessionId(String),
+    SessionRoot(String),
+    Activation(mount::LocalSessionLiveStoreActivationErrorV1),
+    SelectionIdentityMismatch,
+}
+
+#[derive(Debug)]
+pub struct ProductWritableBoundResumeV1 {
+    resume: ActiveSessionResume,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum ProductWritableBoundResumeAdmissionErrorV1 {
+    Activation(BoundActiveSessionResumeErrorV1),
+    OwnerInUse,
+    CanonicalOperationWriterUnavailable,
+}
+
+impl ProductWritableBoundResumeV1 {
+    pub fn saved(&self) -> &SavedSession {
+        self.resume.saved()
+    }
+
+    pub fn into_parts(self) -> (ActiveSessionStore, SavedSession) {
+        (self.resume.store, self.resume.saved)
+    }
+}
+
 /// Evidence for one atomically installed session snapshot. On Unix the file
 /// descriptor is the exact inode created by the commit and remains valid even
 /// if another same-user process immediately renames, hard-links, or unlinks the
@@ -127,6 +220,20 @@ pub struct SnapshotSaveError {
 impl SnapshotSaveError {
     pub fn installed_commit(&self) -> Option<&SnapshotCommit> {
         self.installed_commit.as_ref()
+    }
+
+    fn into_installed_parts(self) -> Result<(SnapshotCommit, String), Self> {
+        let Self {
+            message,
+            installed_commit,
+        } = self;
+        match installed_commit {
+            Some(commit) => Ok((commit, message)),
+            None => Err(Self {
+                message,
+                installed_commit: None,
+            }),
+        }
     }
 }
 
@@ -506,6 +613,29 @@ fn open_directory_path(path: &Path, create: bool) -> std::io::Result<std::fs::Fi
 }
 
 impl PrivateDirectory {
+    fn try_clone_pinned(&self, context: &str) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            let file = self.file.try_clone().map_err(|error| {
+                format!(
+                    "cannot retain pinned {context} directory '{}': {error}",
+                    self.path.display()
+                )
+            })?;
+            Ok(Self {
+                path: self.path.clone(),
+                file,
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                path: self.path.clone(),
+            })
+        }
+    }
+
     fn prepare(path: &Path, context: &str) -> Result<Self, String> {
         #[cfg(unix)]
         {
@@ -1691,6 +1821,20 @@ fn atomic_write_private_in_detailed(
     replace: bool,
     context: &str,
 ) -> Result<AtomicWriteCommit, AtomicWriteFailure> {
+    atomic_write_private_in_detailed_if(directory, target_name, bytes, replace, context, || Ok(()))
+}
+
+fn atomic_write_private_in_detailed_if<F>(
+    directory: &PrivateDirectory,
+    target_name: &OsStr,
+    bytes: &[u8],
+    replace: bool,
+    context: &str,
+    before_install: F,
+) -> Result<AtomicWriteCommit, AtomicWriteFailure>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     let target = directory.path.join(target_name);
 
     #[cfg(unix)]
@@ -1714,6 +1858,10 @@ fn atomic_write_private_in_detailed(
                 "cannot write {context} '{}': {error}",
                 target.display()
             )));
+        }
+        if let Err(message) = before_install() {
+            let _ = unlinkat(&directory.file, OsStr::new(&temporary_name));
+            return Err(AtomicWriteFailure::before_install(message));
         }
         if replace {
             if let Err(error) = renameat(
@@ -1764,6 +1912,7 @@ fn atomic_write_private_in_detailed(
 
     #[cfg(not(unix))]
     {
+        before_install().map_err(AtomicWriteFailure::before_install)?;
         atomic_write_private_detailed(&target, bytes, replace, context)
     }
 }
@@ -2044,6 +2193,18 @@ fn write_saved_file(
     saved: &SavedSession,
     replace: bool,
 ) -> Result<(PathBuf, AtomicWriteCommit), SnapshotSaveError> {
+    write_saved_file_if(dir, saved, replace, || Ok(()))
+}
+
+fn write_saved_file_if<F>(
+    dir: &PrivateDirectory,
+    saved: &SavedSession,
+    replace: bool,
+    before_install: F,
+) -> Result<(PathBuf, AtomicWriteCommit), SnapshotSaveError>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     if !valid_id(&saved.id) {
         return Err(SnapshotSaveError {
             message: "saved session has an invalid id".to_string(),
@@ -2056,9 +2217,15 @@ fn write_saved_file(
         message,
         installed_commit: None,
     })?;
-    let commit =
-        atomic_write_private_in_detailed(dir, OsStr::new(&name), &bytes, replace, "session")
-            .map_err(|error| error.into_snapshot_save_error(target.clone()))?;
+    let commit = atomic_write_private_in_detailed_if(
+        dir,
+        OsStr::new(&name),
+        &bytes,
+        replace,
+        "session",
+        before_install,
+    )
+    .map_err(|error| error.into_snapshot_save_error(target.clone()))?;
     Ok((target, commit))
 }
 
@@ -2159,6 +2326,58 @@ fn open_optional_session_directory(path: &Path) -> Result<Option<PrivateDirector
     Ok(directory)
 }
 
+/// Transitional read-only port for the current v1 logical snapshot. It is
+/// deliberately private: E03 can move selector/read behavior behind one seam
+/// before the canonical revision format exists, without publishing the file
+/// adapter or its string errors as the future store contract.
+trait SessionReadPort {
+    /// Return current-v1 summaries in deterministic newest-first order. The v1
+    /// adapter deliberately omits unreadable snapshots; E03's typed lookup
+    /// state will replace that legacy behavior in a later card.
+    fn list(&self) -> Result<Vec<SessionSummary>, String>;
+
+    /// Read one exact id and validate its current-v1 logical/file identity.
+    fn read(&self, id: &str) -> Result<SavedSession, String>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CurrentV1FileReadPort<'a> {
+    directory: &'a PrivateDirectory,
+}
+
+impl SessionReadPort for CurrentV1FileReadPort<'_> {
+    fn list(&self) -> Result<Vec<SessionSummary>, String> {
+        list_in(self.directory)
+    }
+
+    fn read(&self, id: &str) -> Result<SavedSession, String> {
+        self.directory.read_saved(id)
+    }
+}
+
+/// Transitional write-side partner to [`SessionReadPort`]. It owns only the
+/// current v1 candidate-to-physical-commit step and remains private so its path
+/// receipt and string error do not become the canonical revision API.
+trait SessionWritePort {
+    fn commit(&self, saved: &SavedSession) -> Result<SnapshotCommit, SnapshotSaveError>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CurrentV1FileWritePort<'a> {
+    directory: &'a PrivateDirectory,
+}
+
+impl SessionWritePort for CurrentV1FileWritePort<'_> {
+    fn commit(&self, saved: &SavedSession) -> Result<SnapshotCommit, SnapshotSaveError> {
+        let (path, commit) = write_saved_file(self.directory, saved, true)?;
+        Ok(SnapshotCommit {
+            path,
+            #[cfg(unix)]
+            file: commit.file,
+        })
+    }
+}
+
 fn list_in(directory: &PrivateDirectory) -> Result<Vec<SessionSummary>, String> {
     let names = directory.entry_names("session")?;
 
@@ -2231,6 +2450,50 @@ fn preferred_last_id(summaries: &[SessionSummary], excluded_id: Option<&str>) ->
         .map(|summary| summary.id.clone())
 }
 
+fn load_from_port(
+    port: &dyn SessionReadPort,
+    selector: &str,
+    excluded_id: Option<&str>,
+) -> Result<SavedSession, String> {
+    let id = resolve_selector(&port.list()?, selector, excluded_id)?;
+    if excluded_id == Some(id.as_str()) {
+        return Err(format!("session '{selector}' is already active"));
+    }
+    let saved = port.read(&id)?;
+    if saved.version != SESSION_VERSION {
+        return Err(format!(
+            "session '{}' uses unsupported format version {}",
+            saved.id, saved.version
+        ));
+    }
+    if saved.id != id || !valid_id(&saved.id) {
+        return Err("session id does not match the resolved selector".to_string());
+    }
+    Ok(saved)
+}
+
+fn commit_to_port(
+    port: &dyn SessionWritePort,
+    saved: &SavedSession,
+) -> Result<SnapshotCommit, SnapshotSaveError> {
+    if saved.version != SESSION_VERSION {
+        return Err(SnapshotSaveError {
+            message: format!(
+                "session '{}' uses unsupported format version {}",
+                saved.id, saved.version
+            ),
+            installed_commit: None,
+        });
+    }
+    if !valid_id(&saved.id) {
+        return Err(SnapshotSaveError {
+            message: "saved session has an invalid id".to_string(),
+            installed_commit: None,
+        });
+    }
+    port.commit(saved)
+}
+
 impl SessionStore {
     pub fn create(dir: PathBuf) -> Result<Self, String> {
         let directory = prepare_session_directory(&dir)?;
@@ -2247,7 +2510,8 @@ impl SessionStore {
         })
     }
 
-    pub fn from_saved(dir: PathBuf, saved: &SavedSession) -> Result<Self, String> {
+    #[cfg(test)]
+    fn from_saved(dir: PathBuf, saved: &SavedSession) -> Result<Self, String> {
         if !valid_id(&saved.id) {
             return Err("saved session has an invalid id".to_string());
         }
@@ -2326,18 +2590,18 @@ impl SessionStore {
             project_context: project_context.map(|path| path.display().to_string()),
             messages: messages.to_vec(),
         };
-        let (path, commit) = write_saved_file(&self.directory, &saved, true)?;
-        Ok(SnapshotCommit {
-            path,
-            #[cfg(unix)]
-            file: commit.file,
-        })
+        let port = CurrentV1FileWritePort {
+            directory: &self.directory,
+        };
+        commit_to_port(&port, &saved)
     }
 
     pub fn load(dir: &Path, selector: &str) -> Result<SavedSession, String> {
         let directory = open_session_directory(dir)?;
-        let id = resolve_selector(&list_in(&directory)?, selector, None)?;
-        directory.read_saved(&id)
+        let port = CurrentV1FileReadPort {
+            directory: &directory,
+        };
+        load_from_port(&port, selector, None)
     }
 
     /// Resolve an in-process session switch. `last` means the most recently
@@ -2349,11 +2613,10 @@ impl SessionStore {
         active_id: Option<&str>,
     ) -> Result<SavedSession, String> {
         let directory = open_session_directory(dir)?;
-        let id = resolve_selector(&list_in(&directory)?, selector, active_id)?;
-        if active_id == Some(id.as_str()) {
-            return Err(format!("session '{selector}' is already active"));
-        }
-        directory.read_saved(&id)
+        let port = CurrentV1FileReadPort {
+            directory: &directory,
+        };
+        load_from_port(&port, selector, active_id)
     }
 
     /// Set or clear a saved session's name without touching its transcript or
@@ -2811,13 +3074,610 @@ impl SessionStore {
         let Some(directory) = open_optional_session_directory(dir)? else {
             return Ok(Vec::new());
         };
-        list_in(&directory)
+        CurrentV1FileReadPort {
+            directory: &directory,
+        }
+        .list()
+    }
+}
+
+impl ActiveSessionStore {
+    pub fn create(dir: PathBuf) -> Result<Self, String> {
+        SessionStore::create(dir).map(|current_v1| Self {
+            inner: ActiveSessionStoreInner::CurrentV1(current_v1),
+        })
+    }
+
+    #[cfg(test)]
+    fn resume_current_v1(dir: PathBuf, saved: SavedSession) -> Result<ActiveSessionResume, String> {
+        let current_v1 = SessionStore::from_saved(dir, &saved)?;
+        Ok(ActiveSessionResume {
+            store: Self {
+                inner: ActiveSessionStoreInner::CurrentV1(current_v1),
+            },
+            saved,
+        })
+    }
+
+    pub fn resume_bound_current_v1(
+        dir: PathBuf,
+        selector: &str,
+    ) -> Result<ProductWritableBoundResumeV1, String> {
+        Self::resume_bound_current_excluding_v1(dir, selector, None)
+    }
+
+    pub fn resume_other_bound_current_v1(
+        dir: PathBuf,
+        selector: &str,
+        active_id: Option<&str>,
+    ) -> Result<ProductWritableBoundResumeV1, String> {
+        Self::resume_bound_current_excluding_v1(dir, selector, active_id)
+    }
+
+    fn resume_bound_current_excluding_v1(
+        dir: PathBuf,
+        selector: &str,
+        excluded_id: Option<&str>,
+    ) -> Result<ProductWritableBoundResumeV1, String> {
+        let directory = open_session_directory(&dir)?;
+        let summaries = CurrentV1FileReadPort {
+            directory: &directory,
+        }
+        .list()?;
+        let id = resolve_selector(&summaries, selector, excluded_id)?;
+        if excluded_id == Some(id.as_str()) {
+            return Err(format!("session '{selector}' is already active"));
+        }
+        let session_id = kitsu_core::session::SessionId::new(id.clone())
+            .map_err(|error| format!("invalid resolved session identity: {error}"))?;
+        admit_product_writable_bound_resume_in_directory_v1(&directory, &session_id)
+            .map_err(|error| product_writable_bound_resume_error(&id, error))
+    }
+
+    fn from_bound_local(live: mount::LocalSessionLiveStoreV1) -> Self {
+        let sessions_dir = live.sessions_dir().to_path_buf();
+        let id = live.saved().id.clone();
+        let name = live.saved().name.clone();
+        Self {
+            inner: ActiveSessionStoreInner::BoundLocal(BoundLocalActiveSessionStore {
+                sessions_dir,
+                id,
+                name,
+                live: std::cell::RefCell::new(live),
+            }),
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        match &self.inner {
+            ActiveSessionStoreInner::CurrentV1(store) => store.id(),
+            ActiveSessionStoreInner::BoundLocal(store) => &store.id,
+        }
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        match &self.inner {
+            ActiveSessionStoreInner::CurrentV1(store) => store.name(),
+            ActiveSessionStoreInner::BoundLocal(store) => store.name.as_deref(),
+        }
+    }
+
+    pub fn set_name(&mut self, name: Option<String>) -> Result<(), String> {
+        match &mut self.inner {
+            ActiveSessionStoreInner::CurrentV1(store) => {
+                store.set_name(name);
+                Ok(())
+            }
+            ActiveSessionStoreInner::BoundLocal(store) => {
+                let live = store
+                    .live
+                    .try_borrow()
+                    .map_err(|_| "bound local session store is already in use".to_string())?;
+                match live.activation_receipt().source() {
+                    mount::SessionMountActivatedSourceV1::CurrentV1 => {
+                        drop(live);
+                        store.name = name;
+                        Ok(())
+                    }
+                    mount::SessionMountActivatedSourceV1::Canonical { .. } => {
+                        Err("canonical session rename is not mounted yet".to_string())
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn artifacts_dir(&self) -> Result<PathBuf, String> {
+        match &self.inner {
+            ActiveSessionStoreInner::CurrentV1(store) => Ok(store.artifacts_dir()),
+            ActiveSessionStoreInner::BoundLocal(store) => {
+                let live = store
+                    .live
+                    .try_borrow()
+                    .map_err(|_| "bound local session store is already in use".to_string())?;
+                match live.activation_receipt().source() {
+                    mount::SessionMountActivatedSourceV1::CurrentV1 => {
+                        Ok(store.sessions_dir.join(format!("{}.artifacts", store.id)))
+                    }
+                    mount::SessionMountActivatedSourceV1::Canonical { .. } => Err(
+                        "canonical session artifacts require the physical artifact store"
+                            .to_string(),
+                    ),
+                }
+            }
+        }
+    }
+
+    pub fn reset(&mut self) -> Result<(), String> {
+        match &mut self.inner {
+            ActiveSessionStoreInner::CurrentV1(store) => store.reset(),
+            ActiveSessionStoreInner::BoundLocal(store) => {
+                let source = store
+                    .live
+                    .try_borrow()
+                    .map_err(|_| "bound local session store is already in use".to_string())?
+                    .activation_receipt()
+                    .source()
+                    .clone();
+                match source {
+                    mount::SessionMountActivatedSourceV1::CurrentV1 => {
+                        let replacement = SessionStore::create(store.sessions_dir.clone())?;
+                        self.inner = ActiveSessionStoreInner::CurrentV1(replacement);
+                        Ok(())
+                    }
+                    mount::SessionMountActivatedSourceV1::Canonical { .. } => {
+                        Err("canonical session reset is not mounted yet".to_string())
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn save(
+        &self,
+        directory: &Path,
+        gateway: &str,
+        model: &str,
+        project_context: Option<&Path>,
+        messages: &[ChatMessage],
+    ) -> Result<SnapshotCommit, SnapshotSaveError> {
+        match &self.inner {
+            ActiveSessionStoreInner::CurrentV1(store) => {
+                store.save(directory, gateway, model, project_context, messages)
+            }
+            ActiveSessionStoreInner::BoundLocal(store) => {
+                let mut live = store.live.try_borrow_mut().map_err(|_| SnapshotSaveError {
+                    message: "bound local session store is already in use".to_string(),
+                    installed_commit: None,
+                })?;
+                let saved = SavedSession {
+                    version: SESSION_VERSION,
+                    id: live.saved().id.clone(),
+                    created_at: live.saved().created_at.clone(),
+                    updated_at: now(),
+                    directory: directory.display().to_string(),
+                    gateway: gateway.to_string(),
+                    model: model.to_string(),
+                    name: store.name.clone(),
+                    project_context: project_context.map(|path| path.display().to_string()),
+                    messages: messages.to_vec(),
+                };
+                match live.save(mount::SessionLiveStoreSaveV1::CurrentV1Snapshot(saved)) {
+                    Ok(mount::SessionLiveStoreSaveReceiptV1::CurrentV1(receipt)) => {
+                        let (commit, warning) = receipt.into_parts();
+                        match warning {
+                            Some(message) => Err(SnapshotSaveError {
+                                message,
+                                installed_commit: Some(commit),
+                            }),
+                            None => Ok(commit),
+                        }
+                    }
+                    Ok(mount::SessionLiveStoreSaveReceiptV1::Canonical(_)) => {
+                        Err(SnapshotSaveError {
+                            message: "snapshot save returned a canonical receipt".to_string(),
+                            installed_commit: None,
+                        })
+                    }
+                    Err(mount::SessionMountSaveErrorV1::CurrentV1(
+                        mount::CurrentV1MountSaveErrorV1::Write(error),
+                    )) => Err(error),
+                    Err(mount::SessionMountSaveErrorV1::CurrentV1(
+                        mount::CurrentV1MountSaveErrorV1::InvalidCandidate(message)
+                        | mount::CurrentV1MountSaveErrorV1::Admission(message),
+                    )) => Err(SnapshotSaveError {
+                        message,
+                        installed_commit: None,
+                    }),
+                    Err(mount::SessionMountSaveErrorV1::CanonicalOperationRequired) => {
+                        Err(SnapshotSaveError {
+                            message: "canonical session save requires a canonical operation"
+                                .to_string(),
+                            installed_commit: None,
+                        })
+                    }
+                    Err(
+                        mount::SessionMountSaveErrorV1::CurrentV1SnapshotRequired
+                        | mount::SessionMountSaveErrorV1::Canonical(_),
+                    ) => Err(SnapshotSaveError {
+                        message: "bound local session rejected the snapshot save".to_string(),
+                        installed_commit: None,
+                    }),
+                }
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn activate_bound_session_resume_v1(
+    sessions_dir: &Path,
+    session_id: &str,
+) -> Result<ActiveSessionResume, BoundActiveSessionResumeErrorV1> {
+    let session_id = kitsu_core::session::SessionId::new(session_id.to_string())
+        .map_err(|error| BoundActiveSessionResumeErrorV1::InvalidSessionId(error.to_string()))?;
+    let directory = open_session_directory(sessions_dir)
+        .map_err(BoundActiveSessionResumeErrorV1::SessionRoot)?;
+    activate_bound_session_resume_in_directory_v1(&directory, &session_id)
+}
+
+fn activate_bound_session_resume_in_directory_v1(
+    directory: &PrivateDirectory,
+    session_id: &kitsu_core::session::SessionId,
+) -> Result<ActiveSessionResume, BoundActiveSessionResumeErrorV1> {
+    let live = mount::activate_local_session_live_store_v1(directory, session_id)
+        .map_err(BoundActiveSessionResumeErrorV1::Activation)?;
+    let saved = live.saved().clone();
+    let resume = ActiveSessionResume {
+        store: ActiveSessionStore::from_bound_local(live),
+        saved,
+    };
+    if resume.saved().id != session_id.as_str() {
+        return Err(BoundActiveSessionResumeErrorV1::SelectionIdentityMismatch);
+    }
+    Ok(resume)
+}
+
+#[allow(dead_code)]
+fn admit_product_writable_bound_resume_v1(
+    sessions_dir: &Path,
+    session_id: &str,
+) -> Result<ProductWritableBoundResumeV1, ProductWritableBoundResumeAdmissionErrorV1> {
+    let resume = activate_bound_session_resume_v1(sessions_dir, session_id)
+        .map_err(ProductWritableBoundResumeAdmissionErrorV1::Activation)?;
+    admit_product_writable_bound_resume_value_v1(resume)
+}
+
+fn admit_product_writable_bound_resume_in_directory_v1(
+    directory: &PrivateDirectory,
+    session_id: &kitsu_core::session::SessionId,
+) -> Result<ProductWritableBoundResumeV1, ProductWritableBoundResumeAdmissionErrorV1> {
+    let resume = activate_bound_session_resume_in_directory_v1(directory, session_id)
+        .map_err(ProductWritableBoundResumeAdmissionErrorV1::Activation)?;
+    admit_product_writable_bound_resume_value_v1(resume)
+}
+
+fn admit_product_writable_bound_resume_value_v1(
+    resume: ActiveSessionResume,
+) -> Result<ProductWritableBoundResumeV1, ProductWritableBoundResumeAdmissionErrorV1> {
+    let source = match &resume.store.inner {
+        ActiveSessionStoreInner::CurrentV1(_) => {
+            return Err(ProductWritableBoundResumeAdmissionErrorV1::Activation(
+                BoundActiveSessionResumeErrorV1::SelectionIdentityMismatch,
+            ));
+        }
+        ActiveSessionStoreInner::BoundLocal(store) => store
+            .live
+            .try_borrow()
+            .map_err(|_| ProductWritableBoundResumeAdmissionErrorV1::OwnerInUse)?
+            .activation_receipt()
+            .source()
+            .clone(),
+    };
+    match source {
+        mount::SessionMountActivatedSourceV1::CurrentV1 => {
+            Ok(ProductWritableBoundResumeV1 { resume })
+        }
+        mount::SessionMountActivatedSourceV1::Canonical { .. } => {
+            Err(ProductWritableBoundResumeAdmissionErrorV1::CanonicalOperationWriterUnavailable)
+        }
+    }
+}
+
+fn product_writable_bound_resume_error(
+    session_id: &str,
+    error: ProductWritableBoundResumeAdmissionErrorV1,
+) -> String {
+    match error {
+        ProductWritableBoundResumeAdmissionErrorV1::CanonicalOperationWriterUnavailable => {
+            format!(
+                "session '{session_id}' uses canonical history; startup resume requires the canonical operation writer"
+            )
+        }
+        ProductWritableBoundResumeAdmissionErrorV1::OwnerInUse => {
+            format!("session '{session_id}' activation owner is already in use")
+        }
+        ProductWritableBoundResumeAdmissionErrorV1::Activation(error) => {
+            bound_active_resume_error(session_id, error)
+        }
+    }
+}
+
+fn bound_active_resume_error(session_id: &str, error: BoundActiveSessionResumeErrorV1) -> String {
+    match error {
+        BoundActiveSessionResumeErrorV1::InvalidSessionId(message)
+        | BoundActiveSessionResumeErrorV1::SessionRoot(message) => message,
+        BoundActiveSessionResumeErrorV1::SelectionIdentityMismatch => {
+            format!("session '{session_id}' activation selected a different session identity")
+        }
+        BoundActiveSessionResumeErrorV1::Activation(error) => {
+            local_live_store_activation_error(session_id, error)
+        }
+    }
+}
+
+fn local_live_store_activation_error(
+    session_id: &str,
+    error: mount::LocalSessionLiveStoreActivationErrorV1,
+) -> String {
+    match error {
+        mount::LocalSessionLiveStoreActivationErrorV1::Identity(error) => match error {
+            identity::LocalStoreIdentityErrorV1::Read(message)
+            | identity::LocalStoreIdentityErrorV1::Write { message, .. } => message,
+            identity::LocalStoreIdentityErrorV1::UnboundPhysicalNamespace => {
+                "local session store has a physical namespace without an owning identity"
+                    .to_string()
+            }
+            identity::LocalStoreIdentityErrorV1::UnsafeEntry => {
+                "local session store identity is not owner-private".to_string()
+            }
+            identity::LocalStoreIdentityErrorV1::Malformed => {
+                "local session store identity is malformed".to_string()
+            }
+            identity::LocalStoreIdentityErrorV1::Unsupported {
+                observed,
+                supported,
+            } => format!(
+                "local session store identity schema {observed} is unsupported; this Kitsu supports {supported}"
+            ),
+            identity::LocalStoreIdentityErrorV1::InvalidStoreIdentity => {
+                "local session store identity is invalid".to_string()
+            }
+        },
+        mount::LocalSessionLiveStoreActivationErrorV1::IdentityBindingMismatch => {
+            "local session store identity does not match its physical store".to_string()
+        }
+        mount::LocalSessionLiveStoreActivationErrorV1::Activation(error) => match error {
+            mount::SessionMountActivationErrorV1::Empty => format!(
+                "session '{session_id}' disappeared while it was being resumed; retry the resume"
+            ),
+            mount::SessionMountActivationErrorV1::Rejected(_) => format!(
+                "session '{session_id}' has unavailable or conflicting durable representations"
+            ),
+            mount::SessionMountActivationErrorV1::CurrentV1(error) => match error {
+                mount::CurrentV1MountActivationErrorV1::SessionRoot(message)
+                | mount::CurrentV1MountActivationErrorV1::LegacyFence(message)
+                | mount::CurrentV1MountActivationErrorV1::StoreInitialization(message)
+                | mount::CurrentV1MountActivationErrorV1::CanonicalFence(message) => message,
+                mount::CurrentV1MountActivationErrorV1::WrongSelection
+                | mount::CurrentV1MountActivationErrorV1::SelectionIdentityMismatch
+                | mount::CurrentV1MountActivationErrorV1::CurrentV1Changed(_)
+                | mount::CurrentV1MountActivationErrorV1::CurrentV1ValueChanged
+                | mount::CurrentV1MountActivationErrorV1::CanonicalChanged(_) => format!(
+                    "session '{session_id}' changed while it was being resumed; retry the resume"
+                ),
+            },
+            mount::SessionMountActivationErrorV1::Canonical(error) => match error {
+                mount::CanonicalMountActivationErrorV1::LegacyFence(message)
+                | mount::CanonicalMountActivationErrorV1::CanonicalFence(message) => message,
+                mount::CanonicalMountActivationErrorV1::WrongSelection
+                | mount::CanonicalMountActivationErrorV1::SelectionIdentityMismatch
+                | mount::CanonicalMountActivationErrorV1::Projection(_)
+                | mount::CanonicalMountActivationErrorV1::StoreUnavailable(_)
+                | mount::CanonicalMountActivationErrorV1::CurrentV1Changed(_)
+                | mount::CanonicalMountActivationErrorV1::CanonicalChanged(_)
+                | mount::CanonicalMountActivationErrorV1::CanonicalValueChanged { .. } => format!(
+                    "session '{session_id}' canonical state changed or is unavailable; retry the resume"
+                ),
+            },
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct FixtureSessionReadPort {
+        summaries: Vec<SessionSummary>,
+        sessions: Vec<SavedSession>,
+        read_override: Option<SavedSession>,
+        reads: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl SessionReadPort for FixtureSessionReadPort {
+        fn list(&self) -> Result<Vec<SessionSummary>, String> {
+            Ok(self.summaries.clone())
+        }
+
+        fn read(&self, id: &str) -> Result<SavedSession, String> {
+            self.reads.borrow_mut().push(id.to_string());
+            if let Some(saved) = &self.read_override {
+                return Ok(saved.clone());
+            }
+            self.sessions
+                .iter()
+                .find(|saved| saved.id == id)
+                .cloned()
+                .ok_or_else(|| format!("fixture has no session '{id}'"))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RefusingSessionWritePort {
+        observed: std::cell::RefCell<Option<SavedSession>>,
+    }
+
+    impl SessionWritePort for RefusingSessionWritePort {
+        fn commit(&self, saved: &SavedSession) -> Result<SnapshotCommit, SnapshotSaveError> {
+            self.observed.replace(Some(saved.clone()));
+            Err(SnapshotSaveError {
+                message: "fixture refused before publication".to_string(),
+                installed_commit: None,
+            })
+        }
+    }
+
+    fn fixture_saved(id: &str, name: Option<&str>, directory: String) -> SavedSession {
+        SavedSession {
+            version: SESSION_VERSION,
+            id: id.to_string(),
+            created_at: "2026-08-20T00:00:00.000Z".to_string(),
+            updated_at: "2026-08-20T00:00:01.000Z".to_string(),
+            directory,
+            gateway: "fixture-gateway".to_string(),
+            model: "fixture-model".to_string(),
+            name: name.map(str::to_string),
+            project_context: None,
+            messages: vec![ChatMessage::user(id)],
+        }
+    }
+
+    #[test]
+    fn private_read_port_preserves_selector_and_exclusion_semantics() {
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        let empty = fixture_saved("s-empty", None, "/fixture/other".to_string());
+        let productive = fixture_saved(
+            "s-productive",
+            Some("fox-den"),
+            "/fixture/other".to_string(),
+        );
+        let automatic = fixture_saved("s-auto", None, cwd.clone());
+        let port = FixtureSessionReadPort {
+            summaries: vec![
+                SessionSummary {
+                    id: empty.id.clone(),
+                    name: None,
+                    updated_at: "2026-08-20T00:00:03.000Z".to_string(),
+                    model: empty.model.clone(),
+                    gateway: empty.gateway.clone(),
+                    directory: empty.directory.clone(),
+                    preview: "(no prompt yet)".to_string(),
+                    turns: 0,
+                },
+                SessionSummary {
+                    id: productive.id.clone(),
+                    name: productive.name.clone(),
+                    updated_at: "2026-08-20T00:00:02.000Z".to_string(),
+                    model: productive.model.clone(),
+                    gateway: productive.gateway.clone(),
+                    directory: productive.directory.clone(),
+                    preview: "productive".to_string(),
+                    turns: 1,
+                },
+                SessionSummary {
+                    id: automatic.id.clone(),
+                    name: None,
+                    updated_at: "2026-08-20T00:00:01.000Z".to_string(),
+                    model: automatic.model.clone(),
+                    gateway: automatic.gateway.clone(),
+                    directory: cwd,
+                    preview: "automatic".to_string(),
+                    turns: 1,
+                },
+            ],
+            sessions: vec![empty, productive, automatic],
+            read_override: None,
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+
+        assert_eq!(
+            load_from_port(&port, "last", None).unwrap().id,
+            "s-productive"
+        );
+        assert_eq!(
+            load_from_port(&port, "fox-den", None).unwrap().id,
+            "s-productive"
+        );
+        assert_eq!(load_from_port(&port, "auto", None).unwrap().id, "s-auto");
+        assert_eq!(
+            load_from_port(&port, "last", Some("s-productive"))
+                .unwrap()
+                .id,
+            "s-auto"
+        );
+        let reads_before = port.reads.borrow().len();
+        assert!(load_from_port(&port, "s-productive", Some("s-productive"))
+            .unwrap_err()
+            .contains("already active"));
+        assert_eq!(port.reads.borrow().len(), reads_before);
+
+        let mismatched = FixtureSessionReadPort {
+            summaries: vec![port.summaries[1].clone()],
+            sessions: Vec::new(),
+            read_override: Some(port.sessions[2].clone()),
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+        assert!(load_from_port(&mismatched, "s-productive", None)
+            .unwrap_err()
+            .contains("does not match the resolved selector"));
+        assert_eq!(mismatched.reads.borrow().as_slice(), ["s-productive"]);
+    }
+
+    #[test]
+    fn current_v1_port_keeps_corrupt_entries_out_of_list_but_exact_reads_fail() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let store = SessionStore::create(dir.clone()).unwrap();
+        store
+            .save(
+                root.path(),
+                "gateway",
+                "model",
+                None,
+                &[ChatMessage::user("valid")],
+            )
+            .unwrap();
+        std::fs::write(dir.join("s-corrupt.json"), b"{").unwrap();
+
+        let listed = SessionStore::list(&dir).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, store.id());
+        assert!(SessionStore::load(&dir, "s-corrupt")
+            .unwrap_err()
+            .contains("cannot parse session"));
+    }
+
+    #[test]
+    fn private_write_port_receives_exact_candidate_and_preserves_preinstall_failure() {
+        let candidate = fixture_saved(
+            "s-write-candidate",
+            Some("write-candidate"),
+            "/fixture/write".to_string(),
+        );
+        let port = RefusingSessionWritePort::default();
+
+        let error = commit_to_port(&port, &candidate).unwrap_err();
+
+        assert!(error.to_string().contains("before publication"));
+        assert!(error.installed_commit().is_none());
+        {
+            let observed = port.observed.borrow();
+            let observed = observed.as_ref().unwrap();
+            assert_eq!(observed.id, candidate.id);
+            assert_eq!(observed.name, candidate.name);
+            assert_eq!(observed.messages, candidate.messages);
+        }
+
+        let mut future = candidate;
+        future.version = SESSION_VERSION + 1;
+        let untouched_port = RefusingSessionWritePort::default();
+        let error = commit_to_port(&untouched_port, &future).unwrap_err();
+        assert!(error.to_string().contains("unsupported format version"));
+        assert!(error.installed_commit().is_none());
+        assert!(untouched_port.observed.borrow().is_none());
+    }
 
     #[cfg(unix)]
     fn after_next_session_directory_pin(hook: impl FnOnce() + 'static) {
@@ -4198,5 +5058,633 @@ mod tests {
         assert!(SessionStore::delete(&dir, "linked", None).is_err());
         assert!(linked.exists());
         assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside");
+    }
+
+    #[test]
+    fn active_session_owner_preserves_current_v1_route_and_identity_lifetime() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let mut active = ActiveSessionStore::create(dir.clone()).unwrap();
+        let first_id = active.id().to_string();
+        active.set_name(Some("first-owner".to_string())).unwrap();
+        let commit = active
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("preserve current-v1")],
+            )
+            .unwrap();
+        assert_eq!(commit.path(), dir.join(format!("{first_id}.json")));
+        assert!(!dir.join(".kitsu-store-v1").exists());
+        let first = SessionStore::load(&dir, &first_id).unwrap();
+        assert_eq!(first.name.as_deref(), Some("first-owner"));
+        assert_eq!(first.messages, [ChatMessage::user("preserve current-v1")]);
+        assert_eq!(
+            active.artifacts_dir().unwrap(),
+            dir.join(format!("{first_id}.artifacts"))
+        );
+        let directory = PrivateDirectory::open(&dir, "active owner fixture").unwrap();
+        assert!(SessionLease::acquire(&directory, &first_id).is_err());
+
+        active.reset().unwrap();
+        let second_id = active.id().to_string();
+        assert_ne!(second_id, first_id);
+        assert_eq!(active.name(), None);
+        drop(SessionLease::acquire(&directory, &first_id).unwrap());
+        assert!(SessionLease::acquire(&directory, &second_id).is_err());
+        assert_eq!(
+            encode_saved(&SessionStore::load(&dir, &first_id).unwrap()).unwrap(),
+            encode_saved(&first).unwrap()
+        );
+
+        drop(active);
+        let resumed = SessionStore::load(&dir, &first_id).unwrap();
+        let handoff = ActiveSessionStore::resume_current_v1(dir.clone(), resumed.clone()).unwrap();
+        let (active, exact_resumed) = handoff.into_current_v1_parts().unwrap();
+        assert_eq!(
+            encode_saved(&exact_resumed).unwrap(),
+            encode_saved(&resumed).unwrap()
+        );
+        assert_eq!(active.id(), first_id);
+        assert_eq!(exact_resumed.id, first_id);
+        assert!(SessionLease::acquire(&directory, &first_id).is_err());
+        drop(active);
+        drop(SessionLease::acquire(&directory, &first_id).unwrap());
+        assert!(!dir.join(".kitsu-store-v1").exists());
+    }
+
+    #[test]
+    fn active_resume_handoff_refuses_stale_input_and_returns_the_exact_current_value() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let original = SessionStore::create(dir.clone()).unwrap();
+        original
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("stale product value")],
+            )
+            .unwrap();
+        let id = original.id().to_string();
+        drop(original);
+        let stale = SessionStore::load(&dir, &id).unwrap();
+
+        let replacement = SessionStore::from_saved(dir.clone(), &stale).unwrap();
+        replacement
+            .save(
+                root.path(),
+                "gateway-b",
+                "model-b",
+                None,
+                &[ChatMessage::user("exact product value")],
+            )
+            .unwrap();
+        drop(replacement);
+        let exact = SessionStore::load(&dir, &id).unwrap();
+
+        let error = ActiveSessionStore::resume_current_v1(dir.clone(), stale).unwrap_err();
+        assert!(error.contains("changed while it was being resumed"));
+        let handoff = ActiveSessionStore::resume_current_v1(dir.clone(), exact.clone()).unwrap();
+        let (active, saved) = handoff.into_current_v1_parts().unwrap();
+        assert_eq!(encode_saved(&saved).unwrap(), encode_saved(&exact).unwrap());
+        let directory = PrivateDirectory::open(&dir, "active resume handoff fixture").unwrap();
+        assert!(SessionLease::acquire(&directory, &id).is_err());
+        assert!(!dir.join(identity::LOCAL_STORE_IDENTITY_NAME).exists());
+        assert!(!dir.join(".kitsu-store-v1").exists());
+        assert_eq!(active.id(), saved.id);
+        assert_eq!(saved.messages, [ChatMessage::user("exact product value")]);
+        drop(active);
+        drop(SessionLease::acquire(&directory, &id).unwrap());
+    }
+
+    #[test]
+    fn bound_local_active_variant_preserves_current_save_and_durability_truth() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let mut legacy = SessionStore::create(dir.clone()).unwrap();
+        legacy.set_name(Some("local-source".to_string()));
+        legacy
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("local source")],
+            )
+            .unwrap();
+        let id = legacy.id().to_string();
+        drop(legacy);
+
+        let directory = PrivateDirectory::open(&dir, "bound active fixture").unwrap();
+        let session_id = kitsu_core::session::SessionId::new(id.clone()).unwrap();
+        let local = mount::activate_local_session_live_store_v1(&directory, &session_id).unwrap();
+        let store_id = local.identity_receipt().store_id().clone();
+        let mut active = ActiveSessionStore::from_bound_local(local);
+        assert_eq!(active.id(), id);
+        assert_eq!(active.name(), Some("local-source"));
+        assert_eq!(
+            active.artifacts_dir().unwrap(),
+            dir.join(format!("{id}.artifacts"))
+        );
+        active.set_name(Some("local-bound".to_string())).unwrap();
+        let commit = active
+            .save(
+                root.path(),
+                "gateway-b",
+                "model-b",
+                None,
+                &[ChatMessage::user("saved through active variant")],
+            )
+            .unwrap();
+        assert_eq!(commit.path(), dir.join(format!("{id}.json")));
+        let saved = SessionStore::load(&dir, &id).unwrap();
+        assert_eq!(saved.name.as_deref(), Some("local-bound"));
+        assert_eq!(saved.gateway, "gateway-b");
+        assert_eq!(saved.model, "model-b");
+        assert_eq!(
+            saved.messages,
+            [ChatMessage::user("saved through active variant")]
+        );
+
+        FAIL_NEXT_PRIVATE_DIRECTORY_SYNC.with(|fail| assert!(!fail.replace(true)));
+        let error = active
+            .save(
+                root.path(),
+                "gateway-c",
+                "model-c",
+                None,
+                &[ChatMessage::user("installed unconfirmed")],
+            )
+            .unwrap_err();
+        assert!(error.installed_commit().is_some());
+        let installed = SessionStore::load(&dir, &id).unwrap();
+        assert_eq!(installed.model, "model-c");
+        assert_eq!(
+            installed.messages,
+            [ChatMessage::user("installed unconfirmed")]
+        );
+        let physical = physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
+            .unwrap()
+            .unwrap();
+        assert!(physical.acquire_writer_fence(&session_id).is_err());
+        assert!(SessionLease::acquire(&directory, &id).is_err());
+        active.reset().unwrap();
+        let reset_id = active.id().to_string();
+        assert_ne!(reset_id, id);
+        assert_eq!(active.name(), None);
+        drop(physical.acquire_writer_fence(&session_id).unwrap());
+        drop(SessionLease::acquire(&directory, &id).unwrap());
+        assert!(SessionLease::acquire(&directory, &reset_id).is_err());
+        drop(active);
+        drop(SessionLease::acquire(&directory, &reset_id).unwrap());
+    }
+
+    #[test]
+    fn bound_local_active_variant_refuses_legacy_projection_of_canonical_state() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let directory = PrivateDirectory::prepare(&dir, "bound canonical fixture").unwrap();
+        let identity = identity::acquire_local_store_identity_v1(&directory).unwrap();
+        let store_id = identity.store_id().clone();
+        let session_id = kitsu_core::session::SessionId::new("session-canonical-active").unwrap();
+        let saved = SavedSession {
+            version: SESSION_VERSION,
+            id: session_id.as_str().to_string(),
+            created_at: "2026-08-20T10:00:00.000Z".to_string(),
+            updated_at: "2026-08-20T10:01:00.000Z".to_string(),
+            directory: root.path().display().to_string(),
+            gateway: "gateway-a".to_string(),
+            model: "model-a".to_string(),
+            name: Some("canonical-source".to_string()),
+            project_context: None,
+            messages: vec![ChatMessage::user("canonical source")],
+        };
+        let physical =
+            physical::PhysicalFileStoreV1::create_or_open(&dir, store_id.clone()).unwrap();
+        transaction::publish_current_v1_mount_fixture_v1(
+            &physical,
+            &encode_saved(&saved).unwrap(),
+            &session_id,
+            kitsu_core::session::RevisionId::new("rev-canonical-active").unwrap(),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(physical);
+        let local = mount::activate_local_session_live_store_v1(&directory, &session_id).unwrap();
+        let mut active = ActiveSessionStore::from_bound_local(local);
+        assert_eq!(active.id(), session_id.as_str());
+        assert_eq!(active.name(), Some("canonical-source"));
+        assert!(active
+            .artifacts_dir()
+            .unwrap_err()
+            .contains("physical artifact"));
+        let head_path = physical::PhysicalLayoutV1::head_pointer(&dir, &session_id);
+        let head_before = std::fs::read(&head_path).unwrap();
+
+        assert!(active
+            .set_name(Some("must-not-project".to_string()))
+            .unwrap_err()
+            .contains("not mounted"));
+        assert_eq!(active.name(), Some("canonical-source"));
+        let error = active
+            .save(
+                root.path(),
+                "gateway-b",
+                "model-b",
+                None,
+                &[ChatMessage::user("must not become current-v1")],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("canonical operation"));
+        assert!(error.installed_commit().is_none());
+        assert_eq!(std::fs::read(&head_path).unwrap(), head_before);
+        assert!(!dir.join(format!("{}.json", session_id.as_str())).exists());
+        assert!(active.reset().unwrap_err().contains("not mounted"));
+        assert_eq!(std::fs::read(&head_path).unwrap(), head_before);
+
+        let competing = physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
+            .unwrap()
+            .unwrap();
+        assert!(competing.acquire_writer_fence(&session_id).is_err());
+        assert!(SessionLease::acquire(&directory, session_id.as_str()).is_err());
+        drop(active);
+        drop(competing.acquire_writer_fence(&session_id).unwrap());
+        drop(SessionLease::acquire(&directory, session_id.as_str()).unwrap());
+    }
+
+    #[test]
+    fn bound_resume_returns_the_exact_current_value_selected_with_its_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let initial = SessionStore::create(dir.clone()).unwrap();
+        initial
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("stale pre-activation value")],
+            )
+            .unwrap();
+        let id = initial.id().to_string();
+        drop(initial);
+        let stale = SessionStore::load(&dir, &id).unwrap();
+
+        let replacement = SessionStore::from_saved(dir.clone(), &stale).unwrap();
+        replacement
+            .save(
+                root.path(),
+                "gateway-b",
+                "model-b",
+                None,
+                &[ChatMessage::user("exact selected value")],
+            )
+            .unwrap();
+        drop(replacement);
+        let exact = SessionStore::load(&dir, &id).unwrap();
+        assert_ne!(encode_saved(&stale).unwrap(), encode_saved(&exact).unwrap());
+
+        let resume = activate_bound_session_resume_v1(&dir, &id).unwrap();
+        assert_eq!(
+            encode_saved(resume.saved()).unwrap(),
+            encode_saved(&exact).unwrap()
+        );
+        assert_eq!(resume.saved().id, id);
+        assert_eq!(resume.saved().name, exact.name);
+        assert!(dir.join(identity::LOCAL_STORE_IDENTITY_NAME).is_file());
+        assert!(dir.join(".kitsu-store-v1").is_dir());
+        let directory = PrivateDirectory::open(&dir, "bound resume fixture").unwrap();
+        assert!(SessionLease::acquire(&directory, &id).is_err());
+
+        let mut before_invalid = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        before_invalid.sort();
+        assert!(matches!(
+            activate_bound_session_resume_v1(&dir, "../unsafe"),
+            Err(BoundActiveSessionResumeErrorV1::InvalidSessionId(_))
+        ));
+        let mut after_invalid = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        after_invalid.sort();
+        assert_eq!(after_invalid, before_invalid);
+        let error = resume.into_current_v1_parts().unwrap_err();
+        assert!(error.contains("explicit product admission"));
+        drop(SessionLease::acquire(&directory, &id).unwrap());
+    }
+
+    #[test]
+    fn bound_resume_returns_canonical_projection_with_the_head_owning_store() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let directory = PrivateDirectory::prepare(&dir, "bound resume canonical fixture").unwrap();
+        let identity = identity::acquire_local_store_identity_v1(&directory).unwrap();
+        let store_id = identity.store_id().clone();
+        let session_id = kitsu_core::session::SessionId::new("session-bound-resume").unwrap();
+        let saved = SavedSession {
+            version: SESSION_VERSION,
+            id: session_id.as_str().to_string(),
+            created_at: "2026-08-20T10:00:00.000Z".to_string(),
+            updated_at: "2026-08-20T10:01:00.000Z".to_string(),
+            directory: root.path().display().to_string(),
+            gateway: "gateway-a".to_string(),
+            model: "model-a".to_string(),
+            name: Some("bound-canonical".to_string()),
+            project_context: None,
+            messages: vec![ChatMessage::user("canonical resume")],
+        };
+        let physical =
+            physical::PhysicalFileStoreV1::create_or_open(&dir, store_id.clone()).unwrap();
+        transaction::publish_current_v1_mount_fixture_v1(
+            &physical,
+            &encode_saved(&saved).unwrap(),
+            &session_id,
+            kitsu_core::session::RevisionId::new("rev-bound-resume").unwrap(),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(physical);
+        let head_path = physical::PhysicalLayoutV1::head_pointer(&dir, &session_id);
+        let head_before = std::fs::read(&head_path).unwrap();
+
+        let resume = activate_bound_session_resume_v1(&dir, session_id.as_str()).unwrap();
+        assert_eq!(resume.saved().id, saved.id);
+        assert_eq!(resume.saved().messages, saved.messages);
+        assert_eq!(resume.saved().name, saved.name);
+        assert_eq!(resume.saved().id, session_id.as_str());
+        assert_eq!(std::fs::read(&head_path).unwrap(), head_before);
+        assert!(!dir.join(format!("{}.json", session_id.as_str())).exists());
+        let competing = physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
+            .unwrap()
+            .unwrap();
+        assert!(competing.acquire_writer_fence(&session_id).is_err());
+        assert!(SessionLease::acquire(&directory, session_id.as_str()).is_err());
+        let error = resume.into_current_v1_parts().unwrap_err();
+        assert!(error.contains("explicit product admission"));
+        drop(competing.acquire_writer_fence(&session_id).unwrap());
+        drop(SessionLease::acquire(&directory, session_id.as_str()).unwrap());
+    }
+
+    #[test]
+    fn product_writable_bound_admission_returns_only_current_v1_and_saves_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let legacy = SessionStore::create(dir.clone()).unwrap();
+        legacy
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("bound product source")],
+            )
+            .unwrap();
+        let id = legacy.id().to_string();
+        drop(legacy);
+
+        let admitted = admit_product_writable_bound_resume_v1(&dir, &id).unwrap();
+        let (active, saved) = admitted.into_parts();
+        assert_eq!(active.id(), saved.id);
+        assert_eq!(saved.messages, [ChatMessage::user("bound product source")]);
+        active
+            .save(
+                root.path(),
+                "gateway-b",
+                "model-b",
+                None,
+                &[ChatMessage::user("bound product successor")],
+            )
+            .unwrap();
+        let exact = SessionStore::load(&dir, &id).unwrap();
+        assert_eq!(exact.gateway, "gateway-b");
+        assert_eq!(exact.model, "model-b");
+        assert_eq!(
+            exact.messages,
+            [ChatMessage::user("bound product successor")]
+        );
+        assert!(dir.join(identity::LOCAL_STORE_IDENTITY_NAME).is_file());
+        assert!(dir.join(".kitsu-store-v1").is_dir());
+        let directory = PrivateDirectory::open(&dir, "bound product fixture").unwrap();
+        assert!(SessionLease::acquire(&directory, &id).is_err());
+        drop(active);
+        drop(SessionLease::acquire(&directory, &id).unwrap());
+    }
+
+    #[test]
+    fn product_writable_bound_admission_rejects_canonical_and_releases_both_fences() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let directory = PrivateDirectory::prepare(&dir, "bound product canonical fixture").unwrap();
+        let identity = identity::acquire_local_store_identity_v1(&directory).unwrap();
+        let store_id = identity.store_id().clone();
+        let session_id = kitsu_core::session::SessionId::new("session-product-canonical").unwrap();
+        let saved = SavedSession {
+            version: SESSION_VERSION,
+            id: session_id.as_str().to_string(),
+            created_at: "2026-08-20T11:00:00.000Z".to_string(),
+            updated_at: "2026-08-20T11:01:00.000Z".to_string(),
+            directory: root.path().display().to_string(),
+            gateway: "gateway-a".to_string(),
+            model: "model-a".to_string(),
+            name: Some("product-canonical".to_string()),
+            project_context: None,
+            messages: vec![ChatMessage::user("canonical product source")],
+        };
+        let physical =
+            physical::PhysicalFileStoreV1::create_or_open(&dir, store_id.clone()).unwrap();
+        transaction::publish_current_v1_mount_fixture_v1(
+            &physical,
+            &encode_saved(&saved).unwrap(),
+            &session_id,
+            kitsu_core::session::RevisionId::new("rev-product-canonical").unwrap(),
+            "2026-08-20T11:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(physical);
+        let head_path = physical::PhysicalLayoutV1::head_pointer(&dir, &session_id);
+        let head_before = std::fs::read(&head_path).unwrap();
+
+        assert!(matches!(
+            admit_product_writable_bound_resume_v1(&dir, session_id.as_str()),
+            Err(ProductWritableBoundResumeAdmissionErrorV1::CanonicalOperationWriterUnavailable)
+        ));
+        assert_eq!(std::fs::read(&head_path).unwrap(), head_before);
+        assert!(!dir.join(format!("{}.json", session_id.as_str())).exists());
+        let competing = physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
+            .unwrap()
+            .unwrap();
+        drop(competing.acquire_writer_fence(&session_id).unwrap());
+        drop(SessionLease::acquire(&directory, session_id.as_str()).unwrap());
+    }
+
+    #[test]
+    fn product_writable_bound_admission_keeps_missing_state_effect_free() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(matches!(
+            admit_product_writable_bound_resume_v1(&dir, "session-missing"),
+            Err(ProductWritableBoundResumeAdmissionErrorV1::Activation(_))
+        ));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn startup_bound_resume_resolves_current_selectors_to_one_exact_owned_value() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let cwd = std::env::current_dir().unwrap();
+        let mut legacy = SessionStore::create(dir.clone()).unwrap();
+        legacy.set_name(Some("startup-route".to_string()));
+        legacy
+            .save(
+                &cwd,
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("startup exact value")],
+            )
+            .unwrap();
+        let id = legacy.id().to_string();
+        drop(legacy);
+
+        for selector in [id.as_str(), "startup-route", "last", "auto"] {
+            let admitted =
+                ActiveSessionStore::resume_bound_current_v1(dir.clone(), selector).unwrap();
+            let (active, saved) = admitted.into_parts();
+            assert_eq!(active.id(), id);
+            assert_eq!(saved.id, id);
+            assert_eq!(saved.name.as_deref(), Some("startup-route"));
+            assert_eq!(saved.messages, [ChatMessage::user("startup exact value")]);
+            let directory = PrivateDirectory::open(&dir, "startup route fixture").unwrap();
+            assert!(SessionLease::acquire(&directory, &id).is_err());
+            drop(active);
+            drop(SessionLease::acquire(&directory, &id).unwrap());
+        }
+        assert!(dir.join(identity::LOCAL_STORE_IDENTITY_NAME).is_file());
+        assert!(dir.join(".kitsu-store-v1").is_dir());
+    }
+
+    #[test]
+    fn startup_bound_resume_refuses_exact_canonical_before_returning_product_parts() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let directory = PrivateDirectory::prepare(&dir, "startup canonical fixture").unwrap();
+        let identity = identity::acquire_local_store_identity_v1(&directory).unwrap();
+        let store_id = identity.store_id().clone();
+        let session_id = kitsu_core::session::SessionId::new("s-startup-canonical").unwrap();
+        let saved = SavedSession {
+            version: SESSION_VERSION,
+            id: session_id.as_str().to_string(),
+            created_at: "2026-08-20T12:00:00.000Z".to_string(),
+            updated_at: "2026-08-20T12:01:00.000Z".to_string(),
+            directory: root.path().display().to_string(),
+            gateway: "gateway-a".to_string(),
+            model: "model-a".to_string(),
+            name: None,
+            project_context: None,
+            messages: vec![ChatMessage::user("canonical startup source")],
+        };
+        let physical =
+            physical::PhysicalFileStoreV1::create_or_open(&dir, store_id.clone()).unwrap();
+        transaction::publish_current_v1_mount_fixture_v1(
+            &physical,
+            &encode_saved(&saved).unwrap(),
+            &session_id,
+            kitsu_core::session::RevisionId::new("rev-startup-canonical").unwrap(),
+            "2026-08-20T12:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(physical);
+        let head_path = physical::PhysicalLayoutV1::head_pointer(&dir, &session_id);
+        let head_before = std::fs::read(&head_path).unwrap();
+
+        let error = ActiveSessionStore::resume_bound_current_v1(dir.clone(), session_id.as_str())
+            .unwrap_err();
+        assert!(error.contains("canonical operation writer"));
+        assert_eq!(std::fs::read(&head_path).unwrap(), head_before);
+        assert!(!dir.join(format!("{}.json", session_id.as_str())).exists());
+        let competing = physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
+            .unwrap()
+            .unwrap();
+        drop(competing.acquire_writer_fence(&session_id).unwrap());
+        drop(SessionLease::acquire(&directory, session_id.as_str()).unwrap());
+    }
+
+    #[test]
+    fn in_process_bound_resume_stages_target_and_swaps_owners_exactly_once() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let first = SessionStore::create(dir.clone()).unwrap();
+        first
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("active session")],
+            )
+            .unwrap();
+        let first_id = first.id().to_string();
+        drop(first);
+        let second = SessionStore::create(dir.clone()).unwrap();
+        second
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-b",
+                None,
+                &[ChatMessage::user("target session")],
+            )
+            .unwrap();
+        let second_id = second.id().to_string();
+        drop(second);
+
+        let admitted = ActiveSessionStore::resume_bound_current_v1(dir.clone(), &first_id).unwrap();
+        let (mut active, _) = admitted.into_parts();
+        assert_eq!(active.id(), first_id);
+        let directory = PrivateDirectory::open(&dir, "in-process swap fixture").unwrap();
+        assert!(SessionLease::acquire(&directory, &first_id).is_err());
+        let error = ActiveSessionStore::resume_other_bound_current_v1(
+            dir.clone(),
+            &first_id,
+            Some(&first_id),
+        )
+        .unwrap_err();
+        assert!(error.contains("already active"));
+        assert!(SessionLease::acquire(&directory, &first_id).is_err());
+
+        let staged =
+            ActiveSessionStore::resume_other_bound_current_v1(dir.clone(), "last", Some(&first_id))
+                .unwrap();
+        assert_eq!(staged.saved().id, second_id);
+        assert!(SessionLease::acquire(&directory, &first_id).is_err());
+        assert!(SessionLease::acquire(&directory, &second_id).is_err());
+        drop(staged);
+        drop(SessionLease::acquire(&directory, &second_id).unwrap());
+        assert!(SessionLease::acquire(&directory, &first_id).is_err());
+
+        let staged = ActiveSessionStore::resume_other_bound_current_v1(
+            dir.clone(),
+            &second_id,
+            Some(&first_id),
+        )
+        .unwrap();
+        let (target, saved) = staged.into_parts();
+        active = target;
+        assert_eq!(active.id(), second_id);
+        assert_eq!(saved.id, second_id);
+        assert_eq!(saved.messages, [ChatMessage::user("target session")]);
+        drop(SessionLease::acquire(&directory, &first_id).unwrap());
+        assert!(SessionLease::acquire(&directory, &second_id).is_err());
+        drop(active);
+        drop(SessionLease::acquire(&directory, &second_id).unwrap());
     }
 }

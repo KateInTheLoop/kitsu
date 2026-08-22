@@ -27,6 +27,8 @@ use kitsu_core::{
     bound_inline_output, run_agent_turn, AgentConfig, AgentError, AgentEventLog, AgentRuntimeEvent,
     ArtifactStoragePolicy, SpawnBudget,
 };
+#[cfg(test)]
+use kitsu_providers::ProviderRouteContractError;
 use kitsu_providers::{
     ChatMessage, Provider, ProviderAttemptCategory, ProviderAttemptOutcome, ProviderError,
     ToolDescriptor,
@@ -81,6 +83,51 @@ pub const DEFAULT_MAX_BACKGROUND_RECORDS: usize = 128;
 /// against a stale window.
 pub type LiveModelWindow = Arc<Mutex<(String, Option<u64>)>>;
 
+/// Resolve one immutable provider binding after a subagent's effective model
+/// (including an explicit profile override) is known. A binder is snapshotted
+/// once per subagent run, so replacement cannot mix generations across its
+/// internal rounds.
+type ProviderBindFn<P> = dyn Fn(&str) -> Result<Arc<P>, ProviderError> + Send + Sync;
+
+pub struct ProviderBinder<P> {
+    bind: Arc<ProviderBindFn<P>>,
+}
+
+impl<P> Clone for ProviderBinder<P> {
+    fn clone(&self) -> Self {
+        Self {
+            bind: self.bind.clone(),
+        }
+    }
+}
+
+impl<P: 'static> ProviderBinder<P> {
+    pub fn new<F>(bind: F) -> Self
+    where
+        F: Fn(&str) -> Result<Arc<P>, ProviderError> + Send + Sync + 'static,
+    {
+        Self {
+            bind: Arc::new(bind),
+        }
+    }
+
+    #[cfg(test)]
+    fn fixed(provider: Arc<P>) -> Self
+    where
+        P: Send + Sync,
+    {
+        Self::new(move |_| Ok(provider.clone()))
+    }
+
+    fn resolve(&self, model: &str) -> Result<Arc<P>, ToolError> {
+        (self.bind)(model).map_err(|_| {
+            ToolError::ExecError(
+                "provider route could not be bound for this subagent model".to_string(),
+            )
+        })
+    }
+}
+
 /// System prompt seeding a subagent's isolated context.
 const SUBAGENT_SYSTEM: &str = "You are a kitsu subagent handling ONE delegated task in a fresh, \
 isolated context (you cannot see the parent conversation). Use your tools to complete it, then \
@@ -114,6 +161,11 @@ struct AgentRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentTelemetry {
     pub model: String,
+    /// First immutable provider route generation observed for this child run.
+    pub route_generation: Option<u64>,
+    /// True if attempt evidence ever claimed a second generation. A correctly
+    /// bound child keeps this false; retaining the bit avoids hiding drift.
+    pub route_generation_mismatch: bool,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
@@ -140,6 +192,8 @@ pub enum AgentFailureClass {
     ProviderHttp,
     ProviderToolsUnsupported,
     ProviderAuthConfiguration,
+    ProviderRouteConfiguration,
+    Interrupted,
     AgentLoop,
     ContextOverflow,
     ContextWindowUnknown,
@@ -158,6 +212,8 @@ impl fmt::Display for AgentFailureClass {
             Self::ProviderHttp => "provider_http",
             Self::ProviderToolsUnsupported => "provider_tools_unsupported",
             Self::ProviderAuthConfiguration => "provider_auth_configuration",
+            Self::ProviderRouteConfiguration => "provider_route_configuration",
+            Self::Interrupted => "interrupted",
             Self::AgentLoop => "agent_loop",
             Self::ContextOverflow => "context_overflow",
             Self::ContextWindowUnknown => "context_window_unknown",
@@ -189,6 +245,17 @@ impl AgentTelemetry {
             self.recent_activity.remove(0);
         }
         self.recent_activity.push(activity);
+    }
+
+    fn observe_route_generation(&mut self, generation: Option<u64>) {
+        let Some(generation) = generation else {
+            return;
+        };
+        match self.route_generation {
+            None => self.route_generation = Some(generation),
+            Some(existing) if existing != generation => self.route_generation_mismatch = true,
+            Some(_) => {}
+        }
     }
 }
 
@@ -841,17 +908,28 @@ impl AgentRegistry {
         self.cancel_matching(|_| true, reason).await
     }
 
-    /// Abort detached agents created by a parent turn that is being rolled
-    /// back. Agents that predate the turn are intentionally left alone.
+    /// Compatible ID-only projection retained for focused registry tests.
+    #[cfg(test)]
     pub async fn cancel_started_after(&self, watermark: u64) -> Vec<u64> {
+        self.cancel_started_after_with_status(watermark)
+            .await
+            .into_iter()
+            .map(|status| status.id)
+            .collect()
+    }
+
+    /// Status-preserving rollback cancellation for terminal lifecycle owners.
+    /// This retains malformed/unattached `joined: false` truth instead of
+    /// silently upgrading it to successful cleanup.
+    pub async fn cancel_started_after_with_status(
+        &self,
+        watermark: u64,
+    ) -> Vec<AgentTerminalStatus> {
         self.cancel_matching(
             |id| id > watermark,
             "cancelled because the parent turn was rolled back",
         )
         .await
-        .into_iter()
-        .map(|status| status.id)
-        .collect()
     }
 
     async fn cancel_matching<F>(&self, mut predicate: F, reason: &str) -> Vec<AgentTerminalStatus>
@@ -1192,10 +1270,12 @@ fn classify_agent_error(error: &AgentError) -> AgentFailureClass {
             ProviderError::Http { .. } => AgentFailureClass::ProviderHttp,
             ProviderError::ToolsNotSupported => AgentFailureClass::ProviderToolsUnsupported,
             ProviderError::Auth(_) => AgentFailureClass::ProviderAuthConfiguration,
+            ProviderError::RouteContract(_) => AgentFailureClass::ProviderRouteConfiguration,
         },
         AgentError::ToolCallDuringToolFreeFinalization => {
             AgentFailureClass::ProviderInvalidResponse
         }
+        AgentError::Interrupted(_) => AgentFailureClass::Interrupted,
         AgentError::Loop(_) => AgentFailureClass::AgentLoop,
         AgentError::ContextOverflow { .. } => AgentFailureClass::ContextOverflow,
         AgentError::ContextWindowUnknown => AgentFailureClass::ContextWindowUnknown,
@@ -1227,11 +1307,15 @@ fn safe_subagent_error(error: &AgentError) -> String {
                 "provider does not support required tool calls".to_string()
             }
             ProviderError::Auth(_) => "provider credentials are not configured".to_string(),
+            ProviderError::RouteContract(_) => {
+                "provider route changed or lacks a required capability".to_string()
+            }
         },
         AgentError::ToolCallDuringToolFreeFinalization => {
             "model returned a tool call during tool-free structured finalization; no tool was executed"
                 .to_string()
         }
+        AgentError::Interrupted(_) => "run interrupted before completion".to_string(),
         AgentError::Loop(_) => "agent loop failed".to_string(),
         AgentError::ContextOverflow {
             required,
@@ -1341,16 +1425,23 @@ fn record_telemetry_event(telemetry: &mut AgentTelemetry, event: AgentRuntimeEve
             if targets.len() == 1 { "" } else { "s" }
         )),
         AgentRuntimeEvent::ProviderAttempt {
+            route_generation,
             attempt,
             max_attempts,
             category,
             outcome,
             ..
-        } => telemetry.record_activity(format!(
-            "provider attempt {attempt}/{max_attempts}: {}, {}",
-            provider_category_label(category),
-            provider_outcome_label(outcome)
-        )),
+        } => {
+            telemetry.observe_route_generation(route_generation);
+            let route = route_generation
+                .map(|generation| format!(" on route generation {generation}"))
+                .unwrap_or_default();
+            telemetry.record_activity(format!(
+                "provider attempt {attempt}/{max_attempts}{route}: {}, {}",
+                provider_category_label(category),
+                provider_outcome_label(outcome)
+            ));
+        }
         AgentRuntimeEvent::Usage {
             prompt_tokens,
             completion_tokens,
@@ -1525,8 +1616,27 @@ fn task_preview(task: &str) -> String {
 /// non-streaming agent config *template*; its `model` and `context_window` are
 /// overwritten at call time from `live` so subagents track `/model`. `extra_system`
 /// seeds inherited context (e.g. a skill index) into the subagent's system prompt.
+#[cfg(test)]
 pub fn spawn_agent_tool<P: Provider + 'static>(
     provider: Arc<P>,
+    sub_tools: Arc<Registry>,
+    sub_cfg: AgentConfig,
+    live: LiveModelWindow,
+    extra_system: String,
+    budget: Arc<SpawnBudget>,
+) -> (ToolDescriptor, HandlerFn) {
+    spawn_agent_tool_with_binder(
+        ProviderBinder::fixed(provider),
+        sub_tools,
+        sub_cfg,
+        live,
+        extra_system,
+        budget,
+    )
+}
+
+pub fn spawn_agent_tool_with_binder<P: Provider + 'static>(
+    provider: ProviderBinder<P>,
     sub_tools: Arc<Registry>,
     sub_cfg: AgentConfig,
     live: LiveModelWindow,
@@ -1562,6 +1672,7 @@ pub fn spawn_agent_tool<P: Provider + 'static>(
                 return Err(ToolError::ExecError(spawn_cap_error(&budget)));
             }
             let cfg = resolve_cfg(&sub_cfg, &live);
+            let provider = provider.resolve(&cfg.model)?;
             // Fresh state each call; the isolated loop runs to completion and only
             // its final answer is returned (child rounds never enter the parent).
             run_subagent(&provider, &sub_tools, &cfg, &extra_system, a.task)
@@ -1577,8 +1688,27 @@ pub fn spawn_agent_tool<P: Provider + 'static>(
 /// context, so they run in parallel safely; concurrency is capped at
 /// [`MAX_PARALLEL`]. The subagent registry must NOT contain `spawn_agent` /
 /// `spawn_agents` (depth-1). One failing subagent does not fail the others.
+#[cfg(test)]
 pub fn spawn_agents_tool<P: Provider + 'static>(
     provider: Arc<P>,
+    sub_tools: Arc<Registry>,
+    sub_cfg: AgentConfig,
+    live: LiveModelWindow,
+    extra_system: String,
+    budget: Arc<SpawnBudget>,
+) -> (ToolDescriptor, HandlerFn) {
+    spawn_agents_tool_with_binder(
+        ProviderBinder::fixed(provider),
+        sub_tools,
+        sub_cfg,
+        live,
+        extra_system,
+        budget,
+    )
+}
+
+pub fn spawn_agents_tool_with_binder<P: Provider + 'static>(
+    provider: ProviderBinder<P>,
     sub_tools: Arc<Registry>,
     sub_cfg: AgentConfig,
     live: LiveModelWindow,
@@ -1638,6 +1768,7 @@ pub fn spawn_agents_tool<P: Provider + 'static>(
             let tasks: Vec<String> = a.tasks.into_iter().take(admitted).collect();
             // Same model/window snapshot for the whole batch.
             let cfg = resolve_cfg(&sub_cfg, &live);
+            let provider = provider.resolve(&cfg.model)?;
             // Run each task in its own subagent, at most MAX_PARALLEL at a time.
             let stream = futures::stream::iter(tasks.into_iter().enumerate().map(|(i, task)| {
                 let provider = provider.clone();
@@ -1699,9 +1830,33 @@ impl BackgroundProfileRuntime {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_agent_bg_tool<P: Provider + 'static>(
     provider: Arc<P>,
+    sub_tools: Arc<Registry>,
+    sub_cfg: AgentConfig,
+    live: LiveModelWindow,
+    extra_system: String,
+    registry: Arc<AgentRegistry>,
+    profile_runtime: BackgroundProfileRuntime,
+    budget: Arc<SpawnBudget>,
+) -> (ToolDescriptor, HandlerFn) {
+    spawn_agent_bg_tool_with_binder(
+        ProviderBinder::fixed(provider),
+        sub_tools,
+        sub_cfg,
+        live,
+        extra_system,
+        registry,
+        profile_runtime,
+        budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_agent_bg_tool_with_binder<P: Provider + 'static>(
+    provider: ProviderBinder<P>,
     sub_tools: Arc<Registry>,
     sub_cfg: AgentConfig,
     live: LiveModelWindow,
@@ -1777,6 +1932,7 @@ pub fn spawn_agent_bg_tool<P: Provider + 'static>(
                 }
                 debug_assert!(profile.tool_policy.accepts_registry(&effective_tools));
             }
+            let provider = provider.resolve(&cfg.model)?;
             let model = cfg.model.clone();
             let preview = task_preview(&a.task);
             let profile_name = selected_profile
@@ -1966,6 +2122,27 @@ mod tests {
                 script.into_iter().map(Ok::<_, ProviderError>),
             )))
         }
+        async fn chat_stream_with_telemetry(
+            &self,
+            req: ChatRequest,
+            telemetry: Option<kitsu_providers::ProviderTelemetrySink>,
+        ) -> Result<ChatStream, ProviderError> {
+            let stream = self.chat_stream(req).await?;
+            if let Some(telemetry) = telemetry {
+                let _ = telemetry.record(kitsu_providers::ProviderAttemptEvent {
+                    attempt: 1,
+                    max_attempts: 1,
+                    category: kitsu_providers::ProviderAttemptCategory::Success,
+                    status: Some(200),
+                    outcome: kitsu_providers::ProviderAttemptOutcome::BodyCompleted,
+                    terminal: true,
+                    retry_delay_ms: None,
+                    retry_after_used: false,
+                    remaining_deadline_ms: 1_000,
+                });
+            }
+            Ok(stream)
+        }
         async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
             Ok(None)
         }
@@ -2036,9 +2213,16 @@ mod tests {
             ]]),
             last_model: Mutex::new(None),
         });
+        let bound_models = Arc::new(Mutex::new(Vec::<String>::new()));
+        let binder_provider = provider.clone();
+        let binder_models = bound_models.clone();
+        let binder = ProviderBinder::new(move |model| {
+            binder_models.lock().unwrap().push(model.to_string());
+            Ok(binder_provider.clone())
+        });
         let live: LiveModelWindow = Arc::new(Mutex::new(("model-A".to_string(), Some(128_000))));
-        let (_d, handler) = spawn_agent_tool(
-            provider.clone(),
+        let (_d, handler) = spawn_agent_tool_with_binder(
+            binder,
             Arc::new(Registry::new()),
             sub_cfg(),
             live.clone(),
@@ -2053,6 +2237,76 @@ mod tests {
             Some("model-B"),
             "subagent used the live model, not the frozen initial one"
         );
+        assert_eq!(
+            *bound_models.lock().unwrap(),
+            ["model-B"],
+            "one immutable provider binding is resolved per subagent run"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_report_retains_one_immutable_route_generation() {
+        use kitsu_providers::{
+            ProviderAuthSource, ProviderCatalogPolicy, ProviderProfileId, ProviderRouteCurrent,
+            ProviderRouteDeclaration, ProviderRoutePolicy, ProviderRouteSnapshot,
+        };
+        use std::time::Duration;
+
+        let runtime = Arc::new(MockProvider {
+            rounds: Mutex::new(vec![vec![
+                ChatDelta::Text("route observed".to_string()),
+                ChatDelta::Done(FinishReason::Stop),
+            ]]),
+            last_model: Mutex::new(None),
+        });
+        let declaration = ProviderRouteDeclaration::compatible_chat_v1(
+            ProviderProfileId::derive_v1(b"subagent-route-test", b"primary").unwrap(),
+            false,
+        );
+        let policy = ProviderRoutePolicy::new(
+            0,
+            0,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+            ProviderCatalogPolicy::Unavailable,
+        )
+        .unwrap();
+        let snapshot = ProviderRouteSnapshot::initial(
+            declaration,
+            "model-A",
+            ProviderAuthSource::None,
+            policy,
+            runtime.clone(),
+            runtime,
+        )
+        .unwrap();
+        let provider = Arc::new(
+            ProviderRouteCurrent::new(snapshot)
+                .bind_model("model-B")
+                .unwrap(),
+        );
+        let report = run_subagent_report(
+            &provider,
+            &Arc::new(Registry::new()),
+            &AgentConfig {
+                model: "model-B".to_string(),
+                stream: false,
+                ..Default::default()
+            },
+            "",
+            "inspect route".to_string(),
+        )
+        .await;
+
+        assert_eq!(report.result.unwrap(), "route observed");
+        assert_eq!(report.telemetry.route_generation, Some(1));
+        assert!(!report.telemetry.route_generation_mismatch);
+        assert!(report
+            .telemetry
+            .recent_activity
+            .iter()
+            .any(|activity| { activity.contains("route generation 1") }));
     }
 
     #[tokio::test]
@@ -2299,6 +2553,37 @@ mod tests {
     }
 
     #[test]
+    fn event_summary_preserves_first_route_generation_and_exposes_drift() {
+        let attempt = |route_generation| AgentRuntimeEvent::ProviderAttempt {
+            round: 1,
+            purpose: kitsu_core::ProviderRequestPurpose::Inference,
+            route_generation: Some(route_generation),
+            attempt: 1,
+            max_attempts: 1,
+            category: ProviderAttemptCategory::Success,
+            status: Some(200),
+            outcome: ProviderAttemptOutcome::BodyCompleted,
+            terminal: true,
+            retry_delay_ms: None,
+            retry_after_used: false,
+            deadline_scope: kitsu_core::ProviderDeadlineScope::ProviderRequest,
+            remaining_deadline_ms: 1_000,
+            turn_remaining_ms: None,
+        };
+        let telemetry = summarize_events(
+            "safe-model".to_string(),
+            vec![attempt(4), attempt(4), attempt(5)],
+            None,
+        );
+
+        assert_eq!(telemetry.route_generation, Some(4));
+        assert!(telemetry.route_generation_mismatch);
+        let activity = telemetry.recent_activity.join("\n");
+        assert!(activity.contains("route generation 4"));
+        assert!(activity.contains("route generation 5"));
+    }
+
+    #[test]
     fn provider_failure_classification_never_retains_the_response_body() {
         let error = AgentError::Provider(ProviderError::Http {
             status: 429,
@@ -2324,6 +2609,9 @@ mod tests {
                 status: 503,
                 body: unsafe_detail.to_string(),
             }),
+            AgentError::Provider(ProviderError::RouteContract(
+                ProviderRouteContractError::CurrentRouteUnavailable,
+            )),
             AgentError::Loop(unsafe_detail.to_string()),
         ];
 
@@ -2582,6 +2870,39 @@ mod tests {
             vec![second, third]
         );
         assert_eq!(registry.progress_snapshot().total, 0);
+    }
+
+    #[tokio::test]
+    async fn unattached_fault_fixture_reports_typed_unjoined_residue() {
+        let registry = AgentRegistry::new();
+        // Production admission uses spawn_background_thread and installs its
+        // handle atomically. The test-only split start is retained precisely to
+        // inject the malformed state that a cleanup contract must not call
+        // joined.
+        let id = registry.start("unattached fault".to_string()).unwrap();
+        let cancelled = registry.cancel(id).await;
+        let AgentCancelOutcome::Cancelled(cancelled) = cancelled else {
+            panic!("unattached running record should cancel: {cancelled:?}");
+        };
+        assert!(!cancelled.joined);
+        assert!(matches!(cancelled.status, AgentStatus::Cancelled(_)));
+        assert_eq!(registry.snapshot().running, 0);
+        assert_eq!(registry.snapshot().terminal, 1);
+    }
+
+    #[tokio::test]
+    async fn rollback_cancellation_status_preserves_unjoined_fault_truth() {
+        let registry = AgentRegistry::new();
+        let id = registry
+            .start("unattached rollback fault".to_string())
+            .unwrap();
+
+        let cancelled = registry.cancel_started_after_with_status(0).await;
+
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, id);
+        assert!(!cancelled[0].joined);
+        assert!(matches!(cancelled[0].status, AgentStatus::Cancelled(_)));
     }
 
     #[tokio::test]

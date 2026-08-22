@@ -1,0 +1,2970 @@
+//! Closed canonical logical payload and current-v1 migration input.
+
+use std::collections::{HashMap, HashSet};
+
+use chrono::DateTime;
+use kitsu_core::session::{
+    CanonicalHistory, CanonicalOperation, CanonicalTerminal, CorruptSessionReason,
+    ExpectedRevision, LogicalHead, RevisionId, SessionAssistantDisposition, SessionHistoryError,
+    SessionId, SessionOutcomeClass, StoreId, TurnId,
+};
+use kitsu_core::TerminalOutcome;
+use serde::{Deserialize, Serialize};
+
+pub(super) const LOGICAL_SCHEMA_REVISION: u32 = 2;
+const ARTIFACT_SCHEMA_V1: u32 = 1;
+const PROJECTION_SCHEMA_V1: u32 = 1;
+const RECOVERY_SCHEMA_V1: u32 = 1;
+const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MESSAGES: usize = 65_536;
+const MAX_MESSAGES_PER_OPERATION: usize = 4_096;
+const MAX_TOOL_CALLS_PER_MESSAGE: usize = 64;
+const MAX_CONTENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ARGUMENT_BYTES: usize = 1024 * 1024;
+const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ARTIFACTS: usize = 16_384;
+const MAX_EFFECTS_PER_OPERATION: usize = 4_096;
+const MAX_REFERENCES_PER_FACT: usize = 4_096;
+const MAX_LOSS_ENTRIES: usize = 4_096;
+const MAX_RECOVERY_ENTRIES: usize = 4_096;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CanonicalSessionRevisionV1 {
+    logical_schema: u32,
+    store_id: StoreId,
+    session_id: SessionId,
+    revision_id: RevisionId,
+    parent_revision: ExpectedRevision,
+    created_at: String,
+    committed_at: String,
+    metadata: CanonicalMetadataV1,
+    lineage: CanonicalLineageV1,
+    legacy_baseline: Option<LegacyBaselineV1>,
+    operations: Vec<CanonicalOperationV1>,
+    selected_head: LogicalHead,
+    artifact_manifest: Vec<ImmutableArtifactRefV1>,
+    compaction_binding: Option<ContextProjectionRefV1>,
+    recovery_log: Vec<CanonicalRecoveryBindingV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CanonicalRecoverySkipV1 {
+    revision: RevisionId,
+    reason: CorruptSessionReason,
+}
+
+impl CanonicalRecoverySkipV1 {
+    pub(super) fn new(revision: RevisionId, reason: CorruptSessionReason) -> Self {
+        Self { revision, reason }
+    }
+
+    pub(super) fn revision(&self) -> &RevisionId {
+        &self.revision
+    }
+
+    pub(super) fn reason(&self) -> CorruptSessionReason {
+        self.reason
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalRecoveryBindingV1 {
+    recovery_schema: u32,
+    recovery_revision: RevisionId,
+    committed_at: String,
+    selected_revision: RevisionId,
+    source_revision: RevisionId,
+    source_head: LogicalHead,
+    skipped: Vec<CanonicalRecoverySkipV1>,
+}
+
+impl CanonicalSessionRevisionV1 {
+    pub(super) fn logical_schema(&self) -> u32 {
+        self.logical_schema
+    }
+
+    pub(super) fn store_id(&self) -> &StoreId {
+        &self.store_id
+    }
+
+    pub(super) fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub(super) fn revision_id(&self) -> &RevisionId {
+        &self.revision_id
+    }
+
+    pub(super) fn parent_revision(&self) -> &ExpectedRevision {
+        &self.parent_revision
+    }
+
+    pub(super) fn selected_head(&self) -> &LogicalHead {
+        &self.selected_head
+    }
+
+    pub(super) fn has_artifacts(&self) -> bool {
+        !self.artifact_manifest.is_empty()
+    }
+
+    pub(super) fn artifact_count(&self) -> usize {
+        self.artifact_manifest.len()
+    }
+
+    pub(super) fn artifacts(&self) -> &[ImmutableArtifactRefV1] {
+        &self.artifact_manifest
+    }
+}
+
+/// A derived current-v1-shaped resume value bound to the exact canonical facts
+/// that produced it. The binding is retained for activation-time revalidation;
+/// the `SavedSession` value alone is never canonical HEAD evidence.
+#[derive(Clone, Debug)]
+pub(super) struct CanonicalResumeProjectionV1 {
+    source_revision: RevisionId,
+    source_head: LogicalHead,
+    saved: super::SavedSession,
+    legacy_losses: Vec<LegacyBaselineLossV1>,
+    omitted_operations: Vec<TurnId>,
+}
+
+impl CanonicalResumeProjectionV1 {
+    pub(super) fn source_revision(&self) -> &RevisionId {
+        &self.source_revision
+    }
+
+    pub(super) fn source_head(&self) -> &LogicalHead {
+        &self.source_head
+    }
+
+    pub(super) fn saved(&self) -> &super::SavedSession {
+        &self.saved
+    }
+
+    pub(super) fn legacy_loss_count(&self) -> usize {
+        self.legacy_losses.len()
+    }
+
+    pub(super) fn omitted_operations(&self) -> &[TurnId] {
+        &self.omitted_operations
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CanonicalResumeProjectionErrorV1 {
+    InvalidCanonical(String),
+    ArtifactClosureRequired { artifact_count: usize },
+    SelectedAncestryUnavailable { turn: TurnId },
+}
+
+impl std::fmt::Display for CanonicalResumeProjectionErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidCanonical(reason) => {
+                write!(formatter, "canonical resume source is invalid: {reason}")
+            }
+            Self::ArtifactClosureRequired { artifact_count } => write!(
+                formatter,
+                "canonical resume projection requires an artifact-aware DTO for {artifact_count} immutable artifacts"
+            ),
+            Self::SelectedAncestryUnavailable { turn } => write!(
+                formatter,
+                "canonical resume projection cannot resolve selected ancestor '{turn}'"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalResumeProjectionErrorV1 {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalMetadataV1 {
+    name: Option<String>,
+    launch_directory: String,
+    requested_gateway: String,
+    requested_model: String,
+    project_context_source: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum CanonicalLineageV1 {
+    Root,
+    Fork {
+        source_store: StoreId,
+        source_session: SessionId,
+        source_revision: RevisionId,
+        source_head: LogicalHead,
+        branch_turn: LogicalHead,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyBaselineV1 {
+    legacy_schema: u32,
+    source_session_id: SessionId,
+    source_snapshot_sha256: String,
+    source_updated_at: String,
+    messages: Vec<CanonicalMessageV1>,
+    loss_manifest: Vec<LegacyBaselineLossV1>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum LegacyBaselineLossV1 {
+    #[serde(rename = "terminal_outcomes_unavailable")]
+    TerminalOutcomes,
+    #[serde(rename = "logical_heads_unavailable")]
+    LogicalHeads,
+    #[serde(rename = "turn_lineage_unavailable")]
+    TurnLineage,
+}
+
+const LEGACY_BASELINE_LOSSES: [LegacyBaselineLossV1; 3] = [
+    LegacyBaselineLossV1::TerminalOutcomes,
+    LegacyBaselineLossV1::LogicalHeads,
+    LegacyBaselineLossV1::TurnLineage,
+];
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalOperationV1 {
+    operation: CanonicalOperation,
+    messages: Vec<CanonicalMessageV1>,
+    retained_effects: Vec<RetainedEffectRefV1>,
+}
+
+pub(super) struct CanonicalOperationInputV1 {
+    turn_id: TurnId,
+    terminal: TerminalOutcome,
+    messages: Vec<CanonicalMessageV1>,
+    retained_effects: Vec<RetainedEffectRefV1>,
+    new_artifacts: Vec<ImmutableArtifactRefV1>,
+}
+
+pub(super) struct CanonicalToolRoundV1 {
+    tool_name: String,
+    args: String,
+    call_id: String,
+    result_content: String,
+    effect_id: String,
+    artifact: ImmutableArtifactRefV1,
+}
+
+impl CanonicalToolRoundV1 {
+    pub(super) fn new(
+        tool_name: String,
+        args: String,
+        call_id: String,
+        result_content: String,
+        effect_id: String,
+        artifact: ImmutableArtifactRefV1,
+    ) -> Self {
+        Self {
+            tool_name,
+            args,
+            call_id,
+            result_content,
+            effect_id,
+            artifact,
+        }
+    }
+}
+
+impl CanonicalOperationInputV1 {
+    pub(super) fn artifact_free_text(
+        turn_id: TurnId,
+        terminal: TerminalOutcome,
+        user_content: String,
+        assistant_content: Option<String>,
+    ) -> Self {
+        let mut messages = vec![CanonicalMessageV1::User {
+            content: user_content,
+        }];
+        if let Some(content) = assistant_content {
+            messages.push(CanonicalMessageV1::Assistant {
+                content,
+                tool_calls: Vec::new(),
+            });
+        }
+        Self {
+            turn_id,
+            terminal,
+            messages,
+            retained_effects: Vec::new(),
+            new_artifacts: Vec::new(),
+        }
+    }
+
+    pub(super) fn artifact_tool_round(
+        turn_id: TurnId,
+        terminal: TerminalOutcome,
+        user_content: String,
+        final_assistant_content: String,
+        round: CanonicalToolRoundV1,
+    ) -> Self {
+        let artifact_id = round.artifact.artifact_id.clone();
+        let call_id = round.call_id.clone();
+        Self {
+            turn_id,
+            terminal,
+            messages: vec![
+                CanonicalMessageV1::User {
+                    content: user_content,
+                },
+                CanonicalMessageV1::Assistant {
+                    content: String::new(),
+                    tool_calls: vec![CanonicalToolCallV1 {
+                        tool_name: round.tool_name,
+                        args: round.args,
+                        call_id: call_id.clone(),
+                    }],
+                },
+                CanonicalMessageV1::Tool {
+                    call_id,
+                    content: round.result_content,
+                    artifact_ids: vec![artifact_id.clone()],
+                },
+                CanonicalMessageV1::Assistant {
+                    content: final_assistant_content,
+                    tool_calls: Vec::new(),
+                },
+            ],
+            retained_effects: vec![RetainedEffectRefV1 {
+                effect_id: round.effect_id,
+                artifact_ids: vec![artifact_id],
+            }],
+            new_artifacts: vec![round.artifact],
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
+enum CanonicalMessageV1 {
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    Assistant {
+        content: String,
+        tool_calls: Vec<CanonicalToolCallV1>,
+    },
+    Tool {
+        call_id: String,
+        content: String,
+        artifact_ids: Vec<String>,
+    },
+}
+
+impl CanonicalMessageV1 {
+    fn content(&self) -> &str {
+        match self {
+            Self::System { content }
+            | Self::User { content }
+            | Self::Assistant { content, .. }
+            | Self::Tool { content, .. } => content,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalToolCallV1 {
+    tool_name: String,
+    args: String,
+    call_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedEffectRefV1 {
+    effect_id: String,
+    artifact_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ImmutableArtifactRefV1 {
+    artifact_schema: u32,
+    artifact_id: String,
+    sha256: String,
+    bytes: u64,
+    media_type: Option<String>,
+}
+
+impl ImmutableArtifactRefV1 {
+    pub(super) fn new(
+        artifact_schema: u32,
+        artifact_id: String,
+        sha256: String,
+        bytes: u64,
+        media_type: Option<String>,
+    ) -> Result<Self, String> {
+        if artifact_schema != ARTIFACT_SCHEMA_V1 {
+            return Err(format!(
+                "unsupported artifact schema {artifact_schema}; expected {ARTIFACT_SCHEMA_V1}"
+            ));
+        }
+        validate_opaque_id(&artifact_id, "artifact id")?;
+        validate_sha256(&sha256, "artifact digest")?;
+        if let Some(media_type) = &media_type {
+            bounded_nonempty(media_type, 256, "artifact media type")?;
+        }
+        Ok(Self {
+            artifact_schema,
+            artifact_id,
+            sha256,
+            bytes,
+            media_type,
+        })
+    }
+
+    pub(super) fn artifact_schema(&self) -> u32 {
+        self.artifact_schema
+    }
+
+    pub(super) fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+
+    pub(super) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub(super) fn media_type(&self) -> Option<&str> {
+        self.media_type.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextProjectionRefV1 {
+    projection_schema: u32,
+    projection_id: String,
+    source_revision: RevisionId,
+    source_head: LogicalHead,
+    included_operations: Vec<TurnId>,
+    route_generation: String,
+    capability_generation: String,
+    model_generation: String,
+    estimator_generation: String,
+    budget_tokens: u64,
+    loss_manifest: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CurrentV1MigrationBlocker {
+    /// Current v1 never persisted semantic run terminals or assistant
+    /// disposition, so a migrator must receive those facts from a truthful
+    /// source rather than infer them from transcript tails or process exit.
+    MissingTerminalOutcomes,
+    /// Pointer-bearing transcript facts require a separately authenticated,
+    /// immutable artifact closure before any canonical candidate can be built.
+    ArtifactClosureRequired { message_indices: Vec<usize> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CurrentV1MigrationInput {
+    source_snapshot_sha256: String,
+    id: String,
+    created_at: String,
+    updated_at: String,
+    directory: String,
+    gateway: String,
+    model: String,
+    name: Option<String>,
+    project_context: Option<String>,
+    messages: Vec<CanonicalMessageV1>,
+    blockers: Vec<CurrentV1MigrationBlocker>,
+}
+
+impl CurrentV1MigrationInput {
+    fn source_snapshot_sha256(&self) -> &str {
+        &self.source_snapshot_sha256
+    }
+
+    fn messages(&self) -> &[CanonicalMessageV1] {
+        &self.messages
+    }
+
+    fn blockers(&self) -> &[CurrentV1MigrationBlocker] {
+        &self.blockers
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentV1Wire {
+    version: u32,
+    id: String,
+    created_at: String,
+    updated_at: String,
+    directory: String,
+    gateway: String,
+    model: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    project_context: Option<String>,
+    messages: Vec<CurrentV1MessageWire>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CurrentV1RoleWire {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentV1MessageWire {
+    role: CurrentV1RoleWire,
+    content: String,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<CurrentV1ToolCallWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentV1ToolCallWire {
+    tool_name: String,
+    args: String,
+    call_id: String,
+}
+
+fn decode_current_v1_migration_input(
+    bytes: &[u8],
+    expected_session_id: &str,
+) -> Result<CurrentV1MigrationInput, String> {
+    check_payload_size(bytes, "current-v1 snapshot")?;
+    if !super::valid_id(expected_session_id) {
+        return Err("expected current-v1 session id is unsafe".to_string());
+    }
+    let wire: CurrentV1Wire = serde_json::from_slice(bytes)
+        .map_err(|error| format!("cannot decode strict current-v1 snapshot: {error}"))?;
+    if wire.version != super::SESSION_VERSION {
+        return Err(format!(
+            "unsupported current-v1 logical version {}; expected {}",
+            wire.version,
+            super::SESSION_VERSION
+        ));
+    }
+    if wire.id != expected_session_id || !super::valid_id(&wire.id) {
+        return Err("current-v1 session id does not match its selected identity".to_string());
+    }
+    validate_timestamp(&wire.created_at, "current-v1 created_at")?;
+    validate_timestamp(&wire.updated_at, "current-v1 updated_at")?;
+    validate_timestamp_order(&wire.created_at, &wire.updated_at, "current-v1")?;
+    validate_resume_intent(
+        &wire.directory,
+        &wire.gateway,
+        &wire.model,
+        wire.name.as_deref(),
+        wire.project_context.as_deref(),
+    )?;
+
+    if wire.messages.len() > MAX_MESSAGES {
+        return Err(format!(
+            "current-v1 transcript has {} messages; maximum is {MAX_MESSAGES}",
+            wire.messages.len()
+        ));
+    }
+    let messages = wire
+        .messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| convert_current_message(index, message))
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_message_causality(&messages, true, true, false, "current-v1 transcript")?;
+
+    let pointer_indices = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| match message {
+            CanonicalMessageV1::Tool { content, .. } if contains_offload_pointer(content) => {
+                Some(index)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut blockers = vec![CurrentV1MigrationBlocker::MissingTerminalOutcomes];
+    if !pointer_indices.is_empty() {
+        blockers.push(CurrentV1MigrationBlocker::ArtifactClosureRequired {
+            message_indices: pointer_indices,
+        });
+    }
+
+    Ok(CurrentV1MigrationInput {
+        source_snapshot_sha256: crate::skills::content_sha256_hex(bytes),
+        id: wire.id,
+        created_at: wire.created_at,
+        updated_at: wire.updated_at,
+        directory: wire.directory,
+        gateway: wire.gateway,
+        model: wire.model,
+        name: wire.name,
+        project_context: wire.project_context,
+        messages,
+        blockers,
+    })
+}
+
+fn build_current_v1_legacy_baseline(
+    input: CurrentV1MigrationInput,
+    store_id: StoreId,
+    revision_id: RevisionId,
+    committed_at: String,
+) -> Result<CanonicalSessionRevisionV1, String> {
+    if input.blockers.iter().any(|blocker| {
+        matches!(
+            blocker,
+            CurrentV1MigrationBlocker::ArtifactClosureRequired { .. }
+        )
+    }) {
+        return Err(
+            "current-v1 legacy baseline requires explicit immutable artifact closure resolution"
+                .to_string(),
+        );
+    }
+    if input.blockers.as_slice() != [CurrentV1MigrationBlocker::MissingTerminalOutcomes] {
+        return Err("current-v1 migration input has an unsupported blocker set".to_string());
+    }
+    validate_timestamp(&committed_at, "legacy migration committed_at")?;
+    validate_timestamp_order(&input.updated_at, &committed_at, "legacy migration")?;
+    let session_id = SessionId::new(input.id.clone())
+        .map_err(|error| format!("current-v1 session identity is not canonical: {error}"))?;
+    let payload = CanonicalSessionRevisionV1 {
+        logical_schema: LOGICAL_SCHEMA_REVISION,
+        store_id,
+        session_id: session_id.clone(),
+        revision_id,
+        parent_revision: ExpectedRevision::Missing,
+        created_at: input.created_at,
+        committed_at,
+        metadata: CanonicalMetadataV1 {
+            name: input.name,
+            launch_directory: input.directory,
+            requested_gateway: input.gateway,
+            requested_model: input.model,
+            project_context_source: input.project_context,
+        },
+        lineage: CanonicalLineageV1::Root,
+        legacy_baseline: Some(LegacyBaselineV1 {
+            legacy_schema: super::SESSION_VERSION,
+            source_session_id: session_id,
+            source_snapshot_sha256: input.source_snapshot_sha256,
+            source_updated_at: input.updated_at,
+            messages: input.messages,
+            loss_manifest: LEGACY_BASELINE_LOSSES.to_vec(),
+        }),
+        operations: Vec::new(),
+        selected_head: LogicalHead::Genesis,
+        artifact_manifest: Vec::new(),
+        compaction_binding: None,
+        recovery_log: Vec::new(),
+    };
+    validate_canonical_payload(&payload)?;
+    Ok(payload)
+}
+
+pub(super) fn prepare_current_v1_legacy_baseline(
+    bytes: &[u8],
+    expected_session_id: &str,
+    store_id: StoreId,
+    revision_id: RevisionId,
+    committed_at: String,
+) -> Result<CanonicalSessionRevisionV1, String> {
+    let input = decode_current_v1_migration_input(bytes, expected_session_id)?;
+    build_current_v1_legacy_baseline(input, store_id, revision_id, committed_at)
+}
+
+pub(super) fn append_complete_operation(
+    base: &CanonicalSessionRevisionV1,
+    revision_id: RevisionId,
+    committed_at: String,
+    input: CanonicalOperationInputV1,
+) -> Result<CanonicalSessionRevisionV1, String> {
+    validate_canonical_payload(base)?;
+    if revision_id == base.revision_id {
+        return Err("canonical successor revision must differ from its parent".to_string());
+    }
+    validate_timestamp(&committed_at, "canonical successor committed_at")?;
+    validate_timestamp_order(&base.committed_at, &committed_at, "canonical successor")?;
+
+    let CanonicalOperationInputV1 {
+        turn_id,
+        terminal,
+        messages,
+        retained_effects,
+        new_artifacts,
+    } = input;
+    let terminal = CanonicalTerminal::from_terminal(&terminal);
+    let before_head = base.selected_head.clone();
+    let after_head = match terminal.assistant() {
+        SessionAssistantDisposition::Committed | SessionAssistantDisposition::CommittedPartial => {
+            LogicalHead::Turn(turn_id.clone())
+        }
+        SessionAssistantDisposition::Discarded | SessionAssistantDisposition::Absent => {
+            before_head.clone()
+        }
+    };
+    let operation = CanonicalOperation::new(turn_id, terminal, before_head, after_head.clone())
+        .map_err(|error| format!("cannot assemble canonical operation: {error}"))?;
+
+    let mut next = base.clone();
+    next.revision_id = revision_id;
+    next.parent_revision = ExpectedRevision::Exact(base.revision_id.clone());
+    next.committed_at = committed_at;
+    next.operations.push(CanonicalOperationV1 {
+        operation,
+        messages,
+        retained_effects,
+    });
+    next.selected_head = after_head;
+    next.artifact_manifest.extend(new_artifacts);
+    // A projection is bound to the old revision and selected HEAD. It is never
+    // carried forward as if it summarized the successor operation.
+    next.compaction_binding = None;
+    validate_canonical_payload(&next)?;
+    Ok(next)
+}
+
+pub(super) fn assemble_recovery_revision(
+    source: &CanonicalSessionRevisionV1,
+    selected_revision: RevisionId,
+    recovery_revision: RevisionId,
+    committed_at: String,
+    skipped: Vec<CanonicalRecoverySkipV1>,
+) -> Result<CanonicalSessionRevisionV1, String> {
+    validate_canonical_payload(source)?;
+    validate_timestamp(&committed_at, "canonical recovery committed_at")?;
+    validate_timestamp_order(&source.committed_at, &committed_at, "canonical recovery")?;
+    if recovery_revision == source.revision_id
+        || recovery_revision == selected_revision
+        || selected_revision == source.revision_id
+    {
+        return Err("canonical recovery identities must be distinct".to_string());
+    }
+    validate_recovery_skips(
+        &skipped,
+        &selected_revision,
+        &source.revision_id,
+        &recovery_revision,
+    )?;
+
+    let mut next = source.clone();
+    next.logical_schema = LOGICAL_SCHEMA_REVISION;
+    next.revision_id = recovery_revision.clone();
+    next.parent_revision = ExpectedRevision::Exact(selected_revision.clone());
+    next.committed_at = committed_at.clone();
+    next.compaction_binding = None;
+    next.recovery_log.push(CanonicalRecoveryBindingV1 {
+        recovery_schema: RECOVERY_SCHEMA_V1,
+        recovery_revision,
+        committed_at,
+        selected_revision,
+        source_revision: source.revision_id.clone(),
+        source_head: source.selected_head.clone(),
+        skipped,
+    });
+    validate_canonical_payload(&next)?;
+    Ok(next)
+}
+
+pub(super) fn assemble_branch_at_committed_turn(
+    source: &CanonicalSessionRevisionV1,
+    destination_store: StoreId,
+    destination_session: SessionId,
+    destination_revision: RevisionId,
+    committed_at: String,
+    branch_turn: TurnId,
+) -> Result<CanonicalSessionRevisionV1, String> {
+    validate_canonical_payload(source)?;
+    validate_timestamp(&committed_at, "canonical branch committed_at")?;
+    validate_timestamp_order(&source.committed_at, &committed_at, "canonical branch")?;
+    if destination_session == source.session_id {
+        return Err("canonical branch destination session must be fresh".to_string());
+    }
+    if destination_revision == source.revision_id {
+        return Err("canonical branch destination revision must be fresh".to_string());
+    }
+
+    let branch_index = source
+        .operations
+        .iter()
+        .position(|operation| operation.operation.turn_id() == &branch_turn)
+        .ok_or_else(|| format!("canonical branch turn '{branch_turn}' does not exist"))?;
+    let boundary = &source.operations[branch_index].operation;
+    if !matches!(
+        boundary.terminal().assistant(),
+        SessionAssistantDisposition::Committed | SessionAssistantDisposition::CommittedPartial
+    ) || boundary.after_head() != &LogicalHead::Turn(branch_turn.clone())
+    {
+        return Err(format!(
+            "canonical branch turn '{branch_turn}' is not a committed operation boundary"
+        ));
+    }
+
+    let operations = source.operations[..=branch_index].to_vec();
+    let mut referenced_artifacts = HashSet::new();
+    for operation in &operations {
+        for message in &operation.messages {
+            if let CanonicalMessageV1::Tool { artifact_ids, .. } = message {
+                referenced_artifacts.extend(artifact_ids.iter().map(String::as_str));
+            }
+        }
+        for effect in &operation.retained_effects {
+            referenced_artifacts.extend(effect.artifact_ids.iter().map(String::as_str));
+        }
+    }
+    let artifact_manifest = source
+        .artifact_manifest
+        .iter()
+        .filter(|artifact| referenced_artifacts.contains(artifact.artifact_id.as_str()))
+        .cloned()
+        .collect();
+    let branch_head = LogicalHead::Turn(branch_turn);
+    let payload = CanonicalSessionRevisionV1 {
+        logical_schema: LOGICAL_SCHEMA_REVISION,
+        store_id: destination_store,
+        session_id: destination_session,
+        revision_id: destination_revision,
+        parent_revision: ExpectedRevision::Missing,
+        created_at: source.created_at.clone(),
+        committed_at,
+        metadata: source.metadata.clone(),
+        lineage: CanonicalLineageV1::Fork {
+            source_store: source.store_id.clone(),
+            source_session: source.session_id.clone(),
+            source_revision: source.revision_id.clone(),
+            source_head: source.selected_head.clone(),
+            branch_turn: branch_head.clone(),
+        },
+        legacy_baseline: source.legacy_baseline.clone(),
+        operations,
+        selected_head: branch_head,
+        artifact_manifest,
+        compaction_binding: None,
+        recovery_log: Vec::new(),
+    };
+    validate_canonical_payload(&payload)?;
+    Ok(payload)
+}
+
+fn convert_current_message(
+    index: usize,
+    message: CurrentV1MessageWire,
+) -> Result<CanonicalMessageV1, String> {
+    bounded_content(&message.content, index)?;
+    let calls = message
+        .tool_calls
+        .into_iter()
+        .map(|call| CanonicalToolCallV1 {
+            tool_name: call.tool_name,
+            args: call.args,
+            call_id: call.call_id,
+        })
+        .collect::<Vec<_>>();
+    match message.role {
+        CurrentV1RoleWire::System => {
+            reject_nonassistant_tool_fields(index, &message.tool_call_id, &calls)?;
+            Ok(CanonicalMessageV1::System {
+                content: message.content,
+            })
+        }
+        CurrentV1RoleWire::User => {
+            reject_nonassistant_tool_fields(index, &message.tool_call_id, &calls)?;
+            Ok(CanonicalMessageV1::User {
+                content: message.content,
+            })
+        }
+        CurrentV1RoleWire::Assistant => {
+            if message.tool_call_id.is_some() {
+                return Err(format!(
+                    "current-v1 message {index} assistant cannot carry tool_call_id"
+                ));
+            }
+            Ok(CanonicalMessageV1::Assistant {
+                content: message.content,
+                tool_calls: calls,
+            })
+        }
+        CurrentV1RoleWire::Tool => {
+            if !calls.is_empty() {
+                return Err(format!(
+                    "current-v1 message {index} tool result cannot introduce tool calls"
+                ));
+            }
+            let call_id = message.tool_call_id.ok_or_else(|| {
+                format!("current-v1 message {index} tool result is missing tool_call_id")
+            })?;
+            Ok(CanonicalMessageV1::Tool {
+                call_id,
+                content: message.content,
+                artifact_ids: Vec::new(),
+            })
+        }
+    }
+}
+
+fn reject_nonassistant_tool_fields(
+    index: usize,
+    tool_call_id: &Option<String>,
+    calls: &[CanonicalToolCallV1],
+) -> Result<(), String> {
+    if tool_call_id.is_some() || !calls.is_empty() {
+        Err(format!(
+            "current-v1 message {index} role cannot carry tool correlation fields"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn contains_offload_pointer(content: &str) -> bool {
+    content
+        .lines()
+        .any(|line| line.starts_with("[tool output ") && line.contains("full result saved to "))
+}
+
+#[derive(Debug)]
+pub(super) enum CanonicalPayloadDecodeErrorV1 {
+    Malformed(String),
+    UnsupportedLogicalSchema { observed: u32, supported: u32 },
+    InvalidHead(String),
+    Invalid(String),
+}
+
+impl std::fmt::Display for CanonicalPayloadDecodeErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(message) | Self::InvalidHead(message) | Self::Invalid(message) => {
+                formatter.write_str(message)
+            }
+            Self::UnsupportedLogicalSchema {
+                observed,
+                supported,
+            } => write!(
+                formatter,
+                "unsupported canonical logical schema {observed}; expected {supported}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalPayloadDecodeErrorV1 {}
+
+pub(super) fn decode_canonical_payload_classified(
+    bytes: &[u8],
+) -> Result<CanonicalSessionRevisionV1, CanonicalPayloadDecodeErrorV1> {
+    check_payload_size(bytes, "canonical payload")
+        .map_err(CanonicalPayloadDecodeErrorV1::Malformed)?;
+    let payload: CanonicalSessionRevisionV1 = serde_json::from_slice(bytes).map_err(|error| {
+        CanonicalPayloadDecodeErrorV1::Malformed(format!(
+            "cannot decode closed canonical payload: {error}"
+        ))
+    })?;
+    if payload.logical_schema == 0 {
+        return Err(CanonicalPayloadDecodeErrorV1::Malformed(
+            "canonical logical schema must be nonzero".to_string(),
+        ));
+    }
+    if payload.logical_schema != LOGICAL_SCHEMA_REVISION {
+        return Err(CanonicalPayloadDecodeErrorV1::UnsupportedLogicalSchema {
+            observed: payload.logical_schema,
+            supported: LOGICAL_SCHEMA_REVISION,
+        });
+    }
+    classify_selected_head(&payload)?;
+    validate_canonical_payload(&payload).map_err(CanonicalPayloadDecodeErrorV1::Invalid)?;
+    Ok(payload)
+}
+
+fn classify_selected_head(
+    payload: &CanonicalSessionRevisionV1,
+) -> Result<(), CanonicalPayloadDecodeErrorV1> {
+    let operations = payload
+        .operations
+        .iter()
+        .map(|operation| operation.operation.clone())
+        .collect();
+    match CanonicalHistory::new(operations, payload.selected_head.clone()) {
+        Err(error @ SessionHistoryError::SelectedHeadUnknown { .. }) => {
+            Err(CanonicalPayloadDecodeErrorV1::InvalidHead(format!(
+                "invalid canonical history: {error}"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+pub(super) fn decode_canonical_payload(bytes: &[u8]) -> Result<CanonicalSessionRevisionV1, String> {
+    decode_canonical_payload_classified(bytes).map_err(|error| error.to_string())
+}
+
+pub(super) fn encode_canonical_payload(
+    payload: &CanonicalSessionRevisionV1,
+) -> Result<Vec<u8>, String> {
+    validate_canonical_payload(payload)?;
+    let bytes = serde_json::to_vec(payload)
+        .map_err(|error| format!("cannot encode canonical payload: {error}"))?;
+    check_payload_size(&bytes, "canonical payload")?;
+    Ok(bytes)
+}
+
+pub(super) fn project_canonical_resume_v1(
+    payload: &CanonicalSessionRevisionV1,
+) -> Result<CanonicalResumeProjectionV1, CanonicalResumeProjectionErrorV1> {
+    validate_canonical_payload(payload)
+        .map_err(CanonicalResumeProjectionErrorV1::InvalidCanonical)?;
+    if !payload.artifact_manifest.is_empty() {
+        return Err(CanonicalResumeProjectionErrorV1::ArtifactClosureRequired {
+            artifact_count: payload.artifact_manifest.len(),
+        });
+    }
+
+    let mut selected_turns = HashSet::new();
+    let by_turn = payload
+        .operations
+        .iter()
+        .map(|operation| (operation.operation.turn_id(), operation))
+        .collect::<HashMap<_, _>>();
+    let mut cursor = payload.selected_head.clone();
+    while let LogicalHead::Turn(turn) = cursor {
+        selected_turns.insert(turn.clone());
+        let operation = by_turn.get(&turn).ok_or_else(|| {
+            CanonicalResumeProjectionErrorV1::SelectedAncestryUnavailable { turn: turn.clone() }
+        })?;
+        cursor = operation.operation.before_head().clone();
+    }
+
+    let mut messages = Vec::new();
+    let mut legacy_losses = Vec::new();
+    if let Some(baseline) = &payload.legacy_baseline {
+        messages.extend(baseline.messages.iter().map(project_resume_message));
+        legacy_losses.clone_from(&baseline.loss_manifest);
+    }
+    let mut omitted_operations = Vec::new();
+    for operation in &payload.operations {
+        if selected_turns.contains(operation.operation.turn_id()) {
+            messages.extend(operation.messages.iter().map(project_resume_message));
+        } else {
+            omitted_operations.push(operation.operation.turn_id().clone());
+        }
+    }
+
+    Ok(CanonicalResumeProjectionV1 {
+        source_revision: payload.revision_id.clone(),
+        source_head: payload.selected_head.clone(),
+        saved: super::SavedSession {
+            version: super::SESSION_VERSION,
+            id: payload.session_id.as_str().to_string(),
+            created_at: payload.created_at.clone(),
+            updated_at: payload.committed_at.clone(),
+            directory: payload.metadata.launch_directory.clone(),
+            gateway: payload.metadata.requested_gateway.clone(),
+            model: payload.metadata.requested_model.clone(),
+            name: payload.metadata.name.clone(),
+            project_context: payload.metadata.project_context_source.clone(),
+            messages,
+        },
+        legacy_losses,
+        omitted_operations,
+    })
+}
+
+fn project_resume_message(message: &CanonicalMessageV1) -> kitsu_providers::ChatMessage {
+    match message {
+        CanonicalMessageV1::System { content } => {
+            kitsu_providers::ChatMessage::system(content.clone())
+        }
+        CanonicalMessageV1::User { content } => kitsu_providers::ChatMessage::user(content.clone()),
+        CanonicalMessageV1::Assistant {
+            content,
+            tool_calls,
+        } => kitsu_providers::ChatMessage::assistant(
+            content.clone(),
+            tool_calls
+                .iter()
+                .map(|call| kitsu_providers::ToolCall {
+                    tool_name: call.tool_name.clone(),
+                    args: call.args.clone(),
+                    call_id: call.call_id.clone(),
+                })
+                .collect(),
+        ),
+        CanonicalMessageV1::Tool {
+            call_id, content, ..
+        } => kitsu_providers::ChatMessage::tool(call_id.clone(), content.clone()),
+    }
+}
+
+fn validate_canonical_payload(payload: &CanonicalSessionRevisionV1) -> Result<(), String> {
+    if payload.logical_schema != LOGICAL_SCHEMA_REVISION {
+        return Err(format!(
+            "unsupported canonical logical schema {}; expected {LOGICAL_SCHEMA_REVISION}",
+            payload.logical_schema
+        ));
+    }
+    validate_timestamp(&payload.created_at, "canonical created_at")?;
+    validate_timestamp(&payload.committed_at, "canonical committed_at")?;
+    validate_timestamp_order(
+        &payload.created_at,
+        &payload.committed_at,
+        "canonical payload",
+    )?;
+    validate_resume_intent(
+        &payload.metadata.launch_directory,
+        &payload.metadata.requested_gateway,
+        &payload.metadata.requested_model,
+        payload.metadata.name.as_deref(),
+        payload.metadata.project_context_source.as_deref(),
+    )?;
+    if let Some(baseline) = &payload.legacy_baseline {
+        validate_legacy_baseline(payload, baseline)?;
+    }
+    if let CanonicalLineageV1::Fork {
+        source_session,
+        source_revision,
+        branch_turn,
+        ..
+    } = &payload.lineage
+    {
+        if !matches!(payload.parent_revision, ExpectedRevision::Missing) {
+            return Err("fork lineage must begin with a missing destination revision".to_string());
+        }
+        if source_session == &payload.session_id || source_revision == &payload.revision_id {
+            return Err(
+                "fork lineage source and destination identities must be distinct".to_string(),
+            );
+        }
+        if branch_turn != &payload.selected_head || matches!(branch_turn, LogicalHead::Genesis) {
+            return Err(
+                "fork lineage branch turn must equal a committed selected HEAD".to_string(),
+            );
+        }
+    }
+    if payload.operations.len() > kitsu_core::session::MAX_CANONICAL_OPERATIONS {
+        return Err(format!(
+            "canonical payload has {} operations; maximum is {}",
+            payload.operations.len(),
+            kitsu_core::session::MAX_CANONICAL_OPERATIONS
+        ));
+    }
+    if payload.artifact_manifest.len() > MAX_ARTIFACTS {
+        return Err(format!(
+            "canonical payload has {} artifacts; maximum is {MAX_ARTIFACTS}",
+            payload.artifact_manifest.len()
+        ));
+    }
+
+    let mut artifact_ids = HashSet::with_capacity(payload.artifact_manifest.len());
+    for artifact in &payload.artifact_manifest {
+        if artifact.artifact_schema != ARTIFACT_SCHEMA_V1 {
+            return Err(format!(
+                "unsupported artifact schema {}; expected {ARTIFACT_SCHEMA_V1}",
+                artifact.artifact_schema
+            ));
+        }
+        validate_opaque_id(&artifact.artifact_id, "artifact id")?;
+        if !artifact_ids.insert(artifact.artifact_id.as_str()) {
+            return Err(format!("duplicate artifact '{}'", artifact.artifact_id));
+        }
+        validate_sha256(&artifact.sha256, "artifact digest")?;
+        if let Some(media_type) = &artifact.media_type {
+            bounded_nonempty(media_type, 256, "artifact media type")?;
+        }
+    }
+
+    let mut total_messages = payload
+        .legacy_baseline
+        .as_ref()
+        .map_or(0, |baseline| baseline.messages.len());
+    let mut effect_ids = HashSet::new();
+    let mut referenced_artifacts = HashSet::new();
+    let mut operation_envelopes = Vec::with_capacity(payload.operations.len());
+    for (index, operation) in payload.operations.iter().enumerate() {
+        total_messages = total_messages
+            .checked_add(operation.messages.len())
+            .ok_or_else(|| "canonical message count overflow".to_string())?;
+        if total_messages > MAX_MESSAGES {
+            return Err(format!(
+                "canonical payload has more than {MAX_MESSAGES} messages"
+            ));
+        }
+        validate_canonical_operation(
+            index,
+            operation,
+            &artifact_ids,
+            &mut referenced_artifacts,
+            &mut effect_ids,
+        )?;
+        operation_envelopes.push(operation.operation.clone());
+    }
+    if let Some(unreferenced) = artifact_ids
+        .iter()
+        .find(|artifact| !referenced_artifacts.contains(**artifact))
+    {
+        return Err(format!(
+            "canonical manifest contains unreferenced artifact '{unreferenced}'"
+        ));
+    }
+    CanonicalHistory::new(operation_envelopes.clone(), payload.selected_head.clone())
+        .map_err(|error| format!("invalid canonical history: {error}"))?;
+    validate_recovery_log(payload, &operation_envelopes)?;
+    if let Some(binding) = &payload.compaction_binding {
+        validate_projection_binding(payload, binding)?;
+    }
+    Ok(())
+}
+
+fn validate_recovery_log(
+    payload: &CanonicalSessionRevisionV1,
+    operation_envelopes: &[CanonicalOperation],
+) -> Result<(), String> {
+    if payload.recovery_log.len() > MAX_RECOVERY_ENTRIES {
+        return Err(format!(
+            "canonical recovery log has {} entries; maximum is {MAX_RECOVERY_ENTRIES}",
+            payload.recovery_log.len()
+        ));
+    }
+
+    let mut recovery_revisions = HashSet::with_capacity(payload.recovery_log.len());
+    let mut prior_committed_at = payload.created_at.as_str();
+    for binding in &payload.recovery_log {
+        if binding.recovery_schema != RECOVERY_SCHEMA_V1 {
+            return Err(format!(
+                "unsupported canonical recovery schema {}; expected {RECOVERY_SCHEMA_V1}",
+                binding.recovery_schema
+            ));
+        }
+        validate_timestamp(&binding.committed_at, "canonical recovery committed_at")?;
+        validate_timestamp_order(
+            prior_committed_at,
+            &binding.committed_at,
+            "canonical recovery log",
+        )?;
+        validate_timestamp_order(
+            &binding.committed_at,
+            &payload.committed_at,
+            "canonical recovery payload",
+        )?;
+        prior_committed_at = &binding.committed_at;
+        if !recovery_revisions.insert(binding.recovery_revision.as_str()) {
+            return Err(format!(
+                "duplicate canonical recovery revision '{}'",
+                binding.recovery_revision
+            ));
+        }
+        validate_recovery_skips(
+            &binding.skipped,
+            &binding.selected_revision,
+            &binding.source_revision,
+            &binding.recovery_revision,
+        )?;
+        CanonicalHistory::new(operation_envelopes.to_vec(), binding.source_head.clone())
+            .map_err(|error| format!("invalid canonical recovery source HEAD: {error}"))?;
+
+        if binding.recovery_revision == payload.revision_id
+            && (payload.parent_revision
+                != ExpectedRevision::Exact(binding.selected_revision.clone())
+                || payload.committed_at != binding.committed_at
+                || payload.selected_head != binding.source_head)
+        {
+            return Err(
+                "current canonical recovery revision disagrees with its recovery binding"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_recovery_skips(
+    skipped: &[CanonicalRecoverySkipV1],
+    selected_revision: &RevisionId,
+    source_revision: &RevisionId,
+    recovery_revision: &RevisionId,
+) -> Result<(), String> {
+    if selected_revision == source_revision
+        || selected_revision == recovery_revision
+        || source_revision == recovery_revision
+    {
+        return Err("canonical recovery identities must be distinct".to_string());
+    }
+    if skipped.is_empty() || skipped.len() > MAX_RECOVERY_ENTRIES {
+        return Err(format!(
+            "canonical recovery skipped revisions must contain 1..={MAX_RECOVERY_ENTRIES} entries"
+        ));
+    }
+    if skipped[0].revision != *selected_revision {
+        return Err(
+            "canonical recovery evidence must begin with the selected revision".to_string(),
+        );
+    }
+    let mut revisions = HashSet::with_capacity(skipped.len());
+    for skip in skipped {
+        if skip.revision == *source_revision || skip.revision == *recovery_revision {
+            return Err("canonical recovery source and result cannot be skipped".to_string());
+        }
+        if !revisions.insert(skip.revision.as_str()) {
+            return Err(format!(
+                "duplicate canonical recovery skipped revision '{}'",
+                skip.revision
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_legacy_baseline(
+    payload: &CanonicalSessionRevisionV1,
+    baseline: &LegacyBaselineV1,
+) -> Result<(), String> {
+    if baseline.legacy_schema != super::SESSION_VERSION {
+        return Err(format!(
+            "unsupported legacy baseline schema {}; expected {}",
+            baseline.legacy_schema,
+            super::SESSION_VERSION
+        ));
+    }
+    if matches!(payload.lineage, CanonicalLineageV1::Root)
+        && baseline.source_session_id != payload.session_id
+    {
+        return Err(
+            "root legacy baseline source session must match canonical session identity".to_string(),
+        );
+    }
+    validate_sha256(
+        &baseline.source_snapshot_sha256,
+        "legacy source snapshot digest",
+    )?;
+    validate_timestamp(&baseline.source_updated_at, "legacy source updated_at")?;
+    validate_timestamp_order(
+        &payload.created_at,
+        &baseline.source_updated_at,
+        "legacy source",
+    )?;
+    validate_timestamp_order(
+        &baseline.source_updated_at,
+        &payload.committed_at,
+        "legacy migration",
+    )?;
+    if baseline.loss_manifest.as_slice() != LEGACY_BASELINE_LOSSES {
+        return Err("legacy baseline must carry the exact fixed loss manifest".to_string());
+    }
+    if baseline.messages.len() > MAX_MESSAGES {
+        return Err(format!(
+            "legacy baseline has {} messages; maximum is {MAX_MESSAGES}",
+            baseline.messages.len()
+        ));
+    }
+    validate_message_causality(&baseline.messages, true, true, false, "legacy baseline")?;
+    for message in &baseline.messages {
+        if let CanonicalMessageV1::Tool {
+            content,
+            artifact_ids,
+            ..
+        } = message
+        {
+            if contains_offload_pointer(content) || !artifact_ids.is_empty() {
+                return Err(
+                    "legacy baseline has unresolved artifact closure; explicit resolution is required"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_canonical_operation<'a>(
+    index: usize,
+    operation: &'a CanonicalOperationV1,
+    artifacts: &HashSet<&'a str>,
+    referenced_artifacts: &mut HashSet<&'a str>,
+    effect_ids: &mut HashSet<&'a str>,
+) -> Result<(), String> {
+    if operation.messages.is_empty() || operation.messages.len() > MAX_MESSAGES_PER_OPERATION {
+        return Err(format!(
+            "canonical operation {index} message count must be within 1..={MAX_MESSAGES_PER_OPERATION}"
+        ));
+    }
+    let committed = matches!(
+        operation.operation.terminal().assistant(),
+        SessionAssistantDisposition::Committed | SessionAssistantDisposition::CommittedPartial
+    );
+    validate_terminal_agreement(index, &operation.operation)?;
+    validate_message_causality(
+        &operation.messages,
+        committed,
+        false,
+        true,
+        &format!("canonical operation {index}"),
+    )?;
+    if committed
+        && !matches!(
+            operation.messages.last(),
+            Some(CanonicalMessageV1::Assistant { content, tool_calls })
+                if !content.is_empty() && tool_calls.is_empty()
+        )
+    {
+        return Err(format!(
+            "canonical operation {index} committed assistant must end with non-empty final assistant output"
+        ));
+    }
+    if operation.retained_effects.len() > MAX_EFFECTS_PER_OPERATION {
+        return Err(format!(
+            "canonical operation {index} has too many retained effects"
+        ));
+    }
+    for effect in &operation.retained_effects {
+        validate_opaque_id(&effect.effect_id, "effect id")?;
+        if !effect_ids.insert(effect.effect_id.as_str()) {
+            return Err(format!("duplicate effect '{}'", effect.effect_id));
+        }
+        validate_artifact_references(
+            &effect.artifact_ids,
+            artifacts,
+            referenced_artifacts,
+            "retained effect",
+        )?;
+    }
+    for message in &operation.messages {
+        if let CanonicalMessageV1::Tool {
+            content,
+            artifact_ids,
+            ..
+        } = message
+        {
+            if contains_offload_pointer(content) && artifact_ids.is_empty() {
+                return Err(format!(
+                    "canonical operation {index} has an artifact pointer without an immutable artifact reference"
+                ));
+            }
+            validate_artifact_references(
+                artifact_ids,
+                artifacts,
+                referenced_artifacts,
+                "tool result",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_terminal_agreement(index: usize, operation: &CanonicalOperation) -> Result<(), String> {
+    let terminal = operation.terminal();
+    let agrees = matches!(
+        (terminal.class(), terminal.assistant()),
+        (
+            SessionOutcomeClass::Succeeded,
+            SessionAssistantDisposition::Committed
+        ) | (
+            SessionOutcomeClass::PartiallySucceeded,
+            SessionAssistantDisposition::CommittedPartial
+        ) | (
+            SessionOutcomeClass::UserFault
+                | SessionOutcomeClass::ProviderFault
+                | SessionOutcomeClass::ToolFault
+                | SessionOutcomeClass::Cancelled
+                | SessionOutcomeClass::Interrupted,
+            SessionAssistantDisposition::Discarded | SessionAssistantDisposition::Absent
+        )
+    );
+    if agrees {
+        Ok(())
+    } else {
+        Err(format!(
+            "canonical operation {index} terminal class and assistant disposition disagree"
+        ))
+    }
+}
+
+fn validate_message_causality(
+    messages: &[CanonicalMessageV1],
+    require_closed: bool,
+    allow_leading_system: bool,
+    require_single_initial_user: bool,
+    label: &str,
+) -> Result<(), String> {
+    let mut admitted = HashSet::new();
+    let mut pending = HashSet::new();
+    let mut saw_non_system = false;
+    let mut awaiting_user = true;
+    let mut user_count = 0usize;
+    for (index, message) in messages.iter().enumerate() {
+        bounded_content(message.content(), index)?;
+        match message {
+            CanonicalMessageV1::System { .. } => {
+                if !allow_leading_system || saw_non_system {
+                    return Err(format!("{label} message {index} has misplaced system role"));
+                }
+            }
+            CanonicalMessageV1::User { .. } => {
+                saw_non_system = true;
+                user_count += 1;
+                if !pending.is_empty() || !awaiting_user {
+                    return Err(format!(
+                        "{label} message {index} begins a user exchange before the prior exchange closes"
+                    ));
+                }
+                awaiting_user = false;
+                if require_single_initial_user && (index != 0 || user_count != 1) {
+                    return Err(format!(
+                        "{label} must contain exactly one initial user input"
+                    ));
+                }
+            }
+            CanonicalMessageV1::Assistant { tool_calls, .. } => {
+                saw_non_system = true;
+                if awaiting_user {
+                    return Err(format!(
+                        "{label} message {index} assistant fact has no active settled user exchange"
+                    ));
+                }
+                if !pending.is_empty() {
+                    return Err(format!(
+                        "{label} message {index} assistant fact precedes unresolved tool call results"
+                    ));
+                }
+                if tool_calls.len() > MAX_TOOL_CALLS_PER_MESSAGE {
+                    return Err(format!("{label} message {index} has too many tool calls"));
+                }
+                for call in tool_calls {
+                    validate_tool_call(call, label, index)?;
+                    if !admitted.insert(call.call_id.as_str()) {
+                        return Err(format!(
+                            "{label} message {index} repeats tool call '{}'",
+                            call.call_id
+                        ));
+                    }
+                    pending.insert(call.call_id.as_str());
+                }
+                if tool_calls.is_empty() {
+                    awaiting_user = true;
+                }
+            }
+            CanonicalMessageV1::Tool { call_id, .. } => {
+                saw_non_system = true;
+                if awaiting_user {
+                    return Err(format!(
+                        "{label} message {index} tool result has no active user exchange"
+                    ));
+                }
+                bounded_correlation_id(call_id, "tool result call id")?;
+                if !pending.remove(call_id.as_str()) {
+                    return Err(format!(
+                        "{label} message {index} resolves unknown tool call '{call_id}'"
+                    ));
+                }
+            }
+        }
+    }
+    if require_single_initial_user && user_count != 1 {
+        return Err(format!(
+            "{label} must contain exactly one initial user input"
+        ));
+    }
+    if require_closed && !pending.is_empty() {
+        let mut unresolved = pending.into_iter().collect::<Vec<_>>();
+        unresolved.sort_unstable();
+        return Err(format!(
+            "{label} has unresolved tool call(s): {}",
+            unresolved.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tool_call(
+    call: &CanonicalToolCallV1,
+    label: &str,
+    message_index: usize,
+) -> Result<(), String> {
+    validate_opaque_id(&call.tool_name, "tool name")?;
+    bounded_correlation_id(&call.call_id, "tool call id")?;
+    if call.args.len() > MAX_ARGUMENT_BYTES {
+        return Err(format!(
+            "{label} message {message_index} tool arguments exceed {MAX_ARGUMENT_BYTES} bytes"
+        ));
+    }
+    let args: serde_json::Value = serde_json::from_str(&call.args).map_err(|error| {
+        format!("{label} message {message_index} tool arguments are not JSON: {error}")
+    })?;
+    if !args.is_object() {
+        return Err(format!(
+            "{label} message {message_index} tool arguments must be a JSON object"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_references<'a>(
+    references: &'a [String],
+    artifacts: &HashSet<&'_ str>,
+    referenced_artifacts: &mut HashSet<&'a str>,
+    label: &str,
+) -> Result<(), String> {
+    if references.len() > MAX_REFERENCES_PER_FACT {
+        return Err(format!("{label} has too many artifact references"));
+    }
+    let mut unique = HashSet::with_capacity(references.len());
+    for reference in references {
+        validate_opaque_id(reference, "artifact reference")?;
+        if !unique.insert(reference.as_str()) {
+            return Err(format!("{label} repeats artifact '{reference}'"));
+        }
+        if !artifacts.contains(reference.as_str()) {
+            return Err(format!("{label} references missing artifact '{reference}'"));
+        }
+        referenced_artifacts.insert(reference.as_str());
+    }
+    Ok(())
+}
+
+fn validate_projection_binding(
+    payload: &CanonicalSessionRevisionV1,
+    binding: &ContextProjectionRefV1,
+) -> Result<(), String> {
+    if binding.projection_schema != PROJECTION_SCHEMA_V1 {
+        return Err(format!(
+            "unsupported projection schema {}; expected {PROJECTION_SCHEMA_V1}",
+            binding.projection_schema
+        ));
+    }
+    validate_opaque_id(&binding.projection_id, "projection id")?;
+    for (value, label) in [
+        (&binding.route_generation, "route generation"),
+        (&binding.capability_generation, "capability generation"),
+        (&binding.model_generation, "model generation"),
+        (&binding.estimator_generation, "estimator generation"),
+    ] {
+        validate_opaque_id(value, label)?;
+    }
+    if binding.source_revision != payload.revision_id {
+        return Err(format!(
+            "compaction source revision '{}' does not match canonical revision '{}'",
+            binding.source_revision, payload.revision_id
+        ));
+    }
+    if binding.source_head != payload.selected_head {
+        return Err("compaction source head does not match selected canonical head".to_string());
+    }
+    if binding.budget_tokens == 0 {
+        return Err("compaction budget must be nonzero".to_string());
+    }
+    if binding.loss_manifest.len() > MAX_LOSS_ENTRIES {
+        return Err("compaction loss manifest is too large".to_string());
+    }
+    for loss in &binding.loss_manifest {
+        bounded_nonempty(loss, 4096, "compaction loss entry")?;
+    }
+
+    let by_turn = payload
+        .operations
+        .iter()
+        .map(|operation| (operation.operation.turn_id(), &operation.operation))
+        .collect::<HashMap<_, _>>();
+    let mut ancestry = Vec::new();
+    let mut cursor = payload.selected_head.clone();
+    while let LogicalHead::Turn(turn) = cursor {
+        let operation = by_turn
+            .get(&turn)
+            .ok_or_else(|| format!("compaction ancestry cannot resolve selected turn '{turn}'"))?;
+        ancestry.push(turn);
+        cursor = operation.before_head().clone();
+    }
+    ancestry.reverse();
+    if binding.included_operations != ancestry {
+        return Err(
+            "compaction included operations do not equal selected-head ancestry".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn check_payload_size(bytes: &[u8], label: &str) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() > MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "{label} length must be within 1..={MAX_PAYLOAD_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_resume_intent(
+    directory: &str,
+    gateway: &str,
+    model: &str,
+    name: Option<&str>,
+    project_context: Option<&str>,
+) -> Result<(), String> {
+    bounded_nonempty(directory, 32 * 1024, "launch directory")?;
+    bounded_nonempty(gateway, 4 * 1024, "requested gateway")?;
+    bounded_nonempty(model, 4 * 1024, "requested model")?;
+    if let Some(name) = name {
+        super::valid_session_name(name)?;
+    }
+    if project_context.is_some_and(|context| context.len() > MAX_METADATA_BYTES) {
+        return Err(format!(
+            "project context exceeds {MAX_METADATA_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_timestamp(value: &str, label: &str) -> Result<(), String> {
+    if value.len() > 64 {
+        return Err(format!("{label} is too long"));
+    }
+    DateTime::parse_from_rfc3339(value)
+        .map(|_| ())
+        .map_err(|error| format!("{label} is not RFC3339: {error}"))
+}
+
+fn validate_timestamp_order(created: &str, committed: &str, label: &str) -> Result<(), String> {
+    let created = DateTime::parse_from_rfc3339(created)
+        .map_err(|error| format!("{label} created timestamp is invalid: {error}"))?;
+    let committed = DateTime::parse_from_rfc3339(committed)
+        .map_err(|error| format!("{label} committed timestamp is invalid: {error}"))?;
+    if committed < created {
+        return Err(format!("{label} committed timestamp predates creation"));
+    }
+    Ok(())
+}
+
+fn bounded_content(content: &str, index: usize) -> Result<(), String> {
+    if content.len() > MAX_CONTENT_BYTES {
+        Err(format!(
+            "message {index} content exceeds {MAX_CONTENT_BYTES} bytes"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn bounded_nonempty(value: &str, max: usize, label: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > max {
+        Err(format!("{label} length must be within 1..={max} bytes"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_opaque_id(value: &str, label: &str) -> Result<(), String> {
+    bounded_nonempty(value, 128, label)?;
+    if let Some(index) = value.bytes().position(|byte| {
+        !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    }) {
+        return Err(format!("{label} byte {index} is unsafe"));
+    }
+    Ok(())
+}
+
+fn bounded_correlation_id(value: &str, label: &str) -> Result<(), String> {
+    bounded_nonempty(value, 512, label)?;
+    if let Some(index) = value.bytes().position(|byte| byte.is_ascii_control()) {
+        return Err(format!("{label} byte {index} is a control character"));
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str, label: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(format!("{label} must be 64 lowercase hexadecimal bytes"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn current_v1(messages: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "id": "s-source",
+            "created_at": "2026-08-20T10:00:00.000Z",
+            "updated_at": "2026-08-20T10:01:00.000Z",
+            "directory": "/work/tree",
+            "gateway": "openai",
+            "model": "gpt-test",
+            "name": "kept_name",
+            "project_context": "exact historical context",
+            "messages": messages,
+        }))
+        .unwrap()
+    }
+
+    fn closed_messages() -> serde_json::Value {
+        serde_json::json!([
+            {"role":"system","content":"historical system"},
+            {"role":"user","content":"inspect"},
+            {"role":"assistant","content":"","tool_calls":[{
+                "tool_name":"fs_read_file","args":"{\"path\":\"a.rs\"}","call_id":"call-1"
+            }]},
+            {"role":"tool","content":"contents","tool_call_id":"call-1"},
+            {"role":"assistant","content":"done"}
+        ])
+    }
+
+    fn legacy_base(revision: &str) -> CanonicalSessionRevisionV1 {
+        prepare_current_v1_legacy_baseline(
+            &current_v1(closed_messages()),
+            "s-source",
+            StoreId::new("store-1").unwrap(),
+            RevisionId::new(revision).unwrap(),
+            "2026-08-20T11:00:00.000Z".to_string(),
+        )
+        .unwrap()
+    }
+
+    fn operation_input(
+        turn: &str,
+        run: &str,
+        class: kitsu_core::RunOutcomeClass,
+        assistant: kitsu_core::RunAssistantDisposition,
+        messages: serde_json::Value,
+        retained_effects: serde_json::Value,
+        new_artifacts: serde_json::Value,
+    ) -> CanonicalOperationInputV1 {
+        let spec = kitsu_core::RunSpec::new(kitsu_core::RunId::new(run).unwrap());
+        CanonicalOperationInputV1 {
+            turn_id: TurnId::new(turn).unwrap(),
+            terminal: spec.terminal(class, assistant),
+            messages: serde_json::from_value(messages).unwrap(),
+            retained_effects: serde_json::from_value(retained_effects).unwrap(),
+            new_artifacts: serde_json::from_value(new_artifacts).unwrap(),
+        }
+    }
+
+    fn one_operation_source() -> CanonicalSessionRevisionV1 {
+        append_complete_operation(
+            &legacy_base("revision-1"),
+            RevisionId::new("revision-2").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            operation_input(
+                "turn-1",
+                "run-1",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+                serde_json::json!([
+                    {"role":"user","content":"recoverable question"},
+                    {"role":"assistant","content":"verified answer","tool_calls":[]}
+                ]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn canonical_resume_projection_is_bound_to_selected_head_ancestry() {
+        let second = append_complete_operation(
+            &one_operation_source(),
+            RevisionId::new("revision-3").unwrap(),
+            "2026-08-20T11:02:00.000Z".to_string(),
+            operation_input(
+                "turn-2",
+                "run-2",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+                serde_json::json!([
+                    {"role":"user","content":"second question"},
+                    {"role":"assistant","content":"second answer","tool_calls":[]}
+                ]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap();
+        let source = append_complete_operation(
+            &second,
+            RevisionId::new("revision-4").unwrap(),
+            "2026-08-20T11:03:00.000Z".to_string(),
+            operation_input(
+                "turn-3",
+                "run-3",
+                kitsu_core::RunOutcomeClass::ProviderFault,
+                kitsu_core::RunAssistantDisposition::Discarded,
+                serde_json::json!([{"role":"user","content":"discarded question"}]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap();
+
+        let projection = project_canonical_resume_v1(&source).unwrap();
+        let saved = projection.saved();
+        assert_eq!(projection.source_revision().as_str(), "revision-4");
+        assert_eq!(
+            projection.source_head(),
+            &LogicalHead::Turn(TurnId::new("turn-2").unwrap())
+        );
+        assert_eq!(projection.legacy_loss_count(), 3);
+        assert_eq!(
+            projection
+                .omitted_operations()
+                .iter()
+                .map(TurnId::as_str)
+                .collect::<Vec<_>>(),
+            ["turn-3"]
+        );
+        assert_eq!(saved.version, super::super::SESSION_VERSION);
+        assert_eq!(saved.id, "s-source");
+        assert_eq!(saved.created_at, "2026-08-20T10:00:00.000Z");
+        assert_eq!(saved.updated_at, "2026-08-20T11:03:00.000Z");
+        assert_eq!(saved.directory, "/work/tree");
+        assert_eq!(saved.gateway, "openai");
+        assert_eq!(saved.model, "gpt-test");
+        assert_eq!(saved.name.as_deref(), Some("kept_name"));
+        assert_eq!(
+            saved.project_context.as_deref(),
+            Some("exact historical context")
+        );
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "historical system",
+                "inspect",
+                "",
+                "contents",
+                "done",
+                "recoverable question",
+                "verified answer",
+                "second question",
+                "second answer",
+            ]
+        );
+        assert_eq!(saved.messages[2].tool_calls.len(), 1);
+        assert_eq!(saved.messages[2].tool_calls[0].tool_name, "fs_read_file");
+        assert_eq!(saved.messages[2].tool_calls[0].call_id, "call-1");
+        assert_eq!(saved.messages[3].tool_call_id.as_deref(), Some("call-1"));
+        assert!(!saved
+            .messages
+            .iter()
+            .any(|message| message.content == "discarded question"));
+    }
+
+    #[test]
+    fn canonical_resume_projection_refuses_artifact_or_invalid_sources() {
+        assert_eq!(
+            project_canonical_resume_v1(&three_artifact_source()).unwrap_err(),
+            CanonicalResumeProjectionErrorV1::ArtifactClosureRequired { artifact_count: 3 }
+        );
+
+        let mut invalid = one_operation_source();
+        invalid.metadata.launch_directory.clear();
+        assert!(matches!(
+            project_canonical_resume_v1(&invalid),
+            Err(CanonicalResumeProjectionErrorV1::InvalidCanonical(reason))
+                if reason.contains("launch directory")
+        ));
+    }
+
+    fn three_artifact_source() -> CanonicalSessionRevisionV1 {
+        let mut source = legacy_base("revision-1");
+        for (index, revision, committed_at) in [
+            (1, "revision-2", "2026-08-20T11:01:00.000Z"),
+            (2, "revision-3", "2026-08-20T11:02:00.000Z"),
+            (3, "revision-4", "2026-08-20T11:03:00.000Z"),
+        ] {
+            let artifact_id = format!("artifact-{index}");
+            source = append_complete_operation(
+                &source,
+                RevisionId::new(revision).unwrap(),
+                committed_at.to_string(),
+                operation_input(
+                    &format!("turn-{index}"),
+                    &format!("run-{index}"),
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                    serde_json::json!([
+                        {"role":"user","content":format!("question {index}")},
+                        {"role":"assistant","content":"","tool_calls":[{
+                            "tool_name":"fs_read_file",
+                            "args":"{\"path\":\"a.rs\"}",
+                            "call_id":format!("call-{index}")
+                        }]},
+                        {
+                            "role":"tool",
+                            "call_id":format!("call-{index}"),
+                            "content":format!("contents {index}"),
+                            "artifact_ids":[artifact_id.clone()]
+                        },
+                        {"role":"assistant","content":format!("answer {index}"),"tool_calls":[]}
+                    ]),
+                    serde_json::json!([{
+                        "effect_id":format!("effect-{index}"),
+                        "artifact_ids":[artifact_id.clone()]
+                    }]),
+                    serde_json::json!([{
+                        "artifact_schema":1,
+                        "artifact_id":artifact_id,
+                        "sha256":format!("{:064x}", index),
+                        "bytes":index,
+                        "media_type":"text/plain"
+                    }]),
+                ),
+            )
+            .unwrap();
+        }
+        source
+    }
+
+    #[test]
+    fn branch_assembler_copies_exact_prefix_lineage_and_artifact_closure() {
+        let mut source = assemble_recovery_revision(
+            &three_artifact_source(),
+            RevisionId::new("revision-5").unwrap(),
+            RevisionId::new("revision-6").unwrap(),
+            "2026-08-20T11:03:30.000Z".to_string(),
+            vec![CanonicalRecoverySkipV1::new(
+                RevisionId::new("revision-5").unwrap(),
+                CorruptSessionReason::InvalidHead,
+            )],
+        )
+        .unwrap();
+        source.compaction_binding = Some(ContextProjectionRefV1 {
+            projection_schema: PROJECTION_SCHEMA_V1,
+            projection_id: "projection-branch-source".to_string(),
+            source_revision: source.revision_id.clone(),
+            source_head: source.selected_head.clone(),
+            included_operations: ["turn-1", "turn-2", "turn-3"]
+                .into_iter()
+                .map(|turn| TurnId::new(turn).unwrap())
+                .collect(),
+            route_generation: "route-1".to_string(),
+            capability_generation: "capability-1".to_string(),
+            model_generation: "model-1".to_string(),
+            estimator_generation: "estimator-1".to_string(),
+            budget_tokens: 4096,
+            loss_manifest: vec!["derived summary".to_string()],
+        });
+        assert!(!source.recovery_log.is_empty());
+        assert!(source.compaction_binding.is_some());
+
+        let branch = assemble_branch_at_committed_turn(
+            &source,
+            StoreId::new("store-2").unwrap(),
+            SessionId::new("session-branch").unwrap(),
+            RevisionId::new("revision-branch-1").unwrap(),
+            "2026-08-20T11:04:00.000Z".to_string(),
+            TurnId::new("turn-2").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(branch.store_id.as_str(), "store-2");
+        assert_eq!(branch.session_id.as_str(), "session-branch");
+        assert_eq!(branch.revision_id.as_str(), "revision-branch-1");
+        assert_eq!(branch.parent_revision, ExpectedRevision::Missing);
+        assert_eq!(branch.created_at, source.created_at);
+        assert_eq!(branch.committed_at, "2026-08-20T11:04:00.000Z");
+        assert_eq!(branch.operations.len(), 2);
+        assert_eq!(
+            branch.selected_head,
+            LogicalHead::Turn(TurnId::new("turn-2").unwrap())
+        );
+        assert_eq!(
+            branch
+                .artifact_manifest
+                .iter()
+                .map(|artifact| artifact.artifact_id.as_str())
+                .collect::<Vec<_>>(),
+            ["artifact-1", "artifact-2"]
+        );
+        assert!(branch.compaction_binding.is_none());
+        assert!(branch.recovery_log.is_empty());
+        assert!(matches!(
+            branch.lineage,
+            CanonicalLineageV1::Fork {
+                ref source_store,
+                ref source_session,
+                ref source_revision,
+                source_head: LogicalHead::Turn(ref source_head),
+                branch_turn: LogicalHead::Turn(ref branch_head),
+            } if source_store.as_str() == "store-1"
+                && source_session.as_str() == "s-source"
+                && source_revision.as_str() == "revision-6"
+                && source_head.as_str() == "turn-3"
+                && branch_head.as_str() == "turn-2"
+        ));
+        assert_eq!(
+            decode_canonical_payload(&encode_canonical_payload(&branch).unwrap()).unwrap(),
+            branch
+        );
+
+        for (label, field, value) in [
+            (
+                "branch-head",
+                "branch_turn",
+                serde_json::json!({"kind":"turn","turn":"turn-1"}),
+            ),
+            (
+                "source-session",
+                "source_session",
+                serde_json::json!("session-branch"),
+            ),
+        ] {
+            let mut invalid = serde_json::to_value(&branch).unwrap();
+            invalid["lineage"][field] = value;
+            assert!(
+                decode_canonical_payload(&serde_json::to_vec(&invalid).unwrap()).is_err(),
+                "case: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_assembler_rejects_noncommitted_or_nonfresh_boundaries() {
+        let source = three_artifact_source();
+        let destination_store = StoreId::new("store-2").unwrap();
+        let destination_session = SessionId::new("session-branch").unwrap();
+        let destination_revision = RevisionId::new("revision-branch-1").unwrap();
+
+        for (label, session, revision, committed_at, turn) in [
+            (
+                "same-session",
+                source.session_id.clone(),
+                destination_revision.clone(),
+                "2026-08-20T11:04:00.000Z",
+                TurnId::new("turn-2").unwrap(),
+            ),
+            (
+                "same-revision",
+                destination_session.clone(),
+                source.revision_id.clone(),
+                "2026-08-20T11:04:00.000Z",
+                TurnId::new("turn-2").unwrap(),
+            ),
+            (
+                "old-time",
+                destination_session.clone(),
+                destination_revision.clone(),
+                "2026-08-20T11:02:00.000Z",
+                TurnId::new("turn-2").unwrap(),
+            ),
+            (
+                "unknown-turn",
+                destination_session,
+                destination_revision,
+                "2026-08-20T11:04:00.000Z",
+                TurnId::new("turn-unknown").unwrap(),
+            ),
+        ] {
+            assert!(
+                assemble_branch_at_committed_turn(
+                    &source,
+                    destination_store.clone(),
+                    session,
+                    revision,
+                    committed_at.to_string(),
+                    turn,
+                )
+                .is_err(),
+                "case: {label}"
+            );
+        }
+
+        let failed = append_complete_operation(
+            &source,
+            RevisionId::new("revision-5").unwrap(),
+            "2026-08-20T11:04:00.000Z".to_string(),
+            operation_input(
+                "turn-failed",
+                "run-failed",
+                kitsu_core::RunOutcomeClass::ProviderFault,
+                kitsu_core::RunAssistantDisposition::Absent,
+                serde_json::json!([{"role":"user","content":"failed"}]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap();
+        assert!(assemble_branch_at_committed_turn(
+            &failed,
+            destination_store,
+            SessionId::new("session-branch-2").unwrap(),
+            RevisionId::new("revision-branch-2").unwrap(),
+            "2026-08-20T11:05:00.000Z".to_string(),
+            TurnId::new("turn-failed").unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn recovery_assembler_creates_a_new_revision_with_complete_ordered_evidence() {
+        let source = one_operation_source();
+        let selected = RevisionId::new("revision-4").unwrap();
+        let skipped = vec![
+            CanonicalRecoverySkipV1::new(selected.clone(), CorruptSessionReason::DigestMismatch),
+            CanonicalRecoverySkipV1::new(
+                RevisionId::new("revision-3").unwrap(),
+                CorruptSessionReason::InvalidHead,
+            ),
+        ];
+
+        let recovery = assemble_recovery_revision(
+            &source,
+            selected.clone(),
+            RevisionId::new("revision-5").unwrap(),
+            "2026-08-20T11:05:00.000Z".to_string(),
+            skipped.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(recovery.logical_schema, 2);
+        assert_eq!(
+            recovery.parent_revision,
+            ExpectedRevision::Exact(selected.clone())
+        );
+        assert_eq!(recovery.selected_head, source.selected_head);
+        assert_eq!(recovery.operations, source.operations);
+        assert_eq!(recovery.artifact_manifest, source.artifact_manifest);
+        assert!(recovery.compaction_binding.is_none());
+        assert_eq!(recovery.recovery_log.len(), 1);
+        let binding = &recovery.recovery_log[0];
+        assert_eq!(binding.recovery_revision, recovery.revision_id);
+        assert_eq!(binding.selected_revision, selected);
+        assert_eq!(binding.source_revision, source.revision_id);
+        assert_eq!(binding.source_head, source.selected_head);
+        assert_eq!(binding.skipped, skipped);
+        assert_eq!(binding.committed_at, recovery.committed_at);
+        assert_eq!(
+            decode_canonical_payload(&encode_canonical_payload(&recovery).unwrap()).unwrap(),
+            recovery
+        );
+    }
+
+    #[test]
+    fn recovery_assembler_rejects_ambiguous_or_incomplete_evidence() {
+        let source = one_operation_source();
+        let selected = RevisionId::new("revision-4").unwrap();
+        let new_revision = RevisionId::new("revision-5").unwrap();
+        let valid = vec![CanonicalRecoverySkipV1::new(
+            selected.clone(),
+            CorruptSessionReason::DigestMismatch,
+        )];
+
+        for (label, selected_revision, recovery_revision, skipped, committed_at) in [
+            (
+                "empty",
+                selected.clone(),
+                new_revision.clone(),
+                Vec::new(),
+                "2026-08-20T11:05:00.000Z",
+            ),
+            (
+                "wrong-first",
+                selected.clone(),
+                new_revision.clone(),
+                vec![CanonicalRecoverySkipV1::new(
+                    RevisionId::new("revision-3").unwrap(),
+                    CorruptSessionReason::InvalidHead,
+                )],
+                "2026-08-20T11:05:00.000Z",
+            ),
+            (
+                "source-skipped",
+                selected.clone(),
+                new_revision.clone(),
+                vec![
+                    valid[0].clone(),
+                    CanonicalRecoverySkipV1::new(
+                        source.revision_id.clone(),
+                        CorruptSessionReason::Malformed,
+                    ),
+                ],
+                "2026-08-20T11:05:00.000Z",
+            ),
+            (
+                "identity-reuse",
+                selected.clone(),
+                selected.clone(),
+                valid.clone(),
+                "2026-08-20T11:05:00.000Z",
+            ),
+            (
+                "old-time",
+                selected.clone(),
+                new_revision.clone(),
+                valid,
+                "2026-08-20T10:59:00.000Z",
+            ),
+        ] {
+            assert!(
+                assemble_recovery_revision(
+                    &source,
+                    selected_revision,
+                    recovery_revision,
+                    committed_at.to_string(),
+                    skipped,
+                )
+                .is_err(),
+                "case: {label}"
+            );
+        }
+
+        let recovery = assemble_recovery_revision(
+            &source,
+            selected,
+            new_revision,
+            "2026-08-20T11:05:00.000Z".to_string(),
+            vec![CanonicalRecoverySkipV1::new(
+                RevisionId::new("revision-4").unwrap(),
+                CorruptSessionReason::DigestMismatch,
+            )],
+        )
+        .unwrap();
+        let mut invalid = serde_json::to_value(recovery).unwrap();
+        invalid["recovery_log"][0]["source_revision"] = serde_json::json!("revision-5");
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&invalid).unwrap())
+                .unwrap_err()
+                .contains("identities must be distinct")
+        );
+    }
+
+    #[test]
+    fn strict_current_v1_is_preserved_as_non_publishable_migration_input() {
+        let bytes = current_v1(closed_messages());
+        let decoded = decode_current_v1_migration_input(&bytes, "s-source").unwrap();
+
+        assert_eq!(
+            decoded.source_snapshot_sha256(),
+            crate::skills::content_sha256_hex(&bytes)
+        );
+        assert_eq!(decoded.messages().len(), 5);
+        assert_eq!(decoded.messages()[0].content(), "historical system");
+        assert_eq!(
+            decoded.blockers(),
+            &[CurrentV1MigrationBlocker::MissingTerminalOutcomes]
+        );
+    }
+
+    #[test]
+    fn current_saved_session_encoding_is_accepted_without_provider_wire_reuse() {
+        let saved = super::super::SavedSession {
+            version: super::super::SESSION_VERSION,
+            id: "s-source".to_string(),
+            created_at: "2026-08-20T10:00:00.000Z".to_string(),
+            updated_at: "2026-08-20T10:01:00.000Z".to_string(),
+            directory: "/work/tree".to_string(),
+            gateway: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            name: Some("kept_name".to_string()),
+            project_context: None,
+            messages: vec![
+                kitsu_providers::ChatMessage::system("historical system"),
+                kitsu_providers::ChatMessage::user("inspect"),
+                kitsu_providers::ChatMessage::assistant("done", Vec::new()),
+            ],
+        };
+        let bytes = serde_json::to_vec(&saved).unwrap();
+        let decoded = decode_current_v1_migration_input(&bytes, "s-source").unwrap();
+
+        assert_eq!(decoded.messages().len(), saved.messages.len());
+        assert_eq!(decoded.messages()[2].content(), "done");
+    }
+
+    #[test]
+    fn current_v1_rejects_unknown_fields_at_every_wire_level() {
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&current_v1(closed_messages())).unwrap();
+        root["ambient_authority"] = serde_json::json!(true);
+        assert!(
+            decode_current_v1_migration_input(&serde_json::to_vec(&root).unwrap(), "s-source")
+                .unwrap_err()
+                .contains("unknown field")
+        );
+
+        let mut message: serde_json::Value =
+            serde_json::from_slice(&current_v1(closed_messages())).unwrap();
+        message["messages"][1]["provider_cache"] = serde_json::json!("ambient");
+        assert!(decode_current_v1_migration_input(
+            &serde_json::to_vec(&message).unwrap(),
+            "s-source"
+        )
+        .unwrap_err()
+        .contains("unknown field"));
+
+        let mut call: serde_json::Value =
+            serde_json::from_slice(&current_v1(closed_messages())).unwrap();
+        call["messages"][2]["tool_calls"][0]["approval"] = serde_json::json!("remember");
+        assert!(
+            decode_current_v1_migration_input(&serde_json::to_vec(&call).unwrap(), "s-source")
+                .unwrap_err()
+                .contains("unknown field")
+        );
+    }
+
+    #[test]
+    fn current_v1_rejects_broken_or_open_tool_causality() {
+        let unknown_result = serde_json::json!([
+            {"role":"user","content":"inspect"},
+            {"role":"tool","content":"contents","tool_call_id":"not-admitted"}
+        ]);
+        assert!(
+            decode_current_v1_migration_input(&current_v1(unknown_result), "s-source")
+                .unwrap_err()
+                .contains("unknown tool call")
+        );
+
+        let open_call = serde_json::json!([
+            {"role":"user","content":"inspect"},
+            {"role":"assistant","content":"","tool_calls":[{
+                "tool_name":"fs_read_file","args":"{}","call_id":"call-1"
+            }]}
+        ]);
+        assert!(
+            decode_current_v1_migration_input(&current_v1(open_call), "s-source")
+                .unwrap_err()
+                .contains("unresolved tool call")
+        );
+
+        let assistant_first = serde_json::json!([
+            {"role":"assistant","content":"invented"}
+        ]);
+        assert!(
+            decode_current_v1_migration_input(&current_v1(assistant_first), "s-source")
+                .unwrap_err()
+                .contains("no active settled user exchange")
+        );
+    }
+
+    #[test]
+    fn current_v1_artifact_pointer_requires_explicit_closure_resolution() {
+        let messages = serde_json::json!([
+            {"role":"user","content":"inspect"},
+            {"role":"assistant","content":"","tool_calls":[{
+                "tool_name":"fs_read_file","args":"{}","call_id":"call-1"
+            }]},
+            {"role":"tool","tool_call_id":"call-1","content":
+                "[tool output 9.0 KB — full result saved to /private/s-source.artifacts/call-1.txt. Re-read it with fs_read_file on that path.]"},
+            {"role":"assistant","content":"done"}
+        ]);
+        let decoded = decode_current_v1_migration_input(&current_v1(messages), "s-source").unwrap();
+        assert_eq!(
+            decoded.blockers(),
+            &[
+                CurrentV1MigrationBlocker::MissingTerminalOutcomes,
+                CurrentV1MigrationBlocker::ArtifactClosureRequired {
+                    message_indices: vec![2]
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_legacy_import_preserves_transcript_and_declares_fixed_loss() {
+        let source = current_v1(closed_messages());
+        let payload = prepare_current_v1_legacy_baseline(
+            &source,
+            "s-source",
+            StoreId::new("store-1").unwrap(),
+            RevisionId::new("revision-1").unwrap(),
+            "2026-08-20T11:00:00.000Z".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(payload.selected_head, LogicalHead::Genesis);
+        assert!(payload.operations.is_empty());
+        let baseline = payload.legacy_baseline.as_ref().unwrap();
+        assert_eq!(
+            baseline.source_snapshot_sha256,
+            crate::skills::content_sha256_hex(&source)
+        );
+        assert_eq!(baseline.messages.len(), 5);
+        assert_eq!(
+            baseline.loss_manifest,
+            vec![
+                LegacyBaselineLossV1::TerminalOutcomes,
+                LegacyBaselineLossV1::LogicalHeads,
+                LegacyBaselineLossV1::TurnLineage,
+            ]
+        );
+        let round_trip =
+            decode_canonical_payload(&encode_canonical_payload(&payload).unwrap()).unwrap();
+        assert_eq!(round_trip, payload);
+
+        let mut mismatch = serde_json::to_value(payload).unwrap();
+        mismatch["legacy_baseline"]["source_session_id"] = serde_json::json!("other-session");
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&mismatch).unwrap())
+                .unwrap_err()
+                .contains("source session")
+        );
+    }
+
+    #[test]
+    fn legacy_import_refuses_unresolved_artifact_pointer_without_writing_a_payload() {
+        let messages = serde_json::json!([
+            {"role":"user","content":"inspect"},
+            {"role":"assistant","content":"","tool_calls":[{
+                "tool_name":"fs_read_file","args":"{}","call_id":"call-1"
+            }]},
+            {"role":"tool","tool_call_id":"call-1","content":
+                "[tool output 9.0 KB — full result saved to /private/s-source.artifacts/call-1.txt.]"},
+            {"role":"assistant","content":"done"}
+        ]);
+        let error = prepare_current_v1_legacy_baseline(
+            &current_v1(messages),
+            "s-source",
+            StoreId::new("store-1").unwrap(),
+            RevisionId::new("revision-1").unwrap(),
+            "2026-08-20T11:00:00.000Z".to_string(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("artifact closure"));
+    }
+
+    #[test]
+    fn canonical_legacy_baseline_rejects_missing_or_fabricated_loss_facts() {
+        let input =
+            decode_current_v1_migration_input(&current_v1(closed_messages()), "s-source").unwrap();
+        let payload = build_current_v1_legacy_baseline(
+            input,
+            StoreId::new("store-1").unwrap(),
+            RevisionId::new("revision-1").unwrap(),
+            "2026-08-20T11:00:00.000Z".to_string(),
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(payload).unwrap();
+        value["legacy_baseline"]["loss_manifest"] =
+            serde_json::json!(["terminal_outcomes_unavailable"]);
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&value).unwrap())
+                .unwrap_err()
+                .contains("exact fixed loss manifest")
+        );
+
+        value["legacy_baseline"]["loss_manifest"] = serde_json::json!([
+            "terminal_outcomes_unavailable",
+            "logical_heads_unavailable",
+            "turn_lineage_unavailable"
+        ]);
+        value["legacy_baseline"]["messages"][4] =
+            serde_json::json!({"role":"system","content":"done"});
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&value).unwrap())
+                .unwrap_err()
+                .contains("misplaced system role")
+        );
+    }
+
+    #[test]
+    fn operation_assembler_appends_one_terminal_exchange_with_exact_closure() {
+        let base = legacy_base("revision-1");
+        let input = operation_input(
+            "turn-1",
+            "run-1",
+            kitsu_core::RunOutcomeClass::Succeeded,
+            kitsu_core::RunAssistantDisposition::Committed,
+            serde_json::json!([
+                {"role":"user","content":"inspect new state"},
+                {"role":"assistant","content":"","tool_calls":[{
+                    "tool_name":"fs_read_file","args":"{\"path\":\"b.rs\"}","call_id":"call-new"
+                }]},
+                {"role":"tool","call_id":"call-new","content":"saved immutable output",
+                    "artifact_ids":["artifact-1"]},
+                {"role":"assistant","content":"new answer","tool_calls":[]}
+            ]),
+            serde_json::json!([{"effect_id":"effect-1","artifact_ids":["artifact-1"]}]),
+            serde_json::json!([{
+                "artifact_schema":1,
+                "artifact_id":"artifact-1",
+                "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bytes":22,
+                "media_type":"text/plain"
+            }]),
+        );
+
+        let next = append_complete_operation(
+            &base,
+            RevisionId::new("revision-2").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            input,
+        )
+        .unwrap();
+
+        assert_eq!(
+            next.parent_revision,
+            ExpectedRevision::Exact(RevisionId::new("revision-1").unwrap())
+        );
+        assert_eq!(
+            next.selected_head,
+            LogicalHead::Turn(TurnId::new("turn-1").unwrap())
+        );
+        assert_eq!(next.operations.len(), 1);
+        assert_eq!(
+            next.operations[0].operation.before_head(),
+            &LogicalHead::Genesis
+        );
+        assert_eq!(
+            next.operations[0].operation.after_head(),
+            &LogicalHead::Turn(TurnId::new("turn-1").unwrap())
+        );
+        assert_eq!(next.artifact_manifest.len(), 1);
+        assert_eq!(next.legacy_baseline, base.legacy_baseline);
+        assert!(next.compaction_binding.is_none());
+        assert_eq!(
+            decode_canonical_payload(&encode_canonical_payload(&next).unwrap()).unwrap(),
+            next
+        );
+    }
+
+    #[test]
+    fn operation_assembler_records_discarded_terminal_without_advancing_head() {
+        let base = append_complete_operation(
+            &legacy_base("revision-1"),
+            RevisionId::new("revision-2").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            operation_input(
+                "turn-1",
+                "run-1",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+                serde_json::json!([
+                    {"role":"user","content":"first"},
+                    {"role":"assistant","content":"first answer","tool_calls":[]}
+                ]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap();
+        let prior_head = base.selected_head.clone();
+
+        let next = append_complete_operation(
+            &base,
+            RevisionId::new("revision-3").unwrap(),
+            "2026-08-20T11:02:00.000Z".to_string(),
+            operation_input(
+                "turn-2",
+                "run-2",
+                kitsu_core::RunOutcomeClass::ProviderFault,
+                kitsu_core::RunAssistantDisposition::Discarded,
+                serde_json::json!([{"role":"user","content":"second"}]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(next.operations.len(), 2);
+        assert_eq!(next.selected_head, prior_head);
+        assert_eq!(next.operations[1].operation.before_head(), &prior_head);
+        assert_eq!(next.operations[1].operation.after_head(), &prior_head);
+        assert_eq!(
+            next.operations[1].operation.terminal().class(),
+            SessionOutcomeClass::ProviderFault
+        );
+    }
+
+    #[test]
+    fn operation_assembler_refuses_unclosed_or_inconsistent_facts() {
+        let base = legacy_base("revision-1");
+        let missing_artifact = append_complete_operation(
+            &base,
+            RevisionId::new("revision-2").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            operation_input(
+                "turn-1",
+                "run-1",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+                serde_json::json!([
+                    {"role":"user","content":"inspect"},
+                    {"role":"assistant","content":"done","tool_calls":[]}
+                ]),
+                serde_json::json!([{"effect_id":"effect-1","artifact_ids":["missing"]}]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap_err();
+        assert!(missing_artifact.contains("missing artifact"));
+
+        let mismatched_terminal = append_complete_operation(
+            &base,
+            RevisionId::new("revision-2").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            operation_input(
+                "turn-1",
+                "run-1",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Discarded,
+                serde_json::json!([{"role":"user","content":"inspect"}]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap_err();
+        assert!(mismatched_terminal.contains("disagree"));
+
+        let same_revision = append_complete_operation(
+            &base,
+            RevisionId::new("revision-1").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            operation_input(
+                "turn-1",
+                "run-1",
+                kitsu_core::RunOutcomeClass::ProviderFault,
+                kitsu_core::RunAssistantDisposition::Absent,
+                serde_json::json!([{"role":"user","content":"inspect"}]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap_err();
+        assert!(same_revision.contains("successor revision"));
+
+        let backwards_time = append_complete_operation(
+            &base,
+            RevisionId::new("revision-2").unwrap(),
+            "2026-08-20T10:59:00.000Z".to_string(),
+            operation_input(
+                "turn-1",
+                "run-1",
+                kitsu_core::RunOutcomeClass::ProviderFault,
+                kitsu_core::RunAssistantDisposition::Absent,
+                serde_json::json!([{"role":"user","content":"inspect"}]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap_err();
+        assert!(backwards_time.contains("predates"));
+    }
+
+    #[test]
+    fn complete_payload_round_trips_whole_terminal_operation() {
+        let bytes = complete_payload_fixture();
+        let decoded = decode_canonical_payload(&bytes).unwrap();
+        let encoded = encode_canonical_payload(&decoded).unwrap();
+        let reparsed = decode_canonical_payload(&encoded).unwrap();
+
+        assert_eq!(decoded, reparsed);
+        assert_eq!(decoded.operations.len(), 1);
+        assert_eq!(decoded.operations[0].messages.len(), 4);
+        assert_eq!(
+            decoded.selected_head,
+            kitsu_core::session::LogicalHead::Turn(
+                kitsu_core::session::TurnId::new("turn-1").unwrap()
+            )
+        );
+        assert!(!String::from_utf8(encoded)
+            .unwrap()
+            .contains("canonical_digest"));
+    }
+
+    #[test]
+    fn classified_decode_separates_malformed_future_and_invalid_logical_input() {
+        assert!(matches!(
+            decode_canonical_payload_classified(b"not json"),
+            Err(CanonicalPayloadDecodeErrorV1::Malformed(_))
+        ));
+
+        let mut future: serde_json::Value =
+            serde_json::from_slice(&complete_payload_fixture()).unwrap();
+        future["logical_schema"] = serde_json::json!(3);
+        assert!(matches!(
+            decode_canonical_payload_classified(&serde_json::to_vec(&future).unwrap()),
+            Err(CanonicalPayloadDecodeErrorV1::UnsupportedLogicalSchema {
+                observed: 3,
+                supported: 2
+            })
+        ));
+
+        future["logical_schema"] = serde_json::json!(0);
+        assert!(matches!(
+            decode_canonical_payload_classified(&serde_json::to_vec(&future).unwrap()),
+            Err(CanonicalPayloadDecodeErrorV1::Malformed(_))
+        ));
+
+        let mut invalid: serde_json::Value =
+            serde_json::from_slice(&complete_payload_fixture()).unwrap();
+        invalid["operations"][0]["messages"]
+            .as_array_mut()
+            .unwrap()
+            .remove(2);
+        assert!(matches!(
+            decode_canonical_payload_classified(&serde_json::to_vec(&invalid).unwrap()),
+            Err(CanonicalPayloadDecodeErrorV1::Invalid(_))
+        ));
+
+        let mut invalid_head: serde_json::Value =
+            serde_json::from_slice(&complete_payload_fixture()).unwrap();
+        invalid_head["selected_head"] =
+            serde_json::json!({"kind": "turn", "turn": "turn-not-committed"});
+        assert!(matches!(
+            decode_canonical_payload_classified(&serde_json::to_vec(&invalid_head).unwrap()),
+            Err(CanonicalPayloadDecodeErrorV1::InvalidHead(_))
+        ));
+    }
+
+    #[test]
+    fn committed_operation_requires_closed_causality_and_manifest_closure() {
+        let mut open: serde_json::Value =
+            serde_json::from_slice(&complete_payload_fixture()).unwrap();
+        open["operations"][0]["messages"]
+            .as_array_mut()
+            .unwrap()
+            .remove(2);
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&open).unwrap())
+                .unwrap_err()
+                .contains("unresolved tool call")
+        );
+
+        let mut missing: serde_json::Value =
+            serde_json::from_slice(&complete_payload_fixture()).unwrap();
+        missing["artifact_manifest"] = serde_json::json!([]);
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&missing).unwrap())
+                .unwrap_err()
+                .contains("missing artifact")
+        );
+
+        let mut unreferenced: serde_json::Value =
+            serde_json::from_slice(&complete_payload_fixture()).unwrap();
+        unreferenced["artifact_manifest"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "artifact_schema": 1,
+                "artifact_id": "artifact-extra",
+                "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "bytes": 1,
+                "media_type": null
+            }));
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&unreferenced).unwrap())
+                .unwrap_err()
+                .contains("unreferenced artifact")
+        );
+
+        let mut disagreement: serde_json::Value =
+            serde_json::from_slice(&complete_payload_fixture()).unwrap();
+        disagreement["operations"][0]["operation"]["terminal"]["class"] =
+            serde_json::json!("provider_fault");
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&disagreement).unwrap())
+                .unwrap_err()
+                .contains("terminal class and assistant disposition disagree")
+        );
+    }
+
+    #[test]
+    fn canonical_payload_rejects_unknown_fields_and_stale_projection_binding() {
+        let mut unknown: serde_json::Value =
+            serde_json::from_slice(&complete_payload_fixture()).unwrap();
+        unknown["permission_grants"] = serde_json::json!(["all"]);
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&unknown).unwrap())
+                .unwrap_err()
+                .contains("unknown field")
+        );
+
+        let mut stale: serde_json::Value =
+            serde_json::from_slice(&complete_payload_fixture()).unwrap();
+        stale["compaction_binding"]["source_revision"] = serde_json::json!("rev-other");
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&stale).unwrap())
+                .unwrap_err()
+                .contains("source revision")
+        );
+    }
+
+    fn complete_payload_fixture() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "logical_schema": 2,
+            "store_id": "store-1",
+            "session_id": "session-1",
+            "revision_id": "rev-1",
+            "parent_revision": {"kind":"missing"},
+            "created_at": "2026-08-20T10:00:00.000Z",
+            "committed_at": "2026-08-20T10:01:00.000Z",
+            "metadata": {
+                "name": "review",
+                "launch_directory": "/work/tree",
+                "requested_gateway": "openai",
+                "requested_model": "gpt-test",
+                "project_context_source": "AGENTS.md"
+            },
+            "lineage": {"kind":"root"},
+            "operations": [{
+                "operation": {
+                    "turn_id": "turn-1",
+                    "terminal": {
+                        "run_id": "run-1",
+                        "class": "succeeded",
+                        "assistant": "committed"
+                    },
+                    "before_head": {"kind":"genesis"},
+                    "after_head": {"kind":"turn","turn":"turn-1"}
+                },
+                "messages": [
+                    {"role":"user","content":"inspect"},
+                    {"role":"assistant","content":"","tool_calls":[{
+                        "tool_name":"fs_read_file","args":"{\"path\":\"a.rs\"}","call_id":"call-1"
+                    }]},
+                    {"role":"tool","call_id":"call-1","content":"contents","artifact_ids":["artifact-1"]},
+                    {"role":"assistant","content":"done","tool_calls":[]}
+                ],
+                "retained_effects":[{
+                    "effect_id":"effect-1","artifact_ids":["artifact-1"]
+                }]
+            }],
+            "selected_head": {"kind":"turn","turn":"turn-1"},
+            "artifact_manifest": [{
+                "artifact_schema": 1,
+                "artifact_id": "artifact-1",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bytes": 8,
+                "media_type": "text/plain"
+            }],
+            "compaction_binding": {
+                "projection_schema": 1,
+                "projection_id": "projection-1",
+                "source_revision": "rev-1",
+                "source_head": {"kind":"turn","turn":"turn-1"},
+                "included_operations": ["turn-1"],
+                "route_generation": "route-1",
+                "capability_generation": "caps-1",
+                "model_generation": "model-1",
+                "estimator_generation": "estimator-1",
+                "budget_tokens": 4096,
+                "loss_manifest": ["tool output elided"]
+            },
+            "recovery_log": []
+        }))
+        .unwrap()
+    }
+}

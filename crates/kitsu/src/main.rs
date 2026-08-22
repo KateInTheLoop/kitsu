@@ -8,6 +8,7 @@ mod command_artifact;
 mod config;
 mod credential_store;
 mod llms;
+mod process_exit;
 mod prompt_queue;
 mod session;
 mod skills;
@@ -18,7 +19,7 @@ mod workspace;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -26,26 +27,37 @@ use clap::Parser;
 use rustyline::ExternalPrinter as _;
 
 use cli::{AuthCommand, Cli, Command, SessionCommand};
-use config::{Config, ConfigError, Gateway};
+use config::{Config, ConfigError, Gateway, GatewayAdapter};
 use kitsu_core::context::{
     clamp_window_for_shortfall, estimate_str, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW,
 };
 use kitsu_core::{run_agent_turn_with_state, AgentConfig, ArtifactStoragePolicy, CompactionMode};
+use kitsu_providers::anthropic_messages::{
+    AnthropicMessagesRouteBuildError, AnthropicMessagesRouteConfig,
+};
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
-use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
+use kitsu_providers::compiled::{
+    build_compiled_catalog_route, build_compiled_provider_route, CompiledProvider,
+    CompiledProviderRouteBuildError, CompiledProviderRouteConfig,
+};
+use kitsu_providers::openai_compat::{
+    OpenAICompatCatalogRouteConfig, OpenAICompatRouteBuildError, OpenAICompatRouteConfig,
+};
 use kitsu_providers::{
-    ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderAttemptEvent,
-    ProviderError, ProviderTelemetrySink,
+    ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderAdapterId,
+    ProviderAttemptEvent, ProviderAuthSource, ProviderCapability, ProviderCatalogHandle,
+    ProviderCatalogPolicy, ProviderError, ProviderFallbackPolicy, ProviderProfileId,
+    ProviderReplayGenerationPolicy, ProviderRetryGenerationPolicy, ProviderRouteContractError,
+    ProviderRouteCurrent, ProviderRouteDeclaration, ProviderRouteHandle, ProviderRoutePolicy,
+    ProviderRouteReceipt, ProviderTelemetrySink, ProviderWireRevision,
 };
 use kitsu_tools::{
     builtins, CommandApprovalRequest, CommandDecision, CommandPrompter, Decision, Mode,
-    PermissionRequest, Permissions, Prompter, Registry,
+    PermissionRequest, Permissions, Prompter, Registry, RegistryError,
 };
-
-/// Exit codes per design §6: 1 = user/config/auth-missing, 2 = provider.
-const EXIT_USER: i32 = 1;
-const EXIT_PROVIDER: i32 = 2;
-const EXIT_CANCELLED: i32 = 130;
+use process_exit::{
+    evaluate_process_exit, InferenceCarrier, EXIT_CANCELLED, EXIT_PROVIDER, EXIT_USER,
+};
 const JSONL_SCHEMA: &str = "kitsu.chat.v1";
 static JSONL_SUMMARY_EMITTED: AtomicBool = AtomicBool::new(false);
 /// `-o` is a host-owned sink, so a run with no fully committed assistant must
@@ -60,10 +72,24 @@ static RUN_STARTED_AT: OnceLock<Instant> = OnceLock::new();
 /// Set only by inference-capable commands, keeping management/help output free
 /// of an unrelated timing footer.
 static MODEL_COMMAND_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Distinguishes structurally child-free inference preflight from a carrier
+/// that has begun a provider turn. Only the former may use the top-level
+/// fallback's `Joined` cleanup fact without guessing.
+static MODEL_INFERENCE_STARTED: AtomicBool = AtomicBool::new(false);
+/// One phase owner for the inference-capable process run. Carrier helpers must
+/// advance this instance instead of constructing presentation-local owners.
+static PROCESS_RUN_LIFECYCLE: OnceLock<Mutex<kitsu_core::RunLifecycle>> = OnceLock::new();
+static PROCESS_TERMINAL_FACTS: OnceLock<ProcessTerminalFacts> = OnceLock::new();
+static PROCESS_INTERACTIVE_TERMINAL_FACTS: OnceLock<InteractiveTerminalFacts> = OnceLock::new();
+static PROCESS_INFERENCE_CARRIER: OnceLock<InferenceCarrier> = OnceLock::new();
+static PROCESS_PUBLISHED_RUN: OnceLock<kitsu_core::PublishedRun> = OnceLock::new();
 /// Set only when `--allow-turn-errors` converts a scripted run with both a
 /// success and a failure into an accepted partial result. The process-level
 /// timing footer otherwise sees only exit code 0 and would mislabel it `ok`.
 static SCRIPT_ACCEPTED_PARTIAL: AtomicBool = AtomicBool::new(false);
+/// Last terminal assistant disposition observed in this process-run. Zero is
+/// the valid initial `Absent` state.
+static RUN_ASSISTANT_DISPOSITION: AtomicU8 = AtomicU8::new(0);
 /// Exact count of semantically successful requested operations mirrored into
 /// JSONL's terminal summary. Scripted execution owns its authoritative local
 /// count (notably, `/quit` is control flow rather than a successful operation)
@@ -97,14 +123,26 @@ impl SessionSnapshotState {
 struct JsonlSessionReceipt {
     planned_id: Option<String>,
     snapshot_state: SessionSnapshotState,
+    persistence_state: kitsu_core::RunPersistenceState,
 }
 
 impl JsonlSessionReceipt {
-    const fn disabled() -> Self {
+    const fn new(planned_id: Option<String>, snapshot_state: SessionSnapshotState) -> Self {
+        let persistence_state = match snapshot_state {
+            SessionSnapshotState::Disabled => kitsu_core::RunPersistenceState::NotRequested,
+            SessionSnapshotState::PendingUntilFirstSuccess | SessionSnapshotState::Resumable => {
+                kitsu_core::RunPersistenceState::Preserved
+            }
+        };
         Self {
-            planned_id: None,
-            snapshot_state: SessionSnapshotState::Disabled,
+            planned_id,
+            snapshot_state,
+            persistence_state,
         }
+    }
+
+    const fn disabled() -> Self {
+        Self::new(None, SessionSnapshotState::Disabled)
     }
 
     fn terminal_id(&self) -> Option<String> {
@@ -112,11 +150,31 @@ impl JsonlSessionReceipt {
             .then(|| self.planned_id.clone())
             .flatten()
     }
+
+    const fn persistence_state(&self) -> kitsu_core::RunPersistenceState {
+        self.persistence_state
+    }
+
+    fn mark_committed(&mut self, session_id: &str) {
+        self.planned_id = Some(session_id.to_string());
+        self.snapshot_state = SessionSnapshotState::Resumable;
+        self.persistence_state = kitsu_core::RunPersistenceState::Committed;
+    }
+
+    fn mark_failed(&mut self) {
+        if self.persistence_state != kitsu_core::RunPersistenceState::NotRequested {
+            self.persistence_state = kitsu_core::RunPersistenceState::Failed;
+        }
+    }
 }
 
 static JSONL_SESSION_RECEIPT: Mutex<JsonlSessionReceipt> =
     Mutex::new(JsonlSessionReceipt::disabled());
-static APPROVAL_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+// Count pending and active approval readers. A claimant increments before it
+// waits for the stdin mutex so type-ahead cannot repeatedly reacquire the lock
+// and starve the authority prompt. A count also avoids a false inactive window
+// when more than one prompt is waiting.
+static APPROVAL_INPUT_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static APPROVAL_INPUT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static FOREGROUND_CANCELLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_QUIT_CANCEL: AtomicBool = AtomicBool::new(false);
@@ -146,15 +204,202 @@ fn jsonl_requested() -> bool {
         .any(|arg| arg == "--jsonl" || arg.to_str().is_some_and(|arg| arg.starts_with("--jsonl=")))
 }
 
-fn jsonl_run_id() -> &'static str {
-    static RUN_ID: OnceLock<String> = OnceLock::new();
-    RUN_ID.get_or_init(|| {
+fn run_spec() -> &'static kitsu_core::RunSpec {
+    static RUN_SPEC: OnceLock<kitsu_core::RunSpec> = OnceLock::new();
+    RUN_SPEC.get_or_init(|| {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        format!("{}-{nanos}", std::process::id())
+        let run_id = kitsu_core::RunId::new(format!("{}-{nanos}", std::process::id()))
+            .expect("process-generated run identity is machine-safe and bounded");
+        kitsu_core::RunSpec::new(run_id)
     })
+}
+
+fn run_id() -> &'static str {
+    run_spec().run_id().as_str()
+}
+
+fn process_run_lifecycle() -> &'static Mutex<kitsu_core::RunLifecycle> {
+    PROCESS_RUN_LIFECYCLE.get_or_init(|| Mutex::new(kitsu_core::RunLifecycle::accept(run_spec())))
+}
+
+fn activate_model_command(carrier: InferenceCarrier) -> Result<(), CliError> {
+    PROCESS_INFERENCE_CARRIER.set(carrier).map_err(|_| {
+        CliError::user("internal inference carrier was initialized more than once".to_string())
+    })?;
+    MODEL_COMMAND_ACTIVE.store(true, Ordering::Release);
+    let _ = process_run_lifecycle();
+    Ok(())
+}
+
+fn mark_model_inference_started() {
+    MODEL_INFERENCE_STARTED.store(true, Ordering::Release);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessTerminalFacts {
+    cleanup: kitsu_core::RunCleanupState,
+    persistence: kitsu_core::RunPersistenceState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InteractiveTerminalFacts {
+    outcome: kitsu_core::RunOutcomeClass,
+    assistant: kitsu_core::RunAssistantDisposition,
+    cleanup: kitsu_core::RunCleanupState,
+    persistence: kitsu_core::RunPersistenceState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InteractiveRunAggregate {
+    successful_operation: bool,
+    primary_non_success: Option<kitsu_core::RunOutcomeClass>,
+    assistant: kitsu_core::RunAssistantDisposition,
+    cleanup: kitsu_core::RunCleanupState,
+    replaced_turns: u32,
+}
+
+impl Default for InteractiveRunAggregate {
+    fn default() -> Self {
+        Self {
+            successful_operation: false,
+            primary_non_success: None,
+            assistant: kitsu_core::RunAssistantDisposition::Absent,
+            cleanup: kitsu_core::RunCleanupState::Joined,
+            replaced_turns: 0,
+        }
+    }
+}
+
+impl InteractiveRunAggregate {
+    fn record_non_success(&mut self, outcome: kitsu_core::RunOutcomeClass) {
+        debug_assert!(!matches!(outcome, kitsu_core::RunOutcomeClass::Succeeded));
+        self.primary_non_success.get_or_insert(outcome);
+    }
+
+    fn record_turn(
+        &mut self,
+        outcome: kitsu_core::RunOutcomeClass,
+        assistant: kitsu_core::RunAssistantDisposition,
+    ) {
+        match outcome {
+            kitsu_core::RunOutcomeClass::Succeeded => self.successful_operation = true,
+            kitsu_core::RunOutcomeClass::PartiallySucceeded => {
+                self.successful_operation = true;
+                self.primary_non_success
+                    .get_or_insert(kitsu_core::RunOutcomeClass::PartiallySucceeded);
+            }
+            other => self.record_non_success(other),
+        }
+        self.assistant = assistant;
+    }
+
+    fn record_replaced_turn(&mut self) {
+        self.replaced_turns = self.replaced_turns.saturating_add(1);
+        self.assistant = kitsu_core::RunAssistantDisposition::Discarded;
+    }
+
+    fn record_background_snapshot(&mut self, snapshot: &subagent::AgentProgressSnapshot) {
+        self.successful_operation |= snapshot.done > 0;
+        if snapshot.failed > 0 {
+            self.primary_non_success
+                .get_or_insert(kitsu_core::RunOutcomeClass::ProviderFault);
+        }
+        if snapshot.cancelled > 0 {
+            self.primary_non_success
+                .get_or_insert(kitsu_core::RunOutcomeClass::Cancelled);
+        }
+    }
+
+    fn observe_cleanup(&mut self, cleanup: kitsu_core::RunCleanupState) {
+        use kitsu_core::RunCleanupState::{Joined, NotObserved, Residue};
+        self.cleanup = match (self.cleanup, cleanup) {
+            (NotObserved, _) | (_, NotObserved) => NotObserved,
+            (Joined, state) => state,
+            (state, Joined) => state,
+            (Residue { unjoined: left }, Residue { unjoined: right }) => Residue {
+                unjoined: std::num::NonZeroU32::new(left.get().saturating_add(right.get()))
+                    .expect("sum of nonzero cleanup residue remains nonzero"),
+            },
+        };
+    }
+
+    fn outcome(&self) -> kitsu_core::RunOutcomeClass {
+        match (self.successful_operation, self.primary_non_success) {
+            (true, Some(_)) => kitsu_core::RunOutcomeClass::PartiallySucceeded,
+            (true, None) | (false, None) => kitsu_core::RunOutcomeClass::Succeeded,
+            (false, Some(outcome)) => outcome,
+        }
+    }
+
+    const fn assistant(&self) -> kitsu_core::RunAssistantDisposition {
+        self.assistant
+    }
+
+    #[cfg(test)]
+    const fn replaced_turns(&self) -> u32 {
+        self.replaced_turns
+    }
+
+    fn terminal_facts(
+        &self,
+        persistence: kitsu_core::RunPersistenceState,
+    ) -> InteractiveTerminalFacts {
+        InteractiveTerminalFacts {
+            outcome: self.outcome(),
+            assistant: self.assistant(),
+            cleanup: self.cleanup,
+            persistence,
+        }
+    }
+}
+
+fn record_interactive_terminal_facts(facts: InteractiveTerminalFacts) -> Result<(), CliError> {
+    PROCESS_INTERACTIVE_TERMINAL_FACTS
+        .set(facts)
+        .map_err(|_| CliError::user("interactive terminal facts were already recorded"))
+}
+
+fn record_process_terminal_facts_in(
+    receipt: &OnceLock<ProcessTerminalFacts>,
+    facts: ProcessTerminalFacts,
+) -> Result<(), &'static str> {
+    receipt
+        .set(facts)
+        .map_err(|_| "process terminal facts were already recorded")
+}
+
+fn record_process_terminal_facts(facts: ProcessTerminalFacts) -> Result<(), CliError> {
+    record_process_terminal_facts_in(&PROCESS_TERMINAL_FACTS, facts).map_err(CliError::user)
+}
+
+fn process_terminal_facts_or_fallback() -> ProcessTerminalFacts {
+    PROCESS_TERMINAL_FACTS
+        .get()
+        .copied()
+        .unwrap_or(ProcessTerminalFacts {
+            cleanup: if MODEL_INFERENCE_STARTED.load(Ordering::Acquire) {
+                kitsu_core::RunCleanupState::NotObserved
+            } else {
+                kitsu_core::RunCleanupState::Joined
+            },
+            persistence: jsonl_session_persistence_state(),
+        })
+}
+
+fn record_human_terminal_facts(cleanup: kitsu_core::RunCleanupState) -> Result<(), CliError> {
+    record_process_terminal_facts(ProcessTerminalFacts {
+        cleanup,
+        persistence: jsonl_session_persistence_state(),
+    })
+}
+
+fn record_human_terminal_facts_preserving_error(cleanup: kitsu_core::RunCleanupState) {
+    if let Err(error) = record_human_terminal_facts(cleanup) {
+        eprintln!("~ additional terminal fact handoff failure: {error}");
+    }
 }
 
 fn run_elapsed() -> Duration {
@@ -176,7 +421,7 @@ fn jsonl_emitter() -> &'static Mutex<kitsu_render::jsonl::JsonlEmitter<std::io::
         Mutex::new(kitsu_render::jsonl::JsonlEmitter::new(
             std::io::stdout(),
             JSONL_SCHEMA,
-            jsonl_run_id(),
+            run_id(),
         ))
     })
 }
@@ -268,6 +513,201 @@ fn emit_jsonl_summary_with_local_failures(
     )
 }
 
+fn jsonl_summary_outcome(
+    status: &str,
+    provider_failures: usize,
+    tool_failures: usize,
+    policy_failures: usize,
+) -> Result<kitsu_core::RunOutcomeClass, CliError> {
+    match status {
+        "ok" => Ok(kitsu_core::RunOutcomeClass::Succeeded),
+        "partial" => Ok(kitsu_core::RunOutcomeClass::PartiallySucceeded),
+        "cancelled" => Ok(kitsu_core::RunOutcomeClass::Cancelled),
+        "error" if provider_failures > 0 => Ok(kitsu_core::RunOutcomeClass::ProviderFault),
+        "error" if tool_failures > 0 || policy_failures > 0 => {
+            Ok(kitsu_core::RunOutcomeClass::ToolFault)
+        }
+        "error" => Ok(kitsu_core::RunOutcomeClass::UserFault),
+        unknown => Err(CliError::user(format!(
+            "internal final summary status is not recognized: {unknown}"
+        ))),
+    }
+}
+
+/// Run the deliberately narrow `ask --jsonl` terminal path through the common
+/// lifecycle. `ask` has no tools/children or session store, making Joined and
+/// NotRequested structural facts rather than carrier guesses. The delivery
+/// closure is injectable so provider-free tests can cut the sink boundary.
+#[cfg(test)]
+fn finalize_terminal_with_delivery<E>(
+    outcome: kitsu_core::RunOutcomeClass,
+    assistant: kitsu_core::RunAssistantDisposition,
+    cleanup: kitsu_core::RunCleanupState,
+    persistence: kitsu_core::RunPersistenceState,
+    deliver: impl FnOnce() -> Result<(), E>,
+) -> Result<(kitsu_core::PublishedRun, Result<(), E>), kitsu_core::RunPhaseError> {
+    let mut lifecycle = kitsu_core::RunLifecycle::accept(run_spec());
+    finalize_owned_terminal_with_delivery(
+        &mut lifecycle,
+        outcome,
+        assistant,
+        cleanup,
+        persistence,
+        deliver,
+    )
+}
+
+fn finalize_owned_terminal_with_delivery<E>(
+    lifecycle: &mut kitsu_core::RunLifecycle,
+    outcome: kitsu_core::RunOutcomeClass,
+    assistant: kitsu_core::RunAssistantDisposition,
+    cleanup: kitsu_core::RunCleanupState,
+    persistence: kitsu_core::RunPersistenceState,
+    deliver: impl FnOnce() -> Result<(), E>,
+) -> Result<(kitsu_core::PublishedRun, Result<(), E>), kitsu_core::RunPhaseError> {
+    lifecycle.settle(outcome, assistant)?;
+    lifecycle.join(cleanup)?;
+    lifecycle.persist(persistence)?;
+    let delivery = deliver();
+    lifecycle.deliver(if delivery.is_ok() {
+        kitsu_core::RunDeliveryState::Delivered
+    } else {
+        kitsu_core::RunDeliveryState::Failed
+    })?;
+    let published = lifecycle.publish()?;
+    Ok((published, delivery))
+}
+
+fn finalize_process_terminal_with_delivery<E>(
+    outcome: kitsu_core::RunOutcomeClass,
+    assistant: kitsu_core::RunAssistantDisposition,
+    cleanup: kitsu_core::RunCleanupState,
+    persistence: kitsu_core::RunPersistenceState,
+    deliver: impl FnOnce() -> Result<(), E>,
+) -> Result<(kitsu_core::PublishedRun, Result<(), E>), kitsu_core::RunPhaseError> {
+    let mut lifecycle = process_run_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let result = finalize_owned_terminal_with_delivery(
+        &mut lifecycle,
+        outcome,
+        assistant,
+        cleanup,
+        persistence,
+        deliver,
+    );
+    if let Ok((published, _)) = &result {
+        let recorded = PROCESS_PUBLISHED_RUN.set(published.clone());
+        debug_assert!(recorded.is_ok(), "process terminal publication is unique");
+    }
+    result
+}
+
+#[cfg(test)]
+fn finalize_ask_terminal_with_delivery<E>(
+    outcome: kitsu_core::RunOutcomeClass,
+    assistant: kitsu_core::RunAssistantDisposition,
+    deliver: impl FnOnce() -> Result<(), E>,
+) -> Result<(kitsu_core::PublishedRun, Result<(), E>), kitsu_core::RunPhaseError> {
+    finalize_terminal_with_delivery(
+        outcome,
+        assistant,
+        kitsu_core::RunCleanupState::Joined,
+        kitsu_core::RunPersistenceState::NotRequested,
+        deliver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_ask_jsonl_summary_with_local_failures(
+    status: &str,
+    failures: usize,
+    provider_failures: usize,
+    output_schema_failures: usize,
+    tool_failures: usize,
+    policy_failures: usize,
+    tool_error_totals: ToolErrorTotals,
+) -> Result<(), CliError> {
+    let outcome = jsonl_summary_outcome(status, provider_failures, tool_failures, policy_failures)?;
+    let assistant = run_assistant_disposition();
+    let (published, delivery) = finalize_process_terminal_with_delivery(
+        outcome,
+        assistant,
+        kitsu_core::RunCleanupState::Joined,
+        kitsu_core::RunPersistenceState::NotRequested,
+        || {
+            emit_jsonl_summary_with_local_failures(
+                status,
+                failures,
+                provider_failures,
+                output_schema_failures,
+                tool_failures,
+                policy_failures,
+                tool_error_totals,
+            )
+        },
+    )
+    .map_err(|error| CliError::user(format!("internal ask finalization failed: {error}")))?;
+    debug_assert_eq!(published.terminal().class(), outcome);
+    debug_assert_eq!(published.terminal().assistant(), assistant);
+    delivery
+}
+
+fn publish_fallback_inference_jsonl_terminal(error: &CliError) -> Result<(), CliError> {
+    debug_assert!(MODEL_COMMAND_ACTIVE.load(Ordering::Acquire));
+    let outcome = error.outcome_class();
+    let assistant = run_assistant_disposition();
+    let facts = process_terminal_facts_or_fallback();
+    let cancelled = error.exit_code() == EXIT_CANCELLED;
+    let (published, delivery) = finalize_process_terminal_with_delivery(
+        outcome,
+        assistant,
+        facts.cleanup,
+        facts.persistence,
+        || {
+            emit_jsonl("error", error.jsonl_error_payload())?;
+            emit_jsonl_summary(
+                if cancelled { "cancelled" } else { "error" },
+                1,
+                usize::from(error.exit_code() == EXIT_PROVIDER),
+            )
+        },
+    )
+    .map_err(|phase_error| {
+        CliError::user(format!(
+            "internal fallback inference finalization failed: {phase_error}"
+        ))
+    })?;
+    debug_assert_eq!(published.terminal().class(), outcome);
+    debug_assert_eq!(published.terminal().assistant(), assistant);
+    debug_assert_eq!(published.cleanup(), facts.cleanup);
+    debug_assert_eq!(published.persistence(), facts.persistence);
+    delivery
+}
+
+fn publish_piped_jsonl_terminal(
+    cleanup: kitsu_core::RunCleanupState,
+    status: &str,
+    provider_failures: usize,
+    tool_failures: usize,
+    policy_failures: usize,
+    deliver: impl FnOnce() -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    let outcome = jsonl_summary_outcome(status, provider_failures, tool_failures, policy_failures)?;
+    let assistant = run_assistant_disposition();
+    let persistence = jsonl_session_persistence_state();
+    let (published, delivery) =
+        finalize_process_terminal_with_delivery(outcome, assistant, cleanup, persistence, deliver)
+            .map_err(|error| {
+                CliError::user(format!("internal piped finalization failed: {error}"))
+            })?;
+    debug_assert_eq!(published.terminal().class(), outcome);
+    debug_assert_eq!(published.terminal().assistant(), assistant);
+    debug_assert_eq!(published.cleanup(), cleanup);
+    debug_assert_eq!(published.persistence(), persistence);
+    delivery
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_jsonl_summary_with_postcondition_failures(
     status: &str,
@@ -280,6 +720,8 @@ fn emit_jsonl_summary_with_postcondition_failures(
     tool_error_totals: ToolErrorTotals,
 ) -> Result<(), CliError> {
     debug_assert!(output_schema_failures <= provider_failures);
+    let outcome = jsonl_summary_outcome(status, provider_failures, tool_failures, policy_failures)?;
+    let terminal = run_spec().terminal(outcome, run_assistant_disposition());
     let cancelled_failures = usize::from(status == "cancelled" && failures > 0);
     let user_failures = failures
         .saturating_sub(provider_failures + tool_failures + policy_failures + cancelled_failures);
@@ -292,6 +734,8 @@ fn emit_jsonl_summary_with_postcondition_failures(
     };
     let mut payload = serde_json::json!({
         "status": status,
+        "outcome": terminal.class().as_str(),
+        "assistant": terminal.assistant().as_str(),
         "failures": failures,
         "provider_failures": provider_failures,
         "output_schema_failures": output_schema_failures,
@@ -337,17 +781,29 @@ fn output_last_message_summary_state(postcondition_failures: usize) -> Option<&'
 fn set_jsonl_session_receipt(planned_id: Option<String>, snapshot_state: SessionSnapshotState) {
     *JSONL_SESSION_RECEIPT
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = JsonlSessionReceipt {
-        planned_id,
-        snapshot_state,
-    };
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        JsonlSessionReceipt::new(planned_id, snapshot_state);
 }
 
 fn mark_jsonl_session_resumable(session_id: &str) {
-    set_jsonl_session_receipt(
-        Some(session_id.to_string()),
-        SessionSnapshotState::Resumable,
-    );
+    JSONL_SESSION_RECEIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .mark_committed(session_id);
+}
+
+fn mark_jsonl_session_persistence_failed() {
+    JSONL_SESSION_RECEIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .mark_failed();
+}
+
+fn jsonl_session_persistence_state() -> kitsu_core::RunPersistenceState {
+    JSONL_SESSION_RECEIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .persistence_state()
 }
 
 fn validate_output_last_message_surface(cli: &Cli) -> Result<(), CliError> {
@@ -420,6 +876,50 @@ fn validate_output_schema_surface(cli: &Cli) -> Result<(), CliError> {
     OUTPUT_SCHEMA
         .set(schema)
         .map_err(|_| CliError::user("--output-schema was initialized more than once".to_string()))
+}
+
+fn inference_command_requested(cli: &Cli) -> bool {
+    cli.print_prompt.is_some()
+        || matches!(
+            cli.command.as_ref(),
+            None | Some(Command::Ask { .. })
+                | Some(Command::Review { .. })
+                | Some(Command::Chat { .. })
+        )
+}
+
+fn inference_carrier(cli: &Cli, stdin_is_tty: bool) -> Option<InferenceCarrier> {
+    let human_or_jsonl = |human, jsonl| if cli.jsonl { jsonl } else { human };
+    if cli.print_prompt.is_some() {
+        return Some(human_or_jsonl(
+            InferenceCarrier::AskHuman,
+            InferenceCarrier::AskJsonl,
+        ));
+    }
+    match cli.command.as_ref() {
+        Some(Command::Ask { .. }) => Some(human_or_jsonl(
+            InferenceCarrier::AskHuman,
+            InferenceCarrier::AskJsonl,
+        )),
+        Some(Command::Review { .. }) => Some(human_or_jsonl(
+            InferenceCarrier::PipedHuman,
+            InferenceCarrier::PipedJsonl,
+        )),
+        Some(Command::Chat {
+            script: Some(_), ..
+        }) => Some(human_or_jsonl(
+            InferenceCarrier::ScriptHuman,
+            InferenceCarrier::ScriptJsonl,
+        )),
+        None | Some(Command::Chat { script: None, .. }) if stdin_is_tty && !cli.jsonl => {
+            Some(InferenceCarrier::InteractiveHuman)
+        }
+        None | Some(Command::Chat { script: None, .. }) => Some(human_or_jsonl(
+            InferenceCarrier::PipedHuman,
+            InferenceCarrier::PipedJsonl,
+        )),
+        _ => None,
+    }
 }
 
 fn active_output_schema() -> Option<&'static structured_output::OutputSchema> {
@@ -1074,6 +1574,10 @@ fn install_broken_pipe_guard() {
 
 fn main() {
     let _ = RUN_STARTED_AT.set(Instant::now());
+    // Every surface receives one neutral identity before argument parsing can
+    // accept work. JSONL, human mode, and private artifacts then refer to the
+    // same process-run spec even when presentation does not yet display it.
+    let _ = run_spec();
     install_broken_pipe_guard();
     let jsonl_mode = jsonl_requested();
     // Logs (never the token: HeaderValue is marked sensitive) go to stderr.
@@ -1092,14 +1596,24 @@ fn main() {
         .with_writer(trace_writer)
         .try_init();
 
-    let code = match run() {
-        Ok(()) if jsonl_mode => jsonl_output_failure().map_or(0, |error| {
-            std::eprintln!("{error}");
-            error.exit_code()
-        }),
-        Ok(()) => 0,
+    let (mut code, mut outcome_class) = match run() {
+        Ok(()) if jsonl_mode => {
+            jsonl_output_failure().map_or((0, kitsu_core::RunOutcomeClass::Succeeded), |error| {
+                std::eprintln!("{error}");
+                (error.exit_code(), error.outcome_class())
+            })
+        }
+        Ok(()) => (
+            0,
+            if SCRIPT_ACCEPTED_PARTIAL.load(Ordering::Acquire) {
+                kitsu_core::RunOutcomeClass::PartiallySucceeded
+            } else {
+                kitsu_core::RunOutcomeClass::Succeeded
+            },
+        ),
         Err(e) => {
-            if !jsonl_mode {
+            let outcome_class = e.outcome_class();
+            let code = if !jsonl_mode {
                 // One weighted `! error:` notice (ember-red on a TTY); any
                 // extra lines in the message are the actionable hint.
                 for line in kitsu_render::error_lines(&e.to_string()) {
@@ -1107,18 +1621,25 @@ fn main() {
                 }
                 e.exit_code()
             } else {
-                if jsonl_output_failure().is_none()
-                    && !JSONL_SUMMARY_EMITTED.load(Ordering::Acquire)
-                {
-                    let cancelled = e.exit_code() == EXIT_CANCELLED;
-                    let frame_result =
+                if !JSONL_SUMMARY_EMITTED.load(Ordering::Acquire) {
+                    let frame_result = if MODEL_COMMAND_ACTIVE.load(Ordering::Acquire) {
+                        // Carrier-provided facts win. Before the first provider
+                        // turn, Joined is structural; after it, missing cleanup
+                        // evidence is explicitly NotObserved rather than guessed.
+                        publish_fallback_inference_jsonl_terminal(&e)
+                    } else if jsonl_output_failure().is_none() {
+                        let cancelled = e.exit_code() == EXIT_CANCELLED;
                         emit_jsonl("error", e.jsonl_error_payload()).and_then(|()| {
                             emit_jsonl_summary(
                                 if cancelled { "cancelled" } else { "error" },
                                 1,
                                 usize::from(e.exit_code() == EXIT_PROVIDER),
                             )
-                        });
+                        })
+                    } else {
+                        Err(jsonl_output_failure()
+                            .expect("management fallback observed terminal output failure"))
+                    };
                     // `jsonl_output_failure` below reports the retained
                     // terminal error exactly once when framing itself fails.
                     let _ = frame_result;
@@ -1132,22 +1653,91 @@ fn main() {
                         output_error.exit_code()
                     },
                 )
-            }
+            };
+            (code, outcome_class)
         }
     };
+    if jsonl_mode && MODEL_COMMAND_ACTIVE.load(Ordering::Acquire) {
+        match (
+            PROCESS_INFERENCE_CARRIER.get().copied(),
+            PROCESS_PUBLISHED_RUN.get(),
+        ) {
+            (Some(carrier), Some(published)) => {
+                code = evaluate_process_exit(code, carrier, published);
+            }
+            _ if code == 0 => {
+                std::eprintln!("internal JSONL inference lifecycle was not published");
+                code = EXIT_USER;
+            }
+            _ => {}
+        }
+    }
     if !jsonl_mode && output_last_message_preserved_without_commit() {
         std::eprintln!("~ --output-last-message unchanged: no committed assistant message");
     }
     if !jsonl_mode && MODEL_COMMAND_ACTIVE.load(Ordering::Acquire) {
-        let status = match code {
-            0 if SCRIPT_ACCEPTED_PARTIAL.load(Ordering::Acquire) => {
+        let interactive_facts = PROCESS_INTERACTIVE_TERMINAL_FACTS.get().copied();
+        if let Some(facts) = interactive_facts {
+            outcome_class = facts.outcome;
+        }
+        let terminal = run_spec().terminal(
+            outcome_class,
+            interactive_facts.map_or_else(run_assistant_disposition, |facts| facts.assistant),
+        );
+        let status = match terminal.class() {
+            kitsu_core::RunOutcomeClass::Succeeded => kitsu_render::RunTimingStatus::Ok,
+            kitsu_core::RunOutcomeClass::PartiallySucceeded => {
                 kitsu_render::RunTimingStatus::Partial
             }
-            0 => kitsu_render::RunTimingStatus::Ok,
-            EXIT_CANCELLED => kitsu_render::RunTimingStatus::Cancelled,
-            _ => kitsu_render::RunTimingStatus::Error,
+            kitsu_core::RunOutcomeClass::Cancelled => kitsu_render::RunTimingStatus::Cancelled,
+            kitsu_core::RunOutcomeClass::Interrupted => kitsu_render::RunTimingStatus::Interrupted,
+            kitsu_core::RunOutcomeClass::UserFault
+            | kitsu_core::RunOutcomeClass::ProviderFault
+            | kitsu_core::RunOutcomeClass::ToolFault => kitsu_render::RunTimingStatus::Error,
         };
-        kitsu_render::emit_run_timing(run_elapsed(), status);
+        let deliver = || {
+            kitsu_render::emit_run_timing(
+                run_elapsed(),
+                status,
+                kitsu_render::HumanRunReceipt {
+                    run_id: terminal.run_id().as_str(),
+                    outcome: terminal.class().as_str(),
+                    assistant: terminal.assistant().as_str(),
+                },
+            )
+        };
+        let facts = interactive_facts.map_or_else(process_terminal_facts_or_fallback, |facts| {
+            ProcessTerminalFacts {
+                cleanup: facts.cleanup,
+                persistence: facts.persistence,
+            }
+        });
+        match finalize_process_terminal_with_delivery(
+            terminal.class(),
+            terminal.assistant(),
+            facts.cleanup,
+            facts.persistence,
+            deliver,
+        ) {
+            Ok((published, delivery)) => {
+                debug_assert_eq!(published.terminal(), &terminal);
+                debug_assert_eq!(
+                    delivery.is_ok(),
+                    published.delivery() == kitsu_core::RunDeliveryState::Delivered
+                );
+                let carrier = PROCESS_INFERENCE_CARRIER
+                    .get()
+                    .copied()
+                    .expect("active model command has an inference carrier");
+                code = evaluate_process_exit(code, carrier, &published);
+            }
+            Err(error) => {
+                std::eprintln!("internal human inference finalization failed: {error}");
+                if code == 0 {
+                    code = EXIT_USER;
+                }
+            }
+        }
     }
     std::process::exit(code);
 }
@@ -1157,6 +1747,7 @@ struct CliError {
     message: String,
     code: i32,
     diagnostic: Option<ProviderDiagnosticCode>,
+    outcome_class: kitsu_core::RunOutcomeClass,
 }
 
 impl CliError {
@@ -1165,6 +1756,7 @@ impl CliError {
             message: message.into(),
             code: EXIT_USER,
             diagnostic: None,
+            outcome_class: kitsu_core::RunOutcomeClass::UserFault,
         }
     }
     fn provider(message: impl Into<String>) -> Self {
@@ -1172,6 +1764,7 @@ impl CliError {
             message: message.into(),
             code: EXIT_PROVIDER,
             diagnostic: None,
+            outcome_class: kitsu_core::RunOutcomeClass::ProviderFault,
         }
     }
     fn cancelled(message: impl Into<String>) -> Self {
@@ -1179,6 +1772,25 @@ impl CliError {
             message: message.into(),
             code: EXIT_CANCELLED,
             diagnostic: None,
+            outcome_class: kitsu_core::RunOutcomeClass::Cancelled,
+        }
+    }
+
+    fn tool(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: EXIT_USER,
+            diagnostic: None,
+            outcome_class: kitsu_core::RunOutcomeClass::ToolFault,
+        }
+    }
+
+    fn interrupted(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: EXIT_USER,
+            diagnostic: None,
+            outcome_class: kitsu_core::RunOutcomeClass::Interrupted,
         }
     }
 
@@ -1192,6 +1804,10 @@ impl CliError {
     }
     fn exit_code(&self) -> i32 {
         self.code
+    }
+
+    fn outcome_class(&self) -> kitsu_core::RunOutcomeClass {
+        self.outcome_class
     }
 
     fn jsonl_kind(&self) -> &'static str {
@@ -1213,6 +1829,12 @@ impl CliError {
             payload["recovery_actions"] = serde_json::json!(diagnostic.recovery_actions());
         }
         payload
+    }
+}
+
+impl From<RegistryError> for CliError {
+    fn from(error: RegistryError) -> Self {
+        Self::user(format!("tool registry composition failed: {error}"))
     }
 }
 
@@ -1245,6 +1867,13 @@ fn run() -> Result<(), CliError> {
         },
     };
     kitsu_render::configure_terminal_modes(cli.plain, cli.reduced_motion, cli.screen_reader);
+    if inference_command_requested(&cli) {
+        // Accept the process lifecycle before output/config/runtime preflight,
+        // not only after a carrier has successfully built its provider.
+        let carrier = inference_carrier(&cli, kitsu_render::stdin_is_tty())
+            .expect("every inference command has an explicit carrier");
+        activate_model_command(carrier)?;
+    }
     validate_output_last_message_surface(&cli)?;
     OUTPUT_LAST_MESSAGE_REQUESTED.store(cli.output_last_message.is_some(), Ordering::Release);
     validate_output_schema_surface(&cli)?;
@@ -2834,6 +3463,22 @@ fn safe_provider_error_message(
         ProviderError::ToolsNotSupported => format!(
             "{subject} requires tool calls that this provider does not support - disable tools or choose a tool-capable model"
         ),
+        ProviderError::RouteContract(ProviderRouteContractError::StaleGeneration { .. }) => {
+            format!(
+                "{subject} was not sent because its provider route generation is stale - retry against the current route"
+            )
+        }
+        ProviderError::RouteContract(ProviderRouteContractError::UnsupportedCapability {
+            capability,
+        }) => format!(
+            "{subject} was not sent because the current provider route does not support {capability:?} - choose a compatible route or disable that request feature"
+        ),
+        ProviderError::RouteContract(ProviderRouteContractError::RequestModelMismatch) => format!(
+            "{subject} was not sent because its model does not match the immutable provider route binding - retry against the current model route"
+        ),
+        ProviderError::RouteContract(_) => format!(
+            "{subject} was not sent because the current provider route failed local admission - retry or rebuild the route from valid configuration"
+        ),
         ProviderError::Auth(kitsu_providers::AuthError::Missing { env, hint }) => {
             format!(
                 "credential variable ${} is missing - set it or update the gateway auth configuration{}",
@@ -2984,6 +3629,24 @@ fn print_doctor_human(report: &serde_json::Value) {
         doctor_text(report, "/gateway/model"),
     );
     println!("[info] auth: {}", doctor_text(report, "/auth/status"),);
+    if doctor_value(report, "/provider_route/status") == "bound" {
+        println!(
+            "[info] provider route: {} / {} / generation {} / {}",
+            doctor_text(report, "/provider_route/receipt/route/adapter"),
+            doctor_text(report, "/provider_route/receipt/route/wire_revision"),
+            report
+                .pointer("/provider_route/receipt/route/generation")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unavailable".to_string()),
+            doctor_text(report, "/provider_route/receipt/route/profile"),
+        );
+    } else {
+        println!(
+            "[info] provider route: {}",
+            doctor_text(report, "/provider_route/status"),
+        );
+    }
     println!(
         "[info] context window: {} tokens ({})",
         report
@@ -3096,7 +3759,7 @@ fn print_doctor_human(report: &serde_json::Value) {
 }
 
 async fn minimal_inference_probe(
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteHandle<CompiledProvider>,
     model: &str,
 ) -> Result<(), ProviderError> {
     use futures::StreamExt as _;
@@ -3105,7 +3768,11 @@ async fn minimal_inference_probe(
         model: model.to_string(),
         messages: vec![ChatMessage::user("Reply OK.")],
         tools: None,
-        stream: false,
+        // Native Messages is streaming-only. Choose from the immutable route
+        // identity, not the mutable gateway label, so this auxiliary request
+        // cannot drift onto a different wire than the route it probes.
+        stream: provider.identity().adapter()
+            == kitsu_providers::ProviderAdapterId::AnthropicMessages,
         temperature: None,
         reasoning_effort: None,
         max_tokens: Some(1),
@@ -3126,6 +3793,128 @@ async fn minimal_inference_probe(
             "inference probe ended without a terminal marker".to_string(),
         ))
     }
+}
+
+fn route_build_cli_error(
+    error: CompiledProviderRouteBuildError,
+    operation: ProviderOperation<'_>,
+    diagnostics: ProviderDiagnosticContext,
+) -> CliError {
+    match error {
+        CompiledProviderRouteBuildError::CompatibleChat(OpenAICompatRouteBuildError::Auth(
+            error,
+        ))
+        | CompiledProviderRouteBuildError::AnthropicMessages(
+            AnthropicMessagesRouteBuildError::Auth(error),
+        ) => map_provider_error_with_diagnostics(
+            ProviderError::Auth(error),
+            operation,
+            None,
+            diagnostics,
+        ),
+        CompiledProviderRouteBuildError::Contract(error)
+        | CompiledProviderRouteBuildError::CompatibleChat(OpenAICompatRouteBuildError::Contract(
+            error,
+        ))
+        | CompiledProviderRouteBuildError::AnthropicMessages(
+            AnthropicMessagesRouteBuildError::Contract(error),
+        ) => CliError::user(format!("config error: invalid provider route: {error}")),
+        error => CliError::user(format!("config error: {error}")),
+    }
+}
+
+fn compiled_provider_route_config(
+    gateway: &Gateway,
+    declaration: ProviderRouteDeclaration,
+    model: String,
+    auth_source: ProviderAuthSource,
+    policy: ProviderRoutePolicy,
+) -> CompiledProviderRouteConfig {
+    match gateway.adapter {
+        GatewayAdapter::CompatibleChat => {
+            CompiledProviderRouteConfig::CompatibleChat(OpenAICompatRouteConfig {
+                declaration,
+                model,
+                auth_source,
+                base_url: gateway.base_url.clone(),
+                chat_path: gateway.chat_path.clone(),
+                models_path: gateway.models_path.clone().filter(|path| !path.is_empty()),
+                policy,
+            })
+        }
+        GatewayAdapter::AnthropicMessages => {
+            CompiledProviderRouteConfig::AnthropicMessages(AnthropicMessagesRouteConfig {
+                declaration,
+                model,
+                auth_source,
+                base_url: gateway.base_url.clone(),
+                messages_path: gateway.chat_path.clone(),
+                policy,
+            })
+        }
+    }
+}
+
+fn build_inference_management_route(
+    config_path: &std::path::Path,
+    gateway_name: &str,
+    gateway: &Gateway,
+    model: String,
+    auth_source: ProviderAuthSource,
+    auth: &dyn AuthProvider,
+    timeout: Duration,
+) -> Result<ProviderRouteHandle<CompiledProvider>, CompiledProviderRouteBuildError> {
+    let models_path = gateway.models_path.clone().filter(|path| !path.is_empty());
+    let catalog_policy = if models_path.is_some() {
+        ProviderCatalogPolicy::Configured
+    } else {
+        ProviderCatalogPolicy::Unavailable
+    };
+    let declaration = current_provider_route_declaration(config_path, gateway_name, gateway)?;
+    let policy = ProviderRoutePolicy::new(0, 0, timeout, timeout, timeout, catalog_policy)?;
+    let route_config =
+        compiled_provider_route_config(gateway, declaration, model, auth_source, policy);
+    let snapshot = build_compiled_provider_route(route_config, auth)?;
+    ProviderRouteCurrent::new(snapshot)
+        .bind()
+        .map_err(Into::into)
+}
+
+fn build_catalog_management_route(
+    config_path: &std::path::Path,
+    gateway_name: &str,
+    gateway: &Gateway,
+    models_path: String,
+    auth_source: ProviderAuthSource,
+    auth: &dyn AuthProvider,
+    timeout: Duration,
+) -> Result<ProviderCatalogHandle<CompiledProvider>, CompiledProviderRouteBuildError> {
+    if gateway.adapter == GatewayAdapter::AnthropicMessages {
+        return Err(CompiledProviderRouteBuildError::AnthropicMessagesCatalogUnsupported);
+    }
+    let declaration = current_provider_catalog_route_declaration(config_path, gateway_name)?;
+    let policy = ProviderRoutePolicy::new(
+        0,
+        0,
+        timeout,
+        timeout,
+        timeout,
+        ProviderCatalogPolicy::Configured,
+    )?;
+    let snapshot = build_compiled_catalog_route(
+        OpenAICompatCatalogRouteConfig {
+            declaration,
+            auth_source,
+            base_url: gateway.base_url.clone(),
+            chat_path: gateway.chat_path.clone(),
+            models_path,
+            policy,
+        },
+        auth,
+    )?;
+    ProviderRouteCurrent::new(snapshot)
+        .bind_catalog()
+        .map_err(Into::into)
 }
 
 async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Result<(), CliError> {
@@ -3181,6 +3970,14 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
     } else {
         "model_catalog_only"
     };
+    let mut provider_route_report = serde_json::json!({
+        "status": if provider_check_requested {
+            "not_constructed"
+        } else {
+            "not_constructed_offline"
+        },
+        "receipt": null,
+    });
     let mut online_report = serde_json::json!({
         "requested": provider_check_requested,
         "scope": provider_check_scope,
@@ -3384,21 +4181,32 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
                             "status": issue,
                         });
                     } else {
+                        let auth_source =
+                            current_provider_auth_source(gateway, managed_token.is_some());
                         let auth = build_auth(gateway, gateway_name, managed_token.clone())
                             .map_err(|error| CliError::user(safe_config_error(&error)))?;
-                        let provider = OpenAICompatProvider::new(
-                            OpenAICompatConfig {
-                                base_url: gateway.base_url.clone(),
-                                chat_path: gateway.chat_path.clone(),
-                                models_path: gateway
-                                    .models_path
-                                    .clone()
-                                    .filter(|path| !path.is_empty()),
-                                retries: 0,
-                                timeout: Duration::from_secs(cli.timeout_secs),
-                            },
-                            auth,
-                        );
+                        let provider = build_inference_management_route(
+                            &config_path,
+                            gateway_name,
+                            gateway,
+                            model.clone().expect("validated above"),
+                            auth_source,
+                            auth.as_ref(),
+                            Duration::from_secs(cli.timeout_secs),
+                        )
+                        .map_err(|error| {
+                            route_build_cli_error(
+                                error,
+                                ProviderOperation::InferenceProbe {
+                                    model: model.as_deref().expect("validated above"),
+                                },
+                                provider_diagnostics,
+                            )
+                        })?;
+                        provider_route_report = serde_json::json!({
+                            "status": "bound",
+                            "receipt": provider.receipt(),
+                        });
                         let effective_model = model.as_deref().expect("validated above");
                         match await_cancellable(minimal_inference_probe(&provider, effective_model))
                             .await
@@ -3443,106 +4251,126 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
                     }
                 } else if online {
                     let models_path = gateway.models_path.clone().filter(|path| !path.is_empty());
-                    if models_path.is_none() {
-                        let issue = "online provider check was requested but skipped: no models_path is configured for a safe read-only probe".to_string();
-                        issues.push(issue.clone());
-                        online_report = serde_json::json!({
-                            "requested": true,
-                            "scope": "model_catalog_only",
-                            "chat_route_probed": false,
-                            "potentially_billable": false,
-                            "request_sent": false,
-                            "status": issue,
-                        });
-                    } else if !flavor_ok
-                        || !auth_valid
-                        || !auth_locally_usable
-                        || credential_present == Some(false)
-                        || model.is_none()
-                    {
-                        let issue = "online provider check was requested but skipped: fix gateway, model, or auth diagnostics first".to_string();
-                        issues.push(issue.clone());
-                        online_report = serde_json::json!({
-                            "requested": true,
-                            "scope": "model_catalog_only",
-                            "chat_route_probed": false,
-                            "potentially_billable": false,
-                            "request_sent": false,
-                            "status": issue,
-                        });
-                    } else {
-                        let auth = build_auth(gateway, gateway_name, managed_token.clone())
-                            .map_err(|error| CliError::user(safe_config_error(&error)))?;
-                        let provider = OpenAICompatProvider::new(
-                            OpenAICompatConfig {
-                                base_url: gateway.base_url.clone(),
-                                chat_path: gateway.chat_path.clone(),
+                    match models_path {
+                        None => {
+                            let issue = "online provider check was requested but skipped: no models_path is configured for a safe read-only probe".to_string();
+                            issues.push(issue.clone());
+                            online_report = serde_json::json!({
+                                "requested": true,
+                                "scope": "model_catalog_only",
+                                "chat_route_probed": false,
+                                "potentially_billable": false,
+                                "request_sent": false,
+                                "status": issue,
+                            });
+                        }
+                        Some(_)
+                            if !flavor_ok
+                                || !auth_valid
+                                || !auth_locally_usable
+                                || credential_present == Some(false) =>
+                        {
+                            let issue = "online provider check was requested but skipped: fix gateway or auth diagnostics first".to_string();
+                            issues.push(issue.clone());
+                            online_report = serde_json::json!({
+                                "requested": true,
+                                "scope": "model_catalog_only",
+                                "chat_route_probed": false,
+                                "potentially_billable": false,
+                                "request_sent": false,
+                                "status": issue,
+                            });
+                        }
+                        Some(models_path) => {
+                            let auth_source =
+                                current_provider_auth_source(gateway, managed_token.is_some());
+                            let auth = build_auth(gateway, gateway_name, managed_token.clone())
+                                .map_err(|error| CliError::user(safe_config_error(&error)))?;
+                            let provider = build_catalog_management_route(
+                                &config_path,
+                                gateway_name,
+                                gateway,
                                 models_path,
-                                retries: 0,
-                                timeout: Duration::from_secs(cli.timeout_secs),
-                            },
-                            auth,
-                        )
-                        .with_discovery_timeout(Duration::from_secs(cli.timeout_secs));
-                        match await_cancellable(provider.list_models()).await {
-                            Some(Ok(Some(models))) => {
-                                let models = normalize_model_catalog(models);
-                                let effective_model = model.as_deref().expect("validated above");
-                                let effective_model_available =
-                                    models.iter().any(|candidate| candidate == effective_model);
-                                if !effective_model_available {
-                                    issues.push(format!(
+                                auth_source,
+                                auth.as_ref(),
+                                Duration::from_secs(cli.timeout_secs),
+                            )
+                            .map_err(|error| {
+                                route_build_cli_error(
+                                    error,
+                                    ProviderOperation::ModelCatalog,
+                                    provider_diagnostics,
+                                )
+                            })?;
+                            provider_route_report = serde_json::json!({
+                                "status": "bound",
+                                "receipt": provider.receipt(),
+                            });
+                            match await_cancellable(provider.list_models()).await {
+                                Some(Ok(Some(models))) => {
+                                    let effective_model = model.as_deref();
+                                    let effective_model_available = effective_model.map(|model| {
+                                        model_catalog_advertises_selected_model(
+                                            model,
+                                            &models,
+                                            provider_diagnostics,
+                                        )
+                                    });
+                                    let models = normalize_model_catalog(models);
+                                    if effective_model_available == Some(false) {
+                                        issues.push(format!(
                                         "effective model '{}' is not advertised by the normalized gateway catalog",
-                                        terminal_inline(effective_model)
+                                        terminal_inline(effective_model.expect("checked above"))
+                                    ));
+                                    }
+                                    online_report = serde_json::json!({
+                                        "requested": true,
+                                        "scope": "model_catalog_only",
+                                        "chat_route_probed": false,
+                                        "potentially_billable": false,
+                                        "request_sent": true,
+                                        "status": "reachable",
+                                        "models": models.len(),
+                                        "effective_model": effective_model,
+                                        "effective_model_available": effective_model_available,
+                                    });
+                                }
+                                Some(Ok(None)) => {
+                                    let issue = "online provider check was requested but skipped: provider has no model catalog".to_string();
+                                    issues.push(issue.clone());
+                                    online_report = serde_json::json!({
+                                        "requested": true,
+                                        "scope": "model_catalog_only",
+                                        "chat_route_probed": false,
+                                        "potentially_billable": false,
+                                        "request_sent": true,
+                                        "status": issue,
+                                    });
+                                }
+                                Some(Err(error)) => {
+                                    let safe = safe_provider_error_message(
+                                        &error,
+                                        ProviderOperation::ModelCatalog,
+                                        Some(cli.timeout_secs),
+                                        provider_diagnostics,
+                                    );
+                                    let reason = bounded_model_catalog_reason(&error);
+                                    issues.push(format!("online provider check failed: {safe}"));
+                                    online_report = serde_json::json!({
+                                        "requested": true,
+                                        "scope": "model_catalog_only",
+                                        "chat_route_probed": false,
+                                        "potentially_billable": false,
+                                        "request_sent": true,
+                                        "status": safe,
+                                        "reason": reason,
+                                    });
+                                }
+                                None => {
+                                    return Err(CliError::cancelled(
+                                        "doctor provider check cancelled by Ctrl+C",
                                     ));
                                 }
-                                online_report = serde_json::json!({
-                                    "requested": true,
-                                    "scope": "model_catalog_only",
-                                    "chat_route_probed": false,
-                                    "potentially_billable": false,
-                                    "request_sent": true,
-                                    "status": "reachable",
-                                    "models": models.len(),
-                                    "effective_model": effective_model,
-                                    "effective_model_available": effective_model_available,
-                                });
-                            }
-                            Some(Ok(None)) => {
-                                let issue = "online provider check was requested but skipped: provider has no model catalog".to_string();
-                                issues.push(issue.clone());
-                                online_report = serde_json::json!({
-                                    "requested": true,
-                                    "scope": "model_catalog_only",
-                                    "chat_route_probed": false,
-                                    "potentially_billable": false,
-                                    "request_sent": true,
-                                    "status": issue,
-                                });
-                            }
-                            Some(Err(error)) => {
-                                let safe = safe_provider_error_message(
-                                    &error,
-                                    ProviderOperation::ModelCatalog,
-                                    Some(cli.timeout_secs),
-                                    provider_diagnostics,
-                                );
-                                let reason = bounded_model_catalog_reason(&error);
-                                issues.push(format!("online provider check failed: {safe}"));
-                                online_report = serde_json::json!({
-                                    "requested": true,
-                                    "scope": "model_catalog_only",
-                                    "chat_route_probed": false,
-                                    "potentially_billable": false,
-                                    "request_sent": true,
-                                    "status": safe,
-                                    "reason": reason,
-                                });
-                            }
-                            None => {
-                                return Err(CliError::cancelled(
-                                    "doctor provider check cancelled by Ctrl+C",
-                                ));
                             }
                         }
                     }
@@ -3593,6 +4421,7 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
         },
         "gateway": gateway_report,
         "auth": auth_report,
+        "provider_route": provider_route_report,
         "context": context_report,
         "project_context": project_report,
         "runtime_state": runtime_state,
@@ -3631,20 +4460,16 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
 /// Provider + model + auth resolved from config and CLI flags. Shared by the
 /// `ask` and `chat` commands so they construct the gateway connection identically.
 struct ChatSetup {
-    /// `Arc` so the main loop and spawned subagents can share one connection.
-    provider: Arc<OpenAICompatProvider>,
-    /// User-requested model catalog operations get the full CLI timeout and a
-    /// cache isolated from the two-second advisory startup probe. Otherwise a
-    /// startup timeout's shared negative cache could make an immediate
-    /// `/models` fail without honoring the user's requested wait budget.
-    catalog_provider: Arc<OpenAICompatProvider>,
+    /// Atomic owner of the current immutable generation. `ask`/`chat` bind a
+    /// request-facing handle from this owner; raw inference/catalog runtimes do
+    /// not leave composition.
+    provider_route: ProviderRouteCurrent<CompiledProvider>,
     gateway_name: String,
     provider_diagnostics: ProviderDiagnosticContext,
     config_path: std::path::PathBuf,
     state_dir: std::path::PathBuf,
     endpoint: String,
     auth_status: String,
-    model: String,
     /// Config-level opt-out for the model-callable `workspace_diff` evidence
     /// tool (docs/workspace-diff-tool.md). Defaults to enabled.
     workspace_evidence: bool,
@@ -4017,29 +4842,31 @@ fn register_base_tools(
     can_write: bool,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
     commands: Option<&Arc<kitsu_tools::CommandPolicy>>,
-) {
+) -> Result<(), RegistryError> {
     if can_read {
-        builtins::register_fs_tools(tools, perms.clone());
+        builtins::register_fs_tools(tools, perms.clone())?;
     }
     if can_write {
         let (descriptor, handler) =
             builtins::fs::write_file_tool_with_journal(perms.clone(), Some(journal.clone()));
-        tools.register_with_descriptor(descriptor, handler);
+        tools.register_with_descriptor(descriptor, handler)?;
     }
     // Exact-text edits necessarily inspect existing content. Do not advertise
     // that read-modify-write primitive for a genuinely write-only invocation.
     if can_read && can_write {
         let (descriptor, handler) =
             builtins::fs::edit_file_tool_with_journal(perms.clone(), Some(journal.clone()));
-        tools.register_with_descriptor(descriptor, handler);
+        tools.register_with_descriptor(descriptor, handler)?;
     }
     if !skillset.is_empty() {
         let (d, h) = skills::skill_tool(skillset.clone());
-        tools.register_with_descriptor(d, h);
+        tools.register_with_descriptor(d, h)?;
     }
     if let Some(commands) = commands {
-        builtins::register_command_tool(tools, commands.clone());
+        builtins::register_command_tool(tools, commands.clone())?;
     }
+
+    Ok(())
 }
 
 fn can_resolve_offload_pointers(tool_names: &[String]) -> bool {
@@ -4254,7 +5081,7 @@ impl ArtifactDirectoryAllocator {
                 .next_generation
                 .checked_add(1)
                 .ok_or_else(|| "artifact generation counter exhausted".to_string())?;
-            let directory = base.join(format!("runtime-{}-{generation}", jsonl_run_id()));
+            let directory = base.join(format!("runtime-{}-{generation}", run_id()));
             match std::fs::create_dir(&directory) {
                 Ok(()) => {
                     #[cfg(unix)]
@@ -5250,7 +6077,7 @@ fn context_window_provenance(
 }
 
 fn persist_session(
-    store: &Option<session::SessionStore>,
+    store: &Option<session::ActiveSessionStore>,
     session: &SessionInfo,
     model: &str,
     messages: &[ChatMessage],
@@ -5292,6 +6119,7 @@ fn persist_session(
                     );
                 }
             }
+            mark_jsonl_session_persistence_failed();
             session.autosave_dirty.set(true);
             eprintln!("warning: session was not saved: {error}");
             return false;
@@ -5304,6 +6132,7 @@ fn persist_session(
     #[cfg(not(unix))]
     let observation = session.permissions.observe_protected_path(commit.path());
     if let Err(error) = observation {
+        mark_jsonl_session_persistence_failed();
         session.autosave_dirty.set(true);
         eprintln!(
             "warning: session snapshot was saved but its private file identity could not be recorded: {}",
@@ -5317,7 +6146,7 @@ fn persist_session(
 }
 
 fn persist_session_required(
-    store: &Option<session::SessionStore>,
+    store: &Option<session::ActiveSessionStore>,
     session: &SessionInfo,
     model: &str,
     messages: &[ChatMessage],
@@ -5332,7 +6161,7 @@ fn persist_session_required(
 }
 
 fn persist_started_session(
-    store: &Option<session::SessionStore>,
+    store: &Option<session::ActiveSessionStore>,
     session: &SessionInfo,
     model: &str,
     messages: &[ChatMessage],
@@ -5415,7 +6244,7 @@ impl ClearSessionReceipt {
 /// conversation usable under its original id.
 #[allow(clippy::too_many_arguments)]
 async fn clear_session_boundary(
-    session_store: &mut Option<session::SessionStore>,
+    session_store: &mut Option<session::ActiveSessionStore>,
     session: &SessionInfo,
     model: &str,
     messages: &mut Vec<ChatMessage>,
@@ -5539,15 +6368,16 @@ fn activate_offload_dir(
 fn artifact_directory_for_boundary(
     allocator: &mut ArtifactDirectoryAllocator,
     enabled: bool,
-    store: Option<&session::SessionStore>,
+    store: Option<&session::ActiveSessionStore>,
     stateless_base: &std::path::Path,
 ) -> Result<Option<std::path::PathBuf>, String> {
     if !enabled {
         return Ok(None);
     }
-    let base = store
-        .map(session::SessionStore::artifacts_dir)
-        .unwrap_or_else(|| stateless_base.to_path_buf());
+    let base = match store {
+        Some(store) => store.artifacts_dir()?,
+        None => stateless_base.to_path_buf(),
+    };
     allocator.allocate(&base).map(Some)
 }
 
@@ -6592,6 +7422,73 @@ fn context_totals(
     (window, effective, used)
 }
 
+const fn provider_adapter_label(adapter: ProviderAdapterId) -> &'static str {
+    match adapter {
+        ProviderAdapterId::OpenAiCompatible => "openai_compatible",
+        ProviderAdapterId::AnthropicMessages => "anthropic_messages",
+    }
+}
+
+const fn provider_wire_label(wire: ProviderWireRevision) -> &'static str {
+    match wire {
+        ProviderWireRevision::OpenAiChatCompletionsV1 => "openai_chat_completions_v1",
+        ProviderWireRevision::AnthropicMessages2023_06_01 => "anthropic_messages_2023_06_01",
+    }
+}
+
+const fn provider_capability_label(capability: ProviderCapability) -> &'static str {
+    match capability {
+        ProviderCapability::Streaming => "streaming",
+        ProviderCapability::Tools => "tools",
+        ProviderCapability::ImageInput => "image_input",
+        ProviderCapability::StructuredOutput => "structured_output",
+        ProviderCapability::Usage => "usage",
+        ProviderCapability::ModelCatalog => "model_catalog",
+    }
+}
+
+const fn provider_auth_source_label(source: ProviderAuthSource) -> &'static str {
+    match source {
+        ProviderAuthSource::None => "none",
+        ProviderAuthSource::StaticConfiguration => "static_configuration",
+        ProviderAuthSource::Environment => "environment",
+        ProviderAuthSource::ManagedCredential => "managed_credential",
+    }
+}
+
+const fn provider_catalog_policy_label(policy: ProviderCatalogPolicy) -> &'static str {
+    match policy {
+        ProviderCatalogPolicy::Unavailable => "unavailable",
+        ProviderCatalogPolicy::Configured => "configured",
+    }
+}
+
+const fn provider_retry_generation_label(policy: ProviderRetryGenerationPolicy) -> &'static str {
+    match policy {
+        ProviderRetryGenerationPolicy::BoundGeneration => "bound_generation",
+    }
+}
+
+const fn provider_replay_generation_label(policy: ProviderReplayGenerationPolicy) -> &'static str {
+    match policy {
+        ProviderReplayGenerationPolicy::CurrentGeneration => "current_generation",
+    }
+}
+
+const fn provider_fallback_label(policy: ProviderFallbackPolicy) -> &'static str {
+    match policy {
+        ProviderFallbackPolicy::Disabled => "disabled",
+    }
+}
+
+fn provider_duration_label(receipt: kitsu_providers::ProviderRouteDurationReceipt) -> String {
+    if receipt.nanoseconds() == 0 {
+        format!("{}s", receipt.seconds())
+    } else {
+        format!("{}s+{}ns", receipt.seconds(), receipt.nanoseconds())
+    }
+}
+
 fn format_session_status(
     model: &str,
     messages: &[ChatMessage],
@@ -6599,6 +7496,7 @@ fn format_session_status(
     perms: &Permissions,
     registry: &subagent::AgentRegistry,
     state: &kitsu_core::AgentSessionState,
+    provider_route: &ProviderRouteReceipt,
 ) -> String {
     let model = terminal_inline(model);
     let gateway = terminal_inline(&session.gateway);
@@ -6688,11 +7586,40 @@ fn format_session_status(
             session.artifact_policy_source.as_str()
         ),
     };
+    let route = provider_route.route();
+    let route_profile = terminal_inline(route.profile().as_str());
+    let route_capabilities = {
+        let labels = route
+            .capabilities()
+            .supported()
+            .map(provider_capability_label)
+            .collect::<Vec<_>>();
+        if labels.is_empty() {
+            "none".to_string()
+        } else {
+            labels.join(", ")
+        }
+    };
+    let route_policy = provider_route.policy();
+    let route_inference_timeout = provider_duration_label(route_policy.inference_timeout());
+    let route_catalog_timeout = provider_duration_label(route_policy.catalog_timeout());
+    let route_discovery_timeout =
+        provider_duration_label(route_policy.advisory_discovery_timeout());
 
     format!(
-        "kitsu        {}\nsession:\n  id           {session_id}\n  autosave     {autosave}\n  gateway      {}\n  model        {model}\n  reasoning    {}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  context src  {window_source}\n  context cache {window_cache}\n  context probe {window_discovery}\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  artifacts    {artifacts}\n  agents       {} running",
+        "kitsu        {}\nsession:\n  id           {session_id}\n  autosave     {autosave}\n  gateway      {}\n  model        {model}\n  provider     {} | generation {}\n  profile      {route_profile}\n  wire         {}\n  capabilities {route_capabilities}\n  route auth   {}\n  route retry  {} inference | {} catalog | {}\n  route policy catalog {} | replay {} | fallback {}\n  route timeout inference {route_inference_timeout} | catalog {route_catalog_timeout} | discovery {route_discovery_timeout}\n  reasoning    {}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  context src  {window_source}\n  context cache {window_cache}\n  context probe {window_discovery}\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  artifacts    {artifacts}\n  agents       {} running",
         crate::cli::LONG_VERSION,
         gateway,
+        provider_adapter_label(route.adapter()),
+        route.generation().get(),
+        provider_wire_label(route.wire_revision()),
+        provider_auth_source_label(provider_route.auth_source()),
+        route_policy.inference_retries(),
+        route_policy.catalog_retries(),
+        provider_retry_generation_label(route_policy.retry_generation()),
+        provider_catalog_policy_label(route_policy.catalog()),
+        provider_replay_generation_label(route_policy.semantic_replay_generation()),
+        provider_fallback_label(route_policy.fallback()),
         reasoning_effort_label(session.reasoning_effort.get()),
         shorten_home(&session.directory),
         shorten_home(&session.config_path),
@@ -6715,6 +7642,11 @@ fn format_session_status(
     )
 }
 
+struct RenderedSessionStatus<'a> {
+    provider_route: &'a ProviderRouteReceipt,
+    text: String,
+}
+
 fn session_status_payload(
     model: &str,
     messages: &[ChatMessage],
@@ -6722,8 +7654,12 @@ fn session_status_payload(
     perms: &Permissions,
     registry: &subagent::AgentRegistry,
     state: &kitsu_core::AgentSessionState,
-    text: String,
+    rendered: RenderedSessionStatus<'_>,
 ) -> serde_json::Value {
+    let RenderedSessionStatus {
+        provider_route,
+        text,
+    } = rendered;
     let (window, effective, used) = context_totals(messages, session, state);
     let user_turns = messages
         .iter()
@@ -6757,6 +7693,7 @@ fn session_status_payload(
         "kind": "status",
         "text": text,
         "version": crate::cli::LONG_VERSION,
+        "provider_route": provider_route,
         "session": {
             "id": session_id,
             "gateway": session.gateway,
@@ -7578,6 +8515,100 @@ fn stable_profile_key(config_path: &std::path::Path) -> String {
     format!("v1-fnv128-{digest:032x}")
 }
 
+/// Encode the canonical config location without lossy path conversion. This is
+/// an identity input only: the bytes are hashed before they enter the route
+/// declaration and are never exposed in provider receipts.
+fn provider_profile_namespace(config_path: &std::path::Path) -> Vec<u8> {
+    let config_path =
+        std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        config_path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        config_path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        config_path.to_string_lossy().as_bytes().to_vec()
+    }
+}
+
+/// Declare the exact compiled route selected by configuration. `flavor`
+/// remains a compatibility/display label and cannot silently select a wire
+/// dialect; only the closed `adapter` field can do that.
+fn current_provider_route_declaration(
+    config_path: &std::path::Path,
+    gateway_name: &str,
+    gateway: &Gateway,
+) -> Result<ProviderRouteDeclaration, ProviderRouteContractError> {
+    let profile = current_provider_profile_id(config_path, gateway_name)?;
+    let has_model_catalog = gateway
+        .models_path
+        .as_deref()
+        .is_some_and(|path| !path.is_empty());
+    Ok(match gateway.adapter {
+        GatewayAdapter::CompatibleChat => {
+            ProviderRouteDeclaration::compatible_chat_v1(profile, has_model_catalog)
+        }
+        GatewayAdapter::AnthropicMessages => ProviderRouteDeclaration::native_messages_v1(profile),
+    })
+}
+
+fn current_provider_catalog_route_declaration(
+    config_path: &std::path::Path,
+    gateway_name: &str,
+) -> Result<ProviderRouteDeclaration, ProviderRouteContractError> {
+    Ok(ProviderRouteDeclaration::compatible_catalog_v1(
+        current_provider_profile_id(config_path, gateway_name)?,
+    ))
+}
+
+fn current_provider_profile_id(
+    config_path: &std::path::Path,
+    gateway_name: &str,
+) -> Result<ProviderProfileId, ProviderRouteContractError> {
+    ProviderProfileId::derive_v1(
+        provider_profile_namespace(config_path),
+        gateway_name.as_bytes(),
+    )
+}
+
+/// Identify the credential source that the immediately following auth freeze
+/// will resolve. Missing or malformed credentials fail before a snapshot is
+/// returned, so only successful values can become a route receipt.
+fn current_provider_auth_source(
+    gateway: &Gateway,
+    managed_token_available: bool,
+) -> ProviderAuthSource {
+    match gateway.auth.method.as_str() {
+        "none" => ProviderAuthSource::None,
+        "static" => ProviderAuthSource::StaticConfiguration,
+        "bearer-env" => {
+            let environment_selected = std::env::var_os(&gateway.auth.env)
+                .and_then(|value| value.into_string().ok())
+                .is_some_and(|value| !value.trim().is_empty());
+            if environment_selected {
+                ProviderAuthSource::Environment
+            } else if managed_token_available {
+                ProviderAuthSource::ManagedCredential
+            } else {
+                // The freeze will return the existing typed missing/malformed
+                // auth error; this placeholder is never published.
+                ProviderAuthSource::Environment
+            }
+        }
+        _ => ProviderAuthSource::None,
+    }
+}
+
 /// Location used by builds before profile keys became a stable on-disk
 /// contract. Kept only so this release can migrate existing development data.
 fn legacy_profile_dir(base: &std::path::Path, config_path: &std::path::Path) -> std::path::PathBuf {
@@ -7832,18 +8863,34 @@ enum ContextWindowRefreshOutcome {
 /// result. Provider diagnostics are intentionally not accepted here, so an
 /// endpoint URL or response body can never enter the private cache.
 async fn refresh_cached_context_window(
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     model: &str,
     path: &std::path::Path,
     key: &str,
-) -> ContextWindowRefreshOutcome {
-    let Some(window) = provider.model_context_length(model).await else {
-        return ContextWindowRefreshOutcome::NoMetadata;
+) -> Result<ContextWindowRefreshOutcome, ProviderError> {
+    let Some(window) = provider.advisory_model_context_length(model).await? else {
+        return Ok(ContextWindowRefreshOutcome::NoMetadata);
     };
     if write_cached_context_window(path, key, window).is_ok() {
-        ContextWindowRefreshOutcome::Cached(window)
+        Ok(ContextWindowRefreshOutcome::Cached(window))
     } else {
-        ContextWindowRefreshOutcome::DiscoveredButNotCached(window)
+        Ok(ContextWindowRefreshOutcome::DiscoveredButNotCached(window))
+    }
+}
+
+async fn refresh_cached_context_window_explicit(
+    provider: &ProviderRouteCurrent<CompiledProvider>,
+    model: &str,
+    path: &std::path::Path,
+    key: &str,
+) -> Result<ContextWindowRefreshOutcome, ProviderError> {
+    let Some(window) = provider.model_context_length(model).await? else {
+        return Ok(ContextWindowRefreshOutcome::NoMetadata);
+    };
+    if write_cached_context_window(path, key, window).is_ok() {
+        Ok(ContextWindowRefreshOutcome::Cached(window))
+    } else {
+        Ok(ContextWindowRefreshOutcome::DiscoveredButNotCached(window))
     }
 }
 
@@ -7899,10 +8946,17 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     gateway
         .validate_flavor()
         .map_err(|e| CliError::user(e.to_string()))?;
+    let provider_route_declaration =
+        current_provider_route_declaration(&path, &gateway_name, gateway).map_err(|error| {
+            CliError::user(format!(
+                "config error: cannot derive provider profile identity: {error}"
+            ))
+        })?;
     let model = gateway
         .resolve_model(cli.model.as_deref())
         .map_err(|e| CliError::user(e.to_string()))?;
     let managed_token = managed_credential(&state_dir, &gateway_name, gateway)?;
+    let provider_auth_source = current_provider_auth_source(gateway, managed_token.is_some());
 
     let auth_status = match gateway.auth.method.as_str() {
         "none" => "none (no credential required)".to_string(),
@@ -7910,12 +8964,10 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         "bearer-env" => format!(
             "bearer-env {} (source: {})",
             gateway.auth.env,
-            if environment_override_present(gateway) {
-                "environment"
-            } else if managed_token.is_some() {
-                "managed"
-            } else {
-                "missing"
+            match provider_auth_source {
+                ProviderAuthSource::Environment => "environment",
+                ProviderAuthSource::ManagedCredential => "managed",
+                ProviderAuthSource::None | ProviderAuthSource::StaticConfiguration => "missing",
             }
         ),
         other => other.to_string(),
@@ -7924,36 +8976,47 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
 
     let auth = build_auth(gateway, &gateway_name, managed_token)
         .map_err(|e| CliError::user(e.to_string()))?;
-    require_auth_ready(auth.as_ref(), ProviderOperation::Chat { model: &model })?;
     let models_path = gateway.models_path.clone().filter(|p| !p.is_empty());
     let context_window_refresh = ContextWindowRefreshConfig {
         cache_path: context_window_cache_path(&state_dir),
         base_url: gateway.base_url.clone(),
         models_path: models_path.clone(),
     };
-    let provider = Arc::new(OpenAICompatProvider::new(
-        OpenAICompatConfig {
-            base_url: gateway.base_url.clone(),
-            chat_path: gateway.chat_path.clone(),
-            models_path: models_path.clone(),
-            retries: 2,
-            timeout: Duration::from_secs(cli.timeout_secs),
-        },
-        auth.clone(),
-    ));
-    let catalog_provider = Arc::new(
-        OpenAICompatProvider::new(
-            OpenAICompatConfig {
-                base_url: gateway.base_url.clone(),
-                chat_path: gateway.chat_path.clone(),
-                models_path: models_path.clone(),
-                retries: 0,
-                timeout: Duration::from_secs(cli.timeout_secs),
-            },
-            auth.clone(),
-        )
-        .with_discovery_timeout(Duration::from_secs(cli.timeout_secs)),
+    let catalog_policy = if models_path.is_some() {
+        ProviderCatalogPolicy::Configured
+    } else {
+        ProviderCatalogPolicy::Unavailable
+    };
+    let route_policy = ProviderRoutePolicy::new(
+        2,
+        0,
+        Duration::from_secs(cli.timeout_secs),
+        Duration::from_secs(cli.timeout_secs),
+        Duration::from_secs(2),
+        catalog_policy,
+    )
+    .map_err(|error| CliError::user(format!("config error: invalid provider policy: {error}")))?;
+    let route_config = compiled_provider_route_config(
+        gateway,
+        provider_route_declaration,
+        model.clone(),
+        provider_auth_source,
+        route_policy,
     );
+    let provider_route_snapshot = build_compiled_provider_route(route_config, auth.as_ref())
+        .map_err(|error| {
+            route_build_cli_error(
+                error,
+                ProviderOperation::Chat { model: &model },
+                provider_diagnostics,
+            )
+        })?;
+    let provider_route = ProviderRouteCurrent::new(provider_route_snapshot);
+    provider_route.bind().map_err(|error| {
+        CliError::user(format!(
+            "config error: cannot bind initial provider route: {error}"
+        ))
+    })?;
 
     if let kitsu_providers::ExpiryStatus::Expired { since } = auth.expiry_status() {
         eprintln!(
@@ -8008,25 +9071,25 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     };
     let context_window_provenance = Arc::new(std::sync::Mutex::new(context_window_provenance));
     if let Some((cache_path, cache_key)) = cold_refresh {
-        let discovery_provider = provider.clone();
+        let discovery_provider = provider_route.clone();
         let discovery_model = model.clone();
         let discovery_provenance = context_window_provenance.clone();
         tokio::spawn(async move {
             let discovery = match refresh_cached_context_window(
-                discovery_provider.as_ref(),
+                &discovery_provider,
                 &discovery_model,
                 &cache_path,
                 &cache_key,
             )
             .await
             {
-                ContextWindowRefreshOutcome::Cached(window) => {
+                Ok(ContextWindowRefreshOutcome::Cached(window)) => {
                     ContextWindowDiscoveryState::ReadyForNextRun { window }
                 }
-                ContextWindowRefreshOutcome::DiscoveredButNotCached(window) => {
+                Ok(ContextWindowRefreshOutcome::DiscoveredButNotCached(window)) => {
                     ContextWindowDiscoveryState::CompleteButNotCached { window }
                 }
-                ContextWindowRefreshOutcome::NoMetadata => {
+                Ok(ContextWindowRefreshOutcome::NoMetadata) | Err(_) => {
                     ContextWindowDiscoveryState::FinishedWithoutMetadata
                 }
             };
@@ -8047,15 +9110,13 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     }
 
     Ok(ChatSetup {
-        provider,
-        catalog_provider,
+        provider_route,
         gateway_name,
         provider_diagnostics,
         config_path: path,
         state_dir,
         endpoint,
         auth_status,
-        model,
         workspace_evidence: config.workspace_evidence.unwrap_or(true),
         agent_spawn_cap: config.agent_spawn_cap,
         artifact_policy,
@@ -8076,6 +9137,49 @@ fn normalize_model_catalog(models: Vec<String>) -> Vec<String> {
     normalized.sort();
     normalized.dedup();
     normalized
+}
+
+/// Match the selected model against an advertised catalog without broadening
+/// model-ID semantics for generic OpenAI-compatible gateways. Local Ollama is
+/// the sole exception: its catalog canonicalizes an untagged `name` as
+/// `name:latest`, while its inference route accepts the untagged name.
+fn model_catalog_advertises_selected_model(
+    selected_model: &str,
+    models: &[String],
+    diagnostics: ProviderDiagnosticContext,
+) -> bool {
+    let selected_model = selected_model.trim();
+    if selected_model.is_empty() {
+        return false;
+    }
+    if models
+        .iter()
+        .any(|candidate| candidate.trim() == selected_model)
+    {
+        return true;
+    }
+    if !diagnostics.loopback_ollama || ollama_model_id_has_explicit_version(selected_model) {
+        return false;
+    }
+
+    let implicit_latest = format!("{selected_model}:latest");
+    models
+        .iter()
+        .filter(|candidate| candidate.trim() == implicit_latest)
+        .take(2)
+        .count()
+        == 1
+}
+
+/// A registry port in an Ollama model name is not a tag. Tags live in the
+/// final path component; digest-qualified IDs are also explicit and therefore
+/// remain exact-only.
+fn ollama_model_id_has_explicit_version(model: &str) -> bool {
+    model.contains('@')
+        || model
+            .rsplit('/')
+            .next()
+            .is_some_and(|component| component.contains(':'))
 }
 
 fn filter_model_catalog(models: Vec<String>, filter: &str) -> Vec<String> {
@@ -8121,8 +9225,11 @@ const HUMAN_MODEL_CATALOG_CAP: usize = 12;
 const MODEL_CATALOG_ROUND: u32 = 1;
 const TOP_LEVEL_MODEL_CATALOG_OPERATION_ID: &str = "models:1";
 
-fn model_catalog_attempt_payload(event: ProviderAttemptEvent) -> serde_json::Value {
-    serde_json::json!({
+fn model_catalog_attempt_payload(
+    route_generation: Option<kitsu_providers::ProviderRouteGeneration>,
+    event: ProviderAttemptEvent,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
         "round": MODEL_CATALOG_ROUND,
         "purpose": "model_catalog",
         "attempt": event.attempt,
@@ -8135,12 +9242,17 @@ fn model_catalog_attempt_payload(event: ProviderAttemptEvent) -> serde_json::Val
         "retry_after_used": event.retry_after_used,
         "deadline_scope": "provider_request",
         "remaining_deadline_ms": event.remaining_deadline_ms,
-    })
+    });
+    if let Some(generation) = route_generation {
+        payload["route_generation"] = serde_json::json!(generation.get());
+    }
+    payload
 }
 
 fn top_level_model_catalog_telemetry() -> ProviderTelemetrySink {
-    ProviderTelemetrySink::with_fallible_observer(|event| {
-        let mut payload = model_catalog_attempt_payload(event);
+    ProviderTelemetrySink::with_fallible_context_observer(|observation| {
+        let mut payload =
+            model_catalog_attempt_payload(observation.route_generation, observation.event);
         payload["operation_id"] = serde_json::json!(TOP_LEVEL_MODEL_CATALOG_OPERATION_ID);
         emit_jsonl("provider_attempt", payload).is_ok()
     })
@@ -8229,24 +9341,39 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
     let current_model = gateway.resolve_model(cli.model.as_deref()).ok();
     let state_dir = runtime_state_dir_read_only(&path);
     let managed_token = managed_credential(&state_dir, gateway_name, gateway)?;
+    let auth_source = current_provider_auth_source(gateway, managed_token.is_some());
     let auth = build_auth(gateway, gateway_name, managed_token)
         .map_err(|error| CliError::user(error.to_string()))?;
     require_auth_ready(auth.as_ref(), ProviderOperation::ModelCatalog)?;
-    let provider = OpenAICompatProvider::new(
-        OpenAICompatConfig {
-            base_url: gateway.base_url.clone(),
-            chat_path: gateway.chat_path.clone(),
-            models_path: gateway.models_path.clone().filter(|path| !path.is_empty()),
-            retries: 0,
-            timeout: Duration::from_secs(cli.timeout_secs),
-        },
-        auth,
+    let models_path = gateway
+        .models_path
+        .clone()
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            CliError::user(
+                "this gateway does not expose a model catalog; configure models_path".to_string(),
+            )
+        })?;
+    let provider = build_catalog_management_route(
+        &path,
+        gateway_name,
+        gateway,
+        models_path,
+        auth_source,
+        auth.as_ref(),
+        Duration::from_secs(cli.timeout_secs),
     )
-    .with_discovery_timeout(Duration::from_secs(cli.timeout_secs));
+    .map_err(|error| {
+        route_build_cli_error(error, ProviderOperation::ModelCatalog, provider_diagnostics)
+    })?;
     if cli.jsonl {
         emit_jsonl(
             "run_started",
-            serde_json::json!({"mode": "models", "gateway": gateway_name}),
+            serde_json::json!({
+                "mode": "models",
+                "gateway": gateway_name,
+                "provider_route": provider.receipt(),
+            }),
         )?;
         emit_jsonl(
             "provider_request",
@@ -8309,8 +9436,17 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
 }
 
 async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
-    MODEL_COMMAND_ACTIVE.store(true, Ordering::Release);
+    record_process_terminal_facts(ProcessTerminalFacts {
+        cleanup: kitsu_core::RunCleanupState::Joined,
+        persistence: kitsu_core::RunPersistenceState::NotRequested,
+    })?;
     let setup = build_setup(cli).await?;
+    let provider = Arc::new(setup.provider_route.clone());
+    let model = provider
+        .bind()
+        .map_err(|error| CliError::user(format!("cannot bind current provider route: {error}")))?
+        .model()
+        .to_string();
     if setup.artifact_policy == ArtifactStoragePolicy::InlineOnly && !cli.jsonl {
         eprintln!(
             "~ artifacts disabled: commands keep bounded previews only; large tool results are not offloaded; existing artifacts are unchanged"
@@ -8358,7 +9494,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
     messages.push(ChatMessage::user(prompt));
     let tools = Registry::new();
     let mut agent_cfg = build_agent_config(
-        setup.model.clone(),
+        model.clone(),
         cli,
         setup.context_window,
         None,
@@ -8369,12 +9505,16 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
         live_agent_event_log_capturing(cli.jsonl, "ask:1", Some(partial_answer.clone()));
     agent_cfg.event_log = Some(event_log.clone());
     if cli.jsonl {
+        let provider_route = provider.receipt().map_err(|error| {
+            CliError::user(format!("cannot inspect current provider route: {error}"))
+        })?;
         emit_jsonl(
             "run_started",
             serde_json::json!({
                 "mode": "ask",
                 "gateway": setup.gateway_name,
-                "model": setup.model,
+                "model": model.clone(),
+                "provider_route": provider_route,
                 "artifact_policy": artifact_policy_receipt(
                     setup.artifact_policy,
                     setup.artifact_policy_source,
@@ -8392,14 +9532,8 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
     }
 
     let mut state = kitsu_core::AgentSessionState::default();
-    let outcome = run_turn_cancellable(
-        &setup.provider,
-        &tools,
-        &mut messages,
-        &agent_cfg,
-        &mut state,
-    )
-    .await;
+    let outcome =
+        run_turn_cancellable(&provider, &tools, &mut messages, &agent_cfg, &mut state).await;
     let assistant = match &outcome {
         TurnOutcome::Completed(Ok(text)) => Some(text.as_str()),
         _ => None,
@@ -8432,7 +9566,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                             "policy_errors": state.last_turn.policy_errors,
                         }),
                     )?;
-                    emit_jsonl_summary_with_local_failures(
+                    emit_ask_jsonl_summary_with_local_failures(
                         "error",
                         1,
                         usize::from(failure.kind.is_provider_failure()),
@@ -8461,7 +9595,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
             if let Err(mapped) = write_output_last_message(cli, "ask:1", &text) {
                 emit_output_last_message_error(cli, "ask:1", &mapped)?;
                 if cli.jsonl {
-                    emit_jsonl_summary_with_local_failures(
+                    emit_ask_jsonl_summary_with_local_failures(
                         "error",
                         1,
                         0,
@@ -8474,7 +9608,15 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                 return Err(mapped);
             }
             if cli.jsonl {
-                emit_jsonl_summary_with_local_failures("ok", 0, 0, 0, 0, 0, recovered_tool_errors)?;
+                emit_ask_jsonl_summary_with_local_failures(
+                    "ok",
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    recovered_tool_errors,
+                )?;
             }
             Ok(())
         }
@@ -8492,9 +9634,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
             let cause = agent_error_jsonl_cause(&error);
             let mapped = map_agent_error_with_diagnostics(
                 error,
-                ProviderOperation::Chat {
-                    model: &setup.model,
-                },
+                ProviderOperation::Chat { model: &model },
                 Some(cli.timeout_secs),
                 setup.provider_diagnostics,
             );
@@ -8509,7 +9649,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                     "turn_finished",
                     serde_json::json!({"turn_id": "ask:1", "status": "error"}),
                 )?;
-                emit_jsonl_summary_with_local_failures(
+                emit_ask_jsonl_summary_with_local_failures(
                     "error",
                     1,
                     usize::from(mapped.exit_code() == EXIT_PROVIDER),
@@ -8543,7 +9683,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                     "turn_finished",
                     serde_json::json!({"turn_id": "ask:1", "status": "cancelled"}),
                 )?;
-                emit_jsonl_summary_with_local_failures(
+                emit_ask_jsonl_summary_with_local_failures(
                     "cancelled",
                     1,
                     0,
@@ -8826,13 +9966,19 @@ fn strict_failure_cli_error(failure: &StrictTurnFailure) -> CliError {
             CliError::provider(format!("incomplete turn: {}", failure.issue))
         }
         ScriptFailureKind::OutputSchema => CliError::provider(failure.issue.clone()),
+        ScriptFailureKind::Tool | ScriptFailureKind::Policy => {
+            CliError::tool(failure.issue.clone())
+        }
         _ => CliError::user(failure.issue.clone()),
     }
 }
 
 fn script_failure_kind(error: &kitsu_core::AgentError) -> ScriptFailureKind {
     match error {
-        kitsu_core::AgentError::Provider(ProviderError::Auth(_))
+        kitsu_core::AgentError::Provider(
+            ProviderError::Auth(_) | ProviderError::RouteContract(_),
+        )
+        | kitsu_core::AgentError::Interrupted(_)
         | kitsu_core::AgentError::ContextOverflow { .. }
         | kitsu_core::AgentError::ContextWindowUnknown => ScriptFailureKind::User,
         _ => ScriptFailureKind::Provider,
@@ -9044,6 +10190,24 @@ enum AssistantDisposition {
     Discarded,
 }
 
+fn record_run_assistant_disposition(disposition: AssistantDisposition) {
+    let encoded = match disposition {
+        AssistantDisposition::Committed => 1,
+        AssistantDisposition::CommittedPartial => 2,
+        AssistantDisposition::Discarded => 3,
+    };
+    RUN_ASSISTANT_DISPOSITION.store(encoded, Ordering::Release);
+}
+
+fn run_assistant_disposition() -> kitsu_core::RunAssistantDisposition {
+    match RUN_ASSISTANT_DISPOSITION.load(Ordering::Acquire) {
+        1 => kitsu_core::RunAssistantDisposition::Committed,
+        2 => kitsu_core::RunAssistantDisposition::CommittedPartial,
+        3 => kitsu_core::RunAssistantDisposition::Discarded,
+        _ => kitsu_core::RunAssistantDisposition::Absent,
+    }
+}
+
 impl AssistantDisposition {
     fn jsonl_status(self) -> &'static str {
         match self {
@@ -9189,6 +10353,7 @@ fn finish_assistant_disposition(
     disposition: AssistantDisposition,
     reason: Option<&str>,
 ) -> Result<(), CliError> {
+    record_run_assistant_disposition(disposition);
     if disposition == AssistantDisposition::Committed {
         FULLY_COMMITTED_ASSISTANT_SEEN.store(true, Ordering::Release);
     }
@@ -9561,6 +10726,15 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
             .failure_class
             .map(|class| format!(" | failure {class}"))
             .unwrap_or_default();
+        let route = match (
+            agent.telemetry.route_generation,
+            agent.telemetry.route_generation_mismatch,
+        ) {
+            (Some(generation), false) => format!(" | route gen {generation}"),
+            (Some(generation), true) => format!(" | route gen {generation} (mismatch observed)"),
+            (None, true) => " | route generation mismatch observed".to_string(),
+            (None, false) => String::new(),
+        };
         let bytes = agent
             .result_bytes
             .map(|bytes| format!(" | result {bytes} B"))
@@ -9572,7 +10746,7 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
             .map(terminal_inline)
             .unwrap_or_else(|| "default profile".to_string());
         output.push_str(&format!(
-            "\n  {} #{} {} | {} | {}\n      {:.1}s | model {} | tokens {}/{}/{} | tools {} | writes {} | last {}{}{}",
+            "\n  {} #{} {} | {} | {}\n      {:.1}s | model {}{} | tokens {}/{}/{} | tools {} | writes {} | last {}{}{}",
             kitsu_render::deck_marker(state),
             agent.id,
             agent_progress_status_label(agent.status),
@@ -9580,6 +10754,7 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
             terminal_inline(&agent.task),
             agent.elapsed_ms as f64 / 1000.0,
             model,
+            route,
             agent.telemetry.prompt_tokens,
             agent.telemetry.completion_tokens,
             agent.telemetry.total_tokens,
@@ -9634,6 +10809,8 @@ fn jobs_snapshot_payload(registry: &subagent::AgentRegistry) -> serde_json::Valu
                 "result_bytes": agent.result_bytes,
                 "telemetry": {
                     "model": agent.telemetry.model,
+                    "route_generation": agent.telemetry.route_generation,
+                    "route_generation_mismatch": agent.telemetry.route_generation_mismatch,
                     "prompt_tokens": agent.telemetry.prompt_tokens,
                     "completion_tokens": agent.telemetry.completion_tokens,
                     "total_tokens": agent.telemetry.total_tokens,
@@ -10239,10 +11416,13 @@ fn format_agent_profiles(catalog: &subagent::profile::AgentProfileCatalog) -> St
     output
 }
 
-async fn await_background_agents(registry: &Arc<subagent::AgentRegistry>, reason: &str) {
+async fn await_background_agents(
+    registry: &Arc<subagent::AgentRegistry>,
+    reason: &str,
+) -> kitsu_core::RunCleanupState {
     let running = registry.running();
     if running == 0 {
-        return;
+        return kitsu_core::RunCleanupState::Joined;
     }
     if !jsonl_requested() {
         eprintln!(
@@ -10258,10 +11438,17 @@ async fn await_background_agents(registry: &Arc<subagent::AgentRegistry>, reason
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                report_cancelled_agents(registry.cancel_started_after(0).await);
-                break;
+                let cancelled = registry.cancel_started_after_with_status(0).await;
+                let cleanup = terminal_cleanup_state(&cancelled);
+                report_cancelled_agents(cancelled.iter().map(|status| status.id).collect());
+                return cleanup;
             }
         }
+    }
+    if registry.running() == 0 {
+        kitsu_core::RunCleanupState::Joined
+    } else {
+        kitsu_core::RunCleanupState::NotObserved
     }
 }
 
@@ -10384,6 +11571,17 @@ async fn join_background_agents_at_exit(
     }
     report_write_checkpoints(journal.drain_and_take_reports().await);
     cancelled
+}
+
+fn terminal_cleanup_state(
+    terminal: &[subagent::AgentTerminalStatus],
+) -> kitsu_core::RunCleanupState {
+    let unjoined = terminal.iter().filter(|status| !status.joined).count();
+    let Some(unjoined) = std::num::NonZeroU32::new(u32::try_from(unjoined).unwrap_or(u32::MAX))
+    else {
+        return kitsu_core::RunCleanupState::Joined;
+    };
+    kitsu_core::RunCleanupState::Residue { unjoined }
 }
 
 /// Surface every completed detached result that was never opened through
@@ -10591,10 +11789,27 @@ async fn cancel_agents_and_report_writes(
     watermark: u64,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
 ) -> Vec<kitsu_tools::builtins::fs::JournalTurnReport> {
-    report_cancelled_agents(registry.cancel_started_after(watermark).await);
+    cancel_agents_and_report_writes_with_cleanup(registry, watermark, journal)
+        .await
+        .reports
+}
+
+struct CancelledAgentWrites {
+    reports: Vec<kitsu_tools::builtins::fs::JournalTurnReport>,
+    cleanup: kitsu_core::RunCleanupState,
+}
+
+async fn cancel_agents_and_report_writes_with_cleanup(
+    registry: &Arc<subagent::AgentRegistry>,
+    watermark: u64,
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
+) -> CancelledAgentWrites {
+    let cancelled = registry.cancel_started_after_with_status(watermark).await;
+    let cleanup = terminal_cleanup_state(&cancelled);
+    report_cancelled_agents(cancelled.iter().map(|status| status.id).collect());
     let reports = journal.drain_and_take_reports().await;
     report_write_checkpoints(reports.clone());
-    reports
+    CancelledAgentWrites { reports, cleanup }
 }
 
 /// Cap on the changed files enumerated in the rolled-back-turn note and its
@@ -10881,6 +12096,7 @@ async fn finalize_scripted_run(
     };
     let cancelled_at_exit =
         join_background_agents_at_exit(registry, journal, agent_join_timeout, jsonl).await;
+    let cleanup_state = terminal_cleanup_state(&cancelled_at_exit);
     if !cancelled_at_exit.is_empty() {
         // Work kitsu had to stop is not successful automation. Work it waited
         // for and collected is reported by its own terminal status below.
@@ -10975,6 +12191,8 @@ async fn finalize_scripted_run(
         );
         primary_error = Some(if status.provider_failures > 0 {
             CliError::provider(message)
+        } else if status.tool_failures > 0 || status.policy_failures > 0 {
+            CliError::tool(message)
         } else {
             CliError::user(message)
         });
@@ -10990,6 +12208,8 @@ async fn finalize_scripted_run(
         );
         primary_error = Some(if status.provider_failures > 0 {
             CliError::provider(message)
+        } else if status.tool_failures > 0 || status.policy_failures > 0 {
+            CliError::tool(message)
         } else {
             CliError::user(message)
         });
@@ -11024,49 +12244,91 @@ async fn finalize_scripted_run(
         );
     }
 
-    // Once an emit fails the emitter retains that terminal error. Do not try
-    // additional writes, but still return only after task cleanup above.
-    if jsonl && jsonl_output_failure().is_none() {
-        if let Some(error) = primary_error.as_ref() {
-            if !status.primary_error_framed {
-                if let Err(output_error) = emit_jsonl(
-                    "error",
-                    serde_json::json!({
-                        "kind": error.jsonl_kind(),
-                        "message": error.to_string(),
-                        "exit_code": error.exit_code(),
-                    }),
-                ) {
-                    finalization_output_error = Some(output_error);
-                }
+    let persistence = jsonl_session_persistence_state();
+    if !jsonl {
+        if let Err(error) = record_process_terminal_facts(ProcessTerminalFacts {
+            cleanup: cleanup_state,
+            persistence,
+        }) {
+            if primary_error.is_none() {
+                primary_error = Some(error);
             }
         }
-        if jsonl_output_failure().is_none() {
-            let summary_status = if primary_error
-                .as_ref()
-                .is_some_and(|error| error.exit_code() == EXIT_CANCELLED)
-            {
-                "cancelled"
-            } else if primary_error.is_some() {
-                "error"
-            } else if status.failures > 0 {
-                "partial"
-            } else {
-                "ok"
-            };
-            if let Err(output_error) = emit_jsonl_summary_with_postcondition_failures(
+    }
+
+    if jsonl {
+        let summary_status = if primary_error
+            .as_ref()
+            .is_some_and(|error| error.exit_code() == EXIT_CANCELLED)
+        {
+            "cancelled"
+        } else if primary_error.is_some() {
+            "error"
+        } else if status.failures > 0 {
+            "partial"
+        } else {
+            "ok"
+        };
+        let lifecycle_delivery = (|| -> Result<Result<(), CliError>, CliError> {
+            let outcome = jsonl_summary_outcome(
                 summary_status,
-                status.failures,
                 status.provider_failures,
-                status.output_schema_failures,
-                status.postcondition_failures,
                 status.tool_failures,
                 status.policy_failures,
-                status.tool_error_totals,
-            ) {
-                finalization_output_error = Some(output_error);
-            }
-        }
+            )?;
+            let assistant = run_assistant_disposition();
+            let (published, delivery) = finalize_process_terminal_with_delivery(
+                outcome,
+                assistant,
+                cleanup_state,
+                persistence,
+                || {
+                    // Once an earlier emit fails the emitter retains that
+                    // terminal error. Record failed delivery without trying
+                    // another frame, but only after cleanup above completed.
+                    if let Some(output_error) = finalization_output_error.take() {
+                        return Err(output_error);
+                    }
+                    if let Some(output_error) = jsonl_output_failure() {
+                        return Err(output_error);
+                    }
+                    if let Some(error) = primary_error.as_ref() {
+                        if !status.primary_error_framed {
+                            emit_jsonl(
+                                "error",
+                                serde_json::json!({
+                                    "kind": error.jsonl_kind(),
+                                    "message": error.to_string(),
+                                    "exit_code": error.exit_code(),
+                                }),
+                            )?;
+                        }
+                    }
+                    emit_jsonl_summary_with_postcondition_failures(
+                        summary_status,
+                        status.failures,
+                        status.provider_failures,
+                        status.output_schema_failures,
+                        status.postcondition_failures,
+                        status.tool_failures,
+                        status.policy_failures,
+                        status.tool_error_totals,
+                    )
+                },
+            )
+            .map_err(|error| {
+                CliError::user(format!("internal scripted finalization failed: {error}"))
+            })?;
+            debug_assert_eq!(published.terminal().class(), outcome);
+            debug_assert_eq!(published.terminal().assistant(), assistant);
+            debug_assert_eq!(published.cleanup(), cleanup_state);
+            debug_assert_eq!(published.persistence(), persistence);
+            Ok(delivery)
+        })();
+        finalization_output_error = match lifecycle_delivery {
+            Ok(Ok(())) => None,
+            Ok(Err(output_error)) | Err(output_error) => Some(output_error),
+        };
     }
 
     // Cleanup/finalization never replaces the semantic error that caused the
@@ -11081,6 +12343,7 @@ async fn finalize_scripted_run(
 #[allow(clippy::too_many_arguments)]
 async fn run_scripted(
     setup: &ChatSetup,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
@@ -11093,7 +12356,7 @@ async fn run_scripted(
     context_window: &Rc<Cell<Option<u64>>>,
     live_mw: &subagent::LiveModelWindow,
     registry: &Arc<subagent::AgentRegistry>,
-    session_store: &mut Option<session::SessionStore>,
+    session_store: &mut Option<session::ActiveSessionStore>,
     artifact_directories: &mut ArtifactDirectoryAllocator,
     artifact_storage_enabled: bool,
     stateless_artifact_base: &std::path::Path,
@@ -11103,6 +12366,7 @@ async fn run_scripted(
     let mut status = ScriptRunStatus::default();
     let result = run_scripted_body(
         setup,
+        provider,
         tools,
         messages,
         model,
@@ -11141,6 +12405,7 @@ async fn run_scripted(
 #[allow(clippy::too_many_arguments)]
 async fn run_scripted_body(
     setup: &ChatSetup,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
@@ -11153,7 +12418,7 @@ async fn run_scripted_body(
     context_window: &Rc<Cell<Option<u64>>>,
     live_mw: &subagent::LiveModelWindow,
     registry: &Arc<subagent::AgentRegistry>,
-    session_store: &mut Option<session::SessionStore>,
+    session_store: &mut Option<session::ActiveSessionStore>,
     artifact_directories: &mut ArtifactDirectoryAllocator,
     artifact_storage_enabled: bool,
     stateless_artifact_base: &std::path::Path,
@@ -11226,7 +12491,7 @@ async fn run_scripted_body(
             idx += 1; // consume the closing ">>>"
             let prompt = SubmittedPrompt::full(block.join("\n"));
             let result = run_scripted_turn(
-                setup,
+                provider,
                 tools,
                 perms,
                 journal,
@@ -11282,7 +12547,7 @@ async fn run_scripted_body(
                 rest,
                 messages,
                 model,
-                &setup.catalog_provider,
+                provider,
                 tools,
                 cli,
                 perms,
@@ -11451,7 +12716,7 @@ async fn run_scripted_body(
                         "script cancelled at {path}:{line_number}"
                     )));
                 }
-                SlashResult::Quit => {
+                SlashResult::Quit(_) => {
                     finish_command("ok", None, EXIT_USER)?;
                     break;
                 }
@@ -11512,7 +12777,7 @@ async fn run_scripted_body(
                         TurnToolMode::None => &no_tools,
                     };
                     let result = run_scripted_turn(
-                        setup,
+                        provider,
                         turn_tools,
                         perms,
                         journal,
@@ -11564,7 +12829,7 @@ async fn run_scripted_body(
                         TurnToolMode::None => &no_tools,
                     };
                     let result = run_scripted_turn(
-                        setup,
+                        provider,
                         turn_tools,
                         perms,
                         journal,
@@ -11670,7 +12935,7 @@ async fn run_scripted_body(
         }
         let prompt = SubmittedPrompt::full(trimmed);
         let result = run_scripted_turn(
-            setup,
+            provider,
             tools,
             perms,
             journal,
@@ -11717,7 +12982,7 @@ async fn run_scripted_body(
 /// transactionally while completed filesystem side effects remain inspectable.
 #[allow(clippy::too_many_arguments)]
 async fn run_scripted_turn(
-    setup: &ChatSetup,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     tools: &Registry,
     perms: &Permissions,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
@@ -11835,7 +13100,7 @@ async fn run_scripted_turn(
         turn_deadline,
         journal.scope_turn(
             &journal_turn.token,
-            run_turn_cancellable(&setup.provider, tools, messages, &cfg, state),
+            run_turn_cancellable(provider, tools, messages, &cfg, state),
         ),
     )
     .await
@@ -12431,7 +13696,7 @@ fn run_canonical_typeahead(
 ) -> TypeaheadCaptureResult {
     let mut result = TypeaheadCaptureResult::default();
     while !stop.load(Ordering::Acquire) {
-        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
             std::thread::sleep(Duration::from_millis(25));
             continue;
         }
@@ -12443,7 +13708,7 @@ fn run_canonical_typeahead(
             std::thread::sleep(Duration::from_millis(25));
             continue;
         };
-        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
             continue;
         }
 
@@ -12634,7 +13899,7 @@ fn typeahead_slash_hint(buffer: &str) -> String {
 /// [`typeahead_editor::TypeaheadEditor`], and the draft renders on the shared
 /// status row with a real cursor, ↑/↓ history, and editable text — while
 /// streamed output and tool receipts keep flowing above it. Approval prompts
-/// take stdin back by flipping `APPROVAL_INPUT_ACTIVE`: raw mode is released
+/// take stdin back by claiming `APPROVAL_INPUT_ACTIVE`: raw mode is released
 /// and the draft row hidden until the approval completes.
 #[cfg(unix)]
 fn run_live_typeahead(
@@ -12669,7 +13934,7 @@ fn run_live_typeahead(
     live::live_input_begin(prompt.clone());
     update_live_row(&editor);
     while !stop.load(Ordering::Acquire) {
-        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
             if let Some(guard) = raw.take() {
                 // Canonical mode (with echo) back on for the approval reader;
                 // the draft row is already hidden by the approval guard.
@@ -12697,7 +13962,7 @@ fn run_live_typeahead(
             std::thread::sleep(Duration::from_millis(25));
             continue;
         };
-        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
             continue;
         }
 
@@ -12847,7 +14112,7 @@ where
     };
     if outcome.is_none() {
         FOREGROUND_CANCELLED.store(true, Ordering::Release);
-        while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+        while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     } else {
@@ -12896,14 +14161,21 @@ async fn read_text_file_cancellable(path: std::path::PathBuf) -> Option<std::io:
 }
 
 async fn run_turn_cancellable(
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
     state: &mut kitsu_core::AgentSessionState,
 ) -> TurnOutcome {
+    let provider = match provider.bind_model(&cfg.model) {
+        Ok(provider) => provider,
+        Err(error) => {
+            return TurnOutcome::Completed(Err(kitsu_core::AgentError::Provider(error.into())))
+        }
+    };
+    mark_model_inference_started();
     match await_cancellable(run_agent_turn_with_state(
-        provider, tools, messages, cfg, state,
+        &provider, tools, messages, cfg, state,
     ))
     .await
     {
@@ -12926,7 +14198,7 @@ async fn wait_for_active_quit_cancel() {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_steerable(
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
@@ -12935,10 +14207,19 @@ async fn run_turn_steerable(
     turn: prompt_queue::SteeringTurnId,
     mut corrections: prompt_queue::SteeringReceiver,
 ) -> InteractiveTurnOutcome {
+    let provider = match provider.bind_model(&cfg.model) {
+        Ok(provider) => provider,
+        Err(error) => {
+            return InteractiveTurnOutcome::Turn(TurnOutcome::Completed(Err(
+                kitsu_core::AgentError::Provider(error.into()),
+            )))
+        }
+    };
+    mark_model_inference_started();
     debug_assert_eq!(corrections.turn(), turn);
     FOREGROUND_CANCELLED.store(false, Ordering::Release);
     ACTIVE_QUIT_CANCEL.store(false, Ordering::Release);
-    let future = run_agent_turn_with_state(provider, tools, messages, cfg, state);
+    let future = run_agent_turn_with_state(&provider, tools, messages, cfg, state);
     tokio::pin!(future);
     tokio::select! {
         result = &mut future => {
@@ -12949,7 +14230,7 @@ async fn run_turn_steerable(
         _ = tokio::signal::ctrl_c() => {
             let _ = steering.close_turn(turn);
             FOREGROUND_CANCELLED.store(true, Ordering::Release);
-            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             InteractiveTurnOutcome::Turn(TurnOutcome::Cancelled)
@@ -12957,7 +14238,7 @@ async fn run_turn_steerable(
         correction = corrections.recv() => {
             let _ = steering.close_turn(turn);
             FOREGROUND_CANCELLED.store(true, Ordering::Release);
-            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             let mut texts = correction
@@ -12975,7 +14256,7 @@ async fn run_turn_steerable(
         _ = wait_for_active_quit_cancel() => {
             let _ = steering.close_turn(turn);
             FOREGROUND_CANCELLED.store(true, Ordering::Release);
-            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             InteractiveTurnOutcome::QuitCancelled
@@ -12984,7 +14265,6 @@ async fn run_turn_steerable(
 }
 
 async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliError> {
-    MODEL_COMMAND_ACTIVE.store(true, Ordering::Release);
     let ChatInvocation {
         first_prompt,
         no_tools,
@@ -13007,6 +14287,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         initial_review,
     } = invocation;
     let setup = build_setup(cli).await?;
+    let provider = Arc::new(setup.provider_route.clone());
+    let initial_model = provider
+        .bind()
+        .map_err(|error| CliError::user(format!("cannot bind current provider route: {error}")))?
+        .model()
+        .to_string();
 
     // Permissions gate the fs tools. Interactive TTY chat uses "ask" mode
     // (prompt on demand) with read access to the launch directory by default;
@@ -13068,14 +14354,33 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         }
     }
     let sessions_dir = setup.state_dir.join("sessions");
-    let resumed = match resume {
-        Some(selector) => Some(
-            session::SessionStore::load(&sessions_dir, selector)
-                .map_err(|error| CliError::user(format!("cannot resume chat: {error}")))?,
+    let resumed_existing = resume.is_some();
+    let (mut session_store, resumed) = match (resume, durable_session) {
+        (Some(selector), true) => {
+            let admitted = session::ActiveSessionStore::resume_bound_current_v1(
+                sessions_dir.clone(),
+                selector,
+            )
+            .map_err(|error| CliError::user(format!("cannot resume chat: {error}")))?;
+            let (store, saved) = admitted.into_parts();
+            (Some(store), Some(saved))
+        }
+        (Some(selector), false) => (
+            None,
+            Some(
+                session::SessionStore::load(&sessions_dir, selector)
+                    .map_err(|error| CliError::user(format!("cannot resume chat: {error}")))?,
+            ),
         ),
-        None => None,
+        (None, true) => (
+            Some(
+                session::ActiveSessionStore::create(sessions_dir.clone())
+                    .map_err(CliError::user)?,
+            ),
+            None,
+        ),
+        (None, false) => (None, None),
     };
-    let resumed_existing = resumed.is_some();
     if let Some(saved) = resumed.as_ref() {
         let current = std::env::current_dir().map_err(|error| {
             CliError::user(format!("cannot resolve current directory: {error}"))
@@ -13089,15 +14394,6 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             )));
         }
     }
-    let mut session_store = if durable_session {
-        Some(match resumed.as_ref() {
-            Some(saved) => session::SessionStore::from_saved(sessions_dir.clone(), saved)
-                .map_err(CliError::user)?,
-            None => session::SessionStore::create(sessions_dir.clone()).map_err(CliError::user)?,
-        })
-    } else {
-        None
-    };
     if let Some(requested_name) = session_name {
         let Some(store) = session_store.as_mut() else {
             return Err(CliError::user(
@@ -13117,7 +14413,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 "another session is already named '{requested_name}' — pick a different --name or rename it via `kitsu sessions rename`"
             )));
         }
-        store.set_name(Some(requested_name.to_string()));
+        store
+            .set_name(Some(requested_name.to_string()))
+            .map_err(CliError::user)?;
         eprintln!("~ session name: {}", terminal_inline(requested_name));
     }
     let mode = if cli.dangerously_skip_permissions || cli.dangerously_allow_all_filesystem {
@@ -13401,7 +14699,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             can_write,
             &write_journal,
             command_policy.as_ref(),
-        );
+        )?;
         Arc::new(t)
     };
 
@@ -13419,7 +14717,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             false,
             &write_journal,
             None,
-        );
+        )?;
         Arc::new(tools)
     };
     let reasoning_tools = Arc::new(Registry::new());
@@ -13469,7 +14767,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // (see the loop below) so a subagent never runs the session's initial model
     // against a stale window.
     let live_mw: subagent::LiveModelWindow = Arc::new(std::sync::Mutex::new((
-        setup.model.clone(),
+        initial_model.clone(),
         setup.context_window,
     )));
     // Registry of BACKGROUND subagents (Stage C), shared with the spawn_agent_bg /
@@ -13514,10 +14812,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             can_write,
             &write_journal,
             command_policy.as_ref(),
-        );
+        )?;
     }
     let mut sub_cfg = build_agent_config(
-        setup.model.clone(),
+        initial_model.clone(),
         cli,
         setup.context_window,
         None,
@@ -13542,32 +14840,42 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         )
     };
     if !no_tools && spawn_cap > 0 {
+        let subagent_route = provider.clone();
+        let subagent_provider =
+            subagent::ProviderBinder::<ProviderRouteHandle<CompiledProvider>>::new(move |model| {
+                subagent_route
+                    .bind_model(model)
+                    .map(Arc::new)
+                    .map_err(ProviderError::from)
+            });
         // Stage A: synchronous single delegation.
-        let (d, h) = subagent::spawn_agent_tool(
-            setup.provider.clone(),
+        let (d, h) = subagent::spawn_agent_tool_with_binder(
+            subagent_provider.clone(),
             sub_tools.clone(),
             sub_cfg.clone(),
             live_mw.clone(),
             sub_system.clone(),
             spawn_budget.clone(),
         );
-        tools.register_with_descriptor(d, h);
+        let registration = tools.register_with_descriptor(d, h);
+        registration.expect("tool name must be unique");
         // Stage B: fan several isolated subagents out in parallel.
-        let (d, h) = subagent::spawn_agents_tool(
-            setup.provider.clone(),
+        let (d, h) = subagent::spawn_agents_tool_with_binder(
+            subagent_provider.clone(),
             sub_tools.clone(),
             sub_cfg.clone(),
             live_mw.clone(),
             sub_system.clone(),
             spawn_budget.clone(),
         );
-        tools.register_with_descriptor(d, h);
+        let registration = tools.register_with_descriptor(d, h);
+        registration.expect("tool name must be unique");
         // Stage C: detached background subagent (runs quiet so it doesn't corrupt
         // the prompt) + a tool to fetch its result by id.
         let mut bg_cfg = sub_cfg;
         bg_cfg.quiet = true;
-        let (d, h) = subagent::spawn_agent_bg_tool(
-            setup.provider.clone(),
+        let (d, h) = subagent::spawn_agent_bg_tool_with_binder(
+            subagent_provider,
             sub_tools.clone(),
             bg_cfg,
             live_mw.clone(),
@@ -13576,9 +14884,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             subagent::BackgroundProfileRuntime::new(profile_catalog.clone(), profile_tools),
             spawn_budget.clone(),
         );
-        tools.register_with_descriptor(d, h);
+        let registration = tools.register_with_descriptor(d, h);
+        registration.expect("tool name must be unique");
         let (d, h) = subagent::agent_result_tool(agent_registry.clone());
-        tools.register_with_descriptor(d, h);
+        let registration = tools.register_with_descriptor(d, h);
+        registration.expect("tool name must be unique");
     }
 
     // The model-callable `workspace_diff` evidence tool: a bounded disclosure
@@ -13596,12 +14906,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let private_evidence_paths = vec![
             setup.config_path.clone(),
             setup.state_dir.clone(),
-            std::env::temp_dir().join(format!("kitsu-offload-{}", jsonl_run_id())),
+            std::env::temp_dir().join(format!("kitsu-offload-{}", run_id())),
         ];
         if let Some((d, h)) =
             workspace_diff_tool(&launch_dir, private_evidence_paths, &perms, &live_mw)
         {
-            tools.register_with_descriptor(d, h);
+            let registration = tools.register_with_descriptor(d, h);
+            registration.expect("tool name must be unique");
         }
     }
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();
@@ -13622,7 +14933,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let stateless_artifact_base = if command_policy.is_some() {
         setup.state_dir.join("artifacts")
     } else {
-        std::env::temp_dir().join(format!("kitsu-offload-{}", jsonl_run_id()))
+        std::env::temp_dir().join(format!("kitsu-offload-{}", run_id()))
     };
     let mut artifact_directories = ArtifactDirectoryAllocator::default();
     let offload_state = Rc::new(RefCell::new(None));
@@ -13650,7 +14961,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             None
         };
 
-    let mut model = setup.model.clone();
+    let mut model = initial_model;
     // Shared with session UI state and updated in place by `/model`, so
     // switching models doesn't leave every subsequent turn budgeting against
     // the OLD model's window — a stale, larger window would under-trim and the
@@ -13847,12 +15158,32 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             let resumed_window = if setup.context_window_pinned {
                 context_window.get()
             } else {
-                await_cancellable(setup.catalog_provider.model_context_length(&resumed_model))
+                await_cancellable(provider.model_context_length(&resumed_model))
                     .await
                     .ok_or_else(|| {
                         CliError::cancelled("session context-window discovery cancelled by Ctrl+C")
                     })?
+                    .map_err(|error| {
+                        map_provider_error_with_diagnostics(
+                            error,
+                            ProviderOperation::ModelCatalog,
+                            Some(cli.timeout_secs),
+                            setup.provider_diagnostics,
+                        )
+                    })?
             };
+            let expected_generation = provider
+                .bind()
+                .map_err(|error| {
+                    CliError::user(format!("cannot stage resumed model route: {error}"))
+                })?
+                .identity()
+                .generation();
+            provider
+                .replace_model(expected_generation, resumed_model.clone())
+                .map_err(|error| {
+                    CliError::user(format!("cannot publish resumed model route: {error}"))
+                })?;
             model = resumed_model;
             context_window.set(resumed_window);
             if !setup.context_window_pinned {
@@ -13959,6 +15290,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     }
 
     if cli.jsonl {
+        let provider_route = provider.receipt().map_err(|error| {
+            CliError::user(format!("cannot inspect current provider route: {error}"))
+        })?;
         emit_jsonl(
             "run_started",
             serde_json::json!({
@@ -13971,6 +15305,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 },
                 "gateway": setup.gateway_name,
                 "model": model,
+                "provider_route": provider_route,
                 "session_id": session.session_id.borrow().clone(),
                 "resumed": resumed_existing,
                 "durable_session": durable_session,
@@ -14062,6 +15397,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     if let Some(path) = script {
         return run_scripted(
             &setup,
+            &provider,
             &tools,
             &mut messages,
             &mut model,
@@ -14142,40 +15478,58 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     }
                     let mapped = CliError::user(error);
                     if cli.jsonl {
-                        emit_jsonl(
+                        publish_piped_jsonl_terminal(
+                            kitsu_core::RunCleanupState::Joined,
                             "error",
-                            serde_json::json!({
-                                "turn_id": "piped:1",
-                                "kind": "attachment",
-                                "message": mapped.to_string(),
-                                "exit_code": mapped.exit_code(),
-                            }),
+                            0,
+                            0,
+                            0,
+                            || {
+                                emit_jsonl(
+                                    "error",
+                                    serde_json::json!({
+                                        "turn_id": "piped:1",
+                                        "kind": "attachment",
+                                        "message": mapped.to_string(),
+                                        "exit_code": mapped.exit_code(),
+                                    }),
+                                )?;
+                                emit_jsonl(
+                                    "turn_finished",
+                                    serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                                )?;
+                                emit_jsonl_summary("error", 1, 0)
+                            },
                         )?;
-                        emit_jsonl(
-                            "turn_finished",
-                            serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                        )?;
-                        emit_jsonl_summary("error", 1, 0)?;
                     }
                     return Err(mapped);
                 }
                 Ok(None) => {
                     let mapped = CliError::cancelled("attachment preflight cancelled by Ctrl+C");
                     if cli.jsonl {
-                        emit_jsonl(
-                            "error",
-                            serde_json::json!({
-                                "turn_id": "piped:1",
-                                "kind": "cancelled",
-                                "message": mapped.to_string(),
-                                "exit_code": mapped.exit_code(),
-                            }),
+                        publish_piped_jsonl_terminal(
+                            kitsu_core::RunCleanupState::Joined,
+                            "cancelled",
+                            0,
+                            0,
+                            0,
+                            || {
+                                emit_jsonl(
+                                    "error",
+                                    serde_json::json!({
+                                        "turn_id": "piped:1",
+                                        "kind": "cancelled",
+                                        "message": mapped.to_string(),
+                                        "exit_code": mapped.exit_code(),
+                                    }),
+                                )?;
+                                emit_jsonl(
+                                    "turn_finished",
+                                    serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
+                                )?;
+                                emit_jsonl_summary("cancelled", 1, 0)
+                            },
                         )?;
-                        emit_jsonl(
-                            "turn_finished",
-                            serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
-                        )?;
-                        emit_jsonl_summary("cancelled", 1, 0)?;
                     }
                     return Err(mapped);
                 }
@@ -14185,20 +15539,29 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         cli.timeout_secs
                     ));
                     if cli.jsonl {
-                        emit_jsonl(
+                        publish_piped_jsonl_terminal(
+                            kitsu_core::RunCleanupState::Joined,
                             "error",
-                            serde_json::json!({
-                                "turn_id": "piped:1",
-                                "kind": "deadline",
-                                "message": mapped.to_string(),
-                                "exit_code": mapped.exit_code(),
-                            }),
+                            1,
+                            0,
+                            0,
+                            || {
+                                emit_jsonl(
+                                    "error",
+                                    serde_json::json!({
+                                        "turn_id": "piped:1",
+                                        "kind": "deadline",
+                                        "message": mapped.to_string(),
+                                        "exit_code": mapped.exit_code(),
+                                    }),
+                                )?;
+                                emit_jsonl(
+                                    "turn_finished",
+                                    serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                                )?;
+                                emit_jsonl_summary("error", 1, 1)
+                            },
                         )?;
-                        emit_jsonl(
-                            "turn_finished",
-                            serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                        )?;
-                        emit_jsonl_summary("error", 1, 1)?;
                     }
                     return Err(mapped);
                 }
@@ -14240,7 +15603,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             write_journal.scope_turn(
                 &journal_turn.token,
                 run_turn_cancellable(
-                    &setup.provider,
+                    &provider,
                     turn_tools,
                     &mut messages,
                     &cfg,
@@ -14280,6 +15643,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     cli.jsonl,
                 )
                 .await;
+                let cleanup_state = terminal_cleanup_state(&cancelled_at_exit);
                 let background_results = agent_registry.take_unobserved_terminal_results();
                 emit_script_background_results(&background_results, cli.jsonl)?;
                 let failed_background = background_results
@@ -14310,28 +15674,32 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         "piped turn ended with {unfinished_agents} unfinished or failed background agent(s)"
                     ));
                     if cli.jsonl {
-                        emit_jsonl(
-                            "error",
-                            serde_json::json!({
-                                "turn_id": "piped:1",
-                                "kind": "unfinished_background_agents",
-                                "message": mapped.to_string(),
-                                "exit_code": mapped.exit_code(),
-                            }),
-                        )?;
-                        emit_jsonl(
-                            "turn_finished",
-                            serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                        )?;
-                        emit_jsonl_summary_with_local_failures(
-                            "error",
-                            1,
-                            1,
-                            0,
-                            0,
-                            0,
-                            unrecovered_tool_errors,
-                        )?;
+                        publish_piped_jsonl_terminal(cleanup_state, "error", 1, 0, 0, || {
+                            emit_jsonl(
+                                "error",
+                                serde_json::json!({
+                                    "turn_id": "piped:1",
+                                    "kind": "unfinished_background_agents",
+                                    "message": mapped.to_string(),
+                                    "exit_code": mapped.exit_code(),
+                                }),
+                            )?;
+                            emit_jsonl(
+                                "turn_finished",
+                                serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                            )?;
+                            emit_jsonl_summary_with_local_failures(
+                                "error",
+                                1,
+                                1,
+                                0,
+                                0,
+                                0,
+                                unrecovered_tool_errors,
+                            )
+                        })?;
+                    } else {
+                        record_human_terminal_facts_preserving_error(cleanup_state);
                     }
                     return Err(mapped);
                 }
@@ -14412,32 +15780,43 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     }
                     let mapped = strict_failure_cli_error(&failure);
                     if cli.jsonl {
-                        emit_jsonl(
+                        publish_piped_jsonl_terminal(
+                            cleanup_state,
                             "error",
-                            failure.jsonl_payload(
-                                "piped:1",
-                                &mapped.to_string(),
-                                &session_state.last_turn,
-                            ),
-                        )?;
-                        emit_jsonl(
-                            "turn_finished",
-                            serde_json::json!({
-                                "turn_id": "piped:1",
-                                "status": "error",
-                                "tool_errors": session_state.last_turn.tool_errors,
-                                "policy_errors": session_state.last_turn.policy_errors,
-                            }),
-                        )?;
-                        emit_jsonl_summary_with_local_failures(
-                            "error",
-                            1,
                             usize::from(failure.kind.is_provider_failure()),
-                            usize::from(failure.kind == ScriptFailureKind::OutputSchema),
                             usize::from(failure.kind == ScriptFailureKind::Tool),
                             usize::from(failure.kind == ScriptFailureKind::Policy),
-                            unrecovered_tool_errors,
+                            || {
+                                emit_jsonl(
+                                    "error",
+                                    failure.jsonl_payload(
+                                        "piped:1",
+                                        &mapped.to_string(),
+                                        &session_state.last_turn,
+                                    ),
+                                )?;
+                                emit_jsonl(
+                                    "turn_finished",
+                                    serde_json::json!({
+                                        "turn_id": "piped:1",
+                                        "status": "error",
+                                        "tool_errors": session_state.last_turn.tool_errors,
+                                        "policy_errors": session_state.last_turn.policy_errors,
+                                    }),
+                                )?;
+                                emit_jsonl_summary_with_local_failures(
+                                    "error",
+                                    1,
+                                    usize::from(failure.kind.is_provider_failure()),
+                                    usize::from(failure.kind == ScriptFailureKind::OutputSchema),
+                                    usize::from(failure.kind == ScriptFailureKind::Tool),
+                                    usize::from(failure.kind == ScriptFailureKind::Policy),
+                                    unrecovered_tool_errors,
+                                )
+                            },
                         )?;
+                    } else {
+                        record_human_terminal_facts_preserving_error(cleanup_state);
                     }
                     return Err(mapped);
                 }
@@ -14454,28 +15833,32 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     )?;
                     record_successful_operation();
                     if cli.jsonl {
-                        emit_jsonl(
-                            "error",
-                            serde_json::json!({
-                                "turn_id": "piped:1",
-                                "kind": "session",
-                                "message": mapped.to_string(),
-                                "exit_code": mapped.exit_code(),
-                            }),
-                        )?;
-                        emit_jsonl(
-                            "turn_finished",
-                            serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                        )?;
-                        emit_jsonl_summary_with_local_failures(
-                            "error",
-                            1,
-                            0,
-                            0,
-                            0,
-                            0,
-                            recovered_tool_errors,
-                        )?;
+                        publish_piped_jsonl_terminal(cleanup_state, "error", 0, 0, 0, || {
+                            emit_jsonl(
+                                "error",
+                                serde_json::json!({
+                                    "turn_id": "piped:1",
+                                    "kind": "session",
+                                    "message": mapped.to_string(),
+                                    "exit_code": mapped.exit_code(),
+                                }),
+                            )?;
+                            emit_jsonl(
+                                "turn_finished",
+                                serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                            )?;
+                            emit_jsonl_summary_with_local_failures(
+                                "error",
+                                1,
+                                0,
+                                0,
+                                0,
+                                0,
+                                recovered_tool_errors,
+                            )
+                        })?;
+                    } else {
+                        record_human_terminal_facts_preserving_error(cleanup_state);
                     }
                     return Err(mapped);
                 }
@@ -14511,33 +15894,43 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     &required_write_evaluation,
                 )?;
                 if let Some(mapped) = required_write_evaluation.failure {
-                    emit_required_write_error(cli, &mapped)?;
                     if cli.jsonl {
-                        emit_jsonl_summary_with_postcondition_failures(
-                            "error",
-                            1,
-                            0,
-                            0,
-                            1,
-                            0,
-                            0,
-                            recovered_tool_errors,
-                        )?;
+                        publish_piped_jsonl_terminal(cleanup_state, "error", 0, 0, 0, || {
+                            emit_required_write_error(cli, &mapped)?;
+                            emit_jsonl_summary_with_postcondition_failures(
+                                "error",
+                                1,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                recovered_tool_errors,
+                            )
+                        })?;
+                    } else {
+                        emit_required_write_error(cli, &mapped)?;
+                        record_human_terminal_facts_preserving_error(cleanup_state);
                     }
                     return Err(mapped);
                 }
                 if let Err(mapped) = write_output_last_message(cli, "piped:1", &text) {
-                    emit_output_last_message_error(cli, "piped:1", &mapped)?;
                     if cli.jsonl {
-                        emit_jsonl_summary_with_local_failures(
-                            "error",
-                            1,
-                            0,
-                            0,
-                            0,
-                            0,
-                            recovered_tool_errors,
-                        )?;
+                        publish_piped_jsonl_terminal(cleanup_state, "error", 0, 0, 0, || {
+                            emit_output_last_message_error(cli, "piped:1", &mapped)?;
+                            emit_jsonl_summary_with_local_failures(
+                                "error",
+                                1,
+                                0,
+                                0,
+                                0,
+                                0,
+                                recovered_tool_errors,
+                            )
+                        })?;
+                    } else {
+                        emit_output_last_message_error(cli, "piped:1", &mapped)?;
+                        record_human_terminal_facts_preserving_error(cleanup_state);
                     }
                     return Err(mapped);
                 }
@@ -14554,15 +15947,19 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     );
                 }
                 if cli.jsonl {
-                    emit_jsonl_summary_with_local_failures(
-                        "ok",
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        recovered_tool_errors,
-                    )?;
+                    publish_piped_jsonl_terminal(cleanup_state, "ok", 0, 0, 0, || {
+                        emit_jsonl_summary_with_local_failures(
+                            "ok",
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            recovered_tool_errors,
+                        )
+                    })?;
+                } else {
+                    record_human_terminal_facts(cleanup_state)?;
                 }
                 Ok(())
             }
@@ -14626,8 +16023,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         Some("the model turn failed before commit"),
                     )?;
                 }
-                cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
-                    .await;
+                let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                    &agent_registry,
+                    agent_watermark,
+                    &write_journal,
+                )
+                .await;
                 let cause = agent_error_jsonl_cause(&error);
                 let mapped = map_agent_error_with_diagnostics(
                     error,
@@ -14636,25 +16037,36 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     setup.provider_diagnostics,
                 );
                 if cli.jsonl {
-                    let mut payload = mapped.jsonl_error_payload();
-                    payload["turn_id"] = serde_json::json!("piped:1");
-                    if let Some(cause) = cause {
-                        payload["cause"] = serde_json::json!(cause);
-                    }
-                    emit_jsonl("error", payload)?;
-                    emit_jsonl(
-                        "turn_finished",
-                        serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                    )?;
-                    emit_jsonl_summary_with_local_failures(
+                    publish_piped_jsonl_terminal(
+                        cancelled.cleanup,
                         "error",
-                        1,
                         usize::from(mapped.exit_code() == EXIT_PROVIDER),
                         0,
                         0,
-                        0,
-                        unrecovered_tool_errors,
+                        || {
+                            let mut payload = mapped.jsonl_error_payload();
+                            payload["turn_id"] = serde_json::json!("piped:1");
+                            if let Some(cause) = cause {
+                                payload["cause"] = serde_json::json!(cause);
+                            }
+                            emit_jsonl("error", payload)?;
+                            emit_jsonl(
+                                "turn_finished",
+                                serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                            )?;
+                            emit_jsonl_summary_with_local_failures(
+                                "error",
+                                1,
+                                usize::from(mapped.exit_code() == EXIT_PROVIDER),
+                                0,
+                                0,
+                                0,
+                                unrecovered_tool_errors,
+                            )
+                        },
                     )?;
+                } else {
+                    record_human_terminal_facts_preserving_error(cancelled.cleanup);
                 }
                 Err(mapped)
             }
@@ -14665,32 +16077,40 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     AssistantDisposition::Discarded,
                     Some("the model turn was cancelled before commit"),
                 )?;
-                cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
-                    .await;
+                let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                    &agent_registry,
+                    agent_watermark,
+                    &write_journal,
+                )
+                .await;
                 let mapped = CliError::cancelled("request cancelled by Ctrl+C");
                 if cli.jsonl {
-                    emit_jsonl(
-                        "error",
-                        serde_json::json!({
-                            "turn_id": "piped:1",
-                            "kind": "cancelled",
-                            "message": mapped.to_string(),
-                            "exit_code": mapped.exit_code(),
-                        }),
-                    )?;
-                    emit_jsonl(
-                        "turn_finished",
-                        serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
-                    )?;
-                    emit_jsonl_summary_with_local_failures(
-                        "cancelled",
-                        1,
-                        0,
-                        0,
-                        0,
-                        0,
-                        unrecovered_tool_errors,
-                    )?;
+                    publish_piped_jsonl_terminal(cancelled.cleanup, "cancelled", 0, 0, 0, || {
+                        emit_jsonl(
+                            "error",
+                            serde_json::json!({
+                                "turn_id": "piped:1",
+                                "kind": "cancelled",
+                                "message": mapped.to_string(),
+                                "exit_code": mapped.exit_code(),
+                            }),
+                        )?;
+                        emit_jsonl(
+                            "turn_finished",
+                            serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
+                        )?;
+                        emit_jsonl_summary_with_local_failures(
+                            "cancelled",
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            unrecovered_tool_errors,
+                        )
+                    })?;
+                } else {
+                    record_human_terminal_facts_preserving_error(cancelled.cleanup);
                 }
                 Err(mapped)
             }
@@ -14821,6 +16241,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // into the next live editor or idle prompt so typing is never dropped.
     let mut pending_draft = String::new();
     let no_tools = Registry::new();
+    let mut run_aggregate = InteractiveRunAggregate::default();
 
     loop {
         let agent_snapshot = agent_registry.snapshot();
@@ -14865,11 +16286,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     .expect("prompt queue")
                     .status()
                     .is_empty());
-                await_background_agents(
+                let cleanup = await_background_agents(
                     &agent_registry,
                     "end of input never discards detached work",
                 )
                 .await;
+                run_aggregate.observe_cleanup(cleanup);
                 break;
             }
             (None, None) => match read_chat_line(
@@ -14895,6 +16317,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     continue;
                 }
                 ChatReadline::Error(error) => {
+                    run_aggregate.record_non_success(kitsu_core::RunOutcomeClass::UserFault);
                     eprintln!("input error: {error}");
                     break;
                 }
@@ -14919,7 +16342,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 rest,
                 &mut messages,
                 &mut model,
-                &setup.catalog_provider,
+                &provider,
                 &tools,
                 cli,
                 &perms,
@@ -14947,9 +16370,17 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     eprintln!("{}", terminal_inline(&message));
                     continue;
                 }
-                SlashResult::Error | SlashResult::ProviderFailure(_) => continue,
-                SlashResult::Cancelled => continue,
-                SlashResult::Quit => {
+                SlashResult::Error => continue,
+                SlashResult::ProviderFailure(_) => {
+                    run_aggregate.record_non_success(kitsu_core::RunOutcomeClass::ProviderFault);
+                    continue;
+                }
+                SlashResult::Cancelled => {
+                    run_aggregate.record_non_success(kitsu_core::RunOutcomeClass::Cancelled);
+                    continue;
+                }
+                SlashResult::Quit(cleanup) => {
+                    run_aggregate.observe_cleanup(cleanup);
                     let running = agent_registry.running();
                     if running > 0 {
                         eprintln!(
@@ -14982,6 +16413,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         );
                         continue;
                     }
+                    run_aggregate.record_background_snapshot(&agent_registry.progress_snapshot());
                     surface_unobserved_background_results(&agent_registry);
                     while deferred_notice_receiver.try_recv().is_ok() {}
                     match clear_session_boundary(
@@ -15018,6 +16450,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         );
                         continue;
                     }
+                    run_aggregate.record_background_snapshot(&agent_registry.progress_snapshot());
                     surface_unobserved_background_results(&agent_registry);
                     while deferred_notice_receiver.try_recv().is_ok() {}
                     if !persist_started_session(&session_store, &session, &model, &messages) {
@@ -15080,16 +16513,40 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         continue;
                     }
                     let active_id = session.session_id.borrow().clone();
-                    let saved = match session::SessionStore::load_other(
-                        &sessions_dir,
-                        &selector,
-                        active_id.as_deref(),
-                    ) {
-                        Ok(saved) => saved,
-                        Err(error) => {
-                            eprintln!("cannot resume chat: {error}");
-                            continue;
-                        }
+                    let read_only_saved;
+                    let staged_resume;
+                    let saved = if no_session {
+                        staged_resume = None;
+                        read_only_saved = Some(
+                            match session::SessionStore::load_other(
+                                &sessions_dir,
+                                &selector,
+                                active_id.as_deref(),
+                            ) {
+                                Ok(saved) => saved,
+                                Err(error) => {
+                                    eprintln!("cannot resume chat: {error}");
+                                    continue;
+                                }
+                            },
+                        );
+                        read_only_saved.as_ref().expect("read-only resume value")
+                    } else {
+                        read_only_saved = None;
+                        staged_resume = Some(
+                            match session::ActiveSessionStore::resume_other_bound_current_v1(
+                                sessions_dir.clone(),
+                                &selector,
+                                active_id.as_deref(),
+                            ) {
+                                Ok(staged) => staged,
+                                Err(error) => {
+                                    eprintln!("cannot resume chat: {error}");
+                                    continue;
+                                }
+                            },
+                        );
+                        staged_resume.as_ref().expect("staged resume").saved()
                     };
                     if saved.gateway != session.gateway {
                         eprintln!(
@@ -15119,6 +16576,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         );
                         continue;
                     }
+                    run_aggregate.record_background_snapshot(&agent_registry.progress_snapshot());
                     surface_unobserved_background_results(&agent_registry);
                     while deferred_notice_receiver.try_recv().is_ok() {}
                     if !persist_started_session(&session_store, &session, &model, &messages) {
@@ -15128,30 +16586,74 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         continue;
                     }
                     report_write_checkpoints(write_journal.drain_and_take_reports().await);
-                    let resumed_store = if no_session {
-                        None
-                    } else {
-                        match session::SessionStore::from_saved(sessions_dir.clone(), &saved) {
-                            Ok(store) => Some(store),
-                            Err(error) => {
-                                eprintln!("cannot autosave resumed session: {error}");
-                                continue;
-                            }
-                        }
-                    };
                     let resumed_model = saved.model.clone();
                     let resumed_window = if setup.context_window_pinned {
                         context_window.get()
                     } else {
-                        let Some(window) = await_cancellable(
-                            setup.catalog_provider.model_context_length(&resumed_model),
-                        )
-                        .await
+                        let Some(window) =
+                            await_cancellable(provider.model_context_length(&resumed_model)).await
                         else {
                             eprintln!("^C (session context-window discovery cancelled)");
                             continue;
                         };
-                        window
+                        match window {
+                            Ok(window) => window,
+                            Err(error) => {
+                                eprintln!(
+                                    "cannot discover session context window: {}",
+                                    safe_provider_error_message(
+                                        &error,
+                                        ProviderOperation::ModelCatalog,
+                                        Some(cli.timeout_secs),
+                                        setup.provider_diagnostics,
+                                    )
+                                );
+                                continue;
+                            }
+                        }
+                    };
+                    let expected_generation = match provider.bind() {
+                        Ok(route) => route.identity().generation(),
+                        Err(error) => {
+                            eprintln!(
+                                "cannot stage resumed model route: {}",
+                                safe_provider_error_message(
+                                    &error.into(),
+                                    ProviderOperation::Chat {
+                                        model: &resumed_model,
+                                    },
+                                    Some(cli.timeout_secs),
+                                    setup.provider_diagnostics,
+                                )
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(error) =
+                        provider.replace_model(expected_generation, resumed_model.clone())
+                    {
+                        eprintln!(
+                            "cannot publish resumed model route: {}",
+                            safe_provider_error_message(
+                                &error.into(),
+                                ProviderOperation::Chat {
+                                    model: &resumed_model,
+                                },
+                                Some(cli.timeout_secs),
+                                setup.provider_diagnostics,
+                            )
+                        );
+                        continue;
+                    }
+                    let (resumed_store, saved) = match staged_resume {
+                        Some(staged) => {
+                            let (store, saved) = staged.into_parts();
+                            (Some(store), saved)
+                        }
+                        None => (
+                            None,
+                            read_only_saved.expect("read-only resume value after validation"),
+                        ),
                     };
                     model = resumed_model;
                     context_window.set(resumed_window);
@@ -15367,7 +16869,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .scope_turn(
                 &journal_turn.token,
                 run_turn_steerable(
-                    &setup.provider,
+                    &provider,
                     turn_tools,
                     &mut messages,
                     &cfg,
@@ -15436,15 +16938,19 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     )?;
                     messages = messages_before;
                     rollback_agent_state(&mut session_state, state_before);
-                    let mut retained = turn_reports;
-                    retained.extend(
-                        cancel_agents_and_report_writes(
-                            &agent_registry,
-                            agent_watermark,
-                            &write_journal,
-                        )
-                        .await,
+                    run_aggregate.record_turn(
+                        kitsu_core::RunOutcomeClass::ProviderFault,
+                        kitsu_core::RunAssistantDisposition::Discarded,
                     );
+                    let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                        &agent_registry,
+                        agent_watermark,
+                        &write_journal,
+                    )
+                    .await;
+                    run_aggregate.observe_cleanup(cancelled.cleanup);
+                    let mut retained = turn_reports;
+                    retained.extend(cancelled.reports);
                     last_failed = Some(retry_prompt);
                     eprintln!(
                         "~ {}; turn rolled back - /retry to try again",
@@ -15459,11 +16965,31 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         tools.is_registered("workspace_diff"),
                     )?;
                 } else {
+                    finish_assistant_disposition(
+                        cli,
+                        "interactive",
+                        AssistantDisposition::Committed,
+                        None,
+                    )?;
+                    run_aggregate.record_turn(
+                        kitsu_core::RunOutcomeClass::Succeeded,
+                        kitsu_core::RunAssistantDisposition::Committed,
+                    );
                     last_failed = None;
                     persist_session(&session_store, &session, &model, &messages);
                 }
             }
             InteractiveTurnOutcome::Turn(TurnOutcome::Completed(Err(e))) => {
+                let mapped = map_agent_error_with_diagnostics(
+                    e,
+                    ProviderOperation::Chat { model: &model },
+                    Some(cli.timeout_secs),
+                    session.provider_diagnostics,
+                );
+                run_aggregate.record_turn(
+                    mapped.outcome_class(),
+                    kitsu_core::RunAssistantDisposition::Discarded,
+                );
                 finish_assistant_disposition(
                     cli,
                     "interactive",
@@ -15472,22 +16998,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 )?;
                 messages = messages_before;
                 rollback_agent_state(&mut session_state, state_before);
+                let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                    &agent_registry,
+                    agent_watermark,
+                    &write_journal,
+                )
+                .await;
+                run_aggregate.observe_cleanup(cancelled.cleanup);
                 let mut retained = turn_reports;
-                retained.extend(
-                    cancel_agents_and_report_writes(
-                        &agent_registry,
-                        agent_watermark,
-                        &write_journal,
-                    )
-                    .await,
-                );
+                retained.extend(cancelled.reports);
                 last_failed = Some(retry_prompt);
-                for line in kitsu_render::error_lines(&chat_error_message_with_diagnostics(
-                    e,
-                    &model,
-                    cli.timeout_secs,
-                    session.provider_diagnostics,
-                )) {
+                let message = kitsu_render::sanitize_terminal_text(&mapped.to_string());
+                for line in kitsu_render::error_lines(&message) {
                     eprintln!("{line}");
                 }
                 eprintln!(
@@ -15502,6 +17024,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 )?;
             }
             InteractiveTurnOutcome::Turn(TurnOutcome::Cancelled) => {
+                run_aggregate.record_turn(
+                    kitsu_core::RunOutcomeClass::Cancelled,
+                    kitsu_core::RunAssistantDisposition::Discarded,
+                );
                 finish_assistant_disposition(
                     cli,
                     "interactive",
@@ -15510,15 +17036,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 )?;
                 messages = messages_before;
                 rollback_agent_state(&mut session_state, state_before);
+                let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                    &agent_registry,
+                    agent_watermark,
+                    &write_journal,
+                )
+                .await;
+                run_aggregate.observe_cleanup(cancelled.cleanup);
                 let mut retained = turn_reports;
-                retained.extend(
-                    cancel_agents_and_report_writes(
-                        &agent_registry,
-                        agent_watermark,
-                        &write_journal,
-                    )
-                    .await,
-                );
+                retained.extend(cancelled.reports);
                 last_failed = Some(retry_prompt);
                 kitsu_render::finish_line();
                 eprintln!("^C (response cancelled; turn rolled back - /retry to try again)");
@@ -15532,6 +17058,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 )?;
             }
             InteractiveTurnOutcome::Steered(corrections) => {
+                run_aggregate.record_replaced_turn();
                 finish_assistant_disposition(
                     cli,
                     "interactive",
@@ -15540,15 +17067,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 )?;
                 messages = messages_before;
                 rollback_agent_state(&mut session_state, state_before);
+                let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                    &agent_registry,
+                    agent_watermark,
+                    &write_journal,
+                )
+                .await;
+                run_aggregate.observe_cleanup(cancelled.cleanup);
                 let mut retained = turn_reports;
-                retained.extend(
-                    cancel_agents_and_report_writes(
-                        &agent_registry,
-                        agent_watermark,
-                        &write_journal,
-                    )
-                    .await,
-                );
+                retained.extend(cancelled.reports);
                 note_rollback_retained_changes(
                     cli,
                     None,
@@ -15574,6 +17101,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 eprintln!("~ completed file changes, if any, remain on disk");
             }
             InteractiveTurnOutcome::QuitCancelled => {
+                run_aggregate.record_turn(
+                    kitsu_core::RunOutcomeClass::Cancelled,
+                    kitsu_core::RunAssistantDisposition::Discarded,
+                );
                 finish_assistant_disposition(
                     cli,
                     "interactive",
@@ -15582,15 +17113,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 )?;
                 messages = messages_before;
                 rollback_agent_state(&mut session_state, state_before);
+                let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                    &agent_registry,
+                    agent_watermark,
+                    &write_journal,
+                )
+                .await;
+                run_aggregate.observe_cleanup(cancelled.cleanup);
                 let mut retained = turn_reports;
-                retained.extend(
-                    cancel_agents_and_report_writes(
-                        &agent_registry,
-                        agent_watermark,
-                        &write_journal,
-                    )
-                    .await,
-                );
+                retained.extend(cancelled.reports);
                 note_rollback_retained_changes(
                     cli,
                     None,
@@ -15599,6 +17130,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     tools.is_registered("workspace_diff"),
                 )?;
                 let stopped = agent_registry.cancel_all().await;
+                run_aggregate.observe_cleanup(terminal_cleanup_state(&stopped));
                 let removed = prompt_queue.lock().expect("prompt queue").clear();
                 exit_after_queue = true;
                 last_failed = None;
@@ -15613,11 +17145,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         }
     }
 
-    await_background_agents(
+    let cleanup = await_background_agents(
         &agent_registry,
         "chat input ended before background work completed",
     )
     .await;
+    run_aggregate.observe_cleanup(cleanup);
+    run_aggregate.record_background_snapshot(&agent_registry.progress_snapshot());
     let surfaced_results = surface_unobserved_background_results(&agent_registry);
     if surfaced_results > 0 {
         eprintln!(
@@ -15634,6 +17168,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     if let Some(task) = assistive_signal_task {
         task.abort();
     }
+    record_interactive_terminal_facts(
+        run_aggregate.terminal_facts(jsonl_session_persistence_state()),
+    )?;
     Ok(())
 }
 
@@ -15677,7 +17214,7 @@ impl SubmittedPrompt {
 
 enum SlashResult {
     Continue(Option<serde_json::Value>),
-    Quit,
+    Quit(kitsu_core::RunCleanupState),
     Error,
     /// A host-authored, terminal-safe user error that automation should retain
     /// instead of replacing with the generic scripted-command fallback.
@@ -16101,11 +17638,12 @@ fn skill_load_payload(
 
 async fn refresh_session_context_window(
     model: &str,
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     session: &SessionInfo,
     context_window: &Rc<Cell<Option<u64>>>,
     context_window_pinned: bool,
     jsonl: bool,
+    timeout_secs: u64,
 ) -> SlashResult {
     if context_window_pinned {
         let source = context_window_provenance(&session.window_provenance)
@@ -16127,7 +17665,7 @@ async fn refresh_session_context_window(
         return SlashResult::Error;
     }
     let cache_key = session.window_refresh.cache_key(model);
-    let Some(outcome) = await_cancellable(refresh_cached_context_window(
+    let Some(outcome) = await_cancellable(refresh_cached_context_window_explicit(
         provider,
         model,
         &session.window_refresh.cache_path,
@@ -16139,6 +17677,18 @@ async fn refresh_session_context_window(
             eprintln!("^C (context-window refresh cancelled)");
         }
         return SlashResult::Cancelled;
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return report_slash_provider_error(
+                "context-window refresh failed",
+                error,
+                ProviderOperation::ModelCatalog,
+                timeout_secs,
+                session.provider_diagnostics,
+            );
+        }
     };
     let (window, cache_written) = match outcome {
         ContextWindowRefreshOutcome::Cached(window) => (window, true),
@@ -16188,7 +17738,7 @@ async fn handle_slash(
     cmd: &str,
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     tools: &Registry,
     cli: &Cli,
     perms: &Permissions,
@@ -16225,28 +17775,30 @@ async fn handle_slash(
 
     match name {
         "quit" | "exit" => {
-            match arg {
-                "" => {}
+            let cleanup = match arg {
+                "" => kitsu_core::RunCleanupState::Joined,
                 "wait" => {
                     await_background_agents(
                         registry,
                         "exit requested with wait while background jobs are running",
                     )
-                    .await;
+                    .await
                 }
                 "cancel" => {
                     let cancelled = registry.cancel_all().await;
+                    let cleanup = terminal_cleanup_state(&cancelled);
                     eprintln!(
                         "~ cancelled and joined {} background job(s) before exit",
                         cancelled.len()
                     );
+                    cleanup
                 }
                 _ => {
                     eprintln!("usage: /{name} [wait|cancel]");
                     return SlashResult::Error;
                 }
-            }
-            return SlashResult::Quit;
+            };
+            return SlashResult::Quit(cleanup);
         }
         "" | "help" => {
             if !arg.is_empty() {
@@ -16279,12 +17831,36 @@ async fn handle_slash(
             })));
         }
         "status" => {
-            let text = format_session_status(model, messages, session, perms, registry, state);
+            let provider_route = match provider.receipt() {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    eprintln!("cannot inspect current provider route: {error}");
+                    return SlashResult::Error;
+                }
+            };
+            let text = format_session_status(
+                model,
+                messages,
+                session,
+                perms,
+                registry,
+                state,
+                &provider_route,
+            );
             if !cli.jsonl {
                 eprintln!("{text}");
             }
             return SlashResult::Continue(Some(session_status_payload(
-                model, messages, session, perms, registry, state, text,
+                model,
+                messages,
+                session,
+                perms,
+                registry,
+                state,
+                RenderedSessionStatus {
+                    provider_route: &provider_route,
+                    text,
+                },
             )));
         }
         "permissions" => {
@@ -16363,6 +17939,7 @@ async fn handle_slash(
                     context_window,
                     context_window_pinned,
                     cli.jsonl,
+                    cli.timeout_secs,
                 )
                 .await;
             }
@@ -17166,6 +18743,18 @@ async fn handle_slash(
                 };
             } else {
                 let previous_model = model.clone();
+                let expected_generation = match provider.bind() {
+                    Ok(route) => route.identity().generation(),
+                    Err(error) => {
+                        return report_slash_provider_error(
+                            "could not stage model switch",
+                            error.into(),
+                            ProviderOperation::ModelCatalog,
+                            cli.timeout_secs,
+                            session.provider_diagnostics,
+                        );
+                    }
+                };
                 let Some(catalog) = await_cancellable(list_models_with_runtime_telemetry(
                     provider,
                     runtime_log,
@@ -17215,11 +18804,15 @@ async fn handle_slash(
                 // Only re-resolve when the window was never pinned in the first
                 // place: carrying over the OLD model's discovered window (or
                 // lack thereof) would otherwise budget against the wrong limit.
-                let note = if context_window_pinned {
+                let (next_window, next_provenance, note) = if context_window_pinned {
                     let provenance = context_window_provenance(&session.window_provenance);
-                    format!(
-                        " (context window pinned by {}; unchanged)",
-                        provenance.source.label()
+                    (
+                        context_window.get(),
+                        None,
+                        format!(
+                            " (context window pinned by {}; unchanged)",
+                            provenance.source.label()
+                        ),
                     )
                 } else {
                     let Some(discovered) =
@@ -17228,19 +18821,46 @@ async fn handle_slash(
                         eprintln!("^C (context-window discovery cancelled)");
                         return SlashResult::Cancelled;
                     };
-                    context_window.set(discovered);
-                    *session
-                        .window_provenance
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        ContextWindowProvenance::live_discovery(discovered);
-                    match discovered {
+                    let discovered = match discovered {
+                        Ok(discovered) => discovered,
+                        Err(error) => {
+                            return report_slash_provider_error(
+                                "could not discover context window",
+                                error,
+                                ProviderOperation::ModelCatalog,
+                                cli.timeout_secs,
+                                session.provider_diagnostics,
+                            );
+                        }
+                    };
+                    let note = match discovered {
                         Some(w) => format!(" (context window: {w} tokens)"),
                         None => format!(
                             " (context window not reported; using conservative {DEFAULT_CONTEXT_WINDOW}-token default)"
                         ),
-                    }
+                    };
+                    (
+                        discovered,
+                        Some(ContextWindowProvenance::live_discovery(discovered)),
+                        note,
+                    )
                 };
+                if let Err(error) = provider.replace_model(expected_generation, arg) {
+                    return report_slash_provider_error(
+                        "could not publish model switch",
+                        error.into(),
+                        ProviderOperation::ModelCatalog,
+                        cli.timeout_secs,
+                        session.provider_diagnostics,
+                    );
+                }
+                context_window.set(next_window);
+                if let Some(provenance) = next_provenance {
+                    *session
+                        .window_provenance
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = provenance;
+                }
                 *model = arg.to_string();
                 // The meter's anchor is a real `prompt_tokens` count measured
                 // under the OLD model's tokenizer; a different model can tokenize
@@ -17314,7 +18934,7 @@ fn extract_code_or_text(text: &str) -> String {
 /// like other slash commands. The listed IDs are what you pass to `/model <id>`
 /// or `--model` — handy for exploring a big catalog (e.g. Hugging Face).
 async fn list_models_and_print(
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     filter: &str,
     current_model: &str,
     runtime_log: Option<&kitsu_core::AgentEventLog>,
@@ -17352,10 +18972,14 @@ fn runtime_model_catalog_telemetry(
 ) -> Option<ProviderTelemetrySink> {
     runtime_log.map(|runtime_log| {
         let runtime_log = runtime_log.clone();
-        ProviderTelemetrySink::with_fallible_observer(move |event| {
+        ProviderTelemetrySink::with_fallible_context_observer(move |observation| {
+            let event = observation.event;
             runtime_log.record(kitsu_core::AgentRuntimeEvent::ProviderAttempt {
                 round: MODEL_CATALOG_ROUND,
                 purpose: kitsu_core::ProviderRequestPurpose::ModelCatalog,
+                route_generation: observation
+                    .route_generation
+                    .map(|generation| generation.get()),
                 attempt: event.attempt,
                 max_attempts: event.max_attempts,
                 category: event.category,
@@ -17374,7 +18998,7 @@ fn runtime_model_catalog_telemetry(
 }
 
 async fn list_models_with_runtime_telemetry(
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     runtime_log: Option<&kitsu_core::AgentEventLog>,
     request_timeout_ms: u64,
 ) -> Result<Option<Vec<String>>, ProviderError> {
@@ -17407,7 +19031,10 @@ fn report_slash_provider_error(
     timeout_secs: u64,
     diagnostics: ProviderDiagnosticContext,
 ) -> SlashResult {
-    let user_error = matches!(error, ProviderError::Auth(_));
+    let user_error = matches!(
+        error,
+        ProviderError::Auth(_) | ProviderError::RouteContract(_)
+    );
     let message = safe_provider_error_message(&error, operation, Some(timeout_secs), diagnostics);
     eprintln!("{}: {}", terminal_inline(prefix), message);
     if user_error {
@@ -17439,37 +19066,37 @@ fn finish_slash_model_catalog(
 /// Used only in interactive `Mode::Ask`; the prompt fires mid-turn while
 /// rustyline is idle. Bracketed paste is disabled around the read so a stray
 /// paste can't inject `ESC[200~` markers. Exactly one line is considered:
-/// invalid input, EOF, or an input error denies without letting a later pasted
-/// line become an authorization decision.
+/// Invalid input denies. EOF or an input error interrupts the current run
+/// without letting a later pasted line become an authorization decision.
 struct CliPrompter;
 
 struct CliCommandPrompter;
 
 struct ApprovalInputGuard {
     _owner: std::sync::MutexGuard<'static, ()>,
-    previous_active: bool,
 }
 
 impl ApprovalInputGuard {
     fn enter() -> Self {
+        // Publish the claim before waiting for the mutex. Otherwise the
+        // type-ahead loop can observe `false`, release its short poll lock, and
+        // reacquire it indefinitely while this prompt is already waiting.
+        APPROVAL_INPUT_ACTIVE.fetch_add(1, Ordering::AcqRel);
         let owner = APPROVAL_INPUT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous_active = APPROVAL_INPUT_ACTIVE.swap(true, Ordering::AcqRel);
         // Take the live type-ahead draft row off the terminal before the
         // approval prompt prints; the collector re-shows it (draft intact)
         // once the approval releases stdin.
         kitsu_render::live::live_input_end();
-        Self {
-            _owner: owner,
-            previous_active,
-        }
+        Self { _owner: owner }
     }
 }
 
 impl Drop for ApprovalInputGuard {
     fn drop(&mut self) {
-        APPROVAL_INPUT_ACTIVE.store(self.previous_active, Ordering::Release);
+        let claims = APPROVAL_INPUT_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(claims > 0, "approval-input claim underflow");
     }
 }
 
@@ -17565,7 +19192,7 @@ impl Prompter for CliPrompter {
         }
         let _ = std::io::stderr().flush();
         let Some(line) = read_approval_line() else {
-            return Decision::Deny;
+            return Decision::Interrupt;
         };
         parse_permission_answer(&line).unwrap_or_else(|| {
             eprintln!("invalid permission response; denied (enter y, a/always, or n next time)");
@@ -17624,7 +19251,7 @@ impl CommandPrompter for CliCommandPrompter {
         }
         let _ = std::io::stderr().flush();
         let Some(line) = read_approval_line() else {
-            return CommandDecision::Deny;
+            return CommandDecision::Interrupt;
         };
         match line
             .trim()
@@ -17768,6 +19395,9 @@ fn map_agent_error_with_diagnostics(
         kitsu_core::AgentError::Provider(error) => {
             map_provider_error_with_diagnostics(error, operation, timeout_secs, diagnostics)
         }
+        kitsu_core::AgentError::Interrupted(interruption) => {
+            CliError::interrupted(format!("run interrupted: {interruption}"))
+        }
         kitsu_core::AgentError::ToolCallDuringToolFreeFinalization => CliError::provider(
             "model returned a tool call after tools were withheld for structured finalization; no tool was executed"
                 .to_string(),
@@ -17799,7 +19429,10 @@ fn map_provider_error_with_diagnostics(
     timeout_secs: Option<u64>,
     diagnostics: ProviderDiagnosticContext,
 ) -> CliError {
-    let user_error = matches!(error, ProviderError::Auth(_));
+    let user_error = matches!(
+        error,
+        ProviderError::Auth(_) | ProviderError::RouteContract(_)
+    );
     let diagnostic = diagnostics.code_for(&error);
     let message = safe_provider_error_message(&error, operation, timeout_secs, diagnostics);
     if user_error {
@@ -17818,6 +19451,415 @@ mod tests {
     fn failure_count_phrase_pluralizes_naturally() {
         assert_eq!(failure_count_phrase(1), "1 failure");
         assert_eq!(failure_count_phrase(2), "2 failures");
+    }
+
+    #[test]
+    fn cli_errors_preserve_neutral_outcome_class_independently_from_exit_code() {
+        assert_eq!(
+            CliError::user("bad input").outcome_class(),
+            kitsu_core::RunOutcomeClass::UserFault
+        );
+        assert_eq!(
+            CliError::provider("gateway failed").outcome_class(),
+            kitsu_core::RunOutcomeClass::ProviderFault
+        );
+        assert_eq!(
+            CliError::tool("tool failed").outcome_class(),
+            kitsu_core::RunOutcomeClass::ToolFault
+        );
+        assert_eq!(
+            CliError::cancelled("cancelled").outcome_class(),
+            kitsu_core::RunOutcomeClass::Cancelled
+        );
+        assert_eq!(
+            CliError::interrupted("input closed").outcome_class(),
+            kitsu_core::RunOutcomeClass::Interrupted
+        );
+        assert_eq!(CliError::user("bad input").exit_code(), EXIT_USER);
+        assert_eq!(CliError::tool("tool failed").exit_code(), EXIT_USER);
+    }
+
+    #[test]
+    fn ask_terminal_lifecycle_publishes_clean_delivery_once() {
+        let deliveries = std::cell::Cell::new(0);
+        let (published, delivery) = finalize_ask_terminal_with_delivery(
+            kitsu_core::RunOutcomeClass::Succeeded,
+            kitsu_core::RunAssistantDisposition::Committed,
+            || {
+                deliveries.set(deliveries.get() + 1);
+                Ok::<_, &'static str>(())
+            },
+        )
+        .expect("valid ask phases publish");
+
+        assert!(delivery.is_ok());
+        assert_eq!(deliveries.get(), 1);
+        assert_eq!(
+            published.terminal().class(),
+            kitsu_core::RunOutcomeClass::Succeeded
+        );
+        assert_eq!(
+            published.terminal().assistant(),
+            kitsu_core::RunAssistantDisposition::Committed
+        );
+        assert_eq!(published.cleanup(), kitsu_core::RunCleanupState::Joined);
+        assert_eq!(
+            published.persistence(),
+            kitsu_core::RunPersistenceState::NotRequested
+        );
+        assert_eq!(
+            published.delivery(),
+            kitsu_core::RunDeliveryState::Delivered
+        );
+        assert!(published.is_clean_success());
+    }
+
+    #[test]
+    fn ask_terminal_lifecycle_publishes_delivery_failure_without_reclassification() {
+        let deliveries = std::cell::Cell::new(0);
+        let (published, delivery) = finalize_ask_terminal_with_delivery(
+            kitsu_core::RunOutcomeClass::ProviderFault,
+            kitsu_core::RunAssistantDisposition::Discarded,
+            || {
+                deliveries.set(deliveries.get() + 1);
+                Err::<(), _>("blocked sink")
+            },
+        )
+        .expect("delivery failure is terminal phase data");
+
+        assert_eq!(delivery.unwrap_err(), "blocked sink");
+        assert_eq!(deliveries.get(), 1);
+        assert_eq!(
+            published.terminal().class(),
+            kitsu_core::RunOutcomeClass::ProviderFault
+        );
+        assert_eq!(
+            published.terminal().assistant(),
+            kitsu_core::RunAssistantDisposition::Discarded
+        );
+        assert_eq!(published.delivery(), kitsu_core::RunDeliveryState::Failed);
+        assert!(!published.is_clean_success());
+    }
+
+    #[test]
+    fn process_terminal_helper_rejects_a_second_cross_path_publication() {
+        let spec = kitsu_core::RunSpec::new(
+            kitsu_core::RunId::new("shared-process-owner").expect("valid fixture identity"),
+        );
+        let mut lifecycle = kitsu_core::RunLifecycle::accept(&spec);
+        let deliveries = std::cell::Cell::new(0);
+
+        let (_, first_delivery) = finalize_owned_terminal_with_delivery(
+            &mut lifecycle,
+            kitsu_core::RunOutcomeClass::Succeeded,
+            kitsu_core::RunAssistantDisposition::Committed,
+            kitsu_core::RunCleanupState::Joined,
+            kitsu_core::RunPersistenceState::NotRequested,
+            || {
+                deliveries.set(deliveries.get() + 1);
+                Ok::<_, &'static str>(())
+            },
+        )
+        .expect("first carrier publishes");
+        assert!(first_delivery.is_ok());
+
+        let duplicate = finalize_owned_terminal_with_delivery(
+            &mut lifecycle,
+            kitsu_core::RunOutcomeClass::ProviderFault,
+            kitsu_core::RunAssistantDisposition::Discarded,
+            kitsu_core::RunCleanupState::Joined,
+            kitsu_core::RunPersistenceState::NotRequested,
+            || {
+                deliveries.set(deliveries.get() + 1);
+                Ok::<_, &'static str>(())
+            },
+        )
+        .expect_err("another carrier cannot publish the process terminal again");
+
+        assert_eq!(deliveries.get(), 1, "rejected publication cannot deliver");
+        assert_eq!(
+            duplicate,
+            kitsu_core::RunPhaseError::AfterTerminal {
+                attempted: kitsu_core::RunPhase::Settled,
+            }
+        );
+    }
+
+    #[test]
+    fn process_terminal_owner_is_reserved_only_for_inference_commands() {
+        for argv in [
+            vec!["kitsu"],
+            vec!["kitsu", "ask", "hello"],
+            vec!["kitsu", "review"],
+            vec!["kitsu", "chat"],
+            vec!["kitsu", "-p", "hello"],
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).expect("inference command parses");
+            assert!(
+                inference_command_requested(&cli),
+                "expected inference command: {argv:?}"
+            );
+        }
+
+        for argv in [
+            vec!["kitsu", "init"],
+            vec!["kitsu", "doctor"],
+            vec!["kitsu", "models"],
+            vec!["kitsu", "sessions"],
+            vec!["kitsu", "artifacts"],
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).expect("management command parses");
+            assert!(
+                !inference_command_requested(&cli),
+                "management command cannot reserve inference lifecycle: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inference_carrier_classification_covers_the_seven_supported_surfaces() {
+        let cases = [
+            (
+                vec!["kitsu", "ask", "hello"],
+                false,
+                InferenceCarrier::AskHuman,
+            ),
+            (
+                vec!["kitsu", "--jsonl", "ask", "hello"],
+                false,
+                InferenceCarrier::AskJsonl,
+            ),
+            (vec!["kitsu", "chat"], false, InferenceCarrier::PipedHuman),
+            (
+                vec!["kitsu", "--jsonl", "chat"],
+                false,
+                InferenceCarrier::PipedJsonl,
+            ),
+            (
+                vec!["kitsu", "chat", "--script", "turns.txt"],
+                true,
+                InferenceCarrier::ScriptHuman,
+            ),
+            (
+                vec!["kitsu", "--jsonl", "chat", "--script", "turns.txt"],
+                true,
+                InferenceCarrier::ScriptJsonl,
+            ),
+            (
+                vec!["kitsu", "chat"],
+                true,
+                InferenceCarrier::InteractiveHuman,
+            ),
+        ];
+
+        for (argv, stdin_is_tty, expected) in cases {
+            let cli = Cli::try_parse_from(argv.clone()).expect("carrier fixture parses");
+            assert_eq!(
+                inference_carrier(&cli, stdin_is_tty),
+                Some(expected),
+                "wrong carrier for {argv:?}"
+            );
+        }
+
+        let review = Cli::try_parse_from(["kitsu", "review"]).expect("review parses");
+        assert_eq!(
+            inference_carrier(&review, true),
+            Some(InferenceCarrier::PipedHuman),
+            "review is always a one-shot carrier even when stdin is a TTY"
+        );
+    }
+
+    #[test]
+    fn process_terminal_fact_handoff_is_single_and_exact() {
+        let receipt = OnceLock::new();
+        let facts = ProcessTerminalFacts {
+            cleanup: kitsu_core::RunCleanupState::Joined,
+            persistence: kitsu_core::RunPersistenceState::Preserved,
+        };
+
+        record_process_terminal_facts_in(&receipt, facts).expect("first carrier owns facts");
+        assert_eq!(receipt.get(), Some(&facts));
+        assert!(record_process_terminal_facts_in(&receipt, facts).is_err());
+    }
+
+    #[test]
+    fn interactive_aggregate_is_not_last_turn_wins() {
+        let mut failed_then_recovered = InteractiveRunAggregate::default();
+        failed_then_recovered.record_turn(
+            kitsu_core::RunOutcomeClass::ProviderFault,
+            kitsu_core::RunAssistantDisposition::Discarded,
+        );
+        failed_then_recovered.record_turn(
+            kitsu_core::RunOutcomeClass::Succeeded,
+            kitsu_core::RunAssistantDisposition::Committed,
+        );
+        assert_eq!(
+            failed_then_recovered.outcome(),
+            kitsu_core::RunOutcomeClass::PartiallySucceeded
+        );
+        assert_eq!(
+            failed_then_recovered.assistant(),
+            kitsu_core::RunAssistantDisposition::Committed
+        );
+
+        let mut succeeded_then_failed = InteractiveRunAggregate::default();
+        succeeded_then_failed.record_turn(
+            kitsu_core::RunOutcomeClass::Succeeded,
+            kitsu_core::RunAssistantDisposition::Committed,
+        );
+        succeeded_then_failed.record_turn(
+            kitsu_core::RunOutcomeClass::Interrupted,
+            kitsu_core::RunAssistantDisposition::Discarded,
+        );
+        assert_eq!(
+            succeeded_then_failed.outcome(),
+            kitsu_core::RunOutcomeClass::PartiallySucceeded
+        );
+        assert_eq!(
+            succeeded_then_failed.assistant(),
+            kitsu_core::RunAssistantDisposition::Discarded
+        );
+    }
+
+    #[test]
+    fn interactive_retry_replacement_is_not_a_terminal_fault() {
+        let mut aggregate = InteractiveRunAggregate::default();
+        aggregate.record_replaced_turn();
+        aggregate.record_turn(
+            kitsu_core::RunOutcomeClass::Succeeded,
+            kitsu_core::RunAssistantDisposition::Committed,
+        );
+
+        assert_eq!(aggregate.outcome(), kitsu_core::RunOutcomeClass::Succeeded);
+        assert_eq!(aggregate.replaced_turns(), 1);
+    }
+
+    #[test]
+    fn interactive_terminal_facts_preserve_cleanup_and_persistence() {
+        let mut aggregate = InteractiveRunAggregate::default();
+        aggregate.record_turn(
+            kitsu_core::RunOutcomeClass::Cancelled,
+            kitsu_core::RunAssistantDisposition::Discarded,
+        );
+        aggregate.observe_cleanup(kitsu_core::RunCleanupState::Residue {
+            unjoined: std::num::NonZeroU32::new(2).unwrap(),
+        });
+        let facts = aggregate.terminal_facts(kitsu_core::RunPersistenceState::Failed);
+
+        assert_eq!(facts.outcome, kitsu_core::RunOutcomeClass::Cancelled);
+        assert_eq!(
+            facts.assistant,
+            kitsu_core::RunAssistantDisposition::Discarded
+        );
+        assert_eq!(
+            facts.cleanup,
+            kitsu_core::RunCleanupState::Residue {
+                unjoined: std::num::NonZeroU32::new(2).unwrap()
+            }
+        );
+        assert_eq!(facts.persistence, kitsu_core::RunPersistenceState::Failed);
+    }
+
+    #[test]
+    fn session_receipt_tracks_persistence_independently_from_snapshot_addressability() {
+        let disabled = JsonlSessionReceipt::new(None, SessionSnapshotState::Disabled);
+        assert_eq!(
+            disabled.persistence_state(),
+            kitsu_core::RunPersistenceState::NotRequested
+        );
+
+        let mut pending = JsonlSessionReceipt::new(
+            Some("planned-session".to_string()),
+            SessionSnapshotState::PendingUntilFirstSuccess,
+        );
+        assert_eq!(
+            pending.persistence_state(),
+            kitsu_core::RunPersistenceState::Preserved
+        );
+        assert_eq!(pending.terminal_id(), None);
+
+        pending.mark_committed("planned-session");
+        assert_eq!(
+            pending.persistence_state(),
+            kitsu_core::RunPersistenceState::Committed
+        );
+        assert_eq!(pending.terminal_id().as_deref(), Some("planned-session"));
+
+        pending.mark_failed();
+        assert_eq!(
+            pending.persistence_state(),
+            kitsu_core::RunPersistenceState::Failed
+        );
+        assert_eq!(
+            pending.terminal_id().as_deref(),
+            Some("planned-session"),
+            "post-install failure must not erase addressability"
+        );
+    }
+
+    #[test]
+    fn terminal_cleanup_state_counts_only_actual_unjoined_residue() {
+        let joined = subagent::AgentTerminalStatus {
+            id: 1,
+            task: "joined".to_string(),
+            status: subagent::AgentStatus::Cancelled("bounded stop".to_string()),
+            joined: true,
+        };
+        let residue = subagent::AgentTerminalStatus {
+            id: 2,
+            task: "unattached".to_string(),
+            status: subagent::AgentStatus::Cancelled("malformed fixture".to_string()),
+            joined: false,
+        };
+
+        assert_eq!(
+            terminal_cleanup_state(&[]),
+            kitsu_core::RunCleanupState::Joined
+        );
+        assert_eq!(
+            terminal_cleanup_state(&[joined, residue]),
+            kitsu_core::RunCleanupState::Residue {
+                unjoined: std::num::NonZeroU32::new(1).unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn base_tool_duplicate_maps_to_user_error_before_runtime_entry() {
+        let permissions = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let skillset = Arc::new(skills::SkillSet::default());
+        let journal = kitsu_tools::builtins::fs::WriteJournal::new();
+        let mut tools = Registry::new();
+        let (descriptor, handler) = builtins::fs::read_file_tool(permissions.clone());
+        tools
+            .register_with_descriptor(descriptor, handler)
+            .expect("fixture registration succeeds");
+        let descriptors_before = tools.descriptors().to_vec();
+
+        let error = register_base_tools(
+            &mut tools,
+            &permissions,
+            &skillset,
+            true,
+            false,
+            &journal,
+            None,
+        )
+        .expect_err("base composition rejects duplicate");
+
+        assert_eq!(
+            error,
+            kitsu_tools::RegistryError::DuplicateName {
+                name: "fs_read_file".to_string(),
+            }
+        );
+        assert_eq!(tools.descriptors(), descriptors_before);
+        let cli_error = CliError::from(error);
+        assert_eq!(cli_error.exit_code(), EXIT_USER);
+        assert_eq!(
+            cli_error.to_string(),
+            "tool registry composition failed: duplicate tool registration: fs_read_file"
+        );
     }
 
     fn call(id: &str) -> kitsu_providers::ToolCall {
@@ -19415,6 +21457,7 @@ mod tests {
                 status: 401,
                 hint: Some("provider-body-secret".to_string()),
             },
+            ProviderError::RouteContract(ProviderRouteContractError::CurrentRouteUnavailable),
         ];
         for error in &errors {
             let message = safe_provider_error_message(
@@ -19446,6 +21489,12 @@ mod tests {
             ProviderDiagnosticContext::default(),
         );
         assert!(catalog.contains("model catalog request timed out after 17s"));
+        assert_eq!(
+            script_failure_kind(&kitsu_core::AgentError::Provider(
+                ProviderError::RouteContract(ProviderRouteContractError::CurrentRouteUnavailable)
+            )),
+            ScriptFailureKind::User
+        );
 
         let missing = safe_provider_error_message(
             &ProviderError::Auth(kitsu_providers::AuthError::Missing {
@@ -19486,6 +21535,7 @@ mod tests {
     fn loopback_ollama_connection_hint_is_scoped_and_secret_free() {
         let gateway = |flavor: &str, base_url: &str| Gateway {
             flavor: flavor.to_string(),
+            adapter: config::GatewayAdapter::CompatibleChat,
             base_url: base_url.to_string(),
             chat_path: "/v1/chat/completions".to_string(),
             models_path: Some("/v1/models".to_string()),
@@ -19572,6 +21622,66 @@ mod tests {
         ] {
             assert!(base_url_has_loopback_host(base_url), "{base_url}");
         }
+    }
+
+    #[test]
+    fn local_ollama_model_catalog_matcher_is_narrow_and_ambiguity_safe() {
+        let local_ollama = ProviderDiagnosticContext {
+            loopback_ollama: true,
+        };
+        let generic_gateway = ProviderDiagnosticContext::default();
+        let models = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(model_catalog_advertises_selected_model(
+            "llama3.2",
+            &models(&["llama3.2:latest"]),
+            local_ollama,
+        ));
+        assert!(!model_catalog_advertises_selected_model(
+            "llama3.2:7b",
+            &models(&["llama3.2:latest"]),
+            local_ollama,
+        ));
+        assert!(model_catalog_advertises_selected_model(
+            "llama3.2:7b",
+            &models(&["llama3.2:7b"]),
+            generic_gateway,
+        ));
+        assert!(!model_catalog_advertises_selected_model(
+            "llama3.2",
+            &models(&["llama3.2:latest"]),
+            generic_gateway,
+        ));
+        assert!(!model_catalog_advertises_selected_model(
+            "llama3.2",
+            &models(&["qwen2.5-coder:latest"]),
+            local_ollama,
+        ));
+        assert!(!model_catalog_advertises_selected_model(
+            "llama3.2",
+            &models(&["llama3.2:latest", "llama3.2:latest"]),
+            local_ollama,
+        ));
+        assert!(!model_catalog_advertises_selected_model(
+            "",
+            &models(&["", ":latest"]),
+            local_ollama,
+        ));
+        assert!(model_catalog_advertises_selected_model(
+            "localhost:5000/team/model",
+            &models(&["localhost:5000/team/model:latest"]),
+            local_ollama,
+        ));
+        assert!(!model_catalog_advertises_selected_model(
+            "team/model@sha256:1234",
+            &models(&["team/model@sha256:1234:latest"]),
+            local_ollama,
+        ));
     }
 
     /// The shipped huggingface profile's hint must SURVIVE the credential
@@ -19999,6 +22109,7 @@ mod tests {
         let event = kitsu_core::AgentRuntimeEvent::ProviderAttempt {
             round: 2,
             purpose: kitsu_core::ProviderRequestPurpose::Inference,
+            route_generation: None,
             attempt: 1,
             max_attempts: 3,
             category: kitsu_providers::ProviderAttemptCategory::RateLimited,
@@ -20024,6 +22135,7 @@ mod tests {
         let success = |attempt: u32| kitsu_core::AgentRuntimeEvent::ProviderAttempt {
             round: 1,
             purpose: kitsu_core::ProviderRequestPurpose::Inference,
+            route_generation: None,
             attempt,
             max_attempts: 3,
             category: kitsu_providers::ProviderAttemptCategory::Success,
@@ -20120,6 +22232,165 @@ mod tests {
             stable_profile_key(std::path::Path::new("/workspace/kitsu/kitsu.toml")),
             "v1-fnv128-9f1392a8a96c8bcf6b4866d572b912eb"
         );
+    }
+
+    #[test]
+    fn explicit_adapter_selects_wire_while_legacy_flavors_stay_compatible() {
+        let gateway = |flavor: &str, models_path: Option<&str>| Gateway {
+            flavor: flavor.to_string(),
+            adapter: config::GatewayAdapter::CompatibleChat,
+            base_url: "https://user:secret@example.invalid/?token=hidden".to_string(),
+            chat_path: "/v1/chat/completions".to_string(),
+            models_path: models_path.map(str::to_string),
+            model: Some("display-model".to_string()),
+            context_window: None,
+            auth: config::AuthConfig::default(),
+        };
+        let config_path = std::path::Path::new("/workspace/kitsu/config.toml");
+        let reference = current_provider_route_declaration(
+            config_path,
+            "primary",
+            &gateway("openai", Some("/v1/models")),
+        )
+        .unwrap();
+
+        for flavor in ["openai", "anthropic", "ollama"] {
+            let declaration = current_provider_route_declaration(
+                config_path,
+                "primary",
+                &gateway(flavor, Some("/v1/models")),
+            )
+            .unwrap();
+            assert_eq!(
+                declaration.adapter(),
+                kitsu_providers::ProviderAdapterId::OpenAiCompatible,
+                "the {flavor} display label must not claim a native adapter"
+            );
+            assert_eq!(
+                declaration.wire_revision(),
+                kitsu_providers::ProviderWireRevision::OpenAiChatCompletionsV1
+            );
+            assert_eq!(declaration.profile(), reference.profile());
+            assert!(declaration
+                .capabilities()
+                .supports(kitsu_providers::ProviderCapability::ModelCatalog));
+            assert!(!declaration
+                .capabilities()
+                .supports(kitsu_providers::ProviderCapability::ImageInput));
+        }
+
+        let without_catalog =
+            current_provider_route_declaration(config_path, "primary", &gateway("anthropic", None))
+                .unwrap();
+        assert!(!without_catalog
+            .capabilities()
+            .supports(kitsu_providers::ProviderCapability::ModelCatalog));
+        assert!(!without_catalog.profile().as_str().contains("primary"));
+        assert!(!without_catalog.profile().as_str().contains("secret"));
+        assert!(!without_catalog.profile().as_str().contains("display-model"));
+
+        let mut native = gateway("anthropic", None);
+        native.adapter = config::GatewayAdapter::AnthropicMessages;
+        native.chat_path = "/v1/messages".to_string();
+        let native_declaration =
+            current_provider_route_declaration(config_path, "primary", &native).unwrap();
+        assert_eq!(
+            native_declaration.adapter(),
+            kitsu_providers::ProviderAdapterId::AnthropicMessages
+        );
+        assert_eq!(
+            native_declaration.wire_revision(),
+            kitsu_providers::ProviderWireRevision::AnthropicMessages2023_06_01
+        );
+        assert!(native_declaration
+            .capabilities()
+            .supports(kitsu_providers::ProviderCapability::Streaming));
+        assert!(!native_declaration
+            .capabilities()
+            .supports(kitsu_providers::ProviderCapability::ModelCatalog));
+        assert_eq!(native_declaration.profile(), reference.profile());
+
+        let mut changed_route_contents = gateway("ollama", None);
+        changed_route_contents.base_url = "http://different.invalid/private".to_string();
+        changed_route_contents.chat_path = "/different/chat".to_string();
+        changed_route_contents.model = Some("different-model".to_string());
+        changed_route_contents.auth.token = Some("different-secret".to_string());
+        let changed =
+            current_provider_route_declaration(config_path, "primary", &changed_route_contents)
+                .unwrap();
+        assert_eq!(changed.profile(), reference.profile());
+        assert_ne!(
+            current_provider_route_declaration(config_path, "secondary", &changed_route_contents,)
+                .unwrap()
+                .profile(),
+            reference.profile()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn provider_auth_source_matches_the_credential_that_route_freezing_selects() {
+        const ROUTE_AUTH_ENV: &str = "KITSU_TEST_ROUTE_AUTH_SOURCE";
+        let _guard = EnvVarGuard::set(ROUTE_AUTH_ENV, "environment-token");
+        let mut gateway = Gateway {
+            flavor: "openai".to_string(),
+            adapter: config::GatewayAdapter::CompatibleChat,
+            base_url: "https://example.invalid".to_string(),
+            chat_path: "/v1/chat/completions".to_string(),
+            models_path: None,
+            model: Some("model".to_string()),
+            context_window: None,
+            auth: config::AuthConfig::default(),
+        };
+        gateway.auth.env = ROUTE_AUTH_ENV.to_string();
+
+        assert_eq!(
+            current_provider_auth_source(&gateway, true),
+            ProviderAuthSource::Environment
+        );
+        std::env::set_var(ROUTE_AUTH_ENV, " \t");
+        assert_eq!(
+            current_provider_auth_source(&gateway, true),
+            ProviderAuthSource::ManagedCredential,
+            "whitespace-only environment values select managed fallback"
+        );
+
+        gateway.auth.method = "static".to_string();
+        assert_eq!(
+            current_provider_auth_source(&gateway, false),
+            ProviderAuthSource::StaticConfiguration
+        );
+        gateway.auth.method = "none".to_string();
+        assert_eq!(
+            current_provider_auth_source(&gateway, false),
+            ProviderAuthSource::None
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn provider_profile_identity_uses_the_canonical_config_namespace() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("kitsu.toml");
+        let alias_path = temp.path().join("alias.toml");
+        std::fs::write(&config_path, "[gateways]\n").unwrap();
+        symlink(&config_path, &alias_path).unwrap();
+        let gateway = Gateway {
+            flavor: "openai".to_string(),
+            adapter: config::GatewayAdapter::CompatibleChat,
+            base_url: "https://example.invalid".to_string(),
+            chat_path: "/v1/chat/completions".to_string(),
+            models_path: None,
+            model: Some("model".to_string()),
+            context_window: None,
+            auth: config::AuthConfig::default(),
+        };
+
+        let direct = current_provider_route_declaration(&config_path, "primary", &gateway).unwrap();
+        let aliased = current_provider_route_declaration(&alias_path, "primary", &gateway).unwrap();
+        assert_eq!(direct.profile(), aliased.profile());
     }
 
     #[test]
@@ -20364,7 +22635,7 @@ mod tests {
     #[test]
     fn artifact_allocator_skips_an_existing_generation_instead_of_reusing_it() {
         let root = tempfile::tempdir().unwrap();
-        let occupied = root.path().join(format!("runtime-{}-0", jsonl_run_id()));
+        let occupied = root.path().join(format!("runtime-{}-0", run_id()));
         std::fs::create_dir(&occupied).unwrap();
         std::fs::write(occupied.join("prior.txt"), "prior session").unwrap();
         let mut allocator = ArtifactDirectoryAllocator::default();

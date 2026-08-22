@@ -12,6 +12,9 @@
 //! Tokens: every test uses the dummy value "test-token"; the real
 //! ANTHROPIC_AUTH_TOKEN is never read. Env-touching tests are `#[serial]`.
 
+#[path = "support/jsonl_fixture.rs"]
+mod jsonl_fixture;
+
 use std::fs;
 use std::path::Path;
 
@@ -57,6 +60,108 @@ fn base_cmd(home: &Path) -> Command {
     // Don't auto-load the repo's own llms.txt into test system prompts.
     cmd.env("KITSU_NO_PROJECT_CONTEXT", "1");
     cmd
+}
+
+/// Run a plain interactive chat on a PTY and let a deterministic driver react
+/// to the accumulated transcript. Keeping the PTY mechanics here makes the
+/// confirmation-EOF and active-turn queue fixtures about lifecycle behavior,
+/// not duplicated descriptor plumbing.
+#[cfg(unix)]
+fn run_plain_interactive_chat_pty<F>(
+    home: &Path,
+    cwd: &Path,
+    extra_chat_args: &[&str],
+    mut drive: F,
+) -> (std::process::ExitStatus, String)
+where
+    F: FnMut(&[u8], &mut fs::File),
+{
+    use std::io::Read as _;
+    use std::os::fd::FromRawFd as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: both output pointers are valid; null termios and winsize request
+    // the platform defaults.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0,
+        "allocate interactive carrier PTY"
+    );
+    // SAFETY: the master descriptor remains owned by this function. Making it
+    // nonblocking lets the driver synchronize on prompts without hanging.
+    let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    // SAFETY: each duplicated slave descriptor transfers to one Stdio owner.
+    let child_stdin = unsafe { libc::dup(slave) };
+    let child_stdout = unsafe { libc::dup(slave) };
+    assert!(child_stdin >= 0 && child_stdout >= 0);
+
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
+    command
+        .env("HOME", home)
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .env("KITSU_NO_PROJECT_CONTEXT", "1")
+        .env_remove("ANTHROPIC_TOKEN_EXPIRES")
+        .current_dir(cwd)
+        // SAFETY: all three live descriptors transfer exactly once.
+        .stdin(unsafe { Stdio::from_raw_fd(child_stdin) })
+        .stdout(unsafe { Stdio::from_raw_fd(child_stdout) })
+        .stderr(unsafe { Stdio::from_raw_fd(slave) })
+        .args([
+            "--plain",
+            "--gateway",
+            "example",
+            "--no-stream",
+            "chat",
+            "--no-session",
+        ])
+        .args(extra_chat_args);
+    let mut child = command.spawn().expect("spawn interactive carrier chat");
+    // SAFETY: ownership of the remaining master descriptor transfers once.
+    let mut terminal = unsafe { fs::File::from_raw_fd(master) };
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut transcript = Vec::new();
+
+    let status = loop {
+        let mut buffer = [0_u8; 4096];
+        match terminal.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(read) => transcript.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            // Linux PTY masters report EIO after the last slave closes.
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+            Err(error) => panic!("read interactive carrier PTY: {error}"),
+        }
+        drive(&transcript, &mut terminal);
+        if let Some(status) = child.try_wait().expect("poll interactive carrier") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "interactive carrier timed out: {}",
+                String::from_utf8_lossy(&transcript)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    (status, String::from_utf8_lossy(&transcript).into_owned())
 }
 
 #[test]
@@ -219,6 +324,22 @@ auth = {{ method = "none" }}
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
+    let run_started = events
+        .iter()
+        .find(|event| event["type"] == "run_started")
+        .expect("run_started route receipt");
+    let provider_attempt = events
+        .iter()
+        .find(|event| event["type"] == "provider_attempt")
+        .expect("provider attempt");
+    assert_eq!(
+        run_started["provider_route"]["route"]["adapter"],
+        "openai_compatible"
+    );
+    assert_eq!(
+        provider_attempt["route_generation"],
+        run_started["provider_route"]["route"]["generation"]
+    );
     let error = events
         .iter()
         .find(|event| event["type"] == "error")
@@ -334,6 +455,19 @@ auth = {{ method = "none" }}
             "final_summary",
         ]
     );
+    assert_eq!(model_events[0]["provider_route"]["receipt_revision"], 1);
+    assert_eq!(
+        model_events[0]["provider_route"]["route"]["adapter"],
+        "openai_compatible"
+    );
+    assert_eq!(
+        model_events[0]["provider_route"]["model"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        model_events[0]["provider_route"]["route"]["capabilities"]["supported"],
+        serde_json::json!(["model_catalog"])
+    );
     assert_eq!(model_events[1]["operation_id"], "models:1");
     assert_eq!(model_events[1]["purpose"], "model_catalog");
     assert_eq!(model_events[1]["message_count"], 0);
@@ -352,6 +486,10 @@ auth = {{ method = "none" }}
     assert_eq!(model_events[2]["status"], serde_json::Value::Null);
     assert_eq!(model_events[2]["outcome"], "transport_failed");
     assert_eq!(model_events[2]["terminal"], true);
+    assert_eq!(
+        model_events[2]["route_generation"],
+        model_events[0]["provider_route"]["route"]["generation"]
+    );
     assert_eq!(model_events[2]["deadline_scope"], "provider_request");
     assert_eq!(
         model_events[2]["turn_remaining_ms"],
@@ -397,6 +535,11 @@ fn test_doctor_reports_config_artifact_storage_disable() {
         report["artifact_policy"]["existing_artifacts_unchanged"],
         true
     );
+    assert_eq!(
+        report["provider_route"]["status"],
+        "not_constructed_offline"
+    );
+    assert_eq!(report["provider_route"]["receipt"], serde_json::Value::Null);
 }
 
 #[test]
@@ -2265,6 +2408,550 @@ async fn test_chat_no_tools_omits_every_model_tool() {
 
 #[tokio::test]
 #[serial]
+async fn explicit_anthropic_messages_adapter_drives_the_live_native_wire() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_cli_native","type":"message","role":"assistant","content":[],"model":"native-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"output_tokens":0}}}"#
+        ),
+        concat!(
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#
+        ),
+        concat!(
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello from native Messages"}}"#
+        ),
+        concat!(
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":0}"#
+        ),
+        concat!(
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":4}}"#
+        ),
+        concat!(
+            "event: message_stop\n",
+            r#"data: {"type":"message_stop"}"#
+        ),
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("anthropic-version", "2023-06-01"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("{sse}\n\n")),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).unwrap();
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        format!(
+            r#"default_gateway = "native"
+
+[gateways.native]
+flavor = "anthropic"
+adapter = "anthropic-messages"
+base_url = "{}"
+chat_path = "/v1/messages"
+models_path = ""
+model = "native-model"
+context_window = 8192
+auth = {{ method = "none" }}
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.args([
+            "--max-output-tokens",
+            "64",
+            "chat",
+            "--no-tools",
+            "hello native",
+        ]);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("hello from native Messages"));
+
+        let mut doctor = base_cmd(&home_path);
+        let output = doctor
+            .args(["doctor", "--inference", "--json"])
+            .output()
+            .expect("run native inference doctor");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["online"]["status"], "reachable");
+        assert_eq!(report["online"]["effective_model"], "native-model");
+        assert_eq!(report["provider_route"]["status"], "bound");
+        assert_eq!(
+            report["provider_route"]["receipt"]["route"]["adapter"],
+            "anthropic_messages"
+        );
+        assert_eq!(
+            report["provider_route"]["receipt"]["route"]["wire_revision"],
+            "anthropic_messages_2023_06_01"
+        );
+    })
+    .await
+    .expect("native CLI process should join");
+
+    let requests = server.received_requests().await.expect("record request");
+    assert_eq!(requests.len(), 2);
+    let chat_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(chat_body["model"], "native-model");
+    assert_eq!(chat_body["max_tokens"], 64);
+    assert_eq!(chat_body["stream"], true);
+    assert_eq!(
+        chat_body["messages"],
+        serde_json::json!([{
+            "role": "user",
+            "content": "hello native"
+        }])
+    );
+    assert!(chat_body.get("system").is_some());
+    assert!(chat_body.get("tools").is_none());
+    assert!(chat_body.get("stream_options").is_none());
+
+    let doctor_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(doctor_body["model"], "native-model");
+    assert_eq!(doctor_body["max_tokens"], 1);
+    assert_eq!(doctor_body["stream"], true);
+    assert_eq!(
+        doctor_body["messages"],
+        serde_json::json!([{"role": "user", "content": "Reply OK."}])
+    );
+    assert!(doctor_body.get("tools").is_none());
+}
+
+#[derive(Clone, Copy)]
+struct ProviderProductCase {
+    adapter_config: &'static str,
+    adapter_receipt: &'static str,
+    wire_receipt: &'static str,
+    chat_path: &'static str,
+    capabilities: &'static [&'static str],
+}
+
+const PROVIDER_PRODUCT_CASES: [ProviderProductCase; 2] = [
+    ProviderProductCase {
+        adapter_config: "compatible-chat",
+        adapter_receipt: "openai_compatible",
+        wire_receipt: "openai_chat_completions_v1",
+        chat_path: "/product/chat/completions",
+        capabilities: &["streaming", "tools", "structured_output", "usage"],
+    },
+    ProviderProductCase {
+        adapter_config: "anthropic-messages",
+        adapter_receipt: "anthropic_messages",
+        wire_receipt: "anthropic_messages_2023_06_01",
+        chat_path: "/product/messages",
+        capabilities: &["streaming", "tools", "usage"],
+    },
+];
+
+fn write_provider_product_config(
+    home: &Path,
+    base_url: &str,
+    case: ProviderProductCase,
+    chat_path: &str,
+) {
+    let kitsu_dir = home.join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).expect("create product-conformance config directory");
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        format!(
+            r#"default_gateway = "product"
+
+[gateways.product]
+flavor = "openai"
+adapter = "{}"
+base_url = "{}"
+chat_path = "{}"
+models_path = ""
+model = "product-model"
+context_window = 8192
+auth = {{ method = "none" }}
+"#,
+            case.adapter_config, base_url, chat_path
+        ),
+    )
+    .expect("write product-conformance config");
+}
+
+fn provider_product_sse(case: ProviderProductCase) -> String {
+    if case.adapter_receipt == "openai_compatible" {
+        return [
+            r#"data: {"choices":[{"index":0,"delta":{"content":"product answer"},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n\n");
+    }
+    [
+        concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_product","type":"message","role":"assistant","content":[],"model":"product-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}"#
+        ),
+        concat!(
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#
+        ),
+        concat!(
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"product answer"}}"#
+        ),
+        concat!(
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":0}"#
+        ),
+        concat!(
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}"#
+        ),
+        concat!(
+            "event: message_stop\n",
+            r#"data: {"type":"message_stop"}"#
+        ),
+    ]
+    .join("\n\n")
+        + "\n\n"
+}
+
+fn parse_product_jsonl(output: &std::process::Output) -> Vec<serde_json::Value> {
+    String::from_utf8(output.stdout.clone())
+        .expect("product JSONL is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("product JSONL line"))
+        .collect()
+}
+
+fn assert_product_receipt(
+    receipt: &serde_json::Value,
+    case: ProviderProductCase,
+    expected_model: Option<&str>,
+) {
+    assert_eq!(receipt["receipt_revision"], 1);
+    assert_eq!(receipt["route"]["contract_revision"], 1);
+    assert_eq!(receipt["route"]["adapter"], case.adapter_receipt);
+    assert_eq!(receipt["route"]["wire_revision"], case.wire_receipt);
+    assert_eq!(receipt["route"]["generation"], 1);
+    assert_eq!(
+        receipt["route"]["capabilities"]["supported"],
+        serde_json::json!(case.capabilities)
+    );
+    assert_eq!(receipt["model"], serde_json::json!(expected_model));
+    assert_eq!(receipt["auth_source"], "none");
+    assert_eq!(receipt["policy"]["retry_generation"], "bound_generation");
+    assert_eq!(
+        receipt["policy"]["semantic_replay_generation"],
+        "current_generation"
+    );
+    assert_eq!(receipt["policy"]["fallback"], "disabled");
+}
+
+#[tokio::test]
+#[serial]
+async fn both_compiled_adapters_pass_product_route_receipt_conformance() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for case in PROVIDER_PRODUCT_CASES {
+        let server = MockServer::start().await;
+        let sse = provider_product_sse(case);
+        if case.adapter_receipt == "openai_compatible" {
+            Mock::given(method("POST"))
+                .and(path(case.chat_path))
+                .and(body_string_contains("\"stream\":true"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(sse),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(case.chat_path))
+                .and(body_string_contains("\"stream\":false"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "OK"},
+                        "finish_reason": "stop"
+                    }]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        } else {
+            Mock::given(method("POST"))
+                .and(path(case.chat_path))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(sse),
+                )
+                .expect(2)
+                .mount(&server)
+                .await;
+        }
+        let fault_path = format!("{}/fault", case.chat_path);
+        Mock::given(method("POST"))
+            .and(path(fault_path.as_str()))
+            .respond_with(ResponseTemplate::new(401).set_body_string("provider-secret-body"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let home = TempDir::new().expect("product conformance home");
+        write_provider_product_config(home.path(), &server.uri(), case, case.chat_path);
+        let script = home.path().join("product.script");
+        fs::write(&script, "exercise the product provider seam\n").unwrap();
+        let success = base_cmd(home.path())
+            .args([
+                "--jsonl",
+                "chat",
+                "--no-session",
+                "--no-tools",
+                "--script",
+                &script.to_string_lossy(),
+            ])
+            .output()
+            .expect("run product conformance success");
+        assert!(success.status.success(), "{success:?}");
+        assert!(success.stderr.is_empty(), "{success:?}");
+        let success_events = parse_product_jsonl(&success);
+        let run_started = success_events
+            .iter()
+            .find(|event| event["type"] == "run_started")
+            .expect("success run_started");
+        let run_receipt = &run_started["provider_route"];
+        assert_product_receipt(run_receipt, case, Some("product-model"));
+        let attempts = success_events
+            .iter()
+            .filter(|event| event["type"] == "provider_attempt")
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0]["category"], "success");
+        assert_eq!(attempts[0]["terminal"], true);
+        assert_eq!(
+            attempts[0]["route_generation"],
+            run_receipt["route"]["generation"]
+        );
+        assert!(!run_receipt.to_string().contains(&server.uri()));
+        assert!(!run_receipt.to_string().contains("provider-secret"));
+
+        let status_script = home.path().join("status.script");
+        fs::write(&status_script, "/status\n/quit\n").unwrap();
+        let status = base_cmd(home.path())
+            .args([
+                "--jsonl",
+                "chat",
+                "--no-session",
+                "--script",
+                &status_script.to_string_lossy(),
+            ])
+            .output()
+            .expect("run product conformance status");
+        assert!(status.status.success(), "{status:?}");
+        let status_events = parse_product_jsonl(&status);
+        let status_result = status_events
+            .iter()
+            .find(|event| event["type"] == "command_result" && event["result"]["kind"] == "status")
+            .expect("structured status receipt");
+        assert_eq!(status_result["result"]["provider_route"], *run_receipt);
+
+        let offline_doctor = base_cmd(home.path())
+            .args(["doctor", "--json"])
+            .output()
+            .expect("run offline product doctor");
+        assert!(offline_doctor.status.success(), "{offline_doctor:?}");
+        let offline_report: serde_json::Value =
+            serde_json::from_slice(&offline_doctor.stdout).unwrap();
+        assert_eq!(
+            offline_report["provider_route"]["status"],
+            "not_constructed_offline"
+        );
+        assert!(offline_report["provider_route"]["receipt"].is_null());
+
+        let inference_doctor = base_cmd(home.path())
+            .args(["doctor", "--inference", "--json"])
+            .output()
+            .expect("run product inference doctor");
+        assert!(inference_doctor.status.success(), "{inference_doctor:?}");
+        let inference_report: serde_json::Value =
+            serde_json::from_slice(&inference_doctor.stdout).unwrap();
+        assert_eq!(inference_report["provider_route"]["status"], "bound");
+        assert_product_receipt(
+            &inference_report["provider_route"]["receipt"],
+            case,
+            Some("product-model"),
+        );
+
+        write_provider_product_config(home.path(), &server.uri(), case, &fault_path);
+        let fault = base_cmd(home.path())
+            .args(["--jsonl", "ask", "exercise the product fault path"])
+            .output()
+            .expect("run product conformance fault");
+        assert_eq!(fault.status.code(), Some(2), "{fault:?}");
+        assert!(fault.stderr.is_empty(), "{fault:?}");
+        let fault_events = parse_product_jsonl(&fault);
+        let fault_run = fault_events
+            .iter()
+            .find(|event| event["type"] == "run_started")
+            .expect("fault run_started");
+        assert_eq!(fault_run["provider_route"], *run_receipt);
+        let fault_attempt = fault_events
+            .iter()
+            .find(|event| event["type"] == "provider_attempt")
+            .expect("fault provider attempt");
+        assert_eq!(fault_attempt["category"], "authentication");
+        assert_eq!(fault_attempt["status"], 401);
+        assert_eq!(fault_attempt["terminal"], true);
+        assert_eq!(
+            fault_attempt["route_generation"],
+            fault_run["provider_route"]["route"]["generation"]
+        );
+        assert!(!String::from_utf8_lossy(&fault.stdout).contains("provider-secret-body"));
+        server.verify().await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn both_compiled_adapters_correlate_product_cancellation_to_the_run_receipt() {
+    use std::process::Stdio;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for case in PROVIDER_PRODUCT_CASES {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(case.chat_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_string(provider_product_sse(case)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let home = TempDir::new().expect("cancel conformance home");
+        write_provider_product_config(home.path(), &server.uri(), case, case.chat_path);
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
+        command
+            .env("HOME", home.path())
+            .env("KITSU_NO_PROJECT_CONTEXT", "1")
+            .args(["--jsonl", "ask", "cancel the product request"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command
+            .spawn()
+            .expect("spawn cancellation conformance child");
+        let pid = child.id();
+        for _ in 0..100 {
+            if !server.received_requests().await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!server.received_requests().await.unwrap().is_empty());
+        // SAFETY: `pid` belongs to the live child created immediately above.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) }, 0);
+        let output = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(130), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let events = parse_product_jsonl(&output);
+        let run_started = events
+            .iter()
+            .find(|event| event["type"] == "run_started")
+            .expect("cancel run_started");
+        assert_product_receipt(&run_started["provider_route"], case, Some("product-model"));
+        let attempt = events
+            .iter()
+            .find(|event| event["type"] == "provider_attempt")
+            .expect("cancel provider attempt");
+        assert_eq!(attempt["category"], "cancelled");
+        assert_eq!(attempt["outcome"], "cancelled");
+        assert_eq!(attempt["terminal"], true);
+        assert_eq!(
+            attempt["route_generation"],
+            run_started["provider_route"]["route"]["generation"]
+        );
+        assert_eq!(events.last().unwrap()["type"], "final_summary");
+        assert_eq!(events.last().unwrap()["status"], "cancelled");
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn native_adapter_rejects_model_catalog_before_any_network_send() {
+    use wiremock::MockServer;
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).unwrap();
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        format!(
+            r#"default_gateway = "native"
+
+[gateways.native]
+flavor = "anthropic"
+adapter = "anthropic-messages"
+base_url = "{}"
+chat_path = "/v1/messages"
+models_path = "/v1/models"
+model = "native-model"
+auth = {{ method = "none" }}
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.arg("models");
+        cmd.assert().failure().stderr(predicate::str::contains(
+            "anthropic-messages adapter does not implement model catalog discovery",
+        ));
+    })
+    .await
+    .expect("native catalog refusal process should join");
+
+    assert!(server
+        .received_requests()
+        .await
+        .expect("inspect requests")
+        .is_empty());
+}
+
+#[tokio::test]
+#[serial]
 async fn test_chat_no_tools_composes_with_named_session_fork_and_resume_after_rebase() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3226,6 +3913,15 @@ auth = {{ method = "none" }}
         assert_eq!(report["online"]["models"], 1);
         assert_eq!(report["online"]["effective_model"], "doctor-model");
         assert_eq!(report["online"]["effective_model_available"], true);
+        assert_eq!(report["provider_route"]["status"], "bound");
+        assert_eq!(
+            report["provider_route"]["receipt"]["model"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            report["provider_route"]["receipt"]["route"]["capabilities"]["supported"],
+            serde_json::json!(["model_catalog"])
+        );
 
         let mut missing = base_cmd(&home_path);
         let output = missing
@@ -3275,6 +3971,230 @@ auth = {{ method = "none" }}
     .await
     .expect("online doctor process should join");
 
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_doctor_online_catalog_does_not_require_a_configured_model() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "discoverable-model"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    let config = home.path().join("doctor-online-no-model.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "{}"
+chat_path = "/v1/chat/completions"
+models_path = "/v1/models"
+auth = {{ method = "none" }}
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut doctor = base_cmd(&home_path);
+        let output = doctor
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "doctor",
+                "--online",
+                "--json",
+            ])
+            .output()
+            .expect("run catalog-only doctor without a model");
+        // Doctor still reports the missing chat model as a readiness issue,
+        // but that issue must not suppress the independent catalog probe.
+        assert_eq!(output.status.code(), Some(1));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["online"]["status"], "reachable");
+        assert_eq!(report["online"]["request_sent"], true);
+        assert_eq!(report["online"]["models"], 1);
+        assert_eq!(report["online"]["effective_model"], serde_json::Value::Null);
+        assert_eq!(
+            report["online"]["effective_model_available"],
+            serde_json::Value::Null
+        );
+        assert!(!report["blocking_issues"].as_array().unwrap().is_empty());
+    })
+    .await
+    .expect("catalog-only doctor process should join");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method.as_str(), "GET");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_doctor_online_accepts_only_local_ollama_implicit_latest_without_chat() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                {"id": "llama3.2:latest"},
+                {"id": "qwen2.5-coder:latest"}
+            ]
+        })))
+        .expect(5)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    let config = home.path().join("doctor-local-ollama.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"default_gateway = "ollama"
+[gateways.ollama]
+flavor = "openai"
+base_url = "{}"
+chat_path = "/v1/chat/completions"
+models_path = "/v1/models"
+model = "llama3.2"
+auth = {{ method = "none" }}
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut json_alias = base_cmd(&home_path);
+        let output = json_alias
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "doctor",
+                "--online",
+                "--json",
+            ])
+            .output()
+            .expect("run JSON doctor for implicit latest");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["online"]["scope"], "model_catalog_only");
+        assert_eq!(report["online"]["chat_route_probed"], false);
+        assert_eq!(report["online"]["effective_model"], "llama3.2");
+        assert_eq!(report["online"]["effective_model_available"], true);
+        assert!(report["blocking_issues"].as_array().unwrap().is_empty());
+
+        let mut human_alias = base_cmd(&home_path);
+        human_alias
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "doctor",
+                "--online",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "gateway/model: ollama/llama3.2",
+            ))
+            .stdout(predicate::str::contains(
+                "provider check: reachable — model catalog only; chat/inference access was not tested",
+            ))
+            .stdout(predicate::str::contains(
+                "doctor: no blocking issues found — run `kitsu` to verify chat/inference access",
+            ));
+
+        let mut json_missing = base_cmd(&home_path);
+        let output = json_missing
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "--model",
+                "missing-model",
+                "doctor",
+                "--online",
+                "--json",
+            ])
+            .output()
+            .expect("run JSON doctor for missing model");
+        assert_eq!(output.status.code(), Some(1));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["online"]["chat_route_probed"], false);
+        assert_eq!(report["online"]["effective_model_available"], false);
+        assert_eq!(report["blocking_issues"].as_array().unwrap().len(), 1);
+
+        let mut human_missing = base_cmd(&home_path);
+        human_missing
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "--model",
+                "missing-model",
+                "doctor",
+                "--online",
+            ])
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("doctor: 1 blocking issue(s)"))
+            .stdout(predicate::str::contains(
+                "effective model 'missing-model' is not advertised by the normalized gateway catalog",
+            ));
+
+        let mut explicit_tag = base_cmd(&home_path);
+        let output = explicit_tag
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "--model",
+                "llama3.2:7b",
+                "doctor",
+                "--online",
+                "--json",
+            ])
+            .output()
+            .expect("run JSON doctor for explicit tag mismatch");
+        assert_eq!(output.status.code(), Some(1));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["online"]["effective_model"], "llama3.2:7b");
+        assert_eq!(report["online"]["effective_model_available"], false);
+    })
+    .await
+    .expect("local Ollama doctor processes should join");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("record model-catalog requests");
+    assert_eq!(requests.len(), 5);
+    for request in requests {
+        assert_eq!(request.method.as_str(), "GET");
+        assert_eq!(request.url.path(), "/v1/models");
+    }
     server.verify().await;
 }
 
@@ -3342,6 +4262,19 @@ auth = {{ method = "none" }}
         assert_eq!(report["online"]["request_sent"], true);
         assert_eq!(report["online"]["status"], "reachable");
         assert_eq!(report["online"]["effective_model"], "doctor-model");
+        assert_eq!(report["provider_route"]["status"], "bound");
+        assert_eq!(
+            report["provider_route"]["receipt"]["route"]["adapter"],
+            "openai_compatible"
+        );
+        assert_eq!(
+            report["provider_route"]["receipt"]["route"]["wire_revision"],
+            "openai_chat_completions_v1"
+        );
+        assert_eq!(
+            report["provider_route"]["receipt"]["model"],
+            "doctor-model"
+        );
 
         let mut human = base_cmd(&home_path);
         human
@@ -3355,6 +4288,9 @@ auth = {{ method = "none" }}
             .success()
             .stdout(predicate::str::contains(
                 "provider check: reachable — chat/inference accepted one minimal tool-free completion",
+            ))
+            .stdout(predicate::str::contains(
+                "provider route: openai_compatible / openai_chat_completions_v1 / generation 1",
             ))
             .stdout(predicate::str::contains(
                 "doctor: inference probe succeeded — the configured chat route accepted this model",
@@ -3570,6 +4506,20 @@ async fn test_jsonl_ask_is_versioned_framed_and_parseable() {
         assert!(events
             .iter()
             .all(|event| event["schema"] == "kitsu.chat.v1"));
+        let facts =
+            jsonl_fixture::inspect_jsonl(&events, output.status.code().expect("process exit code"))
+                .expect("inspect successful ask JSONL");
+        assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::Succeeded);
+        assert_eq!(
+            facts.assistant,
+            jsonl_fixture::JsonlAssistantDisposition::Committed
+        );
+        assert_eq!(facts.terminal_count, 1);
+        assert_eq!(facts.exit_code, 0);
+        assert_eq!(facts.provider_requests, 1);
+        assert_eq!(facts.provider_attempts, 1);
+        assert_eq!(facts.tool_started, 0);
+        assert_eq!(facts.tool_finished, 0);
         assert_eq!(events.first().unwrap()["type"], "run_started");
         assert!(events
             .iter()
@@ -5906,7 +6856,7 @@ async fn test_model_command_timing_receipt_and_jsonl_summary() {
                     "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
                 })),
         )
-        .expect(2)
+        .expect(3)
         .mount(&server)
         .await;
 
@@ -5930,7 +6880,41 @@ async fn test_model_command_timing_receipt_and_jsonl_summary() {
             .expect("timing receipt is the terminal human record");
         let timing: serde_json::Value = serde_json::from_str(timing).unwrap();
         assert_eq!(timing["status"], "ok");
+        assert_eq!(timing["outcome"], "succeeded");
+        assert_eq!(timing["assistant"], "committed");
+        let human_run_id = timing["run_id"].as_str().expect("human run identity");
+        assert!(!human_run_id.is_empty());
+        assert!(
+            human_run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'_' | b'.' | b':')),
+            "{timing}"
+        );
         assert!(timing["duration_ms"].as_u64().unwrap() >= 35, "{timing}");
+
+        let mut second_human = base_cmd(&home_path);
+        let output = second_human
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--no-stream", "-p", "time this again"])
+            .output()
+            .expect("run second timed human prompt");
+        assert!(output.status.success(), "{output:?}");
+        let second_stderr = String::from_utf8(output.stderr).unwrap();
+        let second_timing: serde_json::Value = second_stderr
+            .lines()
+            .last()
+            .and_then(|line| line.strip_prefix("kitsu-timing: "))
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .expect("second human terminal receipt");
+        assert_ne!(
+            second_timing["run_id"], timing["run_id"],
+            "sequential process-runs must keep distinct identities"
+        );
+        assert_eq!(second_timing["outcome"], "succeeded");
+        assert_eq!(second_timing["assistant"], "committed");
 
         let mut jsonl = base_cmd(&home_path);
         let output = jsonl
@@ -5948,6 +6932,8 @@ async fn test_model_command_timing_receipt_and_jsonl_summary() {
         let summary = events.last().expect("final summary");
         assert_eq!(summary["type"], "final_summary");
         assert_eq!(summary["status"], "ok");
+        assert_eq!(summary["outcome"], "succeeded");
+        assert_eq!(summary["assistant"], "committed");
         assert!(summary["duration_ms"].as_u64().unwrap() >= 35, "{summary}");
 
         let mut management = base_cmd(&home_path);
@@ -6768,7 +7754,8 @@ async fn test_jsonl_agent_provider_failures_are_typed_for_ask_and_piped_chat() {
     write_config(home.path(), &server.uri());
     let home_path = home.path().to_path_buf();
 
-    tokio::task::spawn_blocking(move || {
+    let run_ids = tokio::task::spawn_blocking(move || {
+        let mut run_ids = Vec::new();
         for piped in [false, true] {
             let mut cmd = base_cmd(&home_path);
             cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
@@ -6797,17 +7784,37 @@ async fn test_jsonl_agent_provider_failures_are_typed_for_ask_and_piped_chat() {
             assert_eq!(summary["policy_errors"], 0, "piped={piped}");
             assert_eq!(summary["recovered_tool_errors"], 0, "piped={piped}");
             assert_eq!(summary["recovered_policy_errors"], 0, "piped={piped}");
+            let facts =
+                jsonl_fixture::inspect_jsonl(&events, 2).expect("inspect provider-fault JSONL");
+            assert_eq!(
+                facts.class,
+                jsonl_fixture::JsonlOutcomeClass::ProviderFault,
+                "piped={piped}"
+            );
+            assert_eq!(facts.terminal_count, 1, "piped={piped}");
+            assert_eq!(facts.provider_requests, 1, "piped={piped}");
+            assert_eq!(facts.provider_attempts, 3, "piped={piped}");
+            assert_eq!(facts.tool_started, 0, "piped={piped}");
+            assert_eq!(facts.tool_finished, 0, "piped={piped}");
+            run_ids.push(facts.run_id);
         }
+        run_ids
     })
     .await
     .unwrap();
+    assert_ne!(
+        run_ids[0], run_ids[1],
+        "separate runs need separate identity"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 6);
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn test_jsonl_preflight_error_keeps_stdout_machine_only() {
+async fn test_jsonl_preflight_error_keeps_stdout_machine_only() {
+    let server = wiremock::MockServer::start().await;
     let home = TempDir::new().unwrap();
-    write_config(home.path(), "https://gateway.invalid");
+    write_config(home.path(), &server.uri());
     let mut cmd = base_cmd(home.path());
     cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
     cmd.args(["--jsonl", "ask", "hello"]);
@@ -6828,6 +7835,14 @@ fn test_jsonl_preflight_error_keeps_stdout_machine_only() {
         .as_str()
         .is_some_and(|message| message.contains("refresh-token")));
     assert_eq!(events[1]["user_failures"], 1);
+    let facts = jsonl_fixture::inspect_jsonl(&events, 1).expect("inspect preflight-fault JSONL");
+    assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::UserFault);
+    assert_eq!(facts.terminal_count, 1);
+    assert_eq!(facts.provider_requests, 0);
+    assert_eq!(facts.provider_attempts, 0);
+    assert_eq!(facts.tool_started, 0);
+    assert_eq!(facts.tool_finished, 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[test]
@@ -6978,6 +7993,17 @@ async fn test_jsonl_sigint_emits_cancelled_turn_and_summary() {
     assert_eq!(events[6]["status"], "cancelled");
     assert_eq!(events[7]["status"], "cancelled");
     assert_eq!(events[7]["cancelled_failures"], 1);
+    let facts = jsonl_fixture::inspect_jsonl(&events, 130).expect("inspect active cancellation");
+    assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::Cancelled);
+    assert_eq!(
+        facts.assistant,
+        jsonl_fixture::JsonlAssistantDisposition::Discarded
+    );
+    assert_eq!(facts.terminal_count, 1);
+    assert_eq!(facts.provider_requests, 1);
+    assert_eq!(facts.provider_attempts, 1);
+    assert_eq!(facts.tool_started, 0);
+    assert_eq!(facts.tool_finished, 0);
 }
 
 #[cfg(unix)]
@@ -7049,6 +8075,18 @@ auth = { method = "none" }
     assert_eq!(events[1]["kind"], "cancelled");
     assert_eq!(events[2]["status"], "cancelled");
     assert_eq!(events[2]["cancelled_failures"], 1);
+    let facts = jsonl_fixture::inspect_jsonl(&events, 130)
+        .expect("inspect cancellation before piped input acceptance");
+    assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::Cancelled);
+    assert_eq!(
+        facts.assistant,
+        jsonl_fixture::JsonlAssistantDisposition::Absent
+    );
+    assert_eq!(facts.terminal_count, 1);
+    assert_eq!(facts.provider_requests, 0);
+    assert_eq!(facts.provider_attempts, 0);
+    assert_eq!(facts.tool_started, 0);
+    assert_eq!(facts.tool_finished, 0);
 }
 
 #[cfg(unix)]
@@ -7119,6 +8157,16 @@ auth = { method = "none" }
     assert_eq!(events[2]["type"], "final_summary");
     assert_eq!(events[2]["status"], "cancelled");
     assert_eq!(events[2]["cancelled_failures"], 1);
+    let facts = jsonl_fixture::inspect_jsonl(&events, 130)
+        .expect("inspect cancellation before script FIFO acceptance");
+    assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::Cancelled);
+    assert_eq!(
+        facts.assistant,
+        jsonl_fixture::JsonlAssistantDisposition::Absent
+    );
+    assert_eq!(facts.terminal_count, 1);
+    assert_eq!(facts.provider_requests, 0);
+    assert_eq!(facts.provider_attempts, 0);
 }
 
 #[cfg(unix)]
@@ -7224,6 +8272,343 @@ async fn test_jsonl_script_slash_turn_cancellation_closes_command_frame() {
     assert_eq!(events[8]["status"], "cancelled");
     assert_eq!(events[9]["status"], "cancelled");
     assert_eq!(events[10]["status"], "cancelled");
+    let facts =
+        jsonl_fixture::inspect_jsonl(&events, 130).expect("inspect scripted command cancellation");
+    assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::Cancelled);
+    assert_eq!(
+        facts.assistant,
+        jsonl_fixture::JsonlAssistantDisposition::Discarded
+    );
+    assert_eq!(facts.terminal_count, 1);
+    assert_eq!(facts.provider_requests, 1);
+    assert_eq!(facts.provider_attempts, 1);
+    assert_eq!(facts.tool_started, 0);
+    assert_eq!(facts.tool_finished, 0);
+}
+
+/// EOF at an authority-admission surface interrupts the run before the
+/// denial can be projected as a tool result into another provider request.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_interactive_confirmation_eof_interrupts_without_followup_send() {
+    use std::io::Write as _;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let repo = TempDir::new().expect("temp interactive repo");
+    let target = repo.path().join("must-not-exist.txt");
+    let write_arguments = serde_json::json!({
+        "path": target.to_string_lossy(),
+        "content": "confirmation EOF must not write"
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "confirmation-eof-write",
+                        "type": "function",
+                        "function": {
+                            "name": "fs_write_file",
+                            "arguments": write_arguments
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        let mut prompt_sent = false;
+        let mut eof_sent = false;
+        let mut quit_sent = false;
+        run_plain_interactive_chat_pty(&home_path, &repo_path, &[], |output, terminal| {
+            let prompt_count = output
+                .windows(b"kitsu>".len())
+                .filter(|window| *window == b"kitsu>")
+                .count();
+            if !prompt_sent && prompt_count >= 1 {
+                terminal
+                    .write_all(b"request one guarded write\n")
+                    .expect("submit guarded request");
+                terminal.flush().unwrap();
+                prompt_sent = true;
+            }
+            if prompt_sent
+                && !eof_sent
+                && output
+                    .windows(b"permission> kitsu wants to write".len())
+                    .any(|window| window == b"permission> kitsu wants to write")
+            {
+                // Ctrl+D at an empty canonical line makes read_line return EOF.
+                terminal
+                    .write_all(b"\x04")
+                    .expect("submit confirmation EOF");
+                terminal.flush().unwrap();
+                eof_sent = true;
+            }
+            let interruption_seen = output
+                .windows(b"authority input closed".len())
+                .any(|window| window == b"authority input closed");
+            if eof_sent && !quit_sent && interruption_seen && prompt_count >= 2 {
+                terminal.write_all(b"/quit\n").expect("exit chat");
+                terminal.flush().unwrap();
+                quit_sent = true;
+            }
+        })
+    })
+    .await
+    .expect("interactive confirmation fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("permission> kitsu wants to write"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("authority input closed"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("interrupted") && transcript.contains("assistant discarded"),
+        "interactive process receipt did not retain the authority interruption: {transcript}"
+    );
+    assert!(
+        !transcript.contains("invalid permission response"),
+        "EOF is an interruption, not malformed consent: {transcript}"
+    );
+    assert!(!target.exists(), "confirmation EOF performed the write");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "EOF must prevent a follow-up send");
+    server.verify().await;
+}
+
+/// An explicit `n` is still an ordinary policy denial: no effect occurs, and
+/// the provider may inspect the bounded tool error and recover next round.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_interactive_explicit_denial_remains_provider_recoverable() {
+    use std::io::Write as _;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let repo = TempDir::new().expect("temp interactive repo");
+    let target = repo.path().join("must-not-exist.txt");
+    let write_arguments = serde_json::json!({
+        "path": target.to_string_lossy(),
+        "content": "explicit denial must not write"
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "EXPLICIT_DENIAL_RECOVERED"
+                },
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "explicit-denial-write",
+                        "type": "function",
+                        "function": {
+                            "name": "fs_write_file",
+                            "arguments": write_arguments
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        let mut prompt_sent = false;
+        let mut denial_sent = false;
+        let mut quit_sent = false;
+        run_plain_interactive_chat_pty(&home_path, &repo_path, &[], |output, terminal| {
+            let prompt_count = output
+                .windows(b"kitsu>".len())
+                .filter(|window| *window == b"kitsu>")
+                .count();
+            if !prompt_sent && prompt_count >= 1 {
+                terminal
+                    .write_all(b"request one guarded write\n")
+                    .expect("submit guarded request");
+                terminal.flush().unwrap();
+                prompt_sent = true;
+            }
+            if prompt_sent
+                && !denial_sent
+                && output
+                    .windows(b"permission> kitsu wants to write".len())
+                    .any(|window| window == b"permission> kitsu wants to write")
+            {
+                terminal.write_all(b"n\n").expect("deny guarded write");
+                terminal.flush().unwrap();
+                denial_sent = true;
+            }
+            let recovered = output
+                .windows(b"EXPLICIT_DENIAL_RECOVERED".len())
+                .any(|window| window == b"EXPLICIT_DENIAL_RECOVERED");
+            if denial_sent && !quit_sent && recovered && prompt_count >= 2 {
+                terminal.write_all(b"/quit\n").expect("exit chat");
+                terminal.flush().unwrap();
+                quit_sent = true;
+            }
+        })
+    })
+    .await
+    .expect("interactive explicit-denial fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("EXPLICIT_DENIAL_RECOVERED"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("succeeded") && transcript.contains("assistant committed"),
+        "recovered denial did not publish a committed interactive aggregate: {transcript}"
+    );
+    assert!(
+        !transcript.contains("authority input closed"),
+        "{transcript}"
+    );
+    assert!(!target.exists(), "explicit denial performed the write");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "explicit denial should allow recovery");
+    assert!(String::from_utf8_lossy(&requests[1].body).contains("\"role\":\"tool\""));
+    server.verify().await;
+}
+
+/// Cancelling an active interactive run must clear already accepted type-ahead
+/// before any queued prompt can become a provider request.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_interactive_quit_cancel_never_activates_queued_prompt() {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let request_seen = Arc::new(AtomicBool::new(false));
+    let responder_seen = request_seen.clone();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_request: &wiremock::Request| {
+            responder_seen.store(true, Ordering::Release);
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(30))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "must be cancelled"},
+                        "finish_reason": "stop"
+                    }]
+                }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let repo = TempDir::new().expect("temp interactive repo");
+    let repo_path = repo.path().to_path_buf();
+    let driver_seen = request_seen.clone();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        let mut prompt_sent = false;
+        let mut cancel_sent = false;
+        run_plain_interactive_chat_pty(
+            &home_path,
+            &repo_path,
+            &["--no-tools"],
+            |output, terminal| {
+                let prompt_visible = output
+                    .windows(b"kitsu>".len())
+                    .any(|window| window == b"kitsu>");
+                if !prompt_sent && prompt_visible {
+                    terminal
+                        .write_all(b"ACTIVE_PROVIDER_REQUEST\n")
+                        .expect("submit active prompt");
+                    terminal.flush().unwrap();
+                    prompt_sent = true;
+                }
+                if prompt_sent && !cancel_sent && driver_seen.load(Ordering::Acquire) {
+                    terminal
+                        .write_all(b"NEVER_ACTIVATE_QUEUED_PROMPT\n/quit cancel\n")
+                        .expect("queue then cancel");
+                    terminal.flush().unwrap();
+                    cancel_sent = true;
+                }
+            },
+        )
+    })
+    .await
+    .expect("interactive queued-cancel fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("exit cancellation completed"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("1 queued prompt(s) cleared"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("cancelled") && transcript.contains("assistant discarded"),
+        "queued exit cancellation did not publish a cancelled aggregate: {transcript}"
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "queued work reached the provider");
+    let request = String::from_utf8_lossy(&requests[0].body);
+    assert!(request.contains("ACTIVE_PROVIDER_REQUEST"), "{request}");
+    assert!(
+        !request.contains("NEVER_ACTIVATE_QUEUED_PROMPT"),
+        "{request}"
+    );
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -7299,6 +8684,7 @@ auth = {{ method = "none" }}
         assert_eq!(events[1]["turn_remaining_ms"], serde_json::Value::Null);
         assert_eq!(events[2]["operation_id"], "models:1");
         assert_eq!(events[2]["purpose"], "model_catalog");
+        assert_eq!(events[2]["route_generation"], 1);
         assert_eq!(events[2]["deadline_scope"], "provider_request");
         assert_eq!(events[2]["turn_remaining_ms"], serde_json::Value::Null);
         assert_eq!(events[2]["category"], "success");
@@ -7420,6 +8806,7 @@ auth = {{ method = "none" }}
         assert_eq!(events[1]["purpose"], "model_catalog");
         assert_eq!(events[2]["operation_id"], "models:1");
         assert_eq!(events[2]["purpose"], "model_catalog");
+        assert_eq!(events[2]["route_generation"], 1);
         assert_eq!(events[2]["attempt"], 1);
         assert_eq!(events[2]["max_attempts"], 1);
         assert_eq!(events[2]["category"], "unavailable");
@@ -7824,6 +9211,24 @@ async fn test_jsonl_provider_requests_identify_model_after_in_session_switch() {
         "catalog lookup is not routed to a model: {catalog_request}"
     );
 
+    let attempt_routes = events
+        .iter()
+        .filter(|event| event["type"] == "provider_attempt")
+        .map(|event| {
+            (
+                event["purpose"].as_str().unwrap().to_string(),
+                event["route_generation"].as_u64(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempt_routes,
+        [
+            ("inference".to_string(), Some(1)),
+            ("inference".to_string(), Some(2)),
+        ]
+    );
+
     let requests = server.received_requests().await.unwrap();
     let wire_models = requests
         .iter()
@@ -7835,6 +9240,178 @@ async fn test_jsonl_provider_requests_identify_model_after_in_session_switch() {
         })
         .collect::<Vec<_>>();
     assert_eq!(wire_models, inference_models);
+    server.verify().await;
+}
+
+/// `/retry` is a new logical operation, not a hidden replay through the failed
+/// request's old route. After `/model` publishes a successor, the retained
+/// prompt must be sent once through that successor and its attempt receipt must
+/// identify the new generation.
+#[tokio::test]
+#[serial]
+async fn test_retry_after_model_switch_uses_the_successor_generation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let responder_attempts = attempts.clone();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_request: &wiremock::Request| {
+            if responder_attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": {"message": "deliberate first-operation failure"}
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "retry used successor"},
+                        "finish_reason": "stop"
+                    }]
+                }))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("retry-route-successor.script");
+    fs::write(
+        &script,
+        "original replay prompt\n/model retry-model\n/retry\n/quit\n",
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+
+    let output = tokio::task::spawn_blocking(move || {
+        base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--gateway",
+                "example",
+                "--jsonl",
+                "--no-stream",
+                "--context-window",
+                "8192",
+                "chat",
+                "--no-session",
+                "--no-tools",
+                "--allow-turn-errors",
+                "--script",
+                &script_path,
+            ])
+            .output()
+            .expect("run retry route-generation script")
+    })
+    .await
+    .expect("retry route-generation command joins");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let attempt_routes = events
+        .iter()
+        .filter(|event| event["type"] == "provider_attempt" && event["purpose"] == "inference")
+        .map(|event| {
+            (
+                event["route_generation"].as_u64(),
+                event["outcome"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempt_routes,
+        [
+            (Some(1), "rejected".to_string()),
+            (Some(2), "body_completed".to_string()),
+        ]
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let bodies = requests
+        .iter()
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies[0]["model"], "example-model-v1");
+    assert_eq!(bodies[1]["model"], "retry-model");
+    for body in &bodies {
+        assert!(body["messages"].as_array().unwrap().iter().any(|message| {
+            message["role"] == "user" && message["content"] == "original replay prompt"
+        }));
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_failed_model_publication_keeps_the_old_route_usable() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "old route retained"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let oversized = "m".repeat(4097);
+    let script = home.path().join("failed-model-publication.script");
+    fs::write(
+        &script,
+        format!("/model {oversized}\nafter failed switch\n/quit\n"),
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+
+    tokio::task::spawn_blocking(move || {
+        base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--gateway",
+                "example",
+                "--no-stream",
+                "--context-window",
+                "8192",
+                "chat",
+                "--no-session",
+                "--no-tools",
+                "--allow-turn-errors",
+                "--script",
+                &script_path,
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("old route retained"))
+            .stderr(predicate::str::contains("could not publish model switch"));
+    })
+    .await
+    .expect("failed-publication command joins");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "failed switch caused an auxiliary send");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["model"], "example-model-v1");
     server.verify().await;
 }
 
@@ -9605,6 +11182,10 @@ async fn test_interactive_empty_response_rolls_back_and_keeps_retry_available() 
 
     assert!(transcript.contains("model returned no final assistant text"));
     assert!(transcript.contains("turn rolled back - /retry to try again"));
+    assert!(
+        transcript.contains("provider_fault") && transcript.contains("assistant discarded"),
+        "empty response did not publish the failed interactive aggregate: {transcript}"
+    );
     let mut sessions = base_cmd(home.path());
     let output = sessions
         .args(["sessions", "--json"])
@@ -9613,6 +11194,98 @@ async fn test_interactive_empty_response_rolls_back_and_keeps_retry_available() 
     assert!(output.status.success(), "{output:?}");
     let listed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(listed, serde_json::json!([]));
+    server.verify().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_interactive_recovered_failed_turn_publishes_partial_process_outcome() {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let responder_attempts = attempts.clone();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_request: &wiremock::Request| {
+            let content = if responder_attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                " \n\t"
+            } else {
+                "RECOVERED_INTERACTIVE_TURN"
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop"
+                }]
+            }))
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let repo = TempDir::new().expect("temp interactive repo");
+    let repo_path = repo.path().to_path_buf();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        let mut prompt_sent = false;
+        let mut retry_sent = false;
+        let mut quit_sent = false;
+        run_plain_interactive_chat_pty(
+            &home_path,
+            &repo_path,
+            &["--no-tools"],
+            |output, terminal| {
+                let prompt_count = output
+                    .windows(b"kitsu>".len())
+                    .filter(|window| *window == b"kitsu>")
+                    .count();
+                if !prompt_sent && prompt_count >= 1 {
+                    terminal
+                        .write_all(b"FIRST_TURN_IS_EMPTY\n")
+                        .expect("submit first interactive prompt");
+                    terminal.flush().unwrap();
+                    prompt_sent = true;
+                }
+                let rolled_back = output
+                    .windows(b"turn rolled back - /retry".len())
+                    .any(|window| window == b"turn rolled back - /retry");
+                if prompt_sent && !retry_sent && rolled_back && prompt_count >= 2 {
+                    terminal.write_all(b"/retry\n").expect("retry failed turn");
+                    terminal.flush().unwrap();
+                    retry_sent = true;
+                }
+                let recovered = output
+                    .windows(b"RECOVERED_INTERACTIVE_TURN".len())
+                    .any(|window| window == b"RECOVERED_INTERACTIVE_TURN");
+                if retry_sent && !quit_sent && recovered && prompt_count >= 3 {
+                    terminal.write_all(b"/quit\n").expect("exit recovered chat");
+                    terminal.flush().unwrap();
+                    quit_sent = true;
+                }
+            },
+        )
+    })
+    .await
+    .expect("interactive recovered-fault fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("RECOVERED_INTERACTIVE_TURN"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("partially_succeeded") && transcript.contains("assistant committed"),
+        "process aggregate collapsed to its last successful turn: {transcript}"
+    );
+    assert_eq!(attempts.load(Ordering::Acquire), 2);
     server.verify().await;
 }
 
@@ -9736,6 +11409,9 @@ async fn test_prompt_length_limit_names_current_cap_and_retry_value() {
             .expect("failed model command ends with a timing receipt");
         let timing: serde_json::Value = serde_json::from_str(timing).unwrap();
         assert_eq!(timing["status"], "error");
+        assert_eq!(timing["outcome"], "provider_fault");
+        assert_eq!(timing["assistant"], "discarded");
+        assert!(timing["run_id"].as_str().is_some_and(|id| !id.is_empty()));
 
         let mut jsonl = base_cmd(&home_path);
         let output = jsonl
@@ -9823,7 +11499,7 @@ async fn test_jsonl_strict_script_separates_local_tool_and_policy_failures() {
                 }]
             })))
             .with_priority(10)
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -9836,7 +11512,7 @@ async fn test_jsonl_strict_script_separates_local_tool_and_policy_failures() {
                 }]
             })))
             .with_priority(1)
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -9848,6 +11524,39 @@ async fn test_jsonl_strict_script_separates_local_tool_and_policy_failures() {
         let home_path = home.path().to_path_buf();
         let allowed_path = allowed.path().to_path_buf();
 
+        let human_home = home_path.clone();
+        let human_allowed = allowed_path.clone();
+        let human_script = script.clone();
+        let human = tokio::task::spawn_blocking(move || {
+            let mut cmd = base_cmd(&human_home);
+            cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+                .args([
+                    "--no-stream",
+                    "chat",
+                    "--no-session",
+                    "--allow-path",
+                    &human_allowed.to_string_lossy(),
+                    "--script",
+                    &human_script.to_string_lossy(),
+                ])
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(human.status.code(), Some(1), "{human:?}");
+        let human_stderr = String::from_utf8(human.stderr).unwrap();
+        let human_timing: serde_json::Value = human_stderr
+            .lines()
+            .last()
+            .and_then(|line| line.strip_prefix("kitsu-timing: "))
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .expect("strict human run terminal receipt");
+        assert_eq!(human_timing["outcome"], "tool_fault");
+        assert_eq!(human_timing["assistant"], "discarded");
+
         let output = tokio::task::spawn_blocking(move || {
             let mut cmd = base_cmd(&home_path);
             cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
@@ -9855,6 +11564,7 @@ async fn test_jsonl_strict_script_separates_local_tool_and_policy_failures() {
                     "--jsonl",
                     "--no-stream",
                     "chat",
+                    "--no-session",
                     "--allow-path",
                     &allowed_path.to_string_lossy(),
                     "--script",
@@ -9901,6 +11611,14 @@ async fn test_jsonl_strict_script_separates_local_tool_and_policy_failures() {
         assert_eq!(summary["policy_errors"], expected_policy_errors);
         assert_eq!(summary["recovered_tool_errors"], 0);
         assert_eq!(summary["recovered_policy_errors"], 0);
+        let facts =
+            jsonl_fixture::inspect_jsonl(&events, 1).expect("inspect strict tool-fault JSONL");
+        assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::ToolFault);
+        assert_eq!(facts.terminal_count, 1);
+        assert_eq!(facts.provider_requests, 2);
+        assert_eq!(facts.provider_attempts, 2);
+        assert_eq!(facts.tool_started, 1);
+        assert_eq!(facts.tool_finished, 1);
         server.verify().await;
     }
 
@@ -12222,6 +13940,7 @@ auth = {{ method = "none" }}
     assert_eq!(events[2]["purpose"], "model_catalog");
     assert_eq!(events[2]["message_count"], 0);
     assert_eq!(events[2]["tools_offered"], 0);
+    assert_eq!(events[3]["route_generation"], 1);
     assert_eq!(events[3]["line"], 1);
     assert_eq!(events[3]["command"], "/models");
     assert_eq!(events[3]["purpose"], "model_catalog");
@@ -12466,6 +14185,12 @@ auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
             .stderr(predicate::str::contains("session:"))
             .stderr(predicate::str::contains("gateway      example"))
             .stderr(predicate::str::contains("model        test-model"))
+            .stderr(predicate::str::contains(
+                "provider     openai_compatible | generation 1",
+            ))
+            .stderr(predicate::str::contains(
+                "wire         openai_chat_completions_v1",
+            ))
             .stderr(predicate::str::contains("context"))
             .stderr(predicate::str::contains("permissions:"))
             .stderr(predicate::str::contains("mode         deny"))
@@ -12491,7 +14216,7 @@ fn test_jsonl_script_query_results_are_structured_and_framed() {
     let script = home.path().join("queries.txt");
     fs::write(
         &script,
-        "/status\n/permissions\n/context\n/sessions\n/skills\n/jobs\n/model alternate-model\n/compact\n/quit\n",
+        "/status\n/permissions\n/context\n/sessions\n/skills\n/jobs\n/model alternate-model\n/status\n/compact\n/quit\n",
     )
     .unwrap();
 
@@ -12517,13 +14242,25 @@ fn test_jsonl_script_query_results_are_structured_and_framed() {
         .iter()
         .filter(|event| event["type"] == "command_result")
         .collect::<Vec<_>>();
-    assert_eq!(results.len(), 8);
+    assert_eq!(results.len(), 9);
+    let run_started = events
+        .iter()
+        .find(|event| event["type"] == "run_started")
+        .expect("run_started route receipt");
     assert_eq!(results[0]["result"]["kind"], "status");
     assert_eq!(results[0]["result"]["session"]["model"], "example-model-v1");
     assert!(results[0]["result"]["session"]["cwd"].is_string());
     assert!(results[0]["result"]["context"]["effective"].is_number());
     assert!(results[0]["result"]["conversation"]["messages"].is_number());
     assert!(results[0]["result"]["tools"]["names"].is_array());
+    assert_eq!(
+        results[0]["result"]["provider_route"]["route"]["adapter"],
+        "openai_compatible"
+    );
+    assert_eq!(
+        results[0]["result"]["provider_route"]["route"]["generation"],
+        run_started["provider_route"]["route"]["generation"]
+    );
     assert!(results[0]["result"]["text"].is_string());
     assert_eq!(results[1]["result"]["kind"], "permissions");
     assert_eq!(results[1]["result"]["mode"], "deny");
@@ -12549,11 +14286,21 @@ fn test_jsonl_script_query_results_are_structured_and_framed() {
     assert_eq!(results[6]["result"]["changed"], true);
     assert_eq!(results[6]["result"]["catalog_validated"], false);
     assert!(results[6]["result"]["effective_context_window"].is_number());
-    assert_eq!(results[7]["result"]["kind"], "compaction");
-    assert!(results[7]["result"]["changed"].is_boolean());
-    assert!(results[7]["result"]["tokens_before"].is_number());
-    assert!(results[7]["result"]["tokens_after"].is_number());
-    assert!(results[7]["result"]["usage"].is_object());
+    assert_eq!(results[7]["result"]["kind"], "status");
+    assert_eq!(results[7]["result"]["session"]["model"], "alternate-model");
+    assert_eq!(
+        results[7]["result"]["provider_route"]["route"]["generation"],
+        2
+    );
+    assert_eq!(
+        results[7]["result"]["provider_route"]["model"],
+        "alternate-model"
+    );
+    assert_eq!(results[8]["result"]["kind"], "compaction");
+    assert!(results[8]["result"]["changed"].is_boolean());
+    assert!(results[8]["result"]["tokens_before"].is_number());
+    assert!(results[8]["result"]["tokens_after"].is_number());
+    assert!(results[8]["result"]["usage"].is_object());
     let started = events
         .iter()
         .filter(|event| event["type"] == "command_started")
@@ -12562,7 +14309,7 @@ fn test_jsonl_script_query_results_are_structured_and_framed() {
         .iter()
         .filter(|event| event["type"] == "command_finished")
         .count();
-    assert_eq!(started, 9);
+    assert_eq!(started, 10);
     assert_eq!(finished, started, "every slash frame must close");
 }
 
@@ -12970,46 +14717,55 @@ async fn test_jsonl_run_started_reports_resolved_session_and_model() {
     fs::write(&resume_script, "/status\n/quit\n").unwrap();
     let home_path = home.path().to_path_buf();
 
-    let (created, resumed) = tokio::task::spawn_blocking(move || {
-        let run = |extra: &[&str], script: &Path| {
-            let mut cmd = base_cmd(&home_path);
-            let mut args = vec!["--jsonl", "chat"];
-            args.extend_from_slice(extra);
-            args.extend(["--script", script.to_str().unwrap()]);
-            let output = cmd
-                .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
-                .args(args)
-                .output()
-                .expect("session query");
-            assert!(
-                output.status.success(),
-                "stderr: {}\nstdout: {}",
-                String::from_utf8_lossy(&output.stderr),
-                String::from_utf8_lossy(&output.stdout)
-            );
-            assert!(
-                output.stderr.is_empty(),
-                "JSONL must suppress durable/resume/project-context notices: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8(output.stdout)
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-                .find(|event| event["type"] == "run_started")
-                .expect("run_started")
-        };
+    let ((created, created_facts), (resumed, resumed_facts)) =
+        tokio::task::spawn_blocking(move || {
+            let run = |extra: &[&str], script: &Path| {
+                let mut cmd = base_cmd(&home_path);
+                let mut args = vec!["--jsonl", "chat"];
+                args.extend_from_slice(extra);
+                args.extend(["--script", script.to_str().unwrap()]);
+                let output = cmd
+                    .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+                    .args(args)
+                    .output()
+                    .expect("session query");
+                assert!(
+                    output.status.success(),
+                    "stderr: {}\nstdout: {}",
+                    String::from_utf8_lossy(&output.stderr),
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                assert!(
+                    output.stderr.is_empty(),
+                    "JSONL must suppress durable/resume/project-context notices: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let exit_code = output.status.code().expect("process exit code");
+                let events = String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                let facts = jsonl_fixture::inspect_jsonl(&events, exit_code)
+                    .expect("inspect same-session JSONL run");
+                let started = events
+                    .into_iter()
+                    .find(|event| event["type"] == "run_started")
+                    .expect("run_started");
+                (started, facts)
+            };
 
-        let created = run(&["--session", "--model", "saved-model"], &create_script);
-        let id = created["session_id"]
-            .as_str()
-            .expect("new durable session id")
-            .to_string();
-        let resumed = run(&["--resume", &id], &resume_script);
-        (created, resumed)
-    })
-    .await
-    .unwrap();
+            let (created, created_facts) =
+                run(&["--session", "--model", "saved-model"], &create_script);
+            let id = created["session_id"]
+                .as_str()
+                .expect("new durable session id")
+                .to_string();
+            let (resumed, resumed_facts) = run(&["--resume", &id], &resume_script);
+            ((created, created_facts), (resumed, resumed_facts))
+        })
+        .await
+        .unwrap();
 
     let id = created["session_id"].as_str().unwrap();
     assert_eq!(created["model"], "saved-model");
@@ -13019,6 +14775,19 @@ async fn test_jsonl_run_started_reports_resolved_session_and_model() {
     assert_eq!(resumed["model"], "saved-model");
     assert_eq!(resumed["resumed"], true);
     assert_eq!(resumed["durable_session"], true);
+    assert_ne!(created_facts.run_id, resumed_facts.run_id);
+    assert_eq!(
+        created_facts.class,
+        jsonl_fixture::JsonlOutcomeClass::Succeeded
+    );
+    assert_eq!(created_facts.provider_requests, 1);
+    assert_eq!(
+        resumed_facts.class,
+        jsonl_fixture::JsonlOutcomeClass::Succeeded
+    );
+    assert_eq!(resumed_facts.provider_requests, 0);
+    assert_eq!(created_facts.terminal_count, 1);
+    assert_eq!(resumed_facts.terminal_count, 1);
     server.verify().await;
 }
 
@@ -13984,6 +15753,13 @@ async fn test_script_exit_joins_live_background_agents_and_never_claims_a_rollba
         .expect("final summary");
     assert_eq!(summary["status"], "ok");
     assert_eq!(summary["failures"], 0);
+    let facts = jsonl_fixture::inspect_jsonl(&events, 0)
+        .expect("inspect successful background join before terminal");
+    assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::Succeeded);
+    assert_eq!(facts.terminal_count, 1);
+    assert_eq!(facts.provider_requests, 2);
+    assert_eq!(facts.provider_attempts, 2);
+    assert_eq!(facts.tool_started, facts.tool_finished);
     server.verify().await;
 }
 

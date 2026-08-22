@@ -1,15 +1,29 @@
 //! kitsu-providers — the Provider trait and concrete adapters (OpenAI-compatible,
 //! gateways like the AI gateway). See docs/architecture.md.
 
+pub mod anthropic_messages;
 pub mod auth;
+pub mod compiled;
 pub mod error;
 pub mod openai_compat;
+mod retry;
+pub mod route;
 pub mod telemetry;
 pub mod types;
 
 pub use error::{AuthError, ExpiryStatus, ProviderError, ProviderResponsePart};
+pub use route::{
+    ProviderAdapterId, ProviderAuthSource, ProviderCapabilities, ProviderCapability,
+    ProviderCatalogHandle, ProviderCatalogPolicy, ProviderFallbackPolicy, ProviderProfileId,
+    ProviderReplayGenerationPolicy, ProviderRetryGenerationPolicy, ProviderRouteContractError,
+    ProviderRouteCurrent, ProviderRouteDeclaration, ProviderRouteDurationReceipt,
+    ProviderRouteGeneration, ProviderRouteHandle, ProviderRouteIdentity, ProviderRoutePolicy,
+    ProviderRoutePolicyReceipt, ProviderRouteReceipt, ProviderRouteSnapshot, ProviderRouteTimeout,
+    ProviderWireRevision, PROVIDER_ROUTE_CONTRACT_REVISION, PROVIDER_ROUTE_RECEIPT_REVISION,
+};
 pub use telemetry::{
-    ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
+    ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptObservation,
+    ProviderAttemptOutcome, ProviderTelemetrySink,
 };
 pub use types::{
     ChatDelta, ChatMessage, ChatRequest, FinishReason, JsonSchemaFormat, ReasoningEffort, Role,

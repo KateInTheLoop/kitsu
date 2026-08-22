@@ -3,7 +3,6 @@
 //! (design §1, §4).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -11,8 +10,20 @@ use futures::stream::{self, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::AuthProvider;
-use crate::error::{ProviderError, ProviderResponsePart};
+use crate::auth::{AuthProvider, FrozenAuth};
+use crate::error::{AuthError, ProviderError, ProviderResponsePart};
+use crate::retry::{
+    add_retry_jitter, backoff_delay, duration_millis, is_retryable_status, record_attempt,
+    remaining_deadline_millis, remaining_request_time, retry_delay_decision, retry_jitter_sample,
+    sleep_before_retry, sleep_before_retry_observed, status_category, InFlightAttemptGuard,
+    ResponseBodyAttemptGuard, RetryBackoffAttemptGuard,
+};
+#[cfg(test)]
+use crate::retry::{parse_retry_after, retry_delay, MAX_RETRY_DELAY};
+use crate::route::{
+    ProviderAuthSource, ProviderRouteContractError, ProviderRouteCurrent, ProviderRouteDeclaration,
+    ProviderRouteHandle, ProviderRoutePolicy, ProviderRouteSnapshot,
+};
 use crate::telemetry::{
     ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
 };
@@ -62,6 +73,117 @@ pub struct OpenAICompatConfig {
     pub timeout: Duration,
 }
 
+/// Consumed composition input for one immutable compatible-Chat generation.
+/// It is intentionally not `Clone`, `Debug`, or serializable: endpoint and
+/// auth-bearing construction values must not become diagnostic payloads.
+pub struct OpenAICompatRouteConfig {
+    pub declaration: ProviderRouteDeclaration,
+    pub model: String,
+    pub auth_source: ProviderAuthSource,
+    pub base_url: String,
+    pub chat_path: String,
+    pub models_path: Option<String>,
+    pub policy: ProviderRoutePolicy,
+}
+
+/// Consumed composition input for a catalog-only compatible generation. It
+/// carries no model and constructs no inference runtime.
+pub struct OpenAICompatCatalogRouteConfig {
+    pub declaration: ProviderRouteDeclaration,
+    pub auth_source: ProviderAuthSource,
+    pub base_url: String,
+    pub chat_path: String,
+    pub models_path: String,
+    pub policy: ProviderRoutePolicy,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OpenAICompatRouteBuildError {
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+    #[error(transparent)]
+    Contract(#[from] ProviderRouteContractError),
+}
+
+/// Resolve auth once and construct both physical runtimes from one consumed
+/// route input. Inference and catalog can have distinct retry/cache budgets,
+/// but can no longer drift in endpoint, paths, credential generation, model,
+/// declaration, or source identity through independent CLI construction.
+pub fn build_openai_compatible_route(
+    config: OpenAICompatRouteConfig,
+    auth: &dyn AuthProvider,
+) -> Result<ProviderRouteSnapshot<OpenAICompatProvider>, OpenAICompatRouteBuildError> {
+    let frozen_auth: Arc<dyn AuthProvider> = Arc::new(FrozenAuth::resolve(auth)?);
+    let inference = Arc::new(
+        OpenAICompatProvider::new(
+            OpenAICompatConfig {
+                base_url: config.base_url.clone(),
+                chat_path: config.chat_path.clone(),
+                models_path: config.models_path.clone(),
+                retries: config.policy.inference_retries(),
+                timeout: config.policy.inference_timeout(),
+            },
+            frozen_auth.clone(),
+        )
+        .with_discovery_timeout(config.policy.advisory_discovery_timeout()),
+    );
+    let catalog = Arc::new(
+        OpenAICompatProvider::new(
+            OpenAICompatConfig {
+                base_url: config.base_url,
+                chat_path: config.chat_path,
+                models_path: config.models_path,
+                retries: config.policy.catalog_retries(),
+                timeout: config.policy.catalog_timeout(),
+            },
+            frozen_auth,
+        )
+        .with_discovery_timeout(config.policy.catalog_timeout()),
+    );
+    ProviderRouteSnapshot::initial(
+        config.declaration,
+        config.model,
+        config.auth_source,
+        config.policy,
+        inference,
+        catalog,
+    )
+    .map_err(Into::into)
+}
+
+/// Resolve auth once and construct a catalog-only generation. The resulting
+/// snapshot cannot be rebound for chat and therefore needs no placeholder
+/// model or unused inference runtime.
+pub fn build_openai_compatible_catalog_route(
+    config: OpenAICompatCatalogRouteConfig,
+    auth: &dyn AuthProvider,
+) -> Result<ProviderRouteSnapshot<OpenAICompatProvider>, OpenAICompatRouteBuildError> {
+    if config.models_path.is_empty() {
+        return Err(ProviderRouteContractError::EmptyCatalogPath.into());
+    }
+    let frozen_auth: Arc<dyn AuthProvider> = Arc::new(FrozenAuth::resolve(auth)?);
+    let catalog = Arc::new(
+        OpenAICompatProvider::new(
+            OpenAICompatConfig {
+                base_url: config.base_url,
+                chat_path: config.chat_path,
+                models_path: Some(config.models_path),
+                retries: config.policy.catalog_retries(),
+                timeout: config.policy.catalog_timeout(),
+            },
+            frozen_auth,
+        )
+        .with_discovery_timeout(config.policy.catalog_timeout()),
+    );
+    ProviderRouteSnapshot::initial_catalog_only(
+        config.declaration,
+        config.auth_source,
+        config.policy,
+        catalog,
+    )
+    .map_err(Into::into)
+}
+
 impl OpenAICompatProvider {
     /// Advisory background model metadata uses a deliberately short budget.
     const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -105,6 +227,46 @@ impl OpenAICompatProvider {
             Some((name, value)) => Ok(rb.header(name, value)),
             None => Ok(rb),
         }
+    }
+}
+
+impl ProviderRouteHandle<OpenAICompatProvider> {
+    /// Admit a full-budget catalog metadata lookup through the catalog runtime.
+    pub async fn model_context_length(&self, model: &str) -> Result<Option<u64>, ProviderError> {
+        let Some(runtime) = self.admit_optional_catalog_runtime()? else {
+            return Ok(None);
+        };
+        Ok(runtime.model_context_length(model).await)
+    }
+
+    /// Admit startup metadata discovery through the separately short-budgeted
+    /// inference runtime. Capability and generation checks are identical; only
+    /// the already frozen discovery/cache policy differs.
+    pub async fn advisory_model_context_length(
+        &self,
+        model: &str,
+    ) -> Result<Option<u64>, ProviderError> {
+        let Some(runtime) =
+            self.admit_optional_inference_runtime(crate::route::ProviderCapability::ModelCatalog)?
+        else {
+            return Ok(None);
+        };
+        Ok(runtime.model_context_length(model).await)
+    }
+}
+
+impl ProviderRouteCurrent<OpenAICompatProvider> {
+    pub async fn model_context_length(&self, model: &str) -> Result<Option<u64>, ProviderError> {
+        self.bind_model(model)?.model_context_length(model).await
+    }
+
+    pub async fn advisory_model_context_length(
+        &self,
+        model: &str,
+    ) -> Result<Option<u64>, ProviderError> {
+        self.bind_model(model)?
+            .advisory_model_context_length(model)
+            .await
     }
 }
 
@@ -723,416 +885,6 @@ async fn read_response_bounded(
         body.extend_from_slice(&chunk);
     }
     Ok(String::from_utf8_lossy(&body).into_owned())
-}
-
-/// A gateway-provided retry delay is useful, but it is still untrusted input.
-/// Capping it keeps one response from parking the client for an arbitrary time;
-/// the request-wide deadline below may impose an even smaller bound.
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-const MAX_RETRY_JITTER: Duration = Duration::from_millis(250);
-
-/// Parse either Retry-After form from RFC 9110: delay-seconds or an HTTP date.
-/// Numeric overflow is treated as a very large delay and therefore capped,
-/// rather than silently falling back to the much shorter exponential delay.
-fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
-    let value = value.trim();
-    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
-        let seconds = value
-            .parse::<u64>()
-            .unwrap_or(MAX_RETRY_DELAY.as_secs())
-            .min(MAX_RETRY_DELAY.as_secs());
-        return Some(Duration::from_secs(seconds));
-    }
-
-    let retry_at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
-    let now = chrono::DateTime::<chrono::Utc>::from(now);
-    let delay = retry_at
-        .with_timezone(&chrono::Utc)
-        .signed_duration_since(now)
-        .to_std()
-        .unwrap_or(Duration::ZERO);
-    Some(delay.min(MAX_RETRY_DELAY))
-}
-
-/// Exponential backoff for retry `attempt` (1-based): 200ms, 400ms, 800ms, …
-/// The shift exponent is clamped to 6 BEFORE shifting, so the multiplier maxes
-/// at 64 (~12.8s) and can never overflow regardless of how large `retries` is
-/// configured — avoids the panic the naive `1 << (attempt-1)` risked.
-fn backoff_delay(attempt: u32) -> Duration {
-    let exp = attempt.saturating_sub(1).min(6);
-    let mult = 1u64 << exp; // exp ≤ 6 ⇒ at most 64, never overflows
-    Duration::from_millis(200 * mult)
-}
-
-/// Add positive jitter without ever exceeding the retry-delay cap. The sample
-/// is an argument so the arithmetic is deterministic in unit tests.
-fn add_retry_jitter(delay: Duration, sample: u64) -> Duration {
-    let jitter_cap = (delay / 10).min(MAX_RETRY_JITTER);
-    if jitter_cap.is_zero() {
-        return delay.min(MAX_RETRY_DELAY);
-    }
-    // `jitter_cap` is at most 250ms, so this conversion cannot truncate.
-    let slots = jitter_cap.as_nanos() as u64 + 1;
-    let jitter = Duration::from_nanos(sample % slots);
-    delay.saturating_add(jitter).min(MAX_RETRY_DELAY)
-}
-
-/// Select a retry delay. The local backoff remains a floor, so a zero/past
-/// Retry-After cannot turn a failing gateway into a hot loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RetryDelayDecision {
-    delay: Duration,
-    retry_after_used: bool,
-}
-
-fn retry_delay_decision(
-    attempt: u32,
-    retry_after: Option<&reqwest::header::HeaderValue>,
-    now: SystemTime,
-    jitter_sample: u64,
-) -> RetryDelayDecision {
-    let advertised = retry_after
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| parse_retry_after(value, now));
-    let local = backoff_delay(attempt);
-    let retry_after_used = advertised.is_some_and(|delay| delay >= local);
-    RetryDelayDecision {
-        delay: add_retry_jitter(local.max(advertised.unwrap_or_default()), jitter_sample),
-        retry_after_used,
-    }
-}
-
-#[cfg(test)]
-fn retry_delay(
-    attempt: u32,
-    retry_after: Option<&reqwest::header::HeaderValue>,
-    now: SystemTime,
-    jitter_sample: u64,
-) -> Duration {
-    retry_delay_decision(attempt, retry_after, now, jitter_sample).delay
-}
-
-/// Cheap process-local entropy is sufficient for retry jitter: it is not a
-/// security primitive, only a way to keep concurrent clients from marching in
-/// lockstep after a shared transient gateway or rate-limit response.
-fn retry_jitter_sample(attempt: u32) -> u64 {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let clock = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|duration| u64::from(duration.subsec_nanos()))
-        .unwrap_or(0);
-    clock ^ counter.rotate_left(17) ^ u64::from(attempt).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-}
-
-fn remaining_request_time(started: tokio::time::Instant, timeout: Duration) -> Option<Duration> {
-    timeout
-        .checked_sub(started.elapsed())
-        .filter(|remaining| !remaining.is_zero())
-}
-
-fn duration_millis(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
-}
-
-fn remaining_deadline_millis(started: tokio::time::Instant, timeout: Duration) -> u64 {
-    remaining_request_time(started, timeout)
-        .map(duration_millis)
-        .unwrap_or(0)
-}
-
-fn status_category(status: StatusCode) -> ProviderAttemptCategory {
-    match status {
-        StatusCode::TOO_MANY_REQUESTS => ProviderAttemptCategory::RateLimited,
-        StatusCode::SERVICE_UNAVAILABLE => ProviderAttemptCategory::Unavailable,
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderAttemptCategory::Authentication,
-        status if status.is_success() => ProviderAttemptCategory::Success,
-        status if status.is_client_error() => ProviderAttemptCategory::ClientError,
-        status if status.is_server_error() => ProviderAttemptCategory::ServerError,
-        _ => ProviderAttemptCategory::UnexpectedStatus,
-    }
-}
-
-/// Is an HTTP response status a transient failure worth retrying within the
-/// inference budget? Rate limiting (429) and the transient gateway/proxy
-/// failures — 408 Request Timeout, 502 Bad Gateway, 503 Service Unavailable,
-/// 504 Gateway Timeout, Cloudflare's non-standard 520-524, and 529 Overloaded
-/// (used by some routers) — are the ones a
-/// hosted router raises when an upstream is momentarily slow or overloaded; a
-/// second attempt commonly succeeds. Everything else (a genuine 500 from bad
-/// input, any 4xx, an auth failure) is deterministic and must not be retried.
-/// A tool-heavy multi-round run through a busy router hits these often enough
-/// that treating them as terminal silently discards a long, productive turn.
-fn is_retryable_status(status: StatusCode) -> bool {
-    matches!(
-        status.as_u16(),
-        408 | 429 | 502 | 503 | 504 | 520 | 521 | 522 | 523 | 524 | 529
-    )
-}
-
-fn record_attempt(telemetry: Option<&ProviderTelemetrySink>, event: ProviderAttemptEvent) -> bool {
-    telemetry.map_or(true, |telemetry| telemetry.record(event))
-}
-
-/// Ensures an admitted physical send remains observable when its async future
-/// is dropped (for example by the CLI Ctrl+C race). Completed sends disarm the
-/// guard before their ordinary status/transport event is recorded.
-struct InFlightAttemptGuard {
-    telemetry: Option<ProviderTelemetrySink>,
-    attempt: u32,
-    max_attempts: u32,
-    started: tokio::time::Instant,
-    timeout: Duration,
-    armed: bool,
-}
-
-impl InFlightAttemptGuard {
-    fn new(
-        telemetry: Option<&ProviderTelemetrySink>,
-        attempt: u32,
-        max_attempts: u32,
-        started: tokio::time::Instant,
-        timeout: Duration,
-    ) -> Self {
-        Self {
-            telemetry: telemetry.cloned(),
-            attempt,
-            max_attempts,
-            started,
-            timeout,
-            armed: true,
-        }
-    }
-
-    fn completed(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for InFlightAttemptGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        record_attempt(
-            self.telemetry.as_ref(),
-            ProviderAttemptEvent {
-                attempt: self.attempt,
-                max_attempts: self.max_attempts,
-                category: ProviderAttemptCategory::Cancelled,
-                status: None,
-                outcome: ProviderAttemptOutcome::Cancelled,
-                terminal: true,
-                retry_delay_ms: None,
-                retry_after_used: false,
-                remaining_deadline_ms: remaining_deadline_millis(self.started, self.timeout),
-            },
-        );
-    }
-}
-
-/// Extends a successful physical send through its response-body lifecycle.
-/// A 2xx header is intentionally non-terminal: only a fully read and decoded
-/// body is success. Dropping an unconsumed/partially consumed stream records a
-/// terminal cancellation, while explicit failures disarm this guard after
-/// recording their precise bounded category.
-struct ResponseBodyAttemptGuard {
-    telemetry: Option<ProviderTelemetrySink>,
-    attempt: u32,
-    max_attempts: u32,
-    status: u16,
-    started: tokio::time::Instant,
-    timeout: Duration,
-    armed: bool,
-}
-
-impl ResponseBodyAttemptGuard {
-    fn new(
-        telemetry: Option<&ProviderTelemetrySink>,
-        attempt: u32,
-        max_attempts: u32,
-        status: u16,
-        started: tokio::time::Instant,
-        timeout: Duration,
-    ) -> Self {
-        Self {
-            telemetry: telemetry.cloned(),
-            attempt,
-            max_attempts,
-            status,
-            started,
-            timeout,
-            armed: true,
-        }
-    }
-
-    fn completed(mut self) {
-        self.record(
-            ProviderAttemptCategory::Success,
-            ProviderAttemptOutcome::BodyCompleted,
-        );
-        self.armed = false;
-    }
-
-    fn failed(mut self, error: &ProviderError) {
-        let category = match error {
-            ProviderError::Timeout => ProviderAttemptCategory::Timeout,
-            ProviderError::Connection(_) => ProviderAttemptCategory::Connection,
-            ProviderError::ResponseTooLarge { .. } => ProviderAttemptCategory::ResponseTooLarge,
-            _ => ProviderAttemptCategory::InvalidResponse,
-        };
-        self.record(category, ProviderAttemptOutcome::BodyFailed);
-        self.armed = false;
-    }
-
-    fn record(&self, category: ProviderAttemptCategory, outcome: ProviderAttemptOutcome) {
-        record_attempt(
-            self.telemetry.as_ref(),
-            ProviderAttemptEvent {
-                attempt: self.attempt,
-                max_attempts: self.max_attempts,
-                category,
-                status: Some(self.status),
-                outcome,
-                terminal: true,
-                retry_delay_ms: None,
-                retry_after_used: false,
-                remaining_deadline_ms: remaining_deadline_millis(self.started, self.timeout),
-            },
-        );
-    }
-}
-
-impl Drop for ResponseBodyAttemptGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        self.record(
-            ProviderAttemptCategory::Cancelled,
-            ProviderAttemptOutcome::Cancelled,
-        );
-    }
-}
-
-/// Keeps a nonterminal `RetryScheduled` disposition observable if the caller
-/// cancels while waiting to start the next physical attempt. This guard is only
-/// installed after a retry event with `terminal=false`; paths which already
-/// emitted `DeadlineExceeded` must not install it or they would double-report a
-/// terminal disposition.
-struct RetryBackoffAttemptGuard {
-    telemetry: Option<ProviderTelemetrySink>,
-    attempt: u32,
-    max_attempts: u32,
-    started: tokio::time::Instant,
-    timeout: Duration,
-    armed: bool,
-}
-
-impl RetryBackoffAttemptGuard {
-    fn new(
-        telemetry: Option<&ProviderTelemetrySink>,
-        attempt: u32,
-        max_attempts: u32,
-        started: tokio::time::Instant,
-        timeout: Duration,
-    ) -> Self {
-        Self {
-            telemetry: telemetry.cloned(),
-            attempt,
-            max_attempts,
-            started,
-            timeout,
-            armed: true,
-        }
-    }
-
-    fn completed(mut self) {
-        self.armed = false;
-    }
-
-    fn deadline_exceeded(mut self) {
-        self.record(
-            ProviderAttemptCategory::Timeout,
-            ProviderAttemptOutcome::DeadlineExceeded,
-        );
-        self.armed = false;
-    }
-
-    fn record(&self, category: ProviderAttemptCategory, outcome: ProviderAttemptOutcome) {
-        record_attempt(
-            self.telemetry.as_ref(),
-            ProviderAttemptEvent {
-                attempt: self.attempt,
-                max_attempts: self.max_attempts,
-                category,
-                // The next attempt was scheduled but no HTTP response exists.
-                status: None,
-                outcome,
-                terminal: true,
-                retry_delay_ms: None,
-                retry_after_used: false,
-                remaining_deadline_ms: remaining_deadline_millis(self.started, self.timeout),
-            },
-        );
-    }
-}
-
-impl Drop for RetryBackoffAttemptGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        self.record(
-            ProviderAttemptCategory::Cancelled,
-            ProviderAttemptOutcome::Cancelled,
-        );
-    }
-}
-
-/// Sleep only while the total request budget permits. If the requested delay
-/// reaches the deadline, return Timeout instead of starting a doomed attempt.
-async fn sleep_before_retry(
-    started: tokio::time::Instant,
-    timeout: Duration,
-    delay: Duration,
-) -> Result<(), ProviderError> {
-    let remaining = remaining_request_time(started, timeout).ok_or(ProviderError::Timeout)?;
-    if delay >= remaining {
-        tokio::time::sleep(remaining).await;
-        return Err(ProviderError::Timeout);
-    }
-    tokio::time::sleep(delay).await;
-    Ok(())
-}
-
-/// Wait after a nonterminal retry disposition while preserving exactly one
-/// later terminal disposition if the wait is cancelled or loses the deadline.
-async fn sleep_before_retry_observed(
-    started: tokio::time::Instant,
-    timeout: Duration,
-    delay: Duration,
-    guard: RetryBackoffAttemptGuard,
-) -> Result<(), ProviderError> {
-    match sleep_before_retry(started, timeout, delay).await {
-        Ok(()) => {
-            // A timer may wake late under scheduler pressure. Recheck before
-            // disarming the only guard for the scheduled attempt; otherwise
-            // the loop's next admission check could return a bare Timeout with
-            // no terminal disposition.
-            if remaining_request_time(started, timeout).is_some() {
-                guard.completed();
-                Ok(())
-            } else {
-                guard.deadline_exceeded();
-                Err(ProviderError::Timeout)
-            }
-        }
-        Err(error) => {
-            guard.deadline_exceeded();
-            Err(error)
-        }
-    }
 }
 
 fn finish_sse(

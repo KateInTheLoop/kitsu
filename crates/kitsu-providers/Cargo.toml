@@ -16,6 +16,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 zeroize = { workspace = true }
+ring = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }

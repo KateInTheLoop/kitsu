@@ -129,7 +129,8 @@ A **gateway profile** is a named block in the config describing one endpoint:
 
 ```toml
 [gateways.myprofile]
-flavor      = "openai"                       # wire protocol (openai chat/completions)
+flavor      = "openai"                       # compatibility/diagnostic label
+adapter     = "compatible-chat"              # optional; this is the wire selector
 base_url    = "https://host.example.com"     # scheme + host (+ optional port)
 chat_path   = "/v1/chat/completions"         # appended to base_url for chat
 models_path = "/v1/models"                   # optional; endpoint's model list
@@ -155,14 +156,22 @@ shell. The complete precedence is:
 3. `KITSU_GATEWAY` / `KITSU_MODEL`
 4. `default_gateway` / the selected profile's `model`
 
+`adapter` is a closed compiled choice: `compatible-chat` (the default when the
+field is omitted) or `anthropic-messages`. `flavor` never silently changes the
+wire, so existing profiles keep their current compatible-Chat behavior.
+Messages requires a `max_tokens` wire field; when `--max-output-tokens` is not
+set, that adapter uses Kitsu's bounded 4,096-token default. An explicit value
+is preserved, while explicit zero is rejected before any request.
+
 For example:
 
 ```bash
 kitsu --gateway huggingface --model "deepseek-ai/DeepSeek-V3:together" ask "hi"
 ```
 
-That's the whole model. Adding a new provider is just adding a block — no code
-changes, nothing baked into the binary.
+Adding another profile for either compiled adapter is just adding a block.
+Adding a genuinely different wire dialect requires a compiled Kitsu adapter
+and the shared conformance suite; configuration cannot load provider code.
 
 ---
 
@@ -187,7 +196,10 @@ reports config lookup and parse status, selected gateway/model,
 credential-variable presence (never its value), context/cache provenance,
 project context, runtime-state writability, and tool policy without changing
 state or contacting a provider. It also reports the effective automatic-artifact
-policy. Add `doctor --online` to opt into a
+policy. Offline doctor explicitly reports that no provider route was
+constructed. An opted-in provider check adds the bounded, secret-free compiled
+adapter/profile/generation/wire/capability/policy receipt for the route it
+actually binds. Add `doctor --online` to opt into a
 model-catalog reachability request. That check does not call the chat route or
 prove that the credential can run inference; the human and JSON reports label
 this scope explicitly. Use `doctor --inference` instead to send exactly one
@@ -447,17 +459,17 @@ kitsu --gateway openai ask "hi"
 
 ### Anthropic
 
-Anthropic hosts an OpenAI-compatible endpoint, so kitsu talks to it with no
-special handling.
+Use Kitsu's compiled native Messages adapter explicitly:
 
 ```toml
 [gateways.anthropic]
-flavor      = "openai"
+flavor      = "anthropic"
+adapter     = "anthropic-messages"
 base_url    = "https://api.anthropic.com"
-chat_path   = "/v1/chat/completions"
-models_path = "/v1/models"
+chat_path   = "/v1/messages"
+models_path = ""
 model       = "claude-opus-4-8"
-auth        = { method = "bearer-env", env = "ANTHROPIC_API_KEY", expires_env = "" }
+auth        = { method = "bearer-env", env = "ANTHROPIC_API_KEY", header = "x-api-key", scheme = "", expires_env = "" }
 ```
 
 ```bash
@@ -468,7 +480,8 @@ kitsu --gateway anthropic ask --max-output-tokens 1024 "hi"
 - Requires a **developer API key** (`sk-ant-…`). A claude.ai Pro/Max
   **subscription** login does *not* grant API access — it's a separate system.
 - Anthropic's endpoint requires a `max_tokens`, so pass `--max-output-tokens N`
-  or the request may be rejected.
+  for ordinary chat. This adapter is streaming-only and does not expose model
+  catalog, structured-output, image-input, or prompt-cache capabilities yet.
 
 ---
 
@@ -833,7 +846,7 @@ Slash commands inside the REPL:
 | `/model <name>` | Switch model (keeps history). |
 | `/models [filter]` | Preview the models the gateway offers (from its `models_path`), optionally filtered by a substring — e.g. `/models qwen`. The active model is pinned and marked; large catalogs show 12 rows plus a narrowing hint. Listed IDs can be passed to `/model`. |
 | `/reasoning [none\|minimal\|low\|medium\|high\|xhigh\|default]` | Show or change reasoning effort for subsequent turns. |
-| `/status` | Show the active gateway/model, directory, context usage, enabled tools, permissions, background agents, and cumulative/last compaction details. |
+| `/status` | Show the active gateway/model and immutable provider adapter/profile/generation/wire/capability/policy receipt, plus directory, context usage, enabled tools, permissions, background agents, and cumulative/last compaction details. |
 | `/diff [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Show bounded host-verified evidence for an explicit scope. Host-owned: needs no read grant, and the bytes never leave your terminal. |
 | `/review [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Review exactly that verified evidence in a no-tools turn. Discloses one bounded diff to the model without granting a read root. The top-level `kitsu review` provides the noninteractive form. |
 | `/checkpoints` / `/checkpoint <id>` | List recoverable write checkpoints or preview one verified diff. |
@@ -940,7 +953,10 @@ mid-answer in a one-shot run closes it as `committed_partial` (kept, marked,
 still exit `2`). A
 `context_window_mismatch` event reports runtime evidence that the server's
 real context window is smaller than the resolved one. `run_started`
-distinguishes disabled, pending, and
+includes the complete bounded provider-route receipt used at run start; each
+`provider_attempt.route_generation` can therefore be correlated to that
+immutable identity without exposing an endpoint, header, credential, or body.
+It also distinguishes disabled, pending, and
 resumable session snapshots; `final_summary` repeats the terminal state and
 returns a non-null session ID only for an installed, resumable snapshot.
 Top-level `kitsu review --jsonl` also emits one `review_disclosure` between
