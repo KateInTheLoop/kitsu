@@ -7,6 +7,10 @@ pub mod context;
 pub mod orchestrator;
 pub mod run;
 pub mod session;
+pub mod session_telemetry;
+
+#[cfg(test)]
+mod session_telemetry_tests;
 
 pub use context::{ContextBreakdown, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
 pub use kitsu_providers::ReasoningEffort;
@@ -16,7 +20,8 @@ pub use orchestrator::{
     ArtifactStoragePolicy, BoundedInlineOutput, CommandRuntimeInvocation, CommandRuntimeResult,
     CompactionLedger, CompactionMode, CompactionOutcome, CompactionReason, CompactionRecord,
     CompactionReport, ContextUnit, ContextWindowEvidence, ProviderDeadlineScope,
-    ProviderRequestPurpose, RunTallies, SpawnBudget, StructuredFinalizationGate,
+    ProviderRequestPurpose, ProviderUsageCoverageSnapshot, RunProviderUsageCoverageSnapshot,
+    RunTallies, RunUsageSnapshot, SpawnBudget, StructuredFinalizationGate,
     StructuredFinalizationRepair, StructuredFinalizationRepairTarget, SummaryFallbackReason,
     ToolArtifactStatus, TurnCompletion,
 };
@@ -32,4 +37,12 @@ pub use session::{
     SessionCommitReceipt, SessionHistoryError, SessionId, SessionIdentityError,
     SessionIdentityKind, SessionIdentityViolation, SessionLookupState, SessionLookupStateError,
     SessionOutcomeClass, StoreId, TurnId, MAX_CANONICAL_OPERATIONS, SESSION_CONTRACT_REVISION,
+};
+pub use session_telemetry::{
+    ActiveProviderRouteSnapshot, ContextSnapshot, ContextSnapshotInput, ContextSourcesSnapshot,
+    ContextSourcesSnapshotInput, ContextWindowSource, CurrencyAmount, CurrentSessionSnapshot,
+    CurrentSessionSnapshotInput, EffectiveAuthorityInput, EffectiveAuthorityMode,
+    EffectiveAuthoritySnapshot, SessionCostInput, SessionUsageInput, StatusSnapshot,
+    TelemetryProvenance, TelemetryValue, TruthClass, UsageSnapshot,
+    CURRENT_SESSION_SNAPSHOT_REVISION,
 };

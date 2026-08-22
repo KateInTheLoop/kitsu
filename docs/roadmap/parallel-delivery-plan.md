@@ -1,18 +1,23 @@
-# Parallel delivery after Cycle 100
+# Parallel delivery after Cycle 118
 
-Status: approved launch topology from the accepted Cycle 100 checkpoint.
+Status: the first post-118 wave plus Cycles 126-133 are accepted on
+`improvements/post-118`. Cycle 129 required one additional acceptance-repair
+commit after a clean parallel run exposed a real quarantine timestamp and
+result-classification defect. The active implementation card is Cycle 134's
+default-disabled external-source declaration and exact grant-admission seam.
 
 ## Objective
 
 Parallelize evidence, fixtures, and narrow mechanisms without weakening Kitsu's
 authority boundaries or turning the roadmap into several competing histories.
-`improvements/harness-roadmap` remains the accepted integration line. Candidate
-branches may build and review in parallel, but only a green squash/integration
-commit receives the next sequential cycle receipt.
+`improvements/post-118` is the next integration line. The pushed
+`improvements/e06-integration` branch remains the immutable review checkpoint.
+Candidate branches may build and review in parallel, but only a green
+integration commit receives the next sequential cycle receipt.
 
 ## Branch and receipt rules
 
-1. Every candidate branch starts from the exact accepted Cycle 100 commit in a
+1. Every candidate branch starts from the exact accepted Cycle 118 commit in a
    separate linked worktree. The original dirty `main` worktree is never used.
 2. A packet owns a bounded file set, requirements, red test, implementation,
    review notes, acceptance commands, rollback, and one draft commit. Draft
@@ -28,23 +33,27 @@ commit receives the next sequential cycle receipt.
 5. A failing packet is reshaped or discarded. It never blocks another lane and
    never earns a cycle number merely because implementation time was spent.
 
-## Immediate E06 split
+## Active post-118 wave
 
-The first launch focuses on the highest-priority missing spine and uses three
-independent packets before product composition.
+Seven dependency-ordered packets run in this wave. They advance a proven owner or
+presentation seam by one bounded step and deliberately stop before product-wide
+composition.
 
 | Candidate branch | Packets | Owned outcome | Gate before integration |
 |---|---|---|---|
-| `improvements/e06-inventory` | P01-P03 | Frozen per-request builtin inventory; source/incarnation/revision/fingerprint identity; pre-publication authority request | Static parity, collision, mutation, withdrawal, subagent intersection, and zero-provider fixtures |
-| `improvements/e06-supervisor` | P04-P06 | Private long-lived child lifecycle owner over Kitsu's existing containment; admitted absolute executable identity; bounded pipes/cancel/reap | `X002-ADMIT-0`, block/flood/descendant/crash/EOF/timeout/drop fixtures, and unchanged one-shot command containment |
-| `improvements/e06-mcp-codec` | P07-P09 | Provider-free bounded JSON-RPC framing and tools-only initialize/list/call state machine | Fragmentation, oversize, malformed/duplicate/late response, deadline, cancellation, and zero ambient capability fixtures |
-| `improvements/e06-integration` | P10+ | Disabled-by-default pinned echo child, atomic inventory publication/withdrawal, required/optional receipts | `PF-06`, `PF-07`, crash/no-replay, descendant reap, offline doctor no-spawn, and full workspace gates |
+| `improvements/e06-serial-transport` | E06-S01-C7 | Retain one sealed/authorized child owner across multiple strictly serial bounded frames | One in-flight request, line/idle deadlines, EOF/crash refusal, cancellation/reap, residue, and unchanged Cycle118 containment |
+| `improvements/e05-local-coordinator` | E05-S01-C3 | Compose the pure transaction with real create-new publication for the credential-free local path | Exact fences/receipts, no parent/overwrite, rollback, cancellation/collision cuts, and zero provider/credential/UI effects |
+| `improvements/e08-context-window` | E08-S05-C6 | Mount exact offline `/context window` from one typed current observation | Bare/refresh compatibility, width/accessibility matrix, redirected output, exact syntax, zero sends, and honest JSONL nonclaim |
+| `improvements/e07-selector-experiment` | E07-S01-C2 | Compare one pure deterministic structural selector with the frozen current-tool baseline | Same corpus/rubric/budgets, byte-repeatability, denied/stale nonclaims, and an explicit promote-or-reject result |
+| `improvements/e05-model-picker` | E05-S02-C1 | Stage one pure offline-capable model picker over an immutable provenance-bearing catalog snapshot | Bounded normalization/dedupe/filter/ranking, unavailable/stale/offline truth, narrow projection, no effects, and no inferred capabilities |
+| `improvements/e08-usage-aliases` | E08-S05-C7 | Add truthful compatibility aliases over the typed current-session usage observation | Bare/session parity, legacy `/cost` compatibility decision, zero external effects, exact syntax, and honest JSONL behavior |
+| `improvements/e07-authority-evidence` | E07-S01-C3 | Measure selector behavior under denied, symlinked, revoked, and source-changed evidence | Existing permission/tool APIs, deterministic artifact, no stale/cache leak, and an explicit pass/reject result |
 
-Authority admission precedes executable discovery and spawn. An executable is
-identified by an admitted absolute path plus content digest; display names are
-never authority. EOF, crash, cancellation, reload, and shutdown withdraw the
-whole source generation atomically and join or report bounded residue. MCP is
-limited to local stdio `initialize`, `tools/list`, and `tools/call`; resources,
+E06 authority admission still precedes every observation and spawn. Cycle 118
+now executes the exact capped sealed native bytes and binds explicit Landlock
+content roots; display names and path re-opens are never authority. The serial
+packet must preserve that proof and may not yet compose MCP. MCP remains limited
+to future local stdio `initialize`, `tools/list`, and `tools/call`; resources,
 prompts, sampling, HTTP, package installation, and executable discovery remain
 out of scope.
 
@@ -61,19 +70,65 @@ owning spine has not published.
 | `improvements/e05-onboarding` | Pure no-clobber transaction model, offline catalog cache fixtures, picker ranking and narrow-terminal views | Credential/config publication and live switching remain integration-owned |
 | `improvements/e09-multimodal-evidence` | Threat contract and hostile PNG/JPEG corpus only | Product bytes wait for two truthful image-capable provider paths and demand evidence |
 
-The initial safe overlap contains 23 bounded cards: four telemetry foundations,
-eight semantic benchmark/selector cards, eight onboarding transaction/picker
-cards, and three multimodal evidence cards. This is capacity, not a promise to
-promote all four features.
+The remaining safe overlap still contains semantic-selector comparisons,
+onboarding picker/UI cards, telemetry aliases/automation/history, and
+multimodal evidence. This is capacity, not a promise to promote a mechanism
+without its measured gate.
 
 ## Merge order and conflict control
 
-E06 integrates inventory identity first, supervisor admission/lifecycle second,
-codec third, then the disabled echo composition. Telemetry DTOs, semantic
-benchmarks, and onboarding transaction values can integrate between those cards
-when their file ownership is disjoint. No more than one integration commit is
-prepared at a time; every accepted commit rebases the remaining candidates and
-runs their focused gates again.
+The current merge order is E06 serial ownership, E05 local coordinator, E08
+context-window presentation, the E07 measured selector result, the pure E05
+model-picker result, then the dependent E08 alias and E07 authority/staleness
+cards, unless review exposes a dependency or shared-file conflict.
+MCP codec/backend composition follows only after serial ownership is accepted.
+Guided UI and model-picker effect integration follow only after the local
+coordinator and pure picker are accepted. No more than one integration commit is
+prepared at a time; every accepted commit rebases or cherry-picks the remaining
+candidates and reruns their focused gates plus the final workspace gate.
+
+That seven-packet order is now accepted through Cycle 125. The next parallel
+wave keeps the same serialized integration rule: E06 composes the pinned
+tools-only codec with the accepted serial owner privately, while E08 may add an
+offline coarse context-source deck whose unsupported buckets remain explicitly
+unavailable. Neither packet may mount an external tool, invent an automation
+payload, or consume an unowned provider, account, filesystem, or persistence
+truth.
+
+Cycle 128 promotes only the measured selector mechanism into a compiled,
+unmounted read-only contributor. Current authorized reads reconstruct every
+emitted line and current definition/reference classification after ranking;
+the frozen 5-to-3-round and 1,456-to-1,134-byte result remains unchanged. A
+later product mount still requires explicit trigger/root ownership,
+cancellation/deadlines, context accounting, and canonical projection rules.
+Cycle 129 first hardens test-only publication fault injection so parallel
+acceptance cannot be misclassified by a stale thread-local fault or hook left
+after an early return or unwind. A completely clean full-suite run then exposed
+a distinct production rollback defect: Kitsu's own quarantine rename changed
+ctime and a pathname result could be misclassified as displaced. The repair
+retains a nonblocking advisory Kitsu-writer lock on the pinned parent, exact
+receipt-fd/name classification, and a strict post-rename baseline. It does not
+claim a Linux conditional unlink primitive or containment of non-cooperating
+same-UID writers; a private transaction-directory/authority mechanism remains
+a separate future card.
+
+Cycle 130 proves the existing private MCP composition against one real sealed
+test-only peer without mounting inventory or configuration. Cycle 131 adds the
+exact profile/compiled-adapter/wire namespace value required before a model
+proposal can be consumed. Cycle 132 composes only an explicit namespace-equal
+proposal with the private local setup coordinator and retains its truth through
+recovery without adding UI, catalog/network access, credentials, activation,
+or product routing. Cycle 133 binds the real-peer owner to exact atomic
+inventory identity and one no-replay echo handler while remaining unmounted.
+That owner accepts exactly one non-paginated descriptor matching the compiled
+echo schema, publishes only host-authored source/incarnation/revision/tool
+identity, and requires both host and caller identity/fingerprint grants. A
+possibly accepted call never retries; withdrawal precedes cleanup or Drop, and
+response evidence is not success until the child shuts down cleanly. Grant
+constructors remain test-only.
+Cycle 134 may now stage only the default-disabled source declaration and exact
+host/caller grant admission required by a later product mount; it must still
+perform no discovery, acquisition, spawn, registry mutation, or provider send.
 
 The integration review rejects name-only identities, ambient runtime loading,
 implicit install/update/discovery, remembered cross-session authority,
@@ -82,8 +137,10 @@ file tail treated as canonical HEAD.
 
 ## Checkpoint and acceleration measure
 
-Cycle 100 is the stable review base. Parallel work accelerates discovery and
-implementation latency, while serialized acceptance preserves bisectability and
-one truthful roadmap. Progress is measured by accepted gates and integrated
-packets—not by multiplying the estimated gate matrix into hundreds of supposed
-features.
+Cycle 118 is the stable pushed review base and `improvements/post-118` is the
+clean next integration branch through Cycle 133. Parallel work accelerates
+discovery and implementation latency, while serialized acceptance preserves
+bisectability and one truthful roadmap. Numbered cycles, integration commits,
+tests, and replaceability gates are reported separately: Cycle 129 legitimately
+has one extra repair commit. Progress is measured by accepted outcomes—not by
+multiplying the estimated gate matrix into hundreds of supposed features.

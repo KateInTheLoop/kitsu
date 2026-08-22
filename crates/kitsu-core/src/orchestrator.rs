@@ -52,7 +52,7 @@ use kitsu_providers::{
 use kitsu_tools::{
     scope_command_progress, CommandAmbientAuthority, CommandExecArgs, CommandExecutableIdentity,
     CommandExecutableResolution, CommandOutput, CommandOutputArtifact, CommandProgressSink,
-    CommandTermination, Registry,
+    CommandTermination, Registry, ToolInventory,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -619,32 +619,43 @@ fn provider_telemetry_sink(
     round: u32,
     purpose: ProviderRequestPurpose,
     turn_deadline: Option<tokio::time::Instant>,
+    usage_tracker: Option<ProviderResponseUsageTracker>,
 ) -> Option<ProviderTelemetrySink> {
-    log.map(|log| {
-        let log = log.clone();
-        ProviderTelemetrySink::with_fallible_context_observer(move |observation| {
+    if log.is_none() && usage_tracker.is_none() {
+        return None;
+    }
+    let log = log.cloned();
+    Some(ProviderTelemetrySink::with_fallible_context_observer(
+        move |observation| {
             let event = observation.event;
-            log.record(AgentRuntimeEvent::ProviderAttempt {
-                round,
-                purpose,
-                route_generation: observation
-                    .route_generation
-                    .map(|generation| generation.get()),
-                attempt: event.attempt,
-                max_attempts: event.max_attempts,
-                category: event.category,
-                status: event.status,
-                outcome: event.outcome,
-                terminal: event.terminal,
-                retry_delay_ms: event.retry_delay_ms,
-                retry_after_used: event.retry_after_used,
-                deadline_scope: ProviderDeadlineScope::ProviderRequest,
-                remaining_deadline_ms: event.remaining_deadline_ms,
-                turn_remaining_ms: remaining_turn_millis(turn_deadline),
-            });
-            !log.abort_requested()
-        })
-    })
+            if let Some(tracker) = &usage_tracker {
+                tracker.observe_attempt(&event);
+            }
+            if let Some(log) = &log {
+                log.record(AgentRuntimeEvent::ProviderAttempt {
+                    round,
+                    purpose,
+                    route_generation: observation
+                        .route_generation
+                        .map(|generation| generation.get()),
+                    attempt: event.attempt,
+                    max_attempts: event.max_attempts,
+                    category: event.category,
+                    status: event.status,
+                    outcome: event.outcome,
+                    terminal: event.terminal,
+                    retry_delay_ms: event.retry_delay_ms,
+                    retry_after_used: event.retry_after_used,
+                    deadline_scope: ProviderDeadlineScope::ProviderRequest,
+                    remaining_deadline_ms: event.remaining_deadline_ms,
+                    turn_remaining_ms: remaining_turn_millis(turn_deadline),
+                });
+                !log.abort_requested()
+            } else {
+                true
+            }
+        },
+    ))
 }
 
 fn remaining_turn_millis(deadline: Option<tokio::time::Instant>) -> Option<u64> {
@@ -1492,19 +1503,23 @@ where
         let is_final_round = (round == cfg.max_rounds && cfg.max_rounds > 1)
             || force_final_next
             || force_structured_final_next;
+        // Freeze schemas and handler identities together for this provider
+        // request. The response must resolve every structured or recovered call
+        // through this exact inventory, never a later registry view.
+        let request_inventory = tools.inventory();
         let offered_tools = if is_final_round {
             None
         } else if spawn_tools_withheld {
-            tool_descriptors(tools).map(|descriptors| {
+            tool_descriptors(&request_inventory).map(|descriptors| {
                 descriptors
                     .into_iter()
                     .filter(|descriptor| !descriptor.name.starts_with("spawn_agent"))
                     .collect::<Vec<_>>()
             })
         } else {
-            tool_descriptors(tools)
+            tool_descriptors(&request_inventory)
         };
-        if is_final_round && tool_descriptors(tools).is_some() {
+        if is_final_round && tool_descriptors(&request_inventory).is_some() {
             let nudge = if force_structured_final_next {
                 STRUCTURED_FINALIZATION_NUDGE
             } else if force_final_next {
@@ -1669,6 +1684,13 @@ where
             Some(kitsu_render::Spinner::start())
         };
 
+        let usage_tracker = cfg.run_tallies.as_ref().map(|tallies| {
+            ProviderResponseUsageTracker::new(
+                std::sync::Arc::clone(tallies),
+                ProviderRequestPurpose::Inference,
+            )
+        });
+
         // 401/403 surface here (or as the first stream item) as a hard error.
         let stream_result = provider
             .chat_stream_with_telemetry(
@@ -1678,6 +1700,7 @@ where
                     round,
                     ProviderRequestPurpose::Inference,
                     cfg.turn_deadline,
+                    usage_tracker.clone(),
                 ),
             )
             .await;
@@ -1718,6 +1741,9 @@ where
                 }
                 ChatDelta::ToolCall(tc) => tool_calls.push(tc),
                 ChatDelta::Usage(u) => {
+                    if let Some(tracker) = &usage_tracker {
+                        tracker.record_reported(u);
+                    }
                     // Anchor the meter on this response's real prompt token
                     // count. `request_constraints_present` records whether THIS
                     // request included tool and/or response schemas, so a later
@@ -1782,6 +1808,9 @@ where
                 ChatDelta::Done(reason) => finish = reason,
             }
         }
+        if let Some(tracker) = &usage_tracker {
+            tracker.record_completed();
+        }
 
         if cfg.defer_response_format_until_final && !tools_were_offered && !tool_calls.is_empty() {
             return Err(AgentError::ToolCallDuringToolFreeFinalization);
@@ -1795,7 +1824,8 @@ where
         let mut malformed_text_calls = 0usize;
         let mut skill_confusion: Option<String> = None;
         if tool_calls.is_empty() && tools_were_offered {
-            let recovered = parse_text_tool_calls(&assistant_text, tools, &cfg.skill_names);
+            let recovered =
+                parse_text_tool_calls(&assistant_text, &request_inventory, &cfg.skill_names);
             if !recovered.calls.is_empty() {
                 tracing::debug!(
                     count = recovered.calls.len(),
@@ -2043,10 +2073,13 @@ where
             } else {
                 match tool_event.command_progress_sink() {
                     Some(sink) => {
-                        scope_command_progress(sink, tools.run(&tc.tool_name, tc.args.clone()))
-                            .await
+                        scope_command_progress(
+                            sink,
+                            request_inventory.run(&tc.tool_name, tc.args.clone()),
+                        )
+                        .await
                     }
-                    None => tools.run(&tc.tool_name, tc.args.clone()).await,
+                    None => request_inventory.run(&tc.tool_name, tc.args.clone()).await,
                 }
             };
             let (content, is_err) = match tool_result {
@@ -2152,7 +2185,7 @@ where
                     is_err,
                     window_evidence: *window_evidence,
                 },
-                tools,
+                &request_inventory,
                 messages,
                 cfg,
             );
@@ -2180,7 +2213,32 @@ where
 /// Build the tool descriptor list advertised to the model. Tools registered
 /// with a descriptor are surfaced; an empty set means no `tools` field is sent
 /// at all (`None`), preserving the descriptor-free `ask` path.
-fn tool_descriptors(tools: &Registry) -> Option<Vec<kitsu_providers::ToolDescriptor>> {
+trait ToolCatalog {
+    fn descriptors(&self) -> &[ToolDescriptor];
+    fn is_registered(&self, name: &str) -> bool;
+}
+
+impl ToolCatalog for Registry {
+    fn descriptors(&self) -> &[ToolDescriptor] {
+        self.descriptors()
+    }
+
+    fn is_registered(&self, name: &str) -> bool {
+        self.is_registered(name)
+    }
+}
+
+impl ToolCatalog for ToolInventory {
+    fn descriptors(&self) -> &[ToolDescriptor] {
+        self.descriptors()
+    }
+
+    fn is_registered(&self, name: &str) -> bool {
+        self.is_registered(name)
+    }
+}
+
+fn tool_descriptors(tools: &impl ToolCatalog) -> Option<Vec<kitsu_providers::ToolDescriptor>> {
     let d = tools.descriptors();
     if d.is_empty() {
         None
@@ -2240,7 +2298,11 @@ fn relax_json_escapes(candidate: &str) -> String {
     out
 }
 
-fn parse_text_tool_calls(text: &str, tools: &Registry, skill_names: &[String]) -> TextToolRecovery {
+fn parse_text_tool_calls(
+    text: &str,
+    tools: &impl ToolCatalog,
+    skill_names: &[String],
+) -> TextToolRecovery {
     let descriptors = tools.descriptors();
     let mut calls = Vec::new();
     let mut malformed = 0usize;
@@ -3625,6 +3687,12 @@ where
                         });
                     }
                     abort_if_event_sink_failed(cfg)?;
+                    let usage_tracker = cfg.run_tallies.as_ref().map(|tallies| {
+                        ProviderResponseUsageTracker::new(
+                            std::sync::Arc::clone(tallies),
+                            ProviderRequestPurpose::Compaction,
+                        )
+                    });
                     let collection = collect_text(
                         provider,
                         req,
@@ -3633,7 +3701,9 @@ where
                             round,
                             ProviderRequestPurpose::Compaction,
                             cfg.turn_deadline,
+                            usage_tracker.clone(),
                         ),
+                        usage_tracker,
                     )
                     .await;
                     abort_if_event_sink_failed(cfg)?;
@@ -3746,6 +3816,7 @@ async fn collect_text<P: Provider>(
     provider: &P,
     req: ChatRequest,
     telemetry: Option<ProviderTelemetrySink>,
+    usage_tracker: Option<ProviderResponseUsageTracker>,
 ) -> SummaryTextCollection {
     let mut stream = match provider.chat_stream_with_telemetry(req, telemetry).await {
         Ok(stream) => stream,
@@ -3763,7 +3834,12 @@ async fn collect_text<P: Provider>(
     while let Some(item) = stream.next().await {
         match item {
             Ok(ChatDelta::Text(t)) => text.push_str(&t),
-            Ok(ChatDelta::Usage(u)) => usage = Some(u),
+            Ok(ChatDelta::Usage(u)) => {
+                if let Some(tracker) = &usage_tracker {
+                    tracker.record_reported(u);
+                }
+                usage = Some(u);
+            }
             Ok(ChatDelta::Done(reason)) => finish = Some(reason),
             Ok(ChatDelta::ToolCall(_)) => unexpected_tool_call = true,
             Err(_) => {
@@ -3773,6 +3849,9 @@ async fn collect_text<P: Provider>(
                 };
             }
         }
+    }
+    if let Some(tracker) = &usage_tracker {
+        tracker.record_completed();
     }
     if unexpected_tool_call || finish != Some(FinishReason::Stop) {
         SummaryTextCollection::Failed {
@@ -3869,6 +3948,98 @@ const OFFLOAD_PREVIEW_CHARS: usize = 500;
 /// subagent (one Arc, like the spawn budget), so end-of-run receipts count
 /// delegated work too: successful reads, denied tool calls, failed tool
 /// calls (denied is a subset of failed).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderUsageCoverageSnapshot {
+    pub responses_reporting_usage: u64,
+    pub responses_missing_usage: u64,
+    /// `None` means no response itemized cached prompt tokens. `Some(0)` is
+    /// retained when the provider explicitly supplied a zero cache count.
+    pub cached_prompt_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunProviderUsageCoverageSnapshot {
+    pub all: ProviderUsageCoverageSnapshot,
+    pub inference: ProviderUsageCoverageSnapshot,
+    pub compaction: ProviderUsageCoverageSnapshot,
+    pub model_catalog: ProviderUsageCoverageSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunUsageSnapshot {
+    pub turns: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub coverage: RunProviderUsageCoverageSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProviderUsageCoverageTallies {
+    responses_reporting_usage: u64,
+    responses_missing_usage: u64,
+    cached_prompt_tokens: Option<u64>,
+}
+
+impl ProviderUsageCoverageTallies {
+    fn record(&mut self, usage: Option<kitsu_providers::Usage>) {
+        match usage {
+            Some(usage) => {
+                self.responses_reporting_usage = self.responses_reporting_usage.saturating_add(1);
+                if let Some(cached) = usage
+                    .prompt_tokens_details
+                    .and_then(|details| details.cached_tokens)
+                {
+                    self.cached_prompt_tokens = Some(
+                        self.cached_prompt_tokens
+                            .unwrap_or(0)
+                            .saturating_add(cached),
+                    );
+                }
+            }
+            None => {
+                self.responses_missing_usage = self.responses_missing_usage.saturating_add(1);
+            }
+        }
+    }
+
+    fn snapshot(self) -> ProviderUsageCoverageSnapshot {
+        ProviderUsageCoverageSnapshot {
+            responses_reporting_usage: self.responses_reporting_usage,
+            responses_missing_usage: self.responses_missing_usage,
+            cached_prompt_tokens: self.cached_prompt_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RunProviderUsageCoverageTallies {
+    all: ProviderUsageCoverageTallies,
+    inference: ProviderUsageCoverageTallies,
+    compaction: ProviderUsageCoverageTallies,
+    model_catalog: ProviderUsageCoverageTallies,
+}
+
+impl RunProviderUsageCoverageTallies {
+    fn record(&mut self, purpose: ProviderRequestPurpose, usage: Option<kitsu_providers::Usage>) {
+        self.all.record(usage);
+        match purpose {
+            ProviderRequestPurpose::Inference => self.inference.record(usage),
+            ProviderRequestPurpose::Compaction => self.compaction.record(usage),
+            ProviderRequestPurpose::ModelCatalog => self.model_catalog.record(usage),
+        }
+    }
+
+    fn snapshot(&self) -> RunProviderUsageCoverageSnapshot {
+        RunProviderUsageCoverageSnapshot {
+            all: self.all.snapshot(),
+            inference: self.inference.snapshot(),
+            compaction: self.compaction.snapshot(),
+            model_catalog: self.model_catalog.snapshot(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RunTallies {
     pub reads: std::sync::atomic::AtomicU64,
@@ -3885,6 +4056,136 @@ pub struct RunTallies {
     /// Per-model spend bins: `/model` mid-session must not blur attribution
     /// (cycle-25 audit). Key = model id; value = (prompt, completion, total).
     pub per_model: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64, u64)>>,
+    provider_usage_coverage: std::sync::Mutex<RunProviderUsageCoverageTallies>,
+}
+
+impl RunTallies {
+    fn record_provider_response(
+        &self,
+        purpose: ProviderRequestPurpose,
+        usage: Option<kitsu_providers::Usage>,
+    ) {
+        self.provider_usage_coverage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(purpose, usage);
+    }
+
+    /// Capture the neutral current-process usage inputs. Coverage is retained
+    /// independently from token totals so omitted provider usage never becomes
+    /// a reported zero, while explicit cached-token zero remains present.
+    pub fn usage_snapshot(&self) -> RunUsageSnapshot {
+        let coverage = self
+            .provider_usage_coverage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot();
+        RunUsageSnapshot {
+            turns: self.turns.load(Ordering::Acquire),
+            prompt_tokens: self.prompt_tokens.load(Ordering::Acquire),
+            completion_tokens: self.completion_tokens.load(Ordering::Acquire),
+            total_tokens: self.total_tokens.load(Ordering::Acquire),
+            coverage,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProviderResponseUsageTrackerState {
+    counted_response_attempts: std::collections::BTreeSet<u32>,
+    final_response_attempt: Option<u32>,
+    final_response_recorded: bool,
+}
+
+/// Per-logical-request accounting guard. Physical attempt numbers deduplicate
+/// adapter dispositions without introducing a durable request identity.
+#[derive(Clone, Debug)]
+struct ProviderResponseUsageTracker {
+    tallies: std::sync::Arc<RunTallies>,
+    purpose: ProviderRequestPurpose,
+    state: std::sync::Arc<std::sync::Mutex<ProviderResponseUsageTrackerState>>,
+}
+
+impl ProviderResponseUsageTracker {
+    fn new(tallies: std::sync::Arc<RunTallies>, purpose: ProviderRequestPurpose) -> Self {
+        Self {
+            tallies,
+            purpose,
+            state: std::sync::Arc::new(std::sync::Mutex::new(
+                ProviderResponseUsageTrackerState::default(),
+            )),
+        }
+    }
+
+    fn observe_attempt(&self, event: &kitsu_providers::ProviderAttemptEvent) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match event.outcome {
+            ProviderAttemptOutcome::RetryScheduled if !event.terminal => {
+                state.final_response_attempt = Some(event.attempt.saturating_add(1));
+            }
+            ProviderAttemptOutcome::ResponseAccepted
+            | ProviderAttemptOutcome::BodyCompleted
+            | ProviderAttemptOutcome::BodyFailed
+                if event.status.is_some() =>
+            {
+                state.final_response_attempt = Some(event.attempt);
+            }
+            _ => {}
+        }
+
+        // An HTTP rejection accepted by the adapter is a completed provider
+        // response even when its body is intentionally discarded before a
+        // retry. A transport-only failure has no response and is not coverage.
+        let completed_without_usage = event.status.is_some()
+            && matches!(
+                event.outcome,
+                ProviderAttemptOutcome::RetryScheduled
+                    | ProviderAttemptOutcome::Rejected
+                    | ProviderAttemptOutcome::DeadlineExceeded
+            );
+        if !completed_without_usage {
+            return;
+        }
+        if state.counted_response_attempts.insert(event.attempt) {
+            self.tallies.record_provider_response(self.purpose, None);
+        }
+    }
+
+    fn record_reported(&self, usage: kitsu_providers::Usage) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.final_response_recorded {
+            let new_response = state.final_response_attempt.map_or(true, |attempt| {
+                state.counted_response_attempts.insert(attempt)
+            });
+            if new_response {
+                self.tallies
+                    .record_provider_response(self.purpose, Some(usage));
+            }
+            state.final_response_recorded = true;
+        }
+    }
+
+    fn record_completed(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.final_response_recorded {
+            let new_response = state.final_response_attempt.map_or(true, |attempt| {
+                state.counted_response_attempts.insert(attempt)
+            });
+            if new_response {
+                self.tallies.record_provider_response(self.purpose, None);
+            }
+            state.final_response_recorded = true;
+        }
+    }
 }
 
 /// True when swapping this inline result for a preview is actually needed:
@@ -3918,7 +4219,7 @@ fn offload_pressure(
 fn prepare_tool_output(
     content: String,
     request: ToolOutputRequest<'_>,
-    tools: &Registry,
+    tools: &impl ToolCatalog,
     messages: &[ChatMessage],
     cfg: &AgentConfig,
 ) -> PreparedToolOutput {
@@ -4003,7 +4304,7 @@ fn maybe_offload_for_tools_detailed(
     content: String,
     call_id: &str,
     dir: Option<&std::path::Path>,
-    tools: &Registry,
+    tools: &impl ToolCatalog,
     messages: &[ChatMessage],
     cfg: &AgentConfig,
     window_evidence: Option<ContextWindowEvidence>,

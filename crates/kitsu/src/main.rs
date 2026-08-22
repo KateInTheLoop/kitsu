@@ -11,6 +11,7 @@ mod llms;
 mod process_exit;
 mod prompt_queue;
 mod session;
+mod session_telemetry_render;
 mod skills;
 mod structured_output;
 mod subagent;
@@ -44,12 +45,10 @@ use kitsu_providers::openai_compat::{
     OpenAICompatCatalogRouteConfig, OpenAICompatRouteBuildError, OpenAICompatRouteConfig,
 };
 use kitsu_providers::{
-    ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderAdapterId,
-    ProviderAttemptEvent, ProviderAuthSource, ProviderCapability, ProviderCatalogHandle,
-    ProviderCatalogPolicy, ProviderError, ProviderFallbackPolicy, ProviderProfileId,
-    ProviderReplayGenerationPolicy, ProviderRetryGenerationPolicy, ProviderRouteContractError,
-    ProviderRouteCurrent, ProviderRouteDeclaration, ProviderRouteHandle, ProviderRoutePolicy,
-    ProviderRouteReceipt, ProviderTelemetrySink, ProviderWireRevision,
+    ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderAttemptEvent,
+    ProviderAuthSource, ProviderCatalogHandle, ProviderCatalogPolicy, ProviderError,
+    ProviderProfileId, ProviderRouteContractError, ProviderRouteCurrent, ProviderRouteDeclaration,
+    ProviderRouteHandle, ProviderRoutePolicy, ProviderRouteReceipt, ProviderTelemetrySink,
 };
 use kitsu_tools::{
     builtins, CommandApprovalRequest, CommandDecision, CommandPrompter, Decision, Mode,
@@ -5270,19 +5269,19 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "context",
-        args: "[refresh]",
-        description: "show context utilization or refresh discovered window metadata",
-        details: "Source-by-source token estimates (system, project context, skills, history, tool schemas), the resolved window and its PROVENANCE (flag/profile/discovery/default), cache state, and the compaction ledger. `refresh` re-discovers window metadata from the gateway.",
+        args: "[window|sources|refresh]",
+        description: "show context details/window/sources or refresh discovered metadata",
+        details: "Bare `/context` preserves the detailed legacy view. `window` shows focused typed occupancy. `sources` shows coarse Kitsu-owned request contributors with explicit estimates and unavailable sub-buckets; it does not reverse-parse attachments, on-demand skill bodies, memory, or response-schema tokens. `refresh` re-discovers window metadata from the gateway.",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
     SlashCommandSpec {
         name: "cost",
         args: "",
-        description: "cumulative session token usage across all turns",
-        details: "Cumulative session usage: prompt + completion = total tokens across all completed turns, plus the live context-window position. Kitsu meters tokens, not currency — multiply by your gateway's rates; provider-side prompt-cache discounts are not itemized on the OpenAI-compatible wire.",
+        description: "compatibility alias for current-session usage",
+        details: "",
         group: CommandGroup::ContextHistory,
-        alias_of: None,
+        alias_of: Some("usage"),
     },
     SlashCommandSpec {
         name: "delete",
@@ -5511,8 +5510,8 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "status",
         args: "",
-        description: "show model, context, tools, and session state",
-        details: "One-screen session health: session id/name, endpoint, model, window + provenance, directory and Git state, project context source, tool/permission state, command roots, background agents, compaction totals.",
+        description: "show the typed current-session telemetry deck",
+        details: "Adaptive route, runtime identity, effective authority, context, and observed current-session usage facts, each labeled with truth class and provenance.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -5546,6 +5545,14 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         description: "undo the latest or selected conflict-free file checkpoint",
         details: "Restores a write checkpoint (default: the latest) after verifying its files still match the recorded state; refuses while background agents run. /checkpoints lists candidates.",
         group: CommandGroup::FilesDiffsCheckpoints,
+        alias_of: None,
+    },
+    SlashCommandSpec {
+        name: "usage",
+        args: "[session]",
+        description: "show observed provider token usage for this session",
+        details: "Shows current-process provider usage and exact response coverage. Bare `/usage` means `/usage session`; `/cost` is retained as an empty-args-only compatibility alias for the identical snapshot. Missing usage and cached-token attribution stay unavailable; no prices, credits, rate limits, or account data are inferred.",
+        group: CommandGroup::ContextHistory,
         alias_of: None,
     },
 ];
@@ -5995,8 +6002,17 @@ impl rustyline::highlight::Highlighter for ChatHelper {
 
 /// A provenance entry: a static context source, why it's loaded, its estimated
 /// token cost, and the governing policy — honest accounting (design §3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CtxSourceKind {
+    CoreInstructions,
+    ProjectContext,
+    SkillContext,
+    ToolSchemas,
+}
+
 #[derive(Clone)]
 struct CtxEntry {
+    kind: CtxSourceKind,
     label: String,
     tokens: u64,
     policy: &'static str,
@@ -6005,12 +6021,14 @@ struct CtxEntry {
 
 impl CtxEntry {
     fn new(
+        kind: CtxSourceKind,
         label: impl Into<String>,
         tokens: u64,
         policy: &'static str,
         why: impl Into<String>,
     ) -> Self {
         Self {
+            kind,
             label: label.into(),
             tokens,
             policy,
@@ -7399,268 +7417,393 @@ fn permission_mode_label(mode: Mode) -> (&'static str, &'static str) {
     }
 }
 
-fn context_totals(
+fn minimal_root_count(mut roots: Vec<std::path::PathBuf>) -> u64 {
+    roots.sort();
+    roots.dedup();
+    let mut minimal = Vec::<std::path::PathBuf>::new();
+    for root in roots {
+        if minimal.iter().any(|parent| root.starts_with(parent)) {
+            continue;
+        }
+        minimal.push(root);
+    }
+    u64::try_from(minimal.len()).unwrap_or(u64::MAX)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn current_session_authority_input(
+    mode: Mode,
+    read_roots: Vec<std::path::PathBuf>,
+    write_roots: Vec<std::path::PathBuf>,
+    protected_read_roots: Vec<std::path::PathBuf>,
+    protected_write_roots: Vec<std::path::PathBuf>,
+    exact_command_grants: u64,
+    commands_enabled: bool,
+) -> kitsu_core::EffectiveAuthorityInput {
+    let protected_roots = protected_read_roots
+        .into_iter()
+        .chain(protected_write_roots)
+        .collect();
+    kitsu_core::EffectiveAuthorityInput {
+        mode: match mode {
+            Mode::Ask => kitsu_core::EffectiveAuthorityMode::Ask,
+            Mode::Scoped => kitsu_core::EffectiveAuthorityMode::Scoped,
+            Mode::AutoAllow => kitsu_core::EffectiveAuthorityMode::AutoAllow,
+            Mode::Deny => kitsu_core::EffectiveAuthorityMode::Deny,
+        },
+        read_roots: minimal_root_count(read_roots),
+        write_roots: minimal_root_count(write_roots),
+        protected_roots: minimal_root_count(protected_roots),
+        exact_command_grants,
+        commands_enabled,
+    }
+}
+
+fn current_session_context_input(
+    reported_window: Option<u64>,
+    source: ContextWindowSource,
+    max_tokens: Option<u32>,
+    used_tokens: u64,
+    provider_anchored: bool,
+    window_evidence: Option<kitsu_core::ContextWindowEvidence>,
+) -> kitsu_core::ContextSnapshotInput {
+    let resolved_window = reported_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let conservative_default = matches!(&source, ContextWindowSource::ConservativeDefault);
+    let telemetry_source = match source {
+        ContextWindowSource::Cli => kitsu_core::ContextWindowSource::CommandLine,
+        ContextWindowSource::Profile => kitsu_core::ContextWindowSource::GatewayProfile,
+        ContextWindowSource::DiskCache => kitsu_core::ContextWindowSource::DiskCache,
+        ContextWindowSource::LiveDiscovery => {
+            kitsu_core::ContextWindowSource::LiveProviderDiscovery
+        }
+        ContextWindowSource::ConservativeDefault => {
+            kitsu_core::ContextWindowSource::ConservativeDefault
+        }
+    };
+    let window_provenance = kitsu_core::TelemetryProvenance::ContextWindow(telemetry_source);
+    let window_tokens = if conservative_default {
+        kitsu_core::TelemetryValue::estimated(resolved_window, window_provenance)
+    } else {
+        kitsu_core::TelemetryValue::authoritative(resolved_window, window_provenance)
+    };
+    let budgeted_window = window_evidence.map_or(resolved_window, |evidence| {
+        if evidence.resolved_window == resolved_window {
+            clamp_window_for_shortfall(
+                resolved_window,
+                evidence.reported_prompt_tokens,
+                evidence.shortfall_count,
+            )
+        } else {
+            resolved_window
+        }
+    });
+    let effective_tokens = ContextBudget::new(budgeted_window, max_tokens).effective;
+    kitsu_core::ContextSnapshotInput {
+        window_tokens,
+        effective_tokens: kitsu_core::TelemetryValue::derived(
+            effective_tokens,
+            kitsu_core::TelemetryProvenance::ContextBudgetArithmetic,
+        ),
+        used_tokens: kitsu_core::TelemetryValue::estimated(
+            used_tokens,
+            if provider_anchored {
+                kitsu_core::TelemetryProvenance::ProviderAnchoredContextMeter
+            } else {
+                kitsu_core::TelemetryProvenance::ContextMeterEstimate
+            },
+        ),
+    }
+}
+
+fn current_session_snapshot_from_observation(
+    provider_route: ProviderRouteReceipt,
+    session_id: Option<String>,
+    run_id: kitsu_core::RunId,
+    authority: kitsu_core::EffectiveAuthorityInput,
+    context: kitsu_core::ContextSnapshotInput,
+    usage: kitsu_core::RunUsageSnapshot,
+) -> kitsu_core::CurrentSessionSnapshot {
+    kitsu_core::CurrentSessionSnapshot::from_input(kitsu_core::CurrentSessionSnapshotInput {
+        provider_route,
+        session_id: session_id.and_then(|session_id| kitsu_core::SessionId::new(session_id).ok()),
+        run_id: Some(run_id),
+        authority,
+        context,
+        usage: kitsu_core::SessionUsageInput::from_run_usage(
+            &usage,
+            kitsu_core::SessionCostInput::unavailable(),
+        ),
+    })
+}
+
+/// Capture the existing current-process owners into one typed DTO without an
+/// await point or a provider, account, filesystem, or persistence operation.
+fn collect_current_session_snapshot(
+    provider_route: ProviderRouteReceipt,
     messages: &[ChatMessage],
     session: &SessionInfo,
+    perms: &Permissions,
     state: &kitsu_core::AgentSessionState,
-) -> (u64, u64, u64) {
-    let b = ContextMeter::new().breakdown(messages);
-    let window = session.window.get().unwrap_or(DEFAULT_CONTEXT_WINDOW);
-    let effective = ContextBudget::new(window, session.max_tokens).effective;
-    let static_tokens: u64 = session
+) -> kitsu_core::CurrentSessionSnapshot {
+    let session_id = session.session_id.borrow().clone();
+    let run_id = run_spec().run_id().clone();
+
+    // Take each authority collection once, then reduce those immutable local
+    // observations. Protected read/write paths are one authority surface.
+    let mode = perms.mode();
+    let read_roots = perms.read_roots();
+    let write_roots = perms.write_roots();
+    let protected_read_roots = perms.protected_read_roots();
+    let protected_write_roots = perms.protected_write_roots();
+    let command_grants = session
+        .command_policy
+        .as_ref()
+        .map(|policy| policy.session_grants())
+        .unwrap_or_default();
+    let commands_enabled = session
+        .tool_names
+        .iter()
+        .any(|tool_name| tool_name == "command_exec");
+    let authority = current_session_authority_input(
+        mode,
+        read_roots,
+        write_roots,
+        protected_read_roots,
+        protected_write_roots,
+        u64::try_from(command_grants.len()).unwrap_or(u64::MAX),
+        commands_enabled,
+    );
+
+    let reported_window = session.window.get();
+    let source = context_window_provenance(&session.window_provenance).source;
+    let breakdown = ContextMeter::new().breakdown(messages);
+    let provenance_tokens = session
         .provenance
         .borrow()
         .iter()
-        .map(|entry| entry.tokens)
-        .sum();
-    let estimated = static_tokens + b.user + b.assistant + b.tool_results;
-    let used = if state.meter.anchored(messages) {
+        .fold(0_u64, |total, entry| total.saturating_add(entry.tokens));
+    let estimated = provenance_tokens
+        .saturating_add(breakdown.user)
+        .saturating_add(breakdown.assistant)
+        .saturating_add(breakdown.tool_results);
+    let provider_anchored = state.meter.anchored(messages);
+    let used_tokens = if provider_anchored {
         state.meter.estimate(messages)
     } else {
         estimated
     };
-    (window, effective, used)
-}
-
-const fn provider_adapter_label(adapter: ProviderAdapterId) -> &'static str {
-    match adapter {
-        ProviderAdapterId::OpenAiCompatible => "openai_compatible",
-        ProviderAdapterId::AnthropicMessages => "anthropic_messages",
-    }
-}
-
-const fn provider_wire_label(wire: ProviderWireRevision) -> &'static str {
-    match wire {
-        ProviderWireRevision::OpenAiChatCompletionsV1 => "openai_chat_completions_v1",
-        ProviderWireRevision::AnthropicMessages2023_06_01 => "anthropic_messages_2023_06_01",
-    }
-}
-
-const fn provider_capability_label(capability: ProviderCapability) -> &'static str {
-    match capability {
-        ProviderCapability::Streaming => "streaming",
-        ProviderCapability::Tools => "tools",
-        ProviderCapability::ImageInput => "image_input",
-        ProviderCapability::StructuredOutput => "structured_output",
-        ProviderCapability::Usage => "usage",
-        ProviderCapability::ModelCatalog => "model_catalog",
-    }
-}
-
-const fn provider_auth_source_label(source: ProviderAuthSource) -> &'static str {
-    match source {
-        ProviderAuthSource::None => "none",
-        ProviderAuthSource::StaticConfiguration => "static_configuration",
-        ProviderAuthSource::Environment => "environment",
-        ProviderAuthSource::ManagedCredential => "managed_credential",
-    }
-}
-
-const fn provider_catalog_policy_label(policy: ProviderCatalogPolicy) -> &'static str {
-    match policy {
-        ProviderCatalogPolicy::Unavailable => "unavailable",
-        ProviderCatalogPolicy::Configured => "configured",
-    }
-}
-
-const fn provider_retry_generation_label(policy: ProviderRetryGenerationPolicy) -> &'static str {
-    match policy {
-        ProviderRetryGenerationPolicy::BoundGeneration => "bound_generation",
-    }
-}
-
-const fn provider_replay_generation_label(policy: ProviderReplayGenerationPolicy) -> &'static str {
-    match policy {
-        ProviderReplayGenerationPolicy::CurrentGeneration => "current_generation",
-    }
-}
-
-const fn provider_fallback_label(policy: ProviderFallbackPolicy) -> &'static str {
-    match policy {
-        ProviderFallbackPolicy::Disabled => "disabled",
-    }
-}
-
-fn provider_duration_label(receipt: kitsu_providers::ProviderRouteDurationReceipt) -> String {
-    if receipt.nanoseconds() == 0 {
-        format!("{}s", receipt.seconds())
-    } else {
-        format!("{}s+{}ns", receipt.seconds(), receipt.nanoseconds())
-    }
-}
-
-fn format_session_status(
-    model: &str,
-    messages: &[ChatMessage],
-    session: &SessionInfo,
-    perms: &Permissions,
-    registry: &subagent::AgentRegistry,
-    state: &kitsu_core::AgentSessionState,
-    provider_route: &ProviderRouteReceipt,
-) -> String {
-    let model = terminal_inline(model);
-    let gateway = terminal_inline(&session.gateway);
-    let auth_status = terminal_inline(&session.auth_status);
-    let (window, effective, used) = context_totals(messages, session, state);
-    let pct = if effective == 0 {
-        0
-    } else {
-        used.saturating_mul(100).saturating_div(effective).min(999)
-    };
-    let user_turns = messages
-        .iter()
-        .filter(|message| matches!(message.role, kitsu_providers::Role::User))
-        .count();
-    let assistant_turns = messages
-        .iter()
-        .filter(|message| matches!(message.role, kitsu_providers::Role::Assistant))
-        .count();
-    let tool_results = messages
-        .iter()
-        .filter(|message| matches!(message.role, kitsu_providers::Role::Tool))
-        .count();
-    let (mode, _) = permission_mode_label(perms.mode());
-    let window_note = if session.window.get().is_some() {
-        window.to_string()
-    } else {
-        format!("{window} default")
-    };
-    let window_provenance = context_window_provenance(&session.window_provenance);
-    let window_source = window_provenance.source.label();
-    let window_cache = window_provenance.cache.label();
-    let window_discovery = window_provenance.discovery.label();
-    let session_id = terminal_inline(
-        &session
-            .session_id
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| "disabled".to_string()),
+    let context = current_session_context_input(
+        reported_window,
+        source,
+        session.max_tokens,
+        used_tokens,
+        provider_anchored,
+        state.window_evidence,
     );
-    let autosave = if session.session_id.borrow().is_none() {
-        "disabled"
-    } else if session.autosave_dirty.get() {
-        "DIRTY - unsaved changes (autosave will retry)"
-    } else {
-        "saved"
-    };
-    let project_context = session
-        .project_context
-        .borrow()
-        .as_deref()
-        .map(shorten_home)
-        .unwrap_or_else(|| "disabled / not found".to_string());
-    let git = workspace::status(&session.directory)
-        .map(|status| {
-            format!(
-                "{} | {} changed ({} untracked)",
-                terminal_inline(&status.branch),
-                status.changed,
-                status.untracked
-            )
-        })
-        .unwrap_or_else(|| "not a Git worktree".to_string());
-    let compaction_last = state
-        .compaction_ledger
-        .last()
-        .map(|record| {
-            format!(
-                "#{}, {:?}/{:?}, {} -> {} tokens{}",
-                record.sequence,
-                record.reason,
-                record.outcome,
-                record.tokens_before,
-                record.tokens_after,
-                record
-                    .fallback_reason
-                    .map(|reason| format!(", fallback {reason:?}"))
-                    .unwrap_or_default()
-            )
-        })
-        .unwrap_or_else(|| "none".to_string());
-    let artifacts = match session.artifact_policy {
-        ArtifactStoragePolicy::Automatic => {
-            format!("automatic ({})", session.artifact_policy_source.as_str())
-        }
-        ArtifactStoragePolicy::InlineOnly => format!(
-            "disabled ({}, bounded inline only; existing unchanged)",
-            session.artifact_policy_source.as_str()
-        ),
-    };
-    let route = provider_route.route();
-    let route_profile = terminal_inline(route.profile().as_str());
-    let route_capabilities = {
-        let labels = route
-            .capabilities()
-            .supported()
-            .map(provider_capability_label)
-            .collect::<Vec<_>>();
-        if labels.is_empty() {
-            "none".to_string()
-        } else {
-            labels.join(", ")
-        }
-    };
-    let route_policy = provider_route.policy();
-    let route_inference_timeout = provider_duration_label(route_policy.inference_timeout());
-    let route_catalog_timeout = provider_duration_label(route_policy.catalog_timeout());
-    let route_discovery_timeout =
-        provider_duration_label(route_policy.advisory_discovery_timeout());
+    let usage = session.run_tallies.usage_snapshot();
 
-    format!(
-        "kitsu        {}\nsession:\n  id           {session_id}\n  autosave     {autosave}\n  gateway      {}\n  model        {model}\n  provider     {} | generation {}\n  profile      {route_profile}\n  wire         {}\n  capabilities {route_capabilities}\n  route auth   {}\n  route retry  {} inference | {} catalog | {}\n  route policy catalog {} | replay {} | fallback {}\n  route timeout inference {route_inference_timeout} | catalog {route_catalog_timeout} | discovery {route_discovery_timeout}\n  reasoning    {}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  context src  {window_source}\n  context cache {window_cache}\n  context probe {window_discovery}\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  artifacts    {artifacts}\n  agents       {} running",
-        crate::cli::LONG_VERSION,
-        gateway,
-        provider_adapter_label(route.adapter()),
-        route.generation().get(),
-        provider_wire_label(route.wire_revision()),
-        provider_auth_source_label(provider_route.auth_source()),
-        route_policy.inference_retries(),
-        route_policy.catalog_retries(),
-        provider_retry_generation_label(route_policy.retry_generation()),
-        provider_catalog_policy_label(route_policy.catalog()),
-        provider_replay_generation_label(route_policy.semantic_replay_generation()),
-        provider_fallback_label(route_policy.fallback()),
-        reasoning_effort_label(session.reasoning_effort.get()),
-        shorten_home(&session.directory),
-        shorten_home(&session.config_path),
-        shorten_home(&session.state_dir),
-        session.endpoint,
-        auth_status,
-        effective.saturating_sub(used),
-        state.compaction_ledger.total_compactions,
-        state.compaction_ledger.tokens_saved,
-        state.compaction_ledger.exchanges_removed,
-        state.compaction_ledger.tool_results_elided,
-        session.tool_names.len(),
-        perms.read_roots().len(),
-        perms.write_roots().len(),
-        session
-            .command_mode
-            .map(|mode| format!("{mode} | {} cwd root(s)", session.command_roots.len()))
-            .unwrap_or_else(|| "disabled".to_string()),
-        registry.running(),
+    current_session_snapshot_from_observation(
+        provider_route,
+        session_id,
+        run_id,
+        authority,
+        context,
+        usage,
     )
 }
 
-struct RenderedSessionStatus<'a> {
-    provider_route: &'a ProviderRouteReceipt,
-    text: String,
+/// Capture the coarse current-request contributors already retained in memory.
+/// Static chunks are folded by their closed source kind, never by parsing
+/// display labels. Embedded attachment and on-demand skill-body text is left
+/// inside the user-message estimate and remains separately unavailable.
+fn collect_context_sources_snapshot(
+    messages: &[ChatMessage],
+    session: &SessionInfo,
+    state: &kitsu_core::AgentSessionState,
+) -> kitsu_core::ContextSourcesSnapshot {
+    let mut core_instructions_tokens = 0_u64;
+    let mut project_context_tokens = 0_u64;
+    let mut skill_context_tokens = 0_u64;
+    let mut tool_schema_tokens = 0_u64;
+    for entry in session.provenance.borrow().iter() {
+        let destination = match entry.kind {
+            CtxSourceKind::CoreInstructions => &mut core_instructions_tokens,
+            CtxSourceKind::ProjectContext => &mut project_context_tokens,
+            CtxSourceKind::SkillContext => &mut skill_context_tokens,
+            CtxSourceKind::ToolSchemas => &mut tool_schema_tokens,
+        };
+        *destination = destination.saturating_add(entry.tokens);
+    }
+
+    let meter = ContextMeter::new();
+    let breakdown = meter.breakdown(messages);
+    let initial_system_tokens = messages
+        .first()
+        .filter(|message| matches!(message.role, kitsu_providers::Role::System))
+        .map(|message| meter.breakdown(std::slice::from_ref(message)).system)
+        .unwrap_or(0);
+
+    let resolved_window = session.window.get().unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let budgeted_window = state.window_evidence.map_or(resolved_window, |evidence| {
+        if evidence.resolved_window == resolved_window {
+            clamp_window_for_shortfall(
+                resolved_window,
+                evidence.reported_prompt_tokens,
+                evidence.shortfall_count,
+            )
+        } else {
+            resolved_window
+        }
+    });
+    let budget = ContextBudget::new(budgeted_window, session.max_tokens);
+    let ledger = &state.compaction_ledger;
+    kitsu_core::ContextSourcesSnapshot::from_input(kitsu_core::ContextSourcesSnapshotInput {
+        core_instructions_tokens,
+        project_context_tokens,
+        skill_context_tokens,
+        tool_schema_tokens,
+        runtime_system_message_tokens: breakdown.system.saturating_sub(initial_system_tokens),
+        user_message_tokens: breakdown.user,
+        assistant_message_tokens: breakdown.assistant,
+        tool_result_tokens: breakdown.tool_results,
+        prompt_budget_tokens: budget.effective,
+        output_reserve_tokens: budget.reserve,
+        trim_target_tokens: budget.target,
+        estimate_buffer_tokens: budget.effective.saturating_sub(budget.target),
+        compactions: ledger.total_compactions,
+        exchanges_removed: ledger.exchanges_removed,
+        tool_results_elided: ledger.tool_results_elided,
+        compaction_tokens_saved: ledger.tokens_saved,
+    })
+}
+
+fn current_session_deck_options(cli: &Cli) -> session_telemetry_render::TelemetryDeckOptions {
+    let destination = if cli.screen_reader {
+        session_telemetry_render::TelemetryDeckDestination::ScreenReader
+    } else if cli.plain {
+        session_telemetry_render::TelemetryDeckDestination::Plain
+    } else if kitsu_render::plain_mode() {
+        session_telemetry_render::TelemetryDeckDestination::NoColor
+    } else if kitsu_render::stderr_styled() {
+        session_telemetry_render::TelemetryDeckDestination::StyledTerminal
+    } else {
+        session_telemetry_render::TelemetryDeckDestination::Redirected
+    };
+    session_telemetry_render::TelemetryDeckOptions {
+        destination,
+        columns: current_terminal_columns().unwrap_or(80),
+    }
+}
+
+fn redirected_current_session_deck_options() -> session_telemetry_render::TelemetryDeckOptions {
+    session_telemetry_render::TelemetryDeckOptions {
+        destination: session_telemetry_render::TelemetryDeckDestination::Redirected,
+        columns: 80,
+    }
+}
+
+fn effective_authority_mode_label(
+    mode: kitsu_core::EffectiveAuthorityMode,
+) -> (&'static str, &'static str) {
+    match mode {
+        kitsu_core::EffectiveAuthorityMode::Ask => ("ask", "prompt for unlisted paths"),
+        kitsu_core::EffectiveAuthorityMode::Scoped => (
+            "scoped",
+            "non-prompting; reject paths outside current roots",
+        ),
+        kitsu_core::EffectiveAuthorityMode::AutoAllow => (
+            "DANGER: global filesystem bypass",
+            "allow every non-protected path without prompting",
+        ),
+        kitsu_core::EffectiveAuthorityMode::Deny => ("deny", "reject unlisted paths"),
+    }
+}
+
+fn snapshot_context_window_source_label(
+    provenance: kitsu_core::TelemetryProvenance,
+) -> &'static str {
+    let kitsu_core::TelemetryProvenance::ContextWindow(source) = provenance else {
+        unreachable!("current status window has context-window provenance")
+    };
+    match source {
+        kitsu_core::ContextWindowSource::CommandLine => "CLI --context-window",
+        kitsu_core::ContextWindowSource::GatewayProfile => "gateway profile context_window",
+        kitsu_core::ContextWindowSource::DiskCache => "disk cache",
+        kitsu_core::ContextWindowSource::LiveProviderDiscovery => "live model discovery",
+        kitsu_core::ContextWindowSource::ConservativeDefault => "conservative default",
+    }
 }
 
 fn session_status_payload(
-    model: &str,
     messages: &[ChatMessage],
     session: &SessionInfo,
-    perms: &Permissions,
     registry: &subagent::AgentRegistry,
     state: &kitsu_core::AgentSessionState,
-    rendered: RenderedSessionStatus<'_>,
+    provider_route: &ProviderRouteReceipt,
+    observation: &session_telemetry_render::CurrentStatusObservation,
+    text: String,
 ) -> serde_json::Value {
-    let RenderedSessionStatus {
-        provider_route,
-        text,
-    } = rendered;
-    let (window, effective, used) = context_totals(messages, session, state);
+    let snapshot = observation.snapshot();
+    let route = &snapshot.status.route;
+    let authority = &snapshot.status.authority;
+    let context = &snapshot.context;
+    let authority_mode = *authority
+        .mode
+        .value()
+        .expect("current status authority mode is observed");
+    let (permission_mode, permission_behavior) = effective_authority_mode_label(authority_mode);
+    let window = context
+        .window_tokens
+        .value()
+        .copied()
+        .expect("current status context window is observed");
+    let effective = context
+        .effective_tokens
+        .value()
+        .copied()
+        .expect("current status effective context is observed");
+    let used = context
+        .used_tokens
+        .value()
+        .copied()
+        .expect("current status used context is observed");
+    let remaining = context
+        .available_tokens
+        .value()
+        .copied()
+        .expect("current status available context is derived");
+    let version = observation
+        .version()
+        .value()
+        .expect("current status version is observed");
+    let cwd = observation
+        .cwd()
+        .value()
+        .expect("current status cwd is observed");
+    let model = route
+        .model
+        .value()
+        .expect("the active chat route has a model");
+    let read_roots = authority
+        .read_roots
+        .value()
+        .copied()
+        .expect("current status read-root count is observed");
+    let write_roots = authority
+        .write_roots
+        .value()
+        .copied()
+        .expect("current status write-root count is observed");
+    let commands_enabled = authority
+        .commands_enabled
+        .value()
+        .copied()
+        .expect("current status command authority is observed");
+    let exact_command_grants = authority
+        .exact_command_grants
+        .value()
+        .copied()
+        .expect("current status command-grant count is observed");
     let user_turns = messages
         .iter()
         .filter(|message| matches!(message.role, kitsu_providers::Role::User))
@@ -7675,31 +7818,24 @@ fn session_status_payload(
         .count();
     let provenance = context_window_provenance(&session.window_provenance);
     let progress = registry.progress_snapshot();
-    let (permission_mode, permission_behavior) = permission_mode_label(perms.mode());
-    let session_id = session.session_id.borrow().clone();
     let project_context = session
         .project_context
         .borrow()
         .as_deref()
         .map(|path| path.to_string_lossy().into_owned());
-    let autosave_enabled = session_id.is_some();
-    let command_grants = session
-        .command_policy
-        .as_ref()
-        .map(|policy| policy.session_grants().len())
-        .unwrap_or(0);
+    let autosave_enabled = snapshot.status.session_id.value().is_some();
 
     serde_json::json!({
         "kind": "status",
         "text": text,
-        "version": crate::cli::LONG_VERSION,
+        "version": version,
         "provider_route": provider_route,
         "session": {
-            "id": session_id,
+            "id": snapshot.status.session_id.value(),
             "gateway": session.gateway,
             "model": model,
             "reasoning_effort": reasoning_effort_label(session.reasoning_effort.get()),
-            "cwd": session.directory,
+            "cwd": cwd,
             "config_path": session.config_path,
             "state_dir": session.state_dir,
             "endpoint": session.endpoint,
@@ -7713,8 +7849,8 @@ fn session_status_payload(
             "window": window,
             "effective": effective,
             "used": used,
-            "remaining": effective.saturating_sub(used),
-            "source": provenance.source.label(),
+            "remaining": remaining,
+            "source": snapshot_context_window_source_label(context.window_tokens.provenance()),
             "cache": provenance.cache.label(),
             "discovery": provenance.discovery.label(),
         },
@@ -7737,14 +7873,14 @@ fn session_status_payload(
         "permissions": {
             "mode": permission_mode,
             "behavior": permission_behavior,
-            "read_roots": perms.read_roots().len(),
-            "write_roots": perms.write_roots().len(),
+            "read_roots": read_roots,
+            "write_roots": write_roots,
         },
         "commands": {
-            "enabled": session.command_mode.is_some(),
+            "enabled": commands_enabled,
             "mode": session.command_mode,
             "cwd_roots": session.command_roots.len(),
-            "exact_grants": command_grants,
+            "exact_grants": exact_command_grants,
         },
         "artifact_policy": artifact_policy_receipt(
             session.artifact_policy,
@@ -15025,6 +15161,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     };
     let base = chat_system_prompt(&tool_names, &prompt_environment);
     provenance.push(CtxEntry::new(
+        CtxSourceKind::CoreInstructions,
         "base prompt",
         estimate_str(&base),
         "always",
@@ -15035,6 +15172,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let contract = "\n\nAutomatic artifact storage is disabled for this run. Commands return bounded previews only; oversized tool results are irreversibly reduced to explicit head/tail previews. No new saved full-output path is created; historical artifact pointers may remain in resumed context, but no managed artifact read root is granted.";
         system.push_str(contract);
         provenance.push(CtxEntry::new(
+            CtxSourceKind::CoreInstructions,
             "artifact-free policy",
             estimate_str(contract),
             "host-enforced",
@@ -15045,6 +15183,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let tokens = estimate_str(&contract);
         system.push_str(&contract);
         provenance.push(CtxEntry::new(
+            CtxSourceKind::CoreInstructions,
             format!("required writes ({})", required_write_contracts.len()),
             tokens,
             "host-enforced",
@@ -15074,6 +15213,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 );
             }
             provenance.push(CtxEntry::new(
+                CtxSourceKind::ProjectContext,
                 format!("project ({label})"),
                 tokens,
                 "loaded",
@@ -15096,6 +15236,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         system.push_str(&chunk);
         eprintln!("~ {} skill(s) available", skillset.names().len());
         provenance.push(CtxEntry::new(
+            CtxSourceKind::SkillContext,
             format!("skill index ({})", skillset.names().len()),
             estimate_str(&chunk),
             "always",
@@ -15107,6 +15248,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let chunk = format!("\n\n---\nPreloaded skills (follow these):\n{pre}");
         system.push_str(&chunk);
         provenance.push(CtxEntry::new(
+            CtxSourceKind::SkillContext,
             format!("skills (--skill x{})", cli.skill.len()),
             estimate_str(&chunk),
             "preloaded",
@@ -15118,6 +15260,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let schema_tokens =
             estimate_str(&serde_json::to_string(tools.descriptors()).unwrap_or_default());
         provenance.push(CtxEntry::new(
+            CtxSourceKind::ToolSchemas,
             format!("tool schemas ({})", tool_names.len()),
             schema_tokens,
             "admitted",
@@ -17831,6 +17974,8 @@ async fn handle_slash(
             })));
         }
         "status" => {
+            // The receipt is a secret-free, in-memory observation of the
+            // already-bound route. `/status` never sends a provider request.
             let provider_route = match provider.receipt() {
                 Ok(receipt) => receipt,
                 Err(error) => {
@@ -17838,29 +17983,45 @@ async fn handle_slash(
                     return SlashResult::Error;
                 }
             };
-            let text = format_session_status(
-                model,
+            let snapshot = collect_current_session_snapshot(
+                provider_route.clone(),
                 messages,
                 session,
                 perms,
+                state,
+            );
+            let observation = session_telemetry_render::CurrentStatusObservation::new(
+                snapshot,
+                kitsu_core::TelemetryValue::authoritative(
+                    crate::cli::LONG_VERSION.to_string(),
+                    kitsu_core::TelemetryProvenance::RuntimeIdentity,
+                ),
+                kitsu_core::TelemetryValue::authoritative(
+                    session.directory.to_string_lossy().into_owned(),
+                    kitsu_core::TelemetryProvenance::RuntimeIdentity,
+                ),
+            );
+            if !cli.jsonl {
+                eprintln!(
+                    "{}",
+                    session_telemetry_render::render_current_status_observation(
+                        &observation,
+                        current_session_deck_options(cli),
+                    )
+                );
+            }
+            let text = session_telemetry_render::render_current_status_observation(
+                &observation,
+                redirected_current_session_deck_options(),
+            );
+            return SlashResult::Continue(Some(session_status_payload(
+                messages,
+                session,
                 registry,
                 state,
                 &provider_route,
-            );
-            if !cli.jsonl {
-                eprintln!("{text}");
-            }
-            return SlashResult::Continue(Some(session_status_payload(
-                model,
-                messages,
-                session,
-                perms,
-                registry,
-                state,
-                RenderedSessionStatus {
-                    provider_route: &provider_route,
-                    text,
-                },
+                &observation,
+                text,
             )));
         }
         "permissions" => {
@@ -17931,6 +18092,52 @@ async fn handle_slash(
                     model, messages, session, state,
                 )));
             }
+            "window" => {
+                // This reads the immutable receipt for the already-bound route;
+                // neither receipt capture nor the typed session observation has
+                // an await point or a provider/account/filesystem operation.
+                let provider_route = match provider.receipt() {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        eprintln!("cannot inspect current provider route: {error}");
+                        return SlashResult::Error;
+                    }
+                };
+                let snapshot = collect_current_session_snapshot(
+                    provider_route,
+                    messages,
+                    session,
+                    perms,
+                    state,
+                );
+                if !cli.jsonl {
+                    eprintln!(
+                        "{}",
+                        session_telemetry_render::render_current_session_context(
+                            &snapshot,
+                            current_session_deck_options(cli),
+                        )
+                    );
+                }
+                // The legacy bare `/context` payload describes its detailed
+                // source/compaction view, not this typed focused projection.
+                return SlashResult::Continue(None);
+            }
+            "sources" => {
+                let snapshot = collect_context_sources_snapshot(messages, session, state);
+                if !cli.jsonl {
+                    eprintln!(
+                        "{}",
+                        session_telemetry_render::render_context_sources(
+                            &snapshot,
+                            current_session_deck_options(cli),
+                        )
+                    );
+                }
+                // This observation deliberately has no public JSONL payload;
+                // the script driver retains only the original lifecycle text.
+                return SlashResult::Continue(None);
+            }
             "refresh" => {
                 return refresh_session_context_window(
                     model,
@@ -17948,6 +18155,36 @@ async fn handle_slash(
                 return SlashResult::Error;
             }
         },
+        "usage" | "cost" => {
+            if name == "usage" && !matches!(arg, "" | "session") {
+                eprintln!("usage: {}", slash_syntax("usage"));
+                return SlashResult::Error;
+            }
+            // The receipt is a secret-free, in-memory observation of the
+            // already-bound route. This command never sends a provider request.
+            let provider_route = match provider.receipt() {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    eprintln!("cannot inspect current provider route: {error}");
+                    return SlashResult::Error;
+                }
+            };
+            let snapshot =
+                collect_current_session_snapshot(provider_route, messages, session, perms, state);
+            if !cli.jsonl {
+                eprintln!(
+                    "{}",
+                    session_telemetry_render::render_current_session_usage(
+                        &snapshot,
+                        current_session_deck_options(cli),
+                    )
+                );
+            }
+            // Both spellings deliberately retain the existing lifecycle-only
+            // JSONL contract: the script driver keeps the original command
+            // text in command_started/command_finished and receives no result.
+            return SlashResult::Continue(None);
+        }
         "compact" => {
             let mut cfg = build_agent_config(
                 model.clone(),
@@ -18246,47 +18483,6 @@ async fn handle_slash(
                     SlashResult::Error
                 }
             };
-        }
-        "cost" => {
-            // Billed truth lives in the shared tallies: they survive turn
-            // rollback and include subagent spend (cycle-23 audit #3).
-            let tallies = &session.run_tallies;
-            eprintln!(
-                "session usage: {} prompt + {} completion = {} total token(s) across {} turn(s), subagent spend included ({} via {})",
-                tallies.prompt_tokens.load(Ordering::Acquire),
-                tallies.completion_tokens.load(Ordering::Acquire),
-                tallies.total_tokens.load(Ordering::Acquire),
-                tallies.turns.load(Ordering::Acquire),
-                terminal_inline(model),
-                terminal_inline(&session.gateway),
-            );
-            {
-                let per_model = tallies
-                    .per_model
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if per_model.len() > 1 {
-                    for (bin_model, (prompt, completion, total)) in per_model.iter() {
-                        eprintln!(
-                            "  {}: {prompt} prompt + {completion} completion = {total} total",
-                            terminal_inline(bin_model)
-                        );
-                    }
-                }
-            }
-            if let Some(window) = context_window.get() {
-                let budget = kitsu_core::ContextBudget::new(window, cli.max_output_tokens);
-                let (used, _) = session_context_used(messages, session, state);
-                let percent = (used.saturating_mul(100)) / budget.effective.max(1);
-                eprintln!(
-                    "context window: {used} of {} effective token(s) used ({percent}%), window {window} — /context for provenance",
-                    budget.effective,
-                );
-            }
-            eprintln!(
-                "~ kitsu meters tokens, not currency — multiply by your gateway's rates; provider-side prompt-cache discounts are not itemized on the OpenAI-compatible wire"
-            );
-            return SlashResult::Continue(None);
         }
         "loop" => {
             let mut parts = arg.splitn(2, char::is_whitespace);
@@ -19453,6 +19649,173 @@ mod tests {
         assert_eq!(failure_count_phrase(2), "2 failures");
     }
 
+    fn telemetry_route_receipt_fixture() -> ProviderRouteReceipt {
+        serde_json::from_value(serde_json::json!({
+            "receipt_revision": 1,
+            "route": {
+                "contract_revision": 1,
+                "adapter": "openai_compatible",
+                "profile": "profile-v1-0123456789abcdef0123456789abcdef",
+                "generation": 3,
+                "wire_revision": "openai_chat_completions_v1",
+                "capabilities": { "revision": 1, "supported": ["usage"] }
+            },
+            "model": "fixture-model",
+            "auth_source": "environment",
+            "policy": {
+                "inference_retries": 0,
+                "catalog_retries": 0,
+                "inference_timeout": { "seconds": 30, "nanoseconds": 0 },
+                "catalog_timeout": { "seconds": 10, "nanoseconds": 0 },
+                "advisory_discovery_timeout": { "seconds": 2, "nanoseconds": 0 },
+                "catalog": "unavailable",
+                "retry_generation": "bound_generation",
+                "semantic_replay_generation": "current_generation",
+                "fallback": "disabled"
+            }
+        }))
+        .expect("provider-free route receipt fixture")
+    }
+
+    #[test]
+    fn current_session_authority_counts_minimal_roots_and_protected_union_once() {
+        let authority = current_session_authority_input(
+            Mode::Scoped,
+            vec!["/work".into(), "/work/src".into(), "/other".into()],
+            vec!["/work".into(), "/work/out".into(), "/work".into()],
+            vec!["/private".into(), "/private/config".into()],
+            vec!["/private".into(), "/state".into(), "/state/cache".into()],
+            2,
+            true,
+        );
+
+        assert_eq!(authority.mode, kitsu_core::EffectiveAuthorityMode::Scoped);
+        assert_eq!(authority.read_roots, 2);
+        assert_eq!(authority.write_roots, 1);
+        assert_eq!(authority.protected_roots, 2);
+        assert_eq!(authority.exact_command_grants, 2);
+        assert!(authority.commands_enabled);
+    }
+
+    #[test]
+    fn current_session_context_preserves_default_anchor_and_shortfall_truth() {
+        let default = current_session_context_input(
+            None,
+            ContextWindowSource::ConservativeDefault,
+            Some(2_048),
+            1_000,
+            false,
+            None,
+        );
+        assert_eq!(default.window_tokens.value(), Some(&DEFAULT_CONTEXT_WINDOW));
+        assert_eq!(
+            default.window_tokens.truth_class(),
+            kitsu_core::TruthClass::Estimated
+        );
+        assert_eq!(
+            default.used_tokens.provenance(),
+            kitsu_core::TelemetryProvenance::ContextMeterEstimate
+        );
+
+        let clamped = current_session_context_input(
+            Some(32_768),
+            ContextWindowSource::LiveDiscovery,
+            Some(2_048),
+            12_000,
+            true,
+            Some(kitsu_core::ContextWindowEvidence {
+                reported_prompt_tokens: 8_192,
+                estimated_sent_tokens: 20_000,
+                resolved_window: 32_768,
+                warned: true,
+                shortfall_count: 2,
+            }),
+        );
+        assert_eq!(clamped.window_tokens.value(), Some(&32_768));
+        assert_eq!(
+            clamped.window_tokens.truth_class(),
+            kitsu_core::TruthClass::Authoritative
+        );
+        assert_eq!(
+            clamped.used_tokens.provenance(),
+            kitsu_core::TelemetryProvenance::ProviderAnchoredContextMeter
+        );
+        assert_eq!(
+            clamped.effective_tokens.value(),
+            Some(&ContextBudget::new(8_192, Some(2_048)).effective)
+        );
+        assert_eq!(
+            clamped.effective_tokens.truth_class(),
+            kitsu_core::TruthClass::Derived
+        );
+    }
+
+    #[test]
+    fn current_session_observation_preserves_mixed_coverage_and_cached_presence() {
+        let authority = current_session_authority_input(
+            Mode::Deny,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+            false,
+        );
+        let context = current_session_context_input(
+            Some(16_384),
+            ContextWindowSource::Profile,
+            Some(1_024),
+            400,
+            false,
+            None,
+        );
+        let coverage = |cached_prompt_tokens| kitsu_core::RunUsageSnapshot {
+            turns: 2,
+            prompt_tokens: 120,
+            completion_tokens: 30,
+            total_tokens: 150,
+            coverage: kitsu_core::RunProviderUsageCoverageSnapshot {
+                all: kitsu_core::ProviderUsageCoverageSnapshot {
+                    responses_reporting_usage: 2,
+                    responses_missing_usage: 1,
+                    cached_prompt_tokens,
+                },
+                ..Default::default()
+            },
+        };
+
+        let absent = current_session_snapshot_from_observation(
+            telemetry_route_receipt_fixture(),
+            Some("bad session id".to_string()),
+            run_spec().run_id().clone(),
+            authority,
+            context.clone(),
+            coverage(None),
+        );
+        assert_eq!(absent.status.session_id.value(), None);
+        assert_eq!(absent.usage.responses_reporting_usage.value(), Some(&2));
+        assert_eq!(absent.usage.responses_missing_usage.value(), Some(&1));
+        assert_eq!(absent.usage.cached_prompt_tokens.value(), None);
+
+        let supplied_zero = current_session_snapshot_from_observation(
+            telemetry_route_receipt_fixture(),
+            Some("session-42".to_string()),
+            run_spec().run_id().clone(),
+            authority,
+            context,
+            coverage(Some(0)),
+        );
+        assert_eq!(
+            supplied_zero.status.session_id.value(),
+            Some(&"session-42".to_string())
+        );
+        assert_eq!(supplied_zero.usage.cached_prompt_tokens.value(), Some(&0));
+        assert_eq!(
+            supplied_zero.usage.monetary_cost.truth_class(),
+            kitsu_core::TruthClass::Unavailable
+        );
+    }
+
     #[test]
     fn cli_errors_preserve_neutral_outcome_class_independently_from_exit_code() {
         assert_eq!(
@@ -20507,7 +20870,13 @@ mod tests {
                 Some(parent) => {
                     assert!(help.contains(&format!("(alias: /{})", spec.name)));
                     assert!(
-                        !help.contains(&spec.syntax()),
+                        !help.lines().any(|line| {
+                            let row = line.trim_start();
+                            row == spec.syntax()
+                                || row
+                                    .strip_prefix(&spec.syntax())
+                                    .is_some_and(|rest| rest.starts_with("  "))
+                        }),
                         "alias {} has own row",
                         spec.name
                     );
@@ -20524,6 +20893,53 @@ mod tests {
         assert!(help.ends_with(
             "current model: test-model — /help <command> explains one command in detail"
         ));
+    }
+
+    #[test]
+    fn usage_registry_exposes_session_default_and_cost_compatibility_alias() {
+        let usage = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "usage")
+            .expect("/usage is registered");
+        assert_eq!(usage.args, "[session]");
+        assert_eq!(usage.syntax(), "/usage [session]");
+        assert!(!usage.description.contains("daily"));
+        assert!(!usage.description.contains("weekly"));
+
+        let cost = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "cost")
+            .expect("/cost remains registered for compatibility");
+        assert_eq!(cost.args, "");
+        assert_eq!(cost.syntax(), "/cost");
+        assert_eq!(cost.alias_of, Some("usage"));
+        assert!(cost.description.contains("compatibility"));
+
+        let help = slash_help("test-model", false);
+        assert!(help.contains("/usage [session]"));
+        assert!(help.contains("(alias: /cost)"));
+        assert!(!help
+            .lines()
+            .any(|line| line.trim_start().starts_with("/cost ")));
+
+        let cost_help = slash_command_help("cost");
+        assert!(cost_help.starts_with("/usage [session]"));
+        assert!(cost_help.contains("/cost is an alias of /usage"));
+    }
+
+    #[test]
+    fn context_registry_exposes_only_bare_window_sources_and_refresh_forms() {
+        let context = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "context")
+            .expect("/context is registered");
+        assert_eq!(context.args, "[window|sources|refresh]");
+        assert_eq!(context.syntax(), "/context [window|sources|refresh]");
+        assert!(context.details.contains("Bare `/context` preserves"));
+        assert!(context.details.contains("`sources`"));
+        assert!(context.details.contains("`refresh`"));
+        assert!(!context.details.contains("daily"));
+        assert!(!context.details.contains("account"));
     }
 
     #[test]

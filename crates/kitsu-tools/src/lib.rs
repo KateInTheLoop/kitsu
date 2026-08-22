@@ -4,7 +4,14 @@
 
 pub mod builtins;
 pub mod error;
+pub mod mcp_codec;
 pub mod permissions;
+pub mod semantic;
+
+// E06 begins with a private, provider-free admission boundary. Later cards
+// consume these values from the bounded child supervisor; they are not a
+// public extension API.
+mod external;
 
 pub use builtins::command::{
     command_exec_tool, env_name_looks_secret, execute_command, scope_command_progress,
@@ -27,6 +34,7 @@ pub use permissions::{
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use kitsu_providers::ToolDescriptor;
 
@@ -67,8 +75,35 @@ pub type HandlerFn = Box<
 /// have a handler but no descriptor (used by tests and the descriptor-free `ask` path).
 #[derive(Default)]
 pub struct Registry {
-    handlers: HashMap<String, HandlerFn>,
+    handlers: HashMap<String, Arc<HandlerFn>>,
     descriptors: Vec<ToolDescriptor>,
+}
+
+/// One immutable tool inventory frozen from a [`Registry`]. Descriptor order,
+/// handler identity, and descriptor-free handlers all match the source at the
+/// instant of freezing. Later registry composition cannot change the schemas
+/// or call resolution owned by an in-flight provider request.
+pub struct ToolInventory {
+    handlers: HashMap<String, Arc<HandlerFn>>,
+    descriptors: Vec<ToolDescriptor>,
+}
+
+impl ToolInventory {
+    /// Exact descriptors frozen for this inventory, in registration order.
+    pub fn descriptors(&self) -> &[ToolDescriptor] {
+        &self.descriptors
+    }
+
+    pub fn is_registered(&self, name: &str) -> bool {
+        self.handlers.contains_key(name)
+    }
+
+    pub async fn run(&self, name: &str, args: String) -> Result<String, ToolError> {
+        match self.handlers.get(name) {
+            Some(handler) => handler(args).await,
+            None => Err(ToolError::NotFound(name.to_string())),
+        }
+    }
 }
 
 impl Registry {
@@ -91,7 +126,7 @@ impl Registry {
         if self.handlers.contains_key(&name) {
             return Err(RegistryError::DuplicateName { name });
         }
-        self.handlers.insert(name, handler);
+        self.handlers.insert(name, Arc::new(handler));
         Ok(())
     }
 
@@ -107,7 +142,8 @@ impl Registry {
                 name: descriptor.name,
             });
         }
-        self.handlers.insert(descriptor.name.clone(), handler);
+        self.handlers
+            .insert(descriptor.name.clone(), Arc::new(handler));
         self.descriptors.push(descriptor);
         Ok(())
     }
@@ -116,6 +152,16 @@ impl Registry {
     /// `tools` field (preserving the descriptor-free `ask` path).
     pub fn descriptors(&self) -> &[ToolDescriptor] {
         &self.descriptors
+    }
+
+    /// Freeze an owned request inventory. Cloning shares immutable handler
+    /// identities while copying the bounded schema/name collections, so the
+    /// returned value no longer borrows and cannot observe later registration.
+    pub fn inventory(&self) -> ToolInventory {
+        ToolInventory {
+            handlers: self.handlers.clone(),
+            descriptors: self.descriptors.clone(),
+        }
     }
 
     pub fn is_registered(&self, name: &str) -> bool {
@@ -244,6 +290,52 @@ mod tests {
         assert_eq!(
             registry.run("test_tool", "{}".to_string()).await.unwrap(),
             "described"
+        );
+    }
+
+    #[tokio::test]
+    async fn frozen_inventory_retains_exact_descriptor_and_handler_snapshot() {
+        let mut registry = Registry::new();
+        let first = descriptor("first_tool", "first descriptor");
+        registry
+            .register_with_descriptor(first.clone(), handler("first result"))
+            .expect("first registration succeeds");
+        registry
+            .register("legacy_tool", handler("legacy result"))
+            .expect("legacy registration succeeds");
+
+        let frozen = registry.inventory();
+
+        let second = descriptor("second_tool", "second descriptor");
+        registry
+            .register_with_descriptor(second.clone(), handler("second result"))
+            .expect("later registration succeeds");
+
+        assert_eq!(frozen.descriptors(), std::slice::from_ref(&first));
+        assert!(frozen.is_registered("first_tool"));
+        assert!(frozen.is_registered("legacy_tool"));
+        assert!(!frozen.is_registered("second_tool"));
+        assert_eq!(
+            frozen.run("first_tool", "{}".to_string()).await.unwrap(),
+            "first result"
+        );
+        assert_eq!(
+            frozen.run("legacy_tool", "{}".to_string()).await.unwrap(),
+            "legacy result"
+        );
+        assert!(matches!(
+            frozen
+                .run("second_tool", "{}".to_string())
+                .await
+                .unwrap_err(),
+            ToolError::NotFound(name) if name == "second_tool"
+        ));
+
+        let next = registry.inventory();
+        assert_eq!(next.descriptors(), &[first, second]);
+        assert_eq!(
+            next.run("second_tool", "{}".to_string()).await.unwrap(),
+            "second result"
         );
     }
 }

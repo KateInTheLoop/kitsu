@@ -846,7 +846,7 @@ Slash commands inside the REPL:
 | `/model <name>` | Switch model (keeps history). |
 | `/models [filter]` | Preview the models the gateway offers (from its `models_path`), optionally filtered by a substring — e.g. `/models qwen`. The active model is pinned and marked; large catalogs show 12 rows plus a narrowing hint. Listed IDs can be passed to `/model`. |
 | `/reasoning [none\|minimal\|low\|medium\|high\|xhigh\|default]` | Show or change reasoning effort for subsequent turns. |
-| `/status` | Show the active gateway/model and immutable provider adapter/profile/generation/wire/capability/policy receipt, plus directory, context usage, enabled tools, permissions, background agents, and cumulative/last compaction details. |
+| `/status` | Show one offline typed observation of the active route/model/generation, runtime/session identity, directory, effective authority, context occupancy, and current usage coverage with explicit truth/provenance. Output adapts across terminal, plain, screen-reader, and redirected destinations. |
 | `/diff [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Show bounded host-verified evidence for an explicit scope. Host-owned: needs no read grant, and the bytes never leave your terminal. |
 | `/review [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Review exactly that verified evidence in a no-tools turn. Discloses one bounded diff to the model without granting a read root. The top-level `kitsu review` provides the noninteractive form. |
 | `/checkpoints` / `/checkpoint <id>` | List recoverable write checkpoints or preview one verified diff. |

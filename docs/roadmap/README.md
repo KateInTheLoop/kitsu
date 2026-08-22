@@ -709,6 +709,39 @@ gates merely because a card appears attractive.
 | 098 | E03-S02-C39 | Admit only snapshot-writable bound-current resume and reject canonical state before product routing |
 | 099 | E03-S02-C40 | Mount durable startup resume on the pinned bound-current route with explicit canonical refusal |
 | 100 | E03-S02-C41 | Stage an exact bound-current in-process target and swap the active owner only after every fallible precommit step |
+| 101 | E06-S02-C1 | Freeze one non-cloneable request inventory that owns exact descriptor order and immutable handler identities through provider response execution |
+| 102 | E06-S01-C1 | Admit one exact versioned child identity and containment preflight only after disabled, denied, malformed, and authority-mismatched requests fail without host effects |
+| 103 | E06-S03-C1 | Decode and emit bounded newline JSON-RPC through one pinned, one-request-at-a-time initialize/list/call state machine that rejects every ambient MCP capability |
+| 104 | E06-S02-C2 | Bind every proposed external tool to closed source, incarnation, revision, and tool identities plus one bounded canonical descriptor fingerprint before publication |
+| 105 | E06-S01-C2 | Own one single-use prepared child through causal ready/start/running/draining/terminal truth, joined natural exit, idempotent shutdown, and typed cleanup residue |
+| 106 | E08-S05-C1 | Type one presentation-neutral current-session status, context, usage, and cost snapshot whose every value carries bounded truth and provenance |
+| 107 | E06-S02-C3 | Publish complete validated external inventories through exact source-lifetime/revision fences with atomic successor, replacement, and withdrawal truth |
+| 108 | E06-S01-C3 | Bind exact bounded phase, I/O, process-group, environment, network, and timeout/reap policy into request, host authority, and prepared child identity |
+| 109 | E08-S05-C2 | Retain reported/missing provider-response coverage and cached-token presence per fixed request purpose, then adapt it without inventing missing telemetry |
+| 110 | E08-S05-C3 | Render only typed current-session facts through adaptive wide/stacked/narrow and stable redirected/plain/no-color/screen-reader decks |
+| 111 | E06-S01-C4 | Consume exact authorized phase budgets in a provider-free supervisor with checked monotonic deadlines, ordered terminate/kill/reap transitions, and owned residue truth |
+| 112 | E08-S05-C4 | Collect one coherent in-memory snapshot and mount exact offline `/usage session` through the typed usage-only adaptive renderer |
+| 113 | E07-S01-C1 | Freeze a bounded provider-free mixed-language locate/explain/change-evidence baseline over the current read-only repository tools |
+| 114 | E05-S01-C1 | Stage a private effect-free guided-setup transaction with explicit consent, create-new publication, reverse owned rollback, and transferable residue |
+| 115 | E06-S01-C5 | Execute one prepared child through a private Linux backend with bounded pipes, real clocks, process-group cleanup, and truthful completion |
+| 116 | E05-S01-C2 | Publish secret-free guided-setup configuration create-new through descriptor-relative durability and exact owned rollback |
+| 117 | E08-S05-C5 | Mount one typed offline current-session observation on adaptive `/status` while preserving the legacy JSONL payload shape |
+| 118 | E06-S01-C6 | Execute exact sealed native bytes under one bounded Landlock filesystem-content policy with no pathname fallback |
+| 119 | E06-S01-C7 | Retain one sealed authorized child across strictly serial bounded line frames with exact deadlines, caps, and owned cleanup |
+| 120 | E05-S01-C3 | Compose the pure local setup transaction with descriptor-relative create-new publication and exact concrete recovery ownership |
+| 121 | E08-S05-C6 | Mount exact offline `/context window` from one typed current-session observation and the existing adaptive renderer |
+| 122 | E07-S01-C2 | Measure a deterministic structural selector against the frozen baseline and record the threshold-backed promote decision |
+| 123 | E05-S02-C1 | Stage a deterministic offline model picker over one bounded provenance-bearing catalog snapshot without applying it |
+| 124 | E08-S05-C7 | Unify bare/session usage and legacy cost compatibility over one truthful typed current-session snapshot |
+| 125 | E07-S01-C3 | Prove selector authority refusal and current-source reconstruction across hostile, replaced, and revoked evidence |
+| 126 | E06-S03-C2 | Compose the pinned tools-only MCP codec with one proof-bounded strictly serial child owner and fail-closed cleanup truth |
+| 127 | E08-S05-C8 | Mount an offline typed `/context sources` deck with estimated coarse rows and explicit unavailable sub-buckets |
+| 128 | E07-S01-C4 | Compile the measured selector as an unmounted bounded read-only contributor with current authority and source revalidation |
+| 129 | E05-S01-C4 | Isolate test-only publication, rollback, and hook fault plans with generation-scoped unwind-safe guards |
+| 130 | E06-S03-C3 | Prove the bounded tools-only composition against one exact test-only sealed peer with typed failure and reap truth |
+| 131 | E05-S02-C2a | Bind every model-picker proposal to exact declaration-derived profile, compiled adapter, and wire identity |
+| 132 | E05-S02-C2b | Consume one explicit namespace-equal proposal in private local setup while retaining its truth through recovery |
+| 133 | E06-S02-C4 | Bind one exact host-authored echo inventory and dual-grant no-replay call to the sealed MCP owner with atomic withdrawal |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -874,6 +907,278 @@ performs one infallible active-owner swap. The polished checkpoint then feeds
 the dependency-safe candidate branches in the
 [parallel delivery plan](parallel-delivery-plan.md); integration acceptance and
 cycle numbering remain serialized.
+Cycle 101 begins E06 by freezing the exact tool descriptors and handler
+identities used by each provider request. Structured calls, recovered text
+calls, and output-offload eligibility all resolve through that same owned,
+non-cloneable inventory until the response is complete. Descriptor-free and
+static-registry behavior remain byte-compatible. This foundation introduces no
+external tool source, child process, MCP configuration, or product route.
+Cycle 102 adds the private, provider-free admission half of the future bounded
+child owner. A host-authored profile must exactly match version, normalized
+absolute executable and working directory, lowercase SHA-256 identity, and
+bounded literal argv before executable canonicalization, hashing, or
+containment preflight may occur. Disabled and denied entries fail first. The
+prepared result remains unspawned: there is no process API, configuration
+surface, runtime composition, or new product authority in this cycle.
+Cycle 103 adds a pure tools-only MCP codec. It pins revision `2025-11-25`,
+advertises no client capabilities, requires only a non-changing server tools
+capability, and admits just initialize/initialized, tools/list, and tools/call
+with one positive integer request ID in flight. Newline framing is explicitly
+bounded and fail-stop. The codec returns raw list/call results only after
+envelope validation; later inventory work owns descriptor validation and
+publication. It still owns no process, transport, deadline, configuration,
+inventory, or product route.
+Cycle 104 defines the closed identity half of external inventory publication.
+Host-authored source, source-incarnation, non-zero inventory-revision, and tool
+IDs are distinct bounded types; advertised names are never identities. A
+transactional validator rejects malformed, oversized, duplicate, and colliding
+proposals before returning a complete inventory. Each descriptor is bound to a
+domain-separated SHA-256 over Kitsu's versioned canonical name, description,
+and schema bytes. This is intentionally not a general JSON canonicalization
+standard. Revision monotonicity, publication/CAS, withdrawal, configuration,
+child trust, and MCP/product composition remain for later cards.
+Cycle 105 adds a non-cloneable provider-free lifecycle owner. Its only
+construction input is the now non-cloneable prepared-launch proof; spawn is an
+injected effect that consumes that proof once. EOF and idle remain observations,
+never success. Natural exit is classified only after the owner calls join, and
+cancel/shutdown signal before join. Unjoined residue remains owned for a drop
+retry and an explicit cleanup report. The effect implementation is still a
+synchronous fixture: there is no real process, pipe, deadline, phase budget,
+durable drop-report store, configuration, or MCP composition.
+Cycle 106 begins the requested `/status`, `/context window`, and `/usage
+session` work with a pure snapshot contract rather than terminal art. Route,
+session/run identity, effective authority, context occupancy, provider-usage
+coverage, token categories, and cost each carry exactly one authoritative,
+provider-reported, derived, estimated, or unavailable variant with closed
+provenance. Missing provider usage has no value and cannot serialize as zero;
+portable cost is unavailable unless the provider explicitly reported currency.
+Existing slash output is unchanged. Run tallies do not yet retain per-response
+usage coverage or cached tokens, so a product adapter and renderer would still
+be dishonest; those are separate prerequisite cards.
+Cycle 107 adds one private, non-cloneable publication owner for a complete
+validated external inventory. Initial publication refuses overwrite;
+same-incarnation updates require the exact next non-wrapping revision; explicit
+replacement and withdrawal require an exact fence for the currently published
+source lifetime and revision. Every refusal preserves the same borrowed old
+snapshot, while success swaps the whole boxed value once. No handler registry,
+child, transport, MCP, configuration, or product path consumes the owner yet.
+Cycle 108 makes the prepared child proof retain one exact runtime policy shared
+with its host authority profile. Five non-zero phase budgets and four non-zero
+I/O ceilings are independently capped; a frame must fit both protocol stream
+budgets. The environment is clear-only with a bounded, ordered, unique literal
+projection whose values are redacted from debug output. Owned process group,
+denied network, and terminate-group-then-reap timeout disposition are mandatory.
+Validation remains inert and unmounted: no process backend enforces the policy
+yet, and the card does not claim containment from the typed values alone.
+Cycle 109 makes current-run accounting distinguish every completed provider
+response that reported usage from one that omitted it, while transport-only and
+uncompleted partial responses are not invented. Per-logical-request physical
+attempt correlation deduplicates retry/terminal observations; a usage report is
+retained even if the stream later fails. Cached prompt tokens preserve explicit
+zero versus absence. Fixed all/inference/compaction/model-catalog buckets feed a
+pure session-usage adapter, but catalog remains unpopulated and no slash command,
+renderer, JSONL field, persistence, cost, or account lookup is mounted.
+Cycle 110 adds a private, presentation-only renderer for the typed status,
+context, and current-session usage snapshot. Styled output uses bounded wide,
+stacked, and narrow layouts; tiny one-cell terminals and double-width Unicode
+remain width-safe. Redirected, plain, no-color, and screen-reader destinations
+share one stable escape-free projection independent of terminal width. Every
+rendered value retains truth/provenance, unavailable facts stay explicit, and
+cost appears only when already provider-reported. Snapshot collection, slash
+routing, JSONL, persistence/history, provider/account/MCP calls, credits, rate
+limits, and inferred pricing remain absent.
+Cycle 111 consumes the already-authorized startup, request, drain, kill, and
+reap budgets in one private provider-free phase supervisor. Every deadline uses
+checked injected monotonic time, equality expires before polling, cancellation
+and shutdown converge idempotently, and process-group termination precedes
+fresh kill and reap clocks. Spawn/effect/clock faults and reap expiry retain one
+non-cloneable owned residue instead of reporting success or abandoning a child.
+The effects remain fixtures: no OS process, pipe, containment backend, natural
+exit composition, configuration, inventory, MCP route, or product behavior is
+mounted.
+Cycle 112 mounts the first typed telemetry deck as exact `/usage session`. The
+command reads the frozen route receipt once, snapshots current effective
+authority, context provenance/arithmetic, process run/session identity, and one
+run-usage observation without an await point or external effect, then renders
+only the usage section. Reported/missing coverage, cached-token absence versus
+reported zero, unavailable cost, terminal destination, and offline zero-send
+behavior remain explicit. Bare `/usage`, calendar history, account/price/limit
+data, `/cost` aliasing, `/status` and `/context` migration, and a JSONL
+`command_result` contract remain separate cards.
+Cycle 113 freezes the first E07 measurement baseline without adding a production
+context contributor. Three immutable mixed-language vectors run fixed read-only
+symbol, outline, grep, file, and manifest plans against an embedded corpus. The
+canonical JSONL is byte-identical across independent temporary roots and records
+closed relevance, round, declared byte-to-token, retained tool-byte, and
+deadline-class evidence. Every input/resource dimension is capped and an
+overflow stops later calls. The change vector proves only read-only evidence
+acquisition; it does not edit or claim task completion. Tree-sitter, reference
+graphs, PageRank, caching, provider calls, production registration, and any
+semantic-selector benefit remain unimplemented and require measured comparison.
+Cycle 114 begins E05 with a pure private transaction rather than a UI or effect
+adapter. Local, hosted, and custom proposals normalize bounded non-secret route
+facts offline; malformed endpoint/target shapes fail before a transaction.
+Explicit consent is the first effect-capable boundary, and exact fenced receipts
+advance acquire, validate, and create-new publish stages. Cancellation or failure
+after effects moves only adapter-reported owned receipts into reverse rollback;
+incomplete cleanup transfers non-cloneable residue with the primary cause. No
+prompt, model picker, provider/catalog call, credential entry/store, config write,
+CLI route, or first-success claim is mounted yet.
+Cycle 115 adds one private real Linux backend behind the exact prepared launch
+and phase supervisor. It builds seccomp state before fork, closes inherited
+descriptors, clears capabilities, denies network and process-group/namespace
+escape, bounds and joins every pipe worker, and uses real monotonic deadlines.
+Real fixtures prove exit/EOF/crash truth, overflow, timeout, cancellation,
+shutdown, descendant-group death, direct wait, drop cleanup, and retryable owned
+residue. It remains unmounted and one-process/one-request: filesystem
+confinement, immutable executable identity, serial MCP transport, inventory
+composition, configuration, and product acceptance are still absent.
+Cycle 116 gives the pure guided-setup transaction one private real configuration
+publication adapter. It renders bounded secret-free TOML, traverses an existing
+parent through no-follow descriptors, installs a same-directory mode-0600 stage
+with no-overwrite link publication and explicit durability truth, and records
+the exact installed object in a bounded concrete ledger. Rollback quarantines
+and removes only that verified object; mutation, cleanup uncertainty, or a
+registration/transfer failure retains a consuming retry owner. The mechanism is
+Linux-only and unmounted: it creates no parents, contacts no provider or
+credential store, prompts no user, selects no model, and activates no config.
+Cycle 117 replaces the legacy human `/status` formatter with the staged typed
+current-session deck. One route receipt and one synchronous observation drive
+route/runtime/session identity, effective authority, context occupancy, and
+current usage coverage across wide, stacked, narrow, tiny, plain, no-color,
+screen-reader, and redirected destinations. The command performs no provider,
+account, Git, or filesystem probe. Its legacy JSONL keys and nesting stay
+unchanged, with deterministic text rendered from the same observation. Credits,
+rates, prices, inferred cost, durable history, `/context` migration, and a new
+automation schema remain absent.
+Cycle 118 closes the disclosed child-executable pathname race and adds one
+bounded filesystem-content authority. After exact request/profile admission,
+the private Linux x86-64 backend copies and hashes a capped native ELF into a
+fully sealed executable memfd, pairs descriptor-pinned cwd/roots with a unique
+linear containment token, applies a parent-built Landlock ruleset, and invokes
+only those bytes through `execveat(AT_EMPTY_PATH)`. Unsupported ABI/platform,
+non-ELF input, seal/ruleset/descriptor/token failure, or authority mismatch
+fails closed before target code. This is still unmounted and one-shot. Landlock
+does not provide mount isolation, path/stat/access secrecy, metadata-family or
+host signal/ptrace confinement; no general sandbox, MCP, or X002 claim follows.
+Cycle 119 retains that exact sealed and Landlock-bound child across multiple
+strictly serial newline frames. One in-flight frame, full request write before
+response, fixed line and progress-reset idle deadlines, cumulative pipe caps,
+bounded frame count, and response consumption once are enforced by one private
+owner. EOF, crash, extra carry, overflow, clock/effect fault, cancellation,
+shutdown, and drop all converge on the existing group-termination/direct-reap
+path or transfer typed retry residue. This is opaque line transport only: MCP
+codec composition, inventory publication, configuration, and product routing
+remain absent.
+Cycle 120 composes the pure guided-setup transaction with the accepted
+descriptor-relative publisher for one private local/offline path. Exact
+transaction fences, a same-ID concrete effect ledger, and create-new
+publication ensure no logical config receipt exists before installation.
+Collision, missing parent, publication failure, rollback, and incomplete stage
+cleanup retain distinct ownership and never overwrite existing configuration.
+The coordinator remains private and unmounted: no prompt, UI, activation,
+provider, catalog, credential, hosted, or custom path is added.
+Cycle 121 mounts exact `/context window` from one bound route receipt and one
+synchronous typed current-session snapshot. Only the context section renders,
+using the same adaptive and accessible destination policy as the status and
+usage decks. Bare `/context` and `/context refresh` remain unchanged. The new
+view is offline and side-effect-free; JSONL keeps lifecycle framing but gains no
+new result payload or misleading reuse of the legacy context schema.
+Cycle 122 records a test-only structural-selector experiment against the same
+three frozen locate/explain/change-evidence vectors. All relevance remains
+10,000 basis points with no forbidden evidence, while aggregate rounds fall
+from 5 to 3 and canonical tool bytes from 1,456 to 1,134, below the predeclared
+1,164-byte promotion threshold. Anti-gaming, permission, denied-symlink,
+overflow, determinism, and fresh-read cases pass. The decision promotes only
+the next authority/staleness experiment; no production contributor, cache,
+provider, mutation, or completed-task claim is added.
+Cycle 123 stages a private immutable model-picker snapshot and proposal. Closed
+availability/source/freshness/provenance tuples and present/absent/unobserved
+membership preserve offline and stale uncertainty. Bounded normalization,
+deduplication, filtering, deterministic ranking, current/default flags, and
+narrow projection operate without provider, network, filesystem, cache,
+credential, configuration, route, or session effects. No apply, publication,
+UI, capability inference, or product mount exists.
+Cycle 124 makes bare `/usage` and `/usage session` identical typed views and
+retains empty-args-only `/cost` as a documented compatibility alias. All forms
+share one in-memory route receipt, snapshot collector, and usage-only adaptive
+renderer. Help, invalid syntax, and original JSONL lifecycle spelling remain
+explicit; JSONL gains no result payload or stderr text. No account, provider,
+network, filesystem, persistence, history, pricing, currency, credit, or rate
+lookup is introduced.
+Cycle 125 hardens the promoted test-only structural selector at its authority
+and staleness boundary. Discovery hits now rank candidates but never supply
+emitted text; every selected path and line is reconstructed through bounded
+current permission-gated reads after the test interstice. Denied, private, and
+symlink candidates leak no canary or path, replacement emits only revalidated
+current truth, and revocation returns no evidence. The original 5-to-3-round and
+1,456-to-1,134-byte promotion result remains byte-stable. This still adds no
+production contributor, cache, provider, mutation, or completed-task claim.
+Cycle 126 privately composes the pinned tools-only MCP codec with one bounded
+serial child owner. Exact initialize, response-free initialized notification,
+tools/list, and strictly serial tools/call ordering share proof-derived frame,
+payload, deadline, and cumulative limits. Client, decoder, protocol, transport,
+clock, and cleanup faults remain typed and cannot publish a stale event or
+success. The owner is still unmounted: no configuration, inventory, handler,
+product route, additional MCP vocabulary, or external-tool acceptance claim is
+added.
+Cycle 127 adds exact `/context sources` from retained request-assembly entries,
+current role-based messages, budget evidence, and session compaction accounting.
+Coarse source tokens remain estimated, budget fields derived, and compaction
+counts authoritative; attachments, on-demand skill bodies, memory, and response
+schema are structurally unavailable rather than zero. Adaptive and accessible
+rendering adds no source-total claim or JSONL result. Bare context, window, and
+refresh behavior remain unchanged, and the command performs no provider,
+account, network, command-time filesystem, persistence, or history work.
+Cycle 128 compiles the measured selector into a public Rust mechanism but does
+not register, configure, or invoke it from the product. Existing permissions
+remain the sole read authority and interactive prompts are suppressed. After
+ranking, bounded current reads reconstruct every emitted line and current role
+classification; changed, shifted, removed, revoked, protected, and symlinked
+evidence cannot yield a partial artifact. The frozen 286/517/331-byte outputs,
+10,000-basis-point relevance, and 5-to-3-round result remain unchanged. No
+tree-sitter/index/cache, provider call, edit, automatic context injection, or
+user-visible semantic feature is claimed.
+Cycle 129 fixes the acceptance harness rather than production behavior.
+Publication, rollback, and pre-install-hook fault plans now have must-use
+generation guards whose drop clears only the matching unconsumed plan. Early
+returns and panics cannot poison a later libtest worker, and an older live guard
+cannot erase a newer injected plan. Deterministic regressions cover all three
+channels; create-new, collision, durability, cleanup, ledger, and rollback
+semantics are unchanged.
+The Cycle 129 acceptance repair then fixes the production rollback defect that
+the clean full suite exposed. The pinned parent now carries a nonblocking
+advisory Kitsu-writer lock through publication and rollback; quarantine rename
+rebaselines only its own ctime transition, and exact receipt-fd/name evidence
+classifies removed, restored, displaced, or unknown ownership. This is not a
+conditional unlink primitive and does not contain arbitrary noncooperating or
+privileged same-UID writers; a private transaction namespace/authority remains
+a later hardening gate.
+Cycle 130 runs the private MCP composition against an exact test-only raw peer
+inside the sealed memfd, Landlock, seccomp, serial-transport lifecycle. The
+fixture proves one-child initialize/notification/list/call framing, exact
+typed protocol failures, cancellation, shutdown, and descendant reaping. It
+adds no product configuration, inventory, handler, provider, or user-visible
+MCP surface.
+Cycle 131 binds private model-picker snapshots, views, and proposals to exact
+typed provider profile, adapter, and wire-revision identity derived from a
+validated route declaration. Capabilities and route generations deliberately
+do not define the model namespace, and offline/stale membership truth remains
+unchanged. Selection still has no apply/publication/UI/product mount.
+Cycle 132 composes one explicit exact-namespace proposal with the private local
+setup owner. Admission checks explicit basis and whole profile/adapter/wire
+identity before replacing the already-normalized preview model; rejection,
+completion, collision, execution error, rollback recovery, and retry retain the
+whole proposal. The card adds no UI, catalog/provider request, credential,
+activation, current-route publication, or product mount.
+Cycle 133 binds the sealed tools-only MCP owner to one exact host-authored echo
+inventory. Exact non-paginated child list truth must match the compiled
+descriptor before atomic publication. One call requires both host and caller
+identity/fingerprint grants, becomes non-replayable once possibly accepted,
+withdraws before cleanup, and exposes its validated integer only after clean
+child shutdown. Cleanup failure retains primary, response evidence, and one
+owned residue without claiming success. Grant construction, configuration,
+registry/request inventory, restart, and product mounting remain absent.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
