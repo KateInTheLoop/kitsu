@@ -16,7 +16,7 @@ license = "MIT"
 description = "One fox, all the fortune. A terminal coding agent that harvests OpenAI, Anthropic, Hugging Face, and local LLMs without picking sides."
 repository = "https://github.com/KateInTheLoop/kitsu"
 homepage = "https://github.com/KateInTheLoop/kitsu"
-authors = ["Kate <kate@westedge.io>"]
+authors = ["CatherinaInTheLoop <CatherinaInTheLoop@pm.me>"]
 
 [workspace.dependencies]
 # Async runtime + HTTP (locked decisions, development_plan.md)

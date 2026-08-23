@@ -72,9 +72,9 @@ flight) — GLM should take fresh items.
 - **Gateway**: `--gateway huggingface --model zai-org/GLM-5.2:together
   --context-window 131072 --timeout-secs 300 --max-output-tokens 24000
   --reasoning-effort low --max-rounds 30 --agent-spawn-cap 1`.
-- **COMMIT IDENTITY**: every commit authored exactly `KateInTheLoop
-  <315232649+KateInTheLoop@users.noreply.github.com>`; commit with `git
-  -c user.name=KateInTheLoop -c user.email=315232649+KateInTheLoop@users.noreply.github.com
+- **COMMIT IDENTITY**: every commit authored exactly `CatherinaInTheLoop
+  <CatherinaInTheLoop@pm.me>`; commit with `git
+  -c user.name=CatherinaInTheLoop -c user.email=CatherinaInTheLoop@pm.me
   commit ...`; never any other -c user.email; verify author after commit.
 - **Token**: supervisor reads it from `~/.cache/kitsu-hf-token`; env/header
   ONLY, never into any file, commit, log, or doc.

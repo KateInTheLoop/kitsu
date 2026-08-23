@@ -57,7 +57,7 @@ futures = { workspace = true }
 # ---------------------------------------------------------------------------
 
 [package.metadata.deb]
-maintainer = "Kate <kate@westedge.io>"
+maintainer = "CatherinaInTheLoop <CatherinaInTheLoop@pm.me>"
 copyright = "2026 Kate"
 license-file = ["../../LICENSE", "0"]
 section = "utils"
