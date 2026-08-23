@@ -11288,11 +11288,22 @@ UseDNS no
         run_journaled_write(&journal, &policy, "model edit", &args).await;
 
         let old_identity = file_identity(&std::fs::metadata(&target).unwrap());
-        std::fs::remove_file(&target).unwrap();
-        std::fs::write(&target, "model").unwrap();
+        // Replace the path with a DIFFERENT inode carrying identical bytes.
+        //
+        // The obvious spelling — remove then rewrite — is not deterministic:
+        // the filesystem is free to hand the freed inode straight back, and
+        // ext4 routinely does, which made this fixture fail roughly one run in
+        // five under parallel load. Building the replacement while the original
+        // is still allocated forces the kernel to pick a different inode, then
+        // the rename installs it. The test is about undo refusing a stale
+        // identity, so the fixture must establish that premise, not gamble on it.
+        let replacement = dir.path().join("inode-conflict.replacement");
+        std::fs::write(&replacement, "model").unwrap();
+        std::fs::rename(&replacement, &target).unwrap();
         assert_ne!(
             old_identity,
-            file_identity(&std::fs::metadata(&target).unwrap())
+            file_identity(&std::fs::metadata(&target).unwrap()),
+            "fixture must install a distinct inode for the conflict to exist"
         );
 
         let error = journal.undo_last(&policy).await.unwrap_err();
