@@ -23493,6 +23493,35 @@ mod tests {
     }
 
     #[test]
+    fn yolo_parses_as_the_single_dangerous_skip_permissions_argument() {
+        for argv in [
+            vec!["kitsu", "--dangerously-skip-permissions", "chat"],
+            vec!["kitsu", "--yolo", "chat"],
+            vec!["kitsu", "chat", "--yolo"],
+        ] {
+            let parsed = Cli::try_parse_from(argv.clone()).unwrap_or_else(|error| {
+                panic!("dangerous bypass spelling must parse {argv:?}: {error}")
+            });
+            assert!(parsed.dangerously_skip_permissions, "argv: {argv:?}");
+            assert!(matches!(parsed.command, Some(Command::Chat { .. })));
+        }
+
+        let error =
+            Cli::try_parse_from(["kitsu", "--dangerously-skip-permissions", "--yolo", "chat"])
+                .expect_err("repeating one boolean argument through both spellings is ambiguous");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn yolo_inherits_the_canonical_dangerous_flag_conflicts() {
+        for other in ["--yes", "--dangerously-allow-all-filesystem"] {
+            let error = Cli::try_parse_from(["kitsu", "--yolo", other, "chat"])
+                .expect_err("contradictory permission policies must fail closed");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
     fn required_write_sha256_parser_splits_final_equals_and_normalizes_hex() {
         let (path, sha256) =
             parse_required_write_sha256(&format!("/tmp/output=part={}", "AB".repeat(32)))

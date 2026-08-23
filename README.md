@@ -652,6 +652,7 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--max-output-tokens <n>` | unset (gateway default) | Cap output tokens. Required by some gateways (e.g. Anthropic). If the model hits an explicit cap, strict one-shot/scripted runs keep the partial text visible but do not commit the turn, exit `2`, and suggest retrying with twice the current value. |
 | `--yes` | off | Never prompt for filesystem access; enabled tools remain confined to explicit/current roots and requests outside them are denied. Never enables tools or approves developer commands. |
 | `--dangerously-allow-all-filesystem` | off | **DANGER:** let enabled filesystem tools access every non-protected host path without prompting. This is the explicit global bypass; it still never enables tools or approves commands. |
+| `--dangerously-skip-permissions`, `--yolo` | off | **DANGER:** run fully unattended. `--yolo` is an exact alias for the long spelling: enabled filesystem tools may access every non-protected path, read/write tools are registered for automation, and commands are auto-approved only when command capability is separately enabled. Kitsu-private paths, explicit `/permissions protect` guards, command roots/validation/containment, and secret-environment filtering remain enforced. |
 | `--context-window <n>` | profile/cache, else `8192` | Override the model context window. A cold metadata lookup runs asynchronously and never delays the first inference. |
 | `--compaction <trim\|summarize>` | `trim` | Choose how older context is reclaimed. |
 | `--skill <name>` | unset | Preload a local skill (repeatable; accepted before or after the subcommand). |
@@ -761,7 +762,10 @@ it won't ask again.
   never removes confinement: unlisted paths are denied without prompting. The
   old unrestricted behavior requires the unmistakable
   `--dangerously-allow-all-filesystem` flag and still cannot bypass Kitsu-private
-  path protections.
+  path protections. For fully unattended automation,
+  `--dangerously-skip-permissions` (short alias `--yolo`) additionally registers
+  read/write tools and skips command approval prompts when command capability is
+  separately enabled; it does not bypass the remaining guards named above.
 - **Background agents** inherit current explicit/session grants but never own
   the foreground terminal and therefore cannot open filesystem or command
   approval prompts. Pre-grant the exact authority they need; an ungranted
