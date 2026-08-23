@@ -2,8 +2,10 @@
 //!
 //! This module is deliberately unmounted from product configuration, the
 //! public registry, and provider request inventories.
-//! Production code intentionally has no constructor for either exact-tool
-//! grant: caller/subagent authority derivation remains a later mount gate.
+//! Production grants can be issued only by the private, default-disabled
+//! source-admission owner after exact host and caller decisions. Deriving those
+//! decisions from product configuration and caller/subagent authority remains
+//! a later mount gate.
 //! This owner provides no discovery, pagination, retry, restart, concurrent
 //! call, resources, prompts, sampling, or general MCP-handler claim.
 
@@ -26,12 +28,13 @@ use super::publication::{
     ExternalInventoryFenceV1, ExternalInventoryPublicationErrorV1, ExternalInventoryPublicationV1,
 };
 use super::serial::SerialChildTransportEffectsV1;
+use super::source::{CallerExternalToolGrantV1, HostExternalToolGrantV1};
 use crate::mcp_codec::ClientEvent;
 
 const FIXTURE_ECHO_WIRE_NAME_V1: &str = "fixture.echo";
 const FIXTURE_ECHO_DESCRIPTION_V1: &str = "Returns one integer as text.";
 
-fn fixture_echo_descriptor_v1() -> ToolDescriptor {
+pub(super) fn fixture_echo_descriptor_v1() -> ToolDescriptor {
     ToolDescriptor {
         name: FIXTURE_ECHO_WIRE_NAME_V1.to_string(),
         description: FIXTURE_ECHO_DESCRIPTION_V1.to_string(),
@@ -105,64 +108,6 @@ impl ExternalEchoToolBindingV1 {
 
     pub(super) fn descriptor_fingerprint(&self) -> DescriptorFingerprintV1 {
         self.descriptor_fingerprint
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct HostExternalToolGrantV1 {
-    identity: ExternalToolIdentityV1,
-    descriptor_fingerprint: DescriptorFingerprintV1,
-}
-
-impl HostExternalToolGrantV1 {
-    #[cfg(test)]
-    pub(super) fn from_binding(binding: &ExternalEchoToolBindingV1) -> Self {
-        Self::from_exact(binding.identity.clone(), binding.descriptor_fingerprint)
-    }
-
-    #[cfg(test)]
-    pub(super) fn from_exact(
-        identity: ExternalToolIdentityV1,
-        descriptor_fingerprint: DescriptorFingerprintV1,
-    ) -> Self {
-        Self {
-            identity,
-            descriptor_fingerprint,
-        }
-    }
-
-    fn matches(&self, binding: &ExternalEchoToolBindingV1) -> bool {
-        self.identity == binding.identity
-            && self.descriptor_fingerprint == binding.descriptor_fingerprint
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct CallerExternalToolGrantV1 {
-    identity: ExternalToolIdentityV1,
-    descriptor_fingerprint: DescriptorFingerprintV1,
-}
-
-impl CallerExternalToolGrantV1 {
-    #[cfg(test)]
-    pub(super) fn from_binding(binding: &ExternalEchoToolBindingV1) -> Self {
-        Self::from_exact(binding.identity.clone(), binding.descriptor_fingerprint)
-    }
-
-    #[cfg(test)]
-    pub(super) fn from_exact(
-        identity: ExternalToolIdentityV1,
-        descriptor_fingerprint: DescriptorFingerprintV1,
-    ) -> Self {
-        Self {
-            identity,
-            descriptor_fingerprint,
-        }
-    }
-
-    fn matches(&self, binding: &ExternalEchoToolBindingV1) -> bool {
-        self.identity == binding.identity
-            && self.descriptor_fingerprint == binding.descriptor_fingerprint
     }
 }
 
@@ -921,10 +866,9 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        CallerExternalToolGrantV1, ExternalCallDispositionV1, ExternalEchoResultErrorV1,
-        ExternalMcpEchoCompletionV1, ExternalMcpEchoFailureV1, ExternalMcpEchoSourceOwnerV1,
-        ExternalMcpEchoSourceStateV1, FixtureEchoRequestV1, HostExternalToolGrantV1,
-        McpSerialChildFailureV1,
+        ExternalCallDispositionV1, ExternalEchoResultErrorV1, ExternalMcpEchoCompletionV1,
+        ExternalMcpEchoFailureV1, ExternalMcpEchoSourceOwnerV1, ExternalMcpEchoSourceStateV1,
+        FixtureEchoRequestV1, McpSerialChildFailureV1,
     };
     use crate::external::authority::{
         prepare_child_launch_request_v1, AdmittedChildLaunchV1, AuthorityProfileV1,
@@ -942,6 +886,13 @@ mod tests {
     use crate::external::serial::{
         SerialChildCauseV1, SerialChildTransportEffectsV1, SerialFrameObservationV1,
         SerialOwnedChildResidueV1, SerialPollAllowanceV1,
+    };
+    use crate::external::source::{
+        admit_external_echo_caller_v1, admit_external_echo_source_v1, CallerExternalToolGrantV1,
+        ExternalEchoCallerAuthorityDecisionV1, ExternalEchoCallerAuthorityProfileV1,
+        ExternalEchoSourceAuthorityDecisionV1, ExternalEchoSourceAuthorityProfileV1,
+        ExternalEchoSourceDeclarationV1, ExternalSourceActivationV1, HostExternalToolGrantV1,
+        EXTERNAL_ECHO_SOURCE_DECLARATION_VERSION_V1,
     };
     use crate::external::supervisor::{ChildReapPollV1, OwnedChildTokenV1};
 
@@ -1258,11 +1209,33 @@ mod tests {
         assert_eq!(owner.binding().unwrap().descriptor(), &echo_descriptor());
         let expected_identity = owner.binding().unwrap().identity().clone();
         let expected_fingerprint = owner.binding().unwrap().descriptor_fingerprint();
-        let host = HostExternalToolGrantV1::from_binding(owner.binding().unwrap());
-        let caller = CallerExternalToolGrantV1::from_binding(owner.binding().unwrap());
+        let declaration = ExternalEchoSourceDeclarationV1::new(
+            EXTERNAL_ECHO_SOURCE_DECLARATION_VERSION_V1,
+            ExternalSourceActivationV1::Enabled,
+            "fixture-source",
+            "boot-1",
+            1,
+            "echo",
+        );
+        let host_profile =
+            ExternalEchoSourceAuthorityProfileV1::exact("fixture-source", "boot-1", 1, "echo")
+                .unwrap();
+        let admitted = admit_external_echo_source_v1(
+            declaration,
+            ExternalEchoSourceAuthorityDecisionV1::Admit(&host_profile),
+        )
+        .unwrap();
+        let caller_profile =
+            ExternalEchoCallerAuthorityProfileV1::exact("fixture-source", "boot-1", 1, "echo")
+                .unwrap();
+        let grants = admit_external_echo_caller_v1(
+            &admitted,
+            ExternalEchoCallerAuthorityDecisionV1::Admit(&caller_profile),
+        )
+        .unwrap();
 
         owner
-            .begin_echo(FixtureEchoRequestV1::new(7), &host, &caller)
+            .begin_echo(FixtureEchoRequestV1::new(7), grants.host(), grants.caller())
             .unwrap();
         assert_eq!(
             owner.attempt().unwrap().disposition(),

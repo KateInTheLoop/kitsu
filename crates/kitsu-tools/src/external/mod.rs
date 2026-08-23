@@ -12,4 +12,5 @@ mod lifecycle;
 mod mcp;
 mod publication;
 mod serial;
+mod source;
 mod supervisor;

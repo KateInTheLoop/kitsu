@@ -1,10 +1,10 @@
 # Parallel delivery after Cycle 118
 
-Status: the first post-118 wave plus Cycles 126-133 are accepted on
+Status: the first post-118 wave plus Cycles 126-134 are accepted on
 `improvements/post-118`. Cycle 129 required one additional acceptance-repair
 commit after a clean parallel run exposed a real quarantine timestamp and
-result-classification defect. The active implementation card is Cycle 134's
-default-disabled external-source declaration and exact grant-admission seam.
+result-classification defect. The active implementation card is Cycle 135's
+admission-before-preparation external-source factory seam.
 
 ## Objective
 
@@ -126,9 +126,12 @@ identity, and requires both host and caller identity/fingerprint grants. A
 possibly accepted call never retries; withdrawal precedes cleanup or Drop, and
 response evidence is not success until the child shuts down cleanly. Grant
 constructors remain test-only.
-Cycle 134 may now stage only the default-disabled source declaration and exact
-host/caller grant admission required by a later product mount; it must still
-perform no discovery, acquisition, spawn, registry mutation, or provider send.
+Cycle 134 adds that default-disabled source declaration and exact host/caller
+grant admission without discovery, acquisition, spawn, registry mutation, or
+provider send. Cycle 135 may compose this admitted source ahead of child launch
+preparation and handler construction. Disabled, denied, malformed, and stale
+authority must still prove zero preparation and spawn; product registry/request
+mounting remains a later independently reviewed step.
 
 The integration review rejects name-only identities, ambient runtime loading,
 implicit install/update/discovery, remembered cross-session authority,
@@ -138,7 +141,7 @@ file tail treated as canonical HEAD.
 ## Checkpoint and acceleration measure
 
 Cycle 118 is the stable pushed review base and `improvements/post-118` is the
-clean next integration branch through Cycle 133. Parallel work accelerates
+clean next integration branch through Cycle 134. Parallel work accelerates
 discovery and implementation latency, while serialized acceptance preserves
 bisectability and one truthful roadmap. Numbered cycles, integration commits,
 tests, and replaceability gates are reported separately: Cycle 129 legitimately
