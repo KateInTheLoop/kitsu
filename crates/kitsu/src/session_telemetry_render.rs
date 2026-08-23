@@ -775,6 +775,7 @@ fn context_window_source_label(value: kitsu_core::ContextWindowSource) -> &'stat
         kitsu_core::ContextWindowSource::GatewayProfile => "gateway profile",
         kitsu_core::ContextWindowSource::DiskCache => "disk cache",
         kitsu_core::ContextWindowSource::LiveProviderDiscovery => "live provider discovery",
+        kitsu_core::ContextWindowSource::RuntimeServedWindow => "runtime-served window",
         kitsu_core::ContextWindowSource::ConservativeDefault => "conservative default",
     }
 }

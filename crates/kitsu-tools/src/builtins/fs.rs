@@ -4425,9 +4425,16 @@ async fn list_dir_run(policy: &Permissions, args: &str) -> Result<String, ToolEr
 struct GrepArgs {
     pattern: String,
     path: String,
-    #[serde(default)]
+    // `repo_grep` was the one model-facing arg struct still parsing these
+    // strictly. Local models quote scalars constantly (`"max_count": "100"`),
+    // and a rejected call costs a whole tool round — tens of seconds of CPU
+    // inference — for a value that was never ambiguous. Every other arg struct
+    // in this file already coerces; this closes the gap. It matters more than
+    // it used to: `repo_grep` is one of only three read tools a lean-tier
+    // registry advertises, so losing it leaves a small model unable to search.
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
     max_count: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_bool")]
     literal: bool,
 }
 
@@ -7539,6 +7546,34 @@ async fn edit_file_run(policy: &Permissions, args: &str) -> Result<String, ToolE
     edit_file_run_with_journal(policy, None, args).await
 }
 
+/// Detect a `new_text` whose newlines arrived double-escaped, returning how
+/// many literal `\n` sequences it carries.
+///
+/// A local model emitting `"...):\\n    if b == 0:\\n..."` decodes to genuine
+/// backslash-`n` characters, which a faithful write turns into a single
+/// corrupted line. Observed live: `divide()` was "successfully" rewritten into
+/// one unparseable line, the checkpoint recorded it as a normal edit, and a
+/// subagent then read the wreckage back and confirmed the fix. Silent
+/// corruption that survives its own verification is far worse than a burnt
+/// tool round, so this refuses the write and tells the model how to retry.
+///
+/// Deliberately narrow, because a literal `\n` is legitimate in source code
+/// (`print("a\nb")`). All three conditions must hold:
+/// - the region being replaced spans real lines, so the replacement should too;
+/// - the replacement has NO real newline at all; and
+/// - it carries at least two literal `\n`, which collapses the plausible case
+///   of swapping a block for one line that happens to contain one escape.
+///
+/// A false positive costs one instructive rejection with the file intact; a
+/// false negative costs a broken file that reads as a success.
+fn double_escaped_newlines(old_text: &str, new_text: &str) -> Option<usize> {
+    if !old_text.contains('\n') || new_text.contains('\n') {
+        return None;
+    }
+    let escapes = new_text.matches("\\n").count();
+    (escapes >= 2).then_some(escapes)
+}
+
 async fn edit_file_run_with_journal(
     policy: &Permissions,
     journal: Option<&WriteJournal>,
@@ -7555,6 +7590,14 @@ async fn edit_file_run_with_journal(
         return Err(ToolError::InvalidArgs(
             "old_text and new_text are identical; file was not modified".to_string(),
         ));
+    }
+    if let Some(escapes) = double_escaped_newlines(&a.old_text, &a.new_text) {
+        return Err(ToolError::InvalidArgs(format!(
+            "new_text replaces a multi-line region but contains no real newline and {escapes} \
+             literal \\n sequences — your newlines arrived double-escaped and would be written \
+             verbatim, corrupting the file. Resend new_text with real line breaks; file was not \
+             modified."
+        )));
     }
     // Reject an obviously oversized replacement before doing any file IO. The
     // complete post-edit content is checked again below.
@@ -9909,6 +9952,128 @@ UseDNS no
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    /// A quoted scalar must not cost a tool round. Local models emit
+    /// `"max_count": "100"` and `"literal": "true"` routinely; every other arg
+    /// struct in this file already coerces them, and `repo_grep` is one of only
+    /// three read tools a lean-tier registry offers, so a rejection here leaves
+    /// a small model with no way to search.
+    /// Regression for live corruption: qwen2.5-coder rewrote a Python function
+    /// with double-escaped newlines, kitsu wrote them verbatim, the turn
+    /// reported success, and a spawned subagent then "verified" the broken
+    /// file. The edit must be refused with the file left intact.
+    #[tokio::test]
+    async fn edit_refuses_double_escaped_newlines_and_leaves_the_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let path = dir.path().join("calc.py");
+        let original = "def divide(a, b):\n    return a / b\n";
+        std::fs::write(&path, original).unwrap();
+        let policy =
+            Permissions::for_roots(std::slice::from_ref(&root), std::slice::from_ref(&root))
+                .unwrap();
+
+        let error = edit_file_run(
+            &policy,
+            &serde_json::json!({
+                "path": path.to_string_lossy(),
+                "old_text": "def divide(a, b):\n    return a / b",
+                // Exactly what the model sent: literal backslash-n, no real breaks.
+                "new_text": "def divide(a, b):\\n    if b == 0:\\n        raise ValueError(\"x\")\\n    return a / b"
+            })
+            .to_string(),
+        )
+        .await
+        .expect_err("a double-escaped replacement must be refused");
+        assert!(matches!(error, ToolError::InvalidArgs(_)), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the file must be untouched"
+        );
+    }
+
+    /// The guard must not fire on legitimate content. A single-line replacement
+    /// carrying escape sequences is normal source code, and any replacement
+    /// that actually contains real newlines is fine no matter what it holds.
+    #[tokio::test]
+    async fn edit_allows_legitimate_escapes_and_real_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy =
+            Permissions::for_roots(std::slice::from_ref(&root), std::slice::from_ref(&root))
+                .unwrap();
+
+        // (a) Multi-line -> multi-line that legitimately contains \n escapes.
+        let path = dir.path().join("a.py");
+        std::fs::write(&path, "def show():\n    pass\n").unwrap();
+        edit_file_run(
+            &policy,
+            &serde_json::json!({
+                "path": path.to_string_lossy(),
+                "old_text": "def show():\n    pass",
+                "new_text": "def show():\n    print(\"a\\nb\\nc\")"
+            })
+            .to_string(),
+        )
+        .await
+        .expect("real newlines must be accepted even with escapes present");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("a\\nb"));
+
+        // (b) Single-line -> single-line with escapes: old_text has no newline,
+        // so the multi-line premise never applies.
+        let path = dir.path().join("b.txt");
+        std::fs::write(&path, "fmt=old\n").unwrap();
+        edit_file_run(
+            &policy,
+            &serde_json::json!({
+                "path": path.to_string_lossy(),
+                "old_text": "fmt=old",
+                "new_text": "fmt=%s\\n%s\\n"
+            })
+            .to_string(),
+        )
+        .await
+        .expect("a single-line edit with escapes must be accepted");
+    }
+
+    #[tokio::test]
+    async fn grep_accepts_quoted_scalars_from_small_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hay.txt");
+        std::fs::write(&file, "alpha\nneedle\nomega\n").unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Arc::new(Permissions::for_roots(&[root], &[]).expect("perms"));
+
+        let output = grep_run(
+            policy.clone(),
+            &serde_json::json!({
+                "path": dir.path().to_string_lossy(),
+                "pattern": "needle",
+                "max_count": "5",
+                "literal": "true"
+            })
+            .to_string(),
+        )
+        .await
+        .expect("quoted scalars must parse");
+        assert!(output.contains("needle"), "{output}");
+
+        // Coercion is of representation only: a value that is not a number is
+        // still an error, not a silent default.
+        let error = grep_run(
+            policy,
+            &serde_json::json!({
+                "path": dir.path().to_string_lossy(),
+                "pattern": "needle",
+                "max_count": "lots"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgs(_)), "{error}");
     }
 
     #[tokio::test]

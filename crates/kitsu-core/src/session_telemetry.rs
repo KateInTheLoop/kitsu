@@ -37,6 +37,13 @@ pub enum ContextWindowSource {
     GatewayProfile,
     DiskCache,
     LiveProviderDiscovery,
+    /// The window the runtime reported it is ACTUALLY SERVING, after clamping a
+    /// larger configured value down to it. Distinct from
+    /// [`Self::LiveProviderDiscovery`] on purpose: catalog discovery reports the
+    /// window a model was TRAINED for, which an Ollama-style runtime routinely
+    /// contradicts by loading it with a far smaller `num_ctx`. A deck that
+    /// conflated the two would report a number the next request cannot use.
+    RuntimeServedWindow,
     ConservativeDefault,
 }
 

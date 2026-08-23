@@ -17,6 +17,15 @@ use kitsu_providers::{ChatMessage, Role};
 
 /// Rough chars-per-token for prose/code.
 ///
+/// Measured against Ollama's tokenizer (2026-08-17), this rate is:
+/// - conservative for prose (4.50 real chars/token — we over-count, which is safe)
+/// - optimistic for unified diffs (3.48 real chars/token — we under-count ~1.15x)
+///
+/// The optimistic direction only bites where code/diff text dominates a small
+/// window; the system prompt and tool schemas that fill most of a small budget
+/// are prose/JSON, where this rate still over-counts. Recorded here so anyone
+/// resizing the trim buffer starts from data rather than a guess.
+///
 /// `pub(crate)` so callers that convert a remaining *token* budget back into a
 /// *byte* budget for ASCII-ish content (e.g. the compaction summarizer sizing
 /// its transcript input) use the same rate `estimate_str`/`message_tokens` do.
