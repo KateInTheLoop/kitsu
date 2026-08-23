@@ -109,11 +109,33 @@ impl ProviderRouteHandle<CompiledProvider> {
             CompiledProvider::AnthropicMessages(_) => Ok(None),
         }
     }
+
+    /// The window the runtime reports it is actually serving, when it exposes
+    /// one. Only the OpenAI-compatible arm can answer: the probe is an
+    /// Ollama-native route, and a hosted Messages endpoint serves exactly the
+    /// window it advertises.
+    pub async fn served_context_length(&self, model: &str) -> Result<Option<u64>, ProviderError> {
+        let Some(runtime) =
+            self.admit_optional_inference_runtime(ProviderCapability::ModelCatalog)?
+        else {
+            return Ok(None);
+        };
+        match runtime.as_ref() {
+            CompiledProvider::CompatibleChat(provider) => {
+                Ok(provider.served_context_length(model).await)
+            }
+            CompiledProvider::AnthropicMessages(_) => Ok(None),
+        }
+    }
 }
 
 impl ProviderRouteCurrent<CompiledProvider> {
     pub async fn model_context_length(&self, model: &str) -> Result<Option<u64>, ProviderError> {
         self.bind_model(model)?.model_context_length(model).await
+    }
+
+    pub async fn served_context_length(&self, model: &str) -> Result<Option<u64>, ProviderError> {
+        self.bind_model(model)?.served_context_length(model).await
     }
 
     pub async fn advisory_model_context_length(
