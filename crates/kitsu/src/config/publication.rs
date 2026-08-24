@@ -725,19 +725,14 @@ impl PinnedConfigTarget {
 
     #[cfg(target_os = "linux")]
     fn rename_noreplace(&self, old: &CStr, new: &CStr) -> std::io::Result<()> {
-        let result = unsafe {
-            libc::renameat2(
+        unsafe {
+            kitsu_tools::rename_flags::renameat2(
                 self.parent.as_raw_fd(),
                 old.as_ptr(),
                 self.parent.as_raw_fd(),
                 new.as_ptr(),
-                libc::RENAME_NOREPLACE,
+                kitsu_tools::rename_flags::RENAME_NOREPLACE,
             )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
         }
     }
 
