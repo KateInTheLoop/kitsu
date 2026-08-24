@@ -5883,6 +5883,16 @@ fn read_assistive_stdin_line(prompt: &str) -> std::io::Result<Option<String>> {
     }
 }
 
+/// Portable fallback: a plain blocking line read. It cannot observe the
+/// interrupt flag mid-wait the way the unix `poll` loop does, but every
+/// non-unix caller gets the same prompt-on-stderr, line-from-stdin contract.
+#[cfg(not(unix))]
+fn read_assistive_stdin_line(prompt: &str) -> std::io::Result<Option<String>> {
+    let stdin = std::io::stdin();
+    let stderr = std::io::stderr();
+    read_assistive_line_from(&mut stdin.lock(), &mut stderr.lock(), prompt)
+}
+
 fn read_chat_line(
     editor: &mut rustyline::Editor<ChatHelper, rustyline::history::DefaultHistory>,
     prompt: &str,
@@ -5890,14 +5900,7 @@ fn read_chat_line(
     initial: &str,
 ) -> ChatReadline {
     if assistive {
-        #[cfg(unix)]
         let result = read_assistive_stdin_line(prompt);
-        #[cfg(not(unix))]
-        let result = {
-            let stdin = std::io::stdin();
-            let stderr = std::io::stderr();
-            read_assistive_line_from(&mut stdin.lock(), &mut stderr.lock(), prompt)
-        };
         return match result {
             Ok(Some(line)) => ChatReadline::Line(line),
             Ok(None) => ChatReadline::Eof,
