@@ -6569,15 +6569,11 @@ fn unix_renameat_with_flags(
     mode: RenameMode,
 ) -> std::io::Result<()> {
     let flags = match mode {
-        RenameMode::Exchange => libc::RENAME_EXCHANGE,
-        RenameMode::NoReplace => libc::RENAME_NOREPLACE,
+        RenameMode::Exchange => crate::rename_flags::RENAME_EXCHANGE,
+        RenameMode::NoReplace => crate::rename_flags::RENAME_NOREPLACE,
     };
-    let result =
-        unsafe { libc::renameat2(old_dir, old.as_ptr(), new_dir, new.as_ptr(), flags as _) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
+    unsafe {
+        crate::rename_flags::renameat2(old_dir, old.as_ptr(), new_dir, new.as_ptr(), flags)
     }
 }
 
@@ -6656,7 +6652,9 @@ fn read_snapshot_limited_portable(
     read_snapshot_from_file(file, max_bytes).map(Some)
 }
 
-#[cfg(test)]
+// Non-unix builds need this outside tests too: `atomic_replace_checked_portable`
+// is the only replace path there, and it reads the current snapshot by path.
+#[cfg(any(test, not(unix)))]
 fn read_snapshot_limited(path: &Path, max_bytes: usize) -> std::io::Result<Option<FileSnapshot>> {
     MutationTarget::pin(path)?.read_snapshot_limited(max_bytes)
 }

@@ -447,7 +447,18 @@ fn openat_file(
     mode: libc::mode_t,
 ) -> std::io::Result<std::fs::File> {
     let name = c_name(name)?;
-    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, mode) };
+    // `openat` is variadic, so the mode is subject to default argument
+    // promotion and must be passed at least as wide as `c_uint`. `mode_t` is
+    // already `u32` on Linux but only `u16` on Apple targets, where passing it
+    // unwidened is a hard compile error — invisible to a Linux-only CI job.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags,
+            mode as libc::c_uint,
+        )
+    };
     if fd < 0 {
         Err(std::io::Error::last_os_error())
     } else {

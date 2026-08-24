@@ -2605,19 +2605,14 @@ fn rename_directory_no_replace(
 ) -> std::io::Result<()> {
     let source_name = super::c_name(source_name)?;
     let target_name = super::c_name(target_name)?;
-    let result = unsafe {
-        libc::renameat2(
+    unsafe {
+        kitsu_tools::rename_flags::renameat2(
             source_parent.file.as_raw_fd(),
             source_name.as_ptr(),
             target_parent.file.as_raw_fd(),
             target_name.as_ptr(),
-            libc::RENAME_NOREPLACE,
+            kitsu_tools::rename_flags::RENAME_NOREPLACE,
         )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
     }
 }
 

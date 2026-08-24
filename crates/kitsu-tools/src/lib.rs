@@ -6,6 +6,8 @@ pub mod builtins;
 pub mod error;
 pub mod mcp_codec;
 pub mod permissions;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod rename_flags;
 pub mod semantic;
 
 // E06 begins with a private, provider-free admission boundary. Later cards
