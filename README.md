@@ -72,6 +72,21 @@ Windows: download the `...-x86_64-pc-windows-msvc.zip` asset, unzip it, and put
 macOS builds are not code-signed, so the first run needs
 `xattr -d com.apple.quarantine kitsu` (or Right-click → Open).
 
+### Container image
+
+Releases also publish a minimal image (distroless, nonroot, amd64 + arm64) to
+GHCR, built from the same static binaries the tarballs ship:
+
+```bash
+docker run --rm -it \
+  -v ~/.kitsu:/home/nonroot/.kitsu \
+  ghcr.io/kateintheloop/kitsu:latest
+```
+
+Mount your config as shown; add `--network host` to reach an Ollama on the
+host's localhost, and mount a workdir (e.g. `-v "$PWD":/work -w /work`) to use
+the filesystem tools on your project.
+
 ### Build from source
 
 Rust 1.80+:
