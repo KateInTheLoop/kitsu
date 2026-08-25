@@ -2358,6 +2358,26 @@ fn parse_text_tool_calls(
             call_id,
         });
     }
+    // An UNBALANCED attempt — truncated output, a stray bracket — produces no
+    // balanced candidate at all, so the per-candidate malformed detection above
+    // never sees it, and the raw JSON used to fall through every guard and be
+    // COMMITTED as the final answer with the run reporting success (observed
+    // live: llama3.2 closed an fs_write_file call with `"})}` and kitsu
+    // reported "succeeded" having written nothing). Same narrow signature as
+    // the per-candidate check, applied to the whole text: an object opener
+    // plus "name" quoting a registered tool is a failed tool attempt, not an
+    // answer.
+    if calls.is_empty()
+        && malformed == 0
+        && skill_confusion.is_none()
+        && text.contains('{')
+        && text.contains("\"name\"")
+        && descriptors
+            .iter()
+            .any(|d| text.contains(&format!("\"{}\"", d.name)))
+    {
+        malformed += 1;
+    }
     TextToolRecovery {
         calls,
         malformed,
