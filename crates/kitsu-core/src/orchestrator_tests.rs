@@ -1887,6 +1887,86 @@ async fn test_text_protocol_malformed_call_feeds_back_instead_of_answering() {
     );
 }
 
+/// Regression for the first 0.1.0 smoke task: llama3.2 emitted a text-form
+/// fs_write_file call closed with `"})}` — a stray paren and a missing brace.
+/// No balanced JSON object exists in that text, so the per-candidate malformed
+/// detection never saw a candidate, and the raw truncated JSON was COMMITTED
+/// as the final answer with the run reporting success while nothing was
+/// written. An unbalanced attempt must get the same corrective-feedback round
+/// as a balanced-but-unparseable one.
+#[tokio::test]
+async fn test_text_protocol_unbalanced_call_feeds_back_instead_of_answering() {
+    let provider = MockProvider::new(vec![
+        vec![
+            // The exact live shape, abbreviated: closes with `"})}`.
+            ChatDelta::Text(
+                r#"{"name": "fs_write_file", "parameters": {"path": "/w/main.cpp", "content": "int main() {}")}"#
+                    .to_string(),
+            ),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text("recovered answer".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let tools = writing_registry(ran.clone());
+
+    let mut state = AgentSessionState::default();
+    let out = run_agent_turn_with_state(
+        &provider,
+        &tools,
+        &mut initial_messages(),
+        &cfg(10),
+        &mut state,
+    )
+    .await
+    .expect("the retry round should produce the committed answer");
+
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "nothing was executed");
+    assert_eq!(provider.call_count(), 2, "feedback round then answer round");
+    assert!(out.contains("recovered answer"), "{out}");
+    assert!(
+        !out.contains("fs_write_file"),
+        "raw truncated tool JSON must not be the answer: {out}"
+    );
+    assert_eq!(
+        state.last_turn.tool_errors, 1,
+        "the ignored attempt is accounted as a tool error"
+    );
+}
+
+/// A real answer that merely QUOTES a tool name in prose (no JSON object
+/// opener anywhere) commits normally — the unbalanced-attempt fallback keys on
+/// `{` + `"name"` + a quoted registered tool, not on the name alone.
+#[tokio::test]
+async fn test_prose_mentioning_a_tool_name_still_commits_as_the_answer() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text(
+            "Use the \"fs_write_file\" tool with a \"name\" field to create files.".to_string(),
+        ),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let tools = writing_registry(ran.clone());
+
+    let mut state = AgentSessionState::default();
+    let out = run_agent_turn_with_state(
+        &provider,
+        &tools,
+        &mut initial_messages(),
+        &cfg(10),
+        &mut state,
+    )
+    .await
+    .expect("prose answers commit unmolested");
+
+    assert_eq!(provider.call_count(), 1, "no feedback round for prose");
+    assert!(out.contains("fs_write_file"), "{out}");
+    assert_eq!(state.last_turn.tool_errors, 0);
+}
+
 /// A skill invoked as a fake tool (`{"name": "code-review"}`) gets targeted
 /// corrective feedback instead of the raw JSON committing as the answer;
 /// arbitrary unknown names (no matching skill) keep the old return-as-text
