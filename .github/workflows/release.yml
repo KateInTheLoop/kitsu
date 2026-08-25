@@ -212,3 +212,69 @@ jobs:
           # A tag like v0.2.0-rc.1 publishes as a pre-release.
           prerelease: ${{ contains(github.ref_name, '-') }}
           fail_on_unmatched_files: true
+
+  # Container image on GHCR, from the SAME binaries the tarballs ship — the
+  # linux job's musl artifacts are downloaded and copied in, never rebuilt, so
+  # `docker run ghcr.io/<owner>/kitsu` is bit-identical to the tarball install.
+  # Tags push the image; a workflow_dispatch run builds it without pushing,
+  # mirroring how the publish job dry-runs.
+  container:
+    needs: [verify, linux]
+    runs-on: ubuntu-24.04
+    # Job-level permissions REPLACE the workflow's, so contents: read must be
+    # restated alongside the packages grant.
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          path: staging
+
+      - name: Stage per-arch binaries and Dockerfile
+        run: |
+          set -euo pipefail
+          mkdir -p ctx/amd64 ctx/arm64
+          tar -xzf "staging/linux-x86_64-unknown-linux-musl/kitsu-${VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            -C ctx/amd64 --strip-components=1 "kitsu-${VERSION}-x86_64-unknown-linux-musl/kitsu"
+          tar -xzf "staging/linux-aarch64-unknown-linux-musl/kitsu-${VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+            -C ctx/arm64 --strip-components=1 "kitsu-${VERSION}-aarch64-unknown-linux-musl/kitsu"
+          # distroless/static, not scratch: kitsu speaks TLS to gateways, so
+          # the image must carry a CA root store; distroless/static ships that
+          # (plus tzdata) and nothing else, and runs as nonroot.
+          printf '%s\n' \
+            'FROM gcr.io/distroless/static-debian12:nonroot' \
+            'ARG TARGETARCH' \
+            'COPY ${TARGETARCH}/kitsu /usr/local/bin/kitsu' \
+            'ENTRYPOINT ["/usr/local/bin/kitsu"]' \
+            > ctx/Dockerfile
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (push on tags only)
+        run: |
+          set -euo pipefail
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${owner}/kitsu"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # Both arches, straight to the registry.
+            docker buildx build --push --platform linux/amd64,linux/arm64 \
+              -t "${image}:${VERSION}" -t "${image}:latest" ctx
+          else
+            # Dry run: --load cannot hold a multi-arch image, so build the
+            # host arch only and smoke-test that the binary actually runs.
+            docker buildx build --load --platform linux/amd64 \
+              -t "${image}:${VERSION}" ctx
+            docker run --rm "${image}:${VERSION}" --version
+          fi
