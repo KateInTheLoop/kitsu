@@ -486,6 +486,83 @@ fn canonicalize_intended(path: &Path) -> Result<PathBuf, ToolError> {
 /// Absolute lexical identity of a request, without following symlinks. This is
 /// retained alongside the resolved identity so a future protected path cannot
 /// be replaced by a symlink and thereby shed its apparent private prefix.
+/// Expand a leading `~` against `$HOME` before any resolution.
+///
+/// Kitsu's own UI displays paths tilde-elided, and models routinely echo those
+/// display forms back as tool arguments (`Write("~/project/main.cpp")`). The
+/// command tool has expanded its cwd this way since cycle 18; the filesystem
+/// checks resolved the literal `~` as a directory name relative to the process
+/// cwd instead, so every such call died with "parent directory does not exist"
+/// — observed live on the first post-release smoke task. Only a leading tilde
+/// is expanded (`~user` is untouched), and permission checks run on the
+/// expanded path, so this widens nothing.
+/// Bounded "; readable root(s): …" / "; no read roots are granted" suffix for
+/// an unresolvable-path denial. `access` is "read" or "write". Bounded because
+/// a session can accumulate many grants, and an unbounded list would push a
+/// small model's context out the way the failed path guess did.
+fn roots_hint(roots: &[PathBuf], access: &str) -> String {
+    const MAX_LISTED_ROOTS: usize = 5;
+    let listed: Vec<String> = roots
+        .iter()
+        .take(MAX_LISTED_ROOTS)
+        .map(|root| root.display().to_string())
+        .collect();
+    if listed.is_empty() {
+        return format!("; no {access} roots are granted in this session");
+    }
+    let overflow = roots.len().saturating_sub(listed.len());
+    format!(
+        "; {access}able root(s): {}{}",
+        listed.join(", "),
+        if overflow > 0 {
+            format!(" (+{overflow} more)")
+        } else {
+            String::new()
+        }
+    )
+}
+
+/// " — resolved as relative to the working directory '…'" for a relative
+/// `requested`, empty for an absolute one. A relative path is resolved against
+/// the process working directory, so naming that directory is the actionable
+/// part — not the fact that the path was relative, which is legitimate and
+/// usually works.
+fn relative_resolution_note(requested: &Path) -> String {
+    if requested.is_absolute() {
+        return String::new();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => format!(
+            " — resolved as relative to the working directory '{}'",
+            cwd.display()
+        ),
+        Err(_) => String::from(" — resolved as relative to the working directory"),
+    }
+}
+
+fn expand_leading_tilde(requested: &Path) -> std::borrow::Cow<'_, Path> {
+    expand_leading_tilde_against(requested, std::env::var_os("HOME"))
+}
+
+/// [`expand_leading_tilde`] with the home directory injected, so the expansion
+/// logic is testable without mutating the process environment (tests run in
+/// parallel, and other tests read `$HOME` concurrently).
+fn expand_leading_tilde_against(
+    requested: &Path,
+    home: Option<std::ffi::OsString>,
+) -> std::borrow::Cow<'_, Path> {
+    match requested.strip_prefix("~") {
+        Ok(rest) => match home {
+            Some(home) if rest.as_os_str().is_empty() => {
+                std::borrow::Cow::Owned(PathBuf::from(home))
+            }
+            Some(home) => std::borrow::Cow::Owned(PathBuf::from(home).join(rest)),
+            None => std::borrow::Cow::Borrowed(requested),
+        },
+        Err(_) => std::borrow::Cow::Borrowed(requested),
+    }
+}
+
 fn normalize_apparent(path: &Path) -> Result<PathBuf, ToolError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -1129,43 +1206,24 @@ impl Permissions {
     fn unresolvable_read_path(&self, requested: &Path) -> ToolError {
         // Bounded: a session can accumulate many grants, and an unbounded list
         // would push a small model's context out the way the path guess did.
-        const MAX_LISTED_ROOTS: usize = 5;
-        let roots = self.read_roots();
-        let listed: Vec<String> = roots
-            .iter()
-            .take(MAX_LISTED_ROOTS)
-            .map(|root| root.display().to_string())
-            .collect();
-        let hint = if listed.is_empty() {
-            String::from("; no read roots are granted in this session")
-        } else {
-            let overflow = roots.len().saturating_sub(listed.len());
-            format!(
-                "; readable root(s): {}{}",
-                listed.join(", "),
-                if overflow > 0 {
-                    format!(" (+{overflow} more)")
-                } else {
-                    String::new()
-                }
-            )
-        };
-        // A relative path is resolved against the process working directory, so
-        // naming that directory is the actionable part — not the fact that the
-        // path was relative, which is legitimate and usually works.
-        let relative = if requested.is_absolute() {
-            String::new()
-        } else {
-            match std::env::current_dir() {
-                Ok(cwd) => format!(
-                    " — resolved as relative to the working directory '{}'",
-                    cwd.display()
-                ),
-                Err(_) => String::from(" — resolved as relative to the working directory"),
-            }
-        };
+        let hint = roots_hint(&self.read_roots(), "read");
+        let relative = relative_resolution_note(requested);
         ToolError::PolicyDenied(format!(
             "path '{}' is not accessible or does not exist{relative}{hint}",
+            requested.display()
+        ))
+    }
+
+    /// The write-side twin of [`Self::unresolvable_read_path`], for a target
+    /// whose PARENT could not be resolved. Same reasoning: a bare "does not
+    /// exist" leaves the model guessing path after path, each guess a full tool
+    /// round, while naming the resolution base and the granted roots makes the
+    /// failure recoverable in one.
+    fn unresolvable_write_parent(&self, requested: &Path) -> ToolError {
+        let hint = roots_hint(&self.write_roots(), "write");
+        let relative = relative_resolution_note(requested);
+        ToolError::PolicyDenied(format!(
+            "parent directory of '{}' is not accessible or does not exist{relative}{hint}",
             requested.display()
         ))
     }
@@ -1173,6 +1231,7 @@ impl Permissions {
     /// Check (and possibly prompt for) read access to `requested`. Returns the
     /// resolved absolute path on success.
     pub async fn check_read(&self, requested: &Path) -> Result<PathBuf, ToolError> {
+        let requested = &*expand_leading_tilde(requested);
         let apparent = normalize_apparent(requested)?;
         let canon =
             std::fs::canonicalize(requested).map_err(|_| self.unresolvable_read_path(requested))?;
@@ -1449,6 +1508,7 @@ impl Permissions {
     /// Check (and possibly prompt for) write access to `requested`. The target
     /// may not exist yet, so the parent is canonicalized before the check.
     pub async fn check_write(&self, requested: &Path) -> Result<PathBuf, ToolError> {
+        let requested = &*expand_leading_tilde(requested);
         let apparent = normalize_apparent(requested)?;
         let file_name = requested.file_name().ok_or_else(|| {
             ToolError::PolicyDenied(format!(
@@ -1461,12 +1521,7 @@ impl Permissions {
             Some(p) => std::fs::canonicalize(p),
             None => std::fs::canonicalize("."),
         }
-        .map_err(|_| {
-            ToolError::PolicyDenied(format!(
-                "parent directory of '{}' is not accessible or does not exist",
-                requested.display()
-            ))
-        })?;
+        .map_err(|_| self.unresolvable_write_parent(requested))?;
         let target = canon_parent.join(file_name);
         // If the target already exists as a SYMLINK, a write follows it — so
         // containment must hold for the link's REAL destination, not the link
@@ -1715,6 +1770,94 @@ mod tests {
             panic!("must be denied");
         };
         assert!(message.contains("no read roots are granted"), "{message}");
+    }
+
+    /// Regression for the first post-release smoke task: kitsu displays paths
+    /// tilde-elided, the model echoed `~/…` back into `Write`, and the literal
+    /// `~` was resolved as a directory name relative to the cwd — so a plain
+    /// "write hello world to ~/project/main.cpp" died with "parent directory
+    /// does not exist". A leading tilde must expand against $HOME for both
+    /// reads and writes, with the permission check running on the expanded
+    /// path.
+    /// The expansion itself, exercised as a pure function so no test mutates
+    /// the process-global `$HOME` (other tests read it concurrently).
+    #[test]
+    fn leading_tilde_expands_only_a_leading_bare_tilde() {
+        let home = Some(std::ffi::OsString::from("/home/kate"));
+        let expand = |p: &str| {
+            expand_leading_tilde_against(Path::new(p), home.clone())
+                .display()
+                .to_string()
+        };
+        assert_eq!(expand("~/project/main.cpp"), "/home/kate/project/main.cpp");
+        assert_eq!(expand("~"), "/home/kate");
+        // `~user` is a different contract; leave it alone rather than guess.
+        assert_eq!(expand("~kate/x"), "~kate/x");
+        // Only a LEADING tilde: mid-path tildes are legitimate file names.
+        assert_eq!(expand("/data/~backup"), "/data/~backup");
+        assert_eq!(expand("/abs/path"), "/abs/path");
+        // No HOME: pass through untouched rather than invent a base.
+        assert_eq!(
+            expand_leading_tilde_against(Path::new("~/x"), None)
+                .display()
+                .to_string(),
+            "~/x"
+        );
+    }
+
+    /// The wiring: both checks run on the EXPANDED path. Proven through the
+    /// denial message — a tilde path under a nonexistent child of the real
+    /// `$HOME` must be reported (and thus was resolved) with the tilde already
+    /// expanded, never as a literal `~` joined to the cwd, which is exactly
+    /// the failure observed live ("parent directory of '~/…' does not exist").
+    #[tokio::test]
+    async fn checks_resolve_tilde_paths_against_home_not_the_cwd() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return; // no HOME in this environment: expansion is a no-op by design
+        };
+        let home = PathBuf::from(home);
+        let perms = Permissions::for_roots(&[], &[]).unwrap();
+
+        let Err(ToolError::PolicyDenied(message)) = perms
+            .check_write(Path::new("~/kitsu-test-no-such-dir-9c1e/file.txt"))
+            .await
+        else {
+            panic!("a write under a nonexistent parent must be denied");
+        };
+        assert!(
+            message.contains(&format!(
+                "{}/kitsu-test-no-such-dir-9c1e",
+                home.display()
+            )),
+            "denial must show the HOME-expanded path: {message}"
+        );
+        assert!(
+            !message.contains("'~/"),
+            "the literal tilde must not survive resolution: {message}"
+        );
+    }
+
+    /// The write-parent denial carries the same recovery aids as the read one:
+    /// the resolution base for a relative path and the granted roots, so one
+    /// failed guess doesn't turn into a chain of failed guesses.
+    #[tokio::test]
+    async fn unresolvable_write_parent_names_the_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let perms = Permissions::for_roots(&[], std::slice::from_ref(&root)).unwrap();
+
+        let Err(ToolError::PolicyDenied(message)) = perms
+            .check_write(Path::new("/definitely-not-here/file.txt"))
+            .await
+        else {
+            panic!("a write under a nonexistent parent must be denied");
+        };
+        assert!(message.contains("parent directory"), "{message}");
+        assert!(
+            message.contains(&root),
+            "denial must name the writable root: {message}"
+        );
+        assert!(!message.contains("working directory"), "{message}");
     }
 
     #[tokio::test]
