@@ -7389,6 +7389,41 @@ fn content_quality_warning(content: &str) -> Option<&'static str> {
     None
 }
 
+/// Detect C0 control characters (other than `\t`, `\n`, `\r`) in text content
+/// destined for a file, returning the count and the first offender.
+///
+/// Observed live, twice, on the 0.1.0 smoke loop: a small model emitted JSON
+/// escapes like ``, ``, `` inside `content`, which decode —
+/// correctly, per JSON — into real control bytes, and the "hello world" it
+/// claimed to write was an uncompilable byte salad the run then reported as a
+/// success. No plausible text write needs a BEL or an ESC byte: files that
+/// legitimately contain control bytes are produced by commands, not typed
+/// through a JSON string field. A false positive costs one instructive
+/// rejection with the file intact; a false negative costs a corrupted file
+/// that reads as a success.
+fn control_character_content(content: &str) -> Option<(char, usize)> {
+    let mut offenders = content
+        .chars()
+        .filter(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'));
+    let first = offenders.next()?;
+    Some((first, 1 + offenders.count()))
+}
+
+/// The shared hard refusal for control-byte content, naming the offender so
+/// the model can correct rather than guess.
+fn refuse_control_characters(field: &str, content: &str) -> Result<(), ToolError> {
+    if let Some((first, count)) = control_character_content(content) {
+        return Err(ToolError::InvalidArgs(format!(
+            "{field} contains {count} control character(s) (first: U+{:04X}) — this is almost \
+             always JSON-escape confusion (e.g. \\u001b) producing bytes no text file wants, and \
+             would corrupt the file. Resend {field} as plain text using only real characters, \
+             with \\t, \\n, \\r as the only control characters; file was not modified.",
+            first as u32
+        )));
+    }
+    Ok(())
+}
+
 async fn write_file_run_with_journal(
     policy: &Permissions,
     journal: Option<&WriteJournal>,
@@ -7396,6 +7431,7 @@ async fn write_file_run_with_journal(
 ) -> Result<String, ToolError> {
     let a: WriteFileArgs =
         serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    refuse_control_characters("content", &a.content)?;
     policy.check_write_size(a.content.len())?;
     if let Some(expected) = a.expected_previous_content.as_deref() {
         policy.check_write_size(expected.len())?;
@@ -7597,6 +7633,7 @@ async fn edit_file_run_with_journal(
              modified."
         )));
     }
+    refuse_control_characters("new_text", &a.new_text)?;
     // Reject an obviously oversized replacement before doing any file IO. The
     // complete post-edit content is checked again below.
     policy.check_write_size(a.new_text.len())?;
@@ -9961,6 +9998,67 @@ UseDNS no
     /// with double-escaped newlines, kitsu wrote them verbatim, the turn
     /// reported success, and a spawned subagent then "verified" the broken
     /// file. The edit must be refused with the file left intact.
+    /// Regression for the 0.1.0 smoke loop, twice over: a small model emitted
+    /// JSON escapes (``, ``, ``…) inside file content, which
+    /// decode into real control bytes, and the resulting byte salad was written
+    /// and reported as a success. Control-byte content must be refused with the
+    /// file untouched, while `\t`/`\n`/`\r` stay writable — and the refusal
+    /// names the first offender so the model corrects instead of guessing.
+    #[tokio::test]
+    async fn write_and_edit_refuse_control_characters_and_leave_files_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy =
+            Permissions::for_roots(std::slice::from_ref(&root), std::slice::from_ref(&root))
+                .unwrap();
+
+        // fs_write_file with an ESC byte (run 1's live corruption).
+        let target = dir.path().join("fresh.cpp");
+        let error = write_file_run(
+            &policy,
+            &serde_json::json!({
+                "path": target.to_string_lossy(),
+                "content": "\u{1b}[31m// \u{1b}[m compile with g++"
+            })
+            .to_string(),
+        )
+        .await
+        .expect_err("control-byte content must be refused");
+        assert!(matches!(error, ToolError::InvalidArgs(_)), "{error}");
+        assert!(error.to_string().contains("U+001B"), "{error}");
+        assert!(!target.exists(), "the file must not be created");
+
+        // fs_edit_file whose replacement smuggles a BEL (run 3's live shape).
+        let existing = dir.path().join("main.cpp");
+        let original = "int main() {\n    return 0;\n}\n";
+        std::fs::write(&existing, original).unwrap();
+        let error = edit_file_run(
+            &policy,
+            &serde_json::json!({
+                "path": existing.to_string_lossy(),
+                "old_text": "    return 0;",
+                "new_text": "\u{7}cout \u{4}\u{19}\"Hello\";\n    return 0;"
+            })
+            .to_string(),
+        )
+        .await
+        .expect_err("a control-byte replacement must be refused");
+        assert!(matches!(error, ToolError::InvalidArgs(_)), "{error}");
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), original);
+
+        // Ordinary text with tabs, newlines, and CRLF is untouched by the guard.
+        write_file_run(
+            &policy,
+            &serde_json::json!({
+                "path": dir.path().join("ok.txt").to_string_lossy(),
+                "content": "line one\r\n\tindented\nlast\n"
+            })
+            .to_string(),
+        )
+        .await
+        .expect("tab/newline/CR content must be accepted");
+    }
+
     #[tokio::test]
     async fn edit_refuses_double_escaped_newlines_and_leaves_the_file_intact() {
         let dir = tempfile::tempdir().unwrap();
@@ -11158,9 +11256,19 @@ UseDNS no
         let policy =
             Permissions::for_roots(&[], &[dir.path().to_string_lossy().to_string()]).unwrap();
         let journal = WriteJournal::new();
-        let mut content = "\u{1b}]0;forged-title\u{7}\u{009b}31m".to_string();
-        content.push_str(&"x".repeat(MAX_JOURNAL_DIFF_BYTES * 2));
-        let args = serde_json::json!({"path": target, "content": content}).to_string();
+        // Control bytes reach files through commands, never through the text
+        // write tool (which refuses them), so seed the control content on disk
+        // directly; the journal must still escape it when it shows up on the
+        // REMOVED side of the diff.
+        let previous = "\u{1b}]0;forged-title\u{7}\u{009b}31m".to_string();
+        std::fs::write(&target, &previous).unwrap();
+        let content = "x".repeat(MAX_JOURNAL_DIFF_BYTES * 2);
+        let args = serde_json::json!({
+            "path": target,
+            "content": content,
+            "expected_previous_content": previous
+        })
+        .to_string();
         let report = run_journaled_write(&journal, &policy, "large control edit", &args).await;
 
         assert!(report.diff_truncated);
