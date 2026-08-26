@@ -358,8 +358,20 @@ fn read_capped_text(mut file: std::fs::File, max_bytes: usize) -> std::io::Resul
             String::from_utf8(bytes[..error.valid_up_to()].to_vec())
                 .expect("validated UTF-8 prefix")
         }
-        Err(error) => {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        Err(_) => {
+            // Binary file. The old InvalidData error made every non-UTF-8
+            // file a dead end under pure read authority — the RE smoke case
+            // could not observe even the four magic bytes of an ELF header,
+            // and the model then confidently answered WRONG from the failure
+            // (issue #24). A bounded hex preview is honest, tiny, and enough
+            // for magic-number triage; truncated stays false because the
+            // "re-read a line range" remedy is meaningless for binary and the
+            // preview describes itself.
+            return Ok(CappedText {
+                text: hex_dump_preview(&bytes, metadata.len()),
+                truncated: false,
+                total_bytes: metadata.len(),
+            });
         }
     };
     Ok(CappedText {
@@ -367,6 +379,32 @@ fn read_capped_text(mut file: std::fs::File, max_bytes: usize) -> std::io::Resul
         truncated,
         total_bytes: metadata.len(),
     })
+}
+
+/// Bytes shown by the binary-file hex preview. Enough for file-type magic,
+/// header fields, and a first impression; small enough to be context-cheap
+/// even on a lean-tier window.
+const HEX_PREVIEW_BYTES: usize = 512;
+
+/// Bounded `offset · hex · ASCII` dump (16 bytes/row) with a self-describing
+/// header line, for files the text reader cannot decode.
+fn hex_dump_preview(bytes: &[u8], total_bytes: u64) -> String {
+    let shown = bytes.len().min(HEX_PREVIEW_BYTES);
+    let mut out = format!(
+        "binary file ({total_bytes} bytes total; not valid UTF-8) — hex dump of the first {shown} bytes:\n"
+    );
+    for (row, chunk) in bytes[..shown].chunks(16).enumerate() {
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+        let ascii: String = chunk
+            .iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .collect();
+        out.push_str(&format!("{:08x}  {:<47}  |{}|\n", row * 16, hex.join(" "), ascii));
+    }
+    if (total_bytes as usize) > shown {
+        out.push_str("...[binary preview capped; use commands (if enabled) for deeper analysis]\n");
+    }
+    out
 }
 
 /// Read lines `[start, end]` (1-based, inclusive) with the byte cap applied
@@ -542,8 +580,23 @@ where
         }
     }
     .await
-    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
-    .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?;
+    let content = match content {
+        Ok(content) => content,
+        // A ranged read of a binary file: line numbers are meaningless there,
+        // so serve the same bounded hex preview a full read produces
+        // (issue #24) instead of the old dead-end UTF-8 error.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            let file = open_read_file(authorization.path())
+                .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+            authorization.validate_opened_file(&file, policy)?;
+            tokio::task::spawn_blocking(move || read_capped_text(file, max_bytes))
+                .await
+                .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+                .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?
+        }
+        Err(error) => return Err(ToolError::ExecError(format!("read failed: {error}"))),
+    };
 
     // Disclose what the caller actually received (post-slice), not the
     // pre-slice absolute read — the earlier figure misdescribed narrow
@@ -7617,7 +7670,12 @@ async fn edit_file_run_with_journal(
         serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
     if a.old_text.is_empty() {
         return Err(ToolError::InvalidArgs(
-            "edit conflict: old_text must not be empty; file was not modified".to_string(),
+            // Name the recovery path: models reach for edit-as-create and,
+            // without it, burn round after round re-trying (issue #24 showed
+            // three in a row).
+            "edit conflict: old_text must not be empty; file was not modified. To create a new \
+             file or replace one entirely, use fs_write_file instead."
+                .to_string(),
         ));
     }
     if a.old_text == a.new_text {
@@ -10170,6 +10228,85 @@ UseDNS no
         .await
         .unwrap_err();
         assert!(matches!(error, ToolError::InvalidArgs(_)), "{error}");
+    }
+
+    /// Regression for issue #24 (RE smoke case): a non-UTF-8 file was a dead
+    /// end — every read errored, the model could not observe even the ELF
+    /// magic, and it answered wrong from the failure. A binary read must serve
+    /// a bounded, self-describing hex preview instead, for both full reads and
+    /// (meaningless-for-binary) line-range reads.
+    #[tokio::test]
+    async fn binary_file_reads_serve_a_hex_preview_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mystery.bin");
+        let mut bytes = vec![0x7f, b'E', b'L', b'F', 0x02, 0x01, 0x01, 0x00];
+        bytes.extend(std::iter::repeat(0xC0).take(2000)); // invalid UTF-8, > preview cap
+        std::fs::write(&path, &bytes).unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap();
+
+        for args in [
+            serde_json::json!({"path": path.to_string_lossy()}),
+            serde_json::json!({"path": path.to_string_lossy(), "start_line": 1, "end_line": 4}),
+        ] {
+            let output = read_file_run(&policy, &args.to_string())
+                .await
+                .expect("a binary read must degrade, not fail");
+            assert!(output.contains("binary file"), "{output}");
+            assert!(output.contains("not valid UTF-8"), "{output}");
+            assert!(
+                output.contains("7f 45 4c 46"),
+                "the ELF magic must be visible in hex: {output}"
+            );
+            assert!(
+                output.contains("|.ELF"),
+                "the ASCII gutter must render printable bytes: {output}"
+            );
+            assert!(
+                output.contains("binary preview capped"),
+                "a preview past the cap must say so: {output}"
+            );
+            assert!(
+                !output.chars().any(|c| c.is_control() && c != '\n'),
+                "the preview itself must be clean text"
+            );
+        }
+
+        // A capped read of a huge VALID UTF-8 file keeps its existing text
+        // behavior — the truncation-boundary path must not regress to hex.
+        let text_path = dir.path().join("big.txt");
+        std::fs::write(&text_path, "é".repeat(200_000)).unwrap();
+        let output = read_file_run(
+            &policy,
+            &serde_json::json!({"path": text_path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("a capped text read still succeeds");
+        assert!(output.starts_with("ééé"), "text stays text");
+        assert!(!output.contains("binary file"), "{output}");
+    }
+
+    /// The empty-old_text refusal must hand the model its recovery path —
+    /// issue #24 showed three consecutive burnt rounds of edit-as-create.
+    #[tokio::test]
+    async fn empty_old_text_error_names_fs_write_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy =
+            Permissions::for_roots(std::slice::from_ref(&root), std::slice::from_ref(&root))
+                .unwrap();
+        let path = dir.path().join("t.txt");
+        std::fs::write(&path, "x\n").unwrap();
+        let error = edit_file_run(
+            &policy,
+            &serde_json::json!({
+                "path": path.to_string_lossy(), "old_text": "", "new_text": "y"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("fs_write_file"), "{error}");
     }
 
     #[tokio::test]
