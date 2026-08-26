@@ -30,8 +30,8 @@ pub use builtins::command::{
 pub use builtins::{ToolTier, LEAN_TIER_WINDOW_THRESHOLD};
 pub use error::{RegistryError, ToolError, ToolInterruption};
 pub use permissions::{
-    Action, Decision, Mode, PermissionRequest, Permissions, Prompter, ReadAuthorization,
-    Revocation, TrustedImplicitReadRoot,
+    host_home_dir, Action, Decision, Mode, PermissionRequest, Permissions, Prompter,
+    ReadAuthorization, Revocation, TrustedImplicitReadRoot,
 };
 
 use std::collections::HashMap;

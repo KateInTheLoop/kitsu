@@ -2363,9 +2363,9 @@ fn environment_override_present(gateway: &Gateway) -> bool {
 }
 
 fn require_persistent_credential_home() -> Result<(), CliError> {
-    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+    let Some(home) = kitsu_tools::host_home_dir() else {
         return Err(CliError::user(
-            "auth login requires an absolute HOME so credentials are never persisted in temporary fallback state",
+            "auth login requires an absolute home directory (HOME, or USERPROFILE on Windows) so credentials are never persisted in temporary fallback state",
         ));
     };
     if !std::path::Path::new(&home).is_absolute() {
@@ -8622,8 +8622,7 @@ struct ContextWindowCache {
 }
 
 fn runtime_state_base() -> std::path::PathBuf {
-    let base = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
+    let base = kitsu_tools::host_home_dir()
         .map(std::path::PathBuf::from)
         .map(|home| home.join(".kitsu"))
         .unwrap_or_else(|| {
@@ -19583,7 +19582,7 @@ fn terminal_inline(value: &str) -> String {
 
 fn shorten_home(p: &std::path::Path) -> String {
     let s = p.to_string_lossy().to_string();
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = kitsu_tools::host_home_dir() {
         let home = home.to_string_lossy();
         let home = home.trim_end_matches('/');
         if !home.is_empty() {

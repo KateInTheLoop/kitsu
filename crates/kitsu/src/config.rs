@@ -278,7 +278,10 @@ impl Config {
                 return PathBuf::from(p);
             }
         }
-        let home = std::env::var("HOME").unwrap_or_default();
+        // HOME → USERPROFILE via the shared accessor: Windows has no HOME,
+        // and the raw read sent the Windows release to a cwd-relative
+        // `.kitsu` (issue #26).
+        let home = kitsu_tools::host_home_dir().unwrap_or_default();
         Path::new(&home).join(".kitsu").join("config.toml")
     }
 

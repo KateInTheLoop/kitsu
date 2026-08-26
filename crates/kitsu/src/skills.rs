@@ -822,9 +822,8 @@ impl SkillSet {
     /// platforms. Non-Unix platforms return an empty set until secure
     /// no-reparse traversal is implemented.
     pub fn discover(start: &Path, no_project: bool, permissions: &Permissions) -> SkillSet {
-        let user_skills = std::env::var_os("HOME")
+        let user_skills = kitsu_tools::host_home_dir()
             .map(PathBuf::from)
-            .filter(|home| !home.as_os_str().is_empty())
             .map(|home| home.join(".kitsu").join("skills"));
         Self::discover_from(start, no_project, user_skills.as_deref(), permissions)
     }

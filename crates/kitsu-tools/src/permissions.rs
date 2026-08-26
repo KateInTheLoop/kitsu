@@ -540,8 +540,32 @@ fn relative_resolution_note(requested: &Path) -> String {
     }
 }
 
+/// The user's home directory as the HOST names it: `HOME` first, then
+/// Windows' `USERPROFILE`, empty values treated as unset.
+///
+/// Every path kitsu derives from "home" — config, state dir, skills, tilde
+/// expansion — went through `HOME` directly, which Windows does not set, so
+/// the Windows release resolved them all against the CURRENT DIRECTORY
+/// (issue #26): config written to a cwd-relative `.kitsu`, `auth login`
+/// refusing outright, `~/…` never expanding. One accessor, shared by both
+/// crates, so no call site can regress to the unix-only spelling.
+pub fn host_home_dir() -> Option<std::ffi::OsString> {
+    host_home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+/// [`host_home_dir`] with the environment injected, so the precedence is
+/// testable without mutating process-global env vars (tests run in parallel
+/// and other tests read them concurrently).
+fn host_home_from(
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+) -> Option<std::ffi::OsString> {
+    home.filter(|value| !value.is_empty())
+        .or_else(|| userprofile.filter(|value| !value.is_empty()))
+}
+
 fn expand_leading_tilde(requested: &Path) -> std::borrow::Cow<'_, Path> {
-    expand_leading_tilde_against(requested, std::env::var_os("HOME"))
+    expand_leading_tilde_against(requested, host_home_dir())
 }
 
 /// [`expand_leading_tilde`] with the home directory injected, so the expansion
@@ -1779,6 +1803,19 @@ mod tests {
     /// does not exist". A leading tilde must expand against $HOME for both
     /// reads and writes, with the permission check running on the expanded
     /// path.
+    /// HOME wins over USERPROFILE; empty values are unset (Windows never sets
+    /// HOME, and an empty HOME on unix must not resolve home to ""). Pure
+    /// function — no process-global env mutation in a parallel suite.
+    #[test]
+    fn host_home_prefers_home_then_userprofile_and_skips_empties() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(host_home_from(os("/home/k"), os("C:\\Users\\k")), os("/home/k"));
+        assert_eq!(host_home_from(None, os("C:\\Users\\k")), os("C:\\Users\\k"));
+        assert_eq!(host_home_from(os(""), os("C:\\Users\\k")), os("C:\\Users\\k"));
+        assert_eq!(host_home_from(os(""), os("")), None);
+        assert_eq!(host_home_from(None, None), None);
+    }
+
     /// The expansion itself, exercised as a pure function so no test mutates
     /// the process-global `$HOME` (other tests read it concurrently).
     #[test]
