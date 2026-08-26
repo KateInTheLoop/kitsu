@@ -807,6 +807,9 @@ fn test_auth_login_never_uses_temporary_state_when_home_is_missing() {
     let mut login = Command::cargo_bin("kitsu").unwrap();
     let output = login
         .env_remove("HOME")
+        // The home accessor falls back to USERPROFILE (issue #26); a Windows
+        // dev box exporting it must not turn this into a passing login.
+        .env_remove("USERPROFILE")
         .env_remove("ANTHROPIC_AUTH_TOKEN")
         .env("KITSU_NO_PROJECT_CONTEXT", "1")
         .args([
@@ -828,7 +831,7 @@ fn test_auth_login_never_uses_temporary_state_when_home_is_missing() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(combined.contains("requires an absolute HOME"));
+    assert!(combined.contains("requires an absolute home directory"));
     assert!(!combined.contains(secret));
     assert!(!root.path().join(".kitsu/credentials").exists());
 }

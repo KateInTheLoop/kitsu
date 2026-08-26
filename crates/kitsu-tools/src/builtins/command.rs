@@ -1599,7 +1599,7 @@ impl CommandPolicy {
         // nothing). Expand a leading `~` against $HOME before resolution.
         let expanded;
         let requested = match requested.strip_prefix("~") {
-            Ok(rest) => match std::env::var_os("HOME") {
+            Ok(rest) => match crate::permissions::host_home_dir() {
                 Some(home) if rest.as_os_str().is_empty() => {
                     expanded = PathBuf::from(home);
                     expanded.as_path()
