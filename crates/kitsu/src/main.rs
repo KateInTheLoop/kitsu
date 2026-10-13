@@ -17,7 +17,6 @@ mod session_telemetry_render;
 mod skills;
 mod structured_output;
 mod subagent;
-mod typeahead_editor;
 mod workspace;
 
 use std::cell::{Cell, RefCell};
@@ -14299,8 +14298,8 @@ struct ActionEffects {
 /// the newest queued prompt plus the remaining count, if any.
 #[cfg(unix)]
 fn resolve_editor_actions(
-    editor: &mut typeahead_editor::TypeaheadEditor,
-    outcome: typeahead_editor::FeedOutcome,
+    editor: &mut kitsu_editor::TypeaheadEditor,
+    outcome: kitsu_editor::FeedOutcome,
     result: &mut TypeaheadCaptureResult,
     mut dispatch: impl FnMut(&str, &mut TypeaheadCaptureResult),
     mut recall_pop: impl FnMut() -> Option<(String, usize)>,
@@ -14311,7 +14310,7 @@ fn resolve_editor_actions(
     };
     for action in outcome.actions {
         match action {
-            typeahead_editor::EditorAction::Submit(line) => {
+            kitsu_editor::EditorAction::Submit(line) => {
                 let line = line.trim().to_string();
                 if line.is_empty() {
                     continue;
@@ -14320,19 +14319,19 @@ fn resolve_editor_actions(
                 // Enqueues and /queue edits both move the pending count.
                 effects.queue_touched = true;
             }
-            typeahead_editor::EditorAction::Eof => {
+            kitsu_editor::EditorAction::Eof => {
                 result.eof = true;
             }
-            typeahead_editor::EditorAction::Interrupt => {
+            kitsu_editor::EditorAction::Interrupt => {
                 effects.raise_signal = Some(libc::SIGINT);
             }
-            typeahead_editor::EditorAction::Suspend => {
+            kitsu_editor::EditorAction::Suspend => {
                 effects.raise_signal = Some(libc::SIGTSTP);
             }
-            typeahead_editor::EditorAction::Quit => {
+            kitsu_editor::EditorAction::Quit => {
                 effects.raise_signal = Some(libc::SIGQUIT);
             }
-            typeahead_editor::EditorAction::CompleteRequest => {
+            kitsu_editor::EditorAction::CompleteRequest => {
                 // Tab accepts the inline slash hint, if one is showing.
                 let buffer = editor.buffer_string();
                 let hint = typeahead_slash_hint(&buffer);
@@ -14341,7 +14340,7 @@ fn resolve_editor_actions(
                     effects.needs_redraw = true;
                 }
             }
-            typeahead_editor::EditorAction::RecallRequest => {
+            kitsu_editor::EditorAction::RecallRequest => {
                 // ↑ on an empty draft: pull the newest queued prompt back
                 // into the editor (it leaves the queue — the draft is now
                 // its only copy; submitting re-enqueues it at the back,
@@ -14361,7 +14360,7 @@ fn resolve_editor_actions(
                     }
                     None => {
                         // Queue empty: plain history walk, as before.
-                        let mut forced = typeahead_editor::FeedOutcome::default();
+                        let mut forced = kitsu_editor::FeedOutcome::default();
                         editor.history_prev_forced(&mut forced);
                     }
                 }
@@ -14376,7 +14375,7 @@ fn resolve_editor_actions(
 /// reverse-search status while Ctrl+R is active, the inline slash hint
 /// otherwise.
 #[cfg(unix)]
-fn update_live_row(editor: &typeahead_editor::TypeaheadEditor) {
+fn update_live_row(editor: &kitsu_editor::TypeaheadEditor) {
     let buffer = editor.buffer_string();
     let search_status = editor.search_status();
     let hint_reserved = search_status.is_some();
@@ -14416,7 +14415,7 @@ fn typeahead_slash_hint(buffer: &str) -> String {
 }
 
 /// The live during-turn editor: raw stdin bytes feed the pure
-/// [`typeahead_editor::TypeaheadEditor`], and the draft renders on the shared
+/// [`kitsu_editor::TypeaheadEditor`], and the draft renders on the shared
 /// status row with a real cursor, ↑/↓ history, and editable text — while
 /// streamed output and tool receipts keep flowing above it. Approval prompts
 /// take stdin back by claiming `APPROVAL_INPUT_ACTIVE`: raw mode is released
@@ -14436,7 +14435,7 @@ fn run_live_typeahead(
         live: true,
         ..TypeaheadCaptureResult::default()
     };
-    let mut editor = typeahead_editor::TypeaheadEditor::with_draft(history, initial_draft);
+    let mut editor = kitsu_editor::TypeaheadEditor::with_draft(history, initial_draft);
     let mut raw = Some(raw);
     // Consecutive no-data poll timeouts; the lone-Esc resolver requires two.
     let mut quiet_ticks = 0u32;
@@ -20798,7 +20797,7 @@ mod tests {
 
     #[cfg(unix)]
     fn resolve(
-        editor: &mut typeahead_editor::TypeaheadEditor,
+        editor: &mut kitsu_editor::TypeaheadEditor,
         bytes: &[u8],
         queue: &mut prompt_queue::PromptQueue,
         dispatched: &mut Vec<String>,
@@ -20824,7 +20823,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn action_resolution_dispatches_trimmed_submissions_and_touches_the_queue() {
-        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut editor = kitsu_editor::TypeaheadEditor::new(Vec::new());
         let mut queue = prompt_queue::PromptQueue::new(4);
         let mut dispatched = Vec::new();
         let (effects, result) = resolve(&mut editor, b"  hello  \r\r", &mut queue, &mut dispatched);
@@ -20839,7 +20838,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn action_resolution_recall_pops_newest_and_falls_back_to_history() {
-        let mut editor = typeahead_editor::TypeaheadEditor::new(vec!["from history".to_string()]);
+        let mut editor = kitsu_editor::TypeaheadEditor::new(vec!["from history".to_string()]);
         let mut queue = prompt_queue::PromptQueue::new(4);
         queue.enqueue("older").unwrap();
         queue.enqueue("newest").unwrap();
@@ -20850,7 +20849,7 @@ mod tests {
         assert!(effects.queue_touched && effects.needs_redraw);
         assert_eq!(queue.status().queued, 1);
         // Empty queue: the same ↑ falls back to the plain history walk.
-        let mut editor = typeahead_editor::TypeaheadEditor::new(vec!["from history".to_string()]);
+        let mut editor = kitsu_editor::TypeaheadEditor::new(vec!["from history".to_string()]);
         let mut queue = prompt_queue::PromptQueue::new(4);
         let (effects, _) = resolve(&mut editor, b"\x1b[A", &mut queue, &mut dispatched);
         assert_eq!(editor.buffer_string(), "from history");
@@ -20861,7 +20860,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn action_resolution_maps_control_actions_to_signals_and_eof() {
-        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut editor = kitsu_editor::TypeaheadEditor::new(Vec::new());
         let mut queue = prompt_queue::PromptQueue::new(4);
         let mut dispatched = Vec::new();
         // Ctrl+C on empty draft → SIGINT effect (raise happens in the caller).
@@ -20882,14 +20881,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn action_resolution_tab_accepts_the_slash_hint() {
-        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut editor = kitsu_editor::TypeaheadEditor::new(Vec::new());
         let mut queue = prompt_queue::PromptQueue::new(4);
         let mut dispatched = Vec::new();
         let (effects, _) = resolve(&mut editor, b"/ste\t", &mut queue, &mut dispatched);
         assert_eq!(editor.buffer_string(), "/steer");
         assert!(effects.needs_redraw);
         // Tab with no matching hint leaves the draft alone.
-        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut editor = kitsu_editor::TypeaheadEditor::new(Vec::new());
         let (_, _) = resolve(&mut editor, b"/zzz\t", &mut queue, &mut dispatched);
         assert_eq!(editor.buffer_string(), "/zzz");
     }

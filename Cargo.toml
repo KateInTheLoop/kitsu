@@ -6,6 +6,7 @@ members = [
     "crates/kitsu-providers",
     "crates/kitsu-tools",
     "crates/kitsu-render",
+    "crates/kitsu-editor",
 ]
 
 [workspace.package]
@@ -53,6 +54,7 @@ kitsu-core = { path = "crates/kitsu-core" }
 kitsu-providers = { path = "crates/kitsu-providers" }
 kitsu-tools = { path = "crates/kitsu-tools" }
 kitsu-render = { path = "crates/kitsu-render" }
+kitsu-editor = { path = "crates/kitsu-editor" }
 
 # Dev-dependencies (tests)
 wiremock = "0.6"
