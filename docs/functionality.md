@@ -267,8 +267,10 @@ adds a bounded redacted event timeline; tool arguments/output and partial model
 bodies are never copied into that inspection record. Built-in `/profiles`
 select a read-only reviewer or a tool-free reasoning worker, and background
 spawns can name a profile without inheriting broader capabilities. `/agents`
-remains a compatibility alias. Styled mode uses a redraw-safe external printer;
-literal plain/assistive input defers notices until the current line is submitted.
+remains a compatibility alias. Styled mode prints background-agent notices
+between prompt cycles by default; `KITSU_LIVE_NOTICES=1` opts into a live
+redraw-safe external printer at the cost of idle input latency. Literal
+plain/assistive input defers notices until the current line is submitted.
 Any terminal result not opened through `/jobs show` is surfaced before a session
 switch or exit. Scripted JSONL emits the same retained evidence as
 `background_result`; an unacknowledged failed detached job makes strict
