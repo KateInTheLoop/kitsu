@@ -1,31 +1,47 @@
-//! Pure line-editor state machine for during-turn type-ahead.
+//! The pure keymap and line editor behind kitsu's during-turn input.
 //!
-//! While a foreground turn runs, stdin is switched to raw (non-canonical)
-//! mode and every byte is fed through this editor. It owns the draft buffer,
-//! cursor, and history navigation; terminal I/O stays in the collector so the
-//! whole keymap is unit-testable as bytes-in → state/actions-out.
+//! This crate holds nothing but the bytes-in → state/actions-out editor
+//! state machine: the draft buffer and cursor, history navigation with a
+//! draft stash, reverse-i-search, bracketed paste, and the key bindings
+//! that drive them. It owns no terminal, performs no I/O, and has no
+//! dependencies at all.
 //!
-//! Supported keys: printable UTF-8 insert, Enter (submit), Backspace, Delete,
-//! ←/→/Home/End (also Ctrl+B/F/A/E), ↑/↓ history walk with a draft stash,
-//! Ctrl+U (kill to start), Ctrl+K (kill to end), Ctrl+W / Alt+Backspace
-//! (delete word behind), Alt+D / Ctrl+Delete (delete word ahead),
-//! Alt+B/F and Ctrl+←/→ (word motion),
-//! Ctrl+D (EOF on an empty draft, delete otherwise), Alt+Enter (literal
-//! newline), Tab (requests inline-hint completion from the collector; the
-//! editor itself is hint-agnostic), and lone Esc (clears the draft — the
-//! collector resolves it via [`TypeaheadEditor::resolve_lone_escape`]
-//! after two consecutive quiet ~50ms poll timeouts, so real escape
-//! sequences, which arrive atomically, are unaffected; a link slow enough
-//! to split a sequence across >100ms will misread it, the standard
-//! escape-time tradeoff every terminal editor makes). Ctrl+R opens
-//! reverse-i-search over history: Ctrl+R cycles older matches, printable
-//! input extends the query, Backspace shrinks it, Enter accepts the match
-//! into the draft (without submitting), Ctrl+G cancels and restores the
-//! pre-search draft, and any other control key accepts then acts. A
-//! bracketed paste
-//! (`ESC[200~`…`ESC[201~`) stays one draft block:
-//! its newlines insert literally instead of submitting. Unknown escape
-//! sequences are consumed and ignored so they never leak into the draft.
+//! It lives in its own library crate because two consumers need it and a
+//! library cannot import from a binary: the `kitsu` binary's raw-mode input
+//! collector, and the terminal-UI crate that renders the prompt row. The
+//! editor was previously a private module of the binary, which made the
+//! second consumer impossible.
+//!
+//! Raw mode and terminal I/O stay in the collector, which is what keeps the
+//! whole keymap unit-testable as bytes in, state and actions out.
+//!
+//! # Supported keys
+//!
+//! Printable UTF-8 insert, Enter (submit), Backspace, Delete, ←/→/Home/End
+//! (also Ctrl+B/F/A/E), ↑/↓ history walk with a draft stash, Ctrl+U (kill to
+//! start), Ctrl+K (kill to end), Ctrl+W and Alt+Backspace (delete word
+//! behind), Alt+D and Ctrl+Delete (delete word ahead), Alt+B/F and Ctrl+←/→
+//! (word motion), Ctrl+D (EOF on an empty draft, delete otherwise), and
+//! Alt+Enter (literal newline).
+//!
+//! Tab requests inline-hint completion from the collector; the editor itself
+//! is hint-agnostic.
+//!
+//! Lone Esc clears the draft. The collector resolves it through
+//! [`TypeaheadEditor::resolve_lone_escape`] after two consecutive quiet
+//! ~50ms poll timeouts, so real escape sequences, which arrive atomically,
+//! are unaffected. A link slow enough to split a sequence across >100ms will
+//! misread it — the standard escape-time tradeoff every terminal editor
+//! makes.
+//!
+//! Ctrl+R opens reverse-i-search over history: Ctrl+R cycles older matches,
+//! printable input extends the query, Backspace shrinks it, Enter accepts the
+//! match into the draft without submitting, Ctrl+G cancels and restores the
+//! pre-search draft, and any other control key accepts then acts.
+//!
+//! A bracketed paste (`ESC[200~`…`ESC[201~`) stays one draft block: its
+//! newlines insert literally instead of submitting. Unknown escape sequences
+//! are consumed and ignored so they never leak into the draft.
 
 /// A side effect the collector must perform after feeding bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,7 +129,7 @@ pub struct TypeaheadEditor {
 }
 
 impl TypeaheadEditor {
-    #[cfg(test)]
+    /// A fresh editor over `history` with an empty draft.
     pub fn new(history: Vec<String>) -> Self {
         Self::with_draft(history, String::new())
     }
