@@ -4477,6 +4477,9 @@ struct ChatSetup {
     /// falls back to the mode default (interactive 8, scripted/piped 2);
     /// `--agent-spawn-cap` overrides.
     agent_spawn_cap: Option<u32>,
+    /// Config-level `[agents] state_file` mode deciding whether this process
+    /// publishes the per-process agent state hint file.
+    agent_state_file: crate::config::StateFileMode,
     /// Effective run-level policy for Kitsu-created automatic output
     /// artifacts. This never changes explicit session, credential, `-o`, or
     /// model filesystem destinations.
@@ -9341,6 +9344,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         auth_status,
         workspace_evidence: config.workspace_evidence.unwrap_or(true),
         agent_spawn_cap: config.agent_spawn_cap,
+        agent_state_file: config.agents.unwrap_or_default().state_file,
         artifact_policy,
         artifact_policy_source,
         context_window,
@@ -15916,6 +15920,39 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         None
     };
 
+    // The per-process agent state file (`[agents] state_file`). The carrier
+    // rule lives entirely in `should_write`, so this is the only gate: a
+    // second check here would make an explicit `on` unobservable in the
+    // scripted and piped carriers that reach this point. The guard removes the
+    // file however this function returns, and writing is best effort — every
+    // error is dropped, because a hint must never cost a turn.
+    let agent_state_pid = std::process::id();
+    let agent_state_dir = agent_state_file::state_dir();
+    let agent_state_enabled = agent_state_file::should_write(
+        setup.agent_state_file,
+        PROCESS_INFERENCE_CARRIER.get().copied(),
+    );
+    let _agent_state_guard = agent_state_enabled
+        .then(|| agent_state_file::StateFileGuard::new(agent_state_dir.clone(), agent_state_pid));
+    let publish_agent_state = |turn_active: bool| {
+        if !agent_state_enabled {
+            return;
+        }
+        let payload = agent_state_file::build(
+            &agent_registry,
+            agent_state_pid,
+            session.directory.display().to_string(),
+            session.session_id.borrow().clone(),
+            turn_active,
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
+        let _ = agent_state_file::write(&agent_state_dir, agent_state_pid, &payload);
+    };
+    // The session's own boundary: idle, before any carrier-specific driver
+    // runs. Scripted, piped and one-shot carriers never reach the interactive
+    // turn boundaries below, so this is the one hint they publish.
+    publish_agent_state(false);
+
     // Scripted mode: run turns from a file non-interactively, then exit. Works
     // regardless of TTY, so it's the deterministic multi-turn driver.
     if let Some(path) = script {
@@ -16768,6 +16805,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let mut run_aggregate = InteractiveRunAggregate::default();
 
     loop {
+        // Turn boundary: the previous turn has ended and nothing is running, so
+        // the hint is refreshed as idle before the next prompt is collected.
+        publish_agent_state(false);
         let agent_snapshot = agent_registry.snapshot();
         if !agent_notifications_live {
             if let Some(message) = background_agent_notice(last_agent_snapshot, agent_snapshot) {
@@ -17373,6 +17413,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let (steering_turn, steering_receiver) = steering
             .begin_turn()
             .expect("interactive turns open steering sequentially");
+        // Turn boundary: a turn is now active, so the hint flips to working
+        // before any inference begins.
+        publish_agent_state(true);
         foreground_typeahead_active.store(true, Ordering::Release);
         // A styled interactive session gets the live raw-mode editor (visible
         // draft + history on the status row); scripted/plain/assistive
