@@ -101,9 +101,14 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T1-S4 state file writer | done | `6fbaaa2` |
 | T1-S4 config key and wiring | done | `eadf6ab` |
 | T1-S5 `kitsu agents` reader | done | this commit |
-| T1-S6 `on_agent_state` hook | next | — |
+| T1-S6 `on_agent_state` hook | done | this commit |
 | T1-S7 docs sweep and records | folded into each story | — |
 | T0 renderer proof of concept | not started | — |
+
+With T1-S6 done, **milestone T1 is complete**: kitsu now exposes its
+background agents to the outside three ways — a grouped and explainable deck
+inside a session, an advisory state file plus a reader for anything outside the
+process, and a push hook on every transition.
 
 T1 was taken before T0 deliberately: it is independent of the renderer and
 ships value whatever the proof of concept concludes. T1-S7 as a separate
