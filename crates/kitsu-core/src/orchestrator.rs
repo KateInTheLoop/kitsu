@@ -1677,7 +1677,8 @@ where
         abort_if_event_sink_failed(cfg)?;
 
         // "Vibing kitsu" while we wait for the model. No-op off a TTY; cleared on
-        // the first stream item (or on drop if the request errors).
+        // the first stream item when text streams live, otherwise when the
+        // stream ends (or on drop if the request errors).
         let mut spinner = if cfg.quiet {
             None
         } else {
@@ -1714,9 +1715,15 @@ where
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut finish = FinishReason::Stop;
 
+        // With tools offered the reply is buffered (ISSUE-002), so the first
+        // item shows nothing; keep the spinner up until the stream ends rather
+        // than leaving a bare prompt that looks idle mid-turn.
+        let streams_live = cfg.stream && !tools_were_offered;
         while let Some(item) = stream.next().await {
-            if let Some(s) = spinner.take() {
-                s.stop();
+            if streams_live {
+                if let Some(s) = spinner.take() {
+                    s.stop();
+                }
             }
             match item? {
                 ChatDelta::Text(t) => {
@@ -1807,6 +1814,9 @@ where
                 }
                 ChatDelta::Done(reason) => finish = reason,
             }
+        }
+        if let Some(s) = spinner.take() {
+            s.stop();
         }
         if let Some(tracker) = &usage_tracker {
             tracker.record_completed();
