@@ -1,6 +1,7 @@
 //! kitsu — CLI entry. MVP target: `kitsu ask --gateway example "hello"` runs the
 //! agent loop against the gateway (Mistral). See docs/architecture.md §6.
 
+mod agent_hook;
 mod agent_state_file;
 mod artifacts;
 mod attachments;
@@ -4501,6 +4502,10 @@ struct ChatSetup {
     /// Config-level `[agents] state_file` mode deciding whether this process
     /// publishes the per-process agent state hint file.
     agent_state_file: crate::config::StateFileMode,
+    /// Config-level `[hooks] on_agent_state` command, already split into argv
+    /// (requirement H3). `None` when absent, empty, or unsplittable, so an
+    /// unusable command is a no-op rather than a per-boundary parse attempt.
+    agent_state_hook: Option<Vec<String>>,
     /// Effective run-level policy for Kitsu-created automatic output
     /// artifacts. This never changes explicit session, credential, `-o`, or
     /// model filesystem destinations.
@@ -9366,6 +9371,12 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         workspace_evidence: config.workspace_evidence.unwrap_or(true),
         agent_spawn_cap: config.agent_spawn_cap,
         agent_state_file: config.agents.unwrap_or_default().state_file,
+        agent_state_hook: config
+            .hooks
+            .unwrap_or_default()
+            .on_agent_state
+            .as_deref()
+            .and_then(agent_hook::split_command),
         artifact_policy,
         artifact_policy_source,
         context_window,
@@ -15969,10 +15980,39 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         );
         let _ = agent_state_file::write(&agent_state_dir, agent_state_pid, &payload);
     };
+    // The agent state hook (`[hooks] on_agent_state`, requirement H3). It is
+    // independent of the state file above: a user may want the notification
+    // without the file, so this is gated only on a usable command. The
+    // previous observations live beside the closure, because firing is driven
+    // by the change between two boundaries, never by an agent's presence.
+    let agent_hook_argv = setup.agent_state_hook.clone();
+    let previous_agent_observations: std::cell::RefCell<Vec<agent_hook::AgentObservation>> =
+        std::cell::RefCell::new(Vec::new());
+    let fire_agent_state_hooks = || {
+        let Some(argv) = agent_hook_argv.as_ref() else {
+            return;
+        };
+        let current = agent_registry
+            .progress_snapshot()
+            .agents
+            .into_iter()
+            .map(|progress| agent_hook::AgentObservation {
+                id: progress.id,
+                state: agent_hook::agent_state_label(progress.status),
+                waiting_for: progress.telemetry.last_activity,
+            })
+            .collect::<Vec<_>>();
+        let mut previous = previous_agent_observations.borrow_mut();
+        for event in agent_hook::transitions(&previous, &current) {
+            agent_hook::fire(argv, &event);
+        }
+        *previous = current;
+    };
     // The session's own boundary: idle, before any carrier-specific driver
     // runs. Scripted, piped and one-shot carriers never reach the interactive
     // turn boundaries below, so this is the one hint they publish.
     publish_agent_state(false);
+    fire_agent_state_hooks();
 
     // Scripted mode: run turns from a file non-interactively, then exit. Works
     // regardless of TTY, so it's the deterministic multi-turn driver.
@@ -16829,6 +16869,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // Turn boundary: the previous turn has ended and nothing is running, so
         // the hint is refreshed as idle before the next prompt is collected.
         publish_agent_state(false);
+        fire_agent_state_hooks();
         let agent_snapshot = agent_registry.snapshot();
         if !agent_notifications_live {
             if let Some(message) = background_agent_notice(last_agent_snapshot, agent_snapshot) {
@@ -17437,6 +17478,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // Turn boundary: a turn is now active, so the hint flips to working
         // before any inference begins.
         publish_agent_state(true);
+        fire_agent_state_hooks();
         foreground_typeahead_active.store(true, Ordering::Release);
         // A styled interactive session gets the live raw-mode editor (visible
         // draft + history on the status row); scripted/plain/assistive

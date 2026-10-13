@@ -52,6 +52,11 @@ pub struct Config {
     /// rather than being handed a silently materialized table.
     #[serde(default)]
     pub agents: Option<AgentsConfig>,
+    /// Optional `[hooks]` table. Absent is the same as every key unset, which
+    /// is why callers read it as `hooks.unwrap_or_default()` rather than being
+    /// handed a silently materialized table.
+    #[serde(default)]
+    pub hooks: Option<HooksConfig>,
 }
 
 /// When the per-process agent state file is written (docs/architecture.md).
@@ -74,6 +79,18 @@ pub enum StateFileMode {
 pub struct AgentsConfig {
     #[serde(default)]
     pub state_file: StateFileMode,
+}
+
+/// The `[hooks]` table. Unknown keys are rejected loudly, so a typo in a hook
+/// name is an error rather than a hook that silently never runs.
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HooksConfig {
+    /// A local command run when a background agent changes state
+    /// (requirement H3). Stored verbatim; splitting into argv is
+    /// `agent_hook`'s job. An empty or whitespace-only string means no hook.
+    #[serde(default)]
+    pub on_agent_state: Option<String>,
 }
 
 /// A single named gateway profile. Unknown keys are rejected loudly: a typo
@@ -617,5 +634,88 @@ mod tests {
             "source leaked in Display: {display}"
         );
         assert!(!debug.contains(SECRET), "source leaked in Debug: {debug}");
+    }
+
+    /// The `[hooks]` table carries the agent state hook. An absent table must
+    /// keep an existing config loading, and an empty command means no hook at
+    /// all rather than an empty argv anyone might try to execute.
+    #[test]
+    fn hooks_table_parses_the_on_agent_state_command() {
+        let parsed: Config = toml::from_str("[hooks]\non_agent_state = \"notify\"\n").unwrap();
+        assert_eq!(
+            parsed.hooks.unwrap_or_default().on_agent_state.as_deref(),
+            Some("notify")
+        );
+
+        let parsed: Config =
+            toml::from_str("[hooks]\non_agent_state = \"/opt/my tools/notify --now\"\n").unwrap();
+        assert_eq!(
+            parsed.hooks.unwrap_or_default().on_agent_state.as_deref(),
+            Some("/opt/my tools/notify --now"),
+            "the command is stored verbatim; splitting is the hook module's job"
+        );
+    }
+
+    #[test]
+    fn hooks_table_is_optional_and_defaults_to_no_hook() {
+        let none: Config = toml::from_str("default_gateway = \"example\"\n").unwrap();
+        assert!(
+            none.hooks.is_none(),
+            "an absent [hooks] table must not be materialized"
+        );
+        assert!(
+            none.hooks.unwrap_or_default().on_agent_state.is_none(),
+            "a config without [hooks] must still load with no hook"
+        );
+
+        let empty: Config = toml::from_str("[hooks]\n").unwrap();
+        assert!(
+            empty.hooks.unwrap_or_default().on_agent_state.is_none(),
+            "a bare [hooks] table must load and mean no hook"
+        );
+
+        assert!(HooksConfig::default().on_agent_state.is_none());
+    }
+
+    /// An empty string is the explicit "disabled" spelling, and it must not
+    /// become a command: it loads, and it carries no hook worth firing.
+    #[test]
+    fn hooks_empty_command_means_no_hook() {
+        let parsed: Config = toml::from_str("[hooks]\non_agent_state = \"\"\n").unwrap();
+        let hooks = parsed.hooks.unwrap_or_default();
+        assert!(
+            hooks
+                .on_agent_state
+                .as_deref()
+                .is_none_or(|command| command.trim().is_empty()),
+            "an empty command must not be a runnable hook: {:?}",
+            hooks.on_agent_state
+        );
+    }
+
+    #[test]
+    fn hooks_table_rejects_unknown_keys_instead_of_defaulting() {
+        let error = toml::from_str::<Config>("[hooks]\non_agent_stat = \"notify\"\n")
+            .expect_err("a typo inside [hooks] must be rejected, not defaulted");
+        assert!(error.message().contains("unknown field"), "{error}");
+        assert!(error.message().contains("on_agent_stat"), "{error}");
+    }
+
+    /// The two optional tables are independent: one present must not require
+    /// or disturb the other.
+    #[test]
+    fn hooks_and_agents_tables_coexist() {
+        let parsed: Config = toml::from_str(
+            "[agents]\nstate_file = \"on\"\n\n[hooks]\non_agent_state = \"notify\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.agents.unwrap_or_default().state_file,
+            StateFileMode::On
+        );
+        assert_eq!(
+            parsed.hooks.unwrap_or_default().on_agent_state.as_deref(),
+            Some("notify")
+        );
     }
 }
