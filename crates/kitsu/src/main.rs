@@ -1,6 +1,7 @@
 //! kitsu — CLI entry. MVP target: `kitsu ask --gateway example "hello"` runs the
 //! agent loop against the gateway (Mistral). See docs/architecture.md §6.
 
+mod agent_state_file;
 mod artifacts;
 mod attachments;
 mod cli;
