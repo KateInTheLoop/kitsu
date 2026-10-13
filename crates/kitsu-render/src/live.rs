@@ -14,7 +14,7 @@
 //! output stays byte-identical.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use owo_colors::OwoColorize;
@@ -83,8 +83,27 @@ fn state() -> &'static Mutex<LiveRowState> {
 /// outermost suspension owns the terminal row.
 static SUSPEND_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
+/// Finding F15's off switch: whether a live status row may be painted at all.
+///
+/// Default `true`, so a session without the inline viewport is byte-identical
+/// to the pre-gate renderer. The inline viewport pins its rows outside the
+/// DECSTBM scroll region and suspends nothing, so a live row painted at the
+/// same time lands *inside* the region and either scrolls away with the
+/// transcript or fights the viewport's parked cursor. The viewport wins,
+/// because its bottom rows are exactly where the spinner, draft, queue tag and
+/// ambient agent tag belong, so running both would be duplication before it is
+/// a conflict.
+static LIVE_ROWS_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Turn the live status row on or off process-wide, returning the **previous**
+/// setting so a caller can restore exactly what it displaced rather than a
+/// hardcoded default.
+pub fn set_live_rows_enabled(enabled: bool) -> bool {
+    LIVE_ROWS_ENABLED.swap(enabled, Ordering::AcqRel)
+}
+
 fn live_rows_supported() -> bool {
-    crate::stderr_styled() && !crate::plain_mode()
+    LIVE_ROWS_ENABLED.load(Ordering::Acquire) && crate::stderr_styled() && !crate::plain_mode()
 }
 
 #[cfg(unix)]
@@ -1579,5 +1598,84 @@ mod tests {
         assert!(display_width(&plain) <= 30, "row must not wrap: {plain:?}");
         // 12 tag + 7 prompt + 5 chars + 1 (1-based).
         assert_eq!(col, Some(12 + 7 + 5 + 1));
+    }
+
+    /// Finding F15, pinned in the crate that owns the mechanism.
+    ///
+    /// The inline viewport pins its rows outside the DECSTBM scroll region and
+    /// suspends nothing, so a live status row painted at the same time lands
+    /// *inside* the region and either scrolls away with the transcript or
+    /// fights the viewport's parked cursor. The resolution is that the
+    /// viewport replaces the live row, which needs a process-wide off switch
+    /// here: `set_live_rows_enabled` returns the previous setting and
+    /// `live_rows_supported` consults it, so with it off every draw path
+    /// degrades to the same pure bookkeeping a non-TTY session already gets.
+    ///
+    /// CAVEAT on the two global pieces this touches. The setting is
+    /// process-wide and so is the live-row state, so the test restores both,
+    /// and the setting is restored through `RestoreLiveRows` so an assertion
+    /// that panics cannot leave the row disabled for the rest of this test
+    /// binary. No serialisation lock is needed: the other tests in this module
+    /// are pure composers that never consult the gate, and the gate's default
+    /// is enabled, so the only observable window is this test's own body.
+    struct RestoreLiveRows(bool);
+
+    impl Drop for RestoreLiveRows {
+        fn drop(&mut self) {
+            set_live_rows_enabled(self.0);
+        }
+    }
+
+    #[test]
+    fn disabling_the_live_rows_stands_the_row_down_and_re_enabling_restores_it() {
+        let _restore = RestoreLiveRows(set_live_rows_enabled(true));
+
+        // Default enabled: with no viewport the gate is transparent and the
+        // predicate is exactly the pre-F15 expression, so nothing changes byte
+        // for byte for a classic session.
+        assert_eq!(
+            live_rows_supported(),
+            crate::stderr_styled() && !crate::plain_mode(),
+            "enabled, the gate must not alter the supported predicate"
+        );
+
+        // Disabled, the predicate is false unconditionally -- styled TTY or
+        // not -- which is what makes the draw paths inert.
+        let previous = set_live_rows_enabled(false);
+        assert!(
+            previous,
+            "set_live_rows_enabled returns the previous setting"
+        );
+        assert!(
+            !live_rows_supported(),
+            "the live row must not be supported while the viewport owns the rows"
+        );
+
+        // A draft update writes nothing: with the row unsupported, `redraw`
+        // returns before touching the terminal, so no region is ever painted
+        // and `drawn_rows` stays at zero. That counter is the only
+        // process-independent witness of "wrote bytes" available here, since
+        // `redraw` takes the real stderr.
+        live_input_begin("kitsu> ".to_string());
+        live_input_update("hello".to_string(), 5, String::new(), false);
+        assert_eq!(
+            state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .drawn_rows,
+            0,
+            "a draft update must paint no rows while the live row is disabled"
+        );
+        live_input_end();
+
+        // Re-enabling restores the previous behaviour: the predicate is the
+        // bare pre-F15 expression again.
+        let previous = set_live_rows_enabled(true);
+        assert!(!previous, "the disabled setting is reported back");
+        assert_eq!(
+            live_rows_supported(),
+            crate::stderr_styled() && !crate::plain_mode(),
+            "re-enabling restores the original predicate exactly"
+        );
     }
 }

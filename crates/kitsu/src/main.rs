@@ -17,6 +17,7 @@ mod session_telemetry_render;
 mod skills;
 mod structured_output;
 mod subagent;
+mod tui_bridge;
 mod workspace;
 
 use std::cell::{Cell, RefCell};
@@ -15965,6 +15966,27 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     );
     let _agent_state_guard = agent_state_enabled
         .then(|| agent_state_file::StateFileGuard::new(agent_state_dir.clone(), agent_state_pid));
+
+    // The inline viewport preview (`KITSU_TUI=inline`, T0-S5a). Held for the
+    // whole session so the scroll region is released on every exit path. With
+    // the variable unset the mode is classic, `install` writes nothing and
+    // touches no global state, so the session is byte-identical.
+    #[cfg(unix)]
+    let _tui_bridge_guard = {
+        let mode = tui_bridge::mode_from_value(std::env::var_os("KITSU_TUI").as_deref());
+        // A failed geometry probe (not a terminal, or an ioctl refusal) falls
+        // back to the conventional 80x24, the same fallback the renderer's own
+        // width probe uses.
+        let (_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        tui_bridge::install(
+            mode,
+            rows,
+            1,
+            "kitsu",
+            Box::new(std::io::stdout()),
+            Box::new(std::io::stderr()),
+        )
+    };
     let publish_agent_state = |turn_active: bool| {
         if !agent_state_enabled {
             return;
