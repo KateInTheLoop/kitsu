@@ -127,3 +127,88 @@ the borrowed shape was exactly backwards and the test failed against correct
 code. One test over any one of the six callers would have made the channel
 contract obvious. That is the real argument for the follow-up card: not
 coverage for its own sake, but a correct example to copy.
+
+## F9 — the declared MSRV of 1.80 is already unachievable, independent of E11
+
+Found: T0-S2, while setting up the plan's MSRV gate. `Cargo.toml` declares
+`rust-version = "1.80"`, and `cargo +1.80.0 check --workspace --all-targets`
+fails with:
+
+```
+feature `edition2024` is required
+The package requires the Cargo feature called `edition2024`, but that feature
+is not stabilized in this version of Cargo (1.80.0)
+```
+
+This is **not** caused by anything E11 added. At commit `7f3133c`, before the
+TUI crate existed, the committed lockfile already pins these at versions whose
+manifests declare `edition = "2024"`, which Cargo 1.80 cannot parse at all:
+
+| Package | Pinned at HEAD |
+|---|---|
+| `clap` / `clap_builder` / `clap_derive` / `clap_lex` | 4.6.1 / 4.6.0 / 4.6.1 / 1.1.0 |
+| `zeroize` | 1.9.0 |
+| `indexmap` / `hashbrown` | 2.14.0 / 0.17.1 |
+| `time` | 0.3.55 |
+| `assert_cmd` / `wiremock` | 2.2.2 / 0.6.5 |
+| `home` | 0.5.12 |
+
+`clap` alone is a core dependency, so the floor is raised for the binary
+itself and not merely for dev targets.
+
+**Consequence for E11:** the plan's T0-S2 gate
+(`cargo +1.80.0 check --workspace --all-targets` green) cannot be met and was
+never meetable. T0-S2 therefore holds a narrower, honest gate: the new crate
+must not *further* raise the floor, verified by pinning `ratatui` to 0.29
+(1.74) rather than 0.30 (1.88) and checking the resolved versions directly.
+The plan's gate text is corrected in the same commit.
+
+**Decision owed to the maintainer**, out of scope here and deliberately not
+taken by E11: either correct `rust-version` to what the dependency tree
+actually supports, or pin the tree back below the edition-2024 releases. The
+second is a large, unrelated change touching `clap`. Until one happens, the
+declared MSRV is documentation that does not hold, and CI does not check it —
+`.github/workflows/rust.yml` runs only `cargo test` on stable, so nothing
+would have caught this.
+
+## F10 — ratatui 0.29 brings three duplicate dependency versions
+
+Found: T0-S2. Adding `ratatui 0.29` plus `crossterm 0.28` leaves the workspace
+carrying two copies of three crates. `crossterm` itself unifies at exactly one
+version (0.28.1, shared by `kitsu-tui` and ratatui), which was the card's gate
+and it passed; these are transitive:
+
+| Crate | Pre-existing | Added by ratatui 0.29 | Via |
+|---|---|---|---|
+| `rustix` | 1.1.4 (`rustyline`/`fd-lock`, `tempfile`) | 0.38.44 | `crossterm 0.28` |
+| `hashbrown` | 0.17.1 (`indexmap`) | 0.15.5 | `lru 0.12` → ratatui |
+| `unicode-width` | 0.1.14 | 0.2.0 (exact pin) | ratatui |
+
+None is unifiable without moving ratatui or crossterm, and ratatui cannot move:
+0.30 requires Rust 1.88. So this is the price of the pin rather than a mistake,
+and it is why the `vt100` dev-dependency had to drop to 0.15 — 0.16 needs
+`unicode-width ^0.2.1` against ratatui's exact `=0.2.0`.
+
+Cost, measured: about 5 s of one-off dependency compilation on a cold build
+(47 crates in the closure), and nothing on the binary today because
+`crates/kitsu` does not depend on `kitsu-tui` yet. The duplicates will reach
+the shipped binary when the bridge lands in T0-S5, so the figure to watch is
+release binary size at that point, not now.
+
+Revisit when ratatui's minimum Rust is reachable, which depends on the
+decision F9 asks for.
+
+## F11 — `TuiRuntime::enter` infers terminal-ness from the process, not its writer
+
+Found: T0-S2. The type is generic over its writer so the lifecycle can be
+tested against a buffer, but a `W: Write` offers no way to ask whether it is a
+terminal, and adding a bound to downcast would change the pinned signature. So
+`enter` asks `std::io::stderr().is_terminal()` instead and enables raw mode on
+that basis, while writing its escape sequences to the injected sink.
+
+That is correct for every intended caller, because the interactive UI is drawn
+to stderr, and it is commented at the site. But the coupling is implicit: a
+future caller that passes a different stream while stderr happens to be a
+terminal would get raw mode enabled for a stream it is not driving. If a second
+destination is ever needed, terminal-ness should become an explicit constructor
+argument rather than a process-wide question.
