@@ -809,6 +809,19 @@ it won't ask again.
   through `/jobs show` are printed before a session switch or interactive exit,
   after live jobs have been joined. Scripted JSONL emits unopened terminal work
   as `background_result`; an unseen failed job makes strict automation nonzero.
+- Because background agents run **in-process**, nothing outside kitsu can see
+  them. `[agents] state_file` publishes a small advisory JSON hint — one file
+  per running process — that an outside tool such as a terminal multiplexer can
+  read to tell whether this kitsu is `idle`, `working`, or `blocked`, with the
+  same redacted thread records `/jobs` shows. `auto` (the default) writes only
+  in an interactive terminal session, so scripted, piped, `ask` and JSONL runs
+  write nothing at all; `on` always writes and `off` never does. It lives at
+  `$XDG_RUNTIME_DIR/kitsu/<pid>.json` (falling back to `$TMPDIR/kitsu-<uid>/`
+  then `/tmp/kitsu-<uid>/`), is created `0700`/`0600`, refuses a directory it
+  does not own or that others can write, never follows a symlink standing in
+  for it, is replaced atomically, refreshes at turn boundaries, and is removed
+  on clean exit. Treat it as a hint, never a source of truth: it may be stale,
+  absent, or left by a process that died, and writing it never affects a turn.
 - Access is **deny-by-default** at the boundary; paths are canonicalized (writes
   canonicalize the parent), so `..`/symlink traversal is rejected. Generated
   files are capped at 1 MiB. `repo_grep` is always available with read tools on
@@ -905,7 +918,7 @@ Slash commands inside the REPL:
 | `/compact` | Compact eligible older exchanges now and report the actual method and savings. |
 | `/profiles` | List validated background-agent profiles with their instructions, requested reasoning effort, tool grant, and session-grant inheritance. Built-ins are a read-only `reviewer` and tool-free `reasoning` worker; both inherit the invocation's reasoning-effort policy rather than requesting one, so they never add a request field a gateway may reject. |
 | `/agent [list\|show ID\|steer ID TEXT\|stop ID\|close ID]` | Inspect one bounded, redacted agent timeline; steer or stop that thread; acknowledge and close retained results. |
-| `/jobs [list\|show ID\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. Steering **restarts** the worker with the correction on a fresh transcript — the receipt reports the elapsed work that discards; completed file changes are kept. `/agents [id]` remains an alias. |
+| `/jobs [list\|view\|explain ID\|show ID\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. `view` groups the same deck by state, agents needing input first, so one row does not hide among many. `explain ID` answers why one agent is in its state, since when, and what it is waiting on, and is read-only: unlike `show` it never acknowledges a ready result, so diagnosing an agent cannot quietly satisfy the unobserved-result exit guard. Steering **restarts** the worker with the correction on a fresh transcript — the receipt reports the elapsed work that discards; completed file changes are kept. `/agents` remains an alias: bare lists, a numeric argument shows that thread, and any other argument is forwarded to `/jobs`. |
 | `/artifacts [list\|prune ID\|prune all]` | Inspect aggregate command-artifact quota/usage and explicitly prune retained evidence. Also reports what earlier runs left on disk; reclaim that with the host-only `kitsu artifacts`. |
 | `/queue [list\|add\|remove\|edit\|move\|promote\|clear]` | Inspect and edit the bounded eight-prompt FIFO; `/queue <prompt>` remains shorthand for add. A single word one edit away from a subaction (e.g. `/queue lst`) gets a close-match suggestion instead of being silently queued; `/queue add <word>` queues it verbatim. |
 | `/steer <correction>` | While a response is running on Unix, cancel its partial turn, keep/report completed file effects, and restart it immediately with the correction before queued follow-ups. |
