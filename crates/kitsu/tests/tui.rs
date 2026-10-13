@@ -426,27 +426,35 @@ fn inline_mode_sets_the_region_once_and_releases_it_once() {
     );
 }
 
-/// Test 4. **A second finding, pinned as measured rather than as wanted.**
+/// Test 4. **Finding F18, now asserted as fixed rather than as measured.**
 ///
 /// The session's closing summary line (`↳ completed in …`) is printed *after*
 /// `BridgeGuard::drop` has released the region: the release and that line are
-/// adjacent in the byte stream, release first. `ESC[r` homes the cursor (per
-/// DECSTBM, resetting the margins moves the cursor to row 1 column 1), so
-/// that line lands on **row 1** and overwrites the top of the transcript,
-/// while the status text painted on row 24 is left on the screen because
-/// `hide` releases the region without clearing the viewport rows.
+/// adjacent in the byte stream, release first. That ordering is not changed
+/// here — the summary is emitted from `main` after `run_chat` returns, while
+/// the guard is a `run_chat` local, so making the guard outlive it would mean
+/// hoisting terminal ownership across process finalisation.
 ///
-/// Both are defects of the teardown order, not of this test; fixing them
-/// belongs to a later card. Asserting the observed behaviour keeps the next
-/// card honest about what it changed.
+/// The fix is contained in `hide` instead: it clears its own viewport rows
+/// while the geometry is still latched, releases the region, and then parks
+/// the cursor on the first (now blank) viewport row, immediately below the
+/// transcript. `ESC[r` homes the cursor, so without that park the summary
+/// lands on row 1 and overwrites the top of the transcript; with it, a later
+/// direct write lands below the transcript by construction.
+///
+/// Asserted on the **final** screen, not `screen_at(1)`: the whole point of
+/// the fix is that the screen a user is left looking at after exit is correct,
+/// so that is the screen under test.
 #[test]
 #[serial]
-fn inline_mode_teardown_leaves_the_last_line_at_the_top_and_a_stale_status_row() {
+fn inline_mode_teardown_parks_below_the_transcript_and_clears_the_status_row() {
     let home = TempDir::new().expect("temp home");
     write_config(home.path());
     let session = run_styled_chat_pty(home.path(), Some("inline"), &help_then_quit());
     let text = session.raw_text();
 
+    // Unchanged: the summary still follows the release in the byte stream.
+    // The fix is in where the cursor is left, not in the ordering.
     let release = text.find("\x1b[r").expect("the guard releases the region");
     let tail = &text[release..];
     assert!(
@@ -455,16 +463,83 @@ fn inline_mode_teardown_leaves_the_last_line_at_the_top_and_a_stale_status_row()
         tail.escape_debug()
     );
 
+    let bottom = ROWS - 1; // rows - viewport_rows, with viewport_rows = 1
+
     let screen = session.screen();
     assert!(
-        screen[0].contains("↳ completed in"),
-        "ESC[r homes the cursor, so that line lands on row 1; screen:\n{}",
+        !screen[0].contains("↳ completed in"),
+        "the summary must not land on row 1 any more; screen:\n{}",
         session.screen_dump()
     );
-    assert_eq!(
+
+    // The top of the transcript is intact: the last of `/help`'s output is
+    // still where the transcript left it, with nothing scribbled over it and
+    // no debris from a half-overwritten row. Pre-fix the summary took row 1
+    // and left the tail of the displaced row showing beneath it.
+    let footer = screen
+        .iter()
+        .position(|row| row.contains("/help <command> explains one command in detail"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the transcript's own footer must survive teardown; screen:\n{}",
+                session.screen_dump()
+            )
+        });
+
+    // The summary lands immediately below the transcript, on the row `hide`
+    // parked the cursor on, and not over it.
+    let summary = screen
+        .iter()
+        .position(|row| row.contains("↳ completed in"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the closing summary must be visible on the exit screen; screen:\n{}",
+                session.screen_dump()
+            )
+        });
+    assert!(
+        summary > footer,
+        "the summary belongs below the transcript, not above its footer on \
+         row {}; screen:\n{}",
+        footer + 1,
+        session.screen_dump()
+    );
+    // ...and it is the *last* thing on the screen: nothing of the transcript
+    // follows it, so it was appended below rather than dropped into the middle
+    // of what was already there. (It is wider than `COLS` and wraps onto one
+    // continuation row, hence `summary + 1`.)
+    let last = screen
+        .iter()
+        .rposition(|row| !row.trim().is_empty())
+        .expect("the exit screen is not blank");
+    assert!(
+        last == summary || last == summary + 1,
+        "the summary is the last content on the exit screen; it ends on row \
+         {}, but row {} still holds {:?}; screen:\n{}",
+        summary + 2,
+        last + 1,
+        screen[last],
+        session.screen_dump()
+    );
+
+    // And the viewport row no longer carries stale status text: `hide` cleared
+    // it. Whatever occupies row 24 is the summary the cursor was parked for,
+    // never the painted `kitsu` status.
+    assert_ne!(
         screen[(ROWS - 1) as usize].trim_end(),
         "kitsu",
-        "and the painted status row is never cleared on the way out; screen:\n{}",
+        "the painted status row must be cleared on the way out; screen:\n{}",
         session.screen_dump()
+    );
+
+    // Finally the raw bytes, so a regression in the sequence itself is named
+    // as such rather than only showing up as a wrong screen.
+    assert_eq!(
+        session.raw_count(&format!("\x1b[{ROWS};1H\x1b[2K\x1b[r\x1b[{ROWS};1H")),
+        1,
+        "teardown clears row {ROWS}, releases the region, then parks on row \
+         {ROWS}, which is bottom + 1 = {}; raw:\n{}",
+        bottom + 1,
+        text.escape_debug()
     );
 }

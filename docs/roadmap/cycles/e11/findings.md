@@ -468,3 +468,33 @@ T0-S5b deliberately **pins the broken behaviour** in a characterisation test —
 release precedes the line, the line lands on row 1, the status row goes stale —
 so the defect cannot change silently. T0-S5c inverts that test, which is what
 makes it the failing test for the fix.
+
+## F19 — `show` emits an invalid scroll region on a terminal shorter than its viewport
+
+Found: T0-S5c, by the test author, while establishing what `hide` may assume
+about geometry. **Pre-existing**, in `InlineSurface::show` since T0-S4.
+
+`show` computes its bottom row as `rows.saturating_sub(viewport_rows)`. When the
+terminal is no taller than the viewport, that saturates to **0** and the region
+set becomes `ESC[1;0r` — an invalid DECSTBM, since the bottom margin must be
+greater than the top. Terminals disagree on what to do with it; some ignore the
+sequence entirely, which leaves no region at all while the code believes one is
+installed.
+
+The same clamp then puts the viewport rows at `1..=viewport_rows`, overlapping
+the region's own top rows rather than sitting below them, so even a terminal
+that tolerates the sequence paints the status over the transcript.
+
+This is only reachable on a terminal of one or two rows with today's single-row
+viewport, which is why it has not been seen. It becomes reachable in ordinary
+use as soon as the viewport grows to the three or four rows the design's
+composer calls for, and F16 already notes that resize is unhandled.
+
+**Deliberately not fixed in T0-S5c**: the natural fix is clamping the bottom to
+at least 1 and refusing to install at all below some minimum height, which
+changes `show`'s emitted bytes and so breaks the tests that pin them. That is a
+card, not a drive-by. The fix also needs a decision this project has not yet
+made — whether an impossibly short terminal should fall back to the classic
+renderer or run with no status row — so it is recorded here rather than guessed
+at. T0-S5c's `hide` is correct for every geometry `show` can currently produce,
+including the degenerate one.
