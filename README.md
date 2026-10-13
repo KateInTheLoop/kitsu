@@ -360,18 +360,26 @@ reads it from `models_path` (useful for scripting / discovery).
 
 The recipes after this first one are already present in the bundled `kitsu.toml`.
 
-### Zero-config local models (`--gateway local`)
+### Zero-config local models (`local`, `remote`, and `--model` routing)
 
 With no `[gateways.local]` profile, `--gateway local` probes the default ports
 of Ollama (11434), LM Studio (1234), llama.cpp (8080) and vLLM (8000) and uses
-the first one that lists models, defaulting to its first model. No config needed:
+the first one that lists models, defaulting to its first model. `--gateway
+remote` is an alias for your `default_gateway`.
+
+Without `--gateway`, `--model` is best-effort: if the local server lists that
+model — exactly, or as a unique substring — kitsu uses it there; otherwise the
+default gateway gets the model id unchanged.
 
 ```bash
 kitsu --gateway local models        # what the local server has
-kitsu --gateway local ask "hi"      # pick another with --model <id>
+kitsu --model glm                   # → local glm-4.7-flash:q4_K_M, if it is served
+kitsu --model gpt-5                 # not local → default_gateway
+kitsu --gateway remote              # always the default_gateway
 ```
 
-A `[gateways.local]` profile, if you define one, always wins.
+An ambiguous substring is an error naming the matches. A `[gateways.local]`
+profile, if you define one, always wins and turns `--model` routing off.
 
 ### Ollama (local)
 
