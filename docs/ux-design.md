@@ -90,6 +90,35 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   carried into the next live editor or pre-filled into the next idle prompt.
   Non-TTY, `--plain`, and assistive sessions keep the canonical
   line-collector loop with byte-identical output.
+- **Inline viewport** (`kitsu-tui`, preview, gated behind `KITSU_TUI=inline`):
+  an alternative to the live status row that keeps its rows **outside** a DEC
+  scroll region instead of repainting one row at the transcript bottom. On
+  entry it sets the region to rows `1..=height - viewport_rows`, parks the
+  cursor on the region's last row, and paints the status rows below it; on exit
+  it clears those rows, releases the region, and leaves the cursor on the first
+  freed row so later output lands below the transcript rather than over its
+  top.
+
+  **The two are mutually exclusive, and the viewport wins.** Both want the
+  bottom rows, and a live row painted while a region is active lands *inside*
+  it and scrolls away with the transcript. So installing the viewport sets
+  `kitsu_render::live::set_live_rows_enabled(false)`, which
+  `live_rows_supported()` consults alongside the existing styled-stderr and
+  plain checks. It defaults enabled, so a session without the viewport is
+  byte-identical to the pre-viewport renderer.
+
+  Because the region scrolls on a line feed regardless of which writer produced
+  it, transcript output that bypasses the render seam entirely — the binary's
+  several hundred direct prints, including all slash-command output — still
+  flows into the region correctly and leaves the status rows intact. This is
+  measured, not assumed, by the styled pseudo-terminal tests in
+  `crates/kitsu/tests/tui.rs`. The measurement holds **at idle in cooked
+  mode**, where the terminal still supplies the carriage return those writers
+  omit; a session that holds raw mode throughout needs them re-measured.
+
+  Tiering is unchanged: the viewport requires a styled interactive TTY, so
+  non-TTY, `--plain`, assistive and JSONL sessions never enter it and stay
+  byte-identical.
 - **Errors**: one weighted `! error: <message>` first line (EMBER, bold on a
   styled TTY) plus untinted hint lines; identical text with zero escape bytes
   elsewhere. Failed turns print no human stats line and no DISCARDED notice

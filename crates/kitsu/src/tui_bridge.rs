@@ -383,10 +383,16 @@ mod tests {
 
         let before = err.bytes().len();
         drop(guard);
-        assert_eq!(
-            &err.text()[before..],
-            "\x1b[r",
-            "the guard releases the DECSTBM region on the way out"
+        // Only that the region is released, not the exact teardown sequence:
+        // `InlineSurface::hide` owns those bytes and pins them against its own
+        // geometry, and this assertion used to duplicate them as a literal.
+        // That snapshot broke the moment F18 made `hide` blank its rows and
+        // park the cursor -- a change this test has no stake in. Assert the
+        // bridge's own concern instead, which is that teardown happened at all.
+        let tail = err.text()[before..].to_string();
+        assert!(
+            tail.contains("\x1b[r"),
+            "the guard releases the DECSTBM region on the way out, got {tail:?}"
         );
 
         let after_drop = err.bytes().len();

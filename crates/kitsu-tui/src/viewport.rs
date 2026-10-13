@@ -57,9 +57,14 @@ use kitsu_render::surface::{Fd, Surface};
 struct Inner {
     out: Box<dyn Write + Send>,
     err: Box<dyn Write + Send>,
-    /// The last row of the scrolling transcript region, 1-based, as
-    /// [`InlineSurface::show`] computed it. `None` until `show` has run.
-    bottom: Option<u16>,
+    /// The latched viewport geometry: `(bottom, viewport_rows)`, where
+    /// `bottom` is the last row of the scrolling transcript region, 1-based,
+    /// as [`InlineSurface::show`] computed it. `None` until `show` has run.
+    ///
+    /// One field rather than two so the pair cannot desynchronise: `hide` must
+    /// clear exactly the rows `show` pinned, and a separately stored row count
+    /// could outlive or contradict the bottom row it belongs to.
+    geometry: Option<(u16, u16)>,
 }
 
 impl Inner {
@@ -88,7 +93,7 @@ impl InlineSurface {
             inner: Mutex::new(Inner {
                 out,
                 err,
-                bottom: None,
+                geometry: None,
             }),
         }
     }
@@ -111,18 +116,43 @@ impl InlineSurface {
     pub fn show(&self, rows: u16, viewport_rows: u16) {
         let bottom = rows.saturating_sub(viewport_rows);
         let mut inner = self.lock();
-        inner.bottom = Some(bottom);
+        inner.geometry = Some((bottom, viewport_rows));
         // Deliberately swallowed: there is nothing to report a failed escape
         // sequence to but the terminal that would not take it.
         let _ = write!(inner.err, "\x1b[1;{bottom}r\x1b[{bottom};1H");
         let _ = inner.err.flush();
     }
 
-    /// Release the scroll region, giving the whole screen back to scrolling.
+    /// Blank the pinned rows, release the scroll region, then park the cursor
+    /// on the first (now blank) viewport row, immediately below the
+    /// transcript.
+    ///
+    /// The order is load-bearing and is the whole of finding F18. The clears
+    /// come first, while the geometry is still latched and the rows are still
+    /// addressable. Releasing the region with `ESC[r` **homes the cursor**, so
+    /// anything written afterwards — including `main`'s closing run summary,
+    /// emitted once the bridge guard has dropped — would land on row 1 and
+    /// overwrite the top of the transcript. The final park puts the cursor
+    /// where such a write belongs, making it land correctly by construction
+    /// rather than by luck of ordering; it has to follow the clears, because
+    /// parking on a row that still holds painted text would merely move the
+    /// same bug down the screen.
+    ///
+    /// With nothing shown this is wholly inert — no rows to clear, no row to
+    /// park on and no region to release — so a second `hide` writes nothing.
     pub fn hide(&self) {
         let mut inner = self.lock();
-        inner.bottom = None;
+        let Some((bottom, viewport_rows)) = inner.geometry.take() else {
+            return;
+        };
+        // Deliberately swallowed, as in `show`: a failed escape sequence has
+        // nowhere to be reported but the terminal that would not take it.
+        for i in 0..viewport_rows {
+            let row = bottom + 1 + i;
+            let _ = write!(inner.err, "\x1b[{row};1H\x1b[2K");
+        }
         let _ = inner.err.write_all(b"\x1b[r");
+        let _ = write!(inner.err, "\x1b[{};1H", bottom + 1);
         let _ = inner.err.flush();
     }
 
@@ -131,13 +161,13 @@ impl InlineSurface {
     /// region.
     ///
     /// Called before [`show`](Self::show) this is a **no-op**: without a
-    /// latched `bottom` there is no region to paint beside and no row to park
+    /// latched geometry there is no region to paint beside and no row to park
     /// on, and emitting absolute positions against a guess would scribble over
     /// the transcript. Doing nothing is the only choice that cannot corrupt
     /// the screen.
     pub fn paint(&self, viewport: &[String]) {
         let mut inner = self.lock();
-        let Some(bottom) = inner.bottom else {
+        let Some((bottom, _)) = inner.geometry else {
             return;
         };
         for (i, row) in viewport.iter().enumerate() {
@@ -272,13 +302,177 @@ mod tests {
         );
     }
 
+    /// The byte sequence `hide` owes a `rows`x`viewport_rows` geometry, built
+    /// from the geometry rather than written out, so the test states the
+    /// contract instead of a transcript of one terminal size.
+    ///
+    /// Order matters and is the whole of finding F18: every viewport row is
+    /// positioned and cleared *first*, while the geometry is still latched and
+    /// the cursor still addressable; then the region is released; then the
+    /// cursor is parked on the first (now blank) viewport row, immediately
+    /// below the transcript. `ESC[r` homes the cursor, so anything written
+    /// afterwards — including `main`'s closing summary, printed after the
+    /// bridge guard has dropped — would otherwise land on row 1 and overwrite
+    /// the top of the transcript. The park is what makes a later direct write
+    /// land in the right place by construction rather than by luck of ordering.
+    fn expected_hide(rows: u16, viewport_rows: u16) -> Vec<u8> {
+        let bottom = rows.saturating_sub(viewport_rows);
+        let mut expected = Vec::new();
+        for i in 0..viewport_rows {
+            let row = bottom + 1 + i;
+            expected.extend_from_slice(format!("\x1b[{row};1H\x1b[2K").as_bytes());
+        }
+        expected.extend_from_slice(b"\x1b[r");
+        expected.extend_from_slice(format!("\x1b[{};1H", bottom + 1).as_bytes());
+        expected
+    }
+
     #[test]
-    fn hide_releases_the_region() {
+    fn hide_clears_the_viewport_row_releases_the_region_then_parks_below_the_transcript() {
         let (surface, sink) = shared();
-        surface.show(24, 3);
+        // 24 rows with a 1-row viewport: bottom = 23, the viewport is row 24,
+        // so exactly ESC[24;1H ESC[2K ESC[r ESC[24;1H.
+        surface.show(24, 1);
         let before = sink.bytes().len();
         surface.hide();
-        assert_eq!(&sink.bytes()[before..], b"\x1b[r");
+        let tail = sink.bytes()[before..].to_vec();
+        assert_eq!(
+            tail,
+            expected_hide(24, 1),
+            "hide tail was {:?}",
+            String::from_utf8_lossy(&tail)
+        );
+        assert_eq!(
+            tail,
+            b"\x1b[24;1H\x1b[2K\x1b[r\x1b[24;1H".to_vec(),
+            "and the derived sequence is the literal one the card specifies"
+        );
+    }
+
+    #[test]
+    fn hide_clears_every_viewport_row_in_ascending_order_before_the_release() {
+        let (surface, sink) = shared();
+        // 10 rows, 3 viewport rows: bottom = 7, the viewport is rows 8, 9 and
+        // 10. All three are cleared, so the loop is pinned rather than a single
+        // hardcoded row.
+        surface.show(10, 3);
+        let before = sink.bytes().len();
+        surface.hide();
+        let tail = sink.bytes()[before..].to_vec();
+        assert_eq!(
+            tail,
+            expected_hide(10, 3),
+            "hide tail was {:?}",
+            String::from_utf8_lossy(&tail)
+        );
+
+        // Spelled out independently of the helper: the clears precede the
+        // release, and they ascend.
+        let text = String::from_utf8(tail).expect("hide emits UTF-8");
+        let release = text.find("\x1b[r").expect("the region is released");
+        let clears = &text[..release];
+        let mut at = 0usize;
+        for row in [8, 9, 10] {
+            let needle = format!("\x1b[{row};1H\x1b[2K");
+            let found = clears
+                .get(at..)
+                .and_then(|rest| rest.find(&needle))
+                .unwrap_or_else(|| {
+                    panic!("row {row} is positioned and cleared before the release: {clears:?}")
+                });
+            at += found + needle.len();
+        }
+        assert_eq!(
+            &text[release..],
+            "\x1b[r\x1b[8;1H",
+            "nothing but the release and the park follows the clears"
+        );
+    }
+
+    #[test]
+    fn hide_with_no_viewport_shown_writes_nothing() {
+        // Without a latched geometry there are no rows to clear and no row to
+        // park on, and there is no region to release either: `hide` is inert.
+        let (surface, sink) = shared();
+        surface.hide();
+        assert!(
+            sink.bytes().is_empty(),
+            "hide before show emits no bytes at all, got {:?}",
+            sink.text()
+        );
+    }
+
+    #[test]
+    fn hide_is_idempotent_and_emits_the_sequence_once() {
+        // This documents rather than changes behaviour: `hide` clears the
+        // latched geometry, and the second call therefore takes the same inert
+        // path as `hide` before `show`. Pinned because the clearing loop makes
+        // a double teardown newly destructive — a second pass would blank rows
+        // whose geometry no longer holds.
+        let (surface, sink) = shared();
+        surface.show(24, 1);
+        let before = sink.bytes().len();
+        surface.hide();
+        let once = sink.bytes()[before..].to_vec();
+        surface.hide();
+        assert_eq!(
+            sink.bytes()[before..].to_vec(),
+            once,
+            "the second hide adds nothing"
+        );
+        assert_eq!(once, expected_hide(24, 1));
+    }
+
+    #[test]
+    fn hide_writes_the_teardown_bytes_to_the_stderr_sink_only() {
+        // Same descriptor discipline as `show`: nothing of the viewport, its
+        // teardown included, may leak into a redirected stdout.
+        let (surface, out, err) = split();
+        surface.show(24, 1);
+        let before = err.bytes().len();
+        surface.hide();
+        assert_eq!(&err.bytes()[before..], expected_hide(24, 1).as_slice());
+        assert!(
+            out.bytes().is_empty(),
+            "stdout carries no viewport teardown bytes"
+        );
+    }
+
+    #[test]
+    fn hide_latches_the_viewport_row_count_so_it_can_clear_what_show_pinned() {
+        // `hide` cannot clear rows it does not know about, so `Inner` must
+        // remember the row count alongside the bottom row. One field holding
+        // both keeps them from desynchronising.
+        let surface = InlineSurface::new(Box::new(SharedSink::new()), Box::new(SharedSink::new()));
+        assert_eq!(surface.lock().geometry, None, "nothing latched before show");
+        surface.show(10, 3);
+        assert_eq!(
+            surface.lock().geometry,
+            Some((7, 3)),
+            "show latches (bottom, viewport_rows)"
+        );
+        surface.hide();
+        assert_eq!(surface.lock().geometry, None, "hide unlatches the geometry");
+    }
+
+    #[test]
+    fn show_and_paint_byte_sequences_are_unchanged_by_the_hide_fix() {
+        // A guard for this card specifically: only `hide` changes. `show` still
+        // sets the region and parks on its last row, and `paint` still
+        // positions, clears and writes each viewport row before re-parking
+        // inside the region.
+        let (surface, sink) = shared();
+        surface.show(24, 3);
+        assert_eq!(sink.bytes(), b"\x1b[1;21r\x1b[21;1H".to_vec());
+        let before = sink.bytes().len();
+        surface.paint(&["composer".to_string()]);
+        assert_eq!(
+            &sink.bytes()[before..],
+            b"\x1b[22;1H\x1b[2Kcomposer\x1b[21;1H"
+        );
+        let before = sink.bytes().len();
+        surface.transcript_line(Fd::Stdout, "line");
+        assert_eq!(&sink.bytes()[before..], b"line\r\n");
     }
 
     #[test]
