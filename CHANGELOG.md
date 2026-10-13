@@ -31,6 +31,15 @@ shapes may change in any minor release.
   working, or blocked, with the same redacted thread records `/jobs` shows.
   `auto`, the default, writes only in an interactive terminal session, so
   scripted, piped, `ask` and JSONL runs write nothing at all.
+- `kitsu agents` lists the background agents every kitsu process on this
+  machine is publishing, in human text or as JSON with `--json`. Processes
+  that have exited are skipped unless `--all`. It is deliberately
+  forgiving of the future: a state file written by a newer kitsu is reported
+  as schema-unsupported rather than dropped, an unrecognised field does not
+  make a file unreadable, and an individual thread record this binary cannot
+  validate is counted instead of blanking the whole listing — a newer sibling
+  process can never blind the reader. It creates, modifies, and deletes
+  nothing.
 - The live status row carries a dimmed ambient tag during a turn — `[N blocked]`
   or `[N agent(s)]`, blocked outranking running — so background work stays
   visible after its one-off completion notice has scrolled away.

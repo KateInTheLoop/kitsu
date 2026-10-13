@@ -638,6 +638,7 @@ single tool-free `ask` turn and exits after the answer.
 | `models [filter]` | List models advertised by the selected gateway without requiring a configured model ID. |
 | `sessions [action]` | List/show/fork/export/archive/restore/delete sessions without a provider; fork receipts name the exact resolved source; `list [filter]` narrows by substring; `resume` launches chat on a TTY or emits exact argv otherwise. |
 | `artifacts [list\|prune <id\|all>]` | Host-only, provider-free inventory and reclamation of command-artifact storage left by earlier runs. Live generations are never removed. |
+| `agents [--all] [--json]` | Host-only, provider-free listing of the background agents every kitsu process on this machine is publishing, read from the advisory state files `[agents] state_file` writes. Dead processes are skipped unless `--all`. A file written by a newer kitsu is reported as schema-unsupported instead of dropped, and a thread record this binary cannot validate is counted rather than blanking the listing. The reader creates, modifies, and deletes nothing. |
 | `chat [prompt]` | Interactive multi-turn REPL. An optional first prompt is queued as the first turn. With piped stdin (non-TTY), the prompt/stdin is a single turn. |
 
 **Global flags** (apply to any command)
