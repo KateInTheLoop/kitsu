@@ -1,0 +1,15 @@
+[package]
+name = "kitsu-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ratatui = "0.29"
+# Declared explicitly so the version unifies with ratatui's own backend
+# dependency instead of resolving a second crossterm.
+crossterm = "0.28"
+
+[dev-dependencies]
+vt100 = "0.15"
