@@ -14215,10 +14215,19 @@ fn run_live_typeahead(
         drop(queue);
         live::live_queue_state(queued, previews);
     };
+    // The ambient background-agent tag: a cheap `watch` borrow of a `Copy`
+    // snapshot, so polling it per tick costs nothing and the tag tracks
+    // reality within one poll interval.
+    let sync_agent_counts = |dispatcher: &TypeaheadDispatcher| {
+        let agents = dispatcher.registry.snapshot();
+        live::live_agents_state(agents.blocked, agents.running);
+    };
     // Depth first, paint second: the row's first frame must reflect the
     // real queue, not the previous turn's persisted count (the main loop
-    // dequeues between turns, so the stored value can be stale here).
+    // dequeues between turns, so the stored value can be stale here). The
+    // agent counts are synced ahead of the first paint for the same reason.
     sync_queue_depth(dispatcher);
+    sync_agent_counts(dispatcher);
     live::live_input_begin(prompt.clone());
     update_live_row(&editor);
     while !stop.load(Ordering::Acquire) {
@@ -14253,6 +14262,11 @@ fn run_live_typeahead(
         if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
             continue;
         }
+        // We own stdin and the row is painted: refresh the ambient agent tag
+        // once per poll tick. Deliberately after the approval checks, so no
+        // work happens while the approval reader owns the terminal and the
+        // row is torn down.
+        sync_agent_counts(dispatcher);
 
         let mut descriptor = libc::pollfd {
             fd: libc::STDIN_FILENO,
