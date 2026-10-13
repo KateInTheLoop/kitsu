@@ -1,0 +1,359 @@
+# Kitsu TUI and agent view — implementation plan
+
+- **Status:** Draft v2 (revised after review `reviews/tui-plan-review-1.md`)
+- **Date:** 2026-10-12
+- **Branch:** `features/tui_herdr_improvements`
+- **Design:** `docs/tui-and-agent-view-design.md` (v2.1). Requirement IDs
+  (R*, A*, B*, H*, N*) below refer to it.
+- **Delivery protocol:** `docs/roadmap/cycle-protocol.md`: a **card** is one
+  30-minute cycle ending in one green commit and never spans two cycles. This
+  plan is written at **story** granularity (2–8 cycles each) because that is
+  the level at which scope and acceptance are stable; each story names its
+  **first card** (the smallest failing test) and is sliced into further cards
+  at execution time. Cycle records cite `E11 / T<n>-S<m> / C<k>`.
+- **IDs:** epic **E11** (E10 is already "five-boundary certification" in
+  `docs/roadmap/README.md`); milestones **T0–T5** (program milestones M0–M7
+  are taken).
+- **Gates (every card):** `cargo test --workspace --no-fail-fast` in **debug
+  and release**; `cargo clippy --workspace --all-targets`; `cargo fmt
+  --check`; the named invariant tests the card touches. CI
+  (`.github/workflows/rust.yml`) runs only `cargo test` in both profiles on
+  Ubuntu, so clippy/fmt/`--locked` are plan gates, not CI gates, until a
+  separate CI card adds them. Dependency-touching cards add `cargo test
+  --locked` and the MSRV check (§9). Milestone exits add the PTY matrix (§9)
+  and, from T3, a Windows `cargo check`.
+- **Do not cite `scripts/check-roadmap.sh`** as acceptance: its default base
+  commit `a2ba2d5…` is not present in this repository (`git cat-file` fails),
+  and it requires one cycle file per commit since that base, which this
+  branch's merge history cannot satisfy. Cycle records follow the template in
+  `cycle-protocol.md` instead.
+
+The plan is a **proof of concept first**, then five milestones. The PoC is
+time-boxed, invisible unless `KITSU_TUI=inline` is set, asks only renderer
+questions, and ends with a go/no-go record. T1 (hooks, classic polish) and T2
+(blocked agents) ship value even if the renderer PoC says no-go.
+
+---
+
+## 1. What the code gives us (baseline facts)
+
+Checked on the branch; line numbers are from the current tree.
+
+| Fact | Where | Consequence |
+|---|---|---|
+| `crates/kitsu` is **binary-only**: `[[bin]]`, no `src/lib.rs`; `typeahead_editor`, `subagent`, `attachments` are private `mod`s of `main.rs` | `crates/kitsu/Cargo.toml:15-17`, `main.rs:4-19` | A library crate `kitsu-tui` that `kitsu` depends on **cannot** import those types. The editor must move to a library crate first (T0-S1); agent rows and completion sources cross the boundary as plain structs/traits. |
+| The orchestrator renders by calling `kitsu-render` globals: `print_fragment` (`orchestrator.rs:1730`), `tool_activity` (`:2051`), `tool_result` (`:2202`) | `crates/kitsu-core/src/orchestrator.rs` | Orchestrator output can be redirected behind a `Surface` seam without touching the orchestrator. |
+| `main.rs` has **349 `eprintln!` and 43 `println!`** outside tests (`handle_jobs_command` alone 28) that write to the terminal directly; exactly one `main.rs` site uses `with_live_row_suspended` (`:13666`); `kitsu-render` has 8 closure callers of it and `StreamBuffer::push` writes straight to `io::stdout()` | `main.rs`, `lib.rs:388,418,1117,1154,1434,1463,1519,1668`, `lib.rs:219-234` | **This is the real seam risk.** Those writes run on the REPL thread between prompts (slash commands) or inside already-suspended notices. A pinned viewport must either wrap the slash dispatcher in the suspend/repaint protocol or keep a permanent scroll region so stray writes flow into scrollback. T0 measures this (Q3). |
+| `with_live_row_suspended` is reentrant via `SUSPEND_DEPTH`; `PromptSafeAsyncNotice` nests it; prompters run synchronously under `spawn_blocking` | `live.rs:697-711`, `lib.rs:1117`, `permissions.rs` `async fn prompt` | A `Surface` lookup must never hold a lock across a `Surface` call (std `RwLock::read` may deadlock on recursion while a writer waits). |
+| `TypeaheadEditor::feed(&mut self, bytes: &[u8])` is **byte-fed**; `main.rs:14243` feeds raw bytes; the collector enables bracketed paste (`:13819`) and yields stdin when `APPROVAL_INPUT_ACTIVE > 0` (`:13920, :14158, :14336`); `CliPrompter::ask` reads stdin directly via `read_approval_line` (`:19404`) | `typeahead_editor.rs:281`, `main.rs` | The TUI reads raw stdin bytes itself (crossterm for output/size only) **and** must honor `APPROVAL_INPUT_ACTIVE` or two readers race. The editor module has no `use crate::` imports, so it moves verbatim. |
+| `/agents` alias arm forwards only an empty argument (`list`) or a numeric one (`show N`); anything else errors (`usage: /agents [id]`). `/agent` forwards its argument verbatim to `handle_jobs_command`. Mid-turn `/jobs` goes to `handle_active_jobs_command` (`list\|show\|steer\|stop`) | `main.rs:18728-18736`, `:18745-18752`, `:13720`, `:13556-13568` | New subcommands must land in **three** places: `handle_jobs_command`, `handle_active_jobs_command`, and the alias arm (plus the `SLASH_COMMANDS` spec rows at `:5194`, `:5202`). |
+| PTY harness `run_plain_interactive_chat_pty` spawns the `kitsu` binary with `--plain --gateway example --no-stream`; an SSE streaming mock exists (`cli.rs:2791`); no terminal-emulator helper (`vt100`, `expectrl`) is in `Cargo.lock` | `crates/kitsu/tests/cli.rs:70-130` | In-process rendering tests need injectable sinks; real-PTY styled streaming tests are new work (T3-S1). |
+| `AgentRegistry` built at `main.rs:15007`; `spawn_agent_bg_tool_with_binder` wired at `:15116` with `quiet = true` (`:15115`); `background_agent_notice` (`:10799`) consumed at `:16423`, `:16496`; `subscribe()` at `subagent.rs:706`; `rename`/`answer`/`tail_timeline` do not exist; private `attach` at `:681` | `main.rs`, `subagent.rs` | T1/T2/T4 registry additions are new methods, not edits. |
+| `AgentRegistrySnapshot` is `Copy + Default`, built by struct literal at `subagent.rs:1185` and in tests `main.rs:21853-21881`; `AgentThreadSnapshot` literals at `thread.rs:700`, `main.rs:20632`; exhaustive matches in `agent_progress_status_label` (`main.rs:10844`), `format_jobs` (`:10909`), `format_agent_thread` (`:11095`) | `subagent.rs`, `thread.rs`, `main.rs` | Adding fields/variants breaks these sites; their files belong in the story's Files column. |
+| Approval gates: `Permissions::resolve` `Mode::Ask` (`permissions.rs:1623`) and `CommandMode::Ask` (`command.rs:1687`), both calling `interactive_prompts_allowed()` (`kitsu-tools/src/lib.rs:61-65`, default `true` when unscoped). `scope_without_interactive_prompts` is used by `subagent.rs:1977` and five `semantic.rs` sites (`:136, :678, :702, :741, :775`); scope tests at `permissions.rs:2064`, `command.rs:3578` | `crates/kitsu-tools` | The prompt route must keep `scope_without_interactive_prompts` ⇒ denied for all seven callers; only the new registry route changes behavior. |
+| `AgentThreadSnapshotDto::validate()` rejects any `schema_version != AGENT_THREAD_SCHEMA_VERSION` (`thread.rs:234-238`) | `thread.rs` | A T2 reader (v2) would reject v1 state files written by a still-running T1 process unless the reader tolerates older versions. |
+| `ratatui 0.30.2` requires Rust **1.88**; `0.29.0` requires 1.74; `crossterm 0.29` 1.63; `vt100 0.16` 1.70. Workspace `resolver = "2"` ignores `rust-version`; MSRV is 1.80 (`Cargo.toml:14`); no 1.80 toolchain installed locally; release builds are `--locked` on linux/macOS/Windows (`release.yml`) | `cargo info`, `Cargo.toml:2,14`, `rustup toolchain list` | Pin `ratatui = "0.29"` and the crossterm it uses (0.28 at the time of writing; confirm one crossterm with `cargo tree -d`), `vt100 = "0.16"` as dev-dep; install `1.80.0` and gate with `cargo +1.80.0 check --workspace --all-targets`. |
+| No `XDG_*`/`dirs` usage anywhere; only `host_home_dir()` (`permissions.rs:552`); roadmap invariants: "Config discovery … performs no implicit … state mutation" and "Optional integrations create no … state write … while disabled" | grep; `docs/roadmap/README.md:68-69, 76` | The state file must be interactive-only by default with explicit opt-in for automation, and needs macOS/Windows directory fallbacks and file permissions. |
+| `SavedSession` (`session.rs:55-70`) persists `messages` plus id/name/model/project_context; no tool receipts or notices | `crates/kitsu/src/session.rs` | Transcript overlay and fullscreen read an in-memory cell ring; slash-command output that bypasses the seam is **not** in the ring (documented limitation until routed). |
+| Tests: `kitsu-render/src/lib.rs` 43, `live.rs` 26, `typeahead_editor.rs` 39; `kitsu-render` has 41 top-level `pub fn` in `lib.rs` + 5 in `live.rs`; 16 live-region call sites outside `live.rs` (`with_live_row_suspended\|live_input_`), 19 including `live_queue_state`/`Spinner::start` | grep | Regression net exists; the extracted editor must carry its 39 tests. |
+| Working tree: `crates/kitsu-tools/src/builtins/fs.rs` is **modified and uncommitted** and predates this work; the design/plan/review docs and two doc fixes are ours | `git status` | Per `docs/roadmap/README.md` Definition of Ready #6, the `fs.rs` change needs an ownership decision from the maintainer before T0 commits; it is never absorbed into E11 commits. |
+
+---
+
+## 2. Milestone map
+
+```
+T0  Renderer PoC (env-gated, time-boxed)     ── answers Q1..Q4, go/no-go record
+ ├─ T1  Herding hooks + classic polish        ── ships regardless of T0
+ ├─ T2  Blocked agents (permission-only)      ── ships regardless of T0
+ └─ (go) T3  Inline renderer, release quality
+            └─ T4  Agent view: peek, attach, dispatch
+                  └─ T5  Fullscreen, agent_wait, herdr manifest, default flip
+```
+
+T1 and T2 run in parallel with T0 (different files). T2-S7 (hook surfacing)
+follows T1. T3 starts only after the T0 **go** record. Each milestone ends with
+an exit gate, a rollback statement, and a cycle record naming residual risk.
+
+| Milestone | Design stage | Stories | Cycles (30 min) | Calendar |
+|---|---|---|---|---|
+| T0 PoC | — | 6 | 20–30 | 1.5–2.5 days, hard stop at 3 |
+| T1 Hooks + classic polish | Stage 0 | 7 | 14–20 | ~1.5 days |
+| T2 Blocked agents | Stage 1 | 7 | 20–28 | ~2 days |
+| T3 Inline renderer | Stage 2 | 13 | 45–60 | 4–5 days |
+| T4 Agent view | Stage 3 | 10 | 35–50 | 3.5–5 days |
+| T5 Fullscreen + polish | Stage 4 | 8 | 20–28 | 2–2.5 days |
+
+---
+
+## 3. T0 — Renderer proof of concept
+
+### Goal
+
+Prove, in the real binary behind `KITSU_TUI=inline` (env only; no config,
+no `/tui`, no docs), that a pinned viewport can coexist with kitsu's existing
+output paths. Questions:
+
+- **Q1 — Scrollback flow.** With a permanent DEC scroll region covering all
+  rows above the viewport, does transcript text written **normally on its own
+  fd** (stdout for assistant text, stderr for chrome) scroll into native
+  scrollback in order, with no duplicates or lost lines, in xterm-class
+  terminals and tmux? If a terminal does not push region-scrolled lines to
+  scrollback, fall back to Codex-style per-cell `insert_history`. (R3, N6)
+- **Q2 — ratatui coexistence.** Does ratatui `Viewport::Inline` tolerate the
+  scroll region / manual repaint, or does its cursor bookkeeping break (Codex
+  forked `Terminal`)? Fallback: paint the viewport manually (as `live.rs`
+  does) and use ratatui only for alternate-screen overlays.
+- **Q3 — Stray writers.** Wrapping the **slash dispatcher** once in the
+  suspend/repaint protocol, plus the already-suspended async notices: does
+  `/jobs`, `/help`, `/status` output at idle leave the viewport intact?
+  Census the remaining unsuspended idle writers (there are 392 direct
+  `eprintln!/println!` in `main.rs`; most are inside slash handlers). Record
+  what is left and whether it is tolerable for T3.
+- **Q4 — Input latency.** Raw-byte input through the extracted editor inside
+  the TUI loop: 10 KiB paste < 100 ms (N2), with `APPROVAL_INPUT_ACTIVE`
+  honored so a foreground approval prompt can still read stdin.
+
+### Scope
+
+In: editor extraction, one new crate, `Surface` seam, env gate, viewport,
+status row with spinner only. Out: config, `/tui`, completion lists, approval
+modal, resize reflow, agent overlay, blocked agents, hooks, docs, Windows.
+
+### Stories
+
+| Story | Deliverable | First card | Files | Acceptance |
+|---|---|---|---|---|
+| T0-S1 | Extract `typeahead_editor.rs` verbatim into new library crate `crates/kitsu-editor` (no new deps); `main.rs` uses `kitsu_editor::…` at its 20 reference sites | Move the file + fix paths; 39 editor tests green in the new crate | `Cargo.toml`, `crates/kitsu-editor/*`, `crates/kitsu/Cargo.toml`, `main.rs` | `cargo test -p kitsu-editor` 39 green; `cargo test -p kitsu` unchanged; no behavior change |
+| T0-S2 | Add `crates/kitsu-tui` with `ratatui = "0.29"`, its crossterm (0.28), `vt100 = "0.16"` (dev); `TuiRuntime::enter/leave` (raw mode, title set/restore, restore on `Drop`, `SIGINT`, panic hook) — nothing drawn yet. **Windows:** crate compiles everywhere but the bridge is `cfg(unix)` until T3 | Failing test: `leave()` idempotent and restore sequence emitted exactly once | `Cargo.toml`, `Cargo.lock`, `crates/kitsu-tui/*` | `cargo test --locked` both profiles; `cargo tree -d` shows one crossterm; `rustup toolchain install 1.80.0 && cargo +1.80.0 check --workspace --all-targets` green; build-time delta recorded in the commit |
+| T0-S3 | `Surface` trait in `kitsu-render` (`transcript_line(Fd, &str)`, `spinner`, `draft`, `queue`, `notice`, `finish_line`, `suspend/resume`); `ClassicSurface` = today's code; globals load an `Arc<dyn Surface>` from a **short-lived** `RwLock` read guard and call it after the guard drops; swap only between turns on the REPL thread | Failing test: a recording `Surface` sees the same calls `print_fragment`/`tool_activity` make today; then every existing `kitsu-render` test must stay green | `crates/kitsu-render/src/{lib,live,surface}.rs` | **Byte-identical**: all 69 render tests green; `cargo test -p kitsu --test cli` plain/non-TTY fixtures unchanged; reentrancy test: nested `with_live_row_suspended` inside a `Surface` call does not deadlock |
+| T0-S4 | `InlineSurface` with **injectable per-fd sinks**: permanent scroll region (rows 1..rows−N) while shown; viewport rows painted by absolute positioning; cursor parked inside the region after each paint; `transcript_line` writes on the given sink | Failing test: in-process, 200 alternating stdout/stderr lines through `vt100::Parser` → screen rows show the viewport, scrollback holds all 200 in order | `crates/kitsu-tui/src/viewport.rs` | vt100 test green; a second test for the `insert_history` fallback path (used only if Q1 fails live) |
+| T0-S5 | Bridge + env gate: `KITSU_TUI=inline` in `run_chat` startup selects `InlineSurface`; idle input = raw stdin bytes → `kitsu_editor::TypeaheadEditor`, Enter submits through the existing prompt path; the reader pauses while `APPROVAL_INPUT_ACTIVE > 0` (reuse the collector's yield logic at `main.rs:14158`); slash dispatcher wrapped in `suspend/resume`; status row = spinner only | Failing test: PTY test (binary) in inline mode: `/help` at idle leaves the viewport rows intact (vt100 on the PTY master) | `crates/kitsu/src/tui_bridge.rs` (new, `cfg(unix)`), `main.rs` `run_chat` startup and slash dispatch | PTY tests: `/help`, `/jobs`, `/status` at idle; streamed turn with two tool calls via the SSE mock keeps viewport intact and scrollback ordered per fd; paste benchmark (10 KiB) recorded; manual ollama smoke with **pre-granted roots** (`--allow-path`, `--allow-write`) so no approval prompt races the reader, then one run with a prompt to prove the pause |
+| T0-S6 | Q2 experiment on top of S4/S5 (ratatui `Viewport::Inline` vs manual paint); writer census for Q3; **go/no-go record** with terminal matrix (xterm-class, tmux, zellij with/without alt screen), paste numbers, mechanism choice (region-flow vs insert_history), and design §4.2 updated accordingly | Record skeleton | `docs/roadmap/cycles/<n>.md`, design doc | Record exists; `KITSU_TUI` unset ⇒ classic byte-identical (fixtures) |
+
+### Exit criteria (go)
+
+- Q1 passes in at least one xterm-class terminal **and** tmux; zellij result
+  recorded (may require `--no-alt-screen` later).
+- Q2 decided (A or B) with the observed failure, if any, in the record.
+- Q3: after the dispatcher wrap, no viewport corruption in the three PTY
+  tests; the census lists ≤ 20 stray idle writers or a one-card plan to wrap
+  them.
+- Q4: 10 KiB paste < 100 ms, or a specific fix identified.
+
+**No-go** (any of: region-flow and insert_history both unreliable in tmux;
+latency unfixable; stray writers unmanageable): keep T0-S1 (editor crate) and
+T0-S3 (seam, classic-only) if green, **delete** `crates/kitsu-tui`,
+`tui_bridge.rs`, the env gate, and the lock entries in one commit; re-plan T3
+as "classic + alt-screen overlays only" or "fullscreen-only"; record it.
+
+### Rollback (T0)
+
+`KITSU_TUI` unset ⇒ classic path through the seam only; byte-identical
+fixtures from T0-S3 are the proof. Full rollback = the no-go deletion commit.
+
+---
+
+## 4. T1 — Herding hooks and classic polish (design Stage 0)
+
+Independent of the renderer; `main.rs` slash handlers, `subagent.rs`, one new
+module, docs **in the same stories**.
+
+| Story | Deliverable | First card | Files | Acceptance / req |
+|---|---|---|---|---|
+| T1-S1 | `AgentRegistrySnapshot.{blocked, unacknowledged}` (populated by T2 when it lands; 0 until then); `background_agent_notice` text unchanged | Failing test on `unacknowledged` after `acknowledge_result` | `subagent.rs:421,1185`, `main.rs` tests `:21853-21881` | Existing notice tests green; new count tests (A8) |
+| T1-S2 | **Classic live row** gains a dimmed `← N agents` tag beside `[N queued]` during a turn (registry watch), per design §4.6 | Failing width-sweep test in `live.rs` | `kitsu-render/src/live.rs`, `main.rs` collector | Width sweep 40..200 no wrap; non-TTY/plain byte-identical (A8 classic, N1) |
+| T1-S3 | `/jobs view` (grouped deck, A2 text form) and `/jobs explain <id>` in **all three dispatch sites** (`handle_jobs_command`, `handle_active_jobs_command`, the `/agents` alias arm widened to forward `view\|explain\|reply`); `SLASH_COMMANDS` rows for `agents`/`agent` args updated; `/help` text; `ux-design.md` agent-deck entry updated in the same story | Failing snapshot test of plain `/jobs view` | `main.rs:11148, 13556, 18728, 5194, 5202`, `docs/ux-design.md`, `docs/functionality.md` | Snapshot tests; `/agents view` and mid-turn `/jobs view` both work; JSONL `/help` lists both (A1 alias, A2) |
+| T1-S4 | State file writer: `agents.state_file = auto\|on\|off` (**`auto` = interactive TTY sessions only**, so `--script`/piped/JSONL runs write nothing unless `on`); path `$XDG_RUNTIME_DIR/kitsu/<pid>.json`, fallbacks `$TMPDIR/kitsu-<uid>/` (macOS/Linux without XDG) and `%LOCALAPPDATA%\kitsu\run\` (Windows); dir 0700, file 0600, write tmp + rename; content = process state + redacted thread DTO array; removed on clean exit; OSC title (`tui.title`, env-gated until T3 config) | Failing test: writer helper produces the expected JSON and permissions in a temp dir | new `crates/kitsu/src/agent_state_file.rs`, `main.rs`, `config.rs` | Unit tests on path selection per platform (cfg); PTY run shows the file; `--script` run shows **no** file; DTOs `validate_default()` (H2, N1) |
+| T1-S5 | `kitsu agents --json [--all]`: read state files, liveness via `libc::kill(pid, 0)` on unix (Windows: `liveness: "unknown"` in T1), stale files skipped; **reader tolerates `schema_version ≤ current`** (validates known versions, reports others as `schema_unsupported`) | Failing parser test with stale-pid and old-schema fixtures | `cli.rs`, `main.rs`, `agent_state_file.rs` | Unit + `--script` integration (H1) |
+| T1-S6 | `[hooks] on_agent_state` runner (local command; env `KITSU_AGENT_ID/STATE/WAITING_FOR`); `Config` nested struct; a failing hook never fails the turn | Failing test: transition fires the hook once | `config.rs`, `main.rs` | Scripted transition test; no network (H3, N7) |
+| T1-S7 | Docs: `functionality.md` (view/explain, state file, hook), `agent_deck_ui.md` pointer, cycle records; design doc status line | — | `docs/` | Cycle record per template |
+
+**Exit gate:** workspace tests both profiles; plain/JSONL fixtures
+byte-identical; `--script` run shows no state file; PTY run shows one.
+**Rollback:** `agents.state_file = off`, `on_agent_state` unset; the `/jobs`
+subcommands are additive.
+
+---
+
+## 5. T2 — Blocked agents, permission-only (design Stage 1)
+
+| Story | Deliverable | First card | Files | Acceptance / req |
+|---|---|---|---|---|
+| T2-S1 | `PromptRoute` task-local (`Foreground\|Denied\|Registry{agent_id, sender}`) in `kitsu-tools`; `interactive_prompts_allowed()` ≡ `route == Foreground`; `scope_without_interactive_prompts` keeps setting `Denied` (all seven callers unchanged); new `scope_with_registry_prompts` | Failing test: `Registry` route in `Permissions::resolve` yields a `Blocked` request and resumes on `AllowOnce` | `kitsu-tools/src/lib.rs:44-62`, `permissions.rs:1623` | `cargo test -p kitsu-tools` whole crate green incl. `permissions.rs:2064`; three-case test (y/a/n) for the fs gate (B1, B2) |
+| T2-S2 | Command gate: `CommandMode::Ask` consults the route; `CommandApprovalRequest` travels the same channel; `always` applies the exact argv/cwd grant via existing code; **`Registry`-routed command test** added | Failing three-case command test | `command.rs:1687`, tests near `:3578` | `cargo test -p kitsu-tools` green (B2) |
+| T2-S3 | Three vocabularies + validator in one story: `AgentStatus::Blocked`, `AgentProgressStatus::Blocked`, `AgentThreadPhase::Blocked`; `validate()` rules (`terminal = phase ∉ {Running, Blocked}` …); `AGENT_THREAD_SCHEMA_VERSION = 2`; optional `name`; label functions and struct literals updated | Failing DTO round-trip test for a blocked thread | `subagent.rs`, `thread.rs:153,194,276,700`, `main.rs:10844,10909,11095,20632`, state-file reader (accepts v1 and v2) | `validate_default()` for blocked DTO; `/jobs` JSON `status: "blocked"`; `debug_assert` holds (B5) |
+| T2-S4 | Registry `answer(id, Decision)`; timeout `agents.block_timeout` → `Interrupt` → `AuthorityInputClosed` → `Failed(interrupted)`; `/jobs stop` on a blocked agent resolves `Interrupt` | Failing tokio time-paused timeout test | `subagent.rs`, `config.rs` | Timeout + stop tests (B3) |
+| T2-S5 | `/jobs reply <id> <y\|a\|n>` and `/agent reply` in **all three dispatch sites** (idle, mid-turn `handle_active_jobs_command`, alias arm); `agents.blocking = ask\|fail_closed` with default **`fail_closed` everywhere until T3** flips the TUI-mode default; explicit `ask` works in classic via `/jobs reply` — that is T2's standalone value | Failing mid-turn PTY/unit test: reply during a running turn releases the agent | `main.rs:11148,13556,18728,5194,5202`, `config.rs` | Plain/scripted/JSONL defaults byte-identical; `background_result` unchanged (B4, N1) |
+| T2-S6 | `AgentTimelineKind::Approval` entries for request/answer; shown in `/jobs show` and `/jobs explain`; redaction test (path/argv only) | Failing timeline DTO test | `thread.rs`, `main.rs` | Redaction proven (N8) |
+| T2-S7 (after T1) | Hooks surface: state file `waiting_for`, `on_agent_state` `STATE=blocked`, `kitsu agents --json` | Failing scripted transition test | from T1 | (B4, H1–H3) |
+
+**Exit gate:** provider-free integration test (fake provider): spawn → blocked
+→ reply → done, both profiles; JSONL strict fixtures unchanged.
+**Rollback:** `agents.blocking = fail_closed` (default) restores today's
+behavior exactly; the route defaults to `Denied` in every existing scope.
+
+---
+
+## 6. T3 — Inline renderer, release quality (design Stage 2)
+
+Starts after the T0 **go** record.
+
+| Story | Deliverable | First card | Files | Acceptance / req |
+|---|---|---|---|---|
+| T3-S1 | **Test infrastructure first:** `run_styled_streaming_chat_pty` (binary under PTY, styled, streaming, tool-calling SSE mock), vt100 screen assertions with deadlines (never byte timing), stdout/stderr split capture | One classic-mode test using the harness | `crates/kitsu/tests/tui.rs` (new) | Harness reused by every later PTY acceptance |
+| T3-S2 | Config `[tui]` nested struct (`mode`, `alternate_screen`, `prefix`, `title`, `left_arrow_opens_agents`, `cell_ring_lines`), `--tui`, `--no-alt-screen`; env gate removed; `kitsu doctor` names an unknown key | Failing config tests | `config.rs`, `cli.rs`, `main.rs` | Unknown-key message test (§4.8) |
+| T3-S3 | Composer parity: `CompletionSource` trait in `kitsu-tui`, implemented in `tui_bridge.rs` over `attachments::complete` and the slash palette; hinter/highlighter re-hosted; shared functions used by rustyline `ChatHelper` too | Failing pure test: same candidates for `@fi` and `/st` from both hosts | `kitsu-tui/src/composer.rs`, `main.rs:5928-5980` | Candidates equal; 39 editor tests green (R4) |
+| T3-S4 | **History file shared**: TUI composer loads/saves the rustyline history file format (design §4.3) | Failing round-trip test on a fixture history file | `kitsu-tui/src/composer.rs`, `main.rs` | ↑ walks the same entries in both renderers (R4) |
+| T3-S5 | Status row (`model · meter · elapsed · [N queued] · ← N agents`) and queue preview rows via `Surface::queue` | Failing width-sweep test | `status.rs` | No wrap 40..200 cols (R5) |
+| T3-S6 | Cell ring (bounded, fd-tagged) fed by the surface | Failing eviction test | `cells.rs` | Memory bound test (N4) |
+| T3-S7 | Approval modal: both prompters render in the bottom pane in TUI mode; same option line; same transcript receipt afterwards; `APPROVAL_INPUT_ACTIVE` protocol replaced by in-loop modal | Failing PTY approval round-trip | `kitsu-tui/src/overlay/approval.rs`, `main.rs:19461,19504` | `sanitize` of receipt equals classic (R7) |
+| T3-S8 | Resize reflow (region reset + repaint, no duplicate lines); `Ctrl+L`; restore on panic/SIGINT/SIGTERM | Failing PTY `TIOCSWINSZ` test | `viewport.rs`, `lib.rs` | No duplicate cell; `kill -INT` restores (R8, N5) |
+| T3-S9 | `/tui classic\|inline` runtime switch (seam swap between turns) | Failing PTY switch test | `main.rs`, `surface.rs` | Transcript continues (R2 partial; fullscreen in T5) |
+| T3-S10 | Stray-writer follow-up from the T0 census: wrap or route the remaining idle writers; documented limitation list for the cell ring | Failing test per wrapped site | `main.rs` | Census count reaches zero or the remainder is documented (Q3) |
+| T3-S11 | Terminal matrix + fallbacks: tmux, zellij (`--no-alt-screen`), screen; Windows Terminal = classic fallback until T5; **Windows `cargo check`**: `rustup target add x86_64-pc-windows-gnu && cargo check --target x86_64-pc-windows-gnu -p kitsu` (no linker needed) and remove the `cfg(unix)` gate where it compiles | — | `viewport.rs`, `tui_bridge.rs` | Matrix in the cycle record; Windows check green (N6) |
+| T3-S12 | Frame coalescing (≤ 60 fps), synchronized-update probe, `--reduced-motion` behavior | Failing scheduler unit test | `lib.rs` | PTY under `--reduced-motion` static (N3, N9) |
+| T3-S13 | N2 benchmark (test binary timing 10 KiB paste through the PTY, reported not gating); docs: `ux-design.md` surface section, `functionality.md` (`/tui`, flags), `ui_guidelines.md`; design status → "implemented through T3" | — | `tests/`, `docs/` | Numbers in the PR text |
+
+**Exit gate:** per-fd sanitize equality on the streamed two-tool PTY run; all
+fixtures byte-identical in classic/plain/JSONL; both profiles; `cargo test
+--locked`; Windows `cargo check`.
+**Rollback:** `--tui classic` / `tui.mode = "classic"`; seam stays.
+
+---
+
+## 7. T4 — Agent view: peek, attach, dispatch (design Stage 3)
+
+| Story | Deliverable | First card | Files | Acceptance / req |
+|---|---|---|---|---|
+| T4-S1 | Pure model in `kitsu-tui`: `AgentRow`/`AgentGroup` plain structs, grouping, ordering, filter grammar; `tui_bridge.rs` maps `AgentThreadSnapshotDto` → `AgentRow` | Failing table-driven grouping test | `kitsu-tui/src/agents_view.rs`, `tui_bridge.rs` | (A2, A3 filter) |
+| T4-S2 | Overlay: list, `↑/↓`, `?`, `Esc`; opened by `Ctrl+X a`, `/jobs view` (TUI mode), `←`-twice on empty composer (config); `←` never consumes a draft; `↑` recall untouched | Failing PTY open/close test | `overlay/agents.rs`, `tui_bridge.rs` | (A1) |
+| T4-S3 | Peek (`Space`): redacted timeline, pending request, result; viewing acknowledges via `peek_result` + `acknowledge_result` | Failing exit-guard test (unviewed failed agent still refuses) | `overlay/agents.rs` | (A4, A7) |
+| T4-S4 | Keys → registry calls: `r` reply, `s` steer, `x` stop/prune, `n` rename (new `AgentRegistry::rename`), `p` acknowledge | Failing outcome tests | `subagent.rs`, overlay | (A3) |
+| T4-S5 | `tail_timeline(id) -> broadcast::Receiver` (cap 256; lag → "n skipped") | Failing lag test | `subagent.rs`, `thread.rs` | Timeline bounds unchanged |
+| T4-S6 | Attach/detach: `⛩` milestones, routed composer (`steer`, `y/a/n` when blocked), 64 KiB foreground buffer replayed with recap; `Ctrl+X d`, `←`, `/detach`; `Ctrl+C` = clear draft / detach | Failing fake-provider integration test | `tui_bridge.rs`, overlay, `status.rs` | (A5) |
+| T4-S7 | Dispatch from the view composer (`@profile task`) admitted by `AgentRegistryLimits`, not `SpawnBudget` | Failing over-capacity test | `tui_bridge.rs`, `subagent.rs` | (A6) |
+| T4-S8 | Ambient counter ≤ 250 ms (watch-driven) in TUI; classic tag from T1-S2 documented | Failing paused-clock timing test | `status.rs` | (A8) |
+| T4-S9 | Transcript overlay (`Ctrl+O`): scroll, `/`, `n/N`, `{ }`, `v`, `q` over the cell ring | Failing search/jump unit test | `overlay/transcript.rs` | (R6) |
+| T4-S10 | Single bindings table → help overlay + `/help keys`; docs (`ux-design.md` glyph `◉` row rule, `functionality.md`) | Failing bindings-table test | `kitsu-tui/src/keys.rs`, `docs/` | (§4.7) |
+
+**Exit gate:** fake-provider integration (two agents, one blocks, view shows
+it first, reply, attach, detach, acknowledged); exit guard unchanged; both
+profiles.
+**Rollback:** `tui.left_arrow_opens_agents = false`; overlay is additive;
+`--tui classic` hides it entirely.
+
+---
+
+## 8. T5 — Fullscreen, agent_wait, herdr manifest, default flip (design Stage 4)
+
+| Story | Deliverable | First card | Files | Acceptance / req |
+|---|---|---|---|---|
+| T5-S1 | Fullscreen renderer over the cell ring (alt screen, auto-follow, `PgUp/PgDn`, `Ctrl+Home/End`) | Failing 5 000-line RSS test | `kitsu-tui/src/fullscreen.rs` | (N4) |
+| T5-S2 | `/tui fullscreen` runtime switch (completes R2) | Failing PTY switch test | `main.rs`, `surface.rs` | (R2) |
+| T5-S3 | `[` dump ring to native scrollback; `v` to `$EDITOR` | Failing equality test | `overlay/transcript.rs` | (R6) |
+| T5-S4 | Windows Terminal fallback (inline → fullscreen when regions misbehave); `--no-alt-screen` forces inline; Windows liveness in `kitsu agents --json` | Failing decision-function test | `viewport.rs`, `agent_state_file.rs` | (N6, H1) |
+| T5-S5 | Mouse wheel in fullscreen (optional) | — | `fullscreen.rs` | Manual |
+| T5-S6 | `agent_wait(id, until, timeout)` tool; no `SpawnBudget` use | Failing until/timeout tests | `subagent.rs` | (H5) |
+| T5-S7 | herdr manifest under `integrations/herdr/` + README | — | `integrations/` | Manual (H4) |
+| T5-S8 | Decision records: default renderer flip (R1), JSONL `background_blocked` (open q. 7), socket API (open q. 6); traceability table appended to the design | — | docs | ADR-style records |
+
+**Rollback:** `tui.mode = "inline"` or `"classic"`.
+
+---
+
+## 9. Cross-cutting rules
+
+- **Kill switch at every stage:** `--tui classic`, `tui.mode = "classic"`,
+  `KITSU_TUI` unset (T0–T2). Classic goes through the seam only; byte-identical
+  fixtures from T0-S3 on are its proof.
+- **Seam lock discipline:** load an `Arc<dyn Surface>` from a short read
+  guard; never hold the guard across a `Surface` call; swap only between turns
+  on the REPL thread.
+- **Invariants cited in every card:** N1 byte-identical tiers; sanitize
+  round-trip; redaction (N8); exit guard for unviewed results;
+  `debug_assert!(validate_default())`; `scope_without_interactive_prompts` ⇒
+  denied for all seven callers.
+- **Both cargo profiles** on every card; `--locked` on dependency cards;
+  MSRV check (`cargo +1.80.0 check --workspace --all-targets`) on dependency
+  cards; Windows `cargo check` at T3 exit and later.
+- **PTY matrix (milestone exits):** xterm-class terminal, tmux, zellij
+  (`--no-alt-screen`), screen; results in the cycle record.
+- **Provider-free acceptance:** fake/wiremock providers only; the ollama smoke
+  (qwen2.5-coder) is a manual extra and never trusted on kitsu's own success
+  report.
+- **Docs move with code:** `ux-design.md` ("when the code and this file
+  disagree, fix one of them in the same change") and `functionality.md` are
+  updated in the story that changes the surface; trailing doc stories only
+  collect cycle records and status lines.
+- **Dirty tree:** `crates/kitsu-tools/src/builtins/fs.rs` is a pre-existing
+  uncommitted change not owned by E11; the maintainer decides (commit
+  separately or stash) before the first E11 commit. The design, plan, review
+  records, and the two doc fixes from the design review form E11's first docs
+  commit.
+- **No orchestrator edits** unless the T0 record says Q3 demanded them.
+
+## 10. Risks specific to the plan
+
+| Risk | Where it bites | Plan response |
+|---|---|---|
+| ratatui/crossterm raise MSRV or build time; `--locked` Windows release | T0-S2, T3 exit | Pins + 1.80 check in the dependency card; `cfg(unix)` bridge until the Windows `cargo check` passes; build delta recorded |
+| ratatui inline viewport fights the scroll region (Q2) | T0-S6 | Pre-decided fallback: manual viewport + ratatui overlays only |
+| Region-flow does not reach scrollback in some terminal (Q1) | T0-S4/S6 | `insert_history` fallback implemented in S4; matrix decides |
+| 392 stray writers corrupt the viewport (Q3) | T0-S5, T3-S10 | Dispatcher wrap first; census; route the remainder or document |
+| `Surface` indirection regresses classic or deadlocks | T0-S3 | Byte-identical fixtures + reentrancy test; lock discipline rule |
+| Two stdin readers during approvals | T0-S5, T3-S7 | Honor `APPROVAL_INPUT_ACTIVE` in T0; modal replaces it in T3 |
+| State file violates the "no state write while disabled" invariant | T1-S4 | `auto` = interactive only; automation writes nothing unless `on` |
+| Schema skew between running processes | T1-S5, T2-S3 | Reader tolerates older schema versions |
+| Styled PTY flakiness | T3-S1 onward | vt100 screen-state assertions with deadlines; "known PTY failure" convention made explicit per test |
+| Scope creep into free-form agent questions or sockets | T2, T5 | Design non-goals / open questions; stories cite them as out of scope |
+
+## 11. Traceability (design requirement → stories)
+
+| Req | Stories |
+|---|---|
+| R1 | T3-S2, T5-S8 |
+| R2 | T3-S9, T5-S2 |
+| R3 | T0-S4, T0-S5, T3 exit |
+| R4 | T3-S3, T3-S4, T3-S5, T3-S7 |
+| R5 | T3-S5 |
+| R6 | T4-S9, T5-S3 |
+| R7 | T3-S7 |
+| R8 | T3-S8 |
+| A1 | T1-S3 (alias widening), T4-S2 |
+| A2 | T1-S3, T4-S1 |
+| A3 | T4-S1, T4-S4 |
+| A4 | T4-S3 |
+| A5 | T4-S6 |
+| A6 | T4-S7 |
+| A7 | T4-S3 |
+| A8 | T1-S1, T1-S2, T4-S8 |
+| B1 | T2-S1, T2-S5 |
+| B2 | T2-S1, T2-S2 |
+| B3 | T2-S4 |
+| B4 | T2-S5, T2-S7 |
+| B5 | T2-S3 |
+| H1 | T1-S5, T5-S4 |
+| H2 | T1-S4 |
+| H3 | T1-S6 |
+| H4 | T5-S7 |
+| H5 | T5-S6 |
+| N1 | T0-S3, T1-S4, T2-S5 |
+| N2 | T0-S5, T3-S13 |
+| N3 | T3-S12 |
+| N4 | T3-S6, T5-S1 |
+| N5 | T0-S2, T3-S8 |
+| N6 | T0-S6, T3-S11, T5-S4 |
+| N7 | T1-S6 (hook runs a local command; test asserts no network client is constructed) |
+| N8 | T2-S6, T4-S3 |
+| N9 | T3-S12 |
+
+## 12. Definition of done (epic E11)
+
+- Every requirement above maps to an accepted story; the table is re-checked
+  at each milestone exit.
+- Classic, plain, non-TTY, assistive, and JSONL fixtures are byte-identical to
+  the pre-E11 baseline.
+- A user can: start in inline mode, see `← 1 agent` change when a background
+  agent blocks, press `Ctrl+X a`, read the request, reply `y`, attach, watch,
+  detach with a recap, and herdr shows kitsu's state without screen scraping.
