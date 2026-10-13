@@ -18467,3 +18467,90 @@ async fn test_piped_deadline_preserves_completed_tool_round_as_resumable_session
         "one request per completed/timed-out round"
     );
 }
+
+/// `/jobs view` and its `/agents` alias, end to end over the JSONL script
+/// surface. The alias arm historically rejected any non-numeric argument, so
+/// the `/agents view` assertion is the one that catches a silent regression.
+/// A separate script, not an extension of the existing one, keeps every
+/// `results[N]` index in `test_jsonl_script_query_results_are_structured_and_framed`
+/// untouched.
+#[test]
+#[serial]
+fn test_jsonl_script_jobs_view_is_served_by_both_the_command_and_its_alias() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("jobs-view.txt");
+    fs::write(&script, "/jobs view\n/agents view\n/agents\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["--jsonl", "chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("jobs view script");
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let results = events
+        .iter()
+        .filter(|event| event["type"] == "command_result")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 3);
+
+    // `/jobs view`: the grouped deck is a `jobs` action with the same snapshot
+    // payload the flat `list` action already publishes.
+    assert_eq!(results[0]["result"]["kind"], "jobs");
+    assert_eq!(results[0]["result"]["action"], "view");
+    assert_eq!(results[0]["result"]["changed"], false);
+    assert_eq!(results[0]["result"]["snapshot"]["total"], 0);
+    assert!(results[0]["result"]["snapshot"]["agents"].is_array());
+    assert!(results[0]["result"]["alias"].is_null());
+
+    // `/agents view`: the alias forwards a non-numeric argument verbatim
+    // instead of erroring, and still stamps its own `alias` field.
+    assert_eq!(results[1]["result"]["kind"], "jobs");
+    assert_eq!(results[1]["result"]["action"], "view");
+    assert_eq!(results[1]["result"]["alias"], "agents");
+    assert_eq!(results[1]["result"]["snapshot"]["total"], 0);
+
+    // Bare `/agents` still means `list`: widening the alias keeps its shapes.
+    assert_eq!(results[2]["result"]["kind"], "jobs");
+    assert_eq!(results[2]["result"]["action"], "list");
+    assert_eq!(results[2]["result"]["alias"], "agents");
+}
+
+/// `/agents <id>` still maps to `show <id>`. With no background agents a
+/// nonexistent id is the only reachable case and the handler rejects it, so
+/// this runs without `--jsonl` to read the human message on stderr: only that
+/// message distinguishes "forwarded to `show`" from "rejected by the alias".
+#[test]
+#[serial]
+fn test_script_agents_with_an_id_still_maps_to_show() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("agents-id.txt");
+    fs::write(&script, "/agents 7\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("agents id script");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    // The argument reached `/jobs show 7`, not the alias' own usage line.
+    assert!(stderr.contains("no background job #7"), "{stderr}");
+    assert!(
+        !stderr.contains("usage: /agents"),
+        "the alias rejected its own numeric form: {stderr}"
+    );
+}
