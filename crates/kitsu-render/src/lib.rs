@@ -208,10 +208,11 @@ struct StreamBuffer {
 }
 
 impl StreamBuffer {
-    /// Push text into the buffer, styling and writing complete lines to stdout.
-    /// Returns the total bytes written to stdout.
+    /// Push text into the buffer, styling and writing complete lines to `out`.
+    /// Returns the total bytes formatted for `out` (counted from the styled
+    /// text, not from what the writer accepted).
     /// Partial lines (not ending with `\n`) are buffered and NOT written.
-    fn push(&mut self, s: &str) -> usize {
+    fn push(&mut self, out: &mut dyn std::io::Write, s: &str) -> usize {
         let mut written = 0;
         self.buffer.push_str(s);
 
@@ -219,9 +220,9 @@ impl StreamBuffer {
         while let Some(newline_pos) = self.buffer.find('\n') {
             let line = &self.buffer[..newline_pos];
             let styled_line = self.styler.style_line(line);
-            let _ = io::stdout().write_all(styled_line.as_bytes());
+            let _ = out.write_all(styled_line.as_bytes());
             written += styled_line.len();
-            let _ = io::stdout().write_all(b"\n");
+            let _ = out.write_all(b"\n");
             written += 1;
             self.buffer.drain(..=newline_pos);
         }
@@ -229,12 +230,12 @@ impl StreamBuffer {
         written
     }
 
-    /// Flush any remaining partial line UNSTYLED and reset fence state.
-    /// Called at turn boundaries (finish_line).
-    fn flush_unstyled(&mut self) -> usize {
+    /// Flush any remaining partial line UNSTYLED into `out` and reset fence
+    /// state. Called at turn boundaries (finish_line).
+    fn flush_unstyled(&mut self, out: &mut dyn std::io::Write) -> usize {
         let mut written = 0;
         if !self.buffer.is_empty() {
-            let _ = io::stdout().write_all(self.buffer.as_bytes());
+            let _ = out.write_all(self.buffer.as_bytes());
             written = self.buffer.len();
             self.buffer.clear();
         }
@@ -377,29 +378,24 @@ pub fn print_fragment(s: &str) {
             ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
             TURN_ASSISTANT_OUTPUT.store(true, Ordering::Release);
         }
-        // GAP — read this before plugging in a non-classic backend.
+        // The block handed to the surface on this branch carries the
+        // assistant text: `StreamBuffer::push` writes each completed styled
+        // line into the writer the block receives, so a non-classic backend
+        // can now carry stdout. For `ClassicSurface` this stays
+        // byte-identical — same descriptor, same order, inside the one
+        // suspension `write_block` opens, which also flushes the descriptor —
+        // and the suspension decision that used to live in the
+        // `sanitized.contains('\n')` test here now lives in the backend
+        // (`suspends_for`), which is the point of the seam.
         //
-        // The block handed to the surface on this branch is **empty**:
-        // `StreamBuffer::push` writes the styled lines to `io::stdout()`
-        // itself, not to the writer the block receives. For `ClassicSurface`
-        // that is byte-identical — same descriptor, same order, inside the one
-        // suspension `write_block` opens — and the suspension decision that
-        // used to live in the `sanitized.contains('\n')` test here now lives
-        // in the backend (`suspends_for`), which is the point of the seam.
-        //
-        // It is byte-identical **for the classic backend only**. The seam is
-        // not yet substitutable for stdout: a terminal-UI backend plugged in
-        // today would receive nothing at all for assistant text. Threading the
-        // writer through `StreamBuffer::push` (and `flush_unstyled`, see
-        // `finish_line`) is required before any non-classic backend can carry
-        // stdout, and is deliberately a separate change — it touches the
-        // styler and the byte-count returns, with its own byte-identity risk.
-        active_surface().write_block(Fd::Stdout, &mut |_out| {
+        // Two caveats remain: write errors are still swallowed, and the byte
+        // count `push` returns is computed from the formatted text rather
+        // than from what the writer actually accepted.
+        active_surface().write_block(Fd::Stdout, &mut |out| {
             stream_buffer()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(&sanitized);
-            let _ = io::stdout().flush();
+                .push(out, &sanitized);
         });
     } else {
         // Non-TTY or plain: use existing sanitizer path (byte-identical)
@@ -1443,27 +1439,23 @@ pub fn turn_wrote_assistant_output() -> bool {
 
 /// Emit a trailing newline after a streamed turn so the next prompt is clean.
 pub fn finish_line() {
-    // GAP — read this before plugging in a non-classic backend.
-    //
-    // The block handed to the surface here is **partial**: when the stream
+    // The block handed to the surface here is complete: when the stream
     // buffer holds a partial line, `StreamBuffer::flush_unstyled` writes those
-    // bytes to `io::stdout()` itself, and only the trailing newline below
-    // flows through the writer the block receives. For `ClassicSurface` that
-    // is byte-identical — same descriptor, same order, inside the one
-    // suspension `write_block` opens.
+    // bytes into the writer the block receives, followed by the trailing
+    // newline that terminates them, so a non-classic backend can now carry
+    // stdout. For `ClassicSurface` this stays byte-identical — same
+    // descriptor, same order, inside the one suspension `write_block` opens.
     //
-    // It is byte-identical **for the classic backend only**. Threading the
-    // writer through `StreamBuffer::flush_unstyled` (and `push`, see
-    // `print_fragment`) is required before any non-classic backend can carry
-    // stdout; until then such a backend would see the newline without the
-    // partial line it terminates.
+    // Two caveats remain: write errors are still swallowed, and the byte
+    // count `flush_unstyled` returns is computed from the buffered text
+    // rather than from what the writer actually accepted.
     active_surface().write_block(Fd::Stdout, &mut |out| {
         // Flush any partial line from the streaming buffer UNSTYLED
         // and reset its fence state.
         stream_buffer()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .flush_unstyled();
+            .flush_unstyled(out);
 
         // Reset the non-TTY sanitizer state as well
         stream_sanitizer()
@@ -2457,31 +2449,32 @@ mod tests {
         // Test the exact spec case: feeding "```di", "ff\n+add", "ed\n```\n"
         // should yield the +added line in green SGR.
         let mut buffer = StreamBuffer::default();
+        let mut sink: Vec<u8> = Vec::new();
 
         // Accumulate first fragment: "```di" (incomplete line, no newline)
-        buffer.push("```di");
+        buffer.push(&mut sink, "```di");
         assert!(
             !buffer.buffer.is_empty(),
             "incomplete line should be buffered"
         );
 
         // Continue with "ff\n" which completes the fence marker line
-        buffer.push("ff\n");
+        buffer.push(&mut sink, "ff\n");
         assert_eq!(buffer.buffer, "", "complete line should be flushed");
 
         // Next: "+add" (incomplete diff line, no newline)
-        buffer.push("+add");
+        buffer.push(&mut sink, "+add");
         assert!(
             !buffer.buffer.is_empty(),
             "incomplete line should be buffered"
         );
 
         // Complete it with "ed\n"
-        buffer.push("ed\n");
+        buffer.push(&mut sink, "ed\n");
         assert_eq!(buffer.buffer, "", "complete diff line should be flushed");
 
         // Finally: "```\n" (closing fence)
-        buffer.push("```\n");
+        buffer.push(&mut sink, "```\n");
         assert_eq!(buffer.buffer, "", "fence marker should be flushed");
     }
 
@@ -2489,13 +2482,14 @@ mod tests {
     fn streaming_buffer_flushes_unstyled() {
         // Test that flush_unstyled outputs partial lines without styling
         let mut buffer = StreamBuffer::default();
+        let mut sink: Vec<u8> = Vec::new();
 
         // Accumulate a partial line (no newline)
-        buffer.push("partial line");
+        buffer.push(&mut sink, "partial line");
         assert!(!buffer.buffer.is_empty(), "should have buffered partial");
 
         // Flush unstyled
-        buffer.flush_unstyled();
+        buffer.flush_unstyled(&mut sink);
         assert_eq!(buffer.buffer, "", "buffer should be empty after flush");
         assert_eq!(buffer.styler.fence, None, "fence state should be reset");
     }
@@ -2504,21 +2498,22 @@ mod tests {
     fn streaming_buffer_respects_fence_state_across_lines() {
         // Test that fence state is maintained across multiple line_style calls
         let mut buffer = StreamBuffer::default();
+        let mut sink: Vec<u8> = Vec::new();
 
         // Push a diff fence opening
-        buffer.push("```diff\n");
+        buffer.push(&mut sink, "```diff\n");
         assert_eq!(buffer.styler.fence.as_deref(), Some("diff"));
 
         // Push a diff line
-        buffer.push("+added line\n");
+        buffer.push(&mut sink, "+added line\n");
         // The +added line should have been styled (green), and fence is still active
 
         // Push another diff line
-        buffer.push("-removed line\n");
+        buffer.push(&mut sink, "-removed line\n");
         // The -removed line should have been styled (red), fence still active
 
         // Close the fence
-        buffer.push("```\n");
+        buffer.push(&mut sink, "```\n");
         assert_eq!(buffer.styler.fence, None, "fence should be closed");
     }
 
@@ -4149,6 +4144,283 @@ mod surface_seam_tests {
             live::suspend_depth(),
             before,
             "the classic block must balance its suspension"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // T0-S3c: closing F12 — `StreamBuffer` must write to a writer it is
+    // handed, not to `io::stdout()`. These tests are written against the
+    // pinned signatures
+    //
+    //     fn push(&mut self, out: &mut dyn std::io::Write, s: &str) -> usize;
+    //     fn flush_unstyled(&mut self, out: &mut dyn std::io::Write) -> usize;
+    //
+    // and must fail to compile until both are threaded.
+    //
+    // Tests (10)-(15) build their own `StreamBuffer`, so they touch no
+    // process-global state and need neither `surface_slot_lock` nor
+    // `StreamStateGuard`. (16) and (17) go through the seam and therefore
+    // hold both, exactly as (4)-(6) do.
+    // ---------------------------------------------------------------------
+
+    use super::StreamBuffer;
+
+    /// (10) A completed line's styled bytes land in the **provided writer**.
+    /// The expectation is computed by the real `LineStyler`, so this pins the
+    /// threading and not the styling, and the returned count must equal the
+    /// bytes actually written.
+    #[test]
+    fn stream_buffer_push_writes_a_completed_line_into_the_given_writer() {
+        let mut buffer = StreamBuffer::default();
+        let mut out: Vec<u8> = Vec::new();
+        let expected = format!("{}\n", LineStyler::default().style_line("hello"));
+
+        let written = buffer.push(&mut out, "hello\n");
+
+        assert_eq!(
+            String::from_utf8(out.clone()).expect("styled bytes must be UTF-8"),
+            expected,
+            "the styled line must reach the writer, not io::stdout()"
+        );
+        assert_eq!(
+            written,
+            out.len(),
+            "the returned count must equal the bytes written to the writer"
+        );
+        assert_eq!(
+            buffer.buffer, "",
+            "a completed line leaves nothing buffered"
+        );
+    }
+
+    /// (11) A partial line is buffered and **nothing** is written.
+    #[test]
+    fn stream_buffer_push_buffers_a_partial_line_and_writes_nothing() {
+        let mut buffer = StreamBuffer::default();
+        let mut out: Vec<u8> = Vec::new();
+
+        let written = buffer.push(&mut out, "partial");
+
+        assert!(out.is_empty(), "a partial line must not be written");
+        assert_eq!(written, 0, "nothing written means a zero count");
+        assert_eq!(buffer.buffer, "partial", "the partial line stays buffered");
+    }
+
+    /// (12) The buffer genuinely spans calls: `"a\nb"` then `"c\n"` must emit
+    /// the `a` line and then the joined `bc` line, in that order.
+    #[test]
+    fn stream_buffer_push_spans_calls_and_joins_a_split_line() {
+        let mut buffer = StreamBuffer::default();
+        let mut out: Vec<u8> = Vec::new();
+        let mut reference = LineStyler::default();
+        let expected = format!(
+            "{}\n{}\n",
+            reference.style_line("a"),
+            reference.style_line("bc")
+        );
+
+        let first = buffer.push(&mut out, "a\nb");
+        let second = buffer.push(&mut out, "c\n");
+
+        assert_eq!(
+            String::from_utf8(out.clone()).expect("styled bytes must be UTF-8"),
+            expected
+        );
+        assert_eq!(
+            first + second,
+            out.len(),
+            "the counts must add up to the writer's contents"
+        );
+    }
+
+    /// (13) THE SUBTLE REGRESSION RISK: the styler's fence state must survive
+    /// threading. A fence opened by one `push` must still be open for the
+    /// next, so the interior line comes out diff-styled rather than plain.
+    ///
+    /// Non-vacuity: the same interior line styled by a *fresh* styler (no
+    /// fence) is asserted to differ from the fenced rendering, so this cannot
+    /// pass by both sides being the bare text. `owo-colors` emits SGR
+    /// unconditionally here (no `if_supports_color` and no override anywhere
+    /// in the workspace), so the green really is present.
+    #[test]
+    fn stream_buffer_push_keeps_fence_state_across_calls_through_the_writer() {
+        let mut buffer = StreamBuffer::default();
+        let mut out: Vec<u8> = Vec::new();
+        let mut reference = LineStyler::default();
+        let expected = format!(
+            "{}\n{}\n{}\n",
+            reference.style_line("```diff"),
+            reference.style_line("+added"),
+            reference.style_line("```")
+        );
+
+        buffer.push(&mut out, "```diff\n");
+        buffer.push(&mut out, "+added\n");
+        buffer.push(&mut out, "```\n");
+
+        let text = String::from_utf8(out).expect("styled bytes must be UTF-8");
+        assert_eq!(text, expected, "fence state must survive the threading");
+
+        let unfenced = LineStyler::default().style_line("+added");
+        assert_ne!(
+            reference_interior(),
+            unfenced,
+            "guard: the fenced and unfenced renderings of the interior line \
+             must differ, or this test would assert nothing"
+        );
+        assert!(
+            text.contains(&reference_interior()),
+            "the interior line must arrive diff-styled, not plain"
+        );
+    }
+
+    /// The diff-styled rendering of the interior line used by (13), computed
+    /// by driving a real `LineStyler` through the fence opener first.
+    fn reference_interior() -> String {
+        let mut styler = LineStyler::default();
+        let _ = styler.style_line("```diff");
+        styler.style_line("+added")
+    }
+
+    /// (14) `flush_unstyled` writes the buffered partial line into the writer
+    /// unstyled, returns its length, empties the buffer, and resets the
+    /// styler. The reset is proved behaviourally: a fence is opened, flushed
+    /// across, and a line that would only be styled with the fence still open
+    /// comes out plain.
+    #[test]
+    fn stream_buffer_flush_unstyled_writes_the_partial_line_and_resets_the_styler() {
+        let mut buffer = StreamBuffer::default();
+        let mut out: Vec<u8> = Vec::new();
+        buffer.push(&mut out, "```diff\n+par");
+        out.clear();
+
+        let written = buffer.flush_unstyled(&mut out);
+
+        assert_eq!(
+            String::from_utf8(out.clone()).expect("flushed bytes must be UTF-8"),
+            "+par",
+            "the partial line must reach the writer, unstyled"
+        );
+        assert_eq!(
+            written,
+            "+par".len(),
+            "the count is the partial line's length"
+        );
+        assert_eq!(buffer.buffer, "", "the buffer is emptied by the flush");
+
+        out.clear();
+        buffer.push(&mut out, "+added\n");
+        let after = String::from_utf8(out).expect("styled bytes must be UTF-8");
+        assert_eq!(
+            after,
+            format!("{}\n", LineStyler::default().style_line("+added")),
+            "with the fence reset the line must come out plain"
+        );
+        assert_ne!(
+            after,
+            format!("{}\n", reference_interior()),
+            "guard: a still-open fence would have produced different bytes"
+        );
+    }
+
+    /// (15) `flush_unstyled` on an empty buffer writes nothing and returns 0.
+    #[test]
+    fn stream_buffer_flush_unstyled_on_an_empty_buffer_writes_nothing() {
+        let mut buffer = StreamBuffer::default();
+        let mut out: Vec<u8> = Vec::new();
+
+        let written = buffer.flush_unstyled(&mut out);
+
+        assert!(out.is_empty(), "an empty buffer has nothing to flush");
+        assert_eq!(written, 0);
+    }
+
+    /// (16) END-TO-END, the first half of F12: a completed line through
+    /// `print_fragment` must leave the styled line's bytes **in the block**.
+    ///
+    /// CAVEAT, stated plainly: `stdout_style()` reads a real descriptor and
+    /// under `cargo test` stdout is captured, so the branch this test actually
+    /// exercises is the **non-styled** one, whose block already carries the
+    /// sanitized bytes. The styled arm — the one F12 is about — cannot be
+    /// driven from here, so its expectation is computed and compared only when
+    /// the test happens to run on a styled TTY. The styled path's threading is
+    /// pinned by (10)-(13) and by review of the call site, not by this test.
+    #[test]
+    fn print_fragment_leaves_the_assistant_text_in_the_block_not_an_empty_block() {
+        let _guard = surface_slot_lock();
+        let _state = StreamStateGuard::new();
+        let fragment = "assistant text through the seam\n";
+        let sanitized = sanitize_terminal_text(fragment);
+        let expected = if stdout_style() {
+            format!(
+                "{}\n",
+                LineStyler::default().style_line(sanitized.trim_end_matches('\n'))
+            )
+        } else {
+            sanitized.clone()
+        };
+
+        let calls = record_calls(|| print_fragment(fragment));
+
+        let (fd, text) = one_block(&calls);
+        assert_eq!(fd, Fd::Stdout);
+        assert!(
+            !text.is_empty(),
+            "F12: a backend must not receive an empty block for assistant text"
+        );
+        assert_eq!(text, expected);
+    }
+
+    /// (17) END-TO-END, the other half of F12, and this one IS reachable on
+    /// the captured-stdout tier: `finish_line` flushes the stream buffer
+    /// unconditionally, with no `stdout_style()` branch. With a partial line
+    /// buffered, the block must contain that partial line **followed by** the
+    /// trailing newline — today it contains only the newline.
+    ///
+    /// The partial line is seeded by writing the field directly, the same way
+    /// `reset_stream_globals` clears it, so no stray bytes are emitted during
+    /// setup.
+    #[test]
+    fn finish_line_block_carries_the_partial_line_before_the_newline() {
+        let _guard = surface_slot_lock();
+        let _state = StreamStateGuard::new();
+        stream_buffer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .buffer
+            .push_str("a buffered partial");
+        ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
+
+        let calls = record_calls(finish_line);
+
+        let (fd, text) = one_block(&calls);
+        assert_eq!(fd, Fd::Stdout);
+        assert_eq!(
+            text, "a buffered partial\n",
+            "F12: the block must carry the partial line the newline terminates"
+        );
+    }
+
+    /// (18) A guard that no `io::stdout()` reference survives inside
+    /// `impl StreamBuffer`. Asserted by construction over the crate's own
+    /// source, which is the only way to state it as a test: a direct
+    /// descriptor reference in the path being decoupled defeats the point,
+    /// and a type-level proof is not available while the methods merely take
+    /// a `&mut dyn Write`.
+    #[test]
+    fn stream_buffer_impl_does_not_reference_stdout() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("impl StreamBuffer {")
+            .expect("the impl block must exist");
+        let end = source[start..]
+            .find("fn stream_buffer()")
+            .expect("the impl block is followed by stream_buffer()")
+            + start;
+        let impl_block = &source[start..end];
+        assert!(
+            !impl_block.contains("io::stdout()"),
+            "StreamBuffer must write only to the writer it is handed"
         );
     }
 }

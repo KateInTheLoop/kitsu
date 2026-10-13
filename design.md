@@ -68,11 +68,12 @@ Recommended workspace:
   `write_block` carries a multi-line block under **one** suspension, because
   lifting the row per line would clear and repaint between lines and change
   the emitted bytes; the backend decides whether to lift at all, since the row
-  lives on stderr and a redirected stdout cannot disturb it. **Caveat worth
-  knowing before writing a second backend:** `StreamBuffer` still writes
-  `io::stdout()` itself, so a block on the assistant-text path is currently
-  empty for anything but the classic backend. Threading its writer is tracked
-  as finding F12 and plan card T0-S3c.
+  lives on stderr and a redirected stdout cannot disturb it. `StreamBuffer`
+  takes the block's writer rather than owning an `io::stdout()` handle, so the
+  seam genuinely carries assistant text and a second backend receives it; the
+  remaining caveats are that a failed write is swallowed, as it was against
+  stdout, and the returned byte count is computed from the formatted text
+  rather than from what the writer accepted.
 - `crates/kitsu-editor` — the pure input keymap and line editor (printable
   insert, motions, kills, history walk with a draft stash, reverse-i-search,
   bracketed paste, lone-Escape resolution). Dependency-free and deliberately
