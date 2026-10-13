@@ -19,6 +19,7 @@ top-level entry points are:
 | `kitsu models [filter]` | Query the configured model catalog without requiring a configured model ID. |
 | `kitsu sessions [action]` | Provider-free list/show/resume/fork/export/archive/restore/delete operations, with `--json`; fork receipts identify the exact resolved source session. |
 | `kitsu artifacts [list\|prune <id\|all>]` | Host-only, provider-free inventory and reclamation of command-artifact storage left by earlier runs, with `--json`. |
+| `kitsu agents [--all] [--json]` | Host-only, provider-free listing of the background agents every kitsu process on this machine is publishing, read from the advisory per-process state files. Processes that are gone are skipped unless `--all`; a file from a newer kitsu is reported as schema-unsupported rather than dropped; nothing is created, modified, or deleted. |
 | `kitsu chat [prompt]` | Interactive chat on a TTY, deterministic `--script` chat, or one piped turn. |
 
 See the [README CLI reference](../README.md#cli-reference) for every flag and

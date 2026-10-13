@@ -86,6 +86,32 @@ an exit gate, a rollback statement, and a cycle record naming residual risk.
 
 ---
 
+## 2b. Progress
+
+Delivered on `features/tui_herdr_improvements`, newest last. Each story has a
+record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
+`findings.md` there.
+
+| Story | State | Commit |
+|---|---|---|
+| T1-S1 reserved registry counts | done | `0ca9d99` |
+| T1-S2 ambient live-row agent tag | done | `24c22a4` |
+| T1-S3 `/jobs view` | done | `59b3bb8` |
+| T1-S3 `/jobs explain` | done | `06b2508` |
+| T1-S4 state file writer | done | `6fbaaa2` |
+| T1-S4 config key and wiring | done | `eadf6ab` |
+| T1-S5 `kitsu agents` reader | done | this commit |
+| T1-S6 `on_agent_state` hook | next | — |
+| T1-S7 docs sweep and records | folded into each story | — |
+| T0 renderer proof of concept | not started | — |
+
+T1 was taken before T0 deliberately: it is independent of the renderer and
+ships value whatever the proof of concept concludes. T1-S7 as a separate
+story is obsolete — documentation now lands in the same commit as its
+feature, so there is nothing left for it to collect.
+
+---
+
 ## 3. T0 — Renderer proof of concept
 
 ### Goal
