@@ -2775,3 +2775,31 @@ async fn test_same_catalog_refresh_preserves_positive_and_negative_memo_entries(
     assert_eq!(memo.get("known"), Some(&Some(8192)));
     assert_eq!(memo.get("missing"), Some(&None));
 }
+
+/// A no-argument tool call streams no argument deltas, so history holds `""`.
+/// Replaying that verbatim made Bedrock-routed Anthropic reject the next round
+/// (HTTP 400 "function response arguments ... not JSON format"); the wire must
+/// carry `{}` instead, and leave real arguments untouched.
+#[test]
+fn test_build_body_replays_empty_tool_arguments_as_empty_object() {
+    let call = |args: &str| crate::types::ToolCall {
+        tool_name: "workspace_diff".to_string(),
+        args: args.to_string(),
+        call_id: "call_1".to_string(),
+    };
+    let mut req = simple_request();
+    req.messages = vec![ChatMessage::assistant(
+        "",
+        vec![call(""), call("  "), call(r#"{"path":"a"}"#)],
+    )];
+
+    let body = super::build_body(&req).expect("empty tool arguments should build");
+    let wire = serde_json::to_value(&body).unwrap();
+    let args: Vec<&str> = wire["messages"][0]["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tc| tc["function"]["arguments"].as_str().unwrap())
+        .collect();
+    assert_eq!(args, ["{}", "{}", r#"{"path":"a"}"#]);
+}
