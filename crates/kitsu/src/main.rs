@@ -5352,7 +5352,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "jobs",
-        args: "[list|view|show <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>]",
+        args: "[list|view|show <id>|explain <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>]",
         description: "inspect, steer, stop, prune, and close background agent threads",
         details: "The agent deck: every background agent thread with state glyphs (filled = running, hollow = spent, half = result awaiting pickup), token/tool telemetry, and ids for /agent.",
         group: CommandGroup::AgentsJobs,
@@ -11243,6 +11243,123 @@ fn format_agent_thread(snapshot: &subagent::thread::AgentThreadSnapshot) -> Stri
     output
 }
 
+/// Human `/jobs explain <id>`, borrowed from herdr's `agent explain`: why is
+/// this agent in this state, since when, and what is it waiting on.
+///
+/// Deliberately *not* `/jobs show`: no timeline, no task text, no result, and
+/// no acknowledgement. Two ages appear in two formats on purpose. `since` is a
+/// run duration and keeps the one decimal this file uses throughout; an
+/// activity age goes through `kitsu_render::format_wait_elapsed`, which
+/// truncates to whole seconds, because that is what the deck's own activity
+/// line shows. They are not unified.
+///
+/// The output does not pass through `sanitize_plain_inline`, so every static
+/// byte here is ASCII and every separator is `|`; user-supplied text is routed
+/// through `terminal_inline`.
+fn format_agent_explain(
+    progress: &subagent::AgentProgress,
+    thread: &subagent::thread::AgentThreadSnapshot,
+) -> String {
+    let state = match thread.phase {
+        subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+        subagent::thread::AgentThreadPhase::Done
+            if thread.handoff == subagent::thread::AgentHandoffState::Ready =>
+        {
+            kitsu_render::DeckState::ResultReady
+        }
+        subagent::thread::AgentThreadPhase::Done => kitsu_render::DeckState::Stopped,
+        subagent::thread::AgentThreadPhase::Failed => kitsu_render::DeckState::Failed,
+        subagent::thread::AgentThreadPhase::Cancelled => kitsu_render::DeckState::Stopped,
+    };
+    let running = matches!(thread.phase, subagent::thread::AgentThreadPhase::Running);
+    let elapsed = thread.elapsed_ms as f64 / 1000.0;
+    let mut output = format!(
+        "{} agent #{} explained | {}",
+        kitsu_render::deck_marker(state),
+        thread.id,
+        thread.phase.label(),
+    );
+
+    if running {
+        output.push_str(&format!("\n  since: started {elapsed:.1}s ago"));
+    } else {
+        output.push_str(&format!("\n  since: ran {elapsed:.1}s"));
+    }
+
+    let activity = progress.telemetry.last_activity.as_deref().map(|label| {
+        let label = terminal_inline(label);
+        match progress.last_activity_ms_ago {
+            Some(ms) => format!(
+                "{label} ({} ago)",
+                kitsu_render::format_wait_elapsed(std::time::Duration::from_millis(ms))
+            ),
+            None => label,
+        }
+    });
+
+    if running {
+        match activity.as_deref() {
+            Some(activity) => output.push_str(&format!("\n  waiting on: {activity}")),
+            None => output.push_str("\n  waiting on: no activity recorded yet"),
+        }
+    } else {
+        if matches!(thread.phase, subagent::thread::AgentThreadPhase::Failed) {
+            if let Some(class) = progress.telemetry.failure_class {
+                output.push_str(&format!("\n  because: {class}"));
+            }
+        }
+        // `AgentProgress::last_activity_ms_ago` is doc-commented "(running
+        // rows)" but is in fact populated for terminal agents too, which this
+        // line's age depends on. Narrowing it to match that comment would
+        // silently drop the age here.
+        if let Some(activity) = activity.as_deref() {
+            output.push_str(&format!("\n  last activity: {activity}"));
+        }
+    }
+
+    if running {
+        if thread.steering_open {
+            output.push_str(&format!(
+                "\n  steering: open | {} queued",
+                thread.pending_steering
+            ));
+        } else {
+            output.push_str("\n  steering: closed");
+        }
+    } else {
+        let handoff = match thread.handoff {
+            subagent::thread::AgentHandoffState::Ready => {
+                format!("ready | result not collected, see /jobs show {}", thread.id)
+            }
+            subagent::thread::AgentHandoffState::Acknowledged => {
+                "acknowledged | result already collected".to_string()
+            }
+            subagent::thread::AgentHandoffState::Unavailable => "unavailable".to_string(),
+        };
+        output.push_str(&format!("\n  handoff: {handoff}"));
+    }
+
+    output
+}
+
+/// `/jobs explain <id>` for both dispatchers: `None` for an unknown id.
+///
+/// Read-only by construction. It never calls `acknowledge_result` and never
+/// calls `result`, which acknowledges too, so diagnosing an agent cannot take
+/// custody of its result and defeat the exit guard on unviewed results.
+///
+/// There is no per-id progress accessor, so the matching progress record is
+/// found by scan; the registry caps records at 128, so this is bounded.
+fn agent_explain_view(registry: &subagent::AgentRegistry, id: u64) -> Option<String> {
+    let thread = registry.thread_snapshot(id)?;
+    let progress = registry
+        .progress_snapshot()
+        .agents
+        .into_iter()
+        .find(|agent| agent.id == id)?;
+    Some(format_agent_explain(&progress, &thread))
+}
+
 async fn handle_jobs_command(
     registry: &Arc<subagent::AgentRegistry>,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
@@ -11300,6 +11417,33 @@ async fn handle_jobs_command(
                 "id": id,
                 "thread": subagent::thread::AgentThreadSnapshotDto::from_snapshot(&thread),
                 "result": result,
+                "handoff": registry.handoff_state(id),
+                "snapshot": jobs_snapshot_payload(registry),
+            }))
+        }
+        "explain" => {
+            let Some(id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+                eprintln!("usage: /jobs explain <id>");
+                return Err(());
+            };
+            if parts.next().is_some() {
+                eprintln!("usage: /jobs explain <id>");
+                return Err(());
+            }
+            let Some(explanation) = agent_explain_view(registry, id) else {
+                eprintln!("no background job #{id}");
+                return Err(());
+            };
+            eprintln!("{explanation}");
+            Ok(serde_json::json!({
+                "kind": "jobs",
+                "action": "explain",
+                "changed": false,
+                "id": id,
+                "thread": registry
+                    .thread_snapshot(id)
+                    .as_ref()
+                    .map(subagent::thread::AgentThreadSnapshotDto::from_snapshot),
                 "handoff": registry.handoff_state(id),
                 "snapshot": jobs_snapshot_payload(registry),
             }))
@@ -11462,7 +11606,7 @@ async fn handle_jobs_command(
             if let Some(suggestion) = closest_jobs_subcommand(action) {
                 eprintln!("unknown action '{action}' - did you mean '{suggestion}'?");
             }
-            eprintln!("usage: /jobs [list|view|show <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>]");
+            eprintln!("usage: /jobs [list|view|show <id>|explain <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>]");
             Err(())
         }
     }
@@ -13690,6 +13834,16 @@ fn handle_active_jobs_command(
             }
             Ok(output)
         }
+        "explain" => {
+            let id = parts
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| "usage: /jobs explain <id>".to_string())?;
+            if parts.next().is_some() {
+                return Err("usage: /jobs explain <id>".to_string());
+            }
+            agent_explain_view(registry, id).ok_or_else(|| format!("no background job #{id}"))
+        }
         "steer" => {
             let id = parts
                 .next()
@@ -13732,7 +13886,7 @@ fn handle_active_jobs_command(
             ))
         }
         _ => Err(
-            "active-turn controls: /jobs [list|view|show <id>|steer <id> <text>|stop <id>|stop-all]"
+            "active-turn controls: /jobs [list|view|show <id>|explain <id>|steer <id> <text>|stop <id>|stop-all]"
                 .to_string(),
         ),
     }
@@ -17861,6 +18015,7 @@ fn closest_jobs_subcommand(name: &str) -> Option<&'static str> {
         "list",
         "view",
         "show",
+        "explain",
         "steer",
         "close-steering",
         "stop",
@@ -21217,6 +21372,477 @@ mod tests {
         assert_eq!(agents.alias_of, Some("jobs"));
         assert!(agents.args.contains("view"), "{}", agents.args);
         assert!(agents.args.contains("id"), "{}", agents.args);
+    }
+
+    /// Build the `(progress, thread)` pair `/jobs explain` renders from. The
+    /// two snapshots the command passes always describe the same agent, so the
+    /// helper keeps them consistent.
+    fn explain_fixture(
+        id: u64,
+        status: subagent::AgentProgressStatus,
+        phase: subagent::thread::AgentThreadPhase,
+        handoff: subagent::thread::AgentHandoffState,
+    ) -> (
+        subagent::AgentProgress,
+        subagent::thread::AgentThreadSnapshot,
+    ) {
+        let progress = subagent::AgentProgress {
+            id,
+            task: "summarize the crate".to_string(),
+            profile: Some("reviewer".to_string()),
+            status,
+            elapsed_ms: 12_500,
+            result_bytes: Some(42),
+            last_activity_ms_ago: Some(3_200),
+            telemetry: subagent::AgentTelemetry {
+                model: "qwen2.5-coder".to_string(),
+                last_activity: Some("tool read".to_string()),
+                ..Default::default()
+            },
+        };
+        let thread = subagent::thread::AgentThreadSnapshot {
+            id,
+            task: "summarize the crate".to_string(),
+            model: "qwen2.5-coder".to_string(),
+            profile: Some("reviewer".to_string()),
+            phase,
+            handoff,
+            elapsed_ms: 12_500,
+            result_bytes: Some(42),
+            steering_open: true,
+            pending_steering: 2,
+            timeline: subagent::thread::AgentTimelineSnapshot {
+                entries: vec![subagent::thread::AgentTimelineEntry {
+                    sequence: 1,
+                    elapsed_ms: 10,
+                    kind: subagent::thread::AgentTimelineKind::UserTask,
+                    round: None,
+                    text: "summarize the crate".to_string(),
+                    truncated: false,
+                }],
+                dropped_entries: 0,
+                retained_bytes: 19,
+                closed: false,
+            },
+        };
+        (progress, thread)
+    }
+
+    /// The labelled lines of an explanation, in order, as `(label, value)`.
+    /// The header line is excluded, and every other line must be a labelled
+    /// one at the documented two-space indent.
+    fn explain_labels(rendered: &str) -> Vec<(String, String)> {
+        rendered
+            .lines()
+            .skip(1)
+            .map(|line| {
+                assert!(
+                    line.starts_with("  ") && !line.starts_with("   "),
+                    "explain lines sit at a two-space indent: {line:?}"
+                );
+                let (label, value) = line
+                    .trim_start()
+                    .split_once(": ")
+                    .unwrap_or_else(|| panic!("unlabelled explain line: {line:?}"));
+                (label.to_string(), value.to_string())
+            })
+            .collect()
+    }
+
+    fn explain_label_value<'a>(labels: &'a [(String, String)], label: &str) -> Option<&'a str> {
+        labels
+            .iter()
+            .find(|(name, _)| name == label)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn explaining_a_running_agent_says_since_when_and_what_it_waits_on() {
+        let (progress, thread) = explain_fixture(
+            3,
+            subagent::AgentProgressStatus::Running,
+            subagent::thread::AgentThreadPhase::Running,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        let explain = format_agent_explain(&progress, &thread);
+        assert_no_debug_leak(&explain);
+        assert!(!explain.contains('\u{1b}'), "{explain}");
+
+        let header = explain
+            .lines()
+            .next()
+            .unwrap_or_else(|| panic!("{explain}"));
+        assert!(header.contains("agent #3 explained"), "{header}");
+        assert!(header.contains("running"), "{header}");
+        if kitsu_render::plain_mode() {
+            assert!(header.starts_with("[run] "), "{header}");
+        } else {
+            assert!(header.starts_with("◆ "), "{header}");
+        }
+
+        let labels = explain_labels(&explain);
+        // Two ages, two deliberately different formats, each matching its own
+        // established precedent. `since` is a run duration, which this file
+        // renders at one decimal throughout (`format_agent_thread`). An
+        // activity age is whole seconds, because `agent_activity_child_row`
+        // routes the deck's own activity age through
+        // `kitsu_render::format_wait_elapsed`, which truncates. Do not
+        // "unify" these: that breaks one precedent whichever way it goes.
+        let since = explain_label_value(&labels, "since").unwrap_or_else(|| panic!("{explain}"));
+        assert_eq!(since, "started 12.5s ago", "{explain}");
+        let waiting =
+            explain_label_value(&labels, "waiting on").unwrap_or_else(|| panic!("{explain}"));
+        assert!(waiting.contains("tool read"), "{explain}");
+        assert!(
+            waiting.contains(&format!(
+                "{} ago",
+                kitsu_render::format_wait_elapsed(std::time::Duration::from_millis(3_200))
+            )),
+            "{explain}"
+        );
+        assert!(!waiting.contains("3.2s"), "{explain}");
+        // `show` says "queued" for this field; `explain` must not invent a
+        // second word for one fact.
+        assert_eq!(
+            explain_label_value(&labels, "steering"),
+            Some("open | 2 queued"),
+            "{explain}"
+        );
+        // A running agent has not failed, has no collected-or-not result, and
+        // its activity is the thing it is waiting on, not a past event.
+        for absent in ["because", "last activity", "handoff"] {
+            assert!(
+                explain_label_value(&labels, absent).is_none(),
+                "a running explanation must omit {absent}: {explain}"
+            );
+        }
+    }
+
+    #[test]
+    fn explaining_a_done_agent_with_an_uncollected_result_points_at_jobs_show() {
+        let (progress, thread) = explain_fixture(
+            4,
+            subagent::AgentProgressStatus::Done,
+            subagent::thread::AgentThreadPhase::Done,
+            subagent::thread::AgentHandoffState::Ready,
+        );
+        let explain = format_agent_explain(&progress, &thread);
+        assert_no_debug_leak(&explain);
+        assert!(!explain.contains('\u{1b}'), "{explain}");
+
+        let labels = explain_labels(&explain);
+        assert_eq!(
+            explain_label_value(&labels, "since"),
+            Some("ran 12.5s"),
+            "{explain}"
+        );
+        let handoff =
+            explain_label_value(&labels, "handoff").unwrap_or_else(|| panic!("{explain}"));
+        assert!(handoff.starts_with("ready |"), "{explain}");
+        assert!(handoff.contains("/jobs show 4"), "{explain}");
+        // Nothing is being waited on and nothing can be steered any more.
+        for absent in ["waiting on", "steering"] {
+            assert!(
+                explain_label_value(&labels, absent).is_none(),
+                "a terminal explanation must omit {absent}: {explain}"
+            );
+        }
+    }
+
+    #[test]
+    fn explaining_a_done_agent_whose_result_was_collected_says_acknowledged() {
+        let (progress, thread) = explain_fixture(
+            5,
+            subagent::AgentProgressStatus::Done,
+            subagent::thread::AgentThreadPhase::Done,
+            subagent::thread::AgentHandoffState::Acknowledged,
+        );
+        let explain = format_agent_explain(&progress, &thread);
+        let labels = explain_labels(&explain);
+        let handoff =
+            explain_label_value(&labels, "handoff").unwrap_or_else(|| panic!("{explain}"));
+        assert!(handoff.starts_with("acknowledged |"), "{explain}");
+        assert!(!handoff.contains("/jobs show"), "{explain}");
+    }
+
+    #[test]
+    fn explaining_a_failed_agent_names_the_failure_class_before_the_last_activity() {
+        let (mut progress, thread) = explain_fixture(
+            6,
+            subagent::AgentProgressStatus::Failed,
+            subagent::thread::AgentThreadPhase::Failed,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        progress.telemetry.failure_class = Some(subagent::AgentFailureClass::ProviderRateLimited);
+        let explain = format_agent_explain(&progress, &thread);
+        assert_no_debug_leak(&explain);
+
+        let labels = explain_labels(&explain);
+        assert_eq!(
+            explain_label_value(&labels, "because"),
+            Some(
+                subagent::AgentFailureClass::ProviderRateLimited
+                    .to_string()
+                    .as_str()
+            ),
+            "{explain}"
+        );
+        let activity =
+            explain_label_value(&labels, "last activity").unwrap_or_else(|| panic!("{explain}"));
+        assert!(activity.contains("tool read"), "{explain}");
+        // Same shared formatter as the deck's activity age, not `since`'s
+        // one-decimal run duration.
+        assert!(
+            activity.contains(&format!(
+                "{} ago",
+                kitsu_render::format_wait_elapsed(std::time::Duration::from_millis(3_200))
+            )),
+            "{explain}"
+        );
+        assert!(!activity.contains("3.2s"), "{explain}");
+
+        // The cause is stated before the evidence, so the line order reads as
+        // an explanation rather than a log.
+        let because = explain
+            .find("\n  because: ")
+            .unwrap_or_else(|| panic!("{explain}"));
+        let last = explain
+            .find("\n  last activity: ")
+            .unwrap_or_else(|| panic!("{explain}"));
+        assert!(because < last, "{explain}");
+    }
+
+    #[test]
+    fn explaining_a_failed_agent_without_a_failure_class_omits_because() {
+        let (progress, thread) = explain_fixture(
+            7,
+            subagent::AgentProgressStatus::Failed,
+            subagent::thread::AgentThreadPhase::Failed,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        assert_eq!(progress.telemetry.failure_class, None);
+        let explain = format_agent_explain(&progress, &thread);
+        let labels = explain_labels(&explain);
+        assert!(
+            explain_label_value(&labels, "because").is_none(),
+            "{explain}"
+        );
+        // The rest of the explanation still renders.
+        assert_eq!(
+            explain_label_value(&labels, "since"),
+            Some("ran 12.5s"),
+            "{explain}"
+        );
+        assert!(
+            explain_label_value(&labels, "last activity").is_some(),
+            "{explain}"
+        );
+    }
+
+    #[test]
+    fn explaining_a_running_agent_with_no_activity_says_so_in_words() {
+        let (mut progress, thread) = explain_fixture(
+            8,
+            subagent::AgentProgressStatus::Running,
+            subagent::thread::AgentThreadPhase::Running,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        progress.telemetry.last_activity = None;
+        progress.last_activity_ms_ago = None;
+        let explain = format_agent_explain(&progress, &thread);
+        assert!(
+            explain.contains("\n  waiting on: no activity recorded yet"),
+            "{explain}"
+        );
+        // No empty parenthetical age leaks out when there is no timestamp.
+        assert!(!explain.contains("( ago)"), "{explain}");
+        assert!(!explain.contains("(0s ago)"), "{explain}");
+        assert!(!explain.contains("(0.0s ago)"), "{explain}");
+    }
+
+    #[test]
+    fn explain_labels_keep_their_documented_order_shape_and_ascii_tier() {
+        const ORDER: [&str; 6] = [
+            "since",
+            "waiting on",
+            "because",
+            "last activity",
+            "steering",
+            "handoff",
+        ];
+        let cases = [
+            (
+                subagent::AgentProgressStatus::Running,
+                subagent::thread::AgentThreadPhase::Running,
+                subagent::thread::AgentHandoffState::Unavailable,
+                Some(subagent::AgentFailureClass::ProviderTimeout),
+            ),
+            (
+                subagent::AgentProgressStatus::Failed,
+                subagent::thread::AgentThreadPhase::Failed,
+                subagent::thread::AgentHandoffState::Unavailable,
+                Some(subagent::AgentFailureClass::ProviderTimeout),
+            ),
+            (
+                subagent::AgentProgressStatus::Done,
+                subagent::thread::AgentThreadPhase::Done,
+                subagent::thread::AgentHandoffState::Ready,
+                None,
+            ),
+            (
+                subagent::AgentProgressStatus::Cancelled,
+                subagent::thread::AgentThreadPhase::Cancelled,
+                subagent::thread::AgentHandoffState::Unavailable,
+                None,
+            ),
+        ];
+        for (index, (status, phase, handoff, class)) in cases.into_iter().enumerate() {
+            let (mut progress, thread) = explain_fixture(9, status, phase, handoff);
+            progress.telemetry.failure_class = class;
+            let explain = format_agent_explain(&progress, &thread);
+            assert_no_debug_leak(&explain);
+            assert!(!explain.contains('\u{1b}'), "case {index}: {explain}");
+
+            // `explain_labels` itself pins the `"  <label>: <value>"` shape.
+            let labels = explain_labels(&explain);
+            assert!(!labels.is_empty(), "case {index}: {explain}");
+            let positions = labels
+                .iter()
+                .map(|(label, _)| {
+                    ORDER
+                        .iter()
+                        .position(|known| known == label)
+                        .unwrap_or_else(|| panic!("case {index}: unknown label {label:?}"))
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "case {index}: labels out of order: {explain}"
+            );
+            // `since` is unconditional.
+            assert_eq!(labels[0].0, "since", "case {index}: {explain}");
+
+            // The explanation does not pass through `sanitize_plain_inline`, so
+            // every byte it adds to the state marker must already be ASCII and
+            // every separator must be `|`.
+            let marker = kitsu_render::deck_marker(match phase {
+                subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+                subagent::thread::AgentThreadPhase::Done
+                    if handoff == subagent::thread::AgentHandoffState::Ready =>
+                {
+                    kitsu_render::DeckState::ResultReady
+                }
+                subagent::thread::AgentThreadPhase::Done => kitsu_render::DeckState::Stopped,
+                subagent::thread::AgentThreadPhase::Failed => kitsu_render::DeckState::Failed,
+                subagent::thread::AgentThreadPhase::Cancelled => kitsu_render::DeckState::Stopped,
+            });
+            let body = explain
+                .strip_prefix(&marker)
+                .unwrap_or_else(|| panic!("case {index}: no deck marker: {explain}"));
+            assert!(body.is_ascii(), "case {index}: {explain}");
+            for forbidden in ["·", "—", "↳", "\u{2502}"] {
+                assert!(!explain.contains(forbidden), "case {index}: {explain}");
+            }
+        }
+    }
+
+    #[test]
+    fn explain_answers_a_different_question_than_show() {
+        let (progress, thread) = explain_fixture(
+            10,
+            subagent::AgentProgressStatus::Done,
+            subagent::thread::AgentThreadPhase::Done,
+            subagent::thread::AgentHandoffState::Ready,
+        );
+        let explain = format_agent_explain(&progress, &thread);
+        let show = format_agent_thread(&thread);
+
+        // `show` dumps the whole bounded timeline and the task text; `explain`
+        // answers why/since-when/waiting-on and dumps nothing.
+        assert!(show.contains("bounded redacted timeline:"), "{show}");
+        assert!(!explain.contains("bounded redacted timeline"), "{explain}");
+        assert!(!explain.contains("timeline:"), "{explain}");
+        assert!(show.contains("\n  task: "), "{show}");
+        assert!(!explain.contains("\n  task: "), "{explain}");
+        assert!(!explain.contains("summarize the crate"), "{explain}");
+
+        // And it says, in the header, that it is an explanation.
+        assert!(explain.contains("explained"), "{explain}");
+        assert!(!show.contains("explained"), "{show}");
+    }
+
+    #[test]
+    fn explaining_an_agent_never_collects_its_result() {
+        let registry = subagent::AgentRegistry::default();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+        assert_eq!(
+            registry.handoff_state(done),
+            Some(subagent::thread::AgentHandoffState::Ready)
+        );
+        let before = registry.snapshot().unacknowledged;
+        assert_eq!(before, 1);
+
+        let explain =
+            agent_explain_view(&registry, done).unwrap_or_else(|| panic!("agent #{done} exists"));
+        assert!(
+            explain.contains(&format!("agent #{done} explained")),
+            "{explain}"
+        );
+
+        // Diagnosing an agent must never be the act that takes custody of its
+        // result: `/jobs show` acknowledges, and if `explain` did too the exit
+        // guard that refuses to quit on unviewed results would be defeated.
+        assert_eq!(
+            registry.handoff_state(done),
+            Some(subagent::thread::AgentHandoffState::Ready),
+            "explain acknowledged the handoff: {explain}"
+        );
+        assert_eq!(registry.snapshot().unacknowledged, before, "{explain}");
+        let view = format_jobs_view(&registry);
+        assert!(
+            jobs_view_heading_offset(&view, "done, result ready").is_some(),
+            "{view}"
+        );
+        assert!(!view.contains("done, collected"), "{view}");
+    }
+
+    #[test]
+    fn explaining_an_unknown_agent_id_has_nothing_to_render() {
+        let registry = subagent::AgentRegistry::default();
+        assert!(agent_explain_view(&registry, 404).is_none());
+        let known = registry.start("still working".to_string()).unwrap();
+        assert!(agent_explain_view(&registry, known).is_some());
+        assert!(agent_explain_view(&registry, known + 1).is_none());
+    }
+
+    #[test]
+    fn a_near_miss_for_explain_is_suggested_as_a_jobs_subcommand() {
+        assert_eq!(closest_jobs_subcommand("explan"), Some("explain"));
+        assert_eq!(closest_jobs_subcommand("explain"), Some("explain"));
+        assert_eq!(closest_jobs_subcommand("xplain"), Some("explain"));
+    }
+
+    #[test]
+    fn the_command_registry_advertises_jobs_explain() {
+        let jobs = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "jobs")
+            .expect("/jobs is registered");
+        assert!(jobs.args.contains("explain"), "{}", jobs.args);
+
+        // The alias needs no row change: it already advertises, and forwards,
+        // every /jobs subcommand.
+        let agents = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "agents")
+            .expect("/agents is registered");
+        assert_eq!(agents.alias_of, Some("jobs"));
+        assert!(
+            agents.args.contains("any /jobs subcommand"),
+            "{}",
+            agents.args
+        );
     }
 
     #[test]
