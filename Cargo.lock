@@ -1034,6 +1034,7 @@ dependencies = [
  "clap",
  "futures",
  "kitsu-core",
+ "kitsu-editor",
  "kitsu-providers",
  "kitsu-render",
  "kitsu-tools",
@@ -1069,6 +1070,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "kitsu-editor"
+version = "0.1.0"
 
 [[package]]
 name = "kitsu-providers"

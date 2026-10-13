@@ -59,6 +59,12 @@ Recommended workspace:
 - `crates/kitsu-providers` — provider trait + `OllamaProvider`, `OpenAICompatProvider`
 - `crates/kitsu-tools` — tool registry, policy engine, built-in tools
 - `crates/kitsu-render` — terminal rendering + JSON output formatting
+- `crates/kitsu-editor` — the pure input keymap and line editor (printable
+  insert, motions, kills, history walk with a draft stash, reverse-i-search,
+  bracketed paste, lone-Escape resolution). Dependency-free and deliberately
+  a library rather than a module of the binary: `crates/kitsu` is binary-only,
+  so a library crate cannot import from it, and the planned terminal UI needs
+  the same editor the binary's input collector uses.
 
 This separation keeps provider logic independent from CLI parsing and makes it easier to add:
 - new providers (e.g., llama.cpp server)

@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 kitsu-core = { workspace = true }
 kitsu-providers = { workspace = true }
+kitsu-editor = { workspace = true }
 kitsu-tools = { workspace = true }
 kitsu-render = { workspace = true }
 tokio = { workspace = true }
