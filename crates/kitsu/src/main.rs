@@ -21855,12 +21855,16 @@ mod tests {
             running: 0,
             terminal: 0,
             failed: 0,
+            unacknowledged: 0,
+            blocked: 0,
         };
         let current = subagent::AgentRegistrySnapshot {
             generation: 3,
             running: 0,
             terminal: 1,
             failed: 0,
+            unacknowledged: 0,
+            blocked: 0,
         };
         let notice = background_agent_notice(previous, current).unwrap();
         assert!(notice.contains("1 background agent(s) finished"));
@@ -21877,12 +21881,16 @@ mod tests {
             running: 1,
             terminal: 0,
             failed: 0,
+            unacknowledged: 0,
+            blocked: 0,
         };
         let current = subagent::AgentRegistrySnapshot {
             generation: 2,
             running: 0,
             terminal: 1,
             failed: 1,
+            unacknowledged: 0,
+            blocked: 0,
         };
         let notice = background_agent_notice(previous, current).unwrap();
         assert!(notice.contains("FAILED"), "{notice}");
