@@ -20,7 +20,7 @@ pub(crate) enum InferenceCarrier {
 }
 
 impl InferenceCarrier {
-    const fn is_interactive(self) -> bool {
+    pub(crate) const fn is_interactive(self) -> bool {
         matches!(self, Self::InteractiveHuman)
     }
 }
