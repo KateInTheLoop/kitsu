@@ -18554,3 +18554,38 @@ fn test_script_agents_with_an_id_still_maps_to_show() {
         "the alias rejected its own numeric form: {stderr}"
     );
 }
+
+/// `/jobs explain <id>` and `/agents explain <id>`. With no background agents
+/// the unknown-id rejection is the only reachable outcome, and under `--jsonl`
+/// both a forwarded `explain` and an alias-level rejection surface as the same
+/// framed failure — so this runs without `--jsonl` and reads stderr, which is
+/// the only place the two paths differ.
+#[test]
+#[serial]
+fn test_script_jobs_explain_is_served_by_both_the_command_and_its_alias() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("jobs-explain.txt");
+    fs::write(&script, "/jobs explain 7\n/agents explain 7\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("jobs explain script");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // Both spellings reached the `explain` arm and were rejected by the id
+    // lookup, not by the subcommand table or by the alias.
+    assert_eq!(
+        stderr.matches("no background job #7").count(),
+        2,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("unknown action 'explain'"), "{stderr}");
+    assert!(!stderr.contains("usage: /jobs ["), "{stderr}");
+    assert!(!stderr.contains("usage: /agents"), "{stderr}");
+    // A rejected lookup is not a usage error either.
+    assert!(!stderr.contains("usage: /jobs explain"), "{stderr}");
+}

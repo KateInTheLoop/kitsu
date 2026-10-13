@@ -80,3 +80,22 @@ undocumented there: the queued-prompt stack rows above the status row, the
 multi-line draft context rows, and the soft-wrap behaviour. A small
 documentation-only card should close that, since the live region is now the
 most-edited surface in `kitsu-render`.
+
+## F7 — `AgentProgress::last_activity_ms_ago` is documented as running-only but is not
+
+Found: T1-S3 second card. The field's doc comment in
+`crates/kitsu/src/subagent.rs` reads "Milliseconds since the agent's last
+recorded activity (running rows)", which reads as a contract that only running
+agents carry it. In fact it is populated for terminal agents too, which
+`/jobs explain` relies on for its `last activity` line on failed and cancelled
+agents.
+
+The deck never exposed the discrepancy because `agent_activity_child_row` is
+only called for running rows, by design ("terminal rows carry no child — their
+story is complete"). So the comment described the deck's usage, not the field.
+
+Latent trap: if someone later narrows the field to running-only to match its
+comment, `/jobs explain` loses the `last activity` line for exactly the agents
+where it matters most, and only the explain tests would catch it. The comment
+should be corrected to describe the field rather than one caller, in whichever
+card next touches that struct.

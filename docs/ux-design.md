@@ -113,7 +113,15 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   `done, result ready`, `done, collected`, `failed`, `cancelled`, with empty
   groups omitted. Those headings bypass `deck_header`, so they are pure ASCII
   in every tier; both views build their counts from one shared expression and
-  their rows from one shared helper, so they cannot drift.
+  their rows from one shared helper, so they cannot drift. `/jobs explain <id>`
+  renders one agent as a `deck_marker` header `agent #N explained | <phase>`
+  followed by `  <label>: <value>` lines in a fixed order — `since`,
+  `waiting on`, `because`, `last activity`, `steering`, `handoff` — each
+  present only when it applies. Separators are ASCII `|` and the static text
+  is pure ASCII, since these lines bypass `sanitize_plain_inline` too. Two
+  ages, two formats, deliberately: `since` is a run duration at one decimal
+  like the rest of this file, while an activity age uses
+  `format_wait_elapsed`, matching the deck's own activity line.
   `/profiles` uses the same `◈` receipt header with rows
   prefixed `◆` (tool-capable / inherits session grants) or `◇` (reasoning-only
   / no tools), reusing the tool-call/tool-result glyphs to signal capability
