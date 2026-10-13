@@ -759,6 +759,14 @@ pub fn with_live_row_suspended<T>(write: impl FnOnce() -> T) -> T {
     write()
 }
 
+/// The current live-row suspension depth, for tests that must prove a routed
+/// writer balances its own suspension (a leaked one would lift the row for the
+/// rest of the process without failing any other assertion).
+#[cfg(test)]
+pub(crate) fn suspend_depth() -> usize {
+    SUSPEND_DEPTH.load(Ordering::Acquire)
+}
+
 /// Show the input draft on the live row. `prompt` may carry styling; it is
 /// measured through the sanitizer.
 pub fn live_input_begin(prompt: String) {
