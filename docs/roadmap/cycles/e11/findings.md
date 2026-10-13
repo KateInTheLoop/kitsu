@@ -243,5 +243,15 @@ routing sites, since that is what the next implementer actually reads.
 through `StreamBuffer::push` and `flush_unstyled`. That touches the line
 styler and both functions' byte-count returns, so bundling it with the routing
 would have recreated exactly the drift risk that splitting T0-S3 was meant to
-avoid. T0-S4 and T0-S5 must not assume stdout flows through the seam until
-T0-S3c lands.
+avoid.
+
+**RESOLVED in T0-S3c.** Both methods now take the block's writer, both routing
+sites pass it, and the `GAP` comments were rewritten rather than left to
+mislead a future reader into believing a closed limitation still applies. A
+source-text guard test asserts the `impl StreamBuffer` block contains no
+`io::stdout()`, so the decoupling cannot silently regress. T0-S4 and T0-S5 may
+now assume stdout flows through the seam. Residual, and smaller: a failed
+write is still swallowed exactly as it was against stdout, and the returned
+byte count is computed from the formatted text rather than from what the
+writer accepted — so a short-writing sink would make the count a lie, though
+`write_all` masks that and both call sites ignore the count.
