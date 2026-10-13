@@ -213,8 +213,15 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   draft-aware Ctrl+C, `↑`-on-empty queue recall, queue preview rows,
   `[N queued]`, approval handoff.
 - **R5** A persistent **status row** MUST show: model, context meter, elapsed
-  turn time, `[N queued]`, and `← N agents` (agents needing input, else
-  running count). It is one line and never scrolls.
+  turn time, `[N queued]`, and an ambient background-agent tag carrying the
+  count of agents needing input, else the running count. It is one line and
+  never scrolls. **Tag form:** `classic` renders it bracketed beside its
+  neighbour (`[1 blocked] [2 queued] kitsu> …`, blocked outranking running,
+  hidden when both are zero), because the `←` glyph Claude Code uses is a
+  live hint for the left-arrow key and classic has no such binding; a TUI
+  mode MAY adopt `← N agents` once A1's left-arrow affordance exists, and
+  not before. Promising a key that does nothing is the kind of dishonest
+  decoration the rest of this design avoids.
 - **R6** Transcript overlay (`Ctrl+O`): scroll, `/` search, `n`/`N`, `{`/`}`
   prompt jumps, `[` dump the cell ring to native scrollback (fullscreen only),
   `v` open in `$EDITOR`, `q`/`Esc` close.
@@ -262,8 +269,9 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   `acknowledge_result`), so the exit guard and strict-automation rules are
   unchanged.
 - **A8** The ambient counter (R5) MUST update within 250 ms of a registry
-  change in TUI modes, and at the next prompt cycle in `classic` (current
-  behavior, now documented).
+  change in TUI modes. In `classic` it refreshes on the live status row once
+  per input poll tick while a turn runs, and the idle prompt keeps reporting
+  at the next prompt cycle, which is the pre-existing notice behavior.
 
 ### 3.3 Functional — blocked agents (B)
 
@@ -537,7 +545,8 @@ Attach does not move the agent to the foreground or take its stdin; it is a
 
 Cheap wins so `classic` users (and herdr users) benefit before Stage 2:
 
-- status row gains `← N agents` using the registry watch (A8 classic path).
+- the live status row gains the ambient background-agent tag, driven by the
+  registry watch, in the bracketed form R5 specifies (A8 classic path).
 - new `/jobs` subcommands in all three dispatch sites (idle
   `handle_jobs_command`, mid-turn `handle_active_jobs_command`, and the
   `/agents` alias arm, widened to forward them): `view` (grouped deck as in

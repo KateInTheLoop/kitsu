@@ -47,6 +47,14 @@ struct LiveRowState {
     /// dimmed `[N queued]` tag so the pending stack stays visible after its
     /// receipt scrolls away.
     queued: usize,
+    /// Detached background agents waiting on the user; rendered as a dimmed
+    /// `[N blocked] ` tag leftmost on the status row so an agent that needs
+    /// an answer stays visible after its one-off notice scrolls away.
+    blocked: usize,
+    /// Detached background agents still running; rendered as a dimmed
+    /// `[N agent(s)] ` tag only when nothing is blocked — progress matters
+    /// less than a question the user must answer.
+    running: usize,
     /// Up to the first three queued prompts, rendered as dimmed stack rows
     /// above the status row (the live region's upper rows).
     previews: Vec<String>,
@@ -167,9 +175,26 @@ fn fit_draft_window(buffer: &str, cursor: usize, avail: usize) -> (String, usize
 
 /// Compose the styled row and the 1-based cursor column (when a draft is
 /// present). Pure so the layout is unit-testable without a terminal.
+/// The ambient background-agent tag (trailing space included), or `None`
+/// when no detached agent is blocked or running. Blocked outranks running:
+/// an agent waiting on the user is the thing the user must act on. Pure.
+fn agents_tag(blocked: usize, running: usize) -> Option<String> {
+    if blocked > 0 {
+        Some(format!("[{blocked} blocked] "))
+    } else if running == 1 {
+        Some("[1 agent] ".to_string())
+    } else if running > 0 {
+        Some(format!("[{running} agents] "))
+    } else {
+        None
+    }
+}
+
 fn compose_row(
     spinner: Option<&str>,
     draft: Option<&LiveDraft>,
+    blocked: usize,
+    running: usize,
     queued: usize,
     cols: usize,
 ) -> (String, Option<usize>) {
@@ -181,7 +206,12 @@ fn compose_row(
     // trailing space is part of its width.
     let queue_tag = (queued > 0).then(|| format!("[{queued} queued] "));
     let queue_tag_width = queue_tag.as_deref().map(display_width).unwrap_or(0);
-    let prompt_width = display_width(&sanitize_terminal_text(&draft.prompt)) + queue_tag_width;
+    // The background-agent tag sits leftmost of the tags, before the queue
+    // tag; its trailing space is part of its width too.
+    let agents_tag = agents_tag(blocked, running);
+    let agents_tag_width = agents_tag.as_deref().map(display_width).unwrap_or(0);
+    let prompt_width =
+        display_width(&sanitize_terminal_text(&draft.prompt)) + agents_tag_width + queue_tag_width;
     // The spinner yields the row to the draft when both cannot fit.
     let spinner = match (spinner, spinner_width) {
         (Some(segment), Some(width)) if width + 2 + prompt_width + 8 <= cols => {
@@ -229,6 +259,9 @@ fn compose_row(
     if let Some((segment, _)) = spinner {
         row.push_str(segment);
         row.push_str("  ");
+    }
+    if let Some(tag) = agents_tag {
+        row.push_str(&format!("{}", tag.dimmed()));
     }
     if let Some(tag) = queue_tag {
         row.push_str(&format!("{}", tag.dimmed()));
@@ -286,12 +319,14 @@ fn compose_row(
 }
 
 /// The columns available to the draft text on the status row, given the
-/// spinner segment, queue tag, and prompt — the SAME math compose_row uses,
-/// shared so soft-wrap segmentation agrees between the bottom row and the
-/// wrap context rows. Pure.
+/// spinner segment, background-agent tag, queue tag, and prompt — the SAME
+/// math compose_row uses, shared so soft-wrap segmentation agrees between the
+/// bottom row and the wrap context rows. Pure.
 fn draft_segment_width(
     spinner: Option<&str>,
     draft: &LiveDraft,
+    blocked: usize,
+    running: usize,
     queued: usize,
     cols: usize,
 ) -> usize {
@@ -301,7 +336,12 @@ fn draft_segment_width(
     } else {
         0
     };
-    let prompt_width = display_width(&sanitize_terminal_text(&draft.prompt)) + queue_tag_width;
+    let agents_tag_width = agents_tag(blocked, running)
+        .as_deref()
+        .map(display_width)
+        .unwrap_or(0);
+    let prompt_width =
+        display_width(&sanitize_terminal_text(&draft.prompt)) + agents_tag_width + queue_tag_width;
     let lead = match spinner_width {
         Some(width) if width + 2 + prompt_width + 8 <= cols => width + 2,
         _ => 0,
@@ -620,7 +660,14 @@ fn render_region(err: &mut impl Write, row_state: &mut LiveRowState, cols: usize
         let segment_width = if draft.hint_reserved {
             0
         } else {
-            draft_segment_width(row_state.spinner.as_deref(), draft, row_state.queued, cols)
+            draft_segment_width(
+                row_state.spinner.as_deref(),
+                draft,
+                row_state.blocked,
+                row_state.running,
+                row_state.queued,
+                cols,
+            )
         };
         upper.extend(compose_draft_context_rows(
             &draft.buffer,
@@ -632,6 +679,8 @@ fn render_region(err: &mut impl Write, row_state: &mut LiveRowState, cols: usize
     let (status, cursor_col) = compose_row(
         row_state.spinner.as_deref(),
         row_state.draft.as_ref(),
+        row_state.blocked,
+        row_state.running,
         row_state.queued,
         cols,
     );
@@ -760,6 +809,26 @@ pub fn live_queue_state(queued: usize, previews: Vec<String>) {
     redraw();
 }
 
+/// Update the background-agent counts behind the status row's ambient tag:
+/// `blocked` detached agents waiting on the user, `running` ones still
+/// working (0/0 hides the tag). No-op when nothing changed. Unlike
+/// [`live_queue_state`] this touches only the bottom status row, so it leaves
+/// `region_dirty` alone — the collector calls it on every poll tick and a
+/// full-region repaint per count change would be wasted work.
+pub fn live_agents_state(blocked: usize, running: usize) {
+    {
+        let mut row_state = state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if row_state.blocked == blocked && row_state.running == running {
+            return;
+        }
+        row_state.blocked = blocked;
+        row_state.running = running;
+    }
+    redraw();
+}
+
 /// Remove the input draft from the live row (spinner, if any, remains).
 pub fn live_input_end() {
     {
@@ -824,7 +893,7 @@ mod tests {
             cursor: 2,
             ..LiveDraft::default()
         };
-        let (row, col) = compose_row(None, Some(&draft), 0, 80);
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 0, 80);
         assert_eq!(row, "kitsu> abc");
         // 7 prompt columns + 2 chars, 1-based.
         assert_eq!(col, Some(10));
@@ -832,7 +901,7 @@ mod tests {
 
     #[test]
     fn compose_row_spinner_only_has_no_cursor_column() {
-        let (row, col) = compose_row(Some("* thinking"), None, 0, 80);
+        let (row, col) = compose_row(Some("* thinking"), None, 0, 0, 0, 80);
         assert_eq!(row, "* thinking");
         assert_eq!(col, None);
     }
@@ -845,7 +914,7 @@ mod tests {
             cursor: 5,
             ..LiveDraft::default()
         };
-        let (row, col) = compose_row(Some("( .a. ) kitsu is thinking"), Some(&draft), 0, 20);
+        let (row, col) = compose_row(Some("( .a. ) kitsu is thinking"), Some(&draft), 0, 0, 0, 20);
         assert!(!row.contains("thinking"));
         assert!(row.starts_with("kitsu> "));
         assert_eq!(col, Some(13));
@@ -868,7 +937,7 @@ mod tests {
             hint: "ue".to_string(),
             hint_reserved: false,
         };
-        let (row, col) = compose_row(None, Some(&draft), 0, 80);
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 0, 80);
         assert!(row.contains("\u{1b}[2m"), "hint must be dimmed: {row:?}");
         assert!(sanitize_terminal_text(&row).contains("/queue"));
         // Cursor sits right after the typed text, before the hint.
@@ -884,7 +953,7 @@ mod tests {
             hint: "ue".to_string(),
             hint_reserved: false,
         };
-        let (row, _) = compose_row(None, Some(&mid_cursor), 0, 80);
+        let (row, _) = compose_row(None, Some(&mid_cursor), 0, 0, 0, 80);
         assert!(!row.contains("\u{1b}[2m"), "no hint mid-buffer: {row:?}");
 
         let no_room = LiveDraft {
@@ -895,7 +964,7 @@ mod tests {
             hint_reserved: false,
         };
         // avail = 10 - 2 - 1 = 7: the buffer exactly fills it.
-        let (row, _) = compose_row(None, Some(&no_room), 0, 10);
+        let (row, _) = compose_row(None, Some(&no_room), 0, 0, 0, 10);
         assert!(
             !row.contains("extra"),
             "hint must never displace text: {row:?}"
@@ -916,7 +985,7 @@ mod tests {
             hint: "ue".to_string(),
             hint_reserved: false,
         };
-        let (row, _) = compose_row(None, Some(&trimmed), 0, 16);
+        let (row, _) = compose_row(None, Some(&trimmed), 0, 0, 0, 16);
         assert!(
             !row.contains("\u{1b}[2m"),
             "no hint on a windowed draft: {row:?}"
@@ -927,7 +996,7 @@ mod tests {
             cursor: 34,
             ..trimmed.clone()
         };
-        let (row, _) = compose_row(None, Some(&wrapped), 0, 16);
+        let (row, _) = compose_row(None, Some(&wrapped), 0, 0, 0, 16);
         assert!(row.contains("\u{1b}[2m"), "hint on wrapped tail: {row:?}");
 
         // Unwindowed + literal `…`: the hint still renders.
@@ -938,7 +1007,7 @@ mod tests {
             hint: "ue".to_string(),
             hint_reserved: false,
         };
-        let (row, _) = compose_row(None, Some(&fits), 0, 80);
+        let (row, _) = compose_row(None, Some(&fits), 0, 0, 0, 80);
         assert!(row.contains("\u{1b}[2m"));
     }
 
@@ -950,13 +1019,13 @@ mod tests {
             cursor: 2,
             ..LiveDraft::default()
         };
-        let (row, col) = compose_row(None, Some(&draft), 2, 80);
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 2, 80);
         assert!(sanitize_terminal_text(&row).starts_with("[2 queued] kitsu> abc"));
         assert!(row.contains("\u{1b}[2m"), "tag must be dimmed: {row:?}");
         // "[2 queued] " is 11 columns; 7 prompt + 2 chars + 1 (1-based).
         assert_eq!(col, Some(21));
         // Zero queued: no tag, original column.
-        let (row, col) = compose_row(None, Some(&draft), 0, 80);
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 0, 80);
         assert!(!sanitize_terminal_text(&row).contains("queued"));
         assert_eq!(col, Some(10));
     }
@@ -972,7 +1041,7 @@ mod tests {
             hint: "  ⌕ reverse-search 'match'".to_string(),
             hint_reserved: true,
         };
-        let (row, _) = compose_row(None, Some(&draft), 0, 48);
+        let (row, _) = compose_row(None, Some(&draft), 0, 0, 0, 48);
         let plain = sanitize_terminal_text(&row);
         assert!(
             plain.contains("reverse-search 'match'"),
@@ -984,7 +1053,7 @@ mod tests {
             hint_reserved: false,
             ..draft
         };
-        let (row, _) = compose_row(None, Some(&unreserved), 0, 48);
+        let (row, _) = compose_row(None, Some(&unreserved), 0, 0, 0, 48);
         assert!(!sanitize_terminal_text(&row).contains("reverse-search"));
     }
 
@@ -1038,7 +1107,7 @@ mod tests {
             cursor: 26,
             ..LiveDraft::default()
         };
-        let (row, col) = compose_row(None, Some(&draft), 0, 18);
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 0, 18);
         let plain = sanitize_terminal_text(&row);
         assert!(
             plain.ends_with("uvwxyz"),
@@ -1076,7 +1145,7 @@ mod tests {
             cursor: 12,
             ..LiveDraft::default()
         };
-        let (row, _) = compose_row(None, Some(&draft), 0, 18);
+        let (row, _) = compose_row(None, Some(&draft), 0, 0, 0, 18);
         assert!(
             sanitize_terminal_text(&row).contains('…'),
             "window still used"
@@ -1108,7 +1177,7 @@ mod tests {
             cursor: 28, // end of "third"
             ..LiveDraft::default()
         };
-        let (row, col) = compose_row(None, Some(&draft), 0, 80);
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 0, 80);
         let plain = sanitize_terminal_text(&row);
         assert!(
             plain.contains("third"),
@@ -1284,7 +1353,7 @@ mod tests {
 
     #[test]
     fn queue_tag_only_renders_alongside_a_draft() {
-        let (row, _) = compose_row(Some("* thinking"), None, 3, 80);
+        let (row, _) = compose_row(Some("* thinking"), None, 0, 0, 3, 80);
         assert!(!row.contains("queued"), "spinner-only row carries no tag");
     }
 
@@ -1296,7 +1365,211 @@ mod tests {
             cursor: 0,
             ..LiveDraft::default()
         };
-        let (_, col) = compose_row(None, Some(&draft), 0, 80);
+        let (_, col) = compose_row(None, Some(&draft), 0, 0, 0, 80);
         assert_eq!(col, Some(8));
+    }
+
+    #[test]
+    fn agents_tag_truth_table_ranks_blocked_over_running() {
+        // (blocked, running) -> rendered tag (trailing space included).
+        let cases: &[(usize, usize, Option<&str>)] = &[
+            (0, 0, None),
+            (0, 1, Some("[1 agent] ")),
+            (0, 2, Some("[2 agents] ")),
+            (0, 7, Some("[7 agents] ")),
+            (1, 0, Some("[1 blocked] ")),
+            (3, 0, Some("[3 blocked] ")),
+            // Blocked outranks running: an agent waiting on the user is the
+            // thing the user must act on.
+            (2, 5, Some("[2 blocked] ")),
+            (1, 1, Some("[1 blocked] ")),
+        ];
+        for &(blocked, running, expected) in cases {
+            assert_eq!(
+                agents_tag(blocked, running).as_deref(),
+                expected,
+                "agents_tag({blocked}, {running})"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_tag_renders_dimmed_and_shifts_the_cursor_column() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "abc".to_string(),
+            cursor: 2,
+            ..LiveDraft::default()
+        };
+        let (row, col) = compose_row(None, Some(&draft), 1, 0, 0, 80);
+        assert!(sanitize_terminal_text(&row).starts_with("[1 blocked] kitsu> abc"));
+        assert!(row.contains("\u{1b}[2m"), "tag must be dimmed: {row:?}");
+        // "[1 blocked] " is 12 columns; + 7 prompt + 2 chars + 1 (1-based).
+        assert_eq!(col, Some(12 + 7 + 2 + 1));
+        // Running-only tag is narrower by its wording.
+        let (row, col) = compose_row(None, Some(&draft), 0, 2, 0, 80);
+        assert!(sanitize_terminal_text(&row).starts_with("[2 agents] kitsu> abc"));
+        assert!(row.contains("\u{1b}[2m"), "tag must be dimmed: {row:?}");
+        // "[2 agents] " is 11 columns; + 7 prompt + 2 chars + 1 (1-based).
+        assert_eq!(col, Some(11 + 7 + 2 + 1));
+        // No agents: no tag, original column.
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 0, 80);
+        assert!(!sanitize_terminal_text(&row).contains("agent"));
+        assert!(!sanitize_terminal_text(&row).contains("blocked"));
+        assert_eq!(col, Some(10));
+    }
+
+    #[test]
+    fn agents_tag_precedes_the_queue_tag_and_both_shift_the_cursor() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "abc".to_string(),
+            cursor: 2,
+            ..LiveDraft::default()
+        };
+        let (row, col) = compose_row(None, Some(&draft), 1, 0, 2, 80);
+        let plain = sanitize_terminal_text(&row);
+        assert_eq!(plain, "[1 blocked] [2 queued] kitsu> abc");
+        assert!(row.contains("\u{1b}[2m"), "tags must be dimmed: {row:?}");
+        // "[1 blocked] " 12 + "[2 queued] " 11 + 7 prompt + 2 chars + 1.
+        assert_eq!(col, Some(12 + 11 + 7 + 2 + 1));
+        // Running-only variant keeps the same ordering.
+        let (row, col) = compose_row(None, Some(&draft), 0, 1, 3, 80);
+        assert_eq!(
+            sanitize_terminal_text(&row),
+            "[1 agent] [3 queued] kitsu> abc"
+        );
+        // "[1 agent] " 10 + "[3 queued] " 11 + 7 + 2 + 1.
+        assert_eq!(col, Some(10 + 11 + 7 + 2 + 1));
+    }
+
+    #[test]
+    fn agents_tag_only_renders_alongside_a_draft() {
+        let (row, col) = compose_row(Some("* thinking"), None, 2, 3, 0, 80);
+        assert_eq!(row, "* thinking");
+        assert_eq!(col, None);
+        assert!(!row.contains("blocked"), "spinner-only row carries no tag");
+        assert!(!row.contains("agent"), "spinner-only row carries no tag");
+    }
+
+    #[test]
+    fn agents_tag_row_never_wraps_across_a_width_sweep() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "the quick brown fox jumps over the lazy dog".to_string(),
+            cursor: 20,
+            ..LiveDraft::default()
+        };
+        for cols in 40usize..=200 {
+            for &(blocked, running, queued) in
+                &[(1usize, 0usize, 2usize), (0, 4, 1), (3, 7, 0), (0, 1, 9)]
+            {
+                let (row, col) = compose_row(
+                    Some("( .a. ) kitsu is thinking"),
+                    Some(&draft),
+                    blocked,
+                    running,
+                    queued,
+                    cols,
+                );
+                let width = display_width(&sanitize_terminal_text(&row));
+                assert!(
+                    width <= cols,
+                    "row wider than {cols} cols ({width}) at ({blocked},{running},{queued}): {row:?}"
+                );
+                let col = col.expect("a draft row always reports a cursor column");
+                assert!(
+                    col >= 1 && col <= cols,
+                    "cursor column {col} outside {cols} cols at ({blocked},{running},{queued})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agents_tag_width_agrees_between_compose_row_and_draft_segment_width() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "abc".to_string(),
+            cursor: 3,
+            ..LiveDraft::default()
+        };
+        let prompt_width = display_width(&draft.prompt);
+        for cols in [40usize, 60, 80, 120] {
+            for &(blocked, running, queued) in &[
+                (0usize, 0usize, 0usize),
+                (1, 0, 0),
+                (0, 1, 0),
+                (0, 2, 0),
+                (2, 5, 3),
+                (0, 0, 2),
+            ] {
+                let tag_width = agents_tag(blocked, running)
+                    .as_deref()
+                    .map(display_width)
+                    .unwrap_or(0);
+                let queue_width = if queued > 0 {
+                    display_width(&format!("[{queued} queued] "))
+                } else {
+                    0
+                };
+                // No spinner, so the lead is 0 and the draft keeps every
+                // column the tags and prompt do not claim, less the one
+                // reserved so an end-of-buffer cursor cannot wrap.
+                let expected = cols.saturating_sub(tag_width + queue_width + prompt_width + 1);
+                assert_eq!(
+                    draft_segment_width(None, &draft, blocked, running, queued, cols),
+                    expected,
+                    "segment width at {cols} cols with ({blocked},{running},{queued})"
+                );
+                // And the row's own arithmetic: the cursor sits one past the
+                // tags, the prompt and the whole (fitting) buffer.
+                let (_, col) = compose_row(None, Some(&draft), blocked, running, queued, cols);
+                assert_eq!(
+                    col,
+                    Some(tag_width + queue_width + prompt_width + display_width(&draft.buffer) + 1),
+                    "cursor column at {cols} cols with ({blocked},{running},{queued})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agents_tag_survives_the_sanitize_round_trip() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "abc".to_string(),
+            cursor: 3,
+            ..LiveDraft::default()
+        };
+        let (row, _) = compose_row(None, Some(&draft), 2, 1, 1, 80);
+        assert!(row.contains("\u{1b}[2m"), "styled row should dim: {row:?}");
+        let plain = sanitize_terminal_text(&row);
+        assert!(plain.contains("[2 blocked] "), "plain tag text: {plain:?}");
+        assert!(
+            !plain.contains('\u{1b}'),
+            "no escape bytes may survive: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_terminal_drops_spinner_but_keeps_draft_and_agents_tag() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "hello".to_string(),
+            cursor: 5,
+            ..LiveDraft::default()
+        };
+        let (row, col) = compose_row(Some("( .a. ) kitsu is thinking"), Some(&draft), 1, 0, 0, 30);
+        let plain = sanitize_terminal_text(&row);
+        assert!(
+            !plain.contains("thinking"),
+            "spinner drops first: {plain:?}"
+        );
+        assert!(plain.starts_with("[1 blocked] kitsu> "), "{plain:?}");
+        assert!(plain.contains("hello"), "draft must survive: {plain:?}");
+        assert!(display_width(&plain) <= 30, "row must not wrap: {plain:?}");
+        // 12 tag + 7 prompt + 5 chars + 1 (1-based).
+        assert_eq!(col, Some(12 + 7 + 5 + 1));
     }
 }
