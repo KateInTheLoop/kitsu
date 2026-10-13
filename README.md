@@ -358,7 +358,20 @@ reads it from `models_path` (useful for scripting / discovery).
 
 ## Provider recipes
 
-All recipes below are already present in the bundled `kitsu.toml`.
+The recipes after this first one are already present in the bundled `kitsu.toml`.
+
+### Zero-config local models (`--gateway local`)
+
+With no `[gateways.local]` profile, `--gateway local` probes the default ports
+of Ollama (11434), LM Studio (1234), llama.cpp (8080) and vLLM (8000) and uses
+the first one that lists models, defaulting to its first model. No config needed:
+
+```bash
+kitsu --gateway local models        # what the local server has
+kitsu --gateway local ask "hi"      # pick another with --model <id>
+```
+
+A `[gateways.local]` profile, if you define one, always wins.
 
 ### Ollama (local)
 
