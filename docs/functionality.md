@@ -293,7 +293,22 @@ owned by this user, or group/world-writable is refused, and a symlink standing
 in for it is never followed. It is replaced atomically, refreshed at turn
 boundaries rather than continuously, and removed on clean exit. It is a hint,
 not a source of truth: it may be stale, absent, or left behind by a process
-that died, and writing it never affects a turn — every failure is silent. Styled mode prints background-agent notices
+that died, and writing it never affects a turn — every failure is silent.
+
+`[hooks] on_agent_state` runs a local command when a background agent changes
+state, with `KITSU_AGENT_ID`, `KITSU_AGENT_STATE` and `KITSU_AGENT_WAITING_FOR`
+added to the inherited environment. The command is split into arguments and
+executed **directly — never through a shell, and with no variable expansion**,
+so a stray metacharacter in the config cannot become execution and the
+behaviour does not depend on which shell is installed; point it at a script, or
+write `sh -c` yourself if you want interpolation. Its standard input, output
+and error are all discarded, because a hook that printed would splice into the
+live status row and break the byte-identical output tiers. kitsu never waits
+for it, bounds how long it may run, reaps it, and silently ignores a spawn
+failure, a nonzero exit, and a timeout: a notification must never cost a turn.
+A hook fires once per transition rather than once per observation, at the same
+turn boundaries the state file refreshes on, and it is independent of
+`[agents] state_file` — either may be used without the other. Styled mode prints background-agent notices
 between prompt cycles by default; `KITSU_LIVE_NOTICES=1` opts into a live
 redraw-safe external printer at the cost of idle input latency. Literal
 plain/assistive input defers notices until the current line is submitted.
