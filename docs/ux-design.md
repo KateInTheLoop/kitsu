@@ -64,8 +64,14 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   (below), never via bare `\r` writes.
 - **Live status row** (`kitsu-render::live`): during a foreground turn on a
   styled interactive TTY, one rewritable stderr row at the transcript bottom
-  holds the spinner segment and a live type-ahead draft — `kitsu> <text>`
-  with a real terminal cursor. stdin drops to raw mode (`ICANON|ECHO` off,
+  holds the spinner segment, two dimmed ambient tags, and a live type-ahead
+  draft — `kitsu> <text>` with a real terminal cursor. The tags sit leftmost
+  in the order background agents then queue: `[N blocked]` or `[N agent(s)]`
+  (blocked outranks running, hidden when both are zero, refreshed from the
+  registry watch once per input poll tick) followed by `[N queued]`. Both tag
+  widths participate in the row's fit math, so the cursor column accounts for
+  them and the spinner is still the first segment dropped on a narrow
+  terminal. stdin drops to raw mode (`ICANON|ECHO` off,
   `ISIG` kept so Ctrl+C still cancels) and bytes feed the pure
   `TypeaheadEditor` keymap: printable insert, ←/→/Home/End, Backspace/Delete,
   ↑/↓ history (seeded from the rustyline history, with a draft stash),
@@ -100,7 +106,15 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
 - **Agent deck**: `/jobs` and `/agent` share one `◈ agent deck — N total · N
   running · N done · N failed · N cancelled · N running slot(s) free · N
   record slot(s) free` receipt line, then per-row status, or `no background
-  agents` when empty. `/profiles` uses the same `◈` receipt header with rows
+  agents` when empty. `/jobs view` renders that same data grouped by state —
+  the header lead becomes `agent deck by state —`, and the rows sit under
+  unglyphed headings `  <state> (N)` at two-space indent (rows 4, continuation
+  8; the flat deck stays 2 and 6) in the fixed order `needs input`, `working`,
+  `done, result ready`, `done, collected`, `failed`, `cancelled`, with empty
+  groups omitted. Those headings bypass `deck_header`, so they are pure ASCII
+  in every tier; both views build their counts from one shared expression and
+  their rows from one shared helper, so they cannot drift.
+  `/profiles` uses the same `◈` receipt header with rows
   prefixed `◆` (tool-capable / inherits session grants) or `◇` (reasoning-only
   / no tools), reusing the tool-call/tool-result glyphs to signal capability
   level rather than tool activity.

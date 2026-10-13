@@ -5223,7 +5223,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "agents",
-        args: "[id]",
+        args: "[view|<id>|any /jobs subcommand]",
         description: "backward-compatible alias for /jobs",
         details: "",
         group: CommandGroup::AgentsJobs,
@@ -5375,7 +5375,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "jobs",
-        args: "[list|show <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>]",
+        args: "[list|view|show <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>]",
         description: "inspect, steer, stop, prune, and close background agent threads",
         details: "The agent deck: every background agent thread with state glyphs (filled = running, hollow = spent, half = result awaiting pickup), token/tool telemetry, and ids for /agent.",
         group: CommandGroup::AgentsJobs,
@@ -10970,19 +10970,11 @@ fn agent_activity_child_row(activity: Option<&str>, ms_ago: Option<u64>, plain: 
     }
 }
 
-/// Human `/jobs list`. Rendered from the same progress snapshot the JSONL
-/// `command_result` payload is built from, using the DTO's own status spellings
-/// — no `{:?}` reaches the terminal.
-fn format_jobs(registry: &subagent::AgentRegistry) -> String {
-    let snapshot = registry.progress_snapshot();
-    let ready = registry
-        .thread_snapshots()
-        .into_iter()
-        .filter(|thread| thread.handoff == subagent::thread::AgentHandoffState::Ready)
-        .map(|thread| thread.id)
-        .collect::<std::collections::HashSet<_>>();
-    let mut output = kitsu_render::deck_header(&format!(
-        "agent deck — {} total · {} running · {} done · {} failed · {} cancelled · {} running slot(s) free · {} record slot(s) free",
+/// The deck's shared count line: one expression so the flat deck and the
+/// grouped view can never disagree on the numbers they report.
+fn jobs_deck_counts(snapshot: &subagent::AgentProgressSnapshot) -> String {
+    format!(
+        "{} total \u{b7} {} running \u{b7} {} done \u{b7} {} failed \u{b7} {} cancelled \u{b7} {} running slot(s) free \u{b7} {} record slot(s) free",
         snapshot.total,
         snapshot.running,
         snapshot.done,
@@ -10990,94 +10982,200 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
         snapshot.cancelled,
         snapshot.available_running_slots,
         snapshot.available_record_slots,
+    )
+}
+
+/// One agent's deck row and its continuation lines, shared by `/jobs list`
+/// (indents 2/6) and `/jobs view` (indents 4/8) so the two renderings can
+/// never drift in content.
+fn agent_deck_row_block(
+    agent: &subagent::AgentProgress,
+    result_collected: bool,
+    row_indent: usize,
+    continuation_indent: usize,
+) -> String {
+    let row = " ".repeat(row_indent);
+    let cont = " ".repeat(continuation_indent);
+    let model = if agent.telemetry.model.is_empty() {
+        "unknown".to_string()
+    } else {
+        terminal_inline(&agent.telemetry.model)
+    };
+    let activity = agent
+        .telemetry
+        .last_activity
+        .as_deref()
+        .map(terminal_inline)
+        .unwrap_or_else(|| "none".to_string());
+    let failure = agent
+        .telemetry
+        .failure_class
+        .map(|class| format!(" | failure {class}"))
+        .unwrap_or_default();
+    let route = match (
+        agent.telemetry.route_generation,
+        agent.telemetry.route_generation_mismatch,
+    ) {
+        (Some(generation), false) => format!(" | route gen {generation}"),
+        (Some(generation), true) => format!(" | route gen {generation} (mismatch observed)"),
+        (None, true) => " | route generation mismatch observed".to_string(),
+        (None, false) => String::new(),
+    };
+    let bytes = agent
+        .result_bytes
+        .map(|bytes| format!(" | result {bytes} B"))
+        .unwrap_or_default();
+    let state = agent_deck_state(agent.status, result_collected);
+    let profile = agent
+        .profile
+        .as_deref()
+        .map(terminal_inline)
+        .unwrap_or_else(|| "default profile".to_string());
+    let mut output = format!(
+        "\n{row}{} #{} {} | {} | {}\n{cont}{:.1}s | model {}{} | tokens {}/{}/{} | tools {} | writes {} | last {}{}{}",
+        kitsu_render::deck_marker(state),
+        agent.id,
+        agent_progress_status_label(agent.status),
+        profile,
+        terminal_inline(&agent.task),
+        agent.elapsed_ms as f64 / 1000.0,
+        model,
+        route,
+        agent.telemetry.prompt_tokens,
+        agent.telemetry.completion_tokens,
+        agent.telemetry.total_tokens,
+        agent.telemetry.tool_count,
+        agent.telemetry.write_count,
+        activity,
+        failure,
+        bytes,
+    );
+    if agent.telemetry.recent_activity.len() > 1 {
+        let recent = agent
+            .telemetry
+            .recent_activity
+            .iter()
+            .map(|activity| terminal_inline(activity))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        output.push_str(&format!("\n{cont}recent {recent}"));
+    }
+    if state == kitsu_render::DeckState::ResultReady {
+        output.push_str(&format!(
+            "\n{cont}result ready and not yet collected - /jobs show {}",
+            agent.id
+        ));
+    }
+    if matches!(agent.status, subagent::AgentProgressStatus::Running) {
+        output.push_str(&format!(
+            "\n{cont}{}",
+            agent_activity_child_row(
+                agent.telemetry.last_activity.as_deref(),
+                agent.last_activity_ms_ago,
+                kitsu_render::plain_mode(),
+            )
+        ));
+        output.push_str(&format!(
+            "\n{cont}partial response text withheld until the job is terminal"
+        ));
+    }
+    output
+}
+
+/// Agents whose Done result is still awaiting pickup, so a row can tell
+/// "result ready" from "collected".
+fn jobs_ready_handoff_ids(registry: &subagent::AgentRegistry) -> std::collections::HashSet<u64> {
+    registry
+        .thread_snapshots()
+        .into_iter()
+        .filter(|thread| thread.handoff == subagent::thread::AgentHandoffState::Ready)
+        .map(|thread| thread.id)
+        .collect()
+}
+
+const JOBS_EMPTY_DECK_LINE: &str =
+    "\n  no background agents \u{2014} ask the model to delegate work, or see /profiles";
+
+/// Human `/jobs list`. Rendered from the same progress snapshot the JSONL
+/// `command_result` payload is built from, using the DTO's own status spellings
+/// — no `{:?}` reaches the terminal.
+fn format_jobs(registry: &subagent::AgentRegistry) -> String {
+    let snapshot = registry.progress_snapshot();
+    let ready = jobs_ready_handoff_ids(registry);
+    let mut output = kitsu_render::deck_header(&format!(
+        "agent deck \u{2014} {}",
+        jobs_deck_counts(&snapshot)
     ));
     if snapshot.agents.is_empty() {
-        output.push_str(
-            "\n  no background agents — ask the model to delegate work, or see /profiles",
-        );
+        output.push_str(JOBS_EMPTY_DECK_LINE);
         return output;
     }
-    for agent in snapshot.agents {
-        let model = if agent.telemetry.model.is_empty() {
-            "unknown".to_string()
-        } else {
-            terminal_inline(&agent.telemetry.model)
-        };
-        let activity = agent
-            .telemetry
-            .last_activity
-            .as_deref()
-            .map(terminal_inline)
-            .unwrap_or_else(|| "none".to_string());
-        let failure = agent
-            .telemetry
-            .failure_class
-            .map(|class| format!(" | failure {class}"))
-            .unwrap_or_default();
-        let route = match (
-            agent.telemetry.route_generation,
-            agent.telemetry.route_generation_mismatch,
-        ) {
-            (Some(generation), false) => format!(" | route gen {generation}"),
-            (Some(generation), true) => format!(" | route gen {generation} (mismatch observed)"),
-            (None, true) => " | route generation mismatch observed".to_string(),
-            (None, false) => String::new(),
-        };
-        let bytes = agent
-            .result_bytes
-            .map(|bytes| format!(" | result {bytes} B"))
-            .unwrap_or_default();
-        let state = agent_deck_state(agent.status, !ready.contains(&agent.id));
-        let profile = agent
-            .profile
-            .as_deref()
-            .map(terminal_inline)
-            .unwrap_or_else(|| "default profile".to_string());
-        output.push_str(&format!(
-            "\n  {} #{} {} | {} | {}\n      {:.1}s | model {}{} | tokens {}/{}/{} | tools {} | writes {} | last {}{}{}",
-            kitsu_render::deck_marker(state),
-            agent.id,
-            agent_progress_status_label(agent.status),
-            profile,
-            terminal_inline(&agent.task),
-            agent.elapsed_ms as f64 / 1000.0,
-            model,
-            route,
-            agent.telemetry.prompt_tokens,
-            agent.telemetry.completion_tokens,
-            agent.telemetry.total_tokens,
-            agent.telemetry.tool_count,
-            agent.telemetry.write_count,
-            activity,
-            failure,
-            bytes,
+    for agent in &snapshot.agents {
+        output.push_str(&agent_deck_row_block(
+            agent,
+            !ready.contains(&agent.id),
+            2,
+            6,
         ));
-        if agent.telemetry.recent_activity.len() > 1 {
-            let recent = agent
-                .telemetry
-                .recent_activity
-                .iter()
-                .map(|activity| terminal_inline(activity))
-                .collect::<Vec<_>>()
-                .join(" -> ");
-            output.push_str(&format!("\n      recent {recent}"));
+    }
+    output
+}
+
+/// Which `/jobs view` group one agent belongs to. `needs input` is
+/// unreachable today — no agent state parks on a user answer yet — so the
+/// group is never produced, and a later story only has to add its arm.
+fn jobs_view_group(agent: &subagent::AgentProgress, result_collected: bool) -> &'static str {
+    match agent.status {
+        subagent::AgentProgressStatus::Running => "working",
+        subagent::AgentProgressStatus::Done if !result_collected => "done, result ready",
+        subagent::AgentProgressStatus::Done => "done, collected",
+        subagent::AgentProgressStatus::Failed => "failed",
+        subagent::AgentProgressStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Human `/jobs view`: the same rows the flat deck prints, grouped by state in
+/// a fixed order with empty groups omitted. Headings bypass `deck_header`, so
+/// they are pure ASCII in every output tier.
+fn format_jobs_view(registry: &subagent::AgentRegistry) -> String {
+    let snapshot = registry.progress_snapshot();
+    let ready = jobs_ready_handoff_ids(registry);
+    let mut output = kitsu_render::deck_header(&format!(
+        "agent deck by state \u{2014} {}",
+        jobs_deck_counts(&snapshot)
+    ));
+    if snapshot.agents.is_empty() {
+        output.push_str(JOBS_EMPTY_DECK_LINE);
+        return output;
+    }
+    // `needs input` is unreachable today: no agent state parks on a user
+    // answer yet. The group stays so a later story only supplies the state.
+    const GROUPS: [&str; 6] = [
+        "needs input",
+        "working",
+        "done, result ready",
+        "done, collected",
+        "failed",
+        "cancelled",
+    ];
+    for heading in GROUPS {
+        let members = snapshot
+            .agents
+            .iter()
+            .filter(|agent| jobs_view_group(agent, !ready.contains(&agent.id)) == heading)
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            continue;
         }
-        if state == kitsu_render::DeckState::ResultReady {
-            output.push_str(&format!(
-                "\n      result ready and not yet collected - /jobs show {}",
-                agent.id
+        debug_assert!(heading.is_ascii(), "deck group headings stay ASCII");
+        output.push_str(&format!("\n  {heading} ({})", members.len()));
+        for agent in members {
+            output.push_str(&agent_deck_row_block(
+                agent,
+                !ready.contains(&agent.id),
+                4,
+                8,
             ));
-        }
-        if matches!(agent.status, subagent::AgentProgressStatus::Running) {
-            output.push_str(&format!(
-                "\n      {}",
-                agent_activity_child_row(
-                    agent.telemetry.last_activity.as_deref(),
-                    agent.last_activity_ms_ago,
-                    kitsu_render::plain_mode(),
-                )
-            ));
-            output.push_str("\n      partial response text withheld until the job is terminal");
         }
     }
     output
@@ -11225,6 +11323,15 @@ async fn handle_jobs_command(
             Ok(serde_json::json!({
                 "kind": "jobs",
                 "action": "list",
+                "changed": false,
+                "snapshot": jobs_snapshot_payload(registry),
+            }))
+        }
+        "view" if parts.next().is_none() => {
+            eprintln!("{}", format_jobs_view(registry));
+            Ok(serde_json::json!({
+                "kind": "jobs",
+                "action": "view",
                 "changed": false,
                 "snapshot": jobs_snapshot_payload(registry),
             }))
@@ -11422,7 +11529,7 @@ async fn handle_jobs_command(
             if let Some(suggestion) = closest_jobs_subcommand(action) {
                 eprintln!("unknown action '{action}' - did you mean '{suggestion}'?");
             }
-            eprintln!("usage: /jobs [list|show <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>]");
+            eprintln!("usage: /jobs [list|view|show <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>]");
             Err(())
         }
     }
@@ -13628,6 +13735,7 @@ fn handle_active_jobs_command(
     let mut parts = argument.split_whitespace();
     match parts.next().unwrap_or("list") {
         "list" if parts.next().is_none() => Ok(format_jobs(registry)),
+        "view" if parts.next().is_none() => Ok(format_jobs_view(registry)),
         "show" => {
             let id = parts
                 .next()
@@ -13691,7 +13799,7 @@ fn handle_active_jobs_command(
             ))
         }
         _ => Err(
-            "active-turn controls: /jobs [list|show <id>|steer <id> <text>|stop <id>|stop-all]"
+            "active-turn controls: /jobs [list|view|show <id>|steer <id> <text>|stop <id>|stop-all]"
                 .to_string(),
         ),
     }
@@ -17821,6 +17929,7 @@ fn closest_slash_command(name: &str) -> Option<&'static str> {
 fn closest_jobs_subcommand(name: &str) -> Option<&'static str> {
     const SUBCOMMANDS: &[&str] = &[
         "list",
+        "view",
         "show",
         "steer",
         "close-steering",
@@ -18810,13 +18919,14 @@ async fn handle_slash(
             return SlashResult::Continue(Some(agent_profiles_payload(&session.agent_profiles)));
         }
         "agents" => {
+            // Any other argument is forwarded verbatim: /jobs owns the
+            // did-you-mean suggester and the usage line.
             let command = if arg.is_empty() {
                 "list".to_string()
             } else if arg.parse::<u64>().is_ok() {
                 format!("show {arg}")
             } else {
-                eprintln!("usage: /agents [id] (or use /jobs for controls)");
-                return SlashResult::Error;
+                arg.to_string()
             };
             return match handle_jobs_command(registry, journal, &command).await {
                 Ok(mut payload) => {
@@ -20821,6 +20931,362 @@ mod tests {
             agent_activity_child_row(None, Some(10), false),
             "↳ no activity yet"
         );
+    }
+
+    /// Byte offset of one `/jobs view` group heading, matched as a whole line
+    /// at the documented two-space indent with its count parenthesis, so a
+    /// heading nested inside a row or missing its count never satisfies it.
+    fn jobs_view_heading_offset(rendered: &str, heading: &str) -> Option<usize> {
+        rendered.find(&format!("\n  {heading} ("))
+    }
+
+    fn jobs_view_heading_count(rendered: &str, heading: &str) -> Option<usize> {
+        let start = jobs_view_heading_offset(rendered, heading)? + 3 + heading.len() + 2;
+        let rest = &rendered[start..];
+        let end = rest.find(')')?;
+        rest[..end].parse::<usize>().ok()
+    }
+
+    /// The detail continuation line for one agent row, trimmed of its indent so
+    /// the flat deck and the grouped view can be compared on content alone.
+    fn jobs_detail_line(rendered: &str) -> &str {
+        rendered
+            .lines()
+            .find(|line| line.contains("| tokens "))
+            .unwrap_or_else(|| panic!("no agent detail line in: {rendered}"))
+            .trim()
+    }
+
+    #[test]
+    fn the_jobs_view_groups_agents_by_state_in_the_documented_order() {
+        let registry = subagent::AgentRegistry::default();
+        let _running = registry.start("still working".to_string()).unwrap();
+        let ready = registry.start("finished cleanly".to_string()).unwrap();
+        let collected = registry.start("already picked up".to_string()).unwrap();
+        let failed = registry.start("broke".to_string()).unwrap();
+        registry.finish(ready, Ok("result awaiting pickup".to_string()));
+        registry.finish(collected, Ok("result already read".to_string()));
+        registry.finish(failed, Err("provider request failed".to_string()));
+        // Observing the result is what moves a row from "result ready" to
+        // "collected"; peeking must not.
+        assert!(registry.result(collected).is_some());
+
+        let view = format_jobs_view(&registry);
+        assert_no_debug_leak(&view);
+        assert!(!view.contains('\u{1b}'), "{view}");
+
+        let working =
+            jobs_view_heading_offset(&view, "working").unwrap_or_else(|| panic!("{view}"));
+        let result_ready = jobs_view_heading_offset(&view, "done, result ready")
+            .unwrap_or_else(|| panic!("{view}"));
+        let done_collected =
+            jobs_view_heading_offset(&view, "done, collected").unwrap_or_else(|| panic!("{view}"));
+        let failed_heading =
+            jobs_view_heading_offset(&view, "failed").unwrap_or_else(|| panic!("{view}"));
+        assert!(
+            working < result_ready && result_ready < done_collected,
+            "{view}"
+        );
+        assert!(done_collected < failed_heading, "{view}");
+
+        assert_eq!(jobs_view_heading_count(&view, "working"), Some(1), "{view}");
+        assert_eq!(
+            jobs_view_heading_count(&view, "done, result ready"),
+            Some(1),
+            "{view}"
+        );
+        assert_eq!(
+            jobs_view_heading_count(&view, "done, collected"),
+            Some(1),
+            "{view}"
+        );
+        assert_eq!(jobs_view_heading_count(&view, "failed"), Some(1), "{view}");
+    }
+
+    #[test]
+    fn jobs_view_omits_empty_groups_and_never_shows_needs_input_today() {
+        let registry = subagent::AgentRegistry::default();
+        let running = registry.start("still working".to_string()).unwrap();
+        let _ = running;
+
+        let view = format_jobs_view(&registry);
+        assert!(
+            jobs_view_heading_offset(&view, "working").is_some(),
+            "{view}"
+        );
+        // Nothing is cancelled, done or failed, so those headings are absent
+        // entirely rather than printed with a zero count.
+        assert!(!view.contains("cancelled ("), "{view}");
+        assert!(!view.contains("failed ("), "{view}");
+        assert!(!view.contains("done, "), "{view}");
+        // No state can reach "needs input" yet, so the group is unreachable.
+        assert!(!view.contains("needs input"), "{view}");
+    }
+
+    #[test]
+    fn jobs_view_moves_a_done_agent_from_result_ready_to_collected_on_handoff() {
+        let registry = subagent::AgentRegistry::default();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+
+        let before = format_jobs_view(&registry);
+        assert!(
+            jobs_view_heading_offset(&before, "done, result ready").is_some(),
+            "{before}"
+        );
+        assert!(!before.contains("done, collected"), "{before}");
+
+        // Peeking is not a handoff.
+        assert!(registry.peek_result(done).is_some());
+        let peeked = format_jobs_view(&registry);
+        assert!(
+            jobs_view_heading_offset(&peeked, "done, result ready").is_some(),
+            "{peeked}"
+        );
+
+        assert!(matches!(
+            registry.acknowledge_result(done),
+            subagent::AgentHandoffAckOutcome::Acknowledged
+        ));
+        let after = format_jobs_view(&registry);
+        assert!(
+            jobs_view_heading_offset(&after, "done, collected").is_some(),
+            "{after}"
+        );
+        assert!(!after.contains("done, result ready"), "{after}");
+    }
+
+    #[test]
+    fn jobs_view_group_order_is_independent_of_agent_creation_order() {
+        let registry = subagent::AgentRegistry::default();
+        // Ids ascend while states descend: the lowest id is the group printed
+        // last, so any id-ordered implementation prints the groups backwards.
+        let failed = registry.start("broke".to_string()).unwrap();
+        let collected = registry.start("already picked up".to_string()).unwrap();
+        let ready = registry.start("finished cleanly".to_string()).unwrap();
+        let _running = registry.start("still working".to_string()).unwrap();
+        registry.finish(failed, Err("provider request failed".to_string()));
+        registry.finish(collected, Ok("result already read".to_string()));
+        registry.finish(ready, Ok("result awaiting pickup".to_string()));
+        assert!(registry.result(collected).is_some());
+
+        let view = format_jobs_view(&registry);
+        let offsets = [
+            jobs_view_heading_offset(&view, "working"),
+            jobs_view_heading_offset(&view, "done, result ready"),
+            jobs_view_heading_offset(&view, "done, collected"),
+            jobs_view_heading_offset(&view, "failed"),
+        ]
+        .map(|offset| offset.unwrap_or_else(|| panic!("{view}")));
+        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]), "{view}");
+    }
+
+    #[test]
+    fn an_empty_jobs_view_says_the_same_thing_the_flat_deck_says() {
+        let registry = subagent::AgentRegistry::default();
+        let view = format_jobs_view(&registry);
+        assert_no_debug_leak(&view);
+        assert!(!view.contains('\u{1b}'), "{view}");
+        assert!(
+            view.contains(
+                "no background agents — ask the model to delegate work, or see /profiles"
+            ),
+            "{view}"
+        );
+        assert!(view.contains("agent deck by state"), "{view}");
+        if kitsu_render::plain_mode() {
+            assert!(view.starts_with("# agent deck by state"), "{view}");
+        } else {
+            assert!(view.starts_with("◈ agent deck by state"), "{view}");
+        }
+        // No group heading can appear when there is nothing to group.
+        for heading in [
+            "needs input",
+            "working",
+            "done, result ready",
+            "done, collected",
+            "failed",
+            "cancelled",
+        ] {
+            assert!(jobs_view_heading_offset(&view, heading).is_none(), "{view}");
+        }
+    }
+
+    #[test]
+    fn the_jobs_view_header_reports_the_same_counts_as_the_flat_deck() {
+        let registry = subagent::AgentRegistry::default();
+        let _running = registry.start("still working".to_string()).unwrap();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        let failed = registry.start("broke".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+        registry.finish(failed, Err("provider request failed".to_string()));
+
+        let flat = format_jobs(&registry);
+        let view = format_jobs_view(&registry);
+        let counts = "3 total · 1 running · 1 done · 1 failed · 0 cancelled";
+        assert!(flat.contains(counts), "{flat}");
+        assert!(view.contains(counts), "{view}");
+        // The header summary is the flat deck's summary with the grouped lead.
+        let flat_header = flat.lines().next().unwrap();
+        let view_header = view.lines().next().unwrap();
+        assert_eq!(
+            view_header.replace("agent deck by state — ", "agent deck — "),
+            flat_header,
+            "{view_header} vs {flat_header}"
+        );
+    }
+
+    #[test]
+    fn jobs_view_rows_carry_the_same_content_as_the_flat_deck_rows() {
+        let registry = subagent::AgentRegistry::default();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+
+        let flat = format_jobs(&registry);
+        let view = format_jobs_view(&registry);
+        // The detail continuation line (model, tokens, tools, writes, last
+        // activity) must be identical once indentation is stripped: the two
+        // views render the same row through one shared helper.
+        assert_eq!(jobs_detail_line(&flat), jobs_detail_line(&view));
+
+        // The row line itself is identical too, marker and label included.
+        let row_of = |rendered: &str| -> String {
+            rendered
+                .lines()
+                .find(|line| line.contains(&format!("#{done} ")))
+                .unwrap_or_else(|| panic!("no agent row in: {rendered}"))
+                .trim()
+                .to_string()
+        };
+        assert_eq!(row_of(&flat), row_of(&view));
+
+        // Grouped rows sit one level deeper than their heading.
+        let row_line = view
+            .lines()
+            .find(|line| line.contains(&format!("#{done} ")))
+            .unwrap_or_else(|| panic!("{view}"));
+        assert!(row_line.starts_with("    "), "{row_line:?}");
+        assert!(!row_line.starts_with("     "), "{row_line:?}");
+
+        // Continuation lines keep the deck's +4 relationship to their row:
+        // the flat deck is 2/6, the grouped view is 4/8.
+        let detail_indent = |rendered: &str| -> usize {
+            let line = rendered
+                .lines()
+                .find(|line| line.contains("| tokens "))
+                .unwrap_or_else(|| panic!("{rendered}"));
+            line.len() - line.trim_start().len()
+        };
+        assert_eq!(detail_indent(&flat), 6, "{flat}");
+        assert_eq!(detail_indent(&view), 8, "{view}");
+    }
+
+    #[test]
+    fn jobs_view_running_rows_keep_the_activity_child_line() {
+        let registry = subagent::AgentRegistry::default();
+        let _running = registry.start("still working".to_string()).unwrap();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+
+        let view = format_jobs_view(&registry);
+        let activity = if kitsu_render::plain_mode() {
+            "-> started | 0s ago"
+        } else {
+            "↳ started · 0s ago"
+        };
+        // Exactly the running row carries exactly one child, as in the deck.
+        assert_eq!(view.matches(activity).count(), 1, "{view}");
+        assert_eq!(
+            format_jobs(&registry).matches(activity).count(),
+            view.matches(activity).count(),
+            "{view}"
+        );
+    }
+
+    #[test]
+    fn jobs_view_group_headings_are_unglyphed_two_space_indented_text() {
+        let registry = subagent::AgentRegistry::default();
+        let _running = registry.start("still working".to_string()).unwrap();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+
+        let view = format_jobs_view(&registry);
+        for heading in ["working", "done, result ready"] {
+            let line = view
+                .lines()
+                .find(|line| line.trim_start().starts_with(heading))
+                .unwrap_or_else(|| panic!("{view}"));
+            assert_eq!(line, format!("  {heading} (1)"), "{view}");
+            // No deck glyph or ASCII marker leaks into a heading.
+            for glyph in ["◆", "◈", "◇", "[run]", "[rdy]", "[err]", "#"] {
+                assert!(!line.contains(glyph), "{line:?}");
+            }
+            // Headings bypass deck_header/sanitize_plain_inline, so they must
+            // already be pure ASCII: --plain and NO_COLOR emit zero non-ASCII
+            // bytes, and mode-dependent heading text would break this test.
+            assert!(line.is_ascii(), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn the_flat_jobs_deck_keeps_its_shape_after_the_row_helper_is_shared() {
+        let registry = subagent::AgentRegistry::default();
+        let _running = registry.start("still working".to_string()).unwrap();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        let failed = registry.start("broke".to_string()).unwrap();
+        registry.finish(done, Ok("collected later".to_string()));
+        registry.finish(failed, Err("provider request failed".to_string()));
+
+        let flat = format_jobs(&registry);
+        assert_no_debug_leak(&flat);
+        assert!(!flat.contains('\u{1b}'), "{flat}");
+        if kitsu_render::plain_mode() {
+            assert!(flat.starts_with("# agent deck —"), "{flat}");
+            assert!(flat.contains("[run] #"), "{flat}");
+            assert!(flat.contains("[rdy] #"), "{flat}");
+            assert!(flat.contains("[err] #"), "{flat}");
+        } else {
+            assert!(flat.starts_with("◈ agent deck —"), "{flat}");
+            assert!(flat.contains("◆ #"), "{flat}");
+            assert!(flat.contains("◈ #"), "{flat}");
+            assert!(flat.contains("◇ #"), "{flat}");
+        }
+        assert!(flat.contains(&format!("/jobs show {done}")), "{flat}");
+        // The flat deck stays flat: no group heading ever appears in it.
+        assert!(!flat.contains("agent deck by state"), "{flat}");
+        for heading in ["needs input", "working", "done, result ready"] {
+            assert!(jobs_view_heading_offset(&flat, heading).is_none(), "{flat}");
+        }
+        // Rows stay at the flat deck's two-space indent.
+        let row = flat
+            .lines()
+            .find(|line| line.contains(&format!("#{done} ")))
+            .unwrap_or_else(|| panic!("{flat}"));
+        assert!(row.starts_with("  ") && !row.starts_with("   "), "{row:?}");
+    }
+
+    #[test]
+    fn a_near_miss_for_view_is_suggested_as_a_jobs_subcommand() {
+        assert_eq!(closest_jobs_subcommand("viw"), Some("view"));
+        assert_eq!(closest_jobs_subcommand("vieww"), Some("view"));
+        assert_eq!(closest_jobs_subcommand("view"), Some("view"));
+    }
+
+    #[test]
+    fn the_command_registry_advertises_jobs_view_on_jobs_and_its_agents_alias() {
+        let jobs = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "jobs")
+            .expect("/jobs is registered");
+        assert!(jobs.args.contains("view"), "{}", jobs.args);
+
+        let agents = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "agents")
+            .expect("/agents is registered");
+        assert_eq!(agents.alias_of, Some("jobs"));
+        assert!(agents.args.contains("view"), "{}", agents.args);
+        assert!(agents.args.contains("id"), "{}", agents.args);
     }
 
     #[test]
