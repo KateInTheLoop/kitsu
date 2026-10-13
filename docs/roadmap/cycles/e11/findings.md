@@ -365,3 +365,44 @@ both were deliberately left out of T0-S4 rather than bundled into a card that
 is already the first to draw. Resize reflow is already scoped as T3-S8; row
 truncation needs a `cols` input the current API does not take, and belongs with
 it.
+
+**F15 RESOLVED in T0-S5a** (recorded here since F15 sits above): the viewport
+replaces the live row. `kitsu-render` gained `set_live_rows_enabled`, which
+`live_rows_supported` consults, and the bridge disables the live row for as
+long as the viewport is installed and restores the previous setting when its
+guard drops. Default enabled, so a session without the viewport is
+byte-identical. The reasoning that decided it: the viewport's bottom rows are
+exactly where the spinner, draft, queue tag and ambient agent tag belong, so
+running both would have been duplication as well as a fight over the same
+cells.
+
+## F17 — in inline mode, any writer that bypasses the seam corrupts the viewport
+
+Found: T0-S5a, by the test author, as the limit of what its own tests can
+prove. The bridge's tests inject sinks and assert the seam **routes** to them.
+They cannot assert **exclusivity**, because the real process still owns the
+actual descriptors.
+
+So anything that writes a descriptor without going through the seam still
+reaches the terminal directly: a stray `eprintln!`, a panic message, rustyline's
+own prompt rendering, `tracing` output on stderr. In classic mode that is
+merely untidy. **In inline mode it is corruption**, because the scroll region
+makes a direct write land either inside the region — where it scrolls away with
+the transcript — or on top of the pinned viewport rows.
+
+This is the sharpest form of the proof of concept's question Q3, which already
+counts 392 direct `eprintln!`/`println!` sites in `main.rs` (mostly slash-command
+output). T0-S3a moved the suspension decision into the backend, but it did not
+make the seam the only path to the terminal, and nothing short of a styled PTY
+harness can tell the difference.
+
+**Consequences:**
+- T0-S5b owns the harness and is the first card that can observe this at all.
+  Its `/help`, `/jobs` and `/status` tests exist precisely to catch it.
+- The stray-writer census that T0-S6 was to perform is now *more* important
+  than when it was written, and its result decides whether the slash dispatcher
+  needs wrapping (cheap, one site) or whether individual writers must be routed
+  (expensive, hundreds).
+- Until then, inline mode is correctly gated behind `KITSU_TUI=inline` and
+  documented as a preview. It must not become a default, nor be recommended,
+  before the census.
