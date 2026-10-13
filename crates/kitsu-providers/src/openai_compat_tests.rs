@@ -2792,6 +2792,12 @@ fn test_build_body_replays_empty_tool_arguments_as_empty_object() {
         "",
         vec![call(""), call("  "), call(r#"{"path":"a"}"#)],
     )];
+    // Mid-turn rounds offer tools, so the history stays structured.
+    req.tools = Some(vec![crate::types::ToolDescriptor {
+        name: "workspace_diff".to_string(),
+        description: "diff".to_string(),
+        parameters: serde_json::json!({"type": "object"}),
+    }]);
 
     let body = super::build_body(&req).expect("empty tool arguments should build");
     let wire = serde_json::to_value(&body).unwrap();
@@ -2802,4 +2808,51 @@ fn test_build_body_replays_empty_tool_arguments_as_empty_object() {
         .map(|tc| tc["function"]["arguments"].as_str().unwrap())
         .collect();
     assert_eq!(args, ["{}", "{}", r#"{"path":"a"}"#]);
+}
+
+/// The final "answer now" round sends no tools but still carries earlier tool
+/// calls; Bedrock-routed Anthropic rejects that (HTTP 400 "toolConfig field
+/// must be defined when using toolUse and toolResult content blocks"), and
+/// stub tool definitions would let Ollama keep calling them. Without tools the
+/// wire replays that history as plain text; with tools it stays structured.
+#[test]
+fn test_build_body_flattens_tool_history_when_no_tools_are_offered() {
+    let call = crate::types::ToolCall {
+        tool_name: "workspace_diff".to_string(),
+        args: "{}".to_string(),
+        call_id: "call_1".to_string(),
+    };
+    let mut req = simple_request();
+    req.messages = vec![
+        ChatMessage::user("review"),
+        ChatMessage::assistant("Checking.", vec![call]),
+        ChatMessage::tool("call_1", "no changes"),
+        ChatMessage::user("final step: answer now"),
+    ];
+
+    let wire = serde_json::to_value(super::build_body(&req).unwrap()).unwrap();
+    assert!(wire.get("tools").is_none());
+    let messages = wire["messages"].as_array().unwrap();
+    assert!(messages
+        .iter()
+        .all(|m| m.get("tool_calls").is_none() && m.get("tool_call_id").is_none()));
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["user", "assistant", "user", "user"]);
+    assert_eq!(
+        messages[1]["content"],
+        "Checking.\n[called tool workspace_diff with {}]"
+    );
+    assert_eq!(messages[2]["content"], "[tool result]\nno changes");
+
+    req.tools = Some(vec![crate::types::ToolDescriptor {
+        name: "workspace_diff".to_string(),
+        description: "diff".to_string(),
+        parameters: serde_json::json!({"type": "object"}),
+    }]);
+    let wire = serde_json::to_value(super::build_body(&req).unwrap()).unwrap();
+    assert_eq!(wire["messages"][1]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(wire["messages"][2]["role"], "tool");
 }
