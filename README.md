@@ -802,6 +802,14 @@ it won't ask again.
   for it, is replaced atomically, refreshes at turn boundaries, and is removed
   on clean exit. Treat it as a hint, never a source of truth: it may be stale,
   absent, or left by a process that died, and writing it never affects a turn.
+- `[hooks] on_agent_state` runs a local command on each agent state change,
+  exporting `KITSU_AGENT_ID`, `KITSU_AGENT_STATE` and
+  `KITSU_AGENT_WAITING_FOR`. It is executed **directly, never through a shell,
+  with no expansion**, so config text cannot turn into shell execution; use a
+  script, or write `sh -c` yourself. Its output is discarded so it cannot
+  disturb kitsu's own rendering, kitsu never waits for it, and a failure,
+  nonzero exit or timeout is ignored — a notification never costs a turn. It
+  fires once per transition and works with or without `state_file`.
 - Access is **deny-by-default** at the boundary; paths are canonicalized (writes
   canonicalize the parent), so `..`/symlink traversal is rejected. Generated
   files are capped at 1 MiB. `repo_grep` is always available with read tools on

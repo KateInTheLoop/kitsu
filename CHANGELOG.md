@@ -40,6 +40,12 @@ shapes may change in any minor release.
   validate is counted instead of blanking the whole listing — a newer sibling
   process can never blind the reader. It creates, modifies, and deletes
   nothing.
+- `[hooks] on_agent_state` runs a local command when a background agent
+  changes state, exporting the agent id, its new state, and what it is waiting
+  on. It is executed directly rather than through a shell and performs no
+  variable expansion, so configuration text cannot become shell execution; its
+  output is discarded so it cannot disturb kitsu's own rendering; and kitsu
+  never waits for it, so a slow or failing hook cannot cost a turn.
 - The live status row carries a dimmed ambient tag during a turn — `[N blocked]`
   or `[N agent(s)]`, blocked outranking running — so background work stays
   visible after its one-off completion notice has scrolled away.

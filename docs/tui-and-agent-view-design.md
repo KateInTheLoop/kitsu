@@ -323,10 +323,27 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   `$XDG_RUNTIME_DIR/kitsu/<pid>.json` on every registry generation change,
   containing the process state plus the redacted thread DTO array (bounded by
   the existing timeline limits), removed on clean exit.
-- **H3** A `[hooks] on_agent_state = "<cmd>"` MUST run with
-  `KITSU_AGENT_ID/STATE/WAITING_FOR` env on transitions, mirroring herdr's
-  plugin events and Claude Code's `Notification` hook. Local command only
-  (N7).
+- **H3** A `[hooks] on_agent_state = "<cmd>"` MUST run on agent state
+  transitions, mirroring herdr's plugin events and Claude Code's
+  `Notification` hook. Local command only (N7). Three decisions settled while
+  implementing, recorded here because the original wording left them open:
+  - **Exact variable names** are `KITSU_AGENT_ID`, `KITSU_AGENT_STATE` and
+    `KITSU_AGENT_WAITING_FOR`, added to the inherited environment. The
+    original `KITSU_AGENT_ID/STATE/WAITING_FOR` shorthand was ambiguous.
+  - **No shell.** The configured string is split into argv and executed
+    directly, with no expansion, so a stray metacharacter cannot become
+    execution and behaviour does not depend on which shell is installed. A
+    user wanting interpolation points this at a script, or writes `sh -c`
+    themselves — their explicit choice rather than kitsu's default.
+  - **Output discarded and never awaited.** Standard input, output and error
+    are all null, because a hook writing to stderr would splice into the live
+    status row and break the byte-identical guarantee N1 gives plain,
+    non-TTY and assistive output. The child is reaped with a bounded
+    runtime, and a spawn error, nonzero exit or timeout is dropped silently:
+    a notification must never cost a turn.
+  - **Cadence** follows the state file: transitions are observed at turn
+    boundaries, so a hook fires once per transition, never once per
+    observation. Mid-turn reactivity is the same deferred watcher card.
 - **H4** Kitsu SHOULD ship a herdr integration manifest (`herdr-plugin.toml`
   or screen manifest) under `integrations/herdr/` so kitsu is detected natively.
 - **H5** New tool `agent_wait(id, until: done|blocked, timeout)` MUST let a
