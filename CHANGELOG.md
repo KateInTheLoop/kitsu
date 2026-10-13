@@ -7,6 +7,40 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 While the major version is `0`, the CLI surface, config schema, and JSONL event
 shapes may change in any minor release.
 
+## [Unreleased]
+
+### Added
+
+#### Background agents and herding
+
+- `/jobs view` groups the agent deck by state — agents needing input first,
+  then working, then finished results split by whether you have read them,
+  then failed and cancelled — with empty groups omitted, so one row that needs
+  you does not hide among many that do not.
+- `/jobs explain <id>` answers why one agent is in its state, since when, and
+  what it is waiting on, drawn from the phase, elapsed time, last activity,
+  failure class, steering and handoff already recorded. It is read-only:
+  unlike `/jobs show` it never acknowledges a ready result, so diagnosing an
+  agent cannot quietly satisfy the guard that refuses to exit on unobserved
+  results.
+- `/agents` now forwards any subcommand to `/jobs`, instead of rejecting
+  everything that is neither empty nor a job id, so both names reach the same
+  surface.
+- `[agents] state_file` publishes an advisory per-process JSON hint that an
+  outside terminal multiplexer can read to tell whether this kitsu is idle,
+  working, or blocked, with the same redacted thread records `/jobs` shows.
+  `auto`, the default, writes only in an interactive terminal session, so
+  scripted, piped, `ask` and JSONL runs write nothing at all.
+- The live status row carries a dimmed ambient tag during a turn — `[N blocked]`
+  or `[N agent(s)]`, blocked outranking running — so background work stays
+  visible after its one-off completion notice has scrolled away.
+
+### Changed
+
+- The background-agent registry snapshot now also carries an unacknowledged
+  count, so a watcher can tell "a result is waiting for you" from "an agent
+  finished at some point", which the terminal count alone could not express.
+
 ## [0.1.0] - 2026-08-23
 
 First public release.
