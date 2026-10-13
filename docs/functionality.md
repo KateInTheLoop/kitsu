@@ -264,7 +264,12 @@ oldest verified artifact. `/artifacts` lists usage and prunes by ID or all.
 usage, tool/write counts, safe recent activity, failure class, terminal result
 handoff, targeted steering, joined cancellation, and pruning. `/jobs view`
 presents the same deck grouped by state, with agents needing input first and
-empty groups omitted. `/agent show`
+empty groups omitted. `/jobs explain <id>` answers why one agent is in its
+state, since when, and what it is waiting on, drawn from the phase, elapsed
+time, last activity, failure class, steering and handoff already recorded; it
+is read-only and, unlike `/jobs show`, never acknowledges a ready result, so
+diagnosing an agent cannot quietly satisfy the unobserved-result exit guard.
+`/agent show`
 adds a bounded redacted event timeline; tool arguments/output and partial model
 bodies are never copied into that inspection record. Built-in `/profiles`
 select a read-only reviewer or a tool-free reasoning worker, and background
