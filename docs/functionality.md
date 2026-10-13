@@ -276,7 +276,23 @@ select a read-only reviewer or a tool-free reasoning worker, and background
 spawns can name a profile without inheriting broader capabilities. `/agents`
 remains a compatibility alias: a bare call lists, a numeric argument shows
 that thread, and any other argument is forwarded verbatim to `/jobs`, so every
-subcommand is reachable through either name. Styled mode prints background-agent notices
+subcommand is reachable through either name.
+
+Background agents run in-process, so nothing outside kitsu can observe them.
+`[agents] state_file` publishes a small advisory JSON hint, one file per running
+process, that an outside tool such as a terminal multiplexer can read to tell
+whether this kitsu is `idle`, `working`, or `blocked`, alongside the same
+redacted thread records `/jobs` shows. `auto` (the default) writes only in an
+interactive terminal session, so scripted, piped, `ask` and JSONL runs write
+nothing at all; `on` writes regardless of how kitsu was invoked, and `off`
+never writes. The file lives at `$XDG_RUNTIME_DIR/kitsu/<pid>.json`, falling
+back to `$TMPDIR/kitsu-<uid>/` and then `/tmp/kitsu-<uid>/`; the directory is
+created `0700` and the file `0600`, a directory that is not a directory, not
+owned by this user, or group/world-writable is refused, and a symlink standing
+in for it is never followed. It is replaced atomically, refreshed at turn
+boundaries rather than continuously, and removed on clean exit. It is a hint,
+not a source of truth: it may be stale, absent, or left behind by a process
+that died, and writing it never affects a turn — every failure is silent. Styled mode prints background-agent notices
 between prompt cycles by default; `KITSU_LIVE_NOTICES=1` opts into a live
 redraw-safe external printer at the cost of idle input latency. Literal
 plain/assistive input defers notices until the current line is submitted.

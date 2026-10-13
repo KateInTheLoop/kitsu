@@ -18589,3 +18589,129 @@ fn test_script_jobs_explain_is_served_by_both_the_command_and_its_alias() {
     // A rejected lookup is not a usage error either.
     assert!(!stderr.contains("usage: /jobs explain"), "{stderr}");
 }
+
+/// Run a one-command script with `agents_toml` appended to the config and the
+/// child pointed at its own runtime directory. Returns that runtime directory
+/// so the caller can assert on what the run left behind. The parent's own
+/// environment is never touched: `XDG_RUNTIME_DIR` is set on the child only.
+fn run_script_with_runtime_dir(
+    home: &TempDir,
+    runtime: &TempDir,
+    script_name: &str,
+    agents_toml: &str,
+) {
+    write_config(home.path(), "http://127.0.0.1:1");
+    if !agents_toml.is_empty() {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(home.path().join(".kitsu").join("config.toml"))
+            .expect("open config.toml to append the [agents] table");
+        write!(file, "\n{agents_toml}").expect("append the [agents] table");
+    }
+    let script = home.path().join(script_name);
+    fs::write(&script, "/jobs view\n/quit\n").expect("write script");
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .args(["--jsonl", "chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("scripted run");
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// The roadmap invariant: an optional integration left at its default writes
+/// no state at all. The file itself is removed on exit, so a finished run
+/// cannot be judged by the file — but the *directory* is never removed, so its
+/// absence proves no write was ever attempted.
+#[test]
+#[serial]
+fn test_script_run_with_default_config_writes_no_agent_state_directory() {
+    let home = TempDir::new().expect("temp home");
+    let runtime = TempDir::new().expect("temp runtime dir");
+
+    run_script_with_runtime_dir(&home, &runtime, "state-default.txt", "");
+
+    let dir = runtime.path().join("kitsu");
+    assert!(
+        !dir.exists(),
+        "a scripted carrier under the default `auto` mode must create nothing, found {dir:?}"
+    );
+    assert_eq!(
+        fs::read_dir(runtime.path()).unwrap().count(),
+        0,
+        "the runtime directory must be untouched"
+    );
+}
+
+/// `state_file = "on"` overrides the carrier rule: a scripted run writes. The
+/// per-pid file is gone because exit removed it, and the owner-only directory
+/// it left behind is the evidence that the write happened.
+#[test]
+#[serial]
+fn test_script_run_with_agents_state_file_on_writes_the_state_directory() {
+    let home = TempDir::new().expect("temp home");
+    let runtime = TempDir::new().expect("temp runtime dir");
+
+    run_script_with_runtime_dir(
+        &home,
+        &runtime,
+        "state-on.txt",
+        "[agents]\nstate_file = \"on\"\n",
+    );
+
+    let dir = runtime.path().join("kitsu");
+    assert!(
+        dir.is_dir(),
+        "`state_file = \"on\"` must create the state directory at {dir:?}"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the state directory must be owner-only"
+        );
+    }
+
+    let leftovers = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        leftovers.is_empty(),
+        "exit must remove the per-pid file and leave no temporary: {leftovers:?}"
+    );
+}
+
+/// The explicit opt-out works independently of the carrier rule: `off` is
+/// indistinguishable from the default here, which is the point.
+#[test]
+#[serial]
+fn test_script_run_with_agents_state_file_off_writes_no_agent_state_directory() {
+    let home = TempDir::new().expect("temp home");
+    let runtime = TempDir::new().expect("temp runtime dir");
+
+    run_script_with_runtime_dir(
+        &home,
+        &runtime,
+        "state-off.txt",
+        "[agents]\nstate_file = \"off\"\n",
+    );
+
+    let dir = runtime.path().join("kitsu");
+    assert!(
+        !dir.exists(),
+        "`state_file = \"off\"` must create nothing, found {dir:?}"
+    );
+    assert_eq!(fs::read_dir(runtime.path()).unwrap().count(), 0);
+}

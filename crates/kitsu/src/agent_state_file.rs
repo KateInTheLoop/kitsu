@@ -11,10 +11,6 @@
 //! so every failure is reported as an `Err(String)` the caller may ignore and
 //! nothing here panics.
 
-// Private writer staged ahead of its callers; the turn lifecycle, the config
-// keys, and the reader that consume it are later cards.
-#![allow(dead_code)]
-
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -266,6 +262,75 @@ pub(crate) fn write(dir: &Path, pid: u32, payload: &AgentStateFile) -> Result<()
 /// desired end state, and a stale one is a hint a reader already tolerates.
 pub(crate) fn remove(dir: &Path, pid: u32) {
     let _ = std::fs::remove_file(state_path(dir, pid));
+}
+
+/// Whether this process should write a state file at all.
+///
+/// `Off` never writes and `On` always does, regardless of how inference was
+/// carried. `Auto` writes only for an interactive carrier, and an unknown
+/// carrier — the early-startup case — fails closed, so a scripted, piped or
+/// JSONL run makes no state write while the integration is at its default.
+pub(crate) fn should_write(
+    mode: crate::config::StateFileMode,
+    carrier: Option<crate::process_exit::InferenceCarrier>,
+) -> bool {
+    match mode {
+        crate::config::StateFileMode::Off => false,
+        crate::config::StateFileMode::On => true,
+        crate::config::StateFileMode::Auto => {
+            carrier.is_some_and(crate::process_exit::InferenceCarrier::is_interactive)
+        }
+    }
+}
+
+/// Assembles the payload from the live registry so the call sites stay thin:
+/// they supply only the identity and the turn, and every tally and thread comes
+/// from one consistent read of the registry.
+pub(crate) fn build(
+    registry: &crate::subagent::AgentRegistry,
+    pid: u32,
+    cwd: String,
+    session_id: Option<String>,
+    turn_active: bool,
+    updated_at: String,
+) -> AgentStateFile {
+    let snapshot = registry.snapshot();
+    AgentStateFile {
+        schema: AGENT_STATE_SCHEMA,
+        pid,
+        cwd,
+        session_id,
+        state: process_state(snapshot.running, snapshot.blocked, turn_active),
+        counts: AgentStateCounts {
+            running: snapshot.running,
+            blocked: snapshot.blocked,
+            unacknowledged: snapshot.unacknowledged,
+            terminal: snapshot.terminal,
+            failed: snapshot.failed,
+        },
+        threads: registry.thread_snapshot_dtos(),
+        updated_at,
+    }
+}
+
+/// Removes this process's state file however the owning scope ends, so no
+/// return path, `?`, or panic can leave a stale hint behind. The guard creates
+/// nothing on drop: a run that never wrote stays invisible.
+pub(crate) struct StateFileGuard {
+    dir: PathBuf,
+    pid: u32,
+}
+
+impl StateFileGuard {
+    pub(crate) fn new(dir: PathBuf, pid: u32) -> Self {
+        Self { dir, pid }
+    }
+}
+
+impl Drop for StateFileGuard {
+    fn drop(&mut self) {
+        remove(&self.dir, self.pid);
+    }
 }
 
 #[cfg(test)]
@@ -549,6 +614,192 @@ mod tests {
 
         remove(&dir, 13);
         remove(&parent.path().join("absent"), 13);
+    }
+
+    /// Every one of the seven carriers against every mode. `Auto` must fail
+    /// closed: only a real interactive session writes, so a scripted, piped or
+    /// one-shot `ask` run makes no state write at all, which is the roadmap
+    /// invariant for an optional integration left disabled.
+    #[test]
+    fn should_write_only_opts_an_interactive_carrier_into_auto() {
+        use crate::config::StateFileMode;
+        use crate::process_exit::InferenceCarrier;
+
+        const ALL: [InferenceCarrier; 7] = [
+            InferenceCarrier::AskHuman,
+            InferenceCarrier::AskJsonl,
+            InferenceCarrier::PipedHuman,
+            InferenceCarrier::PipedJsonl,
+            InferenceCarrier::ScriptHuman,
+            InferenceCarrier::ScriptJsonl,
+            InferenceCarrier::InteractiveHuman,
+        ];
+
+        for carrier in ALL {
+            assert!(
+                !should_write(StateFileMode::Off, Some(carrier)),
+                "off must never write, carrier {carrier:?}"
+            );
+            assert!(
+                should_write(StateFileMode::On, Some(carrier)),
+                "on must always write, carrier {carrier:?}"
+            );
+            assert_eq!(
+                should_write(StateFileMode::Auto, Some(carrier)),
+                carrier == InferenceCarrier::InteractiveHuman,
+                "auto must follow interactivity only, carrier {carrier:?}"
+            );
+        }
+
+        // Spelled out rather than only derived from the loop, so a change to
+        // `is_interactive` cannot quietly take a non-interactive carrier with it.
+        for carrier in [
+            InferenceCarrier::ScriptHuman,
+            InferenceCarrier::ScriptJsonl,
+            InferenceCarrier::PipedHuman,
+            InferenceCarrier::PipedJsonl,
+            InferenceCarrier::AskHuman,
+            InferenceCarrier::AskJsonl,
+        ] {
+            assert!(
+                !should_write(StateFileMode::Auto, Some(carrier)),
+                "auto must not write for {carrier:?}"
+            );
+        }
+        assert!(should_write(
+            StateFileMode::Auto,
+            Some(InferenceCarrier::InteractiveHuman)
+        ));
+        assert!(should_write(
+            StateFileMode::On,
+            Some(InferenceCarrier::ScriptJsonl)
+        ));
+        assert!(!should_write(
+            StateFileMode::Off,
+            Some(InferenceCarrier::InteractiveHuman)
+        ));
+    }
+
+    /// A missing carrier is the early-startup case, and it must fail closed
+    /// under `Auto` while still honouring an explicit `On`/`Off`.
+    #[test]
+    fn should_write_fails_closed_when_the_carrier_is_unknown() {
+        use crate::config::StateFileMode;
+
+        assert!(
+            !should_write(StateFileMode::Auto, None),
+            "auto with no carrier must not write"
+        );
+        assert!(should_write(StateFileMode::On, None));
+        assert!(!should_write(StateFileMode::Off, None));
+    }
+
+    #[test]
+    fn build_carries_the_registry_counts_threads_and_identity_verbatim() {
+        let registry = AgentRegistry::default();
+        let id = registry.start("summarize the diff".to_string()).unwrap();
+        registry.finish(id, Ok("done".to_string()));
+
+        let payload = build(
+            &registry,
+            4321,
+            "/workspace/kitsu".to_string(),
+            Some("sess-7".to_string()),
+            false,
+            "2026-10-13T12:00:00Z".to_string(),
+        );
+
+        let snapshot = registry.snapshot();
+        assert_eq!(payload.counts.running, snapshot.running);
+        assert_eq!(payload.counts.blocked, snapshot.blocked);
+        assert_eq!(payload.counts.unacknowledged, snapshot.unacknowledged);
+        assert_eq!(payload.counts.terminal, snapshot.terminal);
+        assert_eq!(payload.counts.failed, snapshot.failed);
+
+        assert_eq!(payload.threads.len(), registry.thread_snapshot_dtos().len());
+        assert_eq!(payload.threads.len(), 1, "one retained agent, one thread");
+        for thread in &payload.threads {
+            thread
+                .validate_default()
+                .expect("every built thread must pass the reader's validation");
+        }
+
+        assert_eq!(payload.schema, AGENT_STATE_SCHEMA);
+        assert_eq!(payload.pid, 4321);
+        assert_eq!(payload.cwd, "/workspace/kitsu");
+        assert_eq!(payload.session_id.as_deref(), Some("sess-7"));
+        assert_eq!(payload.updated_at, "2026-10-13T12:00:00Z");
+        assert_eq!(
+            payload.state,
+            process_state(snapshot.running, snapshot.blocked, false),
+            "state must be derived from the snapshot and the turn"
+        );
+    }
+
+    /// The turn alone decides between `idle` and `working` when no agent is
+    /// running. `blocked` is asserted through [`process_state`] directly
+    /// because `AgentRegistrySnapshot::blocked` is still reserved and always
+    /// zero, so no registry can currently produce that case.
+    #[test]
+    fn build_derives_idle_and_working_from_the_turn() {
+        let registry = AgentRegistry::default();
+
+        let working = build(
+            &registry,
+            1,
+            "/tmp".to_string(),
+            None,
+            true,
+            "now".to_string(),
+        );
+        assert_eq!(working.state, "working");
+        assert!(working.threads.is_empty());
+        assert_eq!(working.counts, AgentStateCounts::default());
+
+        let idle = build(
+            &registry,
+            1,
+            "/tmp".to_string(),
+            None,
+            false,
+            "now".to_string(),
+        );
+        assert_eq!(idle.state, "idle");
+        assert!(idle.session_id.is_none());
+
+        assert_eq!(process_state(0, 1, false), "blocked");
+        assert_eq!(process_state(0, 1, true), "blocked");
+    }
+
+    #[test]
+    fn state_file_guard_removes_the_file_on_drop_and_keeps_the_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("kitsu-state");
+        write(&dir, 777, &payload(777, "idle", "now", Vec::new())).unwrap();
+        let path = state_path(&dir, 777);
+        assert!(path.is_file());
+
+        {
+            let _guard = StateFileGuard::new(dir.clone(), 777);
+            assert!(path.is_file(), "the guard must not remove anything early");
+        }
+
+        assert!(!path.exists(), "dropping the guard must remove the file");
+        assert!(dir.is_dir(), "the shared directory must survive the drop");
+    }
+
+    #[test]
+    fn state_file_guard_drop_is_harmless_when_the_file_is_already_gone() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("kitsu-state");
+
+        drop(StateFileGuard::new(dir.clone(), 1234));
+        assert!(!dir.exists(), "the guard must not create the directory");
+
+        std::fs::create_dir_all(&dir).unwrap();
+        drop(StateFileGuard::new(dir.clone(), 1234));
+        assert!(dir.is_dir());
+        assert!(!state_path(&dir, 1234).exists());
     }
 
     #[cfg(unix)]
