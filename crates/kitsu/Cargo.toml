@@ -48,6 +48,9 @@ wiremock = { workspace = true }
 tokio = { workspace = true }
 serial_test = { workspace = true }
 futures = { workspace = true }
+# Pinned to the same 0.15 `kitsu-tui` uses: 0.16 bumps `unicode-width` past
+# ratatui's exact pin and fails to resolve.
+vt100 = "0.15"
 
 # ---------------------------------------------------------------------------
 # Distro packaging.

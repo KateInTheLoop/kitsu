@@ -406,3 +406,65 @@ harness can tell the difference.
 - Until then, inline mode is correctly gated behind `KITSU_TUI=inline` and
   documented as a preview. It must not become a default, nor be recommended,
   before the census.
+
+**MEASURED in T0-S5b, and the answer is reassuring — with one condition.** The
+styled PTY harness put a real binary on a real pseudo-terminal at 24x80 with
+the viewport installed, printed all ~40 lines of `/help` (every one a direct
+write that bypasses the seam), and looked at the screen before teardown:
+
+```
+21: "current model: example-model-v1 — /help <command> explains one command…"
+22: "kitsu> "
+23: "╰ model example-model-v1 │ cwd ~                                    ╯"
+24: "kitsu"            <- the status row the bridge painted, intact
+```
+
+Row 24 survived, and the test asserts at least twenty non-blank rows above it
+so the assertion cannot pass vacuously. **A writer that bypasses the seam does
+not corrupt the viewport; it flows into the region harmlessly.** The mechanism:
+a direct write inherits the terminal's cursor, the cursor is parked inside the
+DECSTBM region, and the terminal scrolls that region on a line feed regardless
+of who wrote the bytes. Bypassing the seam costs the viewport's CRLF and any
+future suspend/repaint coordination — not pixel correctness.
+
+So routing hundreds of writers is **not** required for idle slash output, which
+removes the most expensive branch Q3 threatened.
+
+**The condition, and it matters:** this was measured at idle **in cooked mode**.
+Nothing has entered raw mode for the session yet — rustyline enters it only
+while reading a line — so `ONLCR` is still supplying the carriage return those
+392 writers omit. Once T0-S5d owns stdin in raw mode for the whole session they
+lose it and will staircase, exactly as F14 describes. **The harness must be
+re-run after the input path lands**, and the answer above must not be quoted as
+unconditional.
+
+
+## F18 — inline teardown prints the closing summary after releasing the region
+
+Found: T0-S5b, by the harness, in code accepted one card earlier. Deterministic,
+not a race. Tail of a real session:
+
+```
+"kitsu> /quit\r\x1b[12C\x1b[?2004l\r\n"   ESC[r   "  ↳ completed in 25 ms · … · succeeded"
+```
+
+The session's closing summary is printed **after** `BridgeGuard::drop` released
+the scroll region. Resetting DECSTBM margins homes the cursor, so that line
+lands on **row 1 and overwrites the top of the transcript**: the exit screen
+reads `1: "  ↳ completed in 25 ms · …"` with surviving debris from the
+overwritten row beneath it. Verified against the prefix parse — the cursor is on
+row 12 immediately before the release and the line renders at rows 1 and 2.
+
+A second, smaller defect in the same place: `hide()` releases the region without
+clearing the viewport rows, so the stale status text is still on row 24 after
+exit.
+
+Two fixes owed, both T0-S5c's:
+1. the bridge guard must outlive the final summary line, which is an ordering
+   question in `run_chat` rather than a change to the guard;
+2. `hide()` should clear the viewport rows and leave the cursor somewhere sane.
+
+T0-S5b deliberately **pins the broken behaviour** in a characterisation test —
+release precedes the line, the line lands on row 1, the status row goes stale —
+so the defect cannot change silently. T0-S5c inverts that test, which is what
+makes it the failing test for the fix.
