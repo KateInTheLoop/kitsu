@@ -212,3 +212,36 @@ future caller that passes a different stream while stderr happens to be a
 terminal would get raw mode enabled for a stream it is not driving. If a second
 destination is ever needed, terminal-ness should become an explicit constructor
 argument rather than a process-wide question.
+
+## F12 — the `Surface` seam cannot carry stdout until `StreamBuffer` takes a writer
+
+Found: T0-S3b, by the test author, and verified. `StreamBuffer::push` and
+`StreamBuffer::flush_unstyled` write to `io::stdout()` **themselves**
+(`crates/kitsu-render/src/lib.rs` ~222, ~224, ~237), not to any writer passed
+in. So once `print_fragment` and `finish_line` are routed through
+`Surface::write_block`:
+
+- `print_fragment`'s styled branch hands an **empty** block to a backend — the
+  bytes have already left through `StreamBuffer`'s own handle.
+- `finish_line` with a buffered partial line emits that partial line through
+  the real descriptor while only the trailing newline flows through the
+  writer.
+
+For `ClassicSurface` the bytes are identical: same descriptor, same order,
+inside the same single suspension. So T0-S3b is byte-identity-safe and its
+routing is real in the sense that the call site and the suspension decision
+move into the backend. But **the seam is not yet substitutable for stdout**: a
+terminal-UI backend plugged in today would receive nothing for assistant text,
+which is the single most important thing it needs.
+
+This is a trap rather than a mere gap, because the routing makes the path
+*look* handled. It is therefore recorded in three places: this finding, a
+dedicated plan card (T0-S3c), and — most importantly — a doc comment at both
+routing sites, since that is what the next implementer actually reads.
+
+**The fix, deliberately not done in T0-S3b:** thread the block's writer
+through `StreamBuffer::push` and `flush_unstyled`. That touches the line
+styler and both functions' byte-count returns, so bundling it with the routing
+would have recreated exactly the drift risk that splitting T0-S3 was meant to
+avoid. T0-S4 and T0-S5 must not assume stdout flows through the seam until
+T0-S3c lands.
