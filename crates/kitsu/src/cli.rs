@@ -359,6 +359,22 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<SessionCommand>,
     },
+    /// List the background agents published by every kitsu on this machine.
+    #[command(
+        after_help = "EXAMPLES:\n  kitsu agents\n  kitsu agents --json\n  kitsu agents --all\n\nHost-only: it reads the advisory per-process state files kitsu publishes under its runtime directory, deletes nothing, writes nothing, makes no network request, and needs no config to parse. A file is a hint, so it may be stale or left behind by a process that is gone."
+    )]
+    Agents {
+        /// Emit one JSON result instead of human text.
+        // `global = true` is inert here because this variant has no
+        // subcommand; it is kept only to match its `sessions`/`artifacts`
+        // siblings, and carries no behaviour of its own.
+        #[arg(long, global = true)]
+        json: bool,
+
+        /// Include processes that are no longer running (stale state files).
+        #[arg(long)]
+        all: bool,
+    },
     /// Inspect or reclaim command-artifact storage left by earlier runs.
     #[command(
         after_help = "EXAMPLES:\n  kitsu artifacts\n  kitsu artifacts list --json\n  kitsu artifacts prune all --dry-run\n  kitsu artifacts prune all --older-than 7d\n\nHost-only: these paths are Kitsu-private, no model authority is involved, and the config path only selects the isolated namespace. Generations held by a live process are never removed."

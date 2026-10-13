@@ -1941,6 +1941,7 @@ fn run() -> Result<(), CliError> {
             runtime.block_on(run_sessions(&cli, *json, command.as_ref()))
         }
         Some(Command::Artifacts { json, command }) => run_artifacts(&cli, *json, command.as_ref()),
+        Some(Command::Agents { json, all }) => run_agents(&cli, *json, *all),
         Some(Command::Chat {
             prompt,
             no_tools,
@@ -2887,6 +2888,26 @@ fn skip_reason(generation: &artifacts::Generation) -> String {
             "no lock file and younger than the {}s liveness grace period",
             artifacts::UNLOCKED_GRACE_SECS
         ),
+    }
+}
+
+/// `kitsu agents`: the background agents every kitsu on this machine is
+/// publishing. Host-only and read-only — it opens no provider, makes no
+/// inference request, needs no config, and reclaims no state file.
+fn run_agents(cli: &Cli, json: bool, all: bool) -> Result<(), CliError> {
+    reject_jsonl_for_management(cli, "kitsu agents --json")?;
+    let entries = agent_state_file::list_entries(
+        &agent_state_file::state_dir(),
+        all,
+        &agent_state_file::process_is_alive,
+    );
+    if json {
+        // A listing like `kitsu sessions --json`: the bare array, with no
+        // action envelope.
+        print_json(&entries)
+    } else {
+        println!("{}", agent_state_file::format_agents_listing(&entries));
+        Ok(())
     }
 }
 

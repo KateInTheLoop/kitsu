@@ -99,3 +99,31 @@ comment, `/jobs explain` loses the `last activity` line for exactly the agents
 where it matters most, and only the explain tests would catch it. The comment
 should be corrected to describe the field rather than one caller, in whichever
 card next touches that struct.
+
+## F8 — `reject_jsonl_for_management` guards six commands and had no test
+
+Found: T1-S5. `crates/kitsu/src/main.rs:2101` defines the helper that refuses
+the global `--jsonl` flag on a host-management command and points the user at
+that command's own `--json` instead. Six management paths call it. Before this
+card, nothing in `crates/kitsu/tests/` asserted either the refusal or the
+message: a grep for `reserved for chat automation` finds only the format string
+itself.
+
+So any of those six could silently stop rejecting `--jsonl`, or start naming
+the wrong replacement command, with no test failing. T1-S5 adds the first such
+test, for `kitsu agents` only, pinning both the refusal and the exact
+replacement string.
+
+The other five (`sessions`, `artifacts`, `auth`, and the remaining call sites)
+remain uncovered. A small card could extend the same assertion to each; the
+pattern is now established and each addition is three lines.
+
+**Addendum (T1-S5).** The absence of that test had a second cost beyond the
+missing coverage: with no precedent to copy, the test author modelled the new
+assertion on the nearest-looking rejection, `--output-last-message`, which does
+**not** pass `--jsonl` and therefore lands its error on stderr in human mode.
+Under `--jsonl` the error is a framed event on stdout and stderr is empty, so
+the borrowed shape was exactly backwards and the test failed against correct
+code. One test over any one of the six callers would have made the channel
+contract obvious. That is the real argument for the follow-up card: not
+coverage for its own sake, but a correct example to copy.
