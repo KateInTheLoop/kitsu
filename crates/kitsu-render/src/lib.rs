@@ -377,21 +377,30 @@ pub fn print_fragment(s: &str) {
             ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
             TURN_ASSISTANT_OUTPUT.store(true, Ordering::Release);
         }
-        let push_lines = || {
+        // GAP — read this before plugging in a non-classic backend.
+        //
+        // The block handed to the surface on this branch is **empty**:
+        // `StreamBuffer::push` writes the styled lines to `io::stdout()`
+        // itself, not to the writer the block receives. For `ClassicSurface`
+        // that is byte-identical — same descriptor, same order, inside the one
+        // suspension `write_block` opens — and the suspension decision that
+        // used to live in the `sanitized.contains('\n')` test here now lives
+        // in the backend (`suspends_for`), which is the point of the seam.
+        //
+        // It is byte-identical **for the classic backend only**. The seam is
+        // not yet substitutable for stdout: a terminal-UI backend plugged in
+        // today would receive nothing at all for assistant text. Threading the
+        // writer through `StreamBuffer::push` (and `flush_unstyled`, see
+        // `finish_line`) is required before any non-classic backend can carry
+        // stdout, and is deliberately a separate change — it touches the
+        // styler and the byte-count returns, with its own byte-identity risk.
+        active_surface().write_block(Fd::Stdout, &mut |_out| {
             stream_buffer()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(&sanitized);
             let _ = io::stdout().flush();
-        };
-        if sanitized.contains('\n') {
-            // Completed lines are about to hit stdout; lift the live status
-            // row so they land above it. Partial fragments only accumulate
-            // (no write), so they skip the clear/repaint cycle.
-            live::with_live_row_suspended(push_lines);
-        } else {
-            push_lines();
-        }
+        });
     } else {
         // Non-TTY or plain: use existing sanitizer path (byte-identical)
         let sanitized = stream_sanitizer()
@@ -402,9 +411,9 @@ pub fn print_fragment(s: &str) {
             ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
             TURN_ASSISTANT_OUTPUT.store(true, Ordering::Release);
         }
-        let mut out = io::stdout();
-        let _ = out.write_all(sanitized.as_bytes());
-        let _ = out.flush();
+        active_surface().write_block(Fd::Stdout, &mut |out| {
+            let _ = out.write_all(sanitized.as_bytes());
+        });
     }
 }
 
@@ -1154,9 +1163,9 @@ impl PromptSafeAsyncNotice {
 /// following hint lines pass through untinted. `--plain`/non-TTY receive the
 /// same text with no ANSI.
 pub fn render_error(message: &str) {
-    live::with_live_row_suspended(|| {
+    active_surface().write_block(Fd::Stderr, &mut |out| {
         for line in error_lines(message) {
-            eprintln!("{line}");
+            let _ = writeln!(out, "{line}");
         }
     });
 }
@@ -1434,7 +1443,21 @@ pub fn turn_wrote_assistant_output() -> bool {
 
 /// Emit a trailing newline after a streamed turn so the next prompt is clean.
 pub fn finish_line() {
-    live::with_live_row_suspended(|| {
+    // GAP — read this before plugging in a non-classic backend.
+    //
+    // The block handed to the surface here is **partial**: when the stream
+    // buffer holds a partial line, `StreamBuffer::flush_unstyled` writes those
+    // bytes to `io::stdout()` itself, and only the trailing newline below
+    // flows through the writer the block receives. For `ClassicSurface` that
+    // is byte-identical — same descriptor, same order, inside the one
+    // suspension `write_block` opens.
+    //
+    // It is byte-identical **for the classic backend only**. Threading the
+    // writer through `StreamBuffer::flush_unstyled` (and `push`, see
+    // `print_fragment`) is required before any non-classic backend can carry
+    // stdout; until then such a backend would see the newline without the
+    // partial line it terminates.
+    active_surface().write_block(Fd::Stdout, &mut |out| {
         // Flush any partial line from the streaming buffer UNSTYLED
         // and reset its fence state.
         stream_buffer()
@@ -1451,9 +1474,8 @@ pub fn finish_line() {
         if !ASSISTANT_OUTPUT_WRITTEN.swap(false, Ordering::AcqRel) {
             return;
         }
-        let mut out = io::stdout();
         let _ = out.write_all(b"\n");
-        let _ = out.flush();
+        let _ = io::stdout().flush();
     });
 }
 
@@ -3702,5 +3724,431 @@ mod surface_seam_tests {
             // one `eprintln!` of exactly this string, under the suspension.
             ClassicSurface.transcript_line(Fd::Stderr, &expected);
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // T0-S3b: the block seam. The writers below are not line writers: each
+    // emits several lines, or a partial line, under exactly one live-row
+    // suspension. Routing them per line would open one suspension per line
+    // and, with a drawn row, clear and repaint between them — different
+    // stderr bytes. So they route through `Surface::write_block`, which lifts
+    // the row once around the whole block, and the decision to lift at all is
+    // derived in the backend by `suspends_for`.
+    //
+    // These tests are written before the trait method and the routing exist.
+    // ---------------------------------------------------------------------
+
+    use super::surface::suspends_for;
+    use super::{
+        error_lines, finish_line, print_fragment, render_error, sanitize_terminal_text,
+        stdout_style, stream_buffer, stream_sanitizer, LineStyler, ASSISTANT_OUTPUT_WRITTEN,
+        TURN_ASSISTANT_OUTPUT,
+    };
+    use std::sync::atomic::Ordering;
+
+    /// A seam call, kept as an enum so a backend can prove it distinguishes a
+    /// block from a single line (the whole point of the second method).
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum SeamCall {
+        Line(Fd, String),
+        Block(Fd, Vec<u8>),
+    }
+
+    /// Like `Recorder`, but it also overrides `write_block` so the block's
+    /// bytes are captured instead of being forwarded to `transcript_line`.
+    #[derive(Default)]
+    struct BlockRecorder {
+        calls: Mutex<Vec<SeamCall>>,
+    }
+
+    impl Surface for BlockRecorder {
+        fn transcript_line(&self, fd: Fd, text: &str) {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(SeamCall::Line(fd, text.to_string()));
+        }
+
+        fn write_block(&self, fd: Fd, block: &mut dyn FnMut(&mut dyn std::io::Write)) {
+            let mut bytes: Vec<u8> = Vec::new();
+            block(&mut bytes);
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(SeamCall::Block(fd, bytes));
+        }
+    }
+
+    impl BlockRecorder {
+        fn calls(&self) -> Vec<SeamCall> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    fn record_calls(body: impl FnOnce()) -> Vec<SeamCall> {
+        let recorder = Arc::new(BlockRecorder::default());
+        let _installed = InstalledSurface::new(recorder.clone());
+        body();
+        recorder.calls()
+    }
+
+    /// The single block of a recording, or a failure naming what was seen
+    /// instead. Blocks are the unit under test here, so a stray
+    /// `transcript_line` must fail loudly rather than be filtered away.
+    fn one_block(calls: &[SeamCall]) -> (Fd, String) {
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly one seam call (one block), saw {calls:?}"
+        );
+        match &calls[0] {
+            SeamCall::Block(fd, bytes) => (
+                *fd,
+                String::from_utf8(bytes.clone()).expect("block bytes must be UTF-8"),
+            ),
+            other => panic!("expected a write_block call, saw {other:?}"),
+        }
+    }
+
+    /// `print_fragment` and `finish_line` mutate process-global state: the
+    /// streaming sanitizer's escape-parser state, the stream buffer's partial
+    /// line and fence state, and the two output-tracking atomics. The other 93
+    /// tests in this binary share all of it, so every test that touches those
+    /// writers holds one of these: it zeroes the sanitizer and buffer on entry
+    /// and on exit, and puts both atomics back to the values it found. The
+    /// buffer's partial line is dropped by clearing the field rather than by
+    /// `flush_unstyled`, so restoring state never emits stray bytes.
+    struct StreamStateGuard {
+        output_written: bool,
+        turn_output: bool,
+    }
+
+    impl StreamStateGuard {
+        fn new() -> Self {
+            let guard = Self {
+                output_written: ASSISTANT_OUTPUT_WRITTEN.load(Ordering::Acquire),
+                turn_output: TURN_ASSISTANT_OUTPUT.load(Ordering::Acquire),
+            };
+            reset_stream_globals();
+            guard
+        }
+    }
+
+    impl Drop for StreamStateGuard {
+        fn drop(&mut self) {
+            reset_stream_globals();
+            ASSISTANT_OUTPUT_WRITTEN.store(self.output_written, Ordering::Release);
+            TURN_ASSISTANT_OUTPUT.store(self.turn_output, Ordering::Release);
+        }
+    }
+
+    fn reset_stream_globals() {
+        {
+            let mut buffer = stream_buffer()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            buffer.buffer.clear();
+            buffer.styler = LineStyler::default();
+        }
+        stream_sanitizer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reset();
+        ASSISTANT_OUTPUT_WRITTEN.store(false, Ordering::Release);
+        TURN_ASSISTANT_OUTPUT.store(false, Ordering::Release);
+    }
+
+    /// (1) The suspension rule, as a truth table.
+    ///
+    /// WHY stdout is conditional: the live row is painted on **stderr**. A
+    /// stderr write therefore always shares a terminal with the row and must
+    /// lift it. A stdout write shares that terminal only when stdout is itself
+    /// a styled terminal; in a `kitsu chat > file` session the stdout bytes go
+    /// into the file and cannot disturb a row on the terminal, so lifting it
+    /// would insert a clear/repaint cycle and change the emitted stderr bytes.
+    /// That asymmetry is exactly what today's `print_fragment` encodes by
+    /// suspending on the styled branch only, and `suspends_for` is where it
+    /// must live so it can be tested without a real descriptor.
+    #[test]
+    fn suspends_for_lifts_the_row_only_when_the_write_shares_the_rows_terminal() {
+        assert!(
+            suspends_for(Fd::Stderr, true),
+            "the row lives on stderr: a stderr write always shares its terminal"
+        );
+        assert!(
+            suspends_for(Fd::Stderr, false),
+            "stdout's styling is irrelevant to a stderr write"
+        );
+        assert!(
+            suspends_for(Fd::Stdout, true),
+            "a styled stdout shares the terminal with the row"
+        );
+        assert!(
+            !suspends_for(Fd::Stdout, false),
+            "a redirected stdout cannot disturb a row painted on stderr"
+        );
+    }
+
+    /// (2) The regression guard the previous card's author identified:
+    /// `render_error` prints N lines and must route them as **one** block, not
+    /// N `transcript_line` calls. N single-line calls would open N suspensions
+    /// and, with a drawn row, repaint between every hint line.
+    #[test]
+    fn render_error_routes_every_line_in_one_write_block() {
+        let _guard = surface_slot_lock();
+        let message = "boom\nhint: check the gateway\nhint: or lower the tier";
+        let expected_lines = error_lines(message);
+        assert!(
+            expected_lines.len() >= 3,
+            "the fixture must be multi-line for this test to mean anything, \
+             saw {expected_lines:?}"
+        );
+
+        let calls = record_calls(|| render_error(message));
+
+        // Exactly one call, and it is a block on stderr.
+        let (fd, text) = one_block(&calls);
+        assert_eq!(fd, Fd::Stderr);
+
+        // The block emits every line, in order, each terminated — the bytes
+        // today's `for line in error_lines(..) { eprintln!("{line}") }` writes.
+        let expected: String = expected_lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(text, expected);
+
+        // Spelled out as an ordering assertion too, so a failure says which
+        // line went missing rather than dumping two large styled strings.
+        let mut cursor = 0;
+        for line in &expected_lines {
+            let at = text[cursor..]
+                .find(line.as_str())
+                .unwrap_or_else(|| panic!("block output is missing, or reorders, {line:?}"));
+            cursor += at + line.len();
+        }
+    }
+
+    /// (3) One suspension for the whole block, not one per line. A leaked or
+    /// per-line suspension is invisible to a byte assertion made through a
+    /// recording surface, so this one goes through `ClassicSurface` itself and
+    /// reads `live::suspend_depth()` from inside the block.
+    #[test]
+    fn a_classic_block_suspends_the_live_row_exactly_once() {
+        let _guard = surface_slot_lock();
+        let before = live::suspend_depth();
+        let mut depths: Vec<usize> = Vec::new();
+
+        ClassicSurface.write_block(Fd::Stderr, &mut |out| {
+            for index in 0..3 {
+                let _ = writeln!(out, "surface seam: block line {index}");
+                depths.push(live::suspend_depth());
+            }
+        });
+
+        assert_eq!(
+            live::suspend_depth(),
+            before,
+            "ClassicSurface::write_block must balance its own suspension"
+        );
+        assert_eq!(depths.len(), 3, "the block body must have run");
+        for depth in depths {
+            assert!(
+                depth > before,
+                "the block must run inside a suspension (before {before}, inside {depth})"
+            );
+            assert!(
+                depth <= before + 1,
+                "the row must be lifted once for the whole block, not once per \
+                 line (before {before}, inside {depth})"
+            );
+        }
+    }
+
+    /// (4) `print_fragment` on a completed line routes through the seam as one
+    /// block on stdout, and the block's bytes are what the real path produces:
+    /// the styled line plus its newline on a styled TTY, the sanitized text
+    /// verbatim otherwise. Both expectations are derived from the real
+    /// `LineStyler`/sanitizer rather than written out as literals.
+    ///
+    /// CAVEAT: `stdout_style()` reads a real descriptor and cannot be driven
+    /// from a test — under `cargo test` stdout is captured, so the tier taken
+    /// here is the non-styled one. The styled arm's expectation is therefore
+    /// computed from `LineStyler` and compared only if the test happens to run
+    /// on a styled TTY; its *suspension* behaviour is pinned instead by test
+    /// (1), which is the part that could change bytes.
+    #[test]
+    fn print_fragment_routes_a_completed_line_through_one_write_block() {
+        let _guard = surface_slot_lock();
+        let _state = StreamStateGuard::new();
+        let fragment = "hello from the seam\n";
+        let sanitized = sanitize_terminal_text(fragment);
+        let expected = if stdout_style() {
+            format!(
+                "{}\n",
+                LineStyler::default().style_line(sanitized.trim_end_matches('\n'))
+            )
+        } else {
+            sanitized.clone()
+        };
+
+        let calls = record_calls(|| print_fragment(fragment));
+
+        let (fd, text) = one_block(&calls);
+        assert_eq!(fd, Fd::Stdout, "assistant text belongs on stdout");
+        assert_eq!(text, expected);
+    }
+
+    /// (5) A partial fragment (no newline) still sets both output-tracking
+    /// atomics — a turn whose only output is a partial line must count as
+    /// having streamed, per the comment in `print_fragment` — and on the
+    /// styled path it writes nothing, because the text is only buffered. The
+    /// atomics are set from the sanitized text, before any write, so they must
+    /// hold whichever branch ran.
+    #[test]
+    fn print_fragment_with_a_partial_line_tracks_output_and_writes_only_what_the_tier_writes() {
+        let _guard = surface_slot_lock();
+        let _state = StreamStateGuard::new();
+        let fragment = "a partial line with no newline";
+        let sanitized = sanitize_terminal_text(fragment);
+        assert!(!sanitized.is_empty(), "the fixture must survive sanitizing");
+
+        let calls = record_calls(|| print_fragment(fragment));
+
+        assert!(
+            ASSISTANT_OUTPUT_WRITTEN.load(Ordering::Acquire),
+            "a partial fragment must still arm the newline-discipline flag"
+        );
+        assert!(
+            TURN_ASSISTANT_OUTPUT.load(Ordering::Acquire),
+            "a turn whose only output is a partial line must count as streamed"
+        );
+
+        let (fd, text) = one_block(&calls);
+        assert_eq!(fd, Fd::Stdout);
+        if stdout_style() {
+            assert_eq!(
+                text, "",
+                "the styled path only buffers a partial line; it writes nothing"
+            );
+        } else {
+            assert_eq!(
+                text, sanitized,
+                "the raw path writes the sanitized fragment immediately"
+            );
+        }
+    }
+
+    /// (6) `finish_line` routes one block, and the trailing newline stays
+    /// gated on `ASSISTANT_OUTPUT_WRITTEN` — read from the code, not assumed:
+    /// the flag is consumed by a swap, the newline is written only when it was
+    /// set, and the partial-line flush plus sanitizer reset happen either way
+    /// inside the same block.
+    #[test]
+    fn finish_line_routes_one_block_and_keeps_the_newline_gated_on_the_atomic() {
+        let _guard = surface_slot_lock();
+        let _state = StreamStateGuard::new();
+
+        // Output was written: the newline is emitted and the flag consumed.
+        ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
+        let calls = record_calls(finish_line);
+        let (fd, text) = one_block(&calls);
+        assert_eq!(fd, Fd::Stdout);
+        assert_eq!(text, "\n");
+        assert!(
+            !ASSISTANT_OUTPUT_WRITTEN.load(Ordering::Acquire),
+            "finish_line must consume the flag with a swap, not merely read it"
+        );
+
+        // Nothing was written: still one block (the flush and reset live in
+        // it), but no newline.
+        ASSISTANT_OUTPUT_WRITTEN.store(false, Ordering::Release);
+        let calls = record_calls(finish_line);
+        let (fd, text) = one_block(&calls);
+        assert_eq!(fd, Fd::Stdout);
+        assert_eq!(
+            text, "",
+            "with no assistant output written, finish_line emits no newline"
+        );
+    }
+
+    /// (7) This card must not regress the line seam the previous one shipped:
+    /// a routed stderr writer still arrives as exactly one `transcript_line`
+    /// carrying the real formatter's bytes.
+    #[test]
+    fn transcript_line_still_carries_the_routed_stderr_writers_unchanged() {
+        let _guard = surface_slot_lock();
+        let header = "Read(unregressed.md)";
+        let expected = tool_activity_line(header, stderr_is_tty() && !plain_mode(), plain_mode());
+
+        let calls = record_calls(|| tool_activity(header));
+
+        assert_eq!(calls, vec![SeamCall::Line(Fd::Stderr, expected)]);
+    }
+
+    /// (8) A backend can tell a block from a line: the two methods arrive as
+    /// distinct calls, in order, and a block is never decomposed into lines on
+    /// the way through.
+    #[test]
+    fn a_backend_sees_write_block_and_transcript_line_as_distinct_calls() {
+        let _guard = surface_slot_lock();
+        let recorder = Arc::new(BlockRecorder::default());
+        let _installed = InstalledSurface::new(recorder.clone());
+
+        active_surface().transcript_line(Fd::Stderr, "surface seam: a single line");
+        active_surface().write_block(Fd::Stdout, &mut |out| {
+            let _ = out.write_all(b"first\nsecond\n");
+        });
+
+        assert_eq!(
+            recorder.calls(),
+            vec![
+                SeamCall::Line(Fd::Stderr, "surface seam: a single line".to_string()),
+                SeamCall::Block(Fd::Stdout, b"first\nsecond\n".to_vec()),
+            ]
+        );
+    }
+
+    /// (9) Byte-identity of the classic path for a block. Capturing the real
+    /// descriptors is still not feasible from a unit test here: `render_error`
+    /// writes with `eprintln!` and `print_fragment`/`finish_line` write
+    /// through `io::stdout()`, and the crate exposes no injectable process
+    /// sink, so the real bytes cannot be read back. What is asserted instead
+    /// is (a) the block the seam hands a backend contains exactly the
+    /// concatenation of `error_lines`, each newline-terminated — the byte
+    /// stream `eprintln!`-per-line produces — and (b) `ClassicSurface`
+    /// accepts that same block under one balanced suspension. Together with
+    /// the untouched 93 existing tests, that pins the bytes.
+    ///
+    /// Not asserted, and worth saying plainly: that the kernel-level write
+    /// ordering between the block's bytes and the row's clear/repaint escapes
+    /// is unchanged. Only an end-to-end PTY test could show that.
+    #[test]
+    fn classic_write_block_reproduces_the_existing_multiline_stderr_bytes() {
+        let _guard = surface_slot_lock();
+        let message = "boom\nhint: one\nhint: two";
+        let expected: String = error_lines(message)
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect();
+
+        let (_, routed) = {
+            let calls = record_calls(|| render_error(message));
+            one_block(&calls)
+        };
+        assert_eq!(routed, expected, "the seam must carry the bytes verbatim");
+
+        let before = live::suspend_depth();
+        ClassicSurface.write_block(Fd::Stderr, &mut |out| {
+            let _ = out.write_all(expected.as_bytes());
+        });
+        assert_eq!(
+            live::suspend_depth(),
+            before,
+            "the classic block must balance its suspension"
+        );
     }
 }

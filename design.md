@@ -65,6 +65,14 @@ Recommended workspace:
   guard, so a caller structurally cannot hold the lock across a call — which
   matters because the live-row suspension is reentrant, notices nest inside
   it, and approval prompters run synchronously under `spawn_blocking`.
+  `write_block` carries a multi-line block under **one** suspension, because
+  lifting the row per line would clear and repaint between lines and change
+  the emitted bytes; the backend decides whether to lift at all, since the row
+  lives on stderr and a redirected stdout cannot disturb it. **Caveat worth
+  knowing before writing a second backend:** `StreamBuffer` still writes
+  `io::stdout()` itself, so a block on the assistant-text path is currently
+  empty for anything but the classic backend. Threading its writer is tracked
+  as finding F12 and plan card T0-S3c.
 - `crates/kitsu-editor` — the pure input keymap and line editor (printable
   insert, motions, kills, history walk with a draft stash, reverse-i-search,
   bracketed paste, lone-Escape resolution). Dependency-free and deliberately
