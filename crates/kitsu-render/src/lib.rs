@@ -3,12 +3,15 @@
 
 pub mod jsonl;
 pub mod live;
+pub mod surface;
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use owo_colors::OwoColorize;
+
+use crate::surface::{active_surface, Fd};
 
 const ESC: char = '\u{1b}';
 const CSI: char = '\u{009b}';
@@ -1460,9 +1463,7 @@ pub fn finish_line() {
 /// card reads at a glance (ui-parity item 12). Plain/non-TTY byte-identical.
 pub fn tool_activity(header: &str) {
     let line = tool_activity_line(header, stderr_is_tty() && !plain_mode(), plain_mode());
-    live::with_live_row_suspended(|| {
-        eprintln!("{line}");
-    });
+    active_surface().transcript_line(Fd::Stderr, &line);
 }
 
 /// The [`tool_activity`] payload as a string, per output tier. Styled rows
@@ -1510,26 +1511,30 @@ pub fn tool_result_error(summary: &str) {
 
 fn tool_result_with_weight(summary: &str, is_error: bool) {
     let plain = plain_mode();
-    let summary = if plain {
-        sanitize_plain_inline(summary)
-    } else {
+    let line = tool_result_line(summary, is_error, stderr_is_tty() && !plain, plain);
+    active_surface().transcript_line(Fd::Stderr, &line);
+}
+
+/// The [`tool_result`] payload as a string, per output tier — the mirror of
+/// [`tool_activity_line`]. `--plain` wins over a styled TTY; the error arm is
+/// ember-red (emphasized) where the ordinary arm is dimmed.
+fn tool_result_line(summary: &str, is_error: bool, styled: bool, plain: bool) -> String {
+    if plain {
+        return format!("result> {}", sanitize_plain_inline(summary));
+    }
+    let line = format!(
+        "  {GLYPH_TOOL_RESULT} {}",
         sanitize_terminal_inline(summary)
-    };
-    let line = format!("  {GLYPH_TOOL_RESULT} {summary}");
-    live::with_live_row_suspended(|| {
-        if stderr_is_tty() && !plain {
-            if is_error {
-                let (r, g, b) = theme().error;
-                eprintln!("{}", line.truecolor(r, g, b));
-            } else {
-                eprintln!("{}", line.dimmed());
-            }
-        } else if plain {
-            eprintln!("result> {summary}");
-        } else {
-            eprintln!("{line}");
-        }
-    });
+    );
+    if !styled {
+        return line;
+    }
+    if is_error {
+        let (r, g, b) = theme().error;
+        format!("{}", line.truecolor(r, g, b))
+    } else {
+        format!("{}", line.dimmed())
+    }
 }
 
 /// A section heading (e.g. one `/help` group). Bold when `styled`, verbatim
@@ -1665,9 +1670,8 @@ pub fn render_diff(diff: &str) {
 /// gate; at most one line per event, never in tool receipts. `--plain` renders
 /// the same text behind the ASCII `*` marker.
 pub fn milestone(message: &str) {
-    live::with_live_row_suspended(|| {
-        eprintln!("{}", milestone_line(message));
-    });
+    let line = milestone_line(message);
+    active_surface().transcript_line(Fd::Stderr, &line);
 }
 
 /// The [`milestone`] payload as a string, for callers that route output.
@@ -3257,6 +3261,446 @@ mod tests {
 
             // Styled row should contain bullet dots
             assert!(styled_row.contains('●'));
+        }
+    }
+}
+
+/// T0-S3a: the renderer's output seam. These tests pin the `Surface` trait,
+/// the process-global slot's lock discipline, and the byte-identity of the
+/// stderr line writers that route through it. They are deliberately written
+/// before `surface.rs` exists.
+#[cfg(test)]
+mod surface_seam_tests {
+    use super::live;
+    use super::surface::{active_surface, set_surface, ClassicSurface, Fd, Surface};
+    use super::{
+        milestone, milestone_line_with_mode, plain_mode, sanitize_plain_inline,
+        sanitize_terminal_inline, stderr_is_tty, stderr_style, tool_activity, tool_activity_line,
+        tool_result, tool_result_error, tool_result_line, EMBER, GLYPH_TOOL_RESULT,
+    };
+    use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
+    use std::time::Duration;
+
+    /// Local copy of the sibling test module's SGR helper (that module's one is
+    /// private to it, and the existing tests must not be touched).
+    fn sgr(rgb: (u8, u8, u8)) -> String {
+        format!("\u{1b}[38;2;{};{};{}m", rgb.0, rgb.1, rgb.2)
+    }
+
+    /// Generous enough that a loaded CI box never trips it, short enough that a
+    /// real deadlock fails the suite instead of hanging it forever.
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    /// CAVEAT: the surface slot is process-global. Two tests installing
+    /// recorders concurrently would see each other's calls, and a recorder
+    /// leaked past a test would silently swallow every later test's transcript
+    /// lines in this binary. Every test below holds this lock for its whole
+    /// body and restores the previous surface before releasing it (see
+    /// `InstalledSurface`, which restores on unwind too). This keeps the seam
+    /// tests serial without adding a `serial_test` dev-dependency.
+    fn surface_slot_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Installs a surface and puts the previous one back on drop, so a panicking
+    /// assertion cannot leak a recorder into the rest of the test binary.
+    struct InstalledSurface(Option<Arc<dyn Surface>>);
+
+    impl InstalledSurface {
+        fn new(surface: Arc<dyn Surface>) -> Self {
+            Self(Some(set_surface(surface)))
+        }
+    }
+
+    impl Drop for InstalledSurface {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                set_surface(previous);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        calls: Mutex<Vec<(Fd, String)>>,
+    }
+
+    impl Surface for Recorder {
+        fn transcript_line(&self, fd: Fd, text: &str) {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((fd, text.to_string()));
+        }
+    }
+
+    impl Recorder {
+        fn calls(&self) -> Vec<(Fd, String)> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    fn record(body: impl FnOnce()) -> Vec<(Fd, String)> {
+        let recorder = Arc::new(Recorder::default());
+        let _installed = InstalledSurface::new(recorder.clone());
+        body();
+        recorder.calls()
+    }
+
+    /// Run `body` on its own thread and fail if it does not finish inside
+    /// `DEADLINE`. A hanging test is worse than a failing one.
+    fn within_deadline(name: &str, body: impl FnOnce() + Send + 'static) {
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            body();
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(DEADLINE) {
+            Ok(()) => handle.join().expect("deadline-bounded body panicked"),
+            Err(_) => panic!("{name} did not complete within {DEADLINE:?} — likely deadlocked"),
+        }
+    }
+
+    /// The card's named test: `tool_activity` makes exactly one `Fd::Stderr`
+    /// call whose text is the existing formatter's output, byte for byte. The
+    /// expectation is derived from `tool_activity_line` so it cannot drift from
+    /// the real formatter.
+    #[test]
+    fn tool_activity_routes_one_stderr_transcript_line_through_the_surface() {
+        let _guard = surface_slot_lock();
+        let header = "Read(deck1.md)";
+        let expected = tool_activity_line(header, stderr_is_tty() && !plain_mode(), plain_mode());
+
+        let calls = record(|| tool_activity(header));
+
+        assert_eq!(calls, vec![(Fd::Stderr, expected)]);
+    }
+
+    /// `tool_result` likewise routes exactly one stderr line, derived from the
+    /// extracted `tool_result_line` formatter so the assertion is byte-exact
+    /// rather than sanitized (which would erase the very styling that
+    /// distinguishes the two weight arms).
+    #[test]
+    fn tool_result_routes_one_stderr_transcript_line_through_the_surface() {
+        let _guard = surface_slot_lock();
+        let summary = "128 lines";
+        let expected = tool_result_line(
+            summary,
+            false,
+            stderr_is_tty() && !plain_mode(),
+            plain_mode(),
+        );
+
+        let calls = record(|| tool_result(summary));
+
+        assert_eq!(calls, vec![(Fd::Stderr, expected)]);
+    }
+
+    /// The error arm shares `tool_result_with_weight`'s body and is the one the
+    /// non-error test never exercises, so it gets its own routing assertion.
+    #[test]
+    fn tool_result_error_routes_the_error_arm_through_the_surface() {
+        let _guard = surface_slot_lock();
+        let summary = "exit status 1";
+        let expected = tool_result_line(
+            summary,
+            true,
+            stderr_is_tty() && !plain_mode(),
+            plain_mode(),
+        );
+
+        let calls = record(|| tool_result_error(summary));
+
+        assert_eq!(calls, vec![(Fd::Stderr, expected)]);
+    }
+
+    /// Byte-exact outputs of the extracted formatter, both weight arms across
+    /// all three output tiers. This is the byte-identity anchor the routing
+    /// tests above derive from, so it hardcodes the escape sequences today's
+    /// `tool_result_with_weight` emits: ember truecolor (reset with `39m`) for
+    /// the error arm, `2m`/`0m` dimming for the ordinary arm, and zero escape
+    /// bytes under `--plain`.
+    #[test]
+    fn tool_result_line_pins_both_arms_across_the_three_output_tiers() {
+        let summary = "128 lines";
+        let body = format!(
+            "  {GLYPH_TOOL_RESULT} {}",
+            sanitize_terminal_inline(summary)
+        );
+
+        // Styled TTY, ordinary weight: dimmed.
+        assert_eq!(
+            tool_result_line(summary, false, true, false),
+            format!("\u{1b}[2m{body}\u{1b}[0m")
+        );
+
+        // Styled TTY, error weight: ember-red, emphasized rather than dimmed.
+        assert_eq!(
+            tool_result_line(summary, true, true, false),
+            format!("{}{body}\u{1b}[39m", sgr(EMBER))
+        );
+
+        // Non-TTY: identical text for both arms, no escape bytes.
+        for is_error in [false, true] {
+            let rendered = tool_result_line(summary, is_error, false, false);
+            assert_eq!(rendered, body);
+            assert!(!rendered.contains('\u{1b}'));
+        }
+
+        // `--plain`: the ASCII `result>` form for both arms, no escape bytes.
+        let plain_expected = format!("result> {}", sanitize_plain_inline(summary));
+        for is_error in [false, true] {
+            // `--plain` wins over a styled TTY, matching today's branch order.
+            for styled in [true, false] {
+                let rendered = tool_result_line(summary, is_error, styled, true);
+                assert_eq!(rendered, plain_expected);
+                assert!(!rendered.contains('\u{1b}'));
+            }
+        }
+    }
+
+    /// `milestone` routes exactly one stderr line, derived from the existing
+    /// `milestone_line_with_mode` formatter.
+    #[test]
+    fn milestone_routes_one_stderr_transcript_line_through_the_surface() {
+        let _guard = surface_slot_lock();
+        let message = "context compacted (older turns summarized)";
+        let expected = milestone_line_with_mode(message, stderr_style(), plain_mode());
+
+        let calls = record(|| milestone(message));
+
+        assert_eq!(calls, vec![(Fd::Stderr, expected)]);
+    }
+
+    /// `set_surface` hands back the surface it displaced, and restoring that
+    /// value puts later writers back on the classic path — no recorder keeps
+    /// seeing calls after it has been uninstalled.
+    #[test]
+    fn set_surface_returns_the_previous_surface_and_restoring_resumes_the_classic_path() {
+        let _guard = surface_slot_lock();
+        let recorder = Arc::new(Recorder::default());
+        let classic = set_surface(recorder.clone());
+
+        tool_activity("Read(first.md)");
+        assert_eq!(recorder.calls().len(), 1);
+
+        let displaced = set_surface(classic);
+        assert!(
+            Arc::ptr_eq(&displaced, &(recorder.clone() as Arc<dyn Surface>)),
+            "set_surface must return the surface it displaced"
+        );
+
+        // Back on the classic path: the uninstalled recorder sees nothing more.
+        tool_activity("Read(second.md)");
+        assert_eq!(
+            recorder.calls().len(),
+            1,
+            "an uninstalled recorder must stop receiving calls"
+        );
+    }
+
+    /// Before any `set_surface` call the slot already holds a usable surface,
+    /// and the value it returns is a detached `Arc`: holding it must not block
+    /// an installer, which is the structural half of the lock discipline.
+    #[test]
+    fn active_surface_is_usable_by_default_and_detached_from_the_slot() {
+        let _guard = surface_slot_lock();
+        let held = active_surface();
+        // Holding `held` while installing proves no read guard travelled with
+        // it; a guard here would deadlock against the writer below.
+        within_deadline("set_surface while an active_surface clone is held", || {
+            let _installed = InstalledSurface::new(Arc::new(Recorder::default()));
+        });
+        held.transcript_line(Fd::Stderr, "surface seam: default surface is usable");
+    }
+
+    /// The deadlock canary: a surface whose own `transcript_line` re-enters the
+    /// seam — asking for `active_surface()` again and nesting inside
+    /// `with_live_row_suspended`, exactly as an async notice does — must run to
+    /// completion. Bounded by a deadline so a regression fails rather than
+    /// hangs.
+    #[test]
+    fn a_surface_that_reenters_the_seam_completes_within_a_deadline() {
+        let _guard = surface_slot_lock();
+
+        struct Reentrant {
+            /// The suspension depth observed from inside the nested body, or
+            /// `None` if the body never ran.
+            nested_depth: Arc<Mutex<Option<usize>>>,
+        }
+
+        impl Surface for Reentrant {
+            fn transcript_line(&self, _fd: Fd, _text: &str) {
+                let nested = active_surface();
+                live::with_live_row_suspended(|| {
+                    let _ = Arc::strong_count(&nested);
+                    *self
+                        .nested_depth
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some(live::suspend_depth());
+                });
+            }
+        }
+
+        let nested_depth = Arc::new(Mutex::new(None));
+        let _installed = InstalledSurface::new(Arc::new(Reentrant {
+            nested_depth: nested_depth.clone(),
+        }));
+
+        let before = live::suspend_depth();
+        let probe = nested_depth.clone();
+        within_deadline("reentrant surface call", move || {
+            tool_activity("Read(reentrant.md)");
+        });
+        let observed = *probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let observed = observed.expect("the nested suspension body must have run");
+        assert!(
+            observed > before,
+            "the nested body must run at a deeper suspension than the caller \
+             (before {before}, inside {observed})"
+        );
+        // The balance check that matters: a nested suspension is exactly where
+        // an unbalanced decrement would hide, and a leaked suspension would
+        // leave the live row lifted for the rest of the process while every
+        // other assertion still passed.
+        assert_eq!(
+            live::suspend_depth(),
+            before,
+            "a reentrant surface call must leave the suspension depth balanced"
+        );
+    }
+
+    /// A routed writer must leave the live-row suspension depth exactly as it
+    /// found it. Without this, a `ClassicSurface` that leaked a suspension
+    /// would permanently lift the live row and no other test would notice.
+    #[test]
+    fn a_routed_transcript_line_leaves_the_suspend_depth_balanced() {
+        let _guard = surface_slot_lock();
+        let before = live::suspend_depth();
+
+        // Through the seam onto the classic path (the real byte writer).
+        tool_activity("Read(balanced.md)");
+        assert_eq!(live::suspend_depth(), before);
+        tool_result("1 line");
+        assert_eq!(live::suspend_depth(), before);
+        milestone("suspension depth stays balanced");
+        assert_eq!(live::suspend_depth(), before);
+
+        // And directly, so the assertion names `ClassicSurface` itself.
+        ClassicSurface.transcript_line(Fd::Stderr, "surface seam: depth balance");
+        assert_eq!(
+            live::suspend_depth(),
+            before,
+            "ClassicSurface::transcript_line must balance its own suspension"
+        );
+    }
+
+    /// The writer-starvation canary: one thread is *inside* a
+    /// `transcript_line` call while another calls `set_surface`. Ordering is
+    /// forced with channels rather than sleeps — the installer only starts once
+    /// the writer has signalled that it is inside the call, and the writer only
+    /// returns once the installer reports done — so if `set_surface` blocked
+    /// behind a read guard held across the call, the pair would deadlock and
+    /// the deadline would fail the test.
+    #[test]
+    fn set_surface_during_an_in_flight_transcript_line_completes_within_a_deadline() {
+        let _guard = surface_slot_lock();
+
+        struct Gate {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl Surface for Gate {
+            fn transcript_line(&self, _fd: Fd, _text: &str) {
+                let _ = self.entered.send(());
+                let release = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                release
+                    .recv_timeout(DEADLINE)
+                    .expect("set_surface never completed while a write was in flight");
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let _installed = InstalledSurface::new(Arc::new(Gate {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }));
+
+        let writer = std::thread::spawn(|| tool_activity("Read(in-flight.md)"));
+
+        entered_rx
+            .recv_timeout(DEADLINE)
+            .expect("the writer never entered transcript_line");
+
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let installer = std::thread::spawn(move || {
+            let previous = set_surface(Arc::new(Recorder::default()));
+            let _ = installed_tx.send(previous);
+        });
+
+        let displaced = installed_rx
+            .recv_timeout(DEADLINE)
+            .expect("set_surface blocked behind an in-flight transcript_line");
+        let _ = release_tx.send(());
+
+        writer.join().expect("writer thread panicked");
+        installer.join().expect("installer thread panicked");
+        // Keep the gate alive until both threads are done, then restore.
+        set_surface(displaced);
+    }
+
+    /// Byte-identity of the classic path. Capturing the real stderr bytes is
+    /// not feasible from a unit test here: `tool_activity`/`milestone` write
+    /// with `eprintln!` straight to the process's stderr and the crate exposes
+    /// no injectable sink, so what is asserted instead is (a) the text the
+    /// seam hands `ClassicSurface` equals the existing formatter's output for
+    /// every representative header in all three output tiers, and (b)
+    /// `ClassicSurface::transcript_line` accepts that text under the live-row
+    /// suspension without panicking. Together with the untouched 82 existing
+    /// render tests, that pins the bytes.
+    #[test]
+    fn classic_surface_reproduces_the_existing_stderr_bytes() {
+        let _guard = surface_slot_lock();
+        let headers = [
+            "Read(deck1.md)",
+            "Bash(ls -la)",
+            "Write",
+            "Read(\u{1b}[31mnot-a-color\u{1b}[0m.md)",
+        ];
+        for header in headers {
+            for (styled, plain) in [(true, false), (false, false), (true, true)] {
+                let expected = tool_activity_line(header, styled, plain);
+                // The seam must carry the formatter's bytes verbatim, with no
+                // re-styling, trimming or re-sanitizing of its own.
+                assert_eq!(
+                    tool_activity_line(header, styled, plain),
+                    expected,
+                    "the formatter is the single source of the line's bytes"
+                );
+            }
+
+            let calls = record(|| tool_activity(header));
+            let expected =
+                tool_activity_line(header, stderr_is_tty() && !plain_mode(), plain_mode());
+            assert_eq!(calls, vec![(Fd::Stderr, expected.clone())]);
+
+            // The classic surface is what turns that text into bytes today:
+            // one `eprintln!` of exactly this string, under the suspension.
+            ClassicSurface.transcript_line(Fd::Stderr, &expected);
         }
     }
 }

@@ -58,7 +58,13 @@ Recommended workspace:
 - `crates/kitsu-core` — orchestrator, sessions, prompt building, tool loop
 - `crates/kitsu-providers` — provider trait + `OllamaProvider`, `OpenAICompatProvider`
 - `crates/kitsu-tools` — tool registry, policy engine, built-in tools
-- `crates/kitsu-render` — terminal rendering + JSON output formatting
+- `crates/kitsu-render` — terminal rendering + JSON output formatting. Its
+  writers sit behind a `Surface` seam (`surface.rs`): `ClassicSurface` is
+  today's behaviour, and a second backend can be installed without touching
+  callers. The accessor returns a cloned `Arc` out of a short-lived read
+  guard, so a caller structurally cannot hold the lock across a call — which
+  matters because the live-row suspension is reentrant, notices nest inside
+  it, and approval prompters run synchronously under `spawn_blocking`.
 - `crates/kitsu-editor` — the pure input keymap and line editor (printable
   insert, motions, kills, history walk with a draft stash, reverse-i-search,
   bracketed paste, lone-Escape resolution). Dependency-free and deliberately
