@@ -262,12 +262,16 @@ oldest verified artifact. `/artifacts` lists usage and prunes by ID or all.
 
 `/jobs` exposes bounded running/record capacity, status, elapsed time, model,
 usage, tool/write counts, safe recent activity, failure class, terminal result
-handoff, targeted steering, joined cancellation, and pruning. `/agent show`
+handoff, targeted steering, joined cancellation, and pruning. `/jobs view`
+presents the same deck grouped by state, with agents needing input first and
+empty groups omitted. `/agent show`
 adds a bounded redacted event timeline; tool arguments/output and partial model
 bodies are never copied into that inspection record. Built-in `/profiles`
 select a read-only reviewer or a tool-free reasoning worker, and background
 spawns can name a profile without inheriting broader capabilities. `/agents`
-remains a compatibility alias. Styled mode prints background-agent notices
+remains a compatibility alias: a bare call lists, a numeric argument shows
+that thread, and any other argument is forwarded verbatim to `/jobs`, so every
+subcommand is reachable through either name. Styled mode prints background-agent notices
 between prompt cycles by default; `KITSU_LIVE_NOTICES=1` opts into a live
 redraw-safe external printer at the cost of idle input latency. Literal
 plain/assistive input defers notices until the current line is submitted.
