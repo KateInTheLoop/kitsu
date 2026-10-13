@@ -56,6 +56,33 @@ pub struct Config {
     /// on first use.
     #[serde(skip)]
     detected_local: OnceLock<Option<(Gateway, Vec<String>)>>,
+    /// Optional `[agents]` table. Absent is the same as every key at its
+    /// default, which is why callers read it as `agents.unwrap_or_default()`
+    /// rather than being handed a silently materialized table.
+    #[serde(default)]
+    pub agents: Option<AgentsConfig>,
+}
+
+/// When the per-process agent state file is written (docs/architecture.md).
+/// `Auto` is the default: only a real interactive session writes, so scripted,
+/// piped and JSONL runs leave no state behind unless asked to.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StateFileMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+/// The `[agents]` table. Unknown keys are rejected loudly: `agent_spawn_cap`
+/// deliberately stays a flat top-level key, so a copy of it in here is a
+/// mistake and must not be silently ignored.
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsConfig {
+    #[serde(default)]
+    pub state_file: StateFileMode,
 }
 
 /// Well-known loopback ports of OpenAI-compatible local runtimes, probed in
@@ -728,6 +755,71 @@ mod tests {
         .expect_err("unknown adapter names must fail closed");
         assert!(error.message().contains("unknown variant"));
         assert!(error.message().contains("messages-ish"));
+    }
+
+    /// The `[agents]` table carries the state-file switch. `agent_spawn_cap`
+    /// deliberately stays a flat key, so the table must not swallow it.
+    #[test]
+    fn agents_state_file_mode_parses_all_three_spellings() {
+        for (text, expected) in [
+            ("[agents]\nstate_file = \"on\"\n", StateFileMode::On),
+            ("[agents]\nstate_file = \"off\"\n", StateFileMode::Off),
+            ("[agents]\nstate_file = \"auto\"\n", StateFileMode::Auto),
+        ] {
+            let parsed: Config = toml::from_str(text).expect(text);
+            assert_eq!(
+                parsed.agents.unwrap_or_default().state_file,
+                expected,
+                "parsing {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_table_defaults_to_auto_when_absent_or_empty() {
+        let none: Config = toml::from_str("default_gateway = \"example\"\n").unwrap();
+        assert_eq!(
+            none.agents.unwrap_or_default().state_file,
+            StateFileMode::Auto,
+            "a config without [agents] must still load and default to auto"
+        );
+
+        let empty: Config = toml::from_str("[agents]\n").unwrap();
+        assert_eq!(
+            empty.agents.unwrap_or_default().state_file,
+            StateFileMode::Auto
+        );
+
+        assert_eq!(AgentsConfig::default().state_file, StateFileMode::Auto);
+    }
+
+    #[test]
+    fn agents_table_rejects_unknown_keys_and_values_instead_of_defaulting() {
+        let error = toml::from_str::<Config>("[agents]\nstate_fle = \"on\"\n")
+            .expect_err("a typo inside [agents] must be rejected, not defaulted");
+        assert!(error.message().contains("unknown field"), "{error}");
+        assert!(error.message().contains("state_fle"), "{error}");
+
+        let error = toml::from_str::<Config>("[agents]\nstate_file = \"sometimes\"\n")
+            .expect_err("an unknown mode must fail closed rather than default to auto");
+        assert!(error.message().contains("unknown variant"), "{error}");
+        assert!(error.message().contains("sometimes"), "{error}");
+    }
+
+    /// The spawn cap is not part of the new table: putting it there must be a
+    /// loud error, and the flat key must keep working alongside `[agents]`.
+    #[test]
+    fn agent_spawn_cap_stays_a_flat_key_beside_the_agents_table() {
+        let parsed: Config =
+            toml::from_str("agent_spawn_cap = 3\n\n[agents]\nstate_file = \"on\"\n").unwrap();
+        assert_eq!(parsed.agent_spawn_cap, Some(3));
+        assert_eq!(
+            parsed.agents.unwrap_or_default().state_file,
+            StateFileMode::On
+        );
+
+        toml::from_str::<Config>("[agents]\nagent_spawn_cap = 3\n")
+            .expect_err("the spawn cap must not be accepted inside [agents]");
     }
 
     #[test]
