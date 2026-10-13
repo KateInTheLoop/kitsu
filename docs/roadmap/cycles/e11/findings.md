@@ -255,3 +255,113 @@ write is still swallowed exactly as it was against stdout, and the returned
 byte count is computed from the formatted text rather than from what the
 writer accepted — so a short-writing sink would make the count a lie, though
 `write_all` masks that and both call sites ignore the count.
+
+## F13 — the planned T0-S4 acceptance test is impossible: vt100 discards region-scrolled rows
+
+Found: T0-S4, before any work started, by reading the emulator's source rather
+than trusting the plan. `vt100 0.15.2`'s `Grid::scroll_up` is:
+
+```rust
+let removed = self.rows.remove(usize::from(self.scroll_top));
+if self.scrollback_len > 0 && !self.scroll_region_active() {
+    self.scrollback.push_back(removed);
+    ...
+}
+```
+
+and `scroll_region_active()` is true whenever `scroll_top != 0 || scroll_bottom
+!= rows - 1`. The inline viewport sets a region covering rows 1 to
+`rows - viewport_rows`, so the region **is** active and every row scrolled out
+of it is dropped rather than pushed to scrollback.
+
+The plan's T0-S4 acceptance — "200 alternating stdout/stderr lines through
+`vt100::Parser` → screen rows show the viewport, **scrollback holds all 200 in
+order**" — therefore cannot pass. Not because the implementation would be
+wrong, but because the emulator models a terminal that does not retain
+region-scrolled lines. An agent given that acceptance would have spent a whole
+cycle chasing it.
+
+**This is not merely a test-harness quirk; it is the design's open question Q1
+showing up early.** Whether region-scrolled lines reach native scrollback is
+terminal-dependent, which is exactly why T0-S6 exists and why the design keeps
+a Codex-style per-cell `insert_history` fallback. vt100 is a concrete instance
+of a terminal where region flow loses the transcript.
+
+**Consequences, applied in T0-S4:**
+1. The in-process emulator test verifies the **screen** half only: the viewport
+   rows stay put under absolute positioning, transcript lines scroll within the
+   region, and the cursor is parked inside it. The scrollback half is asserted
+   *negatively* — a test pins that the emulator discards those rows, so the
+   limitation is recorded in code rather than folklore.
+2. Verifying that a **real** terminal retains region-scrolled lines is T0-S6's
+   live matrix, which is where it always belonged. T0-S4 must not claim it.
+3. The `insert_history` fallback stays deferred until T0-S6 reports. Building
+   both mechanisms before measuring which is needed is speculative work, and
+   the plan's own go/no-go exists to decide it.
+
+The plan's T0-S4 acceptance text is corrected in the same commit.
+
+## F14 — a raw-mode backend must emit CRLF; my byte contract said LF
+
+Found: T0-S4, by the test author, from running the emulator rather than
+reasoning about it. I specified `InlineSurface::transcript_line` as
+`text + "\n"`. That is wrong for this backend: `TuiRuntime::enter` enables raw
+mode, which clears `ONLCR`, so a bare line feed moves down without returning
+to column zero and **every transcript line staircases**.
+
+The author demonstrated it, then compensated inside the test helper by
+prefixing each line with a carriage return — and said plainly that this meant
+the test no longer proved the contract sufficient. That honesty is what made
+the defect visible; the worst outcome would have been a contract that looks
+tested and fails on real hardware during the live smoke, with a symptom
+("output marching diagonally") several layers from its cause.
+
+**Resolved in T0-S4**: the contract is `text + "\r\n"` for `InlineSurface`, and
+the emulator helper's compensation was removed so the test proves the real
+contract. The principle, worth stating because it will recur: **each backend
+knows its own terminal mode.** `ClassicSurface` keeps a bare line feed because
+it runs in cooked mode where the kernel translates; a raw-mode backend must
+supply the return itself.
+
+**Lesson for later cards:** any byte contract written for the TUI backend must
+be checked against raw mode, not against what works in a cooked-mode terminal.
+`write_block` is unaffected only because the block writes its own bytes — which
+means *its* callers inherit the same obligation.
+
+## F15 — the live status row and the inline viewport will fight; someone must choose
+
+Found: T0-S4. `ClassicSurface::transcript_line` wraps every write in
+`live::with_live_row_suspended`, which clears and repaints a row at the cursor.
+`InlineSurface` does no suspension at all — it does not need to, because its
+viewport is pinned outside the scroll region.
+
+If both are active, the live row paints *inside* the scroll region and scrolls
+away with the transcript, or fights the viewport's parked cursor.
+
+The resolution is almost certainly that **the viewport replaces the live row**:
+its bottom rows already carry the spinner, draft, queue tag and ambient agent
+tag that the live row exists to show, so running both is duplication as well as
+conflict. But that is a decision for the bridge card (T0-S5), which is where
+both become reachable in one process, and it must be made explicitly rather
+than discovered as flicker. Recorded so it cannot be inherited silently.
+
+## F16 — the viewport has no resize and no row truncation
+
+Found: T0-S4, both from the test author.
+
+**Resize.** `show(rows, viewport_rows)` latches the bottom row, so a `SIGWINCH`
+leaves a stale scroll region and `paint` writes to absolute rows that may no
+longer exist. The terminal clamps, so the symptom is a silently drifting
+viewport rather than an error. There is no `resize` in the API.
+
+**Truncation.** `paint` emits `ESC[2K` then the row text, with no width limit,
+so a row longer than the terminal is wide wraps into the next viewport row and
+corrupts it. `kitsu-render`'s live row already does careful width fitting for
+exactly this reason (see its `fit_draft_window` and the width-sweep tests), and
+that logic is the precedent to reuse rather than reinvent.
+
+Neither blocks the proof of concept, which uses a fixed size and short rows, so
+both were deliberately left out of T0-S4 rather than bundled into a card that
+is already the first to draw. Resize reflow is already scoped as T3-S8; row
+truncation needs a `cols` input the current API does not take, and belongs with
+it.
