@@ -556,7 +556,7 @@ Explicitly **not** adopting from CC, with reasons:
 - **LLM permission classifier** (CC's Haiku "yolo" classifier) — adds a model call + prompt-maintenance burden; deterministic rules (P1-1) are better for a CLI.
 - **Network telemetry** — kitsu's local `tracing` + audit log is the right amount; no Datadog/1P sinks.
 - **Provider proliferation** — Anthropic-native, Bedrock-native adapters, etc. The OpenAI wire + gateways already reach every model kitsu needs (`docs/functionality.md`); adding backends is cost without benefit.
-- **Custom TUI / Ink-style renderer** — kitsu's line-based REPL (native scrollback, copy-paste) is a deliberate, correct UX choice (`docs/functionality.md`); don't trade it for an alt-screen.
+- **Custom TUI / Ink-style renderer** — kitsu's line-based REPL (native scrollback, copy-paste) is a deliberate, correct UX choice (`docs/functionality.md`); don't trade it for an alt-screen. **Superseded 2026-10-12** by `docs/tui-and-agent-view-design.md`: the default renderer keeps the transcript in native scrollback (Codex-style inline viewport); the alternate screen is overlay-only and fullscreen is opt-in, so the rationale here is preserved.
 - **Feature-flag / build-DCE framework** (CC's `bun:bundle` `feature()`) — Cargo features suffice for the rare gate.
 - **Full tree-sitter bash security** — the metacharacter-rejecting allowlist (P1-2) gets 90% of the safety at 5% of the cost; only revisit if kitsu ever needs to run arbitrary compound commands (it shouldn't).
 
