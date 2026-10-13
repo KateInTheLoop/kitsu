@@ -394,7 +394,13 @@ fn build_body<'a>(req: &'a ChatRequest) -> Result<WireRequest<'a>, ProviderError
                             kind: "function",
                             function: WireToolCallFn {
                                 name: &tc.tool_name,
-                                arguments: &tc.args,
+                                // A no-argument call streams no argument deltas;
+                                // Bedrock rejects the replayed "" as non-JSON.
+                                arguments: if tc.args.trim().is_empty() {
+                                    "{}"
+                                } else {
+                                    &tc.args
+                                },
                             },
                         })
                         .collect(),
