@@ -65,6 +65,12 @@ Recommended workspace:
   a library rather than a module of the binary: `crates/kitsu` is binary-only,
   so a library crate cannot import from it, and the planned terminal UI needs
   the same editor the binary's input collector uses.
+- `crates/kitsu-tui` — the terminal UI: pinned `ratatui 0.29` plus
+  `crossterm 0.28` (0.30 of ratatui requires a newer Rust than this workspace
+  declares). Currently carries only the terminal lifecycle — raw mode, window
+  title push and pop, and restoration on drop, interrupt and panic — because
+  giving the terminal back on every exit path has to be right before anything
+  is drawn on it.
 
 This separation keeps provider logic independent from CLI parsing and makes it easier to add:
 - new providers (e.g., llama.cpp server)
