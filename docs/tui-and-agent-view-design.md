@@ -448,6 +448,14 @@ Codex's approach, adapted to kitsu's two-fd transcript:
     written **normally on its own fd** (stdout for assistant text, stderr for
     chrome) and scrolls into scrollback like today; the viewport rows below
     the region are painted by absolute positioning on stderr.
+    **An in-process emulator cannot settle this.** `vt100` pushes rows to its
+    scrollback only when no scroll region is active, so with the viewport's
+    region set it discards them (finding F13) — which is itself a faithful
+    model of a terminal that does not retain region-scrolled lines. So the
+    screen half of the mechanism is verifiable in process, and whether a
+    **real** terminal keeps the transcript is strictly a live-matrix question
+    for the proof of concept. That is Q1, and it is why the fallback below
+    stays unbuilt until the matrix reports.
   - **Insert-history (Codex-style fallback):** on cell completion, set the
     region, write the cell's text on its own fd inside a synchronized update,
     flush, reset — the interleaving `with_live_row_suspended` already relies

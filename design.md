@@ -85,7 +85,12 @@ Recommended workspace:
   declares). Currently carries only the terminal lifecycle — raw mode, window
   title push and pop, and restoration on drop, interrupt and panic — because
   giving the terminal back on every exit path has to be right before anything
-  is drawn on it.
+  is drawn on it. `viewport.rs` adds `InlineSurface`, a `Surface` backend that
+  pins a bottom region with `DECSTBM` and paints its rows by absolute
+  positioning while transcript lines flow upward. Its sinks are injectable per
+  descriptor so the whole mechanism is testable in process, and it emits CRLF
+  rather than LF: it lives behind raw mode, which clears `ONLCR`, so each
+  backend supplies its own line ending.
 
 This separation keeps provider logic independent from CLI parsing and makes it easier to add:
 - new providers (e.g., llama.cpp server)

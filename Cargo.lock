@@ -1290,6 +1290,7 @@ name = "kitsu-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "kitsu-render",
  "ratatui",
  "vt100",
 ]
