@@ -111,8 +111,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T0-S4 inline viewport, region flow and painting | done | this commit |
 | T0-S5a F15 settled, gate and surface install | done | this commit |
 | T0-S5b styled PTY harness and the Q3 measurement | done | this commit |
-| T0-S5c act on the measurement | next | — |
-| T0-S5d idle input path | after S5c | — |
+| T0-S5c fix the F18 teardown defect | done | this commit |
+| T0-S5d idle input path | next | — |
 
 With T1-S6 done, **milestone T1 is complete**: kitsu now exposes its
 background agents to the outside three ways — a grouped and explainable deck
