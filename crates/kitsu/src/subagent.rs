@@ -423,6 +423,19 @@ pub struct AgentRegistrySnapshot {
     pub running: usize,
     pub terminal: usize,
     pub failed: usize,
+    /// Retained terminal agents whose result handoff is still
+    /// [`AgentHandoffState::Ready`], meaning no user or model surface has
+    /// observed the result yet. Carried separately from `terminal` because a
+    /// record stays terminal forever once it finishes, while this count is what
+    /// a watcher must surface as "there is something here for you to read" and
+    /// must drop again the moment the result is read or acknowledged.
+    pub unacknowledged: usize,
+    /// Agents waiting on a user answer. Reserved: always 0 in this story, since
+    /// no agent state can express that wait yet. A later story (background
+    /// agents that block on a permission answer) populates it, and the guard
+    /// test asserting it is always zero must then be updated deliberately
+    /// rather than discovered as a surprise.
+    pub blocked: usize,
 }
 
 impl Default for AgentRegistry {
@@ -1182,11 +1195,17 @@ impl AgentRegistry {
             .values()
             .filter(|record| matches!(record.status, AgentStatus::Failed(_)))
             .count();
+        let unacknowledged = agents
+            .values()
+            .filter(|record| record.thread.handoff() == AgentHandoffState::Ready)
+            .count();
         AgentRegistrySnapshot {
             generation,
             running,
             terminal: agents.len().saturating_sub(running),
             failed,
+            unacknowledged,
+            blocked: 0,
         }
     }
 
@@ -3064,5 +3083,200 @@ mod tests {
             open_budget(),
         );
         assert!(handler("not json".to_string()).await.is_err());
+    }
+
+    #[test]
+    fn fresh_registry_snapshot_has_no_unacknowledged_or_blocked_agents() {
+        let registry = AgentRegistry::new();
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.unacknowledged, 0);
+        assert_eq!(snapshot.blocked, 0);
+    }
+
+    #[test]
+    fn a_done_agent_is_published_as_terminal_and_unacknowledged() {
+        let registry = AgentRegistry::new();
+        let mut changes = registry.subscribe();
+        let id = registry.start("ambient status".to_string()).unwrap();
+        registry.finish(id, Ok("done".to_string()));
+
+        let snapshot = *changes.borrow_and_update();
+        assert_eq!(snapshot.terminal, 1);
+        assert_eq!(snapshot.unacknowledged, 1);
+        assert_eq!(snapshot.running, 0);
+        assert_eq!(registry.handoff_state(id), Some(AgentHandoffState::Ready));
+    }
+
+    /// Headline T1-S1 behaviour: acknowledging a result must publish a NEW
+    /// snapshot whose `unacknowledged` has dropped, while the record itself is
+    /// retained and still counted as terminal.
+    #[test]
+    fn acknowledging_a_result_publishes_a_snapshot_with_no_unacknowledged_agents() {
+        let registry = AgentRegistry::new();
+        let mut changes = registry.subscribe();
+        let id = registry.start("needs an ack".to_string()).unwrap();
+        registry.finish(id, Ok("done".to_string()));
+
+        let before = *changes.borrow_and_update();
+        assert_eq!(before.terminal, 1);
+        assert_eq!(
+            before.unacknowledged, 1,
+            "an unread result is unacknowledged"
+        );
+
+        assert_eq!(
+            registry.acknowledge_result(id),
+            AgentHandoffAckOutcome::Acknowledged
+        );
+
+        let after = *changes.borrow_and_update();
+        assert!(
+            after.generation > before.generation,
+            "acknowledgement must publish a new snapshot"
+        );
+        assert_eq!(
+            after.unacknowledged, 0,
+            "an acknowledged result is no longer unacknowledged"
+        );
+        assert_eq!(
+            after.terminal, 1,
+            "the record is retained, so it is still terminal"
+        );
+        assert_eq!(registry.snapshot(), after);
+    }
+
+    #[test]
+    fn reading_a_result_clears_unacknowledged_but_peeking_does_not() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("peek then read".to_string()).unwrap();
+        registry.finish(id, Ok("payload".to_string()));
+
+        assert_eq!(registry.peek_result(id).as_deref(), Some("payload"));
+        assert_eq!(
+            registry.snapshot().unacknowledged,
+            1,
+            "peek_result must not acknowledge the handoff"
+        );
+
+        assert_eq!(registry.result(id).as_deref(), Some("payload"));
+        assert_eq!(
+            registry.snapshot().unacknowledged,
+            0,
+            "result() acknowledges implicitly"
+        );
+        assert_eq!(registry.snapshot().terminal, 1);
+    }
+
+    #[test]
+    fn a_failed_agent_counts_as_unacknowledged_until_acknowledged() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("will fail".to_string()).unwrap();
+        registry.finish(id, Err("boom".to_string()));
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.failed, 1);
+        assert_eq!(snapshot.unacknowledged, 1);
+
+        assert_eq!(
+            registry.acknowledge_result(id),
+            AgentHandoffAckOutcome::Acknowledged
+        );
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.failed, 1, "the failure is still a failure");
+        assert_eq!(
+            snapshot.unacknowledged, 0,
+            "failed and unacknowledged are independent counts"
+        );
+    }
+
+    #[test]
+    fn draining_unobserved_terminal_results_clears_unacknowledged() {
+        let registry = AgentRegistry::new();
+        let done = registry.start("done work".to_string()).unwrap();
+        let failed = registry.start("failed work".to_string()).unwrap();
+        registry.finish(done, Ok("ok".to_string()));
+        registry.finish(failed, Err("bad".to_string()));
+        assert_eq!(registry.snapshot().unacknowledged, 2);
+
+        assert_eq!(registry.take_unobserved_terminal_results().len(), 2);
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.unacknowledged, 0);
+        assert_eq!(snapshot.terminal, 2);
+    }
+
+    #[test]
+    fn one_of_two_terminal_agents_acknowledged_leaves_one_unacknowledged() {
+        let registry = AgentRegistry::new();
+        let first = registry.start("first".to_string()).unwrap();
+        let second = registry.start("second".to_string()).unwrap();
+        registry.finish(first, Ok("one".to_string()));
+        registry.finish(second, Ok("two".to_string()));
+        assert_eq!(registry.snapshot().unacknowledged, 2);
+
+        assert_eq!(
+            registry.acknowledge_result(first),
+            AgentHandoffAckOutcome::Acknowledged
+        );
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.terminal, 2);
+        assert_eq!(snapshot.unacknowledged, 1);
+    }
+
+    /// Guard: `blocked` is reserved for a later story that introduces a
+    /// user-answer wait state. No agent can be blocked yet, so every snapshot
+    /// must publish zero. The story that starts populating `blocked` must
+    /// update this test deliberately rather than discover it as a surprise.
+    #[test]
+    fn blocked_is_always_zero_until_a_later_story_populates_it() {
+        let registry = AgentRegistry::new();
+        let running = registry.start("still running".to_string()).unwrap();
+        assert_eq!(
+            registry.snapshot().blocked,
+            0,
+            "a running agent is not blocked"
+        );
+
+        let done = registry.start("done".to_string()).unwrap();
+        registry.finish(done, Ok("ok".to_string()));
+        assert_eq!(
+            registry.snapshot().blocked,
+            0,
+            "a terminal agent is not blocked"
+        );
+
+        assert_eq!(
+            registry.acknowledge_result(done),
+            AgentHandoffAckOutcome::Acknowledged
+        );
+        assert_eq!(registry.snapshot().blocked, 0);
+        let _ = running;
+    }
+
+    #[test]
+    fn closing_a_terminal_record_leaves_no_stale_unacknowledged_count() {
+        let registry = AgentRegistry::new();
+        let kept = registry.start("kept".to_string()).unwrap();
+        let closed = registry.start("closed".to_string()).unwrap();
+        registry.finish(kept, Ok("kept result".to_string()));
+        registry.finish(closed, Ok("closed result".to_string()));
+        assert_eq!(registry.snapshot().unacknowledged, 2);
+
+        let AgentPruneOutcome::Pruned(_) = registry.close(closed) else {
+            panic!("a terminal record closes");
+        };
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.terminal, 1);
+        assert_eq!(
+            snapshot.unacknowledged, 1,
+            "a closed record must not keep counting as unacknowledged"
+        );
+        assert_eq!(snapshot.blocked, 0);
+
+        let AgentPruneOutcome::Pruned(_) = registry.prune(kept) else {
+            panic!("a terminal record prunes");
+        };
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.terminal, 0);
+        assert_eq!(snapshot.unacknowledged, 0);
     }
 }
