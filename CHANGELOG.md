@@ -92,6 +92,10 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- The inline viewport's composer gained **`@file` path completion** and hint
+  highlighting. It offers the same candidates in the same order as the classic
+  prompt, because both read from one completion source rather than two
+  implementations kept in step by hand.
 - `--tui inline`, or `[tui] mode = "inline"` in the config, opts into an inline
   viewport: a status row pinned to the bottom of the terminal with the
   transcript scrolling above it, instead of one status row repainted in place.

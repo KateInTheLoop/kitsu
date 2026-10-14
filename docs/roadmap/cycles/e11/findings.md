@@ -2591,3 +2591,31 @@ The decisive property, verified by running the real loader: a typo and a
 credential in the same key produce **byte-identical messages**, differing only
 in the reported column. A message that cannot depend on the value cannot leak
 it — which is a stronger guarantee than one that merely tries not to.
+
+### F20 third pass — what R4 actually left undone, and what T3-S3 closes
+
+F20 has now been corrected twice and clarified a third time, so here is the
+settled list. Of the four things R4 was thought to have left behind:
+
+- **cross-session history** — the original claim was **false**; it works, by
+  borrowing rustyline's persistence;
+- **reverse search** — also **false**; only the `⌕ reverse-search '…'` indicator
+  was missing, and T0-S9 restored it;
+- **Tab accepting the showing slash suffix** — **done** in T0-S10;
+- **the lists** — `@file` path completion and the bordered palette — **the
+  genuine remainder.**
+
+**T3-S3 closes the `@file` half**, through one shared completion source rather
+than a second implementation, and re-hosts the highlighter.
+
+**It does not close the bordered palette**, and that distinction matters: the
+palette's *content* is already solved (`tui_bridge::palette_rows` is a tested
+thin join over the one renderer), so what remains is purely its **height and
+placement** — a geometry problem entangled with **F16** (resize) and **F19**
+(the short-terminal clamp), not a completion problem. Anyone reading "T3-S3
+done" should not read it as "F20 closed".
+
+The lesson F20 keeps teaching, now for the third time: **a list of "what is
+missing" written from memory of a design is unreliable.** Two of its four items
+were features that already worked. Each correction came from reading the code or
+running the binary, never from re-reading the design.

@@ -309,6 +309,10 @@ that thread, and any other argument is forwarded verbatim to `/jobs`, so every
 subcommand is reachable through either name.
 
 Background agents run in-process, so nothing outside kitsu can observe them.
+In the inline viewport the composer offers `@file` path completion and slash
+completion with the **same candidates, in the same order**, as the classic
+prompt: both hosts call one completion source, and a test sweeps every prefix of
+every registered command requiring all three to agree, so the two cannot drift.
 `--tui <classic|inline>` and the `[tui]` table select the renderer: `mode`
 (default `classic`), `alternate_screen` (`auto|always|never`, forced to `never`
 by `--no-alt-screen`), `prefix` (default `ctrl+x`), `title`,

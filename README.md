@@ -1180,9 +1180,11 @@ one does, built on kitsu's own editor rather than Rustyline: command history
 persists across sessions, Ctrl+R reverse search works, Tab completes a slash
 command from the hint beside your draft, and typing a slash prefix opens the
 **bordered command palette** above the composer — it grows and narrows as you
-type, shrinks to fit a short window, and closes when the prefix does. Still
-missing: `@file` path completion, and syntax highlighting of the draft. What it
-does have:
+type, shrinks to fit a short window, and closes when the prefix does. `@file`
+path completion works here too, offering the same candidates in the same order
+as the classic prompt — both read from one completion source, so they cannot
+drift apart. Still missing: syntax highlighting of the draft. What it does
+have:
 insertion and cursor motion, Home/End, Backspace/Delete, the Ctrl+U/K/W kills,
 Up/Down through the current session's history, bracketed paste kept as one
 draft, resizing the window (the pinned row follows, and the viewport steps
