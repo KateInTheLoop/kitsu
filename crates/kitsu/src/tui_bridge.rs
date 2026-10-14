@@ -144,7 +144,7 @@ pub(crate) fn install(
 
     let viewport = Arc::new(InlineSurface::new(out, err));
     viewport.show(rows, viewport_rows);
-    viewport.paint(&[status.to_string()]);
+    viewport.paint(&[status.to_string()], live::terminal_columns());
 
     // Finding F15: the viewport owns the bottom rows, so the live row stands
     // down for as long as it is installed.
@@ -204,7 +204,7 @@ impl BridgeGuard {
             // multi-row composer lands.
             live::compose_input_row(&composed, live::terminal_columns()).0
         };
-        self.viewport.paint(&[row]);
+        self.viewport.paint(&[row], live::terminal_columns());
     }
 
     /// Finding F21, step 1: hand the terminal back as a normal full-screen
@@ -290,7 +290,8 @@ impl BridgeGuard {
         // it re-enters the reader.
         self.viewport
             .show(self.rows.get(), self.viewport_rows.get());
-        self.viewport.paint(std::slice::from_ref(&self.status));
+        self.viewport
+            .paint(std::slice::from_ref(&self.status), live::terminal_columns());
     }
 }
 

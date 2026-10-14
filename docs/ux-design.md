@@ -140,6 +140,17 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   rather than re-raising `SIGINT`, because at an idle prompt there is no turn to
   cancel and the raise would take the default disposition and exit.
 
+  **Rows are fitted to the terminal's width before they are drawn.** A pinned
+  row wider than the terminal would wrap into the row below it and overwrite
+  it — harmless with one row, corrupting with several, which is why this is
+  settled before the composer grows. Fitting is escape-aware and shares the
+  renderer's own width primitives: escape sequences cost zero columns, a wide
+  character costs two and is never split across the boundary, and a row that
+  already fits is passed through **byte-identically** so the output tiers stay
+  byte-comparable. A truncated row that carried colour or attributes gets one
+  reset appended so its styling cannot bleed into whatever is drawn next;
+  a truncated plain row stays plain.
+
   **Resize re-pins the viewport, and releases it when the terminal is too
   short.** `DECSTBM` margins are absolute row numbers, so a resized window
   invalidates them: the region must be re-set rather than patched. A `SIGWINCH`
