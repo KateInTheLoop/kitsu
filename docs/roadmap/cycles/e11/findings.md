@@ -622,6 +622,57 @@ which is the one genuinely user-hostile outcome here. That resume path is the
 real work, and it belongs with the other signal handling rather than bolted
 onto a reader.
 
+### Scope decision: Ctrl+Z is handled, Ctrl+backslash stays inert
+
+Taken in T0-S7, and deliberate rather than an oversight.
+
+**Ctrl+Z is handled**, because suspending is a convention every terminal
+program is expected to honour and because the naive version of it is actively
+harmful: re-raising the signal with the scroll region still set hands the shell
+back a terminal whose scrolling area is a subset of the screen. Releasing the
+region and restoring the terminal modes *before* the process stops is most of
+the work, and doing it in the wrong order is worse than not doing it.
+
+**Ctrl+backslash stays inert.** The conventional action is to re-raise
+`SIGQUIT`, whose default disposition terminates the process **and dumps core**.
+This process holds API tokens and conversation text in memory, so honouring
+that convention would write credentials and user content to disk because of a
+single mistyped keystroke — a worse outcome, and a quieter one, than a key that
+does nothing. Programs in this position commonly suppress core dumps for
+exactly this reason.
+
+That leaves the key doing nothing, which is a small deviation from convention
+taken knowingly: `/quit`, Ctrl+D and Ctrl+C all remain available, so nothing is
+unreachable. If this is ever revisited, the right shape is to disable core
+dumps for the process (`RLIMIT_CORE`) *and then* honour the signal, not to
+honour it as-is.
+
+### Resolved in T0-S7
+
+Ctrl+Z now suspends. The editor already emitted a distinct action for it
+(`EditorAction::Suspend`), so no change was needed there — the reader was
+simply swallowing it. The reader now returns `Suspended(draft)` **at that
+keystroke**, carrying the draft and leaving the signal and the terminal to the
+caller; a test feeds bytes after the Ctrl+Z and requires they belong to the
+*resumed* read rather than this one.
+
+The caller releases the viewport, restores terminal modes, stops, re-engages
+and reinstalls, then re-enters the reader with the preserved draft through the
+same replay path that carries a draft between prompts — so typing survives the
+cycle.
+
+**The ordering is the correctness property, so it is enforced behind a seam**
+(`SuspendEffects` / `suspend_and_resume`) and pinned by a test with a recording
+fake. The implementer flagged, correctly, that the seam initially had no test
+using it and was therefore pure indirection; that gap was mine for authorising
+it mid-card, and it is now closed. The test was verified to fail when the stop
+is moved ahead of the release, which is the mutation that matters: a stopped
+process cannot clean up after itself, so no later code can rescue a wrong
+order. A second test pins that a failed re-engage stops short of reinstalling,
+rather than pinning a row nothing can type into.
+
+Still uncovered end-to-end: see **F22**.
+
 
 ## F14 — resolved: raw INPUT mode does not staircase, because output flags stay on
 
@@ -656,3 +707,46 @@ crossterm's raw mode on the binary's path would clear `OPOST` and break every
 one of those writers at once. `transcript_line` keeps its explicit CRLF, which
 is harmless when `ONLCR` is on (a redundant carriage return) and correct if a
 future path does clear `OPOST`.
+
+## F22 — the suspend/resume cycle has no end-to-end test, and why it was deferred
+
+Found: T0-S7. Not a defect — a deliberate coverage gap, recorded so the next
+card inherits the research rather than repeating it.
+
+Suspend is unit-tested at both ends: the reader returns `Suspended` carrying
+the draft, the viewport's release and reinstall are byte-pinned and proven to
+round-trip against an independently installed guard, and the call order is
+pinned through the `SuspendEffects` seam. What is **not** covered is the real
+cycle on a real terminal: Ctrl+Z at an inline prompt, the process actually
+stopping, `fg`, and the screen recovering.
+
+The test author probed the mechanism before declining it, and both findings are
+worth keeping:
+
+- **The stop/continue mechanics do work here.** A child sharing the test
+  runner's process group raises `SIGTSTP`, reaches state `T`, and resumes on
+  `SIGCONT`; the orphaned-process-group discard rule does not bite in this
+  environment. So the idea is not blocked by process-group semantics.
+- **The existing harness tolerates a stopped child but cannot detect one.**
+  `run_styled_chat_pty`'s loop calls `try_wait`, which is
+  `waitpid(WNOHANG)` **without `WUNTRACED`**, so a stopped child simply does
+  not report and the loop keeps polling until it hits the 20-second deadline.
+  Detecting the stop — and then sending `SIGCONT` — requires
+  `waitpid(WNOHANG | WUNTRACED)`.
+
+Two reasons it was right to defer rather than write it:
+
+1. **Its stability could not be measured.** Before the feature existed the only
+   observable run was the failing one, and that failure is a deadline timeout —
+   exactly the shape that becomes an intermittent once the happy path works.
+   Shipping it unmeasured would have been shipping a coin flip.
+2. **It could not be built without changing shared test code.** The `WUNTRACED`
+   change lands in the harness all six pseudo-terminal tests use. The
+   alternative, duplicating ~120 lines of terminal setup, creates a second
+   harness that drifts from the first.
+
+**Next card:** now that the implementation exists, add it and measure it —
+several consecutive runs, and dropped if it cannot be made deterministic. Until
+then the gap is covered by the human terminal matrix, which should include
+Ctrl+Z at an idle prompt followed by `fg`, confirming both the screen and the
+shell's own scrolling area afterwards.

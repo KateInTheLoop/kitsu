@@ -140,8 +140,23 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   rather than re-raising `SIGINT`, because at an idle prompt there is no turn to
   cancel and the raise would take the default disposition and exit.
 
+  **Suspension releases the terminal before stopping.** Ctrl+Z at the inline
+  prompt clears the pinned rows, releases the scroll region and restores
+  canonical terminal modes, *then* raises the stop signal, so the shell is
+  handed an ordinary full-screen terminal rather than one whose scrolling area
+  is a subset of the screen. On resume the region and status row are
+  reinstalled and the unsubmitted draft replays through the same mechanism that
+  carries a draft between prompts, so typing survives the cycle. The order is
+  the correctness property — a stopped process cannot clean up after itself —
+  so it is enforced behind a seam and pinned by a test rather than by review.
+
+  Ctrl+backslash is deliberately inert rather than raising its usual signal,
+  whose default action terminates *and dumps core*: this process holds API
+  tokens and conversation text in memory, so honouring the convention would
+  write credentials to disk on a stray keystroke.
+
   Not yet present at the inline idle prompt, and tracked: the slash-command
-  palette, Tab completion, cross-session history, and Ctrl+Z suspension.
+  palette, Tab completion, and cross-session history.
 
   Tiering is unchanged: the viewport requires a styled interactive TTY, so
   non-TTY, `--plain`, assistive and JSONL sessions never enter it and stay

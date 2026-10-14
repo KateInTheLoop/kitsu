@@ -90,6 +90,18 @@ pub(crate) struct BridgeGuard {
     /// The status text [`install`] painted, so the row can fall back to it
     /// whenever there is no draft to show.
     status: String,
+    /// The terminal height [`install`] was given.
+    ///
+    /// Finding F21: the guard carries its own geometry because
+    /// `InlineSurface::hide` *takes* the latched `(bottom, viewport_rows)`.
+    /// A release therefore leaves the surface with nothing to pin, so the
+    /// reinstall must supply the geometry again from here — and it has to be
+    /// durable rather than consumed, because a session can suspend more than
+    /// once.
+    rows: u16,
+    /// The pinned row count [`install`] was given, kept for the same reason
+    /// as [`rows`](Self::rows).
+    viewport_rows: u16,
 }
 
 /// Install the inline viewport, or do nothing at all in classic mode.
@@ -140,6 +152,8 @@ pub(crate) fn install(
         previous_surface,
         previous_live_rows,
         status: status.to_string(),
+        rows,
+        viewport_rows,
     })
 }
 
@@ -162,6 +176,34 @@ impl BridgeGuard {
             format!("{prompt}{draft}")
         };
         self.viewport.paint(&[row]);
+    }
+
+    /// Finding F21, step 1: hand the terminal back as a normal full-screen
+    /// scrolling terminal before the process stops.
+    ///
+    /// Exactly `InlineSurface::hide`'s teardown — clear the pinned rows,
+    /// release the DECSTBM region, park below the transcript — and nothing
+    /// else: no termios restore and no signal, both of which are the
+    /// caller's, in that order, after this returns.
+    pub(crate) fn release_for_suspend(&self) {
+        // Delegated, not reimplemented: `hide` is the only place the teardown
+        // byte sequence lives, so a release cannot drift from a drop.
+        self.viewport.hide();
+    }
+
+    /// Finding F21, step 5: put back what [`release_for_suspend`] took, so the
+    /// round trip is indistinguishable from a fresh [`install`].
+    ///
+    /// [`release_for_suspend`]: Self::release_for_suspend
+    pub(crate) fn reinstall_after_resume(&self) {
+        // Exactly what [`install`] does after the geometry gate, in the same
+        // order and through the same two calls: re-latch and set the region,
+        // then paint the row. The geometry comes from the guard because
+        // `hide` took the surface's own copy (see [`rows`](Self::rows)), and
+        // the row is the *status* — the draft is the caller's to repaint when
+        // it re-enters the reader.
+        self.viewport.show(self.rows, self.viewport_rows);
+        self.viewport.paint(std::slice::from_ref(&self.status));
     }
 }
 
@@ -192,6 +234,14 @@ pub(crate) enum InlineRead {
     /// Ctrl+C on an empty draft. A non-empty draft is cleared instead and the
     /// read continues, which is what the editor already does.
     Interrupted,
+    /// Ctrl+Z (finding F21): the draft as it stood when the byte arrived.
+    ///
+    /// The reader stays **pure** — it raises no signal and touches no
+    /// terminal — so it reports the keystroke and hands the draft back. The
+    /// caller orchestrates the suspend and then re-enters the reader with
+    /// this draft as its `initial`, which is why typing survives a
+    /// suspend/resume cycle.
+    Suspended(String),
 }
 
 /// Read one line from `input` through the shared editor, repainting through
@@ -248,16 +298,75 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
                     editor.history_prev_forced(&mut forced);
                     changed |= forced.changed;
                 }
+                // Finding F21: report the keystroke and hand the draft back,
+                // returning *at* this action rather than draining the rest of
+                // the chunk -- bytes typed after the Ctrl+Z belong to the
+                // resumed read, not to this one. Nothing is raised and nothing
+                // is painted: the signal and the terminal are the caller's.
+                EditorAction::Suspend => return Ok(InlineRead::Suspended(editor.buffer_string())),
                 // Tab completion at the idle prompt is deliberately out of
-                // scope for the preview, and Ctrl+Z/Ctrl+\ have no outcome
-                // variant yet, so both are swallowed rather than guessed at.
-                EditorAction::CompleteRequest | EditorAction::Suspend | EditorAction::Quit => {}
+                // scope for the preview. Ctrl+\ stays inert on purpose: its
+                // conventional action is to re-raise SIGQUIT, which terminates
+                // *and dumps core*, and this process holds API tokens and
+                // conversation text in memory -- writing those to disk because
+                // of a stray keystroke is worse than the key doing nothing.
+                EditorAction::CompleteRequest | EditorAction::Quit => {}
             }
         }
         if changed {
             paint(&editor.buffer_string(), editor.cursor());
         }
     }
+}
+
+/// The five terminal-and-process effects a Ctrl+Z suspend performs, behind a
+/// seam so that their **order** is observable (finding F21).
+///
+/// The order is the whole defect. Stopping the process with the DECSTBM scroll
+/// region still set, or with termios still raw, hands the shell back a
+/// terminal whose scrolling area is a subset of the screen; and since the real
+/// `stop_process` blocks inside `raise(SIGTSTP)` until the job is
+/// foregrounded again, no end-to-end test can observe the sequence from
+/// outside. A trait keeps the one property that matters -- which call comes
+/// before the stop -- checkable without a terminal.
+///
+/// It is deliberately this small. It exists to make one call order observable,
+/// not to abstract the terminal.
+pub(crate) trait SuspendEffects {
+    /// Clear the pinned rows and release the scroll region.
+    fn release_viewport(&mut self);
+    /// Put the terminal back in canonical mode with `ISIG` on.
+    fn restore_terminal_modes(&mut self);
+    /// `raise(SIGTSTP)`. Blocks until the job is foregrounded again.
+    fn stop_process(&mut self);
+    /// Re-engage raw input mode; `false` if it could not be re-engaged.
+    fn reengage_terminal_modes(&mut self) -> bool;
+    /// Set the region again and repaint the status row.
+    fn reinstall_viewport(&mut self);
+}
+
+/// Run one suspend/resume cycle, returning whether the terminal came back.
+///
+/// Release the viewport, restore the terminal modes, stop, re-engage,
+/// reinstall. Steps 1 and 2 **both** precede the stop: the region must be
+/// gone and the terminal canonical before the process stops, or the shell
+/// inherits a broken terminal. If re-engaging fails the viewport is not
+/// reinstalled and `false` comes back, so the caller bails out of the read
+/// rather than painting into a terminal it cannot read from.
+///
+/// Follow-up card note: an end-to-end PTY test of this is deliberately out of
+/// scope here. Detecting that the child actually stopped needs
+/// `waitpid(WNOHANG | WUNTRACED)`; the existing harness's `try_wait` does not
+/// pass `WUNTRACED`, so it reports a stopped child as still running.
+pub(crate) fn suspend_and_resume(effects: &mut dyn SuspendEffects) -> bool {
+    effects.release_viewport();
+    effects.restore_terminal_modes();
+    effects.stop_process();
+    if !effects.reengage_terminal_modes() {
+        return false;
+    }
+    effects.reinstall_viewport();
+    true
 }
 
 #[cfg(test)]
@@ -270,7 +379,9 @@ mod tests {
     use kitsu_render::surface::{active_surface, set_surface, Surface};
     use serial_test::serial;
 
-    use super::{install, mode_from_value, BridgeGuard, TuiMode};
+    use super::{
+        install, mode_from_value, suspend_and_resume, BridgeGuard, SuspendEffects, TuiMode,
+    };
 
     /// A sink whose buffer outlives the surface that owns it, so bytes written
     /// through a `Box<dyn Write + Send>` stay observable after the surface is
@@ -1008,5 +1119,420 @@ mod tests {
         assert_eq!(read_bytes(b"").0, InlineRead::Eof);
         // Including mid-draft: unterminated typing then a closed descriptor.
         assert_eq!(read_bytes(b"half-typed").0, InlineRead::Eof);
+    }
+
+    // ---------------------------------------------------------------------
+    // Finding F21: Ctrl+Z at an inline idle prompt.
+    //
+    // `RawStdinGuard` clears `ISIG`, so Ctrl+Z (0x1a) arrives as a byte. The
+    // shared editor already turns it into `EditorAction::Suspend`, so the
+    // keymap needs nothing; what is missing is a reader outcome, a terminal
+    // release/reinstall pair on the guard, and the caller's ordering.
+    //
+    // The division of labour these tests pin: the reader is **pure** (it
+    // reports the keystroke and hands the draft back, raising nothing and
+    // writing nothing), the guard owns the terminal bytes, and the caller
+    // sequences release -> termios restore -> raise -> re-engage -> reinstall
+    // -> resume. The hazard being designed out is stopping the process with
+    // the scroll region still set: the shell would then inherit a terminal
+    // whose scrolling area is a subset of the screen.
+    // ---------------------------------------------------------------------
+
+    /// The bytes `InlineSurface::hide` emits for this geometry, derived the
+    /// same way `expected_show` is: every pinned row cleared in ascending
+    /// order, the region released, then the cursor parked on the first (now
+    /// blank) viewport row, immediately below the transcript.
+    fn expected_hide(rows: u16, viewport_rows: u16) -> String {
+        let bottom = rows - viewport_rows;
+        let mut expected = String::new();
+        for i in 0..viewport_rows {
+            let row = bottom + 1 + i;
+            expected.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+        }
+        expected.push_str("\x1b[r");
+        expected.push_str(&format!("\x1b[{};1H", bottom + 1));
+        expected
+    }
+
+    fn suspended(outcome: &InlineRead) -> &str {
+        match outcome {
+            InlineRead::Suspended(draft) => draft,
+            other => panic!("expected a suspend, got {other:?}"),
+        }
+    }
+
+    /// Test 21. Ctrl+Z reports `Suspended` **carrying the draft**, on an empty
+    /// draft as well as a typed one, and the reader returns at the keystroke
+    /// rather than reading on: the trailing bytes below would make a
+    /// read-on reader submit `abzz`.
+    #[test]
+    fn inline_read_reports_suspended_with_the_draft_for_ctrl_z() {
+        let (outcome, _) = read_bytes(b"hello\x1a");
+        assert_eq!(
+            suspended(&outcome),
+            "hello",
+            "Ctrl+Z must hand the draft back so the resume can replay it"
+        );
+
+        let (outcome, _) = read_bytes(b"\x1a");
+        assert_eq!(
+            suspended(&outcome),
+            "",
+            "Ctrl+Z on an empty draft suspends with an empty draft, not an interrupt"
+        );
+
+        let (outcome, _) = read_bytes(b"ab\x1azz\r");
+        assert_eq!(
+            suspended(&outcome),
+            "ab",
+            "the reader returns at Ctrl+Z; a reader that kept going would submit \"abzz\""
+        );
+    }
+
+    /// Test 22. A multi-line bracketed paste survives the suspend intact,
+    /// newlines included: the draft is whatever the editor holds, and the
+    /// paste is one draft (test 15), so Ctrl+Z must not split or truncate it.
+    #[test]
+    fn inline_read_preserves_a_multi_line_paste_across_a_suspend() {
+        let (outcome, _) = read_bytes(b"\x1b[200~one\ntwo\x1b[201~\x1a");
+        assert_eq!(
+            suspended(&outcome),
+            "one\ntwo",
+            "a pasted multi-line draft is returned whole"
+        );
+
+        // And with typing on either side of the paste, so the whole buffer is
+        // carried rather than only the pasted block.
+        let (outcome, _) = read_bytes(b"a\x1b[200~one\ntwo\x1b[201~b\x1a");
+        assert_eq!(suspended(&outcome), "aone\ntwob");
+    }
+
+    /// Test 23. The reader stays pure when it suspends.
+    ///
+    /// Two things are pinned, one of them by the test merely finishing: if the
+    /// reader raised `SIGTSTP` itself, this test process would **stop here**
+    /// and the suite would hang rather than fail, so reaching the assertions
+    /// at all proves the signal is the caller's. The explicit assertion is the
+    /// other half: the last frame the painter saw is the draft that was
+    /// returned, so the reader did not try to tear the row down itself either.
+    #[test]
+    fn inline_read_suspends_without_raising_the_signal_or_painting_a_teardown() {
+        let (outcome, paints) = read_bytes(b"draft\x1a");
+        assert_eq!(suspended(&outcome), "draft");
+        assert_eq!(
+            paints.last().map(|(draft, _)| draft.as_str()),
+            Some("draft"),
+            "the reader hands the row over as it stood; the teardown is the \
+             caller's business: {paints:?}"
+        );
+    }
+
+    /// Test 24. The resume mechanism: the draft `Suspended` returned replays
+    /// into the next read and submits unchanged.
+    ///
+    /// This is the same replay the caller already uses for a carried-over
+    /// draft (`Cursor::new(initial).chain(stdin())`), so the round trip is
+    /// what makes typing survive a suspend/resume cycle.
+    #[test]
+    fn a_suspended_draft_replays_into_the_next_read_unchanged() {
+        let (outcome, _) = read_bytes(b"/model qwen\x1a");
+        let draft = suspended(&outcome).to_string();
+
+        let mut replay = draft.clone().into_bytes();
+        replay.push(b'\r');
+        let (outcome, _) = read_bytes(&replay);
+        assert_eq!(
+            submitted(&outcome),
+            "/model qwen",
+            "re-entering the reader with the preserved draft must submit it intact"
+        );
+    }
+
+    /// Test 25. Ctrl+backslash stays inert **by design**, not by accident.
+    ///
+    /// The conventional action is to re-raise `SIGQUIT`, whose default
+    /// disposition terminates *and dumps core*. This process holds API tokens
+    /// and conversation text in memory, so writing that to disk because of a
+    /// stray keystroke is a worse outcome than the key doing nothing. The
+    /// editor emits `EditorAction::Quit` for 0x1c; the reader swallows it, the
+    /// draft is untouched, and the read continues.
+    #[test]
+    fn inline_read_leaves_ctrl_backslash_deliberately_inert() {
+        let (outcome, _) = read_bytes(b"ab\x1ccd\r");
+        assert_eq!(
+            submitted(&outcome),
+            "abcd",
+            "Ctrl+backslash must neither end the read nor disturb the draft"
+        );
+    }
+
+    /// Test 26. `release_for_suspend` emits exactly `hide`'s teardown: the
+    /// pinned rows cleared, then the region released, then the park below the
+    /// transcript. Derived from the geometry, not hardcoded.
+    ///
+    /// The clears-before-release ordering is spelled out independently of the
+    /// helper, because it is the half that matters: releasing the region homes
+    /// the cursor, so a clear emitted afterwards would address the wrong row.
+    #[test]
+    #[serial]
+    fn release_for_suspend_emits_exactly_the_viewport_teardown() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline(24, 3, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let before = err.text().len();
+
+        guard.release_for_suspend();
+
+        let tail = err.text()[before..].to_string();
+        assert_eq!(
+            tail,
+            expected_hide(24, 3),
+            "release must be the full teardown, got {tail:?}"
+        );
+        let release = tail.find("\x1b[r").expect("the region is released");
+        for row in [22, 23, 24] {
+            let clear = tail
+                .find(&format!("\x1b[{row};1H\x1b[2K"))
+                .unwrap_or_else(|| panic!("row {row} must be cleared: {tail:?}"));
+            assert!(
+                clear < release,
+                "row {row} must be cleared while the region is still set: {tail:?}"
+            );
+        }
+        assert!(out.is_empty(), "no viewport control bytes reach stdout");
+        drop(guard);
+    }
+
+    /// Test 27. `reinstall_after_resume` emits exactly what `install` emits
+    /// after the gate: the region set, the cursor parked, and the status row
+    /// repainted.
+    #[test]
+    #[serial]
+    fn reinstall_after_resume_emits_exactly_the_install_sequence() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline(24, 3, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        guard.release_for_suspend();
+        let before = err.text().len();
+
+        guard.reinstall_after_resume();
+
+        let tail = err.text()[before..].to_string();
+        assert_eq!(
+            tail,
+            expected_show(24, 3) + &expected_status_paint(24, 3, "status: idle"),
+            "reinstall must be install's own sequence, got {tail:?}"
+        );
+        assert!(out.is_empty(), "no viewport control bytes reach stdout");
+        drop(guard);
+    }
+
+    /// Test 28. **The round-trip contract**, which is the whole of this card's
+    /// terminal half: a release followed by a reinstall leaves the terminal in
+    /// the same state as a fresh install, byte for byte on the sink.
+    ///
+    /// Compared against a second, independently installed guard rather than
+    /// against a literal, so the assertion cannot drift from whatever
+    /// `install` actually emits.
+    #[test]
+    #[serial]
+    fn a_release_and_reinstall_round_trip_matches_a_fresh_install() {
+        let _state = GlobalState::capture();
+
+        let (fresh, _out, fresh_err) = install_inline(24, 3, "status: idle");
+        let fresh = fresh.expect("inline mode installs a guard");
+        let fresh_install = fresh_err.text();
+        drop(fresh);
+
+        let (guard, _out, err) = install_inline(24, 3, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let before = err.text().len();
+        guard.release_for_suspend();
+        guard.reinstall_after_resume();
+
+        let round_trip = err.text()[before..].to_string();
+        assert_eq!(
+            round_trip,
+            expected_hide(24, 3) + &fresh_install,
+            "a suspend/resume round trip must put the terminal back exactly as a \
+             fresh install left it, got {round_trip:?}"
+        );
+        drop(guard);
+    }
+
+    /// Test 29. The round trip is repeatable: suspending twice in one session
+    /// must work, so the reinstall has to restore the latched geometry rather
+    /// than leave the viewport permanently unpinned after the first release.
+    ///
+    /// This is the assertion that catches the obvious implementation of
+    /// `release_for_suspend` as a bare `hide()`: `hide` *takes* the latched
+    /// geometry, so a `reinstall` that does not carry the original
+    /// `(rows, viewport_rows)` itself would emit nothing at all the second
+    /// time round.
+    #[test]
+    #[serial]
+    fn release_and_reinstall_can_be_repeated_within_one_session() {
+        let _state = GlobalState::capture();
+        let (guard, _out, err) = install_inline(24, 3, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        let expected = expected_hide(24, 3)
+            + &expected_show(24, 3)
+            + &expected_status_paint(24, 3, "status: idle");
+
+        for round in 1..=3 {
+            let before = err.text().len();
+            guard.release_for_suspend();
+            guard.reinstall_after_resume();
+            assert_eq!(
+                err.text()[before..].to_string(),
+                expected,
+                "round {round} of a suspend/resume cycle must emit the same bytes as the first"
+            );
+        }
+        drop(guard);
+    }
+
+    /// Test 30. Resuming repaints the **status** row, not the draft that was
+    /// on screen when the suspend happened. The caller repaints the draft
+    /// itself at step 6, when it re-enters the reader; what the reinstall owes
+    /// is a row that is correct on its own rather than a stale composer.
+    #[test]
+    #[serial]
+    fn reinstall_after_resume_repaints_the_status_row_not_a_stale_draft() {
+        let _state = GlobalState::capture();
+        let (guard, _out, err) = install_inline(24, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        guard.paint_draft("> ", "half-typed");
+
+        let before = err.text().len();
+        guard.release_for_suspend();
+        guard.reinstall_after_resume();
+
+        let tail = err.text()[before..].to_string();
+        assert!(
+            tail.contains("status: idle"),
+            "the resumed row must read the status text: {tail:?}"
+        );
+        assert!(
+            !tail.contains("half-typed"),
+            "the stale draft must not be repainted by the reinstall: {tail:?}"
+        );
+        drop(guard);
+    }
+
+    /// Test 31. A guard released for a suspend and then **dropped** without a
+    /// reinstall — Ctrl+Z, then EOF on resume — still restores both pieces of
+    /// process-global state. The screen is already torn down by the release,
+    /// so the only thing `Drop` still owes is the seam and the live row.
+    #[test]
+    #[serial]
+    fn dropping_a_guard_released_for_a_suspend_still_restores_the_global_state() {
+        let _state = GlobalState::capture();
+        live::set_live_rows_enabled(true);
+        let before_surface = active_surface();
+
+        let (guard, _out, err) = install_inline(24, 3, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        guard.release_for_suspend();
+        drop(guard);
+
+        assert!(
+            Arc::ptr_eq(&before_surface, &active_surface()),
+            "the displaced surface must be restored even after a release"
+        );
+        assert!(
+            live_rows_enabled(),
+            "the live row must come back even after a release"
+        );
+        let after = err.bytes().len();
+        kitsu_render::tool_activity("read_file(src/main.rs)");
+        assert_eq!(
+            err.bytes().len(),
+            after,
+            "and the seam is restored, so nothing further reaches the injected sink"
+        );
+    }
+
+    /// A `SuspendEffects` that records the order it is called in, so the one
+    /// property the seam exists for is pinned by a test rather than by review.
+    #[derive(Default)]
+    struct RecordingEffects {
+        calls: Vec<&'static str>,
+        reengage_succeeds: bool,
+    }
+
+    impl SuspendEffects for RecordingEffects {
+        fn release_viewport(&mut self) {
+            self.calls.push("release");
+        }
+        fn restore_terminal_modes(&mut self) {
+            self.calls.push("restore");
+        }
+        fn stop_process(&mut self) {
+            self.calls.push("stop");
+        }
+        fn reengage_terminal_modes(&mut self) -> bool {
+            self.calls.push("reengage");
+            self.reengage_succeeds
+        }
+        fn reinstall_viewport(&mut self) {
+            self.calls.push("reinstall");
+        }
+    }
+
+    /// Test 32. The whole reason the seam exists (finding F21): the scroll
+    /// region must be gone and the terminal canonical **before** the process
+    /// stops. Getting this order wrong is worse than not handling Ctrl+Z at
+    /// all, because the shell is then handed a terminal whose scrolling area is
+    /// a subset of the screen — and the stop is a blocking call, so no later
+    /// cleanup can rescue it.
+    #[test]
+    fn suspending_releases_the_region_and_the_terminal_before_stopping() {
+        let mut effects = RecordingEffects {
+            reengage_succeeds: true,
+            ..Default::default()
+        };
+
+        assert!(suspend_and_resume(&mut effects));
+        assert_eq!(
+            effects.calls,
+            vec!["release", "restore", "stop", "reengage", "reinstall"]
+        );
+
+        // Stated as the invariant and not just the sequence, so the failure
+        // message says what is actually wrong if someone reorders it.
+        let stop = effects.calls.iter().position(|c| *c == "stop").unwrap();
+        let release = effects.calls.iter().position(|c| *c == "release").unwrap();
+        let restore = effects.calls.iter().position(|c| *c == "restore").unwrap();
+        assert!(
+            release < stop && restore < stop,
+            "the region must be released and the terminal restored before the \
+             process stops; a stopped process cannot clean up after itself: {:?}",
+            effects.calls
+        );
+    }
+
+    /// Test 33. If raw mode cannot be re-engaged after the resume, stop there:
+    /// reinstalling the viewport over a terminal that is still canonical would
+    /// pin a row nothing can type into, and the caller turns the `false` into a
+    /// plain error instead.
+    #[test]
+    fn a_failed_reengage_after_resume_does_not_reinstall_the_viewport() {
+        let mut effects = RecordingEffects {
+            reengage_succeeds: false,
+            ..Default::default()
+        };
+
+        assert!(!suspend_and_resume(&mut effects));
+        assert_eq!(
+            effects.calls,
+            vec!["release", "restore", "stop", "reengage"]
+        );
+        assert!(
+            !effects.calls.contains(&"reinstall"),
+            "a failed reengage must not go on to pin a viewport: {:?}",
+            effects.calls
+        );
     }
 }
