@@ -3374,6 +3374,24 @@ fn refresh_hint_contains_credential(hint: &str) -> bool {
     false
 }
 
+/// A 400/422 says what the gateway disliked about the request, which no
+/// generic remedy can. Surface only the JSON `error.message` / `message` field,
+/// with URL-like words replaced, under the same bound and credential-marker
+/// rejection as refresh hints; anything else stays withheld.
+fn safe_gateway_rejection_reason(body: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    let message = body
+        .pointer("/error/message")
+        .or_else(|| body.get("message"))?
+        .as_str()?;
+    let without_urls = message
+        .split_whitespace()
+        .map(|word| if word.contains("://") { "<url>" } else { word })
+        .collect::<Vec<_>>()
+        .join(" ");
+    safe_auth_refresh_hint(Some(&without_urls))
+}
+
 fn auth_refresh_hint_suffix(hint: Option<&str>) -> String {
     safe_auth_refresh_hint(hint)
         .map(|hint| format!("; configured refresh hint: {hint}"))
@@ -3389,8 +3407,10 @@ fn expired_auth_warning(since: &str, hint: Option<&str>) -> String {
 }
 
 /// One bounded formatter for every provider-facing surface. Provider-supplied
-/// URL/body/detail strings are never interpolated; configured refresh hints are
-/// accepted only when bounded and free of URL/credential-like markers.
+/// URL/body/detail strings are never interpolated, except the JSON `message`
+/// of a 400/422 rejection, filtered by [`safe_gateway_rejection_reason`];
+/// configured refresh hints are accepted only when bounded and free of
+/// URL/credential-like markers.
 fn safe_provider_error_message(
     error: &ProviderError,
     operation: ProviderOperation<'_>,
@@ -3453,8 +3473,11 @@ fn safe_provider_error_message(
         ProviderError::Http { status, .. } if *status >= 500 => format!(
             "{subject} failed because the gateway is unavailable (HTTP {status}) - retry later or check provider status"
         ),
-        ProviderError::Http { status, .. } if *status == 400 || *status == 422 => format!(
-            "{subject} was rejected (HTTP {status}) - verify the selected model, gateway flavor, and request compatibility"
+        ProviderError::Http { status, body } if *status == 400 || *status == 422 => format!(
+            "{subject} was rejected (HTTP {status}) - verify the selected model, gateway flavor, and request compatibility{}",
+            safe_gateway_rejection_reason(body)
+                .map(|reason| format!("; gateway said: {reason}"))
+                .unwrap_or_default()
         ),
         ProviderError::Http { status, .. } => format!(
             "{subject} was rejected (HTTP {status}) - check gateway configuration and model access"
@@ -22050,6 +22073,60 @@ mod tests {
         assert!(!bad_model.contains("provider-body-secret"));
         assert!(!bad_model.contains('\n'));
         assert!(!bad_model.contains('\u{1b}'));
+    }
+
+    /// A 400/422 shows the gateway's own reason (the two Bedrock rejections that
+    /// hid behind the generic remedy), with URLs elided; credential-like,
+    /// non-JSON, and non-400 bodies stay withheld and control bytes are
+    /// neutralized.
+    #[test]
+    fn rejected_request_shows_only_a_safe_gateway_reason() {
+        let rejected = |status: u16, body: &str| {
+            safe_provider_error_message(
+                &ProviderError::Http {
+                    status,
+                    body: body.to_string(),
+                },
+                ProviderOperation::Chat { model: "m" },
+                Some(17),
+                ProviderDiagnosticContext::default(),
+            )
+        };
+        let tool_config = rejected(
+            400,
+            r#"{"message":"The toolConfig field must be defined when using toolUse and toolResult content blocks."}"#,
+        );
+        assert!(tool_config.contains("(HTTP 400) - verify the selected model"));
+        assert!(tool_config.ends_with(
+            "; gateway said: The toolConfig field must be defined when using toolUse and toolResult content blocks."
+        ));
+        let arguments = rejected(
+            400,
+            r#"{"error":{"message":"error transforming to bedrock://llm/v1/chat: failed to decode function response arguments from assistant's message, not JSON format"}}"#,
+        );
+        assert!(arguments.contains("gateway said: error transforming to <url> failed to decode"));
+        assert!(!arguments.contains("://"));
+
+        for withheld in [
+            rejected(
+                400,
+                r#"{"message":"bad header Authorization: Bearer sk-live"}"#,
+            ),
+            rejected(400, "provider-body-secret"),
+            rejected(500, r#"{"message":"provider-body-secret"}"#),
+        ] {
+            assert!(!withheld.contains("gateway said"), "{withheld}");
+            assert!(!withheld.contains("sk-live") && !withheld.contains("provider-body-secret"));
+        }
+        // A URL is elided whole, so credentials embedded in it never surface.
+        let url = rejected(
+            400,
+            r#"{"message":"see https://user:pw@example.invalid?api_key=x"}"#,
+        );
+        assert!(url.ends_with("; gateway said: see <url>"), "{url}");
+        let escaped = rejected(422, "{\"message\":\"bad\\nfield\\u001b]0;owned\\u0007\"}");
+        assert!(escaped.contains("gateway said: bad field"));
+        assert!(!escaped.contains('\n') && !escaped.contains('\u{1b}'));
     }
 
     #[test]
