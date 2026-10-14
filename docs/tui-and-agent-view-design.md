@@ -559,6 +559,17 @@ which today only accepts the inline slash hint. The idle prompt stops using
 rustyline in TUI modes (rustyline keeps `classic`); the history file format is
 shared.
 
+**Amended in T3-S4, because "shared" was read as "reimplemented".** The history
+file **and its implementation** stay rustyline's. In `inline`, rustyline's
+*composer* never runs but its *history* still does: it loads the file, the inline
+reader is handed a snapshot of the loaded entries (re-taken on every read, so it
+is fresh each turn), every submitted line is recorded on the path common to both
+readers, and rustyline writes the file. That is why cross-session history works
+in the viewport — a thing F20 twice recorded as missing when it never was — and
+why **nothing in `kitsu-tui` needs to know the file exists**. A loader there
+would be a second parser for a format rustyline owns and a second writer for one
+file; see **F49**.
+
 ### 4.4 Agent view and blocked agents
 
 Backed mostly by existing data: `AgentRegistry::snapshot()`,

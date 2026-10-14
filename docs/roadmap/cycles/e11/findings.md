@@ -2619,3 +2619,86 @@ The lesson F20 keeps teaching, now for the third time: **a list of "what is
 missing" written from memory of a design is unreliable.** Two of its four items
 were features that already worked. Each correction came from reading the code or
 running the binary, never from re-reading the design.
+
+## F49 — T3-S4 needed no production code, and the plan row would have made the product worse
+
+The plan told T3-S4 to have the TUI composer "load/save the rustyline history
+file format". Investigated before implementing, and the answer is that **history
+is already shared, by delegation to a single owner**, and the row's literal
+instruction would have created a **second parser for a format rustyline owns and
+a second writer competing for one file on disk**.
+
+**What the reading established** (all in `main.rs`): rustyline loads the file
+(`:17433`), the inline reader is handed a **snapshot** of its entries
+(`:6155`, taken inside `read_idle_chat_line`, which runs **per loop iteration**,
+so it is fresh every turn), every submitted line is recorded on the path
+**common to both readers** (`:17576`, outside any branch on which reader
+produced it), and rustyline saves the file (`:18412`). `kitsu-tui` contains the
+string "history" **nowhere**; the walk lives in `kitsu-editor` over a `Vec` it is
+*handed*. So there is exactly one implementation and one file owner.
+
+Order, de-duplication and blank handling were checked against **rustyline
+14.0.0's own source**, not assumed: `iter()` is oldest-first and both walks take
+the newest on the first ↑; the dedup policy is rustyline's default
+`IgnoreConsecutive`, which kitsu does not override and the editor matches; blank
+lines never reach either walk because `:17573` continues first. The first-↑
+divergence that would otherwise exist is already closed deliberately
+(`tui_bridge.rs:651` declines `RecallRequest` at the idle prompt).
+
+**So the card shipped two tests and a plan amendment, and no code.** That is the
+right outcome, and the general rule is worth keeping: **a plan row describes an
+implementation that was plausible when it was written. If the system has since
+solved the same problem a better way, satisfying the row makes the product worse
+while making the plan look right.** Amend the plan.
+
+### Two latent risks found on the way, neither this card's to fix
+
+1. **A dropped cargo feature would turn a tolerated error into a panic.**
+   `DefaultHistory` is `FileHistory` only because rustyline's
+   `with-file-history` is a **default** feature. `MemHistory`'s `save` and
+   `load` are `unimplemented!()`, so `let _ = rl.load_history(&path)` — written
+   to tolerate a missing file — would **panic** rather than return `Err` if that
+   feature were ever disabled, including by someone adding
+   `default-features = false` for an unrelated reason. The `let _ =` makes it
+   look safe. Worth a compile-time assertion or a comment at the call site.
+
+2. **↑ on a multi-line draft diverges between the renderers.** Classic binds ↑
+   to `LineUpOrPreviousHistory`, which moves the cursor *within* a multi-line
+   draft and only walks history when there is no line above;
+   `TypeaheadEditor` has no intra-draft line motion and always walks. This is
+   **reachable** — a bracketed paste submits a multi-line draft as one entry,
+   and rustyline escapes the newline into the file — so multi-line history
+   entries are real. The test author deliberately wrote **no** failing test,
+   because the inline viewport is **one row** and cannot display a multi-line
+   draft at all, and pinned the boundary in a doc comment so nobody extends the
+   walk by one ↑ and gets a false pass. This belongs with the bordered palette
+   under **F16**/**F19** — height and placement — not with history.
+
+   Labelled as hypothesis, per F43/F47: the *mechanism* was established by
+   reading; whether a user's real history file contains such an entry was not
+   tested through a terminal.
+
+## F39 second occurrence — and both times our own tooling destroyed the evidence
+
+F39 recorded one unidentified `--test cli` failure in seven full-suite runs,
+whose name I lost **by re-running instead of saving the failing output**.
+
+T3-S4 produced a second, in a different suite: the first
+`cargo test -p kitsu --test tui -- --test-threads=1` of that session reported
+**18 passed, 1 failed**, and four consecutive re-runs afterwards were 19/19
+green. The agent reported it rather than burying it, and saved output on every
+run after that — but the name was already gone, because **that run had been
+piped through `tail -4`**.
+
+**Two occurrences, two different suites, and in both cases the evidence was
+destroyed by how we were looking at it** — once by re-running, once by
+truncating the output through `tail`. That is the same family as this project's
+standing rule never to assert absence from a `head`-truncated search: the habit
+that makes output readable is the habit that throws away the part that matters.
+
+**The rule, now with two data points behind it:** when running a suite that
+could plausibly fail, write the full output to a file **first** and read the file
+— never pipe the only copy through `head`, `tail` or `grep`. Both of this
+project's unidentified failures would have been diagnosable under that rule.
+
+Neither occurrence has recurred, neither is characterised, and both remain open.

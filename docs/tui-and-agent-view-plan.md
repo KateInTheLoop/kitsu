@@ -138,7 +138,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | F43 fix: a cancelled approval is recorded (was recorded as nothing); five of five resolutions | done | 6e843de |
 | T3-S1 streaming/tool-calling PTY harness + 5 tests; found and fixed F47 (erased final line) | done | 90570eb |
 | T3-S2 `[tui]` table (6 keys), `--tui`, `--no-alt-screen`, `KITSU_TUI` retired, doctor names a bad key | done | ea1d609 |
-| T3-S3 one completion source for both hosts; `@file` in the inline composer; closes F20's list half, **not** the palette | done | this commit |
+| T3-S3 one completion source for both hosts; `@file` in the inline composer; closes F20's list half, **not** the palette | done | 11cf2d1 |
+| T3-S4 history sharing pinned by test; **no code needed**, plan row amended (F49) | done | this commit |
 
 > **`KITSU_TUI` is retired as of T3-S2.** Mentions of it in the T0-T2 rows and
 > requirement text below are **historical** — they record how the preview was
@@ -304,7 +305,7 @@ Starts after the T0 **go** record.
 | T3-S1 | **Test infrastructure first:** `run_styled_streaming_chat_pty` (binary under PTY, styled, streaming, tool-calling SSE mock), vt100 screen assertions with deadlines (never byte timing), stdout/stderr split capture | One classic-mode test using the harness | `crates/kitsu/tests/tui.rs` (new) | Harness reused by every later PTY acceptance |
 | T3-S2 | Config `[tui]` nested struct (`mode`, `alternate_screen`, `prefix`, `title`, `left_arrow_opens_agents`, `cell_ring_lines`), `--tui`, `--no-alt-screen`; env gate removed; `kitsu doctor` names an unknown key | Failing config tests | `config.rs`, `cli.rs`, `main.rs` | Unknown-key message test (§4.8) |
 | T3-S3 | Composer parity: `CompletionSource` trait in `kitsu-tui`, implemented in `tui_bridge.rs` over `attachments::complete` and the slash palette; hinter/highlighter re-hosted; shared functions used by rustyline `ChatHelper` too | Failing pure test: same candidates for `@fi` and `/st` from both hosts | `kitsu-tui/src/composer.rs`, `ChatHelper`'s `Completer`/`Hinter`/`Highlighter` impls and the `rl.set_helper` construction in `run_chat` (**find by name — the former `main.rs:5928-5980` reference had drifted to an unrelated reader**) | Candidates equal; 39 editor tests green (R4) |
-| T3-S4 | **History file shared**: TUI composer loads/saves the rustyline history file format (design §4.3) | Failing round-trip test on a fixture history file | `kitsu-tui/src/composer.rs`, `main.rs` | ↑ walks the same entries in both renderers (R4) |
+| T3-S4 | **History file shared**: history stays rustyline's — it loads, records and saves; the inline reader is handed a per-read snapshot. **Amended in T3-S4: no parser in `kitsu-tui`** (F49) | Round-trip test on a fixture history file (passes on arrival; there was nothing to fail) | `main.rs` tests only | ↑ walks the same entries in both renderers (R4) |
 | T3-S5 | Status row (`model · meter · elapsed · [N queued] · ← N agents`) and queue preview rows via `Surface::queue` | Failing width-sweep test | `status.rs` | No wrap 40..200 cols (R5) |
 | T3-S6 | Cell ring (bounded, fd-tagged) fed by the surface | Failing eviction test | `cells.rs` | Memory bound test (N4) |
 | T3-S7 | Approval modal: both prompters render in the bottom pane in TUI mode; same option line; same transcript receipt afterwards; `APPROVAL_INPUT_ACTIVE` protocol replaced by in-loop modal | Failing PTY approval round-trip | `kitsu-tui/src/overlay/approval.rs`, `main.rs:19461,19504` | `sanitize` of receipt equals classic (R7) |

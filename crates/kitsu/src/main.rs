@@ -21647,6 +21647,273 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Card T3-S4: the history file, shared between the two renderers.
+    //
+    // There is exactly one history implementation and exactly one owner of the
+    // file: rustyline's `FileHistory`. `main.rs:17435` loads it,
+    // `main.rs:17576` adds every submitted line on the path common to both
+    // readers, and `main.rs:18412` saves it. The inline reader does not parse
+    // or write the file at all -- `read_idle_chat_line` (`main.rs:6155`) hands
+    // it `editor.history().iter().cloned().collect()`, a snapshot taken afresh
+    // on every read.
+    //
+    // So "shared" here is a *delegation* claim, and these tests pin it as one:
+    // the bytes on disk are rustyline's, and the list the inline reader walks
+    // is the list rustyline would have walked itself.
+    // -----------------------------------------------------------------------
+
+    /// The list `read_idle_chat_line` hands the inline reader, taken the same
+    /// way production takes it (`main.rs:6155`).
+    #[cfg(unix)]
+    fn inline_history_snapshot(history: &rustyline::history::DefaultHistory) -> Vec<String> {
+        history.iter().cloned().collect()
+    }
+
+    /// The classic renderer's ↑/↓ walk, over rustyline's own history.
+    ///
+    /// This mirrors `rustyline::edit::State::edit_history_next`: the index
+    /// starts at `len()` (the live draft), ↑ decrements and reads
+    /// `get(idx, SearchDirection::Reverse)`, ↑ at index 0 is a no-op, and ↓
+    /// past the newest entry restores the backed-up draft. `ups` Ups are
+    /// followed by `downs` Downs; the visible draft is returned after each
+    /// keystroke.
+    ///
+    /// **Fidelity limit, deliberate.** Up is bound to
+    /// `Cmd::LineUpOrPreviousHistory`, which tries `edit_move_line_up` first
+    /// and only walks history when that fails -- i.e. when the draft has no
+    /// line above the cursor. This helper models the walk, so every draft it
+    /// is given must be single-line at the moment the key arrives. Callers
+    /// keep to that; a multi-line draft is where the two renderers genuinely
+    /// part company (the editor has no intra-draft line motion) and that
+    /// belongs with the multi-row composer, not here.
+    #[cfg(unix)]
+    fn classic_history_walk(
+        history: &rustyline::history::DefaultHistory,
+        draft: &str,
+        ups: usize,
+        downs: usize,
+    ) -> Vec<String> {
+        use rustyline::history::{History as _, SearchDirection};
+
+        let mut index = history.len();
+        let mut backup = String::new();
+        let mut line = draft.to_string();
+        let mut seen = Vec::new();
+        for _ in 0..ups {
+            if history.is_empty() || index == 0 {
+                seen.push(line.clone());
+                continue;
+            }
+            if index == history.len() {
+                backup = line.clone();
+            }
+            index -= 1;
+            if let Some(found) = history.get(index, SearchDirection::Reverse).unwrap() {
+                index = found.idx;
+                line = found.entry.into_owned();
+            }
+            seen.push(line.clone());
+        }
+        for _ in 0..downs {
+            if history.is_empty() || index == history.len() {
+                seen.push(line.clone());
+                continue;
+            }
+            index += 1;
+            if index < history.len() {
+                if let Some(found) = history.get(index, SearchDirection::Forward).unwrap() {
+                    index = found.idx;
+                    line = found.entry.into_owned();
+                }
+            } else {
+                line = backup.clone();
+            }
+            seen.push(line.clone());
+        }
+        seen
+    }
+
+    /// The inline renderer's ↑/↓ walk, over the snapshot it is handed.
+    ///
+    /// The `RecallRequest` arm mirrors `tui_bridge.rs:651`: at the idle prompt
+    /// there is no prompt queue, so the reader declines the recall point and
+    /// takes the plain walk. Without that arm the first Up at an idle inline
+    /// prompt would do nothing, and the two renderers would not agree.
+    #[cfg(unix)]
+    fn inline_history_walk(
+        snapshot: &[String],
+        draft: &str,
+        ups: usize,
+        downs: usize,
+    ) -> Vec<String> {
+        let mut editor =
+            kitsu_editor::TypeaheadEditor::with_draft(snapshot.to_vec(), draft.to_string());
+        let mut seen = Vec::new();
+        for bytes in std::iter::repeat_n(&b"\x1b[A"[..], ups)
+            .chain(std::iter::repeat_n(&b"\x1b[B"[..], downs))
+        {
+            let outcome = editor.feed(bytes);
+            for action in &outcome.actions {
+                if *action == kitsu_editor::EditorAction::RecallRequest {
+                    let mut forced = kitsu_editor::FeedOutcome::default();
+                    editor.history_prev_forced(&mut forced);
+                }
+            }
+            seen.push(editor.buffer_string());
+        }
+        seen
+    }
+
+    /// Card T3-S4's risk gate (R4): **↑ walks the same entries in both
+    /// renderers.**
+    ///
+    /// Not vacuous, and the first three assertions are what make it so: the
+    /// agreement is asserted against a *named, non-empty* expected sequence,
+    /// so two renderers that both walked nothing, or both walked the list in
+    /// the wrong direction, fail. The entries are the ones rustyline accepted
+    /// through the very call `main.rs:17576` makes, so the list is also not an
+    /// invention of the test.
+    #[cfg(unix)]
+    #[test]
+    fn up_walks_the_same_entries_in_both_renderers() {
+        use rustyline::history::History as _;
+
+        // Built exactly as `main.rs:17364` builds it, so the history's
+        // duplicate and size policy is production's.
+        let config = rustyline::Config::builder()
+            .bracketed_paste(true)
+            .completion_type(rustyline::CompletionType::List)
+            .build();
+        let mut history = rustyline::history::DefaultHistory::with_config(config);
+        // `main.rs:17576` adds the *trimmed* line, and only a non-empty one.
+        for line in ["/status", "write the readme", "write the readme", "/quit"] {
+            history.add(line).unwrap();
+        }
+
+        // Non-vacuity, part 1: there is something to agree about, and it is
+        // the de-duplicated list -- the consecutive repeat collapsed.
+        let snapshot = inline_history_snapshot(&history);
+        assert_eq!(
+            snapshot,
+            vec![
+                "/status".to_string(),
+                "write the readme".to_string(),
+                "/quit".to_string(),
+            ],
+            "the snapshot handed to the inline reader is rustyline's list, oldest first"
+        );
+
+        // Non-vacuity, part 2: the expected walk is spelled out, newest first,
+        // then one step past the oldest (which must not move), then back down
+        // through the list to the draft that was stashed.
+        let expected = vec![
+            "/quit".to_string(),
+            "write the readme".to_string(),
+            "/status".to_string(),
+            "/status".to_string(),
+            "write the readme".to_string(),
+            "/quit".to_string(),
+            "half-typed".to_string(),
+        ];
+        let classic = classic_history_walk(&history, "half-typed", 4, 3);
+        let inline = inline_history_walk(&snapshot, "half-typed", 4, 3);
+
+        assert_eq!(classic, expected, "the classic renderer's ↑/↓ walk");
+        assert_eq!(inline, expected, "the inline renderer's ↑/↓ walk");
+        assert_eq!(inline, classic, "R4: the same entries in both renderers");
+    }
+
+    /// Card T3-S4's acceptance: a round trip over a **fixture history file on
+    /// disk**, in rustyline's own format.
+    ///
+    /// The fixture exercises every part of that format kitsu can produce: the
+    /// `#V2` header, an escaped line feed (reachable here -- a bracketed paste
+    /// at the inline prompt submits a multi-line draft), an escaped backslash,
+    /// and a blank line, which the loader skips.
+    #[cfg(unix)]
+    #[test]
+    fn the_history_file_round_trips_into_both_renderers() {
+        use rustyline::history::History as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        std::fs::write(
+            &path,
+            "#V2\n/status\nfirst line\\nsecond line\nC:\\\\temp\n\n/quit\n",
+        )
+        .unwrap();
+
+        let config = rustyline::Config::builder()
+            .bracketed_paste(true)
+            .completion_type(rustyline::CompletionType::List)
+            .build();
+        let mut history = rustyline::history::DefaultHistory::with_config(config);
+        history.load(&path).unwrap();
+
+        // Read back: the escapes are undone and the blank line is gone.
+        let loaded = inline_history_snapshot(&history);
+        assert_eq!(
+            loaded,
+            vec![
+                "/status".to_string(),
+                "first line\nsecond line".to_string(),
+                "C:\\temp".to_string(),
+                "/quit".to_string(),
+            ],
+            "the fixture file's entries, as both renderers receive them"
+        );
+
+        // Both renderers walk those entries, the multi-line one included.
+        // Non-vacuous: the expected first two Ups are named, and the list
+        // above is already pinned non-empty.
+        let expected = vec![
+            "/quit".to_string(),
+            "C:\\temp".to_string(),
+            "first line\nsecond line".to_string(),
+        ];
+        // Three Ups and no more: each of these arrives on a draft that is
+        // single-line at the time (empty, then "/quit", then "C:\\temp"), so
+        // the classic model above is faithful. A fourth Up would arrive on the
+        // recalled multi-line draft, where rustyline moves the cursor up
+        // inside it instead of walking -- see `classic_history_walk`.
+        assert_eq!(classic_history_walk(&history, "", 3, 0), expected);
+        assert_eq!(inline_history_walk(&loaded, "", 3, 0), expected);
+
+        // Write back: a line submitted at either prompt reaches the file, and
+        // the file is still the format the fixture was written in. Pinned as
+        // the whole text rather than a substring (F41).
+        history.add("ship it \\ now").unwrap();
+        history.save(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "#V2\n/status\nfirst line\\nsecond line\nC:\\\\temp\n/quit\nship it \\\\ now\n",
+            "the saved file is rustyline's V2 format, re-escaped"
+        );
+
+        // And it round-trips: a fresh load sees what was saved.
+        let mut reloaded =
+            rustyline::history::DefaultHistory::with_config(rustyline::Config::builder().build());
+        reloaded.load(&path).unwrap();
+        let reloaded = inline_history_snapshot(&reloaded);
+        assert_eq!(
+            reloaded,
+            vec![
+                "/status".to_string(),
+                "first line\nsecond line".to_string(),
+                "C:\\temp".to_string(),
+                "/quit".to_string(),
+                "ship it \\ now".to_string(),
+            ],
+            "the round trip adds the new entry and changes nothing else"
+        );
+        assert_eq!(
+            inline_history_walk(&reloaded, "", 1, 0),
+            vec!["ship it \\ now".to_string()],
+            "the inline reader's first Up is the entry the save round-tripped"
+        );
+    }
+
     #[cfg(unix)]
     fn resolve(
         editor: &mut kitsu_editor::TypeaheadEditor,
