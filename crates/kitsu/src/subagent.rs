@@ -382,17 +382,19 @@ pub struct AgentTerminalStatus {
 }
 
 /// B3's default blocking timeout: a blocked agent resolves `Interrupt` after
-/// this long, so a headless run cannot hang. The `agents.block_timeout`
-/// config key is T2-S5's; until it lands this constant is the only source of
-/// the value.
+/// this long, so a headless run cannot hang. This constant is the DEFAULT of
+/// the `agents.block_timeout_secs` config key; the value a registry actually
+/// waits is [`AgentRegistry::block_timeout`].
 pub const DEFAULT_AGENT_BLOCK_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30 * 60);
 
+/// Atomic encoding of [`AgentBlockingMode`]. `FailClosed` is zero so a
+/// zero-initialized registry is fail-closed by construction.
+const BLOCKING_FAIL_CLOSED: u64 = 0;
+const BLOCKING_ASK: u64 = 1;
+
 /// Outcome of answering one agent's parked permission request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
-// Nothing routes a `Registry` prompt route or calls `/jobs reply` until T2-S5
-// wires the spawn path and the command, so production never names a variant.
 pub enum AgentAnswerOutcome {
     /// The agent was blocked; its gate received exactly this decision.
     Answered,
@@ -453,6 +455,12 @@ pub struct AgentRegistry {
     changes: watch::Sender<AgentRegistrySnapshot>,
     limits: AgentRegistryLimits,
     thread_limits: AgentThreadLimits,
+    /// `agents.blocking` for the run, stored atomically so the spawn path can
+    /// read it through the `Arc` it already holds. 0 is `FailClosed`.
+    blocking: AtomicU64,
+    /// `agents.block_timeout_secs` for the run, kept in nanoseconds so a
+    /// sub-second timeout (which only a test asks for) survives the round trip.
+    block_timeout_nanos: AtomicU64,
 }
 
 /// Cheap state published whenever the externally visible agent registry
@@ -495,6 +503,8 @@ impl AgentRegistry {
             changes,
             limits,
             thread_limits: AgentThreadLimits::default(),
+            blocking: AtomicU64::new(BLOCKING_FAIL_CLOSED),
+            block_timeout_nanos: AtomicU64::new(DEFAULT_AGENT_BLOCK_TIMEOUT.as_nanos() as u64),
         }
     }
 
@@ -772,11 +782,10 @@ impl AgentRegistry {
     ///
     /// The returned sender's receiver is serviced by a detached task that marks
     /// the requesting agent [`AgentStatus::Blocked`], holds its reply channel,
-    /// and arms a [`DEFAULT_AGENT_BLOCK_TIMEOUT`] timer resolving
+    /// and arms a [`AgentRegistry::block_timeout`] timer resolving
     /// [`Decision::Interrupt`] so a headless run cannot hang (B3). The task
     /// holds only a weak reference, so handing out a sender never keeps the
     /// registry alive.
-    #[cfg_attr(not(test), allow(dead_code))] // No route is set until T2-S5.
     pub fn prompt_sender(self: &Arc<Self>) -> kitsu_tools::PromptRequestSender {
         let (sender, mut receiver) =
             tokio::sync::mpsc::unbounded_channel::<kitsu_tools::PromptRequest>();
@@ -793,9 +802,12 @@ impl AgentRegistry {
                     continue;
                 };
                 let timer_owner = Arc::downgrade(&registry);
+                // Read the CONFIGURED timeout, not the constant: the constant
+                // is only this value's default.
+                let timeout = registry.block_timeout();
                 drop(registry);
                 tokio::spawn(async move {
-                    tokio::time::sleep(DEFAULT_AGENT_BLOCK_TIMEOUT).await;
+                    tokio::time::sleep(timeout).await;
                     if let Some(registry) = timer_owner.upgrade() {
                         registry.resolve_prompt(agent_id, Some(token), Decision::Interrupt);
                     }
@@ -803,6 +815,38 @@ impl AgentRegistry {
             }
         });
         sender
+    }
+
+    /// The run's `agents.blocking` mode. Taken by `&self` so the spawn path can
+    /// read it through the `Arc` it already holds.
+    pub fn blocking(&self) -> crate::config::AgentBlockingMode {
+        match self.blocking.load(Ordering::Relaxed) {
+            BLOCKING_ASK => crate::config::AgentBlockingMode::Ask,
+            _ => crate::config::AgentBlockingMode::FailClosed,
+        }
+    }
+
+    /// Install the run's `agents.blocking` mode.
+    pub fn set_blocking(&self, mode: crate::config::AgentBlockingMode) {
+        let encoded = match mode {
+            crate::config::AgentBlockingMode::Ask => BLOCKING_ASK,
+            crate::config::AgentBlockingMode::FailClosed => BLOCKING_FAIL_CLOSED,
+        };
+        self.blocking.store(encoded, Ordering::Relaxed);
+    }
+
+    /// How long a parked request waits before resolving `Interrupt` (B3).
+    pub fn block_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.block_timeout_nanos.load(Ordering::Relaxed))
+    }
+
+    /// Install the run's blocking timeout. Stored in nanoseconds, so a
+    /// sub-second value is preserved exactly rather than truncated to zero.
+    pub fn set_block_timeout(&self, timeout: std::time::Duration) {
+        self.block_timeout_nanos.store(
+            timeout.as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// Answer one blocked agent's parked request (design §4.4; B1).
@@ -813,7 +857,7 @@ impl AgentRegistry {
     /// distinctly and change no state, because `/jobs reply` takes a
     /// human-typed id in a world where the agent may have just timed out,
     /// been cancelled, or finished.
-    #[cfg_attr(not(test), allow(dead_code))] // `/jobs reply` is T2-S5's.
+    #[cfg_attr(not(test), allow(dead_code))] // `/jobs reply` is T2-S5b's.
     pub fn answer(&self, id: u64, decision: Decision) -> AgentAnswerOutcome {
         self.resolve_prompt(id, None, decision)
     }
@@ -1533,7 +1577,16 @@ fn safe_subagent_error(error: &AgentError) -> String {
             "model returned a tool call during tool-free structured finalization; no tool was executed"
                 .to_string()
         }
-        AgentError::Interrupted(_) => "run interrupted before completion".to_string(),
+        // B3: a blocked agent whose parked request timed out arrives here. The
+        // named interruption is kept so the reason says WHICH authority input
+        // closed rather than only that the run stopped.
+        AgentError::Interrupted(interruption) => format!(
+            "run interrupted before completion: {}",
+            match interruption {
+                kitsu_core::run::RunInterruption::AuthorityInputClosed =>
+                    kitsu_tools::ToolInterruption::AuthorityInputClosed,
+            }
+        ),
         AgentError::Loop(_) => "agent loop failed".to_string(),
         AgentError::ContextOverflow {
             required,
@@ -2180,18 +2233,31 @@ pub fn spawn_agent_bg_tool_with_binder<P: Provider + 'static>(
                     model,
                     profile_name,
                     move |id, running_registry, runtime| async move {
-                        let mut report = kitsu_tools::scope_without_interactive_prompts(
-                            run_subagent_report_with_progress(
-                                &provider,
-                                &effective_tools,
-                                &cfg,
-                                &effective_system,
-                                a.task,
-                                Some((running_registry, id)),
-                                Some(runtime),
-                            ),
-                        )
-                        .await;
+                        // B1: `blocking = ask` routes this detached agent's
+                        // ungranted gates through the registry so the user can
+                        // answer them; the default stays byte-identically
+                        // fail-closed.
+                        let prompt_route = match running_registry.blocking() {
+                            crate::config::AgentBlockingMode::Ask => {
+                                Some(running_registry.prompt_sender())
+                            }
+                            crate::config::AgentBlockingMode::FailClosed => None,
+                        };
+                        let run = run_subagent_report_with_progress(
+                            &provider,
+                            &effective_tools,
+                            &cfg,
+                            &effective_system,
+                            a.task,
+                            Some((running_registry, id)),
+                            Some(runtime),
+                        );
+                        let mut report = match prompt_route {
+                            Some(sender) => {
+                                kitsu_tools::scope_with_registry_prompts(id, sender, run).await
+                            }
+                            None => kitsu_tools::scope_without_interactive_prompts(run).await,
+                        };
                         if report.telemetry.failure_class
                             == Some(AgentFailureClass::ProviderClientError)
                         {
@@ -3808,5 +3874,339 @@ mod tests {
             AgentAnswerOutcome::NotBlocked,
             "the parked request is gone, so a late answer finds nothing to resolve"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // T2-S5a: `agents.blocking` / `agents.block_timeout_secs` reach the
+    // registry, and the spawn path scopes a detached agent's tool work with
+    // the registry route only under `ask` (design B1/B3, plan row T2-S5).
+    //
+    // FAILING-FIRST: `AgentRegistry::blocking`, `set_blocking`,
+    // `block_timeout` and `set_block_timeout` do not exist yet, and the spawn
+    // path still calls `scope_without_interactive_prompts` unconditionally.
+    // ---------------------------------------------------------------------
+
+    use crate::config::AgentBlockingMode;
+
+    /// A registry built by any constructor is fail-closed with B3's 30-minute
+    /// timeout until the run's config says otherwise. Nothing in this card
+    /// moves either default.
+    #[test]
+    fn a_fresh_registry_is_fail_closed_with_the_thirty_minute_block_timeout() {
+        let registry = AgentRegistry::new();
+        assert_eq!(
+            registry.blocking(),
+            AgentBlockingMode::FailClosed,
+            "blocking is opt-in: a registry nobody configured behaves exactly as today"
+        );
+        assert_eq!(
+            registry.block_timeout(),
+            DEFAULT_AGENT_BLOCK_TIMEOUT,
+            "the constant stays the default even though the value is now configurable"
+        );
+        assert_eq!(
+            AgentRegistry::with_limits(AgentRegistryLimits::default()).blocking(),
+            AgentBlockingMode::FailClosed
+        );
+    }
+
+    /// The point of making the timeout configurable: a parked request must
+    /// resolve `Interrupt` after the *configured* duration, not after the
+    /// hard-coded 30 minutes. Paused clock, so this is exact rather than slow.
+    #[tokio::test(start_paused = true)]
+    async fn a_configured_block_timeout_replaces_the_hard_coded_thirty_minutes() {
+        let registry = AgentRegistry::new();
+        registry.set_block_timeout(std::time::Duration::from_secs(2));
+        assert_eq!(
+            registry.block_timeout(),
+            std::time::Duration::from_secs(2),
+            "the configured value is what the registry reports"
+        );
+
+        let id = registry.start("waits two seconds".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let mut answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            answer.try_recv().is_err(),
+            "still parked one second into a two-second timeout"
+        );
+
+        // Advance past the configured two seconds but nowhere near 30 minutes,
+        // and poll rather than `await` -- awaiting would let the paused clock
+        // auto-advance to whatever timer is pending and pass either way.
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        let mut resolved = None;
+        for _ in 0..1_000 {
+            if let Ok(decision) = answer.try_recv() {
+                resolved = Some(decision);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            resolved,
+            Some(Decision::Interrupt),
+            "the timeout must fire at the configured duration, not at DEFAULT_AGENT_BLOCK_TIMEOUT"
+        );
+        assert_eq!(registry.snapshot().blocked, 0);
+    }
+
+    /// A tool registry whose single tool asks a REAL `Mode::Ask` path gate
+    /// about an unlisted path. No prompter is attached, exactly as a
+    /// background agent's permissions are reached today, so the whole
+    /// behaviour under test is the prompt route.
+    fn real_path_gate_tools(target: std::path::PathBuf) -> Arc<Registry> {
+        let perms = Arc::new(
+            kitsu_tools::Permissions::new(&[], &[], kitsu_tools::Mode::Ask)
+                .expect("empty roots are valid"),
+        );
+        let mut tools = Registry::new();
+        let handler: HandlerFn = Box::new(move |_args: String| {
+            let perms = perms.clone();
+            let target = target.clone();
+            Box::pin(async move {
+                perms
+                    .check_read(&target)
+                    .await
+                    .map(|path| format!("read {}", path.display()))
+            })
+        });
+        tools
+            .register_with_descriptor(
+                ToolDescriptor {
+                    name: "gated_read".to_string(),
+                    description: "Read one fixed path through the real permission gate".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                },
+                handler,
+            )
+            .expect("fresh registry");
+        Arc::new(tools)
+    }
+
+    /// Records every request body it is handed, so a test can assert what the
+    /// gate handed back as the tool result. Round 1 calls `gated_read`; every
+    /// later round ends the turn.
+    struct GatedToolProvider {
+        rounds: AtomicUsize,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Provider for GatedToolProvider {
+        async fn healthcheck(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, ProviderError> {
+            for message in &req.messages {
+                self.seen.lock().unwrap().push(message.content.clone());
+            }
+            let deltas = if self.rounds.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                vec![
+                    ChatDelta::ToolCall(kitsu_providers::ToolCall {
+                        tool_name: "gated_read".to_string(),
+                        args: "{}".to_string(),
+                        call_id: "gate-call-1".to_string(),
+                    }),
+                    ChatDelta::Done(FinishReason::ToolCalls),
+                ]
+            } else {
+                vec![
+                    ChatDelta::Text("GATED_AGENT_FINISHED".to_string()),
+                    ChatDelta::Done(FinishReason::Stop),
+                ]
+            };
+            Ok(Box::pin(stream::iter(
+                deltas.into_iter().map(Ok::<_, ProviderError>),
+            )))
+        }
+        async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+            Ok(None)
+        }
+    }
+
+    fn spawn_bg_against_gate(
+        registry: Arc<AgentRegistry>,
+        target: std::path::PathBuf,
+        seen: Arc<Mutex<Vec<String>>>,
+    ) -> HandlerFn {
+        let mut cfg = sub_cfg();
+        cfg.quiet = true;
+        let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
+        let (_descriptor, handler) = spawn_agent_bg_tool(
+            Arc::new(GatedToolProvider {
+                rounds: AtomicUsize::new(0),
+                seen,
+            }),
+            real_path_gate_tools(target),
+            cfg,
+            live,
+            String::new(),
+            registry,
+            empty_profile_runtime(),
+            open_budget(),
+        );
+        handler
+    }
+
+    /// THE DEFAULT, and the most important assertion in this card: with
+    /// `blocking = fail_closed` the detached agent's tool work is still
+    /// scoped `Denied`, so the gate returns today's byte-identical message
+    /// and nothing is ever parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn by_default_a_detached_agent_still_fails_closed_at_a_real_permission_gate() {
+        let outside = tempfile::TempDir::new().expect("a directory no root covers");
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "secret").unwrap();
+
+        let registry = AgentRegistry::new();
+        assert_eq!(registry.blocking(), AgentBlockingMode::FailClosed);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler = spawn_bg_against_gate(registry.clone(), target.clone(), seen.clone());
+
+        handler(r#"{"task":"read the file"}"#.to_string())
+            .await
+            .expect("the spawn returns an id immediately");
+
+        let mut changes = registry.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if changes.borrow_and_update().terminal == 1 {
+                    break;
+                }
+                changes.changed().await.expect("registry alive");
+            }
+        })
+        .await
+        .expect("a fail-closed agent reaches a terminal state without any human");
+
+        assert_eq!(
+            registry.snapshot().blocked,
+            0,
+            "the default route parks nothing, so no agent is ever blocked"
+        );
+        let transcript = seen.lock().unwrap().join("\n");
+        assert!(
+            transcript.contains("background agents cannot open interactive permission prompts"),
+            "the default must keep today's exact fail-closed message: {transcript}"
+        );
+    }
+
+    /// Under `ask`, the same agent parks instead: the spawn path scopes its
+    /// tool work with `scope_with_registry_prompts`, so the real gate reaches
+    /// the real registry and the blocked count is real (B1, B4).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_ask_a_detached_agent_parks_at_a_real_permission_gate() {
+        let outside = tempfile::TempDir::new().expect("a directory no root covers");
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "secret").unwrap();
+
+        let registry = AgentRegistry::new();
+        registry.set_blocking(AgentBlockingMode::Ask);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler = spawn_bg_against_gate(registry.clone(), target.clone(), seen.clone());
+
+        handler(r#"{"task":"read the file"}"#.to_string())
+            .await
+            .expect("the spawn returns an id immediately");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.snapshot().blocked == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the agent never parked: the spawn path is not using the registry route"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(registry.snapshot().blocked, 1);
+        assert_eq!(
+            progress_status(&registry, 1),
+            Some(AgentProgressStatus::Blocked),
+            "/jobs sees it under `needs input`"
+        );
+        assert_eq!(
+            registry.thread_snapshot(1).unwrap().phase,
+            AgentThreadPhase::Blocked
+        );
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|message| message.contains("cannot open interactive permission prompts")),
+            "a parked gate must not also hand the model the fail-closed error"
+        );
+
+        // The answer travels the real route back into the real gate.
+        assert_eq!(
+            registry.answer(1, Decision::AllowOnce),
+            AgentAnswerOutcome::Answered
+        );
+        let mut changes = registry.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if changes.borrow_and_update().terminal == 1 {
+                    break;
+                }
+                changes.changed().await.expect("registry alive");
+            }
+        })
+        .await
+        .expect("an answered agent resumes and finishes");
+        assert_eq!(registry.snapshot().blocked, 0);
+        let result = registry.result(1).expect("agent #1 exists");
+        assert!(result.contains("GATED_AGENT_FINISHED"), "{result}");
+    }
+
+    /// `ask` with a short timeout is the whole headless story: nobody
+    /// answers, the configured timer fires, and the agent ends
+    /// `Failed(interrupted)` through the real gate's `AuthorityInputClosed`
+    /// mapping (B3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_ask_an_unanswered_real_gate_times_out_to_failed_interrupted() {
+        let outside = tempfile::TempDir::new().expect("a directory no root covers");
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "secret").unwrap();
+
+        let registry = AgentRegistry::new();
+        registry.set_blocking(AgentBlockingMode::Ask);
+        registry.set_block_timeout(std::time::Duration::from_millis(250));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler = spawn_bg_against_gate(registry.clone(), target.clone(), seen);
+
+        handler(r#"{"task":"read the file"}"#.to_string())
+            .await
+            .expect("the spawn returns an id immediately");
+
+        let mut changes = registry.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if changes.borrow_and_update().terminal == 1 {
+                    break;
+                }
+                changes.changed().await.expect("registry alive");
+            }
+        })
+        .await
+        .expect("an unanswered blocked agent must time out rather than hang");
+
+        let status = registry
+            .take_unobserved_terminal_results()
+            .into_iter()
+            .find(|agent| agent.id == 1)
+            .map(|agent| agent.status)
+            .expect("the timed-out agent is retained");
+        match status {
+            AgentStatus::Failed(reason) => assert!(
+                reason.contains(&ToolInterruption::AuthorityInputClosed.to_string()),
+                "B3 maps the timeout to AuthorityInputClosed: {reason}"
+            ),
+            other => panic!("expected Failed(interrupted), got {other:?}"),
+        }
+        assert_eq!(registry.snapshot().blocked, 0);
     }
 }

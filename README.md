@@ -802,6 +802,27 @@ it won't ask again.
   for it, is replaced atomically, refreshes at turn boundaries, and is removed
   on clean exit. Treat it as a hint, never a source of truth: it may be stale,
   absent, or left by a process that died, and writing it never affects a turn.
+- `[agents] blocking` decides what a background agent does when a tool of its
+  own needs permission you have not granted. The default, `fail_closed`, is
+  today's behaviour: the operation is refused and the agent carries on, because
+  a detached agent has nobody to ask. Set it to `ask` and the agent **parks**
+  instead — it reports as `blocked`, appears first in `/jobs view` under
+  `needs input`, and waits for you to answer, after which `allow once` or
+  `allow always` applies exactly the grant the foreground prompt would have
+  applied. Nothing is refused behind your back and no new kind of permission is
+  created.
+
+  `ask` only has an effect where a human could actually answer. Scripted,
+  piped and JSONL runs never reach the question at all — their permission mode
+  short-circuits before the route is consulted — so setting `ask` cannot change
+  what automation does, by construction rather than by policy.
+
+  `[agents] block_timeout_secs` bounds the wait, defaulting to `1800` (thirty
+  minutes). If nobody answers in that time the agent ends as failed-interrupted
+  rather than waiting forever, so an unattended run can never hang on a
+  question. The unit is in the key name on purpose: a bare `block_timeout` is
+  exactly where seconds and minutes get confused, and that spelling is rejected
+  rather than guessed at.
 - `[hooks] on_agent_state` runs a local command on each agent state change,
   exporting `KITSU_AGENT_ID`, `KITSU_AGENT_STATE` and
   `KITSU_AGENT_WAITING_FOR`. It is executed **directly, never through a shell,

@@ -291,6 +291,16 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   closed, when `agents.blocking = ask` (default in interactive TUI modes). In
   `classic`, piped, scripted, and JSONL runs the default stays `fail_closed`.
   Free-form questions from the model are out of scope (non-goals).
+  **[Amendment, T2-S5a] In scripted, piped and JSONL runs this is stronger than
+  a default: asking is structurally impossible.** `main.rs` computes
+  `interactive = stdin_is_tty() && !scripted && !forced_one_shot`, and a
+  non-interactive run gets `Mode::Deny`, whose arm in `Permissions::resolve`
+  returns `self.denied(..)` **before** `prompt_route()` is ever consulted. So no
+  value of `agents.blocking` can make those runs park an agent — the route is
+  not read on that path at all. That makes B4's "JSONL output is unchanged" and
+  N1 enforced by structure rather than by configuration discipline, and it is
+  why T2's end-to-end proof has to run on a pseudo-terminal rather than under
+  `--script`.
 - **B2** The request is produced by the two existing gates (`Permissions::
   resolve` and the `CommandMode::Ask` branch in `command.rs`): instead of the
   `interactive_prompts_allowed()` bool, both consult a task-local

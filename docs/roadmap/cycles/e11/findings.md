@@ -1946,3 +1946,57 @@ positive tests are where silent misbehaviour lives.
   comparison is a tuple `match`. Adding no *new* MSRV violation while an
   existing one stands unresolved is the right call: F9 is a release decision for
   the maintainer, not a licence to drift further.
+
+
+## F37 — two test defects that a green suite would never have shown
+
+Both found in T2-S5a by the implementer, both **proven rather than argued**, and
+both instructive beyond this card.
+
+### A positive assertion that no implementation could satisfy
+
+`test_blocking_ask_parks_a_gated_detached_agent_and_times_it_out` asserts the
+literal `needs input`, but its poll loop typed `/jobs` and `/agents`. Both print
+the **agent deck**; `needs input` is a group heading produced only by
+`format_jobs_view`, reached by **`/jobs view`**. So the assertion was
+unreachable at any timeout.
+
+**I had pre-authorised the wrong fix.** My brief told the implementer to raise
+`block_timeout_secs` from 1 to 2 if the string was ever missed. It declined,
+showed that at 2 seconds the agent sat visibly parked across about six polls and
+the test still failed, and identified the real cause — a one-word change. Then
+it measured: **30 of 30 passing** with `/jobs view` (10 debug at 1s, 10 release
+at 1s, 10 release at 2s), and I reproduced 10 of 10 myself. An authorised
+instruction is not evidence; it was right to override it.
+
+### Two negative assertions that passed vacuously
+
+The same mistake made the *guards* worthless: `!transcript.contains("needs
+input")` in both default-behaviour tests polled a view that can never print the
+string, so they would have passed however broken the feature was. Fixing the
+shared helper tightened all three tests at once.
+
+**The general shape, which is the reusable part:** a negative assertion over
+captured output is only as strong as the command that produced the output. A
+test asserting "X does not appear" must first establish that X *can* appear
+there — otherwise it is a tautology wearing a guard's clothing. This is the
+third vacuity of this family in the project, after F27 (a full repaint repairs
+the damage a partial repaint would reveal) and T0-S19's `probe_lock` (a reader
+that repairs the condition it is meant to catch).
+
+### A byte-identity test that could not pass for any implementation
+
+`test_scripted_and_jsonl_runs_are_byte_identical_under_the_default` compares
+full transcripts of four runs. The JSONL `run_started` event carries
+`provider_route.route.profile` — `profile-v1-` plus a 32-hex digest of the
+**canonicalised config path** — and each run uses a fresh temp home, so that
+field differs by construction. The normaliser collapsed digit runs, which
+cannot help: a hex digest's `a`-`f` survive. The implementer measured two actual
+digests rather than theorising.
+
+Fixed by normalising the digest, not by sharing a config path: the digest is
+**environmental** like `run_id` and `duration_ms`, which that test already
+normalises, and it is not the behaviour under test. The plain half of the
+comparison — which carries no profile field — passed throughout, so the
+feature's byte-identity claim was evidenced even while the JSONL half was
+unprovable.
