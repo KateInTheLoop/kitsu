@@ -19404,3 +19404,261 @@ fn test_agents_rejects_the_global_jsonl_flag_and_names_its_replacement() {
     let facts = jsonl_fixture::inspect_jsonl(&events, 1).expect("inspect the rejection JSONL");
     assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::UserFault);
 }
+
+// --- T2-S5b: `/jobs reply <id> <y|a|n>` ------------------------------------
+//
+// FAILING-FIRST. No dispatcher has a `reply` arm yet, so the scripted runs
+// below currently print the did-you-mean nudge and the usage line instead of
+// reaching an id lookup.
+
+/// The idle dispatcher's wording, read from stderr because that is the only
+/// place the three outcomes and the usage line differ. With no background
+/// agents the unknown-id rejection is the only reachable outcome, and the
+/// `/agents` alias must reach the same arm (T1-S3 forwards verbatim).
+#[test]
+#[serial]
+fn test_script_jobs_reply_is_served_by_both_the_command_and_its_alias() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("jobs-reply.txt");
+    fs::write(
+        &script,
+        "/jobs reply 7 y\n/agents reply 7 y\n/agent reply 7 y\n/quit\n",
+    )
+    .unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("jobs reply script");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // All three spellings reached the `reply` arm and were rejected by the id
+    // lookup, not by the subcommand table or by the alias.
+    assert_eq!(
+        stderr.matches("no background job #7").count(),
+        3,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("unknown action 'reply'"), "{stderr}");
+    assert!(!stderr.contains("usage: /jobs ["), "{stderr}");
+    assert!(!stderr.contains("usage: /jobs reply"), "{stderr}");
+}
+
+/// Bad input is a usage error on the idle path too, and the usage line names
+/// the three keys. Site 7: the unknown-subcommand line must list `reply`.
+#[test]
+#[serial]
+fn test_script_jobs_reply_rejects_bad_input_with_a_usage_line() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("jobs-reply-bad.txt");
+    fs::write(
+        &script,
+        "/jobs reply\n/jobs reply notanumber y\n/jobs reply 7\n/jobs reply 7 maybe\n/jobs nosuchthing\n/quit\n",
+    )
+    .unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("jobs reply bad-input script");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert_eq!(
+        stderr.matches("usage: /jobs reply <id> <y|a|n>").count(),
+        4,
+        "each of the four bad forms prints the reply usage line: {stderr}"
+    );
+    // A bad key is never silently treated as a denial.
+    assert!(!stderr.contains("no background job #7"), "{stderr}");
+    // Site 7: the unknown-subcommand usage line advertises reply.
+    assert!(stderr.contains("unknown action 'nosuchthing'"), "{stderr}");
+    assert!(
+        stderr.contains("reply <id> <y|a|n>]"),
+        "the /jobs usage line must advertise reply: {stderr}"
+    );
+}
+
+/// Drive the interactive PTY the way `run_gated_delegation_pty` does, but
+/// answer the parked agent instead of waiting for the timer: poll `/jobs view`
+/// until `needs input` appears, send `/jobs reply <id> <key>`, then keep
+/// polling `/agents` until the released child's answer is printed.
+///
+/// `/jobs view` -- NOT bare `/jobs`. The `needs input` heading is produced only
+/// by `format_jobs_view`; the bare command prints the agent deck, which never
+/// contains that string. Polling the deck would make the positive assertion
+/// unreachable at any timeout and the negative guards pass vacuously.
+#[cfg(unix)]
+fn run_gated_delegation_pty_answering(
+    home: &Path,
+    cwd: &Path,
+    extra_chat_args: &[&str],
+    key: &'static str,
+) -> (std::process::ExitStatus, String) {
+    use std::io::Write as _;
+
+    let mut delegated = false;
+    let mut replied = false;
+    let mut quit = false;
+    let mut polls = 0_u32;
+    let mut last_poll = std::time::Instant::now();
+    run_plain_interactive_chat_pty(home, cwd, extra_chat_args, move |output, terminal| {
+        let text = String::from_utf8_lossy(output);
+        let prompts = text.matches("kitsu>").count();
+        if !delegated && prompts >= 1 {
+            terminal
+                .write_all(b"delegate the read\n")
+                .expect("delegate");
+            terminal.flush().unwrap();
+            delegated = true;
+            last_poll = std::time::Instant::now();
+            return;
+        }
+        if !delegated || quit {
+            return;
+        }
+        if !text.contains("PARENT_DELEGATED") {
+            return;
+        }
+        if !replied {
+            // Synchronize on the heading only `format_jobs_view` emits, then
+            // answer the id the `needs input` group names.
+            if let Some(id) = jobs_view_needs_input_id(&text) {
+                terminal
+                    .write_all(format!("/jobs reply {id} {key}\n").as_bytes())
+                    .expect("reply");
+                terminal.flush().unwrap();
+                replied = true;
+                last_poll = std::time::Instant::now();
+                return;
+            }
+        }
+        let settled = text.contains("CHILD_SAW") || text.contains("interrupted");
+        if settled || polls >= 40 {
+            // `stop-all` first: the block timeout is deliberately longer than
+            // this test, so a still-parked agent would otherwise make `/quit`
+            // hang on the exit guard and the run would die on the harness
+            // deadline instead of on this test's own assertion.
+            terminal
+                .write_all(b"/jobs stop-all\n/quit\n")
+                .expect("quit");
+            terminal.flush().unwrap();
+            quit = true;
+            return;
+        }
+        if last_poll.elapsed() >= std::time::Duration::from_millis(150) {
+            terminal.write_all(b"/jobs view\n/agents\n").expect("poll");
+            terminal.flush().unwrap();
+            polls += 1;
+            last_poll = std::time::Instant::now();
+        }
+    })
+}
+
+/// The first `#<digits>` printed under the `needs input` heading of a
+/// `/jobs view` render. `None` until that heading has actually been emitted,
+/// which is what makes the driver above synchronize rather than sleep.
+#[cfg(unix)]
+fn jobs_view_needs_input_id(transcript: &str) -> Option<u64> {
+    let after = transcript.rsplit_once("needs input")?.1;
+    let digits = after.split_once('#')?.1;
+    let id: String = digits.chars().take_while(char::is_ascii_digit).collect();
+    id.parse().ok()
+}
+
+/// Plan row T2-S5's acceptance over the whole real stack: `blocking = "ask"`
+/// with a block timeout far longer than the test, so the ONLY thing that can
+/// release the parked agent is the typed answer. `y` lets the gated read
+/// through, so the child's own answer carries the file's bytes back.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_jobs_reply_allow_releases_a_parked_detached_agent() {
+    let server = wiremock::MockServer::start().await;
+    let home = TempDir::new().expect("temp home");
+    let repo = TempDir::new().expect("temp repo");
+    let outside = TempDir::new().expect("a directory no allow root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "GATED_BYTES").unwrap();
+    mount_gated_detached_agent_gateway(&server, &forbidden).await;
+    write_config_with_agents_table(
+        home.path(),
+        &server.uri(),
+        "blocking = \"ask\"\nblock_timeout_secs = 600\n",
+    );
+
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let allow = repo_path.to_string_lossy().into_owned();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        run_gated_delegation_pty_answering(&home_path, &repo_path, &["--allow-path", &allow], "y")
+    })
+    .await
+    .expect("interactive gated-delegation fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("needs input"),
+        "the agent must park first: {transcript}"
+    );
+    assert!(
+        transcript.contains("CHILD_SAW"),
+        "the typed answer must release the agent and let its turn finish: {transcript}"
+    );
+    assert!(
+        transcript.contains("GATED_BYTES"),
+        "`y` is AllowOnce, so the gated read succeeds: {transcript}"
+    );
+    assert!(
+        !transcript.contains("interrupted"),
+        "a 600s block timeout cannot be what released it: {transcript}"
+    );
+}
+
+/// `n` is an answer too: the gate turns it into a policy denial and the agent
+/// resumes with that error rather than being interrupted.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_jobs_reply_deny_releases_a_parked_detached_agent_with_a_denial() {
+    let server = wiremock::MockServer::start().await;
+    let home = TempDir::new().expect("temp home");
+    let repo = TempDir::new().expect("temp repo");
+    let outside = TempDir::new().expect("a directory no allow root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "GATED_BYTES").unwrap();
+    mount_gated_detached_agent_gateway(&server, &forbidden).await;
+    write_config_with_agents_table(
+        home.path(),
+        &server.uri(),
+        "blocking = \"ask\"\nblock_timeout_secs = 600\n",
+    );
+
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let allow = repo_path.to_string_lossy().into_owned();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        run_gated_delegation_pty_answering(&home_path, &repo_path, &["--allow-path", &allow], "n")
+    })
+    .await
+    .expect("interactive gated-delegation fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("needs input"),
+        "the agent must park first: {transcript}"
+    );
+    assert!(
+        transcript.contains("CHILD_SAW"),
+        "a denial releases the agent rather than interrupting it: {transcript}"
+    );
+    assert!(
+        !transcript.contains("GATED_BYTES"),
+        "`n` must not let the gated read through: {transcript}"
+    );
+}

@@ -2000,3 +2000,112 @@ normalises, and it is not the behaviour under test. The plain half of the
 comparison — which carries no profile field — passed throughout, so the
 feature's byte-identity claim was evidenced even while the JSONL half was
 unprovable.
+
+
+## F38 — adding a `/jobs` subcommand touches seven sites, not three
+
+Enumerated while scoping T2-S5b. The plan says "all three dispatch sites", and
+that phrase has been repeated since T1-S3 — but it counts only the sites that
+**execute** the subcommand. Four more decide whether a user can ever find it,
+and a command that works while being undiscoverable is half-shipped.
+
+**Behaviour (the three the plan means):**
+1. `handle_jobs_command` — the idle path, which also emits a JSON payload
+   carrying an `"action"` field;
+2. `handle_active_jobs_command` — the mid-turn path, a different function with a
+   different return type (`Result<String, String>`);
+3. the `/agents` alias arm, which T1-S3 widened to forward verbatim.
+
+**Discoverability (the four it does not):**
+4. `closest_jobs_subcommand`'s `SUBCOMMANDS` list — the typo suggester. **This is
+   F2**, already recorded as drifting from the registry, and it drifts precisely
+   because it is a hand-maintained list no compiler checks;
+5. the `/jobs` advertised `args:` string, which the help and palette render;
+6. the `/agent` advertised `args:` string — which **already lists fewer
+   subcommands than `/jobs`** (no `view`, `explain`, `stop-all`, `prune`),
+   apparently left behind when T1-S3 widened the alias to forward everything.
+   So the alias accepts commands it does not advertise;
+7. the usage line printed on an unknown subcommand.
+
+**Why this keeps happening:** sites 1-3 are `match` arms, and adding a
+subcommand there is driven by the work itself. Sites 4-7 are **string and array
+literals** that no compiler, test or type checks against the real set — the same
+shape of defect as F2, and the same shape as T2-S3's label table, except that
+one *was* compiler-enforced because the enums were exhaustive.
+
+**The durable fix is not vigilance.** A single source of truth — one table of
+subcommand name, arity and help text that the dispatcher, the suggester, the
+`args:` strings and the usage line all read — would make sites 4-7 impossible to
+forget. That is a refactor worth its own card. Until then, anyone adding a
+subcommand should treat this list of seven as a checklist.
+
+### F2 is closed by a test, not by a checklist
+
+T2-S5b did better than the checklist above. Its test
+`every_jobs_subcommand_is_its_own_nearest_suggestion` requires **all ten**
+dispatched subcommands to be their own nearest suggestion — so the suggester
+table can no longer drift one entry at a time, which is exactly how **F2**
+arose. That converts a vigilance problem into a failing test, and it is why F2
+can be closed rather than carried.
+
+Sites 5-7 remain unguarded by anything but review, so the single-source-of-truth
+refactor is still worth doing; but the worst of the three is now mechanical.
+
+### The alias drift was in THREE places, not one
+
+Scoping this card found `/agent` advertising five of the ten subcommands it
+forwards. The test author fixed the `args:` string in code. Writing the docs I
+found **the README's own command-table row carried the same stale subset**
+(`list|show|steer|stop|close`), and the row's prose describes only those — a
+third copy, in a third file, of a list that is already wrong twice.
+
+I replaced the README row with **`/agent [any /jobs subcommand]`**, which is
+what the `/agents` row already says and which **cannot drift again**, because it
+states the relationship instead of enumerating the set. That is the cheap
+version of the single-source fix: where a list is derived rather than
+authoritative, say so instead of copying it.
+
+## F39 — one unidentified CLI-suite failure, and the capture mistake that lost it
+
+Observed in T2-S5b review. **Status: one failure in seven full-suite runs,
+test unknown.** Recorded rather than dismissed, because this project has twice
+punished the comfortable reading of exactly this situation.
+
+The implementer reported `cargo test -p kitsu --test cli` at 237/0. My own
+verification run returned **236 passed, 1 failed**. Six subsequent runs — three
+immediately, three with logs retained — were all 237/0, and no failure named
+itself in any retained log.
+
+### The mistake is mine and it is the reusable part
+
+When I saw `236 passed; 1 failed`, **I re-ran the suite to find out which test
+it was.** That destroys the evidence: the failing run's output is the only place
+the name exists, and a fresh run that passes prints nothing. I should have
+captured that run's output — or run with output retained from the start, which
+is what I belatedly did.
+
+**Rule: when an intermittent appears, keep the failing run's output before
+doing anything else.** A re-run is not an investigation; it is the deletion of
+the only artefact that identifies the problem.
+
+### Why it is not being dismissed
+
+- **F23**: a pseudo-terminal test in this very suite failed ~7% of the time
+  while appearing green on every manual run, and was found only by measuring
+  against a stashed baseline.
+- **F28**: a transaction flake that three readings called test noise — including
+  mine — turned out to be a **real production bug**, a `fork`/`flock` race that
+  could make a session commit falsely report "already active".
+
+Both times "I ran it again and it passed" was the wrong conclusion. So the
+honest status here is *unidentified*, not *absent*.
+
+### For whoever sees it next
+
+Run `cargo test -p kitsu --test cli > log 2>&1` in a loop and keep every log;
+the suite takes about 43 s, so a dozen runs is ten minutes. The new
+pseudo-terminal tests in this area (`test_jobs_reply_*`,
+`test_blocking_ask_parks_*`) are the most likely candidates, being real
+processes on real terminals with a 600-second block timeout and an exit guard
+in play — but that is a guess, and the point of this finding is that a guess is
+all anyone has until a failing run is captured.
