@@ -10,7 +10,6 @@ shapes may change in any minor release.
 ## [Unreleased]
 
 ### Fixed
-
 - A session commit could fail with `session '<id>' is already active in this or
   another process` when nothing else held it. The session lock is advisory and
   kernel-held per open file description, and a descriptor marked close-on-exec
@@ -26,9 +25,16 @@ shapes may change in any minor release.
   still in use, so it was never cleaned up; and taking an artifact generation
   lock could report failure and skip work. All five lock sites now share one
   implementation, so there is a single place for this to be right.
+- Cancelling a background agent that was waiting for a permission left **no
+  record of how the request ended** — `/jobs show` kept the request with nothing
+  after it, so the timeline said the agent had asked and never said what
+  happened. Every way a request can end is now recorded.
+- `[hooks] on_agent_state` exported a stale activity label (often `started`) as
+  `KITSU_AGENT_WAITING_FOR` for an agent that was in fact waiting for a
+  permission, so a hook was told the state was `blocked` but given a nonsense
+  reason.
 
 ### Added
-
 #### Background agents that can ask
 
 - `[agents] blocking = "ask"` lets a background agent **park** when one of its
@@ -61,11 +67,9 @@ shapes may change in any minor release.
   spelling, and all three name the **kind** of permission and never the path,
   URL or command line. Answering an agent removes the reason rather than leaving
   a stale one behind.
-- Fixed: `KITSU_AGENT_WAITING_FOR` reported a stale activity label (often
-  `started`) for an agent that was in fact waiting for a permission, so a hook
-  was told the state was `blocked` but given a nonsense reason.
 - A background agent's bounded timeline now records **each permission it asked
-  for and how that ended** — allowed once, allowed always, denied, or timed out
+  for and how that ended** — allowed once, allowed always, denied, timed out, or
+  cancelled
   — so `/jobs show` still shows that an agent asked, after it has been answered.
   `/jobs explain` reports a pending permission on its `waiting on:` line instead
   of the agent's last tool activity. These entries name the kind of permission
@@ -80,17 +84,7 @@ shapes may change in any minor release.
   where it previously stopped at the first clause. The old text is still the
   prefix, so anything matching it keeps matching.
 
-### Changed
 
-- `/jobs --json` reports `thread.schema_version` as **2**, and a thread object
-  may now carry an optional `thread.name`. The version rose because the agent
-  phase vocabulary gained a `blocked` value, which a closed enum cannot accept
-  without one. `name` is omitted entirely when unset rather than sent as null,
-  so existing readers see no new key unless a name exists. Nothing reports
-  `blocked` yet — no agent can enter that state until a later change — so the
-  only difference visible today is the version number and the optional field.
-
-### Added
 
 #### Terminal UI (preview)
 
@@ -177,10 +171,20 @@ shapes may change in any minor release.
   visible after its one-off completion notice has scrolled away.
 
 ### Changed
+- `/jobs --json` reports `thread.schema_version` as **2**, and a thread object
+  may now carry an optional `thread.name`. The version rose because the agent
+  phase vocabulary gained a `blocked` value, which a closed enum cannot accept
+  without one. `name` is omitted entirely when unset rather than sent as null,
+  so existing readers see no new key unless a name exists. Nothing reports
+  `blocked` yet — no agent can enter that state until a later change — so the
+  only difference visible today is the version number and the optional field.
+
+
 
 - The background-agent registry snapshot now also carries an unacknowledged
   count, so a watcher can tell "a result is waiting for you" from "an agent
   finished at some point", which the terminal count alone could not express.
+
 
 ## [0.1.0] - 2026-08-23
 

@@ -181,6 +181,10 @@ pub enum AgentApprovalOutcome {
     /// No human answered within `agents.block_timeout_secs` (B3). This is the
     /// one outcome with nobody present, so the record matters most here.
     TimedOut,
+    /// The park was cancelled rather than decided: `cancel_matching` took
+    /// the parked prompt itself and resolved the gate with `Interrupt`, so
+    /// the outcome is recorded at that site (F43).
+    Cancelled,
 }
 
 impl AgentApprovalOutcome {
@@ -190,6 +194,7 @@ impl AgentApprovalOutcome {
             Self::AllowedAlways => "allowed always",
             Self::Denied => "denied",
             Self::TimedOut => "timed out",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -1693,6 +1698,92 @@ mod tests {
         AgentThreadSnapshotDto::from_snapshot(&snapshot)
             .validate(limits)
             .expect("approval entries satisfy the DTO's redaction and accounting rules");
+    }
+
+    // -----------------------------------------------------------------
+    // F43: a cancelled approval is not a timeout. `AgentApprovalOutcome`
+    // has no `Cancelled` variant today, so both tests below are expected
+    // to fail to COMPILE until the variant and its label exist.
+    // -----------------------------------------------------------------
+
+    /// The fifth outcome's spelling, and that it is its own word rather than
+    /// a second name for the timeout. Vocabulary pin only, no behaviour.
+    #[test]
+    fn a_cancelled_approval_has_its_own_label_distinct_from_the_timeout() {
+        assert_eq!(AgentApprovalOutcome::Cancelled.label(), "cancelled");
+        assert!(AgentApprovalOutcome::Cancelled.label().is_ascii());
+        assert_ne!(
+            AgentApprovalOutcome::Cancelled.label(),
+            AgentApprovalOutcome::TimedOut.label(),
+            "a human cancellation and an unattended timeout are different facts"
+        );
+        let labels = [
+            AgentApprovalOutcome::AllowedOnce,
+            AgentApprovalOutcome::AllowedAlways,
+            AgentApprovalOutcome::Denied,
+            AgentApprovalOutcome::TimedOut,
+            AgentApprovalOutcome::Cancelled,
+        ]
+        .map(AgentApprovalOutcome::label);
+        let mut unique = labels.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "five outcomes, five spellings: {labels:?}"
+        );
+    }
+
+    /// Every outcome's recorded entry text, pinned by exact equality rather
+    /// than by `contains`, so neither the cancellation nor the timeout can
+    /// be recorded as the other (F41: pin what the output *is*).
+    #[test]
+    fn every_outcome_including_cancellation_records_its_own_exact_entry_text() {
+        for (outcome, expected) in [
+            (
+                AgentApprovalOutcome::AllowedOnce,
+                "approval to write a file allowed once",
+            ),
+            (
+                AgentApprovalOutcome::AllowedAlways,
+                "approval to write a file allowed always",
+            ),
+            (
+                AgentApprovalOutcome::Denied,
+                "approval to write a file denied",
+            ),
+            (
+                AgentApprovalOutcome::TimedOut,
+                "approval to write a file timed out",
+            ),
+            (
+                AgentApprovalOutcome::Cancelled,
+                "approval to write a file cancelled",
+            ),
+        ] {
+            let (mut state, _runtime) =
+                AgentThreadState::new("task", "model", None, AgentThreadLimits::default());
+            assert!(state.block());
+            state.record_approval_request(AgentApprovalKind::WriteFile);
+            state.record_approval_outcome(AgentApprovalKind::WriteFile, outcome);
+            let texts = state
+                .snapshot(1, 1)
+                .timeline
+                .entries
+                .into_iter()
+                .filter(|entry| entry.kind == AgentTimelineKind::Approval)
+                .map(|entry| entry.text)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                texts,
+                vec![
+                    "approval to write a file requested".to_string(),
+                    expected.to_string()
+                ],
+                "{outcome:?} records one request and one outcome, spelled exactly"
+            );
+        }
     }
 
     // -----------------------------------------------------------------

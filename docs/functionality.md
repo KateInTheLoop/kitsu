@@ -294,8 +294,9 @@ diagnosing an agent cannot quietly satisfy the unobserved-result exit guard.
 adds a bounded redacted event timeline; tool arguments/output and partial model
 bodies are never copied into that inspection record. That timeline also records
 each permission a background agent asked for and how it was decided -- allowed
-once, allowed always, denied, or timed out -- so an answered agent still shows
-that it asked. Those entries name the **kind** of permission and nothing else
+once, allowed always, denied, timed out, or cancelled -- so an answered agent
+still shows that it asked, and a cancelled one shows that its request was never
+answered. Those entries name the **kind** of permission and nothing else
 ("approval to write a file"), never the path, URL or command line: the request's
 payload is converted to a kind at the boundary and no argument travels to the
 recording site, which is how the sentence above stays true of them. A blocked

@@ -26281,4 +26281,165 @@ mod tests {
             "an answered agent is not waiting for permission any more: {explain}"
         );
     }
+
+    // ------------------------------------------------------------------
+    // F43: the two inspection surfaces must not call a cancellation a
+    // timeout. STUB: `AgentApprovalOutcome::Cancelled` does not exist, so
+    // the second test fails to COMPILE; the first fails on content.
+    // ------------------------------------------------------------------
+
+    /// `/jobs show` for a cancelled park and for a timed-out park, side by
+    /// side in one test so the absence assertion cannot be vacuous: the
+    /// timed-out agent proves this very surface does print "timed out" from
+    /// an approval entry, and the cancelled agent must not.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn jobs_show_distinguishes_a_cancelled_approval_from_a_timed_out_one() {
+        let registry = subagent::AgentRegistry::new();
+        let cancelled_id = registry
+            .start("cancelled while blocked".to_string())
+            .unwrap();
+        let timed_out_id = registry.start("never answered".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let cancelled_answer = park_a_path_request(&sender, cancelled_id);
+        let timed_out_answer = park_a_path_request(&sender, timed_out_id);
+        for id in [cancelled_id, timed_out_id] {
+            for _ in 0..1_000 {
+                let blocked = registry
+                    .progress_snapshot()
+                    .agents
+                    .into_iter()
+                    .any(|agent| {
+                        agent.id == id && agent.status == subagent::AgentProgressStatus::Blocked
+                    });
+                if blocked {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        assert!(matches!(
+            registry.cancel(cancelled_id).await,
+            subagent::AgentCancelOutcome::Cancelled(_)
+        ));
+        assert_eq!(
+            cancelled_answer.await.expect("the gate is resolved"),
+            Decision::Interrupt
+        );
+        tokio::time::advance(
+            subagent::DEFAULT_AGENT_BLOCK_TIMEOUT + std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            timed_out_answer
+                .await
+                .expect("the timeout resolves the gate"),
+            Decision::Interrupt
+        );
+
+        let timed_out = format_agent_thread(&registry.thread_snapshot(timed_out_id).unwrap());
+        assert_no_debug_leak(&timed_out);
+        // NON-VACUITY: this surface prints an outcome's words verbatim.
+        assert!(
+            timed_out.contains("timed out"),
+            "/jobs show prints a timeout outcome from an approval entry: {timed_out}"
+        );
+
+        let cancelled = format_agent_thread(&registry.thread_snapshot(cancelled_id).unwrap());
+        assert_no_debug_leak(&cancelled);
+        assert!(
+            cancelled.contains("write a file cancelled"),
+            "/jobs show says the approval was cancelled: {cancelled}"
+        );
+        assert!(
+            !cancelled.contains("timed out"),
+            "a deliberate cancellation is not reported as an unattended \
+             timeout: {cancelled}"
+        );
+        for argument in ["notes.txt", "/work"] {
+            assert!(
+                !cancelled.contains(argument),
+                "/jobs show leaked a tool argument ({argument}): {cancelled}"
+            );
+        }
+    }
+
+    /// `/jobs explain` and the cancelled outcome. A GUARD, green today and
+    /// required to stay green: `pending_approval_request` keys on the
+    /// `" requested"` suffix, so the new `cancelled` outcome must close the
+    /// pending request exactly as `allowed once` does, and an implementer
+    /// who spells the entry differently (or records the cancellation as a
+    /// second *request*) would break this line.
+    ///
+    /// The phase is `Running` on purpose: `cancel_matching` calls
+    /// `thread.unblock()` before the terminal transition, so a thread that
+    /// is `Running` with a cancelled approval as its newest entry is a
+    /// state the cancel path really passes through.
+    ///
+    /// NON-VACUITY is proved inside this test: the first half builds the
+    /// same thread WITHOUT the outcome entry and shows this surface does
+    /// print "waiting on: permission to write a file" from it.
+    #[test]
+    fn explain_does_not_treat_a_cancelled_approval_as_a_pending_request() {
+        fn fixture_with(
+            texts: &[String],
+        ) -> (
+            subagent::AgentProgress,
+            subagent::thread::AgentThreadSnapshot,
+        ) {
+            let (progress, mut thread) = explain_fixture(
+                9,
+                subagent::AgentProgressStatus::Running,
+                subagent::thread::AgentThreadPhase::Running,
+                subagent::thread::AgentHandoffState::Unavailable,
+            );
+            for (offset, text) in texts.iter().enumerate() {
+                thread.timeline.retained_bytes += text.len();
+                thread
+                    .timeline
+                    .entries
+                    .push(subagent::thread::AgentTimelineEntry {
+                        sequence: 2 + offset as u64,
+                        elapsed_ms: 20,
+                        kind: subagent::thread::AgentTimelineKind::Approval,
+                        round: None,
+                        text: text.clone(),
+                        truncated: false,
+                    });
+            }
+            (progress, thread)
+        }
+
+        let requested = format!(
+            "approval to {} requested",
+            subagent::thread::AgentApprovalKind::WriteFile.label()
+        );
+        let cancelled = format!(
+            "approval to {} {}",
+            subagent::thread::AgentApprovalKind::WriteFile.label(),
+            subagent::thread::AgentApprovalOutcome::Cancelled.label()
+        );
+
+        let (progress, thread) = fixture_with(std::slice::from_ref(&requested));
+        let pending = format_agent_explain(&progress, &thread);
+        let pending_labels = explain_labels(&pending);
+        let pending_waiting = explain_label_value(&pending_labels, "waiting on")
+            .unwrap_or_else(|| panic!("a pending request has a waiting-on line: {pending}"));
+        assert_eq!(
+            pending_waiting, "permission to write a file",
+            "NON-VACUITY: this surface prints exactly this from a request              entry, so the absence asserted below is a real claim"
+        );
+
+        let (progress, thread) = fixture_with(&[requested, cancelled]);
+        let decided = format_agent_explain(&progress, &thread);
+        assert_no_debug_leak(&decided);
+        let decided_labels = explain_labels(&decided);
+        let decided_waiting = explain_label_value(&decided_labels, "waiting on")
+            .unwrap_or_else(|| panic!("the waiting-on line is still printed: {decided}"));
+        assert!(
+            !decided_waiting.contains("permission to"),
+            "a cancelled approval is decided, not pending: {decided}"
+        );
+    }
 }

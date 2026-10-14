@@ -2235,7 +2235,82 @@ nothing was rewritten from memory. The cost was time, not work.
    has teeth is valuable (F41 is better for it), but the proof should not
    require mutating the file under review.
 
-## F43 — a cancelled approval is recorded as "timed out", which is untrue
+## F43 — CORRECTED: a cancelled approval is recorded as nothing at all
+
+**My original text said a cancelled approval is recorded as "timed out". That is
+wrong, and the truth is worse. The correction and its lesson are below; the
+original reasoning is kept after it so the mistake is legible.**
+
+### What is actually true, verified by reading every call site
+
+**Cancellation never reaches `resolve_prompt`.** There is one cancel path,
+`cancel_matching` — the single implementation behind `cancel`, `cancel_all`,
+`cancel_all_with_reason` and `cancel_started_after*` — and inside the registry
+lock it takes the parked prompt **itself**, calls `thread.unblock()`, sets
+`AgentStatus::Cancelled`, and sends `Decision::Interrupt` straight to the
+waiting gate's channel. It never calls the shared resolution path, so **no
+outcome is recorded at all**.
+
+What a cancelled park actually leaves behind is a **dangling request with no
+outcome**, proven from a real `/jobs show`:
+
+```
+  bounded redacted timeline:
+    [1 +0.0s user_task] cancelled while blocked
+    [2 +0.0s approval] approval to write a file requested
+    [3 +0.0s lifecycle] agent cancelled; result ready for handoff
+```
+
+The agent asked, and the record never says what happened. The still-armed block
+timer that fires later finds no park and records nothing either.
+
+**So T2-S6's claimed invariant — every resolution leaves a record — was already
+broken when I accepted that card**, for one of its five cases. Four of five
+resolutions were recorded; the fifth recorded nothing. And
+`approval_outcome(Decision::Interrupt) => TimedOut` turns out to be *correct*,
+because the only `Interrupt` that reaches `resolve_prompt` really is the timer.
+
+### The lesson, which is about me
+
+I wrote F43 from the implementer's report, which said *"`Interrupt` also arrives
+from a cancellation of a blocked agent, which is likewise recorded as a timeout"*
+— and I recorded that as a finding **without tracing the call path myself**. One
+grep for `pending_prompt` would have shown four touch points and that
+cancellation was not among the recorders.
+
+**A claim about a code path is not verified until the path is read.** I had
+already written F39's rule — a re-run is not an investigation — and then made the
+same class of error one level up: a plausible mechanism, reported confidently by
+an agent whose other work was excellent, propagated into a finding and from
+there into a card brief. The agent that fixed it checked, found the premise
+false, and said so instead of implementing what I asked for.
+
+**Two things follow for the rest of this epic:** when a report explains *why*
+something happens, the mechanism is a hypothesis until someone reads the path;
+and findings written from a report, rather than from code, should say so, so the
+next reader knows what has actually been verified.
+
+### The fix this card takes
+
+Add a fifth `AgentApprovalOutcome::Cancelled` and record it in `cancel_matching`,
+where the parked prompt is already taken under the lock. The shared-path
+guarantee is **not** weakened, because cancellation was never on the shared path
+— it is strengthened, from four of five resolutions recorded to five of five,
+with the two recording sites exhaustive and pinned by a test rather than assumed
+by construction.
+
+**No machine vocabulary is needed**, verified: `AgentApprovalOutcome` derives
+only `Clone, Copy, Debug, Eq, PartialEq` — no `Serialize`, no `wire()`, no DTO
+field of its own — and reaches machine surfaces only as the free text of a
+timeline entry. `AgentApprovalKind` needs `wire()` because that kind *is* a DTO
+field and a hook variable; this outcome is not. Adding `wire()` here would invent
+a machine vocabulary nothing consumes, which **F45**'s own rule forbids.
+
+---
+
+### Original text, kept for the record (premise incorrect)
+
+## F43 (as first written) — a cancelled approval is recorded as "timed out"
 
 Noticed while reviewing T2-S6 and **not fixed in it**, because the fix is a
 design change rather than a line.
