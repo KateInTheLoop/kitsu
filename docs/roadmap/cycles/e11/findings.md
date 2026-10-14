@@ -1137,7 +1137,39 @@ a dependency rather than by preference:
    height: a palette that would not fit must be truncated or suppressed rather
    than pushing the region to an invalid geometry.
 3. **T0-S15, the palette itself** — matching, filtering as you type, the
-   border, and `Tab` semantics against a list rather than a single hint.
+   border, and `Tab` semantics against a list rather than a single hint. Split
+   again on contact: **S15a** the rows as data, **S15b** the wiring.
+
+### The drop-from-the-top rule collides with a bordered box
+
+Found while scoping T0-S15a, and it is a collision between two decisions I made
+in earlier cards rather than a defect in either.
+
+T0-S14 established that when the viewport cannot fit every requested row, the
+**topmost** rows are dropped so the composer survives. That is correct for a
+list. It is **wrong for a bordered box**: the top row is the box's top border
+and its ` slash commands ` label, so dropping it leaves a frame with no lid —
+and dropping two leaves a stray `│` column with no context at all.
+
+The resolution is not to change the rule, which is right for the general case,
+but to **build the palette to the height it will be granted** rather than
+building it at full size and letting the clamp cut it. Hence
+`granted_rows(requested)` as a query the caller consults *before* laying out —
+which is exactly the shape recorded above, and arrived at twice from different
+directions: once to let a palette mark its hidden entries without a repaint
+flicker, and once here to keep its frame intact.
+
+A consequence for the "N more" row: the existing `slash_palette` already emits
+one when matches exceed `SLASH_PALETTE_ROWS`, but the **height** can hide
+entries too. A count that reflects only the row cap would under-report whenever
+the window is short, which is the kind of wrong that looks right — so it is
+pinned against a prefix matching many commands at a small height.
+
+Worth stating plainly, because it is the reason this card is small: the classic
+palette renderer already does matching, both frame styles, the row cap, the
+"N more" row, the no-match case and per-row width fitting with ellipsis. The
+inline palette **reuses** it. Two palettes that drifted would be worse than one
+palette with an awkward call site.
 
 ### T0-S14's two decisions, taken rather than deferred
 
@@ -1274,3 +1306,39 @@ module. Worth bearing in mind that F23 established this suite had a test failing
 roughly 7% of the time while appearing green on every manual run, so "I ran it
 and it passed" is weak evidence here. If it recurs, the cheap first step is a
 repeat-run loop on that module alone rather than the whole suite.
+
+## F29 — the inline palette duplicates the classic one's frame and labels
+
+Found while reviewing T0-S15a. **Accepted deliberately, on evidence, with the
+factoring recorded rather than deferred silently.**
+
+`palette_rows` reuses the classic renderer's *pieces* — `matching_slash_commands`,
+the entry format, `fit_palette_text` and `fit_palette_text_with_padding` — but it
+necessarily re-derives the row-selection step, because `slash_palette` has **no
+height parameter**: its `SLASH_PALETTE_ROWS` cap is unconditional, and the whole
+point of the inline palette is to be built to a granted height so its frame
+survives.
+
+That re-derivation drags along copies of the two labels (` slash commands `,
+` type to filter · Tab to complete `), both frame-character sets, and the
+`no matching command` text. Duplication in a renderer is precisely how this
+project has been bitten before — it is the reasoning that made T0-S9 share
+`compose_input_row` instead of reimplementing the row composer.
+
+**Why accepted anyway: the drift is provably caught, not hopefully caught.** A
+test asserts the inline rows equal `slash_palette`'s own output, for two widths
+and both frames, at the exact height. I verified the net bites rather than
+assuming it: changing the label in `slash_palette` **alone** turns that test
+red. So the cost of the duplication is a double edit that fails loudly, not a
+silent divergence.
+
+**The factoring, for T0-S15b to do first**, since that card touches this code
+anyway: give the classic renderer the height parameter —
+`slash_palette_rows(prefix, rich, inner_width, max_rows) -> Vec<String>` — and
+make `slash_palette` a thin join over it with the classic height, exactly as
+`compose_input_row` is a thin wrapper over `compose_row`. Then the labels, the
+frames and the selection logic exist once, the parity test becomes trivially
+true, and the inline path stops carrying copies. It was not done in S15a because
+that card was scoped to tests-then-implementation of the data, and refactoring
+the classic Rustyline hint path mid-card would have put a shared, separately
+tested surface at risk for no test-visible gain.

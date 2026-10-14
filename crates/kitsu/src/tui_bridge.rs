@@ -215,6 +215,25 @@ impl BridgeGuard {
             .paint(std::slice::from_ref(&row), live::terminal_columns());
     }
 
+    /// T0-S15: how many rows a [`paint_rows`](Self::paint_rows) request for
+    /// `requested` rows would actually be granted on this terminal.
+    ///
+    /// A **query**, not a second source of truth: it is
+    /// [`kitsu_tui::viewport::clamp_viewport_rows`] against the guard's own
+    /// stored terminal height, which is precisely what `paint_rows` latches
+    /// for the same request. A caller that computed the clamp itself would be
+    /// a second copy of F19's bound, free to drift from the one the paint
+    /// uses.
+    ///
+    /// It exists because a bordered box cannot be built at full size and then
+    /// clamped: `fit_viewport_rows` drops rows from the **top**, which for a
+    /// list is right and for a box removes the lid. The palette therefore asks
+    /// what height it will get *before* laying its content out.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn granted_rows(&self, requested: u16) -> u16 {
+        clamp_viewport_rows(self.rows.get(), requested)
+    }
+
     /// T0-S14: draw `content` on the pinned viewport, making the viewport as
     /// tall as the content needs.
     ///
@@ -680,6 +699,111 @@ pub(crate) fn suspend_and_resume(effects: &mut dyn SuspendEffects) -> bool {
     true
 }
 
+/// The shortest bordered palette that is still a box: the top border, one
+/// content row, and the footer separator. Below this height there is no
+/// palette at all -- a frame with no lid, or a lid with no frame, is worse
+/// than nothing.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const PALETTE_MIN_ROWS: u16 = 3;
+
+/// T0-S15: the bordered slash-command palette as **rows**, already sized to
+/// the height the viewport will grant.
+///
+/// `buffer` is the composer's raw buffer, slash included: anything that is not
+/// a single-token slash prefix (an empty buffer, ordinary text, a buffer with
+/// whitespace or a newline) has no palette, exactly as `ChatHelper::hint`
+/// decides in `main.rs`. The content itself comes from
+/// [`crate::slash_palette`] -- there is deliberately no second palette
+/// renderer, because two that drift would be worse than one.
+///
+/// Returns at most `max_rows` complete lines, none of them newline-terminated,
+/// where the first is always the top border and the last always the footer
+/// separator. When `max_rows` cannot hold [`PALETTE_MIN_ROWS`] the answer is
+/// **empty**: never a partial box. Height is taken out of the *entries*, and
+/// the trailing "N more" row counts everything actually hidden, whether the
+/// `SLASH_PALETTE_ROWS` cap or the height is what hid it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn palette_rows(
+    buffer: &str,
+    rich: bool,
+    inner_width: usize,
+    max_rows: u16,
+) -> Vec<String> {
+    if max_rows < PALETTE_MIN_ROWS {
+        return Vec::new();
+    }
+    // Exactly `ChatHelper::hint`'s rule: a single-token slash prefix, no
+    // newline, no whitespace anywhere after the slash.
+    let Some(prefix) = buffer.strip_prefix('/') else {
+        return Vec::new();
+    };
+    if buffer.contains('\n') || prefix.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+
+    let top_label = " slash commands ";
+    let footer_label = " type to filter \u{b7} Tab to complete ";
+    let (top_left, horizontal, top_right, vertical, separator_left, separator_right) = if rich {
+        (
+            '\u{256d}', '\u{2500}', '\u{256e}', '\u{2502}', '\u{251c}', '\u{2524}',
+        )
+    } else {
+        ('+', '-', '+', '|', '+', '+')
+    };
+    let framed = |text: &str| {
+        format!(
+            "{vertical}{}{vertical}",
+            crate::fit_palette_text(text, inner_width)
+        )
+    };
+
+    let mut rows = vec![format!(
+        "{top_left}{}{top_right}",
+        crate::fit_palette_text_with_padding(top_label, inner_width, horizontal)
+    )];
+
+    let matches = crate::matching_slash_commands(prefix);
+    // The content budget is everything but the top border and the footer
+    // separator; there is no bottom border, because the composer status line
+    // supplies the `\u{2570}\u{2026}\u{256f}` that closes the box.
+    let budget = usize::from(max_rows - 2);
+    if matches.is_empty() {
+        rows.push(framed(
+            " no matching command \u{2014} /help lists everything",
+        ));
+    } else {
+        let entry = |spec: &crate::SlashCommandSpec| {
+            if inner_width >= crate::SLASH_DESCRIPTION_MIN_INNER_WIDTH {
+                format!(" /{:<22} {}", spec.name, spec.description)
+            } else {
+                format!(" {}", spec.syntax())
+            }
+        };
+        if matches.len() <= crate::SLASH_PALETTE_ROWS.min(budget) {
+            // Everything fits: no "more" row to carry, so the entries take
+            // the whole budget.
+            rows.extend(matches.iter().map(|spec| framed(&entry(spec))));
+        } else {
+            // One content row goes to the "more" line, so the entries get
+            // `max_rows - 3`. At exactly `PALETTE_MIN_ROWS` that is zero
+            // entries and a "more" row carrying the full match count: a
+            // well-formed, honest minimal box.
+            let shown = crate::SLASH_PALETTE_ROWS.min(usize::from(max_rows - 3));
+            rows.extend(matches.iter().take(shown).map(|spec| framed(&entry(spec))));
+            rows.push(framed(&format!(
+                " \u{2026} {} more \u{2014} keep typing to narrow the list",
+                matches.len() - shown
+            )));
+        }
+    }
+
+    rows.push(format!(
+        "{separator_left}{}{separator_right}",
+        crate::fit_palette_text_with_padding(footer_label, inner_width, horizontal)
+    ));
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
@@ -691,7 +815,8 @@ mod tests {
     use serial_test::serial;
 
     use super::{
-        install, mode_from_value, suspend_and_resume, BridgeGuard, SuspendEffects, TuiMode,
+        install, mode_from_value, palette_rows, suspend_and_resume, BridgeGuard, SuspendEffects,
+        TuiMode, PALETTE_MIN_ROWS,
     };
 
     /// A sink whose buffer outlives the surface that owns it, so bytes written
@@ -3014,5 +3139,332 @@ mod tests {
             kitsu_render::sanitize_terminal_text(body).chars().count()
         );
         drop(guard);
+    }
+
+    // ---------------------------------------------------------------------
+    // T0-S15: the bordered slash palette as data.
+    //
+    // T0-S14 settled that a viewport too short for its content drops the
+    // **topmost** rows, so the composer survives. For a list that is right;
+    // for a bordered box it removes the top border and its ` slash commands `
+    // label, leaving a frame with no lid. The palette therefore has to be
+    // *built to fit* the height it will be granted -- hence
+    // `BridgeGuard::granted_rows`, which answers "how many rows would I get?"
+    // before the content is laid out, and `palette_rows`, which lays it out to
+    // that budget.
+    //
+    // Nothing is wired here: no reader, no keystroke, no repaint policy. This
+    // is the data, and the next card decides when it appears.
+    // ---------------------------------------------------------------------
+
+    /// The classic palette's rows, as `slash_palette` renders them for the
+    /// same prefix and width. `slash_palette` opens with a bare `\n` (it is a
+    /// Rustyline hint appended under the composer) and ends with no newline,
+    /// so the rows are its lines with that leading blank dropped.
+    ///
+    /// Derived from `slash_palette` itself rather than written out, so the two
+    /// palettes cannot drift apart without a test failing.
+    fn classic_rows(prefix: &str, rich: bool, inner_width: usize) -> Vec<String> {
+        crate::slash_palette(prefix, rich, inner_width)
+            .trim_start_matches('\n')
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn is_top_border(row: &str, rich: bool) -> bool {
+        row.starts_with(if rich { '\u{256d}' } else { '+' })
+            && row.ends_with(if rich { '\u{256e}' } else { '+' })
+            && row.contains("slash commands")
+    }
+
+    fn is_footer(row: &str, rich: bool) -> bool {
+        row.starts_with(if rich { '\u{251c}' } else { '+' })
+            && row.ends_with(if rich { '\u{2524}' } else { '+' })
+            && row.contains("type to filter")
+    }
+
+    /// The trailing "N more" row's count, when there is one.
+    fn more_count(rows: &[String]) -> Option<usize> {
+        rows.iter()
+            .find(|row| row.contains("more \u{2014} keep typing"))
+            .map(|row| {
+                let digits: String = row
+                    .chars()
+                    .skip_while(|character| !character.is_ascii_digit())
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits
+                    .parse()
+                    .unwrap_or_else(|_| panic!("the more row carries a count: {row:?}"))
+            })
+    }
+
+    /// Command rows: everything that is neither frame nor the "N more" row.
+    fn entry_rows(rows: &[String], rich: bool) -> usize {
+        rows.iter()
+            .filter(|row| {
+                !is_top_border(row, rich)
+                    && !is_footer(row, rich)
+                    && !row.contains("more \u{2014} keep typing")
+            })
+            .count()
+    }
+
+    const PALETTE_WIDTH: usize = crate::COMPOSER_SURFACE_DEFAULT_INNER_WIDTH;
+
+    /// Test S15-1. `granted_rows` is a **query** on the guard, not a second
+    /// copy of F19's bound: for every terminal height and request it answers
+    /// exactly the height `paint_rows` goes on to latch for the same request.
+    /// The palette must be able to size itself in advance without computing
+    /// the clamp -- a caller-side clamp would be free to drift from the one
+    /// the paint actually applies.
+    #[test]
+    #[serial]
+    fn granted_rows_answers_exactly_what_paint_rows_latches() {
+        let _state = GlobalState::capture();
+        for rows in 3u16..=12 {
+            for requested in 1u16..=10 {
+                let (guard, _out, err) = install_inline(rows, 1, "status: idle");
+                let guard = guard.expect("inline mode installs a guard");
+
+                let granted = guard.granted_rows(requested);
+                assert_eq!(
+                    granted,
+                    requested.min(rows - 2),
+                    "a {requested}-row request on a {rows}-row terminal is clamped to \
+                     F19's bound, not refused"
+                );
+
+                // And it agrees with the paint: the second paint at the same
+                // height emits the paint alone (finding F27), so the number of
+                // cleared rows is the latched height.
+                let content: Vec<String> = (0..requested).map(|i| format!("row {i}")).collect();
+                guard.paint_rows(&content);
+                let before = err.text().len();
+                guard.paint_rows(&content);
+                assert_eq!(
+                    err.text()[before..].matches("\x1b[2K").count(),
+                    granted as usize,
+                    "granted_rows({requested}) on a {rows}-row terminal must equal the \
+                     rows paint_rows draws"
+                );
+                drop(guard);
+            }
+        }
+    }
+
+    /// Test S15-2. **The headline.** The box is always well formed: if any
+    /// rows come back, the first is the top border and the last is the footer
+    /// separator -- for every height from the minimum upward, both frames, and
+    /// prefixes matching zero, one, few and many commands. This is the
+    /// invariant T0-S14's drop-from-the-top rule would violate if the palette
+    /// were built at full size and then clamped.
+    #[test]
+    fn palette_rows_is_a_well_formed_box_at_every_height_it_returns_one() {
+        for buffer in ["/", "/s", "/mod", "/model", "/zzz"] {
+            for rich in [true, false] {
+                for max_rows in PALETTE_MIN_ROWS..=14 {
+                    let rows = palette_rows(buffer, rich, PALETTE_WIDTH, max_rows);
+                    assert!(
+                        !rows.is_empty(),
+                        "{buffer:?} at {max_rows} rows (rich={rich}) fits a box, so one \
+                         must come back"
+                    );
+                    assert!(
+                        is_top_border(&rows[0], rich),
+                        "the first row must be the top border with its label \
+                         ({buffer:?}, {max_rows}, rich={rich}): {rows:?}"
+                    );
+                    assert!(
+                        is_footer(rows.last().expect("non-empty"), rich),
+                        "the last row must be the footer separator ({buffer:?}, \
+                         {max_rows}, rich={rich}): {rows:?}"
+                    );
+                    assert!(
+                        rows.len() <= max_rows as usize,
+                        "{} rows exceeds the {max_rows} granted ({buffer:?})",
+                        rows.len()
+                    );
+                    assert!(
+                        rows.iter().all(|row| !row.contains('\n')),
+                        "each row is one complete line with no newline: {rows:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test S15-3. Below a minimal box -- the top border, one content row and
+    /// the footer -- there is **no** palette rather than a broken one. A lid
+    /// with no frame, or a frame with no lid, is worse than nothing.
+    #[test]
+    fn palette_rows_declines_a_height_too_small_for_a_minimal_box() {
+        assert_eq!(PALETTE_MIN_ROWS, 3, "top border + one content row + footer");
+        for buffer in ["/", "/mod", "/zzz"] {
+            for rich in [true, false] {
+                for max_rows in 0..PALETTE_MIN_ROWS {
+                    assert!(
+                        palette_rows(buffer, rich, PALETTE_WIDTH, max_rows).is_empty(),
+                        "{max_rows} rows cannot hold a box, so {buffer:?} must yield no \
+                         palette at all (rich={rich})"
+                    );
+                }
+                assert_eq!(
+                    palette_rows(buffer, rich, PALETTE_WIDTH, PALETTE_MIN_ROWS).len(),
+                    PALETTE_MIN_ROWS as usize,
+                    "and at exactly the minimum it is exactly a minimal box"
+                );
+            }
+        }
+    }
+
+    /// Test S15-4. Entries are what gets squeezed, never the frame: as the
+    /// granted height shrinks the number of command rows falls monotonically
+    /// while the border and footer survive every step.
+    #[test]
+    fn palette_rows_squeezes_entries_and_never_the_frame() {
+        let rich = true;
+        let mut previous = usize::MAX;
+        for max_rows in (PALETTE_MIN_ROWS..=14).rev() {
+            let rows = palette_rows("/", rich, PALETTE_WIDTH, max_rows);
+            let entries = entry_rows(&rows, rich);
+            assert!(
+                entries <= previous,
+                "entries must not grow as the height shrinks ({max_rows} rows): \
+                 {entries} after {previous}"
+            );
+            previous = entries;
+            assert!(
+                is_top_border(&rows[0], rich) && is_footer(rows.last().expect("non-empty"), rich),
+                "the frame survives every squeeze ({max_rows} rows): {rows:?}"
+            );
+        }
+        assert!(
+            entry_rows(
+                &palette_rows("/", rich, PALETTE_WIDTH, PALETTE_MIN_ROWS),
+                rich
+            ) < entry_rows(&palette_rows("/", rich, PALETTE_WIDTH, 14), rich),
+            "a minimal box shows strictly fewer commands than a generous one"
+        );
+    }
+
+    /// Test S15-5. The "N more" row is **honest**. Entries hidden by the
+    /// height count exactly as much as entries hidden by `SLASH_PALETTE_ROWS`:
+    /// at every height, either every match is on screen and there is no more
+    /// row, or the more row's count is precisely the number of matches that
+    /// are not. Pinned against prefixes matching many commands at small
+    /// heights, which is where a count copied from the classic palette's
+    /// `matches.len() - SLASH_PALETTE_ROWS` would quietly lie.
+    #[test]
+    fn palette_rows_more_count_reflects_entries_hidden_by_the_height() {
+        for (buffer, prefix) in [("/", ""), ("/s", "s"), ("/m", "m"), ("/mod", "mod")] {
+            let total = crate::matching_slash_commands(prefix).len();
+            for rich in [true, false] {
+                for max_rows in PALETTE_MIN_ROWS..=14 {
+                    let rows = palette_rows(buffer, rich, PALETTE_WIDTH, max_rows);
+                    let entries = entry_rows(&rows, rich);
+                    match more_count(&rows) {
+                        Some(more) => assert_eq!(
+                            more,
+                            total - entries,
+                            "{buffer:?} at {max_rows} rows shows {entries} of {total} \
+                             commands, so the more row must say {} (rich={rich}): {rows:?}",
+                            total - entries
+                        ),
+                        None => assert_eq!(
+                            entries, total,
+                            "{buffer:?} at {max_rows} rows has no more row, so every one \
+                             of its {total} matches must be on screen (rich={rich}): \
+                             {rows:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Test S15-6. Content parity with the classic Rustyline palette: for a
+    /// height that holds the whole thing, the rows are byte-for-byte the text
+    /// `slash_palette` produces for the same prefix and width -- asserted
+    /// against `slash_palette` itself, never against literals, so the two
+    /// cannot drift. A generous height must not add rows either.
+    #[test]
+    fn palette_rows_are_the_classic_palettes_rows_where_both_fit() {
+        for (buffer, prefix) in [("/", ""), ("/s", "s"), ("/mod", "mod"), ("/zzz", "zzz")] {
+            for inner_width in [30, PALETTE_WIDTH] {
+                for rich in [true, false] {
+                    let classic = classic_rows(prefix, rich, inner_width);
+                    let exact = u16::try_from(classic.len()).expect("a small box");
+                    assert_eq!(
+                        palette_rows(buffer, rich, inner_width, exact),
+                        classic,
+                        "{buffer:?} at its exact height (width {inner_width}, rich={rich}) \
+                         must be the classic palette's own rows"
+                    );
+                    assert_eq!(
+                        palette_rows(buffer, rich, inner_width, exact + 5),
+                        classic,
+                        "and extra height adds nothing ({buffer:?}, width {inner_width}, \
+                         rich={rich})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test S15-7. The `rich` flag picks the frame, matching `slash_palette`:
+    /// Unicode box drawing when rich, pure ASCII when not -- and no stray
+    /// Unicode frame character survives into the ASCII form.
+    #[test]
+    fn palette_rows_frame_follows_the_rich_flag() {
+        let rich = palette_rows("/mod", true, PALETTE_WIDTH, 6);
+        assert!(
+            rich.iter()
+                .all(|row| row.starts_with(['\u{256d}', '\u{2502}', '\u{251c}'])),
+            "every rich row opens with a box-drawing character: {rich:?}"
+        );
+
+        let plain = palette_rows("/mod", false, PALETTE_WIDTH, 6);
+        assert!(
+            plain.iter().all(|row| row.starts_with(['+', '|'])),
+            "every ASCII row opens with + or |: {plain:?}"
+        );
+        assert!(
+            plain
+                .iter()
+                .all(|row| !row.contains(['\u{256d}', '\u{2502}', '\u{251c}', '\u{256e}'])),
+            "no Unicode frame leaks into the ASCII palette: {plain:?}"
+        );
+        assert!(
+            plain.iter().any(|row| row.contains("/model")),
+            "and it is still the same content: {plain:?}"
+        );
+    }
+
+    /// Test S15-8. No palette at all for a buffer that is not a single-token
+    /// slash prefix: an empty buffer, ordinary text, a command with arguments,
+    /// a multi-line paste, a leading space. These are exactly the cases
+    /// `ChatHelper::hint` declines in `main.rs`, and the two must agree.
+    #[test]
+    fn palette_rows_is_empty_for_anything_that_is_not_a_slash_prefix() {
+        for buffer in [
+            "",
+            "model",
+            "ordinary prompt",
+            "/model qwen",
+            "/mod ",
+            " /mod",
+            "/mo\nde",
+            "line\n/mod",
+        ] {
+            for rich in [true, false] {
+                assert!(
+                    palette_rows(buffer, rich, PALETTE_WIDTH, 14).is_empty(),
+                    "{buffer:?} is not a slash prefix, so it opens no palette \
+                     (rich={rich})"
+                );
+            }
+        }
     }
 }
