@@ -41,8 +41,24 @@ use std::sync::Arc;
 
 use kitsu_providers::ToolDescriptor;
 
+/// Where a permission gate must take an ungranted decision (design §4.4, B2).
+///
+/// This is the seam the blocked-agent work is built on: the gates keep asking
+/// one question ("may I prompt?"), but the answer now carries *who* would be
+/// asked. Nothing routes to the registry yet, so only `Foreground` permits an
+/// interactive prompt and both other routes keep failing closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptRoute {
+    /// The future owns the process's interactive input and may prompt.
+    Foreground,
+    /// No prompt is reachable: an ungranted operation must fail closed.
+    Denied,
+    /// A registry-tracked background agent that a human could answer for.
+    Registry { agent_id: u64 },
+}
+
 tokio::task_local! {
-    static INTERACTIVE_PROMPTS_ALLOWED: bool;
+    static PROMPT_ROUTE: PromptRoute;
 }
 
 /// Run tool work without allowing it to claim the process's interactive input.
@@ -55,13 +71,31 @@ pub async fn scope_without_interactive_prompts<F>(future: F) -> F::Output
 where
     F: Future,
 {
-    INTERACTIVE_PROMPTS_ALLOWED.scope(false, future).await
+    PROMPT_ROUTE.scope(PromptRoute::Denied, future).await
+}
+
+/// Run tool work whose ungranted decisions belong to a registry-tracked agent.
+///
+/// Only the route is recorded here; the gates do not consult it yet, so such a
+/// future still fails closed exactly like [`scope_without_interactive_prompts`].
+pub async fn scope_with_registry_prompts<F>(agent_id: u64, future: F) -> F::Output
+where
+    F: Future,
+{
+    PROMPT_ROUTE
+        .scope(PromptRoute::Registry { agent_id }, future)
+        .await
+}
+
+/// The route in effect for the current task; an unscoped task is foreground.
+pub(crate) fn prompt_route() -> PromptRoute {
+    PROMPT_ROUTE
+        .try_with(|route| *route)
+        .unwrap_or(PromptRoute::Foreground)
 }
 
 pub(crate) fn interactive_prompts_allowed() -> bool {
-    INTERACTIVE_PROMPTS_ALLOWED
-        .try_with(|allowed| *allowed)
-        .unwrap_or(true)
+    matches!(prompt_route(), PromptRoute::Foreground)
 }
 
 /// A tool handler: takes raw JSON args, returns a JSON string result.
@@ -340,5 +374,97 @@ mod tests {
             next.run("second_tool", "{}".to_string()).await.unwrap(),
             "second result"
         );
+    }
+
+    // T2-S1 — the prompt route seam. These pin only the route itself: no gate
+    // consults it yet, so a `Registry` route still reports "not foreground"
+    // and every existing caller keeps today's behavior.
+
+    #[tokio::test]
+    async fn unset_prompt_route_defaults_to_foreground() {
+        assert!(matches!(prompt_route(), PromptRoute::Foreground));
+        assert!(
+            interactive_prompts_allowed(),
+            "an unset route must behave like today's unwrap_or(true)"
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_prompts_allowed_is_exactly_the_foreground_route() {
+        fn allowed_matches_route() {
+            let route = prompt_route();
+            assert_eq!(
+                interactive_prompts_allowed(),
+                matches!(route, PromptRoute::Foreground),
+                "interactive_prompts_allowed() must be exactly `route == Foreground`"
+            );
+        }
+
+        allowed_matches_route(); // unset == Foreground
+        scope_without_interactive_prompts(async { allowed_matches_route() }).await;
+        scope_with_registry_prompts(7, async { allowed_matches_route() }).await;
+    }
+
+    #[tokio::test]
+    async fn scope_without_interactive_prompts_sets_the_denied_route() {
+        scope_without_interactive_prompts(async {
+            assert!(matches!(prompt_route(), PromptRoute::Denied));
+            assert!(
+                !interactive_prompts_allowed(),
+                "the denied route must keep failing closed for every current caller"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn registry_route_carries_the_agent_id_and_is_not_foreground() {
+        scope_with_registry_prompts(42, async {
+            match prompt_route() {
+                PromptRoute::Registry { agent_id } => assert_eq!(agent_id, 42),
+                _ => panic!("scope_with_registry_prompts must set the Registry route"),
+            }
+            assert!(
+                !interactive_prompts_allowed(),
+                "nothing routes yet, so the gates must still fail closed on a Registry route"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn nested_prompt_route_scope_restores_the_outer_route() {
+        scope_without_interactive_prompts(async {
+            scope_with_registry_prompts(9, async {
+                assert!(matches!(
+                    prompt_route(),
+                    PromptRoute::Registry { agent_id: 9 }
+                ));
+            })
+            .await;
+            assert!(
+                matches!(prompt_route(), PromptRoute::Denied),
+                "a nested scope must not outlive itself"
+            );
+        })
+        .await;
+
+        assert!(matches!(prompt_route(), PromptRoute::Foreground));
+    }
+
+    #[tokio::test]
+    async fn prompt_route_does_not_leak_into_a_sibling_task() {
+        scope_with_registry_prompts(3, async {
+            let sibling = tokio::spawn(async { matches!(prompt_route(), PromptRoute::Foreground) });
+            assert!(
+                sibling.await.expect("sibling task joins"),
+                "the route is task-local: a sibling task must see the default"
+            );
+            assert!(matches!(
+                prompt_route(),
+                PromptRoute::Registry { agent_id: 3 }
+            ));
+        })
+        .await;
     }
 }

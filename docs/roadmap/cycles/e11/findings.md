@@ -1724,3 +1724,69 @@ The one deliberate exception is in `crates/kitsu/tests/cli.rs`, where a test
 takes the lock from the *test* side to simulate a live holder and asserts on the
 raw return value. Wrapping that in the retry would change what it tests, so it
 stays direct.
+
+## F33 — `cargo fmt -p kitsu-tools` rewrites the maintainer's uncommitted work
+
+Found in T2-S1, by an agent that did it, caught it and repaired it — and said
+so, which is the only reason it is recorded rather than discovered later.
+
+`crates/kitsu-tools` is **not rustfmt-clean at HEAD**: with the maintainer's
+uncommitted `fs.rs` work stashed, `cargo fmt -p kitsu-tools -- --check`
+reports **4** violations, two in `builtins/fs.rs` and two in `permissions.rs`.
+That is F1 narrowed to one crate.
+
+The consequence is a trap rather than an inconvenience: `cargo fmt -p` formats
+the **whole crate**, so any card that runs it in `kitsu-tools` reformats those
+four places — and while the maintainer's uncommitted edit-tool changes sit in
+`fs.rs`, it reformats *their* lines too. The agent's repair restored the file
+byte-for-byte (verified: 54 insertions / 20 deletions in three hunks, exactly
+as at session start), but the next card would hit it again.
+
+### My first rule here was wrong, and it caused the second incident
+
+I recorded the rule below after the first occurrence:
+
+> format only the files you changed — `rustfmt --edition 2021 <file>`
+
+**That is unsafe, and the next agent tripped on it doing exactly what I told it
+to.** `rustfmt` in write mode follows the `mod` declarations of the file it is
+given, so pointing it at a **crate root** formats the entire module tree — it
+is equivalent to `cargo fmt -p` for writing purposes. And `lib.rs`, the file
+this card had to change, *is* the crate root. So my "safe" command reformatted
+both pre-existing violations in `builtins/fs.rs` — inside the maintainer's
+blast radius, taking the numstat from 54/20 to 68/25 — and both in
+`permissions.rs`.
+
+It was repaired precisely: the agent reverse-applied **only** the two
+rustfmt-induced hunks in `fs.rs` with `git apply -R`, leaving the maintainer's
+three hunks untouched, and restored `permissions.rs` from HEAD since it had no
+local changes. I verified: numstat back to `54 20`, the same three hunk
+headers, `permissions.rs` clean, and `rustfmt --check` still reporting the same
+4 pre-existing violations — the crate's unclean state preserved exactly as
+found.
+
+Note also that my original diagnosis named the wrong culprit: I blamed
+`cargo fmt -p` for the first incident, but the mechanism is rustfmt following
+`mod` declarations, which both commands trigger.
+
+### The actual working rule for `kitsu-tools`
+
+**Do not run write-mode rustfmt in this crate at all while the maintainer's
+`fs.rs` work is in the tree.**
+
+- `rustfmt --check` and `cargo fmt -p kitsu-tools -- --check` are **read-only
+  and safe** — use them to inspect.
+- To fix formatting in one file, hand-fix it, or format a *copy* elsewhere and
+  diff the result back. This rustfmt has no `--skip-children`.
+- A card's gate is "the file I touched is clean", verified with `--check`, not
+  "the crate is clean" — the crate is not clean, and making it clean is the
+  maintainer's call because their uncommitted work sits in the blast radius.
+- Pointing rustfmt at a **leaf** module file is far safer than at a crate root,
+  since a leaf declares no submodules — but the root is exactly the file most
+  cards need to touch, so the rule above is stated as a flat prohibition rather
+  than a nuance to be remembered under pressure.
+
+Worth noting for F1's eventual fix: the four violations are all pre-existing
+committed code, so formatting them is safe **once the maintainer's `fs.rs`
+work is committed or set aside** — and doing it then removes this trap
+permanently.
