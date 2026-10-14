@@ -818,6 +818,51 @@ pub(crate) fn palette_rows(
     crate::slash_palette_rows(prefix, rich, inner_width, max_rows)
 }
 
+/// The inline composer's completion host.
+///
+/// This is the whole of the inline host: a delegate. Every candidate comes
+/// from [`crate::ComposerCompletion`], which is also the classic Rustyline
+/// `ChatHelper`'s only source, so the two cannot disagree -- there is nothing
+/// here that could drift. The same holds for the re-hosted hinter and
+/// highlighter below.
+///
+/// Nothing in production drives the inline composer yet -- that is a later
+/// card -- so the only constructions are in the parity tests; the seam is
+/// kept here, beside `palette_rows`, rather than in a test module.
+#[allow(dead_code)]
+pub(crate) struct InlineComposerHost {
+    completion: crate::ComposerCompletion,
+    /// Rich terminals get color; `NO_COLOR` keeps the composer unstyled.
+    rich: bool,
+}
+
+impl InlineComposerHost {
+    #[allow(dead_code)]
+    pub(crate) fn new(completion: crate::ComposerCompletion, rich: bool) -> Self {
+        Self { completion, rich }
+    }
+}
+
+impl kitsu_tui::composer::CompletionSource for InlineComposerHost {
+    fn complete(&self, line: &str, pos: usize) -> kitsu_tui::composer::Completion {
+        self.completion.candidates(line, pos)
+    }
+}
+
+impl kitsu_tui::composer::ComposerDecoration for InlineComposerHost {
+    /// The inline row's hint is the **row** hint, not the classic multi-row
+    /// deck: F20's second correction established that the palette and the
+    /// row suffix are different things with different causes. The palette
+    /// reaches the inline composer through [`palette_rows`] instead.
+    fn hint(&self, line: &str) -> String {
+        crate::idle_slash_hint(line)
+    }
+
+    fn highlight_hint(&self, hint: &str) -> String {
+        crate::highlight_composer_hint(hint, self.rich)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;

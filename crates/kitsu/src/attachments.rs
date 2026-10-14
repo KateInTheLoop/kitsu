@@ -732,7 +732,11 @@ fn completion_entries_no_follow(_path: &Path) -> std::io::Result<Vec<CompletionF
 /// Return `(replacement_start, display, replacement)` candidates for the
 /// `@path` token at the cursor. Completion is relative to `base`, does not
 /// follow symlinks, and only exposes paths covered by an existing read grant.
-fn complete_from(
+///
+/// `base` is passed in rather than read from the process so that the one
+/// shared composer completion source (`crate::ComposerCompletion`) is a pure
+/// function of its inputs; [`complete`] is the launch-directory wrapper.
+pub(crate) fn complete_from(
     line: &str,
     pos: usize,
     base: &Path,
@@ -832,18 +836,6 @@ fn completion_text_is_safe(value: &str) -> bool {
             // but terminal frontends may still render them as row boundaries.
             && !matches!(ch, '\u{2028}' | '\u{2029}')
     }) && kitsu_render::sanitize_terminal_text(value) == value
-}
-
-/// Complete a relative attachment mention from the process launch directory.
-/// This is synchronous by design: completion never prompts for new access and
-/// returns no candidates on platforms without secure no-reparse traversal.
-pub fn complete(
-    line: &str,
-    pos: usize,
-    perms: &Permissions,
-) -> Option<(usize, Vec<(String, String)>)> {
-    let base = std::env::current_dir().ok()?;
-    complete_from(line, pos, &base, perms)
 }
 
 #[cfg(test)]

@@ -5665,12 +5665,118 @@ fn slash_help(model: &str, styled: bool) -> String {
     out
 }
 
+/// The **one** composer completion source, used by both hosts.
+///
+/// The classic Rustyline `ChatHelper` and the inline composer's
+/// `kitsu_tui::composer::CompletionSource` implementation in
+/// [`tui_bridge`](crate::tui_bridge) both call
+/// [`candidates`](ComposerCompletion::candidates) and neither computes
+/// anything of its own. This is the F2/F38/F45 lesson applied up front: two
+/// implementations that happen to agree are worth much less than one that
+/// cannot disagree.
+///
+/// The launch directory is held explicitly rather than read from
+/// `std::env::current_dir` inside the call, so the candidate list is a pure
+/// function of its inputs and both hosts can be compared in a unit test.
+pub(crate) struct ComposerCompletion {
+    permissions: std::sync::Arc<Permissions>,
+    /// The directory relative `@file` mentions resolve against.
+    base: std::path::PathBuf,
+}
+
+impl ComposerCompletion {
+    pub(crate) fn new(permissions: std::sync::Arc<Permissions>, base: std::path::PathBuf) -> Self {
+        Self { permissions, base }
+    }
+
+    /// The production construction: attachments resolve from the process
+    /// launch directory. This is the only place that directory is read, which
+    /// is why `attachments` exposes only the explicit-base
+    /// [`complete_from`](attachments::complete_from).
+    pub(crate) fn at_launch_directory(permissions: std::sync::Arc<Permissions>) -> Self {
+        Self::new(
+            permissions,
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        )
+    }
+
+    /// Candidates for `line` with the cursor at byte offset `pos`.
+    ///
+    /// `start` is the byte offset the replacement begins at, exactly
+    /// Rustyline's contract, so the inline composer splices `start..pos`.
+    pub(crate) fn candidates(&self, line: &str, pos: usize) -> kitsu_tui::composer::Completion {
+        use kitsu_tui::composer::{Candidate, Completion};
+
+        let Some(typed) = line.get(..pos).and_then(|text| text.strip_prefix('/')) else {
+            // Not a slash line: the cursor may sit in an `@path` mention.
+            let Some((start, candidates)) =
+                attachments::complete_from(line, pos, &self.base, self.permissions.as_ref())
+            else {
+                return Completion::none();
+            };
+            if candidates.is_empty() {
+                // Nothing to offer carries no start, so two hosts with
+                // nothing to offer compare equal.
+                return Completion::none();
+            }
+            return Completion {
+                start,
+                candidates: candidates
+                    .into_iter()
+                    .map(|(display, replacement)| Candidate::new(display, replacement))
+                    .collect(),
+            };
+        };
+        if typed.chars().any(char::is_whitespace) {
+            // The command is already complete; its arguments are not ours.
+            return Completion::none();
+        }
+        Completion {
+            // A slash candidate is the whole line.
+            start: 0,
+            candidates: matching_slash_commands(typed)
+                .into_iter()
+                .map(|spec| {
+                    Candidate::new(
+                        format!("{:<24} {}", spec.syntax(), spec.description),
+                        format!(
+                            "/{}{}",
+                            spec.name,
+                            if spec.args.is_empty() { "" } else { " " }
+                        ),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The one styling pass for the composer's hint, shared by the classic
+/// Rustyline `Highlighter` and the inline composer's re-hosted one.
+///
+/// Styling must preserve the display width Rustyline computed from the
+/// unstyled hint, which is why there is one function and not two.
+pub(crate) fn highlight_composer_hint(hint: &str, rich: bool) -> String {
+    if !rich {
+        return hint.to_string();
+    }
+    // Bright cyan separates the transient command deck; the persistent
+    // model/directory footer is dimmer. Styling preserves the display width
+    // Rustyline calculated from the unstyled hint.
+    hint.rsplit_once('\n').map_or_else(
+        || format!("\x1b[2;36m{hint}\x1b[0m"),
+        |(deck, status)| format!("\x1b[1;96m{deck}\x1b[0m\n\x1b[2;36m{status}\x1b[0m"),
+    )
+}
+
 /// Rustyline helper for slash-command completion. Multi-line paste is kept
 /// verbatim: shortening it from a highlighter corrupts Rustyline's cursor-width
 /// accounting (especially for Unicode), so visual collapsing belongs in a
 /// future editor renderer that can preserve buffer geometry.
 struct ChatHelper {
-    permissions: Arc<Permissions>,
+    /// The shared completion source. `impl Completer` must route through this
+    /// and keep only the mapping to `rustyline::completion::Pair`.
+    completion: ComposerCompletion,
     /// Rich terminals get Unicode borders plus color. `NO_COLOR` keeps the
     /// Rustyline editor but selects an unstyled ASCII palette; explicit
     /// plain/screen-reader modes bypass Rustyline entirely.
@@ -6270,38 +6376,21 @@ impl rustyline::completion::Completer for ChatHelper {
         pos: usize,
         _ctx: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let Some(typed) = line.get(..pos).and_then(|text| text.strip_prefix('/')) else {
-            if let Some((start, candidates)) =
-                attachments::complete(line, pos, self.permissions.as_ref())
-            {
-                return Ok((
-                    start,
-                    candidates
-                        .into_iter()
-                        .map(|(display, replacement)| rustyline::completion::Pair {
-                            display,
-                            replacement,
-                        })
-                        .collect(),
-                ));
-            }
-            return Ok((0, Vec::new()));
-        };
-        if typed.chars().any(char::is_whitespace) {
-            return Ok((0, Vec::new()));
-        }
-        let candidates = matching_slash_commands(typed)
-            .into_iter()
-            .map(|spec| rustyline::completion::Pair {
-                display: format!("{:<24} {}", spec.syntax(), spec.description),
-                replacement: format!(
-                    "/{}{}",
-                    spec.name,
-                    if spec.args.is_empty() { "" } else { " " }
-                ),
-            })
-            .collect();
-        Ok((0, candidates))
+        // Nothing is chosen here: every candidate comes from the one shared
+        // source, and all that is left is the mapping to Rustyline's own
+        // `Pair`. There is deliberately no second completion implementation.
+        let offered = self.completion.candidates(line, pos);
+        Ok((
+            offered.start,
+            offered
+                .candidates
+                .into_iter()
+                .map(|candidate| rustyline::completion::Pair {
+                    display: candidate.display,
+                    replacement: candidate.replacement,
+                })
+                .collect(),
+        ))
     }
 }
 impl rustyline::hint::Hinter for ChatHelper {
@@ -6336,14 +6425,9 @@ impl rustyline::Helper for ChatHelper {}
 impl rustyline::highlight::Highlighter for ChatHelper {
     fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
         if self.rich_palette {
-            // Bright cyan separates the transient command deck; the persistent
-            // model/directory footer is dimmer. Styling preserves the display
-            // width Rustyline calculated from the unstyled hint.
-            let styled = hint.rsplit_once('\n').map_or_else(
-                || format!("\x1b[2;36m{hint}\x1b[0m"),
-                |(deck, status)| format!("\x1b[1;96m{deck}\x1b[0m\n\x1b[2;36m{status}\x1b[0m"),
-            );
-            std::borrow::Cow::Owned(styled)
+            // One styling pass, shared with the inline composer's re-hosted
+            // highlighter; there is deliberately no second one.
+            std::borrow::Cow::Owned(highlight_composer_hint(hint, true))
         } else {
             std::borrow::Cow::Borrowed(hint)
         }
@@ -17286,7 +17370,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .map_err(|e| CliError::user(format!("failed to start input editor: {e}")))?;
     // Complete slash commands without changing the visible input-buffer width.
     rl.set_helper(Some(ChatHelper {
-        permissions: perms.clone(),
+        completion: ComposerCompletion::at_launch_directory(perms.clone()),
         rich_palette: !kitsu_render::plain_mode(),
         live_model_window: live_mw.clone(),
         directory: shorten_home(&session.directory),
@@ -21321,14 +21405,245 @@ mod tests {
     }
 
     fn chat_helper() -> ChatHelper {
+        chat_helper_completing_in(
+            Arc::new(Permissions::for_roots(&[], &[]).unwrap()),
+            std::env::current_dir().unwrap(),
+        )
+    }
+
+    /// `chat_helper` with the completion source's launch directory chosen, so
+    /// the `@file` half of the parity test needs no `set_current_dir`.
+    fn chat_helper_completing_in(
+        permissions: Arc<Permissions>,
+        base: std::path::PathBuf,
+    ) -> ChatHelper {
         ChatHelper {
-            permissions: Arc::new(Permissions::for_roots(&[], &[]).unwrap()),
+            completion: ComposerCompletion::new(permissions, base),
             rich_palette: true,
             live_model_window: Arc::new(std::sync::Mutex::new((
                 "test-model".to_string(),
                 Some(8_000),
             ))),
             directory: "~/project".to_string(),
+        }
+    }
+
+    /// The classic host's answer, in the shared vocabulary.
+    ///
+    /// Everything here is the Rustyline *mapping* -- building a `Context` and
+    /// turning `Pair` back into `Candidate`. No candidate is chosen here.
+    fn classic_candidates(
+        helper: &ChatHelper,
+        line: &str,
+        pos: usize,
+    ) -> kitsu_tui::composer::Completion {
+        use rustyline::completion::Completer as _;
+
+        let history = rustyline::history::DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let (start, pairs) = helper.complete(line, pos, &ctx).unwrap();
+        kitsu_tui::composer::Completion {
+            start,
+            candidates: pairs
+                .into_iter()
+                .map(|pair| kitsu_tui::composer::Candidate::new(pair.display, pair.replacement))
+                .collect(),
+        }
+    }
+
+    /// The inline host's answer.
+    fn inline_candidates(
+        permissions: Arc<Permissions>,
+        base: std::path::PathBuf,
+        line: &str,
+        pos: usize,
+    ) -> kitsu_tui::composer::Completion {
+        use kitsu_tui::composer::CompletionSource as _;
+
+        tui_bridge::InlineComposerHost::new(ComposerCompletion::new(permissions, base), true)
+            .complete(line, pos)
+    }
+
+    /// Card T3-S3, the acceptance test the plan names, slash half: the same
+    /// candidates in the same order from both hosts for `/st`.
+    ///
+    /// The third assertion is what keeps the first two from being vacuous:
+    /// the shared list is also the live registry's own answer, so an empty or
+    /// invented list fails even if both hosts produced it.
+    #[test]
+    fn both_hosts_offer_the_same_slash_candidates_for_st() {
+        let permissions = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let base = std::env::current_dir().unwrap();
+        let helper = chat_helper_completing_in(permissions.clone(), base.clone());
+
+        let shared = helper.completion.candidates("/st", 3);
+        let classic = classic_candidates(&helper, "/st", 3);
+        let inline = inline_candidates(permissions, base, "/st", 3);
+
+        assert_eq!(classic, inline, "the two hosts must agree on `/st`");
+        assert_eq!(classic, shared, "the classic host adds nothing of its own");
+        assert_eq!(inline, shared, "the inline host adds nothing of its own");
+
+        let expected_replacements: Vec<String> = matching_slash_commands("st")
+            .into_iter()
+            .map(|spec| {
+                format!(
+                    "/{}{}",
+                    spec.name,
+                    if spec.args.is_empty() { "" } else { " " }
+                )
+            })
+            .collect();
+        assert!(
+            !expected_replacements.is_empty(),
+            "the registry must have at least one `st` command for this test to mean anything"
+        );
+        assert_eq!(shared.start, 0, "a slash candidate replaces the whole line");
+        assert_eq!(
+            shared
+                .candidates
+                .iter()
+                .map(|candidate| candidate.replacement.clone())
+                .collect::<Vec<_>>(),
+            expected_replacements,
+            "the shared source is the registry's answer, in registry order"
+        );
+    }
+
+    /// Card T3-S3, the acceptance test's `@file` half -- the user-visible
+    /// part, since the inline composer has never had path completion (R4,
+    /// finding F20).
+    ///
+    /// The launch directory is passed in rather than set process-wide, so the
+    /// test is pure and parallel-safe.
+    #[cfg(unix)]
+    #[test]
+    fn both_hosts_offer_the_same_at_file_candidates_for_fi() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file_one.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.path().join("fish.txt"), "x\n").unwrap();
+        std::fs::create_dir(root.path().join("figures")).unwrap();
+        std::fs::write(root.path().join("other.md"), "x\n").unwrap();
+        let permissions = Arc::new(
+            Permissions::for_roots(&[root.path().to_string_lossy().to_string()], &[]).unwrap(),
+        );
+        let base = root.path().to_path_buf();
+        let helper = chat_helper_completing_in(permissions.clone(), base.clone());
+        let line = "look at @fi";
+        let pos = line.len();
+
+        let shared = helper.completion.candidates(line, pos);
+        let classic = classic_candidates(&helper, line, pos);
+        let inline = inline_candidates(permissions, base, line, pos);
+
+        assert_eq!(classic, inline, "the two hosts must agree on `@fi`");
+        assert_eq!(classic, shared, "the classic host adds nothing of its own");
+        assert_eq!(inline, shared, "the inline host adds nothing of its own");
+
+        // Non-vacuity, and the replacement range: `@fi` starts at byte 8.
+        assert_eq!(shared.start, 8);
+        assert_eq!(
+            shared
+                .candidates
+                .iter()
+                .map(|candidate| (candidate.display.as_str(), candidate.replacement.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("@figures/", "@figures/"),
+                ("@file_one.rs", "@file_one.rs "),
+                ("@fish.txt", "@fish.txt "),
+            ],
+            "sorted, directories keep their slash, files gain a trailing space, \
+             and `other.md` is not a `fi` match"
+        );
+    }
+
+    /// The anti-fork test: for **every** prefix of **every** registered
+    /// command, each host's answer is exactly the shared source's answer.
+    ///
+    /// A fork cannot survive by agreeing on the two sampled inputs above; it
+    /// would have to reproduce the registry traversal over its whole domain,
+    /// which is the duplication this card exists to prevent.
+    #[test]
+    fn both_hosts_are_exactly_the_shared_source_for_every_slash_prefix() {
+        let permissions = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let base = std::env::current_dir().unwrap();
+        let helper = chat_helper_completing_in(permissions.clone(), base.clone());
+
+        let mut checked = 0usize;
+        for spec in SLASH_COMMANDS.iter() {
+            for end in 0..=spec.name.len() {
+                if !spec.name.is_char_boundary(end) {
+                    continue;
+                }
+                let line = format!("/{}", &spec.name[..end]);
+                let pos = line.len();
+                let shared = helper.completion.candidates(&line, pos);
+                assert_eq!(
+                    classic_candidates(&helper, &line, pos),
+                    shared,
+                    "classic host forked at {line:?}"
+                );
+                assert_eq!(
+                    inline_candidates(permissions.clone(), base.clone(), &line, pos),
+                    shared,
+                    "inline host forked at {line:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= SLASH_COMMANDS.len(),
+            "the sweep must visit at least one prefix per command, visited {checked}"
+        );
+    }
+
+    /// The re-hosted highlighter: one styling function, two hosts. Rustyline
+    /// computes the hint's display width from the unstyled text, so a second
+    /// styling pass that differed would corrupt the classic row -- which is
+    /// why this is pinned rather than left to agree by accident.
+    #[test]
+    fn both_hosts_style_the_composer_hint_through_one_function() {
+        use kitsu_tui::composer::ComposerDecoration as _;
+        use rustyline::highlight::Highlighter as _;
+
+        let permissions = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let base = std::env::current_dir().unwrap();
+        let helper = chat_helper_completing_in(permissions.clone(), base.clone());
+        let hint = "deck row\nmodel: test-model";
+
+        let shared = highlight_composer_hint(hint, true);
+        let inline =
+            tui_bridge::InlineComposerHost::new(ComposerCompletion::new(permissions, base), true)
+                .highlight_hint(hint);
+
+        assert_eq!(helper.highlight_hint(hint).as_ref(), shared.as_str());
+        assert_eq!(inline, shared);
+        assert_ne!(
+            shared, hint,
+            "a rich terminal really is styled, so the equalities above are not \
+             two pass-throughs agreeing on nothing"
+        );
+    }
+
+    /// The inline row's hint is the row suffix, not the classic multi-row
+    /// deck -- F20's second correction. Pinned so "parity" is not read as
+    /// "the hosts return the same hint string", which would be wrong.
+    #[test]
+    fn the_inline_rows_hint_is_the_shared_row_hint() {
+        use kitsu_tui::composer::ComposerDecoration as _;
+
+        let permissions = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let base = std::env::current_dir().unwrap();
+        let host =
+            tui_bridge::InlineComposerHost::new(ComposerCompletion::new(permissions, base), true);
+
+        for line in ["/st", "/", "", "hello", "/steer now"] {
+            assert_eq!(
+                host.hint(line),
+                idle_slash_hint(line),
+                "the inline hint for {line:?} is the shared row hint"
+            );
         }
     }
 
