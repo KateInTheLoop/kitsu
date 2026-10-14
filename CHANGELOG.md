@@ -9,6 +9,18 @@ shapes may change in any minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- A session commit could fail with `session '<id>' is already active in this or
+  another process` when nothing else held it. The session lock is advisory and
+  kernel-held per open file description, and a descriptor marked close-on-exec
+  is still duplicated into a child between `fork` and `exec` — so any tool call,
+  agent hook or `git` invocation running on another thread could make an
+  uncontended lock appear taken. Both lock sites now retry briefly before
+  reporting a conflict, which leaves genuine cross-process contention reported
+  exactly as before. Under a sustained burst of subprocess spawning the retry
+  can still be exhausted, so this reduces the window rather than closing it.
+
 ### Added
 
 #### Terminal UI (preview)
