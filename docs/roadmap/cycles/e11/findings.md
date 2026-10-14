@@ -1633,8 +1633,94 @@ and the deterministic-reproduction pattern for this bug class is now established
 cost of waiting is one known-rare flake, already recorded; the cost of skipping
 the test would be a third fix with no evidence it worked.
 
-**A note on why three sites existed.** All three hand-rolled the same
-`flock(LOCK_EX | LOCK_NB)` → "busy" inference independently. The fix introduces
-the first shared helper for it; the lasting improvement is that there is now one
-place to be correct, and the next such lock should use it rather than add a
-fourth copy.
+### It is not three sites. It is five, and I found the last two by surveying
+
+Before briefing T0-S19 I ran an **exhaustive, untruncated** grep for every
+`libc::flock` in the workspace — the discipline this file already records as a
+rule, applied proactively rather than after being wrong. It found two more
+production sites that nobody had looked at, because the diagnosis was scoped to
+sessions and the implementer to its own two files:
+
+| Site | Inference on first `EWOULDBLOCK` | Status |
+|---|---|---|
+| `session.rs` `SessionLease::acquire` | "already active" | fixed, T0-S18 |
+| `session/physical.rs` `acquire_writer_fence` | "already active" | fixed, T0-S18 |
+| `config/publication.rs:516` | `PinTargetError::Busy` | **open** |
+| `artifacts.rs:227` `probe_lock` | `Liveness::Live` | **open, newly found** |
+| `artifacts.rs:264` `hold_generation_lock` | `None` (lock not held) | **open, newly found** |
+
+The two artifact sites have the same false-positive shape with different
+consequences: `probe_lock` reports a **free** lock as **live**, so a reclaimable
+artifact generation looks in use and is never reclaimed; `hold_generation_lock`
+silently returns "could not acquire", so its caller skips or fails work it
+should have done. Neither is as loud as a failed session commit, which is
+presumably why neither was noticed.
+
+(The sixth and last `flock` in the tree is in `tests/cli.rs`, which is a test
+deliberately taking a lock to create contention — correct as written.)
+
+**A note on why so many sites existed.** Every one of them hand-rolled the same
+`flock(LOCK_EX | LOCK_NB)` → "busy" inference independently. T0-S18 introduced
+the first shared helper; the lasting improvement is that there is now **one
+place to be correct**, and the remaining three should adopt it rather than
+anyone adding a sixth copy.
+
+### `probe_lock` nearly proved itself innocent, and the reason generalises
+
+Worth recording because the first attempt at its regression test **passed**, and
+a passing test here would have been read as "this site is fine".
+
+`probe_lock` takes the lock, immediately `LOCK_UN`s on success, and reports
+whether it was free. A test that simply probed an untouched lock file in a loop
+never failed — because `LOCK_UN` releases the **open file description**, which
+is the very description a forked child inherited. So a loop of nothing but
+probes **cleans up after its own leak** and never observes contention.
+
+The insight that fixed the test: `probe_lock` is only ever wrong about a lock
+that *some other code path* leaked across a fork. The working test therefore
+uses the production leak source — a `hold_generation_lock` taken and dropped on
+the same generation directory each attempt, which is exactly the "run finished,
+directory now reclaimable" state a sweep inspects. It then `continue`s rather
+than fails if that acquisition itself trips, so the two artifact defects stay
+isolated and the fix order does not matter.
+
+**The generalisable form:** when testing a race in a *reader* of shared state,
+the reader may repair the very condition it is supposed to catch. Reproducing
+such a bug needs the real producer of the bad state, not a synthetic stand-in.
+This is the same shape as F27 — where a full repaint repaired the damage a
+partial repaint would have shown — and both were found by an agent noticing its
+own test passed when it should not have.
+
+Tuning note: all three tests needed `ATTEMPTS` raised from 300 to 2000 to reach
+100 failures in 100 runs; at 300 they sat at 91, 96 and 98. The cost is nil,
+since each aborts at the first failure, typically within a few dozen attempts.
+
+### RESOLVED in T0-S19 — and the structural result is the point
+
+All three remaining sites now call the shared helper. **Verified
+independently**: a grep of the whole production tree finds exactly **one**
+`flock(LOCK_EX | LOCK_NB)` acquisition left, and it is inside
+`flock_exclusive_with_fork_retry` itself. Five hand-rolled copies of the same
+wrong inference have become one place to be correct — which matters more than
+the three fixes, because it is what stops a sixth appearing.
+
+The helper was made `pub(crate)` with **no re-export and no move**: `artifacts`,
+`config` and `session` are sibling modules, so `crate::session::flock_…`
+resolves directly. The implementer argued for this over a crate-root re-export
+(a second name for one function, hiding where it lives) and over a new module
+(which would drag the budget constants and the `cfg` block away from the fence
+callers and their tests). The fully qualified path also makes each call site
+self-documenting. Each site keeps a short comment saying why a plain `flock`
+would be wrong, so a reader of `artifacts.rs` need not find `session.rs` first.
+
+Verified: helper logic and budget byte-identical (only the signature line
+changed); no `cfg` widened or narrowed — the `publication.rs` call stays inside
+its `#[cfg(target_os = "linux")]` block while the helper remains `#[cfg(unix)]`;
+`probe_lock` keeps its `LOCK_UN`, since only the failure inference was wrong.
+`-p kitsu --bins` 729/0 in both profiles, six runs at `--test-threads=256` all
+clean, 0 failures in 50 release runs per new test.
+
+The one deliberate exception is in `crates/kitsu/tests/cli.rs`, where a test
+takes the lock from the *test* side to simulate a live holder and asserts on the
+raw return value. Wrapping that in the retry would change what it tests, so it
+stays direct.

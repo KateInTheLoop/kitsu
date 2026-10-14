@@ -223,9 +223,12 @@ fn probe_lock(path: &Path) -> Liveness {
     else {
         return Liveness::Live;
     };
-    // SAFETY: `file` is an open descriptor owned by this scope.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
+    // A plain `flock` would be wrong here: a sibling thread between `fork` and
+    // `execve` holds a duplicate of whatever lock descriptors this process has
+    // open, so the first `EWOULDBLOCK` does not mean the lock is held. See
+    // `crate::session::flock_exclusive_with_fork_retry` for the mechanism and
+    // the retry budget.
+    if crate::session::flock_exclusive_with_fork_retry(file.as_raw_fd()).is_ok() {
         // SAFETY: same descriptor, still open.
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
         Liveness::Free
@@ -260,9 +263,13 @@ pub fn hold_generation_lock(directory: &Path) -> Option<std::fs::File> {
         .mode(0o600)
         .open(directory.join(GENERATION_LOCK_NAME))
         .ok()?;
-    // SAFETY: `file` is an open descriptor owned here and returned to the caller.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    (result == 0).then_some(file)
+    // A plain `flock` would be wrong here: a sibling thread's fork-to-exec
+    // window keeps a duplicate of our lock descriptors alive, so the first
+    // `EWOULDBLOCK` is not contention. See
+    // `crate::session::flock_exclusive_with_fork_retry`.
+    crate::session::flock_exclusive_with_fork_retry(file.as_raw_fd())
+        .ok()
+        .map(|()| file)
 }
 
 #[cfg(not(unix))]
@@ -672,5 +679,140 @@ mod tests {
         assert_eq!(parse_duration_secs("90s").unwrap(), 90);
         assert_eq!(parse_duration_secs("2").unwrap(), 172_800);
         assert!(parse_duration_secs("soon").is_err());
+    }
+
+    /// `flock` locks live on the open file description and `O_CLOEXEC` closes
+    /// only at `exec`, so a sibling thread sitting between `fork` and `execve`
+    /// holds a duplicate of any lock descriptor open in this process. A probe
+    /// that trusts the first `EWOULDBLOCK` therefore reports a free lock as
+    /// held, and a reclaimable generation is never reclaimed.
+    #[cfg(unix)]
+    #[test]
+    fn probe_lock_is_not_spuriously_live_while_another_thread_forks() {
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const SPAWNERS: usize = 4;
+        const ATTEMPTS: usize = 2000;
+
+        let root = tempfile::tempdir().unwrap();
+        let generation = root.path().join("runtime-8-8-0");
+        std::fs::create_dir(&generation).unwrap();
+        let lock = generation.join(GENERATION_LOCK_NAME);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..SPAWNERS)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let Ok(mut child) = Command::new("/bin/true")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                        else {
+                            return;
+                        };
+                        let _ = child.wait();
+                    }
+                })
+            })
+            .collect();
+
+        let mut failure = None;
+        for attempt in 0..ATTEMPTS {
+            // A run takes the generation lock and finishes: the handle drops,
+            // its descriptor closes, and the directory is reclaimable. This is
+            // the leak source a sweep meets in production -- a fork that caught
+            // the descriptor keeps the lock alive past the holder's exit. (If
+            // this acquisition itself trips, that is the sibling defect, not
+            // this one, so the attempt is skipped rather than failed.)
+            let Some(held) = hold_generation_lock(&generation) else {
+                continue;
+            };
+            drop(held);
+            let liveness = probe_lock(&lock);
+            if liveness != Liveness::Free {
+                failure = Some((attempt, liveness));
+                break;
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+
+        if let Some((attempt, liveness)) = failure {
+            panic!(
+                "an unheld generation lock probed as {liveness:?} on attempt {attempt} \
+                 of {ATTEMPTS} while another thread was forking"
+            );
+        }
+    }
+
+    /// The same fork window makes `hold_generation_lock` report "could not
+    /// acquire" for a lock nobody holds, and the caller then skips work it
+    /// should have done.
+    #[cfg(unix)]
+    #[test]
+    fn generation_lock_is_not_spuriously_unavailable_while_another_thread_forks() {
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const SPAWNERS: usize = 4;
+        const ATTEMPTS: usize = 2000;
+
+        let root = tempfile::tempdir().unwrap();
+        let generation = root.path().join("runtime-9-9-0");
+        std::fs::create_dir(&generation).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..SPAWNERS)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let Ok(mut child) = Command::new("/bin/true")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                        else {
+                            return;
+                        };
+                        let _ = child.wait();
+                    }
+                })
+            })
+            .collect();
+
+        let mut failure = None;
+        for attempt in 0..ATTEMPTS {
+            match hold_generation_lock(&generation) {
+                // Dropping the handle closes the descriptor and releases the
+                // lock, so every attempt is uncontended.
+                Some(held) => drop(held),
+                None => {
+                    failure = Some(attempt);
+                    break;
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+
+        if let Some(attempt) = failure {
+            panic!(
+                "an uncontended generation lock could not be acquired on attempt {attempt} \
+                 of {ATTEMPTS} while another thread was forking"
+            );
+        }
     }
 }
