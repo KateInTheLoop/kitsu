@@ -1125,6 +1125,24 @@ retains the rich Rustyline editor, including history, completion, and bracketed
 multi-line paste. Pass `--reduced-motion` or set `KITSU_REDUCED_MOTION=1` to
 replace the animated wait indicator with a visible static status.
 
+Set `KITSU_TUI=inline` to opt into the **inline viewport**, a preview renderer
+that pins a status row to the bottom of the terminal and lets the transcript
+scroll above it, instead of repainting one status row in place. The value is
+matched exactly: only `inline` selects it, so `INLINE`, `Inline` or a stray
+trailing space leave you in the renderer you already had. The variable is
+unset by default and a session without it is byte-identical to one from before
+the viewport existed.
+
+It is a preview, and the idle prompt inside it is kitsu's own editor rather
+than Rustyline, so it does not yet have the slash-command palette, Tab
+completion, history that persists across sessions, or Ctrl+Z suspension. What
+it does have: insertion and cursor motion, Home/End, Backspace/Delete, the
+Ctrl+U/K/W kills, Up/Down through the current session's history, bracketed
+paste kept as one draft, Ctrl+D to exit on an empty line, and Ctrl+C to clear
+the line. Everything else — every tier, every byte of non-TTY, `--plain`,
+assistive and JSONL output — is unaffected, because the viewport requires a
+styled interactive terminal.
+
 Background-agent notices print between prompt cycles by default: rendering
 them live at an idle prompt requires a line-editor hook that measurably
 degrades burst-input processing (pastes), and kitsu prioritizes input
