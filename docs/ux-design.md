@@ -76,6 +76,25 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   therefore literal — the region must never occupy a row that already holds
   output.
 
+  **The row's content is composed once, in `kitsu-render`, for both
+  renderers** (T3-S5). `live::compose_status_row` builds the persistent row —
+  model, context meter, elapsed, `[N queued]`, ambient tag — and
+  `live::compose_stack_rows` the queue preview rows; `live::agents_tag` and
+  `live::queued_tag` are the single source for those two tags, called by the
+  classic row and the status row alike. The composer **must** live here rather
+  than in `kitsu-tui`, because `kitsu-render` cannot depend on `kitsu-tui` and
+  the classic row needs the same content: a composer in the viewport crate
+  could never serve both. `kitsu-tui/src/status.rs` is a **caller** that
+  composes nothing. The drop order when the row cannot fit is a requirement, not
+  a rendering detail, and is stated in **R5** of
+  `docs/tui-and-agent-view-design.md`.
+
+  The meter is **8 cells** here against `/context`'s sixteen, because a
+  one-line row shares its width with four other segments. It degrades to ASCII
+  in `--plain` for free, since the structural-marker mapping already handles
+  those glyphs — though the inline viewport never runs in plain mode, so nothing
+  depends on that today.
+
   A writer that leaves the cursor **mid-row** breaks that contract, and the
   consequence is silent: the next repaint erases the transcript text sharing
   that row. This is not hypothetical — it is exactly how a streamed answer's
