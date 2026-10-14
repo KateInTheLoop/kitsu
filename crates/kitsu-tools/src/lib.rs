@@ -47,15 +47,50 @@ use kitsu_providers::ToolDescriptor;
 /// one question ("may I prompt?"), but the answer now carries *who* would be
 /// asked. Nothing routes to the registry yet, so only `Foreground` permits an
 /// interactive prompt and both other routes keep failing closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum PromptRoute {
     /// The future owns the process's interactive input and may prompt.
     Foreground,
     /// No prompt is reachable: an ungranted operation must fail closed.
     Denied,
     /// A registry-tracked background agent that a human could answer for.
-    Registry { agent_id: u64 },
+    ///
+    /// `sender` is the channel the gate parks its question on; the registry
+    /// (T2-S4) owns the receiver. `kitsu-tools` cannot name a `kitsu` type, so
+    /// the agent is still identified by a bare id.
+    Registry {
+        agent_id: u64,
+        sender: PromptRequestSender,
+    },
 }
+
+/// What a parked gate is asking about. Both gates travel the same channel and
+/// share one answer vocabulary ([`Decision`]); only the question differs.
+#[derive(Debug, Clone)]
+pub enum PromptRequestPayload {
+    /// A path/file gate in `Permissions::resolve`.
+    Path(PermissionRequest),
+    /// The `CommandMode::Ask` gate in `command.rs`.
+    Command(CommandApprovalRequest),
+}
+
+/// One ungranted decision a background agent needs a human to take.
+///
+/// The gate builds exactly the request the foreground `Prompter` would have
+/// been shown, sends it, and awaits the answer on `reply`.
+#[derive(Debug)]
+pub struct PromptRequest {
+    /// Registry id of the agent that is now blocked.
+    pub agent_id: u64,
+    pub payload: PromptRequestPayload,
+    /// One-shot answer channel. Dropping it resolves [`Decision::Interrupt`],
+    /// which both gates already map to `AuthorityInputClosed`.
+    pub reply: tokio::sync::oneshot::Sender<Decision>,
+}
+
+/// Channel a `Registry` route parks approval requests on. Unbounded so a gate
+/// never blocks the agent's task before it is marked `Blocked`.
+pub type PromptRequestSender = tokio::sync::mpsc::UnboundedSender<PromptRequest>;
 
 tokio::task_local! {
     static PROMPT_ROUTE: PromptRoute;
@@ -78,24 +113,79 @@ where
 ///
 /// Only the route is recorded here; the gates do not consult it yet, so such a
 /// future still fails closed exactly like [`scope_without_interactive_prompts`].
-pub async fn scope_with_registry_prompts<F>(agent_id: u64, future: F) -> F::Output
+pub async fn scope_with_registry_prompts<F>(
+    agent_id: u64,
+    sender: PromptRequestSender,
+    future: F,
+) -> F::Output
 where
     F: Future,
 {
     PROMPT_ROUTE
-        .scope(PromptRoute::Registry { agent_id }, future)
+        .scope(PromptRoute::Registry { agent_id, sender }, future)
         .await
 }
 
 /// The route in effect for the current task; an unscoped task is foreground.
 pub(crate) fn prompt_route() -> PromptRoute {
     PROMPT_ROUTE
-        .try_with(|route| *route)
+        .try_with(|route| route.clone())
         .unwrap_or(PromptRoute::Foreground)
 }
 
+/// Retained as the single definition of "may this future prompt?" — the gates
+/// now match the whole route, so only the route tests still call it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn interactive_prompts_allowed() -> bool {
     matches!(prompt_route(), PromptRoute::Foreground)
+}
+
+/// Park one ungranted decision on a [`PromptRoute::Registry`] channel and wait
+/// for the human answer.
+///
+/// A closed channel or a dropped reply sender resolves [`Decision::Interrupt`],
+/// which both gates already map to `AuthorityInputClosed`.
+pub(crate) async fn ask_registry(
+    agent_id: u64,
+    sender: &PromptRequestSender,
+    payload: PromptRequestPayload,
+) -> Decision {
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    if sender
+        .send(PromptRequest {
+            agent_id,
+            payload,
+            reply,
+        })
+        .is_err()
+    {
+        return Decision::Interrupt;
+    }
+    answer.await.unwrap_or(Decision::Interrupt)
+}
+
+/// Test-side stand-in for the registry (T2-S4): answers every parked request
+/// with `decision` and records the payloads it saw.
+///
+/// STUB — exists only so T2-S2 can be tested before the registry owns the
+/// receiver. Delete when `AgentRegistry::answer` lands.
+#[cfg(test)]
+pub(crate) fn registry_prompt_stub(
+    decision: Decision,
+) -> (
+    PromptRequestSender,
+    Arc<std::sync::Mutex<Vec<PromptRequestPayload>>>,
+) {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<PromptRequest>();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Some(request) = receiver.recv().await {
+            sink.lock().unwrap().push(request.payload.clone());
+            let _ = request.reply.send(decision);
+        }
+    });
+    (sender, seen)
 }
 
 /// A tool handler: takes raw JSON args, returns a JSON string result.
@@ -402,7 +492,8 @@ mod tests {
 
         allowed_matches_route(); // unset == Foreground
         scope_without_interactive_prompts(async { allowed_matches_route() }).await;
-        scope_with_registry_prompts(7, async { allowed_matches_route() }).await;
+        let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
+        scope_with_registry_prompts(7, sender, async { allowed_matches_route() }).await;
     }
 
     #[tokio::test]
@@ -419,9 +510,10 @@ mod tests {
 
     #[tokio::test]
     async fn registry_route_carries_the_agent_id_and_is_not_foreground() {
-        scope_with_registry_prompts(42, async {
+        let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
+        scope_with_registry_prompts(42, sender, async {
             match prompt_route() {
-                PromptRoute::Registry { agent_id } => assert_eq!(agent_id, 42),
+                PromptRoute::Registry { agent_id, .. } => assert_eq!(agent_id, 42),
                 _ => panic!("scope_with_registry_prompts must set the Registry route"),
             }
             assert!(
@@ -434,11 +526,12 @@ mod tests {
 
     #[tokio::test]
     async fn nested_prompt_route_scope_restores_the_outer_route() {
+        let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
         scope_without_interactive_prompts(async {
-            scope_with_registry_prompts(9, async {
+            scope_with_registry_prompts(9, sender, async {
                 assert!(matches!(
                     prompt_route(),
-                    PromptRoute::Registry { agent_id: 9 }
+                    PromptRoute::Registry { agent_id: 9, .. }
                 ));
             })
             .await;
@@ -454,7 +547,8 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_route_does_not_leak_into_a_sibling_task() {
-        scope_with_registry_prompts(3, async {
+        let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
+        scope_with_registry_prompts(3, sender, async {
             let sibling = tokio::spawn(async { matches!(prompt_route(), PromptRoute::Foreground) });
             assert!(
                 sibling.await.expect("sibling task joins"),
@@ -462,7 +556,7 @@ mod tests {
             );
             assert!(matches!(
                 prompt_route(),
-                PromptRoute::Registry { agent_id: 3 }
+                PromptRoute::Registry { agent_id: 3, .. }
             ));
         })
         .await;

@@ -1621,21 +1621,37 @@ impl Permissions {
             Mode::Scoped | Mode::Deny => Err(self.denied(action, requested)),
             Mode::AutoAllow => Ok(canon),
             Mode::Ask => {
-                if !crate::interactive_prompts_allowed() {
-                    return Err(ToolError::PolicyDenied(format!(
-                        "{} denied: background agents cannot open interactive permission prompts; \
-                         pre-grant '{}' from the foreground session",
-                        action.verb(),
-                        requested.display()
-                    )));
-                }
+                let route = crate::prompt_route();
                 let grant_dir = grant_dir_for(&canon);
                 let req = PermissionRequest {
                     action,
                     path: canon.display().to_string(),
                     grant_dir: grant_dir.display().to_string(),
                 };
-                match self.prompt(req).await {
+                // The question is identical on every route; only who is asked
+                // differs. The answer is applied through the same grant code
+                // below, so a background "always" cannot escalate further than
+                // a foreground one.
+                let decision = match route {
+                    crate::PromptRoute::Denied => {
+                        return Err(ToolError::PolicyDenied(format!(
+                            "{} denied: background agents cannot open interactive permission prompts; \
+                             pre-grant '{}' from the foreground session",
+                            action.verb(),
+                            requested.display()
+                        )));
+                    }
+                    crate::PromptRoute::Foreground => self.prompt(req).await,
+                    crate::PromptRoute::Registry { agent_id, sender } => {
+                        crate::ask_registry(
+                            agent_id,
+                            &sender,
+                            crate::PromptRequestPayload::Path(req),
+                        )
+                        .await
+                    }
+                };
+                match decision {
                     Decision::AllowOnce => Ok(canon),
                     Decision::AllowAlways => {
                         let roots = match action {
@@ -2067,6 +2083,138 @@ mod tests {
         assert!(matches!(error, ToolError::PolicyDenied(_)));
         assert!(error.to_string().contains("background agents"));
         assert_eq!(prompts.load(Ordering::Relaxed), 0);
+    }
+
+    // T2-S2 — the path/file gate consults the prompt route. A `Registry` route
+    // parks the question on the channel instead of failing closed, and the
+    // answer is applied through the *existing* grant code.
+
+    struct NeverPrompts(Arc<std::sync::atomic::AtomicUsize>);
+    impl Prompter for NeverPrompts {
+        fn ask(&self, _req: &PermissionRequest) -> Decision {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Decision::AllowAlways
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_route_allow_once_reads_without_granting_a_root() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = write_file(dir.path(), "once.txt", "hi");
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let perms = Permissions::new(&[], &[], Mode::Ask)
+            .unwrap()
+            .with_prompter(Arc::new(NeverPrompts(prompts.clone())));
+        let (sender, seen) = crate::registry_prompt_stub(Decision::AllowOnce);
+
+        let allowed = crate::scope_with_registry_prompts(11, sender, perms.check_read(&target))
+            .await
+            .expect("a registry-routed AllowOnce must permit this read");
+
+        assert_eq!(allowed, target);
+        assert_eq!(
+            prompts.load(Ordering::Relaxed),
+            0,
+            "a background gate must never touch the interactive prompter"
+        );
+        assert!(
+            perms.read_roots().is_empty() && perms.runtime_read_roots().is_empty(),
+            "allow once must grant nothing durable"
+        );
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "exactly one request is parked");
+        match &requests[0] {
+            crate::PromptRequestPayload::Path(request) => {
+                assert_eq!(request.action, Action::Read);
+                assert_eq!(request.path, target.display().to_string());
+                assert_eq!(
+                    request.grant_dir,
+                    std::fs::canonicalize(dir.path())
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                    "the parked request must be the same one the foreground \
+                     prompter would have been shown"
+                );
+            }
+            other => panic!("the path gate must park a Path payload, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_route_allow_always_installs_the_same_minimal_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = write_file(dir.path(), "a.txt", "hi");
+        let second = write_file(dir.path(), "b.txt", "hi");
+        let perms = Permissions::new(&[], &[], Mode::Ask).unwrap();
+        let (sender, seen) = crate::registry_prompt_stub(Decision::AllowAlways);
+
+        crate::scope_with_registry_prompts(12, sender.clone(), perms.check_read(&first))
+            .await
+            .expect("a registry-routed AllowAlways must permit this read");
+
+        // The grant must be the *existing* `insert_minimal_root` grant into the
+        // shared runtime roots — not a new background-only escalation path.
+        assert_eq!(
+            perms.runtime_read_roots(),
+            vec![std::fs::canonicalize(dir.path()).unwrap()],
+            "allow always must install the minimal root the foreground path installs"
+        );
+        assert!(
+            perms.runtime_write_roots().is_empty(),
+            "a read grant must not widen write authority"
+        );
+
+        // A sibling in the now-granted directory is allowed without a second
+        // question, and the grant is visible to the foreground too.
+        let sibling = crate::scope_with_registry_prompts(12, sender, perms.check_read(&second))
+            .await
+            .expect("the installed root covers a sibling");
+        assert_eq!(sibling, second);
+        assert_eq!(perms.check_read(&second).await.unwrap(), second);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the installed grant must satisfy later checks without re-asking"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_route_deny_refuses_exactly_like_the_foreground_deny() {
+        struct No;
+        impl Prompter for No {
+            fn ask(&self, _req: &PermissionRequest) -> Decision {
+                Decision::Deny
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = write_file(dir.path(), "denied.txt", "secret");
+        let foreground = Permissions::new(&[], &[], Mode::Ask)
+            .unwrap()
+            .with_prompter(Arc::new(No));
+        let expected = match foreground.check_read(&target).await {
+            Err(ToolError::PolicyDenied(message)) => message,
+            other => panic!("foreground Deny must be PolicyDenied, got {other:?}"),
+        };
+
+        let perms = Permissions::new(&[], &[], Mode::Ask).unwrap();
+        let (sender, seen) = crate::registry_prompt_stub(Decision::Deny);
+        let error = crate::scope_with_registry_prompts(13, sender, perms.check_read(&target))
+            .await
+            .expect_err("a registry-routed Deny must refuse");
+
+        match error {
+            ToolError::PolicyDenied(message) => assert_eq!(
+                message, expected,
+                "a background denial must be indistinguishable from the foreground denial"
+            ),
+            other => panic!("expected PolicyDenied, got {other:?}"),
+        }
+        assert!(perms.runtime_read_roots().is_empty());
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[test]
