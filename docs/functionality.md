@@ -309,6 +309,13 @@ that thread, and any other argument is forwarded verbatim to `/jobs`, so every
 subcommand is reachable through either name.
 
 Background agents run in-process, so nothing outside kitsu can observe them.
+In the inline viewport a permission prompt renders as a bottom-pane modal
+rather than scrolling past: the same option line the classic prompt shows, from
+the same composer, and for a command approval the same provenance rows. Because
+the modal is transient, the viewport writes the `◉ permission —` receipt into the
+transcript once you answer, which is the line classic leaves in place by virtue
+of printing it there; the sanitized text is identical either way. `--plain`
+keeps its own unstyled prompt and no modal.
 In the inline viewport the pinned bottom row carries the model, a compact
 context meter, the elapsed time in the current turn, `[N queued]` and the
 background-agent tag, refreshed on the same 50 ms input tick that keeps the

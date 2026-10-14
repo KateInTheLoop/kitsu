@@ -61,26 +61,19 @@ pub(crate) enum TuiMode {
 /// **previous** values rather than restoring defaults: the surface slot's
 /// former occupant and the live-row setting as it was found.
 pub(crate) struct BridgeGuard {
-    /// The viewport, kept so `Drop` can release its scroll region after the
-    /// seam has been pointed back at the displaced surface.
-    viewport: Arc<InlineSurface>,
+    /// The viewport and its latched geometry, kept so `Drop` can release the
+    /// scroll region after the seam has been pointed back at the displaced
+    /// surface.
+    ///
+    /// Behind an `Arc` because the geometry is shared with the process-global
+    /// modal painter (card T3-S7a): an approval prompter runs with no guard
+    /// in hand and must re-latch and paint through the *same* clamp this
+    /// session's guard does, never a second copy of it.
+    pane: Arc<PinnedPane>,
     /// The surface that was in the slot before the viewport went in.
     previous_surface: Arc<dyn Surface>,
     /// The live-row setting as it was found, which may itself be `false`.
     previous_live_rows: bool,
-    /// The status text [`install`] painted, so the row can fall back to it
-    /// whenever there is no draft to show.
-    ///
-    /// The *fallback*, not the row: once [`enable_live_status`] has handed the
-    /// guard a [`StatusSource`], every idle paint re-reads that instead (see
-    /// [`status_row`]). It is still carried, because `install` is reached by
-    /// callers with no live session behind them -- this module's own tests --
-    /// and a renderer with nothing to compose from must still paint something
-    /// rather than an empty row.
-    ///
-    /// [`enable_live_status`]: Self::enable_live_status
-    /// [`status_row`]: Self::status_row
-    status: String,
     /// Requirement **R5**'s live status row, once a session has one.
     ///
     /// `RefCell` because the guard is held by shared reference everywhere
@@ -88,22 +81,6 @@ pub(crate) struct BridgeGuard {
     /// the fields does not exist yet when `install` runs: the viewport is
     /// installed before the prompt queue the queue tag counts.
     live_status: std::cell::RefCell<Option<Arc<StatusSource>>>,
-    /// The terminal height [`install`] was given.
-    ///
-    /// Finding F21: the guard carries its own geometry because
-    /// `InlineSurface::hide` *takes* the latched `(bottom, viewport_rows)`.
-    /// A release therefore leaves the surface with nothing to pin, so the
-    /// reinstall must supply the geometry again from here — and it has to be
-    /// durable rather than consumed, because a session can suspend more than
-    /// once.
-    /// Finding F16: a resize updates this in place, so it is a `Cell` --
-    /// `resize` takes `&self` because every caller holds the guard by
-    /// reference, and a resize that could not update the stored geometry
-    /// would make the next suspend reinstall the pre-resize one.
-    rows: std::cell::Cell<u16>,
-    /// The pinned row count [`install`] was given, kept for the same reason
-    /// as [`rows`](Self::rows).
-    viewport_rows: std::cell::Cell<u16>,
 }
 
 /// Install the inline viewport, or do nothing at all in classic mode.
@@ -149,15 +126,52 @@ pub(crate) fn install(
     let previous_live_rows = live::set_live_rows_enabled(false);
     let previous_surface = set_surface(viewport.clone());
 
-    Some(BridgeGuard {
+    let pane = Arc::new(PinnedPane {
         viewport,
+        status: status.to_string(),
+        rows: std::sync::atomic::AtomicU16::new(rows),
+        viewport_rows: std::sync::atomic::AtomicU16::new(viewport_rows),
+    });
+    // Card T3-S7a: publish the pane for the approval modal, which paints from
+    // a thread that holds no guard. Taken back by `Drop`, exactly as
+    // `STATUS_PAINTER` is.
+    *lock(&MODAL_PANE) = Some(pane.clone());
+
+    Some(BridgeGuard {
+        pane,
         previous_surface,
         previous_live_rows,
-        status: status.to_string(),
         live_status: std::cell::RefCell::new(None),
-        rows: std::cell::Cell::new(rows),
-        viewport_rows: std::cell::Cell::new(viewport_rows),
     })
+}
+
+/// The pinned pane: the inline viewport plus the geometry currently latched
+/// on it -- the terminal height and the pinned row count [`install`] was
+/// given.
+///
+/// Finding F21: the geometry is carried here because `InlineSurface::hide`
+/// *takes* the latched `(bottom, viewport_rows)`. A release therefore leaves
+/// the surface with nothing to pin, so the reinstall must supply the geometry
+/// again from here -- and it has to be durable rather than consumed, because
+/// a session can suspend more than once.
+///
+/// Finding F16: a resize updates both in place, so every method here takes
+/// `&self` -- each caller holds the pane by shared reference, and a resize
+/// that could not update the stored geometry would make the next suspend
+/// reinstall the pre-resize one.
+///
+/// They are `AtomicU16` rather than `Cell` for one reason: `BridgeGuard` is a
+/// `run_chat` local that is neither `Send` nor `Sync`, so a pane the
+/// process-global modal painter can reach must carry its geometry in a form
+/// that crosses threads.
+pub(crate) struct PinnedPane {
+    viewport: Arc<InlineSurface>,
+    /// The status text [`install`] painted: what the single pinned row falls
+    /// back to when no session has published live fields, and so what the
+    /// approval modal's teardown restores in that case.
+    status: String,
+    rows: std::sync::atomic::AtomicU16,
+    viewport_rows: std::sync::atomic::AtomicU16,
 }
 
 /// Requirement **R5**'s status row as *live state*, re-read on every paint
@@ -287,6 +301,56 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 static STATUS_PAINTER: std::sync::Mutex<Option<(Arc<InlineSurface>, Arc<StatusSource>)>> =
     std::sync::Mutex::new(None);
 
+/// The pinned pane, published for painters that hold no [`BridgeGuard`]
+/// (card T3-S7a's approval modal), and taken back by the guard's `Drop`.
+///
+/// Process-global for exactly `STATUS_PAINTER`'s reason: an approval prompter
+/// runs on the tool executor, while the guard is a `run_chat` local that is
+/// neither `Send` nor `Sync`. `InlineSurface::paint` is write-only and knows
+/// nothing about stdin, and the pane carries its own latched geometry, so a
+/// painter needs nothing from the guard but this handle.
+static MODAL_PANE: std::sync::Mutex<Option<Arc<PinnedPane>>> = std::sync::Mutex::new(None);
+
+/// Requirement **R7**: paint an approval prompt as a modal on the pinned
+/// bottom rows, and say whether it went there.
+///
+/// `false` means no pinned pane is installed -- classic mode, or a terminal
+/// below finding F19's bound -- and the caller then prints the classic stderr
+/// prompt instead. That is what keeps classic's bytes identical: classic
+/// installs no viewport, so this is inert before it writes anything.
+///
+/// The rows are [`kitsu_render::approval_modal`]'s composition of the
+/// caller's own header, provenance and option strings, painted through
+/// [`PinnedPane::paint_rows`] so the clamp, the re-latch and the paint are
+/// one operation with F19's and F16's behaviour intact.
+pub(crate) fn paint_approval_modal(header: &str, details: &[String], options: &str) -> bool {
+    let Some(pane) = lock(&MODAL_PANE).clone() else {
+        return false;
+    };
+    pane.paint_rows(&kitsu_render::approval_modal(header, details, options))
+}
+
+/// Take the modal back down once the decision has been read, leaving the one
+/// status row the pane had before it.
+///
+/// The row is recomposed from the published [`StatusSource`] rather than
+/// remembered, so the row that comes back is the row the cadence would paint
+/// next -- and `invalidate` is what lets that cadence paint it again, since
+/// its dedupe would otherwise believe the modal's bottom row is on screen.
+pub(crate) fn clear_approval_modal() {
+    let Some(pane) = lock(&MODAL_PANE).clone() else {
+        return;
+    };
+    let row = match lock(&STATUS_PAINTER).clone() {
+        Some((_, source)) => {
+            source.invalidate();
+            source.compose(live::terminal_columns())
+        }
+        None => pane.status.clone(),
+    };
+    pane.paint_rows(std::slice::from_ref(&row));
+}
+
 /// Repaint R5's status row on the pinned viewport row, if one is installed
 /// and a session has published its fields.
 ///
@@ -323,14 +387,15 @@ impl BridgeGuard {
     /// registration is the guard's, so `Drop` takes it back and a released
     /// viewport can never be painted by a late tick.
     pub(crate) fn enable_live_status(&self, source: Arc<StatusSource>) {
-        *lock(&STATUS_PAINTER) = Some((self.viewport.clone(), source.clone()));
+        *lock(&STATUS_PAINTER) = Some((self.pane.viewport.clone(), source.clone()));
         *self.live_status.borrow_mut() = Some(source);
         // Paint at once rather than at the next read: `install` has already
         // put the fallback text on the row, and leaving it there until the
         // first keystroke would show a frame of a row this session does not
         // use.
         let row = self.status_row();
-        self.viewport
+        self.pane
+            .viewport
             .paint(std::slice::from_ref(&row), live::terminal_columns());
     }
 
@@ -349,7 +414,7 @@ impl BridgeGuard {
                 source.invalidate();
                 source.compose(live::terminal_columns())
             }
-            None => self.status.clone(),
+            None => self.pane.status.clone(),
         }
     }
     /// Paint the idle prompt's draft onto the pinned viewport row.
@@ -405,7 +470,8 @@ impl BridgeGuard {
         // through it would shrink a viewport another caller made taller --
         // which `resize_relatches_by_tearing_down_the_old_geometry_and_setting_up_the_new`
         // pins against. The draft paints into whatever height is latched.
-        self.viewport
+        self.pane
+            .viewport
             .paint(std::slice::from_ref(&row), live::terminal_columns());
     }
 
@@ -495,7 +561,75 @@ impl BridgeGuard {
     /// genuinely latched, so the next paint lands on the right absolute
     /// lines.
     pub(crate) fn resize_rows(&self, rows: u16) -> bool {
-        self.resize(rows, self.viewport_rows.get())
+        self.resize(rows, self.pane.viewport_rows())
+    }
+
+    /// T0-S15: how many rows a [`paint_rows`](Self::paint_rows) request for
+    /// `requested` rows would actually be granted on this terminal.
+    ///
+    /// The pane's own query, so the guard and the modal painter share one
+    /// clamp (see [`PinnedPane::granted_rows`]).
+    pub(crate) fn granted_rows(&self, requested: u16) -> u16 {
+        self.pane.granted_rows(requested)
+    }
+
+    /// T0-S14: draw `content` on the pinned viewport, making the viewport as
+    /// tall as the content needs -- the pane's one operation (see
+    /// [`PinnedPane::paint_rows`]).
+    pub(crate) fn paint_rows(&self, content: &[String]) -> bool {
+        self.pane.paint_rows(content)
+    }
+
+    /// Finding F21, step 1: hand the terminal back as a normal full-screen
+    /// scrolling terminal before the process stops.
+    ///
+    /// Exactly `InlineSurface::hide`'s teardown — clear the pinned rows,
+    /// release the DECSTBM region, park below the transcript — and nothing
+    /// else: no termios restore and no signal, both of which are the
+    /// caller's, in that order, after this returns.
+    pub(crate) fn release_for_suspend(&self) {
+        // Delegated, not reimplemented: `hide` is the only place the teardown
+        // byte sequence lives, so a release cannot drift from a drop.
+        self.pane.viewport.hide();
+    }
+
+    /// Finding F16: apply a terminal resize, through the pane that owns the
+    /// latched geometry (see [`PinnedPane::resize`]).
+    pub(crate) fn resize(&self, rows: u16, viewport_rows: u16) -> bool {
+        self.pane.resize(rows, viewport_rows)
+    }
+
+    /// Finding F21, step 5: put back what [`release_for_suspend`] took, so the
+    /// round trip is indistinguishable from a fresh [`install`].
+    ///
+    /// [`release_for_suspend`]: Self::release_for_suspend
+    pub(crate) fn reinstall_after_resume(&self) {
+        // Exactly what [`install`] does after the geometry gate, in the same
+        // order and through the same two calls: re-latch and set the region,
+        // then paint the row. The geometry comes from the guard because
+        // `hide` took the surface's own copy (see [`rows`](Self::rows)), and
+        // the row is the *status* — the draft is the caller's to repaint when
+        // it re-enters the reader.
+        self.pane
+            .viewport
+            .show(self.pane.rows(), self.pane.viewport_rows());
+        let row = self.status_row();
+        self.pane
+            .viewport
+            .paint(std::slice::from_ref(&row), live::terminal_columns());
+    }
+}
+
+impl PinnedPane {
+    /// The terminal height currently latched.
+    fn rows(&self) -> u16 {
+        self.rows.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The pinned row count currently latched.
+    fn viewport_rows(&self) -> u16 {
+        self.viewport_rows
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// T0-S15: how many rows a [`paint_rows`](Self::paint_rows) request for
@@ -513,7 +647,7 @@ impl BridgeGuard {
     /// list is right and for a box removes the lid. The palette therefore asks
     /// what height it will get *before* laying its content out.
     pub(crate) fn granted_rows(&self, requested: u16) -> u16 {
-        clamp_viewport_rows(self.rows.get(), requested)
+        clamp_viewport_rows(self.rows(), requested)
     }
 
     /// T0-S14: draw `content` on the pinned viewport, making the viewport as
@@ -545,7 +679,7 @@ impl BridgeGuard {
         // with the terminal height unchanged -- so `Unchanged` still emits
         // nothing and `Release` still releases.
         let height = clamp_viewport_rows(
-            self.rows.get(),
+            self.rows(),
             u16::try_from(content.len()).unwrap_or(u16::MAX),
         );
         if height == 0 {
@@ -556,27 +690,14 @@ impl BridgeGuard {
             // emits no bytes.
             return self.installed().is_some();
         }
-        self.resize(self.rows.get(), height);
+        self.resize(self.rows(), height);
         // The rows painted are `fit_viewport_rows`' slice, whose `len()` is
         // the very height just latched: there is no second count to drift.
         self.viewport.paint(
-            fit_viewport_rows(content, self.rows.get()),
+            fit_viewport_rows(content, self.rows()),
             live::terminal_columns(),
         );
         self.installed().is_some()
-    }
-
-    /// Finding F21, step 1: hand the terminal back as a normal full-screen
-    /// scrolling terminal before the process stops.
-    ///
-    /// Exactly `InlineSurface::hide`'s teardown — clear the pinned rows,
-    /// release the DECSTBM region, park below the transcript — and nothing
-    /// else: no termios restore and no signal, both of which are the
-    /// caller's, in that order, after this returns.
-    pub(crate) fn release_for_suspend(&self) {
-        // Delegated, not reimplemented: `hide` is the only place the teardown
-        // byte sequence lives, so a release cannot drift from a drop.
-        self.viewport.hide();
     }
 
     /// Finding F16: apply a terminal resize.
@@ -615,8 +736,9 @@ impl BridgeGuard {
         // emits the teardown alone). The only arm that needs its own
         // treatment is `Unchanged`, which must emit no bytes whatsoever.
         let plan = plan_resize(self.installed(), rows, viewport_rows);
-        self.rows.set(rows);
-        self.viewport_rows.set(viewport_rows);
+        self.rows.store(rows, std::sync::atomic::Ordering::Relaxed);
+        self.viewport_rows
+            .store(viewport_rows, std::sync::atomic::Ordering::Relaxed);
         if plan != ResizePlan::Unchanged {
             self.viewport.hide();
             self.viewport.show(rows, viewport_rows);
@@ -632,26 +754,8 @@ impl BridgeGuard {
     /// dimensions *is* whether a viewport is pinned, and there is no second
     /// flag that could contradict it.
     fn installed(&self) -> Option<(u16, u16)> {
-        let (rows, viewport_rows) = (self.rows.get(), self.viewport_rows.get());
+        let (rows, viewport_rows) = (self.rows(), self.viewport_rows());
         (rows >= viewport_rows.saturating_add(2)).then_some((rows, viewport_rows))
-    }
-
-    /// Finding F21, step 5: put back what [`release_for_suspend`] took, so the
-    /// round trip is indistinguishable from a fresh [`install`].
-    ///
-    /// [`release_for_suspend`]: Self::release_for_suspend
-    pub(crate) fn reinstall_after_resume(&self) {
-        // Exactly what [`install`] does after the geometry gate, in the same
-        // order and through the same two calls: re-latch and set the region,
-        // then paint the row. The geometry comes from the guard because
-        // `hide` took the surface's own copy (see [`rows`](Self::rows)), and
-        // the row is the *status* — the draft is the caller's to repaint when
-        // it re-enters the reader.
-        self.viewport
-            .show(self.rows.get(), self.viewport_rows.get());
-        let row = self.status_row();
-        self.viewport
-            .paint(std::slice::from_ref(&row), live::terminal_columns());
     }
 }
 
@@ -740,9 +844,12 @@ impl Drop for BridgeGuard {
         // runs on another thread, so it must be unpublished before the region
         // is released rather than after.
         *lock(&STATUS_PAINTER) = None;
+        // Card T3-S7a: and the modal painter's handle, for the same reason --
+        // a late approval paint must not reach a released viewport.
+        *lock(&MODAL_PANE) = None;
         set_surface(self.previous_surface.clone());
         live::set_live_rows_enabled(self.previous_live_rows);
-        self.viewport.hide();
+        self.pane.viewport.hide();
     }
 }
 

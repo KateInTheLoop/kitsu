@@ -20539,6 +20539,62 @@ fn read_approval_line() -> Option<String> {
     }
 }
 
+/// Requirement **R7**, the paint half: put an approval prompt on the pinned
+/// bottom rows when a TUI pane is installed, and say whether it went there.
+///
+/// A thin, portable wrapper over [`tui_bridge::paint_approval_modal`]: the
+/// bridge is `#![cfg(unix)]`, and on any other platform there is no pane to
+/// paint on, so this answers `false` and the caller prints the classic stderr
+/// prompt. **Classic mode answers `false` too** -- `tui_bridge::install`
+/// returns `None` for `TuiMode::Classic` before emitting a byte, so no pane is
+/// ever published and classic's bytes are untouched.
+fn approval_modal_paint(header: &str, details: &[String], options: &str) -> bool {
+    #[cfg(unix)]
+    {
+        tui_bridge::paint_approval_modal(header, details, options)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (header, details, options);
+        false
+    }
+}
+
+/// Take the modal down with no receipt: the read was interrupted, so there is
+/// no decision for a receipt to record. Inert when nothing was painted.
+fn approval_modal_dismiss(header: Option<&str>) {
+    if header.is_none() {
+        return;
+    }
+    #[cfg(unix)]
+    tui_bridge::clear_approval_modal();
+}
+
+/// Requirement **R7**, the receipt half: once the decision has been read, take
+/// the modal down and leave the `◉ permission —` header in the transcript.
+///
+/// `header` is `Some` exactly when [`approval_modal_paint`] painted, so this
+/// is inert in classic mode and in plain mode -- in classic the prompt *is*
+/// the transcript line (it is printed into the scroll region and stays there),
+/// which is why only the pane renderer has a receipt to commit. The receipt is
+/// the modal's own header string, emitted through the renderer's surface seam,
+/// so its sanitize is classic's prompt line byte for byte.
+fn approval_modal_commit(header: Option<&str>) {
+    let Some(header) = header else {
+        return;
+    };
+    // The receipt first, the teardown second. The receipt is a transcript
+    // line -- text plus CRLF, no addressing at all -- so it lands wherever the
+    // cursor is parked, and that is immediately after the newline the kernel
+    // echoed with the answer. Clearing the modal first would repark the cursor
+    // with a cursor address instead, putting the receipt on a line the byte
+    // stream never terminated.
+    kitsu_render::surface::active_surface()
+        .transcript_line(kitsu_render::surface::Fd::Stderr, header);
+    #[cfg(unix)]
+    tui_bridge::clear_approval_modal();
+}
+
 fn parse_permission_answer(answer: &str) -> Option<Decision> {
     let answer = answer
         .trim()
@@ -20563,6 +20619,7 @@ impl Prompter for CliPrompter {
         if !kitsu_render::assistive_input_mode() {
             eprint!("\x1b[?2004l");
         }
+        let mut modal = None;
         if kitsu_render::plain_mode() {
             eprint!(
                 "\npermission> kitsu wants to {} {}\n  [y] allow once   [a] always ({})   [n] deny\n> ",
@@ -20573,23 +20630,38 @@ impl Prompter for CliPrompter {
         } else {
             // The approval moment carries visual weight: one shared header
             // design for file and command prompts (see CliCommandPrompter).
-            eprint!(
-                "\n{}\n{}\n> ",
-                kitsu_render::approval_header(&format!(
-                    "kitsu wants to {} {}",
-                    req.action.verb(),
-                    terminal_inline(&req.path)
-                )),
-                kitsu_render::approval_options(&format!(
-                    "always ({})",
-                    terminal_inline(&req.grant_dir)
-                )),
-            );
+            let header = kitsu_render::approval_header(&format!(
+                "kitsu wants to {} {}",
+                req.action.verb(),
+                terminal_inline(&req.path)
+            ));
+            let options = kitsu_render::approval_options(&format!(
+                "always ({})",
+                terminal_inline(&req.grant_dir)
+            ));
+            // Requirement R7: in a TUI mode the prompt is a modal on the
+            // pinned bottom rows, composed from the very strings classic
+            // prints. `paint_approval_modal` is inert when no pane is
+            // installed -- classic mode installs none -- and then the classic
+            // stderr prompt below runs unchanged.
+            if approval_modal_paint(&header, &[], &options) {
+                modal = Some(header);
+                // The `> ` cue stays in the scroll region: the read is
+                // canonical *with echo* until card T3-S7b retires the
+                // APPROVAL_INPUT_ACTIVE protocol, so the kernel echoes the
+                // answer wherever the cursor is parked, and that is not a row
+                // the pane owns.
+                eprint!("> ");
+            } else {
+                eprint!("\n{header}\n{options}\n> ");
+            }
         }
         let _ = std::io::stderr().flush();
         let Some(line) = read_approval_line() else {
+            approval_modal_dismiss(modal.as_deref());
             return Decision::Interrupt;
         };
+        approval_modal_commit(modal.as_deref());
         parse_permission_answer(&line).unwrap_or_else(|| {
             eprintln!("invalid permission response; denied (enter y, a/always, or n next time)");
             Decision::Deny
@@ -20614,6 +20686,7 @@ impl CommandPrompter for CliCommandPrompter {
             .as_deref()
             .map(terminal_inline)
             .unwrap_or_else(|| "not observed".to_string());
+        let mut modal = None;
         if kitsu_render::plain_mode() {
             eprint!(
                 "\ncommand permission> run {}\n  cwd: {}\n  executable: {} ({resolution}; observed: {observed}; bytes not pinned)\n  timeout: {} ms\n  authority: {}\n  [y] allow once   [a] allow this exact argv/cwd for session   [n] deny\n> ",
@@ -20626,12 +20699,14 @@ impl CommandPrompter for CliCommandPrompter {
         } else {
             // Same weighted header design as the filesystem prompt above, with
             // the command's provenance details dimmed beneath it.
-            eprint!(
-                "\n{}\n{}\n{}\n{}\n{}\n{}\n> ",
-                kitsu_render::approval_header(&format!(
-                    "run {}",
-                    terminal_inline(&req.display_argv())
-                )),
+            let header = kitsu_render::approval_header(&format!(
+                "run {}",
+                terminal_inline(&req.display_argv())
+            ));
+            // R7's "command approvals keep their provenance rows": the same
+            // four rows, in the same order, whether they go to stderr or onto
+            // the pinned rows.
+            let details = vec![
                 kitsu_render::approval_detail(&format!("cwd: {}", terminal_inline(&req.cwd))),
                 kitsu_render::approval_detail(&format!(
                     "executable: {} ({resolution}; observed: {observed}; bytes not pinned)",
@@ -20642,13 +20717,22 @@ impl CommandPrompter for CliCommandPrompter {
                     "authority: {}",
                     terminal_inline(req.authority_notice())
                 )),
-                kitsu_render::approval_options("allow this exact argv/cwd for session"),
-            );
+            ];
+            let options = kitsu_render::approval_options("allow this exact argv/cwd for session");
+            if approval_modal_paint(&header, &details, &options) {
+                modal = Some(header);
+                eprint!("> ");
+            } else {
+                let details = details.join("\n");
+                eprint!("\n{header}\n{details}\n{options}\n> ");
+            }
         }
         let _ = std::io::stderr().flush();
         let Some(line) = read_approval_line() else {
+            approval_modal_dismiss(modal.as_deref());
             return CommandDecision::Interrupt;
         };
+        approval_modal_commit(modal.as_deref());
         match line
             .trim()
             .trim_start_matches("\u{1b}[200~")
