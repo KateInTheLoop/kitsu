@@ -6036,6 +6036,13 @@ fn read_chat_line_inline(
     // never dropped" contract the rustyline path has. Finding F21 reuses the
     // same replay for a draft that survived a suspend, which is why this is a
     // `mut` binding and the read below sits in a loop.
+    // Finding F16: the `SIGWINCH` handler, installed once per process. It is
+    // installed here rather than at the bridge install because this is the
+    // only place the flag is ever checked -- a flag set while no inline read
+    // is in flight has nobody to re-latch for.
+    static SIGWINCH: std::sync::Once = std::sync::Once::new();
+    SIGWINCH.call_once(tui_bridge::install_sigwinch_handler);
+
     let mut carried = initial.to_string();
     // Raw mode spans the read, but not the *whole* function any more: a
     // suspend must hand a canonical terminal back to the shell before the
@@ -6060,7 +6067,15 @@ fn read_chat_line_inline(
             let mut paint = |draft: &str, cursor: usize, hint: &str, hint_reserved: bool| {
                 bridge.paint_draft(prompt, draft, cursor, hint, hint_reserved)
             };
-            tui_bridge::read_line_inline(&mut input, &mut paint, history)
+            // Finding F16: re-probe and re-latch. The notification carries
+            // no dimensions, so the terminal is the only source of truth for
+            // the new size; `1` is the pinned row count the install used.
+            let mut on_resize = || {
+                if let Ok((_cols, rows)) = crossterm::terminal::size() {
+                    bridge.resize(rows, 1);
+                }
+            };
+            tui_bridge::read_line_inline(&mut input, &mut paint, history, &mut on_resize)
         };
         // Whatever happened, the row must not keep showing a draft that is
         // gone. On the suspend path the release below clears the row anyway,

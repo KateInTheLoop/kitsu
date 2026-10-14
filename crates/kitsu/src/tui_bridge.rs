@@ -49,7 +49,7 @@ use std::sync::Arc;
 
 use kitsu_render::live;
 use kitsu_render::surface::{set_surface, Surface};
-use kitsu_tui::viewport::InlineSurface;
+use kitsu_tui::viewport::{plan_resize, InlineSurface, ResizePlan};
 
 /// Which renderer a session runs: the classic line renderer, or the inline
 /// viewport preview.
@@ -98,10 +98,14 @@ pub(crate) struct BridgeGuard {
     /// reinstall must supply the geometry again from here — and it has to be
     /// durable rather than consumed, because a session can suspend more than
     /// once.
-    rows: u16,
+    /// Finding F16: a resize updates this in place, so it is a `Cell` --
+    /// `resize` takes `&self` because every caller holds the guard by
+    /// reference, and a resize that could not update the stored geometry
+    /// would make the next suspend reinstall the pre-resize one.
+    rows: std::cell::Cell<u16>,
     /// The pinned row count [`install`] was given, kept for the same reason
     /// as [`rows`](Self::rows).
-    viewport_rows: u16,
+    viewport_rows: std::cell::Cell<u16>,
 }
 
 /// Install the inline viewport, or do nothing at all in classic mode.
@@ -152,8 +156,8 @@ pub(crate) fn install(
         previous_surface,
         previous_live_rows,
         status: status.to_string(),
-        rows,
-        viewport_rows,
+        rows: std::cell::Cell::new(rows),
+        viewport_rows: std::cell::Cell::new(viewport_rows),
     })
 }
 
@@ -216,6 +220,63 @@ impl BridgeGuard {
         self.viewport.hide();
     }
 
+    /// Finding F16: apply a terminal resize.
+    ///
+    /// The region is **re-set**, never patched: the teardown for the old
+    /// geometry, then the setup for the new one, which is exactly
+    /// [`release_for_suspend`] followed by the geometry half of
+    /// [`reinstall_after_resume`] with new dimensions. DECSTBM margins are
+    /// absolute row numbers, so there is no such thing as adjusting one.
+    ///
+    /// Three things follow from that and are pinned by this module's tests:
+    ///
+    /// * a resize to the **same** dimensions emits nothing, so a spurious
+    ///   `SIGWINCH` cannot flicker the pinned row;
+    /// * the guard's own `rows`/`viewport_rows` are **updated**, or the next
+    ///   suspend's reinstall would put back the pre-resize geometry;
+    /// * crossing below F19's `rows >= viewport_rows + 2` bound **releases**
+    ///   the viewport and leaves it released, and a later resize back above
+    ///   the bound re-installs it.
+    ///
+    /// No row is painted here. A resize happens mid-read, so the row's content
+    /// is the caller's current draft rather than the status, and the caller
+    /// repaints immediately afterwards -- painting the status first would show
+    /// a frame of the wrong thing.
+    ///
+    /// Returns whether a viewport is pinned once the resize has been applied.
+    ///
+    /// [`release_for_suspend`]: Self::release_for_suspend
+    /// [`reinstall_after_resume`]: Self::reinstall_after_resume
+    pub(crate) fn resize(&self, rows: u16, viewport_rows: u16) -> bool {
+        // Exactly the suspend pair with new dimensions, minus the paint --
+        // and *one* pair rather than four branches, because both halves are
+        // already inert where a plan says they should be: `hide` writes
+        // nothing without a latched geometry (so `Install` emits the setup
+        // alone) and `show` writes nothing below F19's bound (so `Release`
+        // emits the teardown alone). The only arm that needs its own
+        // treatment is `Unchanged`, which must emit no bytes whatsoever.
+        let plan = plan_resize(self.installed(), rows, viewport_rows);
+        self.rows.set(rows);
+        self.viewport_rows.set(viewport_rows);
+        if plan != ResizePlan::Unchanged {
+            self.viewport.hide();
+            self.viewport.show(rows, viewport_rows);
+        }
+        self.installed().is_some()
+    }
+
+    /// The geometry currently pinned, or `None` when nothing is.
+    ///
+    /// Derived rather than stored: `install` and `resize` only ever hand
+    /// `show` the dimensions kept here, and `show` latches a geometry exactly
+    /// when it clears F19's bound -- so the bound applied to the stored
+    /// dimensions *is* whether a viewport is pinned, and there is no second
+    /// flag that could contradict it.
+    fn installed(&self) -> Option<(u16, u16)> {
+        let (rows, viewport_rows) = (self.rows.get(), self.viewport_rows.get());
+        (rows >= viewport_rows.saturating_add(2)).then_some((rows, viewport_rows))
+    }
+
     /// Finding F21, step 5: put back what [`release_for_suspend`] took, so the
     /// round trip is indistinguishable from a fresh [`install`].
     ///
@@ -227,8 +288,85 @@ impl BridgeGuard {
         // `hide` took the surface's own copy (see [`rows`](Self::rows)), and
         // the row is the *status* — the draft is the caller's to repaint when
         // it re-enters the reader.
-        self.viewport.show(self.rows, self.viewport_rows);
+        self.viewport
+            .show(self.rows.get(), self.viewport_rows.get());
         self.viewport.paint(std::slice::from_ref(&self.status));
+    }
+}
+
+/// The `SIGWINCH` latch (finding F16).
+///
+/// The handler may do **nothing** but store into this: it is the only
+/// async-signal-safe operation available to it. No allocation, no locking, no
+/// printing, and above all no escape sequences -- a handler that painted would
+/// interleave its bytes into whatever write the interrupted thread was in the
+/// middle of.
+static RESIZE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that the terminal was resized. This is the whole of what the
+/// `SIGWINCH` handler does, exposed under its own name so the reader's
+/// flag-and-check contract can be driven from a test without raising a real
+/// signal into a blocking read.
+pub(crate) fn note_resize() {
+    // A relaxed store would do -- the flag is the only thing the handler
+    // touches -- but `SeqCst` costs nothing at this rate and keeps the latch
+    // ordered against the reader's `swap` without anyone having to reason
+    // about it.
+    RESIZE_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Take the pending-resize flag, clearing it: `true` exactly once per
+/// [`note_resize`] burst.
+///
+/// Clearing on read is what keeps one resize from being handled twice, and
+/// coalescing is correct rather than lossy -- the flag carries no dimensions,
+/// so the handler re-probes the terminal and several notifications collapse
+/// into one re-latch.
+pub(crate) fn take_resize() -> bool {
+    RESIZE_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Install the `SIGWINCH` handler.
+///
+/// The read loop blocks in `read()`, and a signal interrupts it with `EINTR`,
+/// which the reader already retries on -- so the signal needs no self-pipe and
+/// no `poll`: waking the read *is* the delivery mechanism, and the flag is how
+/// the reader learns why it woke.
+pub(crate) fn install_sigwinch_handler() {
+    /// The handler itself: one atomic store and nothing else. Every other
+    /// operation -- allocating, locking, printing, writing an escape
+    /// sequence -- is not async-signal-safe.
+    extern "C" fn handler(_signal: libc::c_int) {
+        note_resize();
+    }
+
+    // SAFETY: `sigaction` with a zeroed `struct sigaction` whose handler is a
+    // plain `extern "C"` function doing one atomic store, and a null
+    // `oldact`. Nothing here can unwind into the signal context.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        // ============================================================
+        // `sa_flags = 0`, and **`SA_RESTART` must never be added here.**
+        //
+        // This is the whole reason the handler is installed with
+        // `sigaction` rather than the one-line `libc::signal`: on
+        // Linux/glibc `signal()` implies `SA_RESTART`, and with that flag
+        // set a `SIGWINCH` arriving while the reader blocks in `read()`
+        // *restarts the read* instead of returning `EINTR`. The handler
+        // would still set the flag, but the read loop would never wake to
+        // check it, so the viewport would silently never resize -- while
+        // every unit test in this module still passed, because raising a
+        // signal from the same thread never blocks in `read`.
+        //
+        // Waking the read *is* this feature's delivery mechanism (which is
+        // why it needs no self-pipe and no `poll`). Do not "simplify" this
+        // to `libc::signal`, and do not add `SA_RESTART`: only a human at a
+        // real terminal, resizing the window mid-draft, would notice.
+        // ============================================================
+        action.sa_flags = 0;
+        libc::sigaction(libc::SIGWINCH, &action, std::ptr::null_mut());
     }
 }
 
@@ -289,6 +427,7 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
     input: &mut R,
     paint: &mut dyn FnMut(&str, usize, &str, bool),
     history: &[String],
+    on_resize: &mut dyn FnMut(),
 ) -> std::io::Result<InlineRead> {
     use kitsu_editor::{EditorAction, FeedOutcome, TypeaheadEditor};
 
@@ -325,7 +464,28 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
             // is configured VMIN=1, so zero bytes means end of input.
             Ok(0) => return Ok(InlineRead::Eof),
             Ok(count) => count,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                // Finding F16: a `SIGWINCH` is delivered by interrupting this
+                // very read, so a wake is where the flag is checked. A wake
+                // with no resize pending is some other signal and is retried
+                // silently, without a frame.
+                if take_resize() {
+                    on_resize();
+                    // The row's content is the live draft, not the status: the
+                    // resize deliberately painted nothing, so the first frame
+                    // at the new geometry is drawn here.
+                    let (hint, hint_reserved) = hint_of(&editor);
+                    paint(
+                        &editor.buffer_string(),
+                        editor.cursor(),
+                        &hint,
+                        hint_reserved,
+                    );
+                    last_hint = hint;
+                    last_reserved = hint_reserved;
+                }
+                continue;
+            }
             Err(error) => return Err(error),
         };
         // Fed verbatim: the editor owns the keymap, the escape-sequence state
@@ -780,7 +940,7 @@ mod tests {
     // `kitsu-editor`'s own tests, so only a representative subset appears here.
     // ---------------------------------------------------------------------
 
-    use super::{read_line_inline, InlineRead};
+    use super::{install_sigwinch_handler, note_resize, read_line_inline, take_resize, InlineRead};
 
     /// A reader that hands out one chunk per `read`, so a test can control how
     /// input is split across reads the way a real terminal does. Returns
@@ -839,7 +999,7 @@ mod tests {
             let mut paint = |draft: &str, cursor: usize, hint: &str, hint_reserved: bool| {
                 frames.push((draft.to_string(), cursor, hint.to_string(), hint_reserved))
             };
-            read_line_inline(&mut input, &mut paint, history).expect("inline read")
+            read_line_inline(&mut input, &mut paint, history, &mut || {}).expect("inline read")
         };
         (outcome, frames)
     }
@@ -1499,7 +1659,7 @@ mod tests {
         let outcome = {
             let mut paint =
                 |_draft: &str, _cursor: usize, _hint: &str, _reserved: bool| paints += 1;
-            read_line_inline(&mut input, &mut paint, &[]).expect("inline read")
+            read_line_inline(&mut input, &mut paint, &[], &mut || {}).expect("inline read")
         };
         let elapsed = started.elapsed();
 
@@ -2059,6 +2219,445 @@ mod tests {
             "the search status is display text: it belongs in the hint slot \
              (T0-S9) and must never appear as draft text, or Tab would type \
              the indicator into the prompt: {paints:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Finding F16: a resized terminal.
+    //
+    // Geometry is latched once at install and never updated, and DECSTBM
+    // margins are absolute row numbers, so after a resize the pinned row is in
+    // the wrong place (or off-screen) and `paint` keeps addressing rows from
+    // the stale geometry.
+    //
+    // Two seams are pinned here. `note_resize`/`take_resize` are the
+    // flag-and-check contract the `SIGWINCH` handler and the read loop share --
+    // the handler may do nothing but store a bool, which is all that is
+    // async-signal-safe. `BridgeGuard::resize` is the re-latch: the teardown
+    // for the old geometry then the setup for the new one, which is exactly
+    // the suspend pair with new dimensions.
+    // ---------------------------------------------------------------------
+
+    /// Test F16-1. The flag is a one-shot latch: set by the handler's only
+    /// permitted action, cleared by the reader's check, and false again
+    /// afterwards so one resize is handled once.
+    #[test]
+    #[serial]
+    fn note_resize_latches_and_take_resize_clears_it() {
+        // Drain anything an earlier test left behind, so this reads the latch
+        // rather than a leftover.
+        let _ = take_resize();
+        assert!(
+            !take_resize(),
+            "the flag must be clear when nothing has been noted"
+        );
+
+        note_resize();
+        assert!(
+            take_resize(),
+            "a noted resize must be visible to the reader"
+        );
+        assert!(
+            !take_resize(),
+            "taking the flag clears it, so one resize is handled exactly once"
+        );
+
+        // Coalescing: the flag carries no dimensions, so several
+        // notifications collapse into one re-latch against a fresh probe.
+        note_resize();
+        note_resize();
+        note_resize();
+        assert!(take_resize(), "several notes still latch");
+        assert!(
+            !take_resize(),
+            "and they coalesce into one, rather than queueing three re-latches"
+        );
+    }
+
+    /// Test F16-2. A real `SIGWINCH` reaches the latch.
+    ///
+    /// This is as far as an in-process test can go: it proves the handler is
+    /// installed and sets the flag, but **not** that a signal delivered while
+    /// the reader blocks in `read()` surfaces as `EINTR` rather than being
+    /// restarted by `SA_RESTART`. That depends on how the handler is
+    /// installed and can only be exercised against a real terminal or a PTY.
+    #[test]
+    #[serial]
+    fn a_raised_sigwinch_sets_the_resize_flag() {
+        let _ = take_resize();
+        install_sigwinch_handler();
+        // SAFETY: raising a signal in-process whose handler has just been
+        // installed and does nothing but store into an `AtomicBool`.
+        let raised = unsafe { libc::raise(libc::SIGWINCH) };
+        assert_eq!(raised, 0, "raise(SIGWINCH) failed");
+        assert!(
+            take_resize(),
+            "a delivered SIGWINCH must set the flag the read loop checks; if this \
+             fails the handler is not installed, or it is not storing into the latch"
+        );
+    }
+
+    /// Test F16-3. A resize to the same dimensions emits nothing at all.
+    ///
+    /// A resize notification carries no dimensions, so a redundant one is the
+    /// common case: re-latching unconditionally would tear the region down and
+    /// set it back up on every spurious `SIGWINCH`, which the user sees as the
+    /// pinned row flickering.
+    #[test]
+    #[serial]
+    fn resize_to_the_same_dimensions_writes_nothing() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline(24, 3, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let before = err.text().len();
+
+        let installed = guard.resize(24, 3);
+
+        assert!(
+            installed,
+            "the viewport is still pinned after a no-op resize"
+        );
+        assert_eq!(
+            &err.text()[before..],
+            "",
+            "a resize to the same geometry must emit no bytes at all"
+        );
+        assert!(out.is_empty(), "no viewport control bytes reach stdout");
+        drop(guard);
+    }
+
+    /// Test F16-4. A resize above the bound re-sets the region: the teardown
+    /// for the **old** geometry, then the setup for the **new** one.
+    ///
+    /// Patching a margin is not an option -- DECSTBM takes absolute row
+    /// numbers -- and the expected bytes are therefore literally
+    /// `expected_hide(old) + expected_show(new)`, the same two halves a
+    /// suspend/resume round trip uses, with different dimensions.
+    #[test]
+    #[serial]
+    fn resize_relatches_by_tearing_down_the_old_geometry_and_setting_up_the_new() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline(24, 3, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let before = err.text().len();
+
+        let installed = guard.resize(40, 3);
+
+        assert!(
+            installed,
+            "a resize above the bound keeps a viewport pinned"
+        );
+        let tail = err.text()[before..].to_string();
+        assert_eq!(
+            tail,
+            expected_hide(24, 3) + &expected_show(40, 3),
+            "a resize must emit the old geometry's teardown then the new geometry's \
+             setup, and nothing else -- no status paint, because the caller repaints \
+             the live draft immediately afterwards. Got {tail:?}"
+        );
+        assert!(out.is_empty(), "no viewport control bytes reach stdout");
+
+        // And the new geometry is what gets painted: a 40-row terminal with a
+        // 3-row viewport paints its first row at 38, not at 22.
+        let before = err.text().len();
+        guard.paint_draft("> ", "", 0, "", false);
+        assert_eq!(
+            &err.text()[before..],
+            expected_status_paint(40, 3, "status: idle"),
+            "paint must address the resized geometry, not the latched one"
+        );
+        drop(guard);
+    }
+
+    /// Test F16-5. Shrinking re-latches too, which is the dangerous direction:
+    /// the old bottom margin may now be past the bottom of the screen.
+    #[test]
+    #[serial]
+    fn resize_relatches_when_the_terminal_shrinks() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline(40, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let before = err.text().len();
+
+        assert!(guard.resize(10, 1), "10 rows still clears the bound");
+
+        assert_eq!(
+            err.text()[before..].to_string(),
+            expected_hide(40, 1) + &expected_show(10, 1),
+            "shrinking must release the old region before setting the new one, or the \
+             margins are left off-screen"
+        );
+        assert!(out.is_empty(), "no viewport control bytes reach stdout");
+        drop(guard);
+    }
+
+    /// Test F16-6. **The decision this card makes.** A resize that takes the
+    /// terminal below F19's `rows >= viewport_rows + 2` bound releases the
+    /// viewport -- region reset, rows cleared, nothing pinned -- and leaves it
+    /// released while the terminal is too short.
+    ///
+    /// A pinned row that cannot be drawn correctly is worse than no pinned
+    /// row, and the alternative -- keeping a region whose bottom margin no
+    /// longer fits the screen -- is exactly the corruption F19 was about.
+    #[test]
+    #[serial]
+    fn resize_below_the_f19_bound_releases_the_viewport_and_pins_nothing() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline(24, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let before = err.text().len();
+
+        let installed = guard.resize(2, 1);
+
+        assert!(
+            !installed,
+            "2 rows cannot hold a two-row scrolling region plus a pinned row"
+        );
+        assert_eq!(
+            err.text()[before..].to_string(),
+            expected_hide(24, 1),
+            "the release must be the full teardown for the geometry that *was* \
+             pinned: rows cleared, region reset, cursor parked below the transcript"
+        );
+
+        // Released means released: nothing is painted into a terminal with no
+        // region, and a further resize that is still too short adds nothing.
+        let before = err.text().len();
+        guard.paint_draft("> ", "draft", 5, "", false);
+        assert!(!guard.resize(1, 1), "still too short, still unpinned");
+        assert_eq!(
+            &err.text()[before..],
+            "",
+            "while released, nothing addresses rows that were never pinned"
+        );
+        assert!(out.is_empty(), "no viewport control bytes reach stdout");
+        drop(guard);
+    }
+
+    /// Test F16-7. **The round trip**: tall, then too short, then tall again
+    /// ends with a correctly installed viewport, and the short interval emitted
+    /// a proper release rather than leaving a stale region behind.
+    #[test]
+    #[serial]
+    fn a_resize_round_trip_through_a_too_short_terminal_ends_correctly_installed() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline(24, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let before = err.text().len();
+
+        assert!(!guard.resize(2, 1), "too short: released");
+        let short = err.text()[before..].to_string();
+        assert_eq!(
+            short,
+            expected_hide(24, 1),
+            "the short interval must emit a proper release: {short:?}"
+        );
+
+        let before = err.text().len();
+        assert!(
+            !guard.resize(3, 2),
+            "3 rows with a 2-row viewport is still short"
+        );
+        assert_eq!(
+            &err.text()[before..],
+            "",
+            "a second too-short resize emits nothing: there is nothing left to release"
+        );
+
+        let before = err.text().len();
+        assert!(guard.resize(30, 1), "tall again: re-installed");
+        assert_eq!(
+            err.text()[before..].to_string(),
+            expected_show(30, 1),
+            "re-installing is the setup half alone -- there is no old region to tear \
+             down, so a teardown here would clear rows the viewport does not own"
+        );
+
+        // Proof it is genuinely pinned again, at the *new* size.
+        let before = err.text().len();
+        guard.paint_draft("> ", "", 0, "", false);
+        assert_eq!(
+            &err.text()[before..],
+            expected_status_paint(30, 1, "status: idle"),
+            "the re-installed viewport paints at the geometry it was re-installed with"
+        );
+        assert!(out.is_empty(), "no viewport control bytes reach stdout");
+        drop(guard);
+    }
+
+    /// Test F16-8. A resize must **update** the guard's stored geometry, not
+    /// just emit bytes: `BridgeGuard` keeps `rows`/`viewport_rows` so a
+    /// suspend's reinstall can re-latch (finding F21), and a resize that left
+    /// them alone would put the pre-resize geometry back after the next Ctrl+Z.
+    #[test]
+    #[serial]
+    fn resize_updates_the_geometry_the_next_reinstall_uses() {
+        let _state = GlobalState::capture();
+        let (guard, _out, err) = install_inline(24, 3, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        guard.resize(40, 3);
+        let before = err.text().len();
+
+        guard.release_for_suspend();
+        guard.reinstall_after_resume();
+
+        assert_eq!(
+            err.text()[before..].to_string(),
+            expected_hide(40, 3)
+                + &expected_show(40, 3)
+                + &expected_status_paint(40, 3, "status: idle"),
+            "a suspend after a resize must round-trip the *resized* geometry"
+        );
+        drop(guard);
+    }
+
+    /// One step of a scripted read: bytes, or a signal that interrupts the
+    /// read the way `SIGWINCH` does.
+    #[derive(Clone, Copy)]
+    enum Step {
+        Bytes(&'static [u8]),
+        /// A `SIGWINCH`: the handler's `note_resize` runs, then the blocked
+        /// `read` fails with `EINTR`. That is the real delivery order, and the
+        /// reason the reader needs no self-pipe -- waking the read *is* the
+        /// notification.
+        Winch,
+        /// An `EINTR` with **no** resize pending: some other signal. The
+        /// reader must retry silently, exactly as it does today.
+        Eintr,
+    }
+
+    /// A reader driven by [`Step`]s, so an interrupted read is scriptable
+    /// without a real signal arriving mid-`read`.
+    struct Signalled(std::collections::VecDeque<Step>);
+
+    impl Signalled {
+        fn new<const N: usize>(steps: [Step; N]) -> Self {
+            Self(steps.into_iter().collect())
+        }
+    }
+
+    impl std::io::Read for Signalled {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                None => Ok(0),
+                Some(Step::Winch) => {
+                    note_resize();
+                    Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+                }
+                Some(Step::Eintr) => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                Some(Step::Bytes(chunk)) => {
+                    assert!(
+                        chunk.len() <= buf.len(),
+                        "test chunk larger than the buffer"
+                    );
+                    buf[..chunk.len()].copy_from_slice(chunk);
+                    Ok(chunk.len())
+                }
+            }
+        }
+    }
+
+    /// Drive the reader over scripted steps, recording paints and resize
+    /// callbacks into **one** ordered log, so their interleaving is observable.
+    fn drive_signalled<const N: usize>(steps: [Step; N]) -> (InlineRead, Vec<String>) {
+        let log = std::cell::RefCell::new(Vec::<String>::new());
+        let mut input = Signalled::new(steps);
+        let outcome = {
+            let mut paint = |draft: &str, _cursor: usize, _hint: &str, _reserved: bool| {
+                log.borrow_mut().push(format!("paint:{draft}"));
+            };
+            let mut on_resize = || log.borrow_mut().push("resize".to_string());
+            read_line_inline(&mut input, &mut paint, &[], &mut on_resize).expect("inline read")
+        };
+        (outcome, log.into_inner())
+    }
+
+    /// Test F16-9. The reader's half of the contract: when a read is
+    /// interrupted and the flag is set, the reader handles the resize once,
+    /// clears the flag, and goes on reading.
+    #[test]
+    #[serial]
+    fn the_reader_handles_a_pending_resize_when_a_read_is_interrupted() {
+        let _ = take_resize();
+        let (outcome, log) = drive_signalled([Step::Winch, Step::Bytes(b"x\r")]);
+
+        assert_eq!(
+            submitted(&outcome),
+            "x",
+            "the read continues after the resize"
+        );
+        assert_eq!(
+            log.iter().filter(|event| *event == "resize").count(),
+            1,
+            "the resize is handled exactly once: {log:?}"
+        );
+        assert!(
+            !take_resize(),
+            "the reader must clear the flag, or every later wake would re-latch"
+        );
+    }
+
+    /// Test F16-10. The draft survives a resize, and the repaint that follows
+    /// one shows the **current draft** rather than the status row.
+    ///
+    /// Ordering is the assertion: the frame immediately after the resize is
+    /// the draft as it stood when the signal arrived. A resize that painted
+    /// the status would flash the wrong row at a user in mid-sentence, and one
+    /// that painted nothing would leave the row blank at the new geometry.
+    #[test]
+    #[serial]
+    fn the_reader_repaints_the_current_draft_after_a_resize() {
+        let _ = take_resize();
+        let (outcome, log) = drive_signalled([
+            Step::Bytes(b"h"),
+            Step::Bytes(b"e"),
+            Step::Bytes(b"l"),
+            Step::Winch,
+            Step::Bytes(b"lo\r"),
+        ]);
+
+        assert_eq!(
+            submitted(&outcome),
+            "hello",
+            "the draft must survive the resize untouched: the reader keeps reading"
+        );
+        let at = log
+            .iter()
+            .position(|event| event == "resize")
+            .unwrap_or_else(|| panic!("the resize must be handled: {log:?}"));
+        assert_eq!(
+            log.get(at + 1).map(String::as_str),
+            Some("paint:hel"),
+            "the frame right after a resize must repaint the current draft at the new \
+             geometry: {log:?}"
+        );
+    }
+
+    /// Test F16-11. An `EINTR` with no resize pending is retried silently --
+    /// the behaviour the reader already has, pinned so the new flag check
+    /// cannot turn every other signal into a re-latch.
+    #[test]
+    #[serial]
+    fn an_interrupted_read_without_a_pending_resize_is_retried_silently() {
+        let _ = take_resize();
+        let (outcome, log) = drive_signalled([
+            Step::Bytes(b"a"),
+            Step::Eintr,
+            Step::Eintr,
+            Step::Bytes(b"b\r"),
+        ]);
+
+        assert_eq!(submitted(&outcome), "ab");
+        assert!(
+            !log.iter().any(|event| event == "resize"),
+            "no resize was pending, so none may be handled: {log:?}"
+        );
+        assert_eq!(
+            log,
+            // The initial empty frame, then the one keystroke. The submitting
+            // chunk paints nothing: the reader returns at the `Submit` action.
+            vec!["paint:".to_string(), "paint:a".to_string()],
+            "a bare EINTR adds no frame at all: {log:?}"
         );
     }
 }

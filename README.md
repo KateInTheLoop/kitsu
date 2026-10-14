@@ -1141,8 +1141,10 @@ beside your draft. What it does not have is Rustyline's completion *lists* —
 commands over several rows as you type. What it does have:
 insertion and cursor motion, Home/End, Backspace/Delete, the Ctrl+U/K/W kills,
 Up/Down through the current session's history, bracketed paste kept as one
-draft, Ctrl+D to exit on an empty line, Ctrl+C to clear the line, and Ctrl+Z to
-suspend — which releases the pinned row and hands the shell back an ordinary
+draft, resizing the window (the pinned row follows, and the viewport steps
+aside entirely if you shrink the terminal below three rows, coming back when
+you grow it again), Ctrl+D to exit on an empty line, Ctrl+C to clear the line,
+and Ctrl+Z to suspend — which releases the pinned row and hands the shell back an ordinary
 terminal, then restores the row and your unsubmitted draft on `fg`. Ctrl+\ is
 deliberately inert: its usual action dumps core, and this process holds your API
 credentials and conversation in memory. Everything else — every tier, every byte of non-TTY, `--plain`,

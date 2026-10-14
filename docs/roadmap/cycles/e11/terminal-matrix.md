@@ -55,7 +55,8 @@ Then record, per terminal:
 | **Scrollback retains the transcript** | Scroll up (mouse wheel / Shift+PageUp). Can you see output that scrolled out of the region? This is Q1. |
 | **The pinned row stayed pinned** | During the run, did the status row stay on the last line while output flowed above it? |
 | **No corruption on exit** | After `/quit`, is the shell prompt in a sane place, with no leftover region (type a long command — does it wrap normally)? |
-| **Resize behaviour** | Resize the window mid-session. Does the pinned row follow, or is it stranded? (F16 — known unhandled; record what actually happens.) |
+| **Resize behaviour** | Resize the window mid-session, **while a draft is typed**. The pinned row must follow to the new bottom and the transcript must scroll in the full new height, with the draft intact. Shrink below three rows: the viewport must release entirely and the shell get a normal terminal back; grow again and it must come back. (F16 is handled as of T0-S11 — this row now **verifies** it.) |
+| **Resize actually wakes the reader** | The same test, but this row is about *why* it can fail: `SIGWINCH` must interrupt the blocking read rather than restarting it. If the pinned row only moves after you press a key, the handler was installed with `SA_RESTART` and the feature is silently dead (F24). **No automated test can catch this** — it is the second item here, after Q1, that needs a human. |
 | **Short window** | Shrink to 2-3 rows. The viewport must not install at all and the classic renderer takes over (the F19 guard). |
 | **Suspend and resume** | Press Ctrl+Z at an idle prompt. kitsu must stop and the shell must come back with a *normal* terminal — type a long line and confirm it wraps against the full screen, not a subset. Then `fg`: the pinned row must come back and any draft you had typed must still be there. (F22 — no automated coverage; this row is the only check.) |
 

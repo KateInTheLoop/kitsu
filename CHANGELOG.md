@@ -21,6 +21,12 @@ shapes may change in any minor release.
   — only `inline` selects it — and with the variable unset output is
   byte-identical to before, so no existing session changes.
 
+  Resizing the terminal re-pins the viewport: the row follows the new bottom
+  and the transcript scrolls in the full new height, with your draft intact. If
+  a resize leaves the window too short to hold a scroll region plus the row,
+  the viewport releases entirely rather than pinning a row it cannot draw, and
+  re-installs when there is room again.
+
   Ctrl+Z suspends from the inline prompt, releasing the pinned row and the
   terminal's scrolling restriction first so the shell is handed back an
   ordinary terminal, then restoring both — and your unsubmitted draft — on

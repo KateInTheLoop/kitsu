@@ -140,6 +140,26 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   rather than re-raising `SIGINT`, because at an idle prompt there is no turn to
   cancel and the raise would take the default disposition and exit.
 
+  **Resize re-pins the viewport, and releases it when the terminal is too
+  short.** `DECSTBM` margins are absolute row numbers, so a resized window
+  invalidates them: the region must be re-set rather than patched. A `SIGWINCH`
+  handler stores into one atomic flag — the only async-signal-safe action
+  available to it — and the reader, whose blocking read the signal interrupts,
+  checks the flag on waking, re-latches the geometry and repaints the live
+  draft (not the status, since a resize happens mid-read). A resize to the same
+  dimensions emits nothing, so a spurious signal cannot flicker the row.
+
+  Re-latching is the same pair of operations as a suspend/resume at new
+  dimensions, minus the paint, which is why all four cases — grow, shrink,
+  release, re-install — fall out of one hide-then-show sequence: `hide` is inert
+  with no latched geometry and `show` is inert below the minimum height. That
+  minimum is the same bound the renderer uses at startup: a terminal must hold
+  at least two scrolling rows above the viewport, because the region's bottom
+  margin has to exceed its top. **Crossing that bound downward releases the
+  viewport entirely** — region reset, rows cleared, nothing pinned — rather than
+  keeping a region whose margins no longer fit the screen; crossing back up
+  re-installs it.
+
   **Suspension releases the terminal before stopping.** Ctrl+Z at the inline
   prompt clears the pinned rows, releases the scroll region and restores
   canonical terminal modes, *then* raises the stop signal, so the shell is
