@@ -27,6 +27,31 @@ shapes may change in any minor release.
   lock could report failure and skip work. All five lock sites now share one
   implementation, so there is a single place for this to be right.
 
+### Added
+
+#### Background agents that can ask
+
+- `[agents] blocking = "ask"` lets a background agent **park** when one of its
+  own tools needs a permission you have not granted, instead of being refused.
+  It reports as `blocked`, appears first in `/jobs view` under `needs input`,
+  and waits; answering applies exactly the grant the foreground prompt would
+  have applied, through the same code, so no new permission path exists.
+  `[agents] block_timeout_secs` bounds the wait at thirty minutes by default,
+  after which the agent ends as failed-interrupted — an unattended run cannot
+  hang on a question.
+
+  **The default is `fail_closed` everywhere**, which is exactly today's
+  behaviour, so nothing changes unless you opt in. Scripted, piped and JSONL
+  runs are unaffected even then: they never reach the question, because their
+  permission mode short-circuits before the route is consulted.
+
+  Answering from the prompt arrives in the next change; for now a parked agent
+  is visible in `/jobs view` and bounded by the timeout.
+- An interrupted background agent now says **why**: the failure reads
+  `run interrupted before completion: authority input closed before a decision`
+  where it previously stopped at the first clause. The old text is still the
+  prefix, so anything matching it keeps matching.
+
 ### Changed
 
 - `/jobs --json` reports `thread.schema_version` as **2**, and a thread object

@@ -71,14 +71,64 @@ pub enum StateFileMode {
     Off,
 }
 
+/// How a background agent's ungranted permission request is handled
+/// (design B1). `FailClosed` is today's behaviour and the default everywhere:
+/// a detached agent's gate returns an error instead of waiting for a human, so
+/// a headless run cannot stall. `Ask` parks the agent in the registry so the
+/// user can answer it.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBlockingMode {
+    /// Park the request and mark the agent blocked until it is answered or
+    /// `block_timeout_secs` elapses.
+    Ask,
+    /// Return the fail-closed error immediately; nothing is ever parked.
+    #[default]
+    FailClosed,
+}
+
+/// B3's default blocking timeout in seconds (30 minutes). The unit lives in
+/// the key name deliberately: a bare `block_timeout = 30` is exactly where a
+/// reader guesses wrong between seconds and minutes.
+fn default_block_timeout_secs() -> u64 {
+    crate::subagent::DEFAULT_AGENT_BLOCK_TIMEOUT.as_secs()
+}
+
 /// The `[agents]` table. Unknown keys are rejected loudly: `agent_spawn_cap`
 /// deliberately stays a flat top-level key, so a copy of it in here is a
 /// mistake and must not be silently ignored.
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentsConfig {
     #[serde(default)]
     pub state_file: StateFileMode,
+    /// How an ungranted permission request from a background agent is handled.
+    #[serde(default)]
+    pub blocking: AgentBlockingMode,
+    /// How long a parked request waits before it resolves `Interrupt` (B3).
+    #[serde(default = "default_block_timeout_secs")]
+    pub block_timeout_secs: u64,
+}
+
+// Hand-written rather than derived: every caller reads the table as
+// `agents.unwrap_or_default()`, so a derived `Default` would hand a config with
+// no `[agents]` table a ZERO-second block timeout while `#[serde(default =
+// ...)]` only covers the key's absence inside a table that is present.
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            state_file: StateFileMode::default(),
+            blocking: AgentBlockingMode::default(),
+            block_timeout_secs: default_block_timeout_secs(),
+        }
+    }
+}
+
+impl AgentsConfig {
+    /// The configured blocking timeout as a `Duration`.
+    pub fn block_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.block_timeout_secs)
+    }
 }
 
 /// The `[hooks]` table. Unknown keys are rejected loudly, so a typo in a hook
@@ -611,6 +661,123 @@ mod tests {
 
         toml::from_str::<Config>("[agents]\nagent_spawn_cap = 3\n")
             .expect_err("the spawn cap must not be accepted inside [agents]");
+    }
+
+    // -----------------------------------------------------------------
+    // T2-S5a: `agents.blocking` and `agents.block_timeout_secs`
+    // (design B1/B3, plan row T2-S5). FAILING-FIRST: neither key exists
+    // yet, so these do not compile until the implementer adds
+    // `AgentBlockingMode`, `AgentsConfig::blocking` and
+    // `AgentsConfig::block_timeout_secs` / `block_timeout()`.
+    // -----------------------------------------------------------------
+
+    /// B1 + plan row T2-S5: the key exists, follows the `StateFileMode`
+    /// enum-key precedent, and its default is `fail_closed` EVERYWHERE.
+    /// Nothing about the surface, the mode or the tier moves it in this card,
+    /// so an absent `[agents]`, an empty one, the struct default and an
+    /// explicit `fail_closed` must all be the same value.
+    #[test]
+    fn agents_blocking_defaults_to_fail_closed_everywhere() {
+        for text in [
+            "default_gateway = \"example\"\n",
+            "[agents]\n",
+            "[agents]\nstate_file = \"on\"\n",
+            "[agents]\nblocking = \"fail_closed\"\n",
+        ] {
+            let parsed: Config = toml::from_str(text).expect(text);
+            assert_eq!(
+                parsed.agents.unwrap_or_default().blocking,
+                AgentBlockingMode::FailClosed,
+                "the default must stay fail_closed until T3 flips the TUI default: {text:?}"
+            );
+        }
+        assert_eq!(
+            AgentsConfig::default().blocking,
+            AgentBlockingMode::FailClosed
+        );
+
+        let parsed: Config = toml::from_str("[agents]\nblocking = \"ask\"\n").unwrap();
+        assert_eq!(
+            parsed.agents.unwrap_or_default().blocking,
+            AgentBlockingMode::Ask,
+            "explicit `ask` is T2's standalone value and must parse"
+        );
+    }
+
+    /// The `StateFileMode` precedent again: an unknown mode or a typo'd key
+    /// must fail loudly rather than silently leave the run fail-closed.
+    #[test]
+    fn agents_blocking_rejects_unknown_modes_and_typos() {
+        let error = toml::from_str::<Config>("[agents]\nblocking = \"sometimes\"\n")
+            .expect_err("an unknown blocking mode must fail closed loudly");
+        assert!(error.message().contains("unknown variant"), "{error}");
+        assert!(error.message().contains("sometimes"), "{error}");
+
+        let error = toml::from_str::<Config>("[agents]\nblockign = \"ask\"\n")
+            .expect_err("a typo inside [agents] must be rejected, not defaulted");
+        assert!(error.message().contains("unknown field"), "{error}");
+        assert!(error.message().contains("blockign"), "{error}");
+
+        // `ask`/`fail_closed` are the only two spellings: the dash and the
+        // camel spelling are typos, not aliases.
+        toml::from_str::<Config>("[agents]\nblocking = \"fail-closed\"\n")
+            .expect_err("only the snake_case spelling is accepted");
+    }
+
+    /// B3: the 30-minute default survives the move out of
+    /// `DEFAULT_AGENT_BLOCK_TIMEOUT` and into config, and a short value
+    /// parses (which is what makes an end-to-end block test possible).
+    ///
+    /// Spelling: `block_timeout_secs`. There is no duration key in this
+    /// config today — no humantime, no `*_secs` precedent — and the card
+    /// forbids a new dependency, so the unit goes in the name where it
+    /// cannot be misread as milliseconds or as "30" meaning 30 seconds.
+    #[test]
+    fn agents_block_timeout_secs_defaults_to_thirty_minutes() {
+        for text in [
+            "default_gateway = \"example\"\n",
+            "[agents]\n",
+            "[agents]\nblocking = \"ask\"\n",
+        ] {
+            let parsed: Config = toml::from_str(text).expect(text);
+            let agents = parsed.agents.unwrap_or_default();
+            assert_eq!(
+                agents.block_timeout_secs, 1_800,
+                "B3's 30-minute default must survive becoming a config key: {text:?}"
+            );
+            assert_eq!(
+                agents.block_timeout(),
+                std::time::Duration::from_secs(30 * 60),
+                "the typed accessor and the raw key agree: {text:?}"
+            );
+        }
+        assert_eq!(AgentsConfig::default().block_timeout_secs, 1_800);
+
+        let parsed: Config =
+            toml::from_str("[agents]\nblocking = \"ask\"\nblock_timeout_secs = 2\n").unwrap();
+        let agents = parsed.agents.unwrap_or_default();
+        assert_eq!(agents.block_timeout_secs, 2);
+        assert_eq!(
+            agents.block_timeout(),
+            std::time::Duration::from_secs(2),
+            "a short timeout is what lets a test observe the whole gate->registry->timer path"
+        );
+    }
+
+    /// A duration key is a place where a wrong type silently becomes a
+    /// default. It must not: a string, a float and a negative number are all
+    /// errors, and the unit must be in the name rather than in the value.
+    #[test]
+    fn agents_block_timeout_secs_rejects_non_integer_and_negative_values() {
+        for text in [
+            "[agents]\nblock_timeout_secs = \"30m\"\n",
+            "[agents]\nblock_timeout_secs = 1.5\n",
+            "[agents]\nblock_timeout_secs = -1\n",
+            "[agents]\nblock_timeout = 30\n",
+        ] {
+            toml::from_str::<Config>(text)
+                .expect_err(&format!("{text:?} must be an error, not a silent default"));
+        }
     }
 
     #[test]

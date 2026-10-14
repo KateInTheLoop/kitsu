@@ -4502,6 +4502,11 @@ struct ChatSetup {
     /// Config-level `[agents] state_file` mode deciding whether this process
     /// publishes the per-process agent state hint file.
     agent_state_file: crate::config::StateFileMode,
+    /// Config-level `[agents] blocking` mode: how a background agent's
+    /// ungranted permission request is handled (design B1).
+    agent_blocking: crate::config::AgentBlockingMode,
+    /// Config-level `[agents] block_timeout_secs`, already typed (B3).
+    agent_block_timeout: std::time::Duration,
     /// Config-level `[hooks] on_agent_state` command, already split into argv
     /// (requirement H3). `None` when absent, empty, or unsplittable, so an
     /// unusable command is a no-op rather than a per-boundary parse attempt.
@@ -9656,6 +9661,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         kitsu_render::set_theme(name).map_err(CliError::user)?;
     }
 
+    let agents_config = config.agents.unwrap_or_default();
     Ok(ChatSetup {
         provider_route,
         gateway_name,
@@ -9666,7 +9672,9 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         auth_status,
         workspace_evidence: config.workspace_evidence.unwrap_or(true),
         agent_spawn_cap: config.agent_spawn_cap,
-        agent_state_file: config.agents.unwrap_or_default().state_file,
+        agent_state_file: agents_config.state_file,
+        agent_blocking: agents_config.blocking,
+        agent_block_timeout: agents_config.block_timeout(),
         agent_state_hook: config
             .hooks
             .unwrap_or_default()
@@ -11423,8 +11431,9 @@ fn format_jobs_view(registry: &subagent::AgentRegistry) -> String {
         output.push_str(JOBS_EMPTY_DECK_LINE);
         return output;
     }
-    // `needs input` is unreachable today: no agent state parks on a user
-    // answer yet. The group stays so a later story only supplies the state.
+    // `needs input` is reachable only under `[agents] blocking = "ask"`, which
+    // is where a gate parks a detached agent on a user answer; under the
+    // default `fail_closed` no agent ever enters the group.
     const GROUPS: [&str; 6] = [
         "needs input",
         "working",
@@ -15672,6 +15681,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         subagent::thread::AgentThreadLimits::default(),
     )
     .map_err(|error| CliError::user(format!("invalid background-thread limits: {error}")))?;
+    // `[agents] blocking` / `block_timeout_secs` (design B1/B3). The defaults
+    // are the registry's own, so a config with no `[agents]` table is a no-op.
+    agent_registry.set_blocking(setup.agent_blocking);
+    agent_registry.set_block_timeout(setup.agent_block_timeout);
 
     // G3 (docs/chat-ux-cycle-10.md): per-turn subagent spawn budget. Prompt
     // guidance demonstrably does not restrain small local models from agent

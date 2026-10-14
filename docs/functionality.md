@@ -174,7 +174,19 @@ invocation roots and drops runtime grants. Exact command grants are numbered,
 labeled invocation/runtime, and revocable with `/revoke-command <number>`.
 Detached agents share active grants but cannot invoke either interactive
 prompter; ungranted background work fails closed without racing foreground
-stdin.
+stdin. `[agents] blocking` chooses between that and parking: `fail_closed`
+(the default, and the behaviour just described) refuses the operation and lets
+the agent carry on, while `ask` makes the agent report as `blocked` and wait
+for a human answer, which then applies through the same grant code the
+foreground prompter uses — `allow always` installs the identical minimal root
+or exact argv/cwd grant, so no second permission path exists.
+`[agents] block_timeout_secs` bounds that wait at 1800 seconds by default,
+after which the agent ends failed-interrupted rather than waiting forever. The
+unit is in the key name deliberately and a bare `block_timeout` is rejected,
+never interpreted. `ask` cannot affect scripted, piped or JSONL runs: those
+resolve permissions in a mode that returns before the prompt route is
+consulted, so the question is never reached — a structural property, not a
+default.
 
 - `fs_read_file`, `fs_list_dir`, and `repo_grep` inspect granted paths.
   On Unix, `repo_grep` is an always-available in-process UTF-8 content search:
