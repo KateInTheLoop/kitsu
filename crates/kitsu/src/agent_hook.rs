@@ -108,6 +108,35 @@ pub(crate) struct AgentObservation {
     pub(crate) waiting_for: Option<String>,
 }
 
+/// Observe every retained agent in `registry`, in the shape [`transitions`]
+/// compares.
+///
+/// This exists as a named function rather than a closure in the session loop
+/// because it is the hook's payload assembly, and F40 names payload assembly
+/// as a place whose narrowness was incidental: `waiting_for` is a free-form
+/// `String` here, so a path *can* be assembled into it. The blocked case must
+/// therefore take its value from the argument-free approval kind and never
+/// from anything carrying a tool argument.
+pub(crate) fn observations(registry: &crate::subagent::AgentRegistry) -> Vec<AgentObservation> {
+    registry
+        .progress_snapshot()
+        .agents
+        .into_iter()
+        .map(|progress| AgentObservation {
+            id: progress.id,
+            state: agent_state_label(progress.status),
+            // A parked agent's reason is the typed, argument-free approval
+            // kind -- never the telemetry activity label, which is a
+            // free-form string and, for a parked agent, also stale.
+            waiting_for: progress
+                .waiting_for
+                .map_or(progress.telemetry.last_activity, |kind| {
+                    Some(kind.wire().to_string())
+                }),
+        })
+        .collect()
+}
+
 /// One state change worth firing the hook for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HookEvent {
