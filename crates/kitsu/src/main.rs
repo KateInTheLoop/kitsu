@@ -4511,6 +4511,11 @@ struct ChatSetup {
     /// (requirement H3). `None` when absent, empty, or unsplittable, so an
     /// unusable command is a no-op rather than a per-boundary parse attempt.
     agent_state_hook: Option<Vec<String>>,
+    /// The config-level `[tui]` table (design §4.8), already defaulted. Held
+    /// whole rather than as a resolved mode: the flags that override it are
+    /// read where the renderer is installed, so there is one resolution point
+    /// instead of one per key.
+    tui: crate::config::TuiConfig,
     /// Effective run-level policy for Kitsu-created automatic output
     /// artifacts. This never changes explicit session, credential, `-o`, or
     /// model filesystem destinations.
@@ -9681,6 +9686,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
             .on_agent_state
             .as_deref()
             .and_then(agent_hook::split_command),
+        tui: config.tui.unwrap_or_default(),
         artifact_policy,
         artifact_policy_source,
         context_window,
@@ -16455,13 +16461,30 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let _agent_state_guard = agent_state_enabled
         .then(|| agent_state_file::StateFileGuard::new(agent_state_dir.clone(), agent_state_pid));
 
-    // The inline viewport preview (`KITSU_TUI=inline`, T0-S5a). Held for the
-    // whole session so the scroll region is released on every exit path. With
-    // the variable unset the mode is classic, `install` writes nothing and
-    // touches no global state, so the session is byte-identical.
+    // The inline viewport preview (`--tui inline` or `[tui] mode = "inline"`,
+    // T0-S5a/T3-S2). Held for the whole session so the scroll region is
+    // released on every exit path. In classic mode — the default — `install`
+    // writes nothing and touches no global state, so the session is
+    // byte-identical.
     #[cfg(unix)]
     let tui_bridge_guard = {
-        let mode = tui_bridge::mode_from_value(std::env::var_os("KITSU_TUI").as_deref());
+        // T3-S2 resolves the whole `[tui]` table here, at the one point where
+        // the renderer is chosen. Only `mode` has a consumer today; the
+        // remaining four are resolved and bound so that the alternate-screen
+        // force, the chord prefix (T4), the title row, the left-arrow binding
+        // and the cell ring (T3-S6) each arrive at their renderer already
+        // decided, rather than growing a second resolution point per card.
+        let _resolved_tui = (
+            setup.tui.effective_alternate_screen(cli.no_alt_screen),
+            setup.tui.prefix.as_str(),
+            setup.tui.title,
+            setup.tui.left_arrow_opens_agents,
+            setup.tui.cell_ring_lines,
+        );
+        let mode = match setup.tui.effective_mode(cli.tui_mode()) {
+            crate::config::TuiMode::Classic => tui_bridge::TuiMode::Classic,
+            crate::config::TuiMode::Inline => tui_bridge::TuiMode::Inline,
+        };
         // A failed geometry probe (not a terminal, or an ioctl refusal) falls
         // back to the conventional 80x24, the same fallback the renderer's own
         // width probe uses.

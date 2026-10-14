@@ -24,14 +24,6 @@
 //! [`install`] disables the live row for as long as the viewport is installed
 //! and [`BridgeGuard`]'s `Drop` restores whatever the setting was before.
 //!
-//! # Failing closed
-//!
-//! [`mode_from_value`] returns [`TuiMode::Inline`] for the exact value
-//! `"inline"` and [`TuiMode::Classic`] for everything else — a missing value,
-//! an empty one, an unknown word, a different case, a stray trailing space. A
-//! typo must not silently move a user into a preview renderer, so the match is
-//! byte-exact rather than forgiving.
-//!
 //! # Unix only
 //!
 //! The whole module is gated with an inner `#![cfg(unix)]` rather than a
@@ -61,19 +53,6 @@ pub(crate) enum TuiMode {
     Classic,
     /// The pinned inline viewport from `kitsu-tui`.
     Inline,
-}
-
-/// Decide the mode from one environment value, failing closed.
-///
-/// The match is **byte-exact and case-sensitive, with no trimming**: only
-/// `"inline"` selects the viewport. A typo must leave the user in the renderer
-/// they already had, and a forgiving match would make the set of values that
-/// silently switch renderers unbounded.
-pub(crate) fn mode_from_value(value: Option<&std::ffi::OsStr>) -> TuiMode {
-    match value {
-        Some(value) if value.as_encoded_bytes() == b"inline" => TuiMode::Inline,
-        _ => TuiMode::Classic,
-    }
 }
 
 /// A session-lifetime guard that puts back everything [`install`] displaced.
@@ -841,7 +820,6 @@ pub(crate) fn palette_rows(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
@@ -850,8 +828,8 @@ mod tests {
     use serial_test::serial;
 
     use super::{
-        install, mode_from_value, palette_rows, suspend_and_resume, BridgeGuard, SuspendEffects,
-        TuiMode, PALETTE_MIN_ROWS,
+        install, palette_rows, suspend_and_resume, BridgeGuard, SuspendEffects, TuiMode,
+        PALETTE_MIN_ROWS,
     };
 
     /// A sink whose buffer outlives the surface that owns it, so bytes written
@@ -967,28 +945,6 @@ mod tests {
             Box::new(err.clone()),
         );
         (guard, out, err)
-    }
-
-    /// Test 1. The gate's truth table, including the two cases that decide how
-    /// it fails: a different case and a trailing space are **Classic**, so the
-    /// match is byte-exact and a typo keeps the user in the renderer they
-    /// already had.
-    #[test]
-    fn mode_from_value_selects_inline_only_for_the_exact_value() {
-        assert!(matches!(
-            mode_from_value(Some(OsStr::new("inline"))),
-            TuiMode::Inline
-        ));
-
-        for value in [
-            "", "classic", "Inline", "INLINE", "inline ", " inline", "1", "true",
-        ] {
-            assert!(
-                matches!(mode_from_value(Some(OsStr::new(value))), TuiMode::Classic),
-                "{value:?} must fail closed to classic"
-            );
-        }
-        assert!(matches!(mode_from_value(None), TuiMode::Classic));
     }
 
     /// Test 2. Installing in inline mode writes the viewport's control bytes

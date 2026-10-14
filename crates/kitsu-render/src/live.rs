@@ -1740,7 +1740,7 @@ mod tests {
     // ------------------------------------------------------------------
     // The inline viewport's shared composition surface.
     //
-    // The inline renderer (`KITSU_TUI=inline`) paints its own pinned row and
+    // The inline renderer (`--tui inline`) paints its own pinned row and
     // has no spinner, queue tag or agent tag to place, but it needs exactly
     // the hint handling this module already implements: a reserved
     // reverse-search status that claims its columns before the draft is

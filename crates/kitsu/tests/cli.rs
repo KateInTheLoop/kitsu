@@ -20218,3 +20218,157 @@ async fn test_jobs_reply_deny_releases_a_parked_detached_agent_with_a_denial() {
         "`n` must not let the gated read through: {transcript}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T3-S2: `--tui <MODE>`, `--no-alt-screen`, and the `[tui]` table reaching the
+// product (design §4.8, plan row T3-S2).
+//
+// FAILING-FIRST: neither flag exists and `[tui]` is an unknown field on
+// `Config` today, so every test below fails against this commit. The
+// precedence and default assertions live in `config.rs`'s unit tests; these
+// pin the user-visible surface: help text, argument rejection, and what
+// `kitsu doctor` says about a misspelled key.
+// ---------------------------------------------------------------------------
+
+/// The flags are discoverable, with their accepted values, and `--tui` takes a
+/// value while `--no-alt-screen` does not.
+#[test]
+fn test_help_exposes_the_tui_mode_flag_and_no_alt_screen() {
+    let home = TempDir::new().unwrap();
+    let mut cmd = base_cmd(home.path());
+    cmd.arg("--help");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        stdout.contains("--tui <MODE>"),
+        "--tui must appear with its value name: {stdout}"
+    );
+    assert!(
+        stdout.contains("--no-alt-screen"),
+        "--no-alt-screen must appear: {stdout}"
+    );
+    assert!(
+        stdout.contains("[possible values: classic, inline]"),
+        "the accepted modes must be listed (fullscreen is T5): {stdout}"
+    );
+}
+
+/// An unknown mode on the command line is clap's own loud error, not a
+/// fail-closed fallback to classic. The retired `KITSU_TUI` gate swallowed
+/// `Inline` and `1`; a flag the user typed on purpose must not.
+#[test]
+fn test_tui_flag_rejects_an_unknown_mode_naming_the_value() {
+    let home = TempDir::new().unwrap();
+    for value in ["Inline", "INLINE", "viewport", "fullscreen", "1", ""] {
+        let output = base_cmd(home.path())
+            .args(["--tui", value, "doctor"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "--tui {value:?} must be rejected, not defaulted: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            stderr.contains("invalid value") && stderr.contains("--tui"),
+            "the error must name the flag and the bad value for {value:?}: {stderr}"
+        );
+    }
+
+    // ...and the two accepted values are accepted, so the loop above is not
+    // rejecting every invocation.
+    for value in ["classic", "inline"] {
+        let output = base_cmd(home.path())
+            .args(["--tui", value, "doctor"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            !stderr.contains("invalid value"),
+            "--tui {value} must parse: {stderr}"
+        );
+    }
+}
+
+/// `--no-alt-screen` is a bare switch and composes with `--tui`.
+#[test]
+fn test_no_alt_screen_is_a_bare_switch_that_composes_with_tui() {
+    let home = TempDir::new().unwrap();
+    let output = base_cmd(home.path())
+        .args(["--tui", "inline", "--no-alt-screen", "doctor"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("invalid value"),
+        "both flags must parse together: {stderr}"
+    );
+}
+
+/// The risk gate of design §4.8, end to end: `kitsu doctor` names the
+/// misspelled `[tui]` key. Today the whole table is unknown, so the message
+/// names `tui` and the user is never told which key they got wrong.
+#[test]
+fn test_doctor_names_an_unknown_tui_key() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let config = home.path().join(".kitsu/config.toml");
+    let contents = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!("{contents}\n[tui]\nleft_arrow_opens_agent = true\n"),
+    )
+    .unwrap();
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["config"]["status"], "parse/read failed");
+    let issues = report["blocking_issues"]
+        .as_array()
+        .expect("doctor must report blocking issues")
+        .iter()
+        .map(|issue| issue.as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        issues.contains("unknown field `left_arrow_opens_agent`"),
+        "doctor must name the misspelled key: {issues}"
+    );
+    assert!(
+        issues.contains("left_arrow_opens_agents"),
+        "and the real key, which is the fix: {issues}"
+    );
+}
+
+/// The converse, so the test above is not passing on a config that was broken
+/// for some other reason: a well-spelled `[tui]` table parses.
+#[test]
+fn test_doctor_accepts_a_well_spelled_tui_table() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let config = home.path().join(".kitsu/config.toml");
+    let contents = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "{contents}\n[tui]\nmode = \"inline\"\nalternate_screen = \"never\"\n\
+             prefix = \"ctrl+b\"\ntitle = false\nleft_arrow_opens_agents = false\n\
+             cell_ring_lines = 2000\n"
+        ),
+    )
+    .unwrap();
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["config"]["status"], "parsed successfully");
+}

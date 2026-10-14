@@ -115,7 +115,9 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   carried into the next live editor or pre-filled into the next idle prompt.
   Non-TTY, `--plain`, and assistive sessions keep the canonical
   line-collector loop with byte-identical output.
-- **Inline viewport** (`kitsu-tui`, preview, gated behind `KITSU_TUI=inline`):
+- **Inline viewport** (`kitsu-tui`, preview, selected by `--tui inline` or
+  `[tui] mode = "inline"`; flag, then config, then the `classic` default, and no
+  environment variable):
   an alternative to the live status row that keeps its rows **outside** a DEC
   scroll region instead of repainting one row at the transcript bottom. On
   entry it sets the region to rows `1..=height - viewport_rows`, parks the

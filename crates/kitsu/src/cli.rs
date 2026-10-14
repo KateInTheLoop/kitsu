@@ -3,6 +3,57 @@
 
 use clap::{Parser, Subcommand};
 
+/// The value parser for `--tui <MODE>`.
+///
+/// Hand-written rather than `value_parser = ["classic", "inline"]` for one
+/// reason: clap's `PossibleValuesParser` rejects an EMPTY value with "a value
+/// is required ... but none was supplied", which reads as a missing argument
+/// rather than a wrong one. `--tui ""` is a value the user typed, so it is an
+/// *invalid value* like `--tui viewport` is, named and listed the same way.
+/// `possible_values` is still implemented, so `--help` keeps clap's own
+/// "[possible values: classic, inline]" line.
+#[derive(Clone, Copy, Debug)]
+struct TuiModeParser;
+
+/// The modes `--tui` accepts. `fullscreen` is T5's renderer and is absent
+/// until it exists, so the name cannot silently select the inline viewport.
+const TUI_FLAG_MODES: [&str; 2] = ["classic", "inline"];
+
+impl clap::builder::TypedValueParser for TuiModeParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        let raw = value.to_string_lossy();
+        if TUI_FLAG_MODES.contains(&raw.as_ref()) {
+            return Ok(raw.into_owned());
+        }
+        let flag = arg.map_or_else(|| "--tui <MODE>".to_string(), ToString::to_string);
+        Err(clap::Error::raw(
+            clap::error::ErrorKind::InvalidValue,
+            format!(
+                "invalid value '{raw}' for '{flag}'\n  [possible values: {}]\n\n",
+                TUI_FLAG_MODES.join(", ")
+            ),
+        )
+        .with_cmd(cmd))
+    }
+
+    fn possible_values(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue> + '_>> {
+        Some(Box::new(
+            TUI_FLAG_MODES
+                .into_iter()
+                .map(clap::builder::PossibleValue::new),
+        ))
+    }
+}
+
 /// Commit + source commit date embedded in this binary — `-V` shows the plain
 /// semver, while `--version` shows this provenance too. The date is deliberately
 /// not called a build date: reproducible builds derive it from Git history.
@@ -251,8 +302,40 @@ pub struct Cli {
     #[arg(long = "skill", value_name = "NAME", global = true)]
     pub skill: Vec<String>,
 
+    /// Which renderer interactive chat runs: `classic` (today's line
+    /// renderer) or `inline` (the pinned viewport preview). Overrides the
+    /// config key `[tui] mode`; there is no environment variable — the
+    /// `KITSU_TUI` preview gate was retired, so this flag and the config key
+    /// are the only two sources, in that order.
+    #[arg(
+        long = "tui",
+        global = true,
+        value_name = "MODE",
+        value_parser = TuiModeParser
+    )]
+    pub tui: Option<String>,
+
+    /// Never take the terminal's alternate screen. A one-way force: it beats
+    /// any `[tui] alternate_screen` value, and omitting it forces nothing.
+    #[arg(long = "no-alt-screen", global = true)]
+    pub no_alt_screen: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+impl Cli {
+    /// `--tui` as the config's own mode type, or `None` when the flag is
+    /// absent. clap has already rejected everything but the two accepted
+    /// spellings, so an unreachable third value is a bug here rather than a
+    /// silent fallback to classic.
+    pub fn tui_mode(&self) -> Option<crate::config::TuiMode> {
+        match self.tui.as_deref() {
+            Some("classic") => Some(crate::config::TuiMode::Classic),
+            Some("inline") => Some(crate::config::TuiMode::Inline),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
