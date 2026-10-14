@@ -1685,13 +1685,7 @@ impl CommandPolicy {
                 }
             }
             CommandMode::Ask => {
-                if !crate::interactive_prompts_allowed() {
-                    return Err(ToolError::PolicyDenied(format!(
-                        "background command {} in '{}' requires interactive approval; pre-grant the exact argv/cwd before starting background work",
-                        display_argv(argv),
-                        cwd.display()
-                    )));
-                }
+                let route = crate::prompt_route();
                 let request = CommandApprovalRequest {
                     argv: argv.to_vec(),
                     cwd: cwd.display().to_string(),
@@ -1699,7 +1693,32 @@ impl CommandPolicy {
                     executable: executable.identity.clone(),
                     ambient_authority: self.ambient_authority(),
                 };
-                match self.prompt(request).await {
+                // Same question, same answer vocabulary, same grant code as
+                // the foreground gate: `Decision::AllowAlways` becomes exactly
+                // the existing `AllowForSession` exact argv/cwd grant.
+                let decision = match route {
+                    crate::PromptRoute::Denied => {
+                        return Err(ToolError::PolicyDenied(format!(
+                            "background command {} in '{}' requires interactive approval; pre-grant the exact argv/cwd before starting background work",
+                            display_argv(argv),
+                            cwd.display()
+                        )));
+                    }
+                    crate::PromptRoute::Foreground => self.prompt(request).await,
+                    crate::PromptRoute::Registry { agent_id, sender } => match crate::ask_registry(
+                        agent_id,
+                        &sender,
+                        crate::PromptRequestPayload::Command(request),
+                    )
+                    .await
+                    {
+                        crate::Decision::AllowOnce => CommandDecision::AllowOnce,
+                        crate::Decision::AllowAlways => CommandDecision::AllowForSession,
+                        crate::Decision::Deny => CommandDecision::Deny,
+                        crate::Decision::Interrupt => CommandDecision::Interrupt,
+                    },
+                };
+                match decision {
                     CommandDecision::AllowOnce => Ok(AuthorizedCommand {
                         cwd: authorized_cwd,
                         executable,
@@ -3588,6 +3607,149 @@ mod tests {
         ));
         assert_eq!(prompts.load(Ordering::Relaxed), 0);
         assert!(policy.session_grants().is_empty());
+    }
+
+    // T2-S2 — the command gate consults the prompt route. Symmetric with the
+    // path gate: same channel, same answer vocabulary, existing grant code.
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn registry_route_allow_once_runs_the_command_without_a_session_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::Ask)
+            .unwrap()
+            .with_prompter(Arc::new(FixedPrompter {
+                decision: CommandDecision::AllowForSession,
+                prompts: prompts.clone(),
+            }));
+        let (sender, seen) = crate::registry_prompt_stub(crate::Decision::AllowOnce);
+        let invocation = args(&["/bin/echo", "registry-allow-once"], dir.path());
+
+        let output = crate::scope_with_registry_prompts(
+            21,
+            sender,
+            execute_command(&policy, invocation.clone()),
+        )
+        .await
+        .expect("a registry-routed AllowOnce must run this command");
+
+        assert_eq!(output.stdout.trim_end(), "registry-allow-once");
+        assert_eq!(
+            prompts.load(Ordering::Relaxed),
+            0,
+            "a background gate must never touch the interactive command prompter"
+        );
+        assert!(
+            policy.session_grants().is_empty(),
+            "allow once must grant nothing durable"
+        );
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "exactly one request is parked");
+        match &requests[0] {
+            crate::PromptRequestPayload::Command(request) => {
+                assert_eq!(request.argv, invocation.argv);
+                assert_eq!(
+                    request.cwd,
+                    std::fs::canonicalize(dir.path())
+                        .unwrap()
+                        .display()
+                        .to_string()
+                );
+                assert!(
+                    request.executable.observed_path.is_some(),
+                    "the parked request must carry the same bound executable \
+                     identity the foreground prompter is shown"
+                );
+            }
+            other => panic!("the command gate must park a Command payload, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn registry_route_allow_always_installs_the_exact_argv_cwd_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::Ask).unwrap();
+        let (sender, seen) = crate::registry_prompt_stub(crate::Decision::AllowAlways);
+        let invocation = args(&["/bin/echo", "registry-allow-always"], dir.path());
+
+        crate::scope_with_registry_prompts(
+            22,
+            sender.clone(),
+            execute_command(&policy, invocation.clone()),
+        )
+        .await
+        .expect("a registry-routed AllowAlways must run this command");
+
+        // The grant must be the *existing* exact argv/cwd session grant, not a
+        // broader background-only approval.
+        let grants = policy.session_grants();
+        assert_eq!(grants.len(), 1, "exactly one exact grant is installed");
+        assert_eq!(grants[0].argv, invocation.argv);
+        assert_eq!(grants[0].cwd, std::fs::canonicalize(dir.path()).unwrap());
+        assert!(
+            grants[0].executable.is_some(),
+            "the grant must bind the observed executable identity, as the \
+             foreground AllowForSession path does"
+        );
+        assert!(
+            !policy.is_granted(&["/bin/echo".to_string()], dir.path()),
+            "the grant must stay exact: a different argv is still unapproved"
+        );
+
+        // The installed grant satisfies a repeat without a second question, and
+        // it is the same grant the foreground session sees.
+        crate::scope_with_registry_prompts(
+            22,
+            sender,
+            execute_command(&policy, invocation.clone()),
+        )
+        .await
+        .expect("the exact grant covers a repeat");
+        execute_command(&policy, invocation)
+            .await
+            .expect("the foreground sees the same session grant");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the installed grant must satisfy later runs without re-asking"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn registry_route_deny_refuses_exactly_like_the_foreground_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let foreground = CommandPolicy::new(&[root(&dir)], CommandMode::Ask)
+            .unwrap()
+            .with_prompter(Arc::new(FixedPrompter {
+                decision: CommandDecision::Deny,
+                prompts: prompts.clone(),
+            }));
+        let invocation = args(&["/bin/echo", "registry-deny"], dir.path());
+        let expected = match execute_command(&foreground, invocation.clone()).await {
+            Err(ToolError::PolicyDenied(message)) => message,
+            other => panic!("foreground Deny must be PolicyDenied, got {other:?}"),
+        };
+
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::Ask).unwrap();
+        let (sender, seen) = crate::registry_prompt_stub(crate::Decision::Deny);
+        let error =
+            crate::scope_with_registry_prompts(23, sender, execute_command(&policy, invocation))
+                .await
+                .expect_err("a registry-routed Deny must refuse");
+
+        match error {
+            ToolError::PolicyDenied(message) => assert_eq!(
+                message, expected,
+                "a background denial must be indistinguishable from the foreground denial"
+            ),
+            other => panic!("expected PolicyDenied, got {other:?}"),
+        }
+        assert!(policy.session_grants().is_empty());
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

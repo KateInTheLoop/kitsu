@@ -128,7 +128,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T0-S18 fork/flock fence race, F28 closed as a production bug | done | this commit |
 | T0-S19 the three remaining flock sites, F32 closed | done | 187e120 |
 | T2-S1 `PromptRoute` task-local seam | done | c4bd57b |
-| T2-S3 `Blocked` vocabulary + validator + schema v2 | done, **taken before S2** | this commit |
+| T2-S3 `Blocked` vocabulary + validator + schema v2 | done, **taken before S2** | 68c7e54 |
+| T2-S2 both gates consult the route (absorbs S1's gate half) | done | this commit |
 
 With T1-S6 done, **milestone T1 is complete**: kitsu now exposes its
 background agents to the outside three ways — a grouped and explainable deck
@@ -245,6 +246,17 @@ subcommands are additive.
 | Story | Deliverable | First card | Files | Acceptance / req |
 |---|---|---|---|---|
 | T2-S1 | `PromptRoute` task-local (`Foreground\|Denied\|Registry{agent_id, sender}`) in `kitsu-tools`; `interactive_prompts_allowed()` ≡ `route == Foreground`; `scope_without_interactive_prompts` keeps setting `Denied` (all seven callers unchanged); new `scope_with_registry_prompts` | Failing test: `Registry` route in `Permissions::resolve` yields a `Blocked` request and resumes on `AllowOnce` | `kitsu-tools/src/lib.rs:44-62`, `permissions.rs:1623` | `cargo test -p kitsu-tools` whole crate green incl. `permissions.rs:2064`; three-case test (y/a/n) for the fs gate (B1, B2) |
+**Scope note:** the shipped **T2-S1** was *narrower* than this row. The row
+scopes the task-local **and** routing `Permissions::resolve`, with a three-case
+y/a/n test for the fs gate. The commit (`c4bd57b`) delivered only the seam —
+the `PromptRoute` enum, the `interactive_prompts_allowed()` equivalence and the
+scope functions — and deliberately left the `sender` off the `Registry` variant,
+because defining it needs the request and answer types. **T2-S2 therefore
+absorbs this row's gate half**, and does both gates together: they are
+symmetric, they share the request/answer types, and B2 specifies both. Nothing
+regressed in the meantime because nothing in production sets a `Registry` route
+— verified, the only callers of `scope_with_registry_prompts` are tests.
+
 **Order note:** S3 is taken **before** S2. S2 defines the channel an approval
 request travels on, and that channel's destination *is* the `Blocked` state S3
 introduces — building the channel first would mean inventing its destination

@@ -1846,3 +1846,28 @@ only test that changes is T2-S3's `the_blocked_deck_row_is_marked_live_and_reads
   (schema 1 is rejected, naming the expected version); if a later milestone
   needs v1 tolerance it must be a deliberate accept-older-version path, and that
   test revisited on purpose.
+
+
+## F35 — `interactive_prompts_allowed()` is now test-only, deliberately
+
+Recorded in T2-S2 so it is not mistaken for dead code to delete, nor left to
+rot.
+
+Both gates now match the whole `PromptRoute` rather than asking a yes/no
+question, so **no production code calls `interactive_prompts_allowed()` any
+more**. Two pre-existing lib tests do, and the implementer could not touch
+tests, so the function survives behind
+`#[cfg_attr(not(test), allow(dead_code))]`.
+
+That is the right outcome rather than a leftover, and the reason is worth
+stating: the function now *documents an invariant* —
+`interactive_prompts_allowed() ≡ matches!(prompt_route(), Foreground)` — and a
+T2-S1 test pins exactly that equivalence. Keeping it means the equivalence
+stays checked as the route grows variants; deleting it would remove the only
+assertion that a new variant has not quietly become "allowed to prompt".
+
+**For whoever revisits it:** either keep it as the documented equivalence (and
+leave the attribute), or remove it *together with* the two tests that call it —
+but not the function alone, because that silently drops the invariant check. If
+a future variant should permit prompting, the equivalence test is what will
+force that decision to be explicit.
