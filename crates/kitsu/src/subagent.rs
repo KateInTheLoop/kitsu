@@ -138,6 +138,10 @@ do the task with what you have.";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentStatus {
     Running,
+    /// Parked on a user answer. Non-terminal, like `Running`, and a unit
+    /// variant because nothing carries a reason yet.
+    #[allow(dead_code)] // Nothing parks an agent yet; a later card constructs it.
+    Blocked,
     Done(String),
     Failed(String),
     Cancelled(String),
@@ -328,6 +332,8 @@ pub struct AgentProgress {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentProgressStatus {
     Running,
+    /// Parked on a user answer; the `/jobs view` group `needs input`.
+    Blocked,
     Done,
     Failed,
     Cancelled,
@@ -343,6 +349,9 @@ pub struct AgentProgressSnapshot {
     pub done: usize,
     pub failed: usize,
     pub cancelled: usize,
+    /// Agents parked on a user answer. Counted here so the per-state counts
+    /// still sum to `total`. Unrelated to `AgentRegistrySnapshot::blocked`.
+    pub blocked: usize,
     pub max_running: usize,
     pub max_records: usize,
     pub available_running_slots: usize,
@@ -740,9 +749,11 @@ impl AgentRegistry {
         let mut done = 0;
         let mut failed = 0;
         let mut cancelled = 0;
+        let mut blocked = 0;
         for agent in &progress {
             match agent.status {
                 AgentProgressStatus::Running => running += 1,
+                AgentProgressStatus::Blocked => blocked += 1,
                 AgentProgressStatus::Done => done += 1,
                 AgentProgressStatus::Failed => failed += 1,
                 AgentProgressStatus::Cancelled => cancelled += 1,
@@ -755,6 +766,7 @@ impl AgentRegistry {
             done,
             failed,
             cancelled,
+            blocked,
             max_running: self.limits.max_running,
             max_records: self.limits.max_records,
             available_running_slots: self.limits.max_running.saturating_sub(running),
@@ -1076,6 +1088,7 @@ impl AgentRegistry {
                 let rec = &g[id];
                 let tag = match &rec.status {
                     AgentStatus::Running => "running",
+                    AgentStatus::Blocked => "blocked",
                     AgentStatus::Done(_) => "done",
                     AgentStatus::Failed(_) => "failed",
                     AgentStatus::Cancelled(_) => "cancelled",
@@ -1235,6 +1248,7 @@ fn elapsed_millis(started: Instant, finished: Option<Instant>) -> u64 {
 fn result_text(id: u64, status: &AgentStatus) -> String {
     match status {
         AgentStatus::Running => format!("agent #{id} is still running"),
+        AgentStatus::Blocked => format!("agent #{id} is waiting on an answer"),
         AgentStatus::Done(result) => result.clone(),
         AgentStatus::Failed(error) => format!("agent #{id} failed: {error}"),
         AgentStatus::Cancelled(reason) => format!("agent #{id} cancelled: {reason}"),
@@ -1244,6 +1258,7 @@ fn result_text(id: u64, status: &AgentStatus) -> String {
 fn agent_progress(id: u64, record: &AgentRecord) -> AgentProgress {
     let (status, result_bytes) = match &record.status {
         AgentStatus::Running => (AgentProgressStatus::Running, None),
+        AgentStatus::Blocked => (AgentProgressStatus::Blocked, None),
         AgentStatus::Done(result) => (AgentProgressStatus::Done, Some(result.len())),
         AgentStatus::Failed(error) => (AgentProgressStatus::Failed, Some(error.len())),
         AgentStatus::Cancelled(reason) => (AgentProgressStatus::Cancelled, Some(reason.len())),
