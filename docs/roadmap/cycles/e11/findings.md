@@ -2259,3 +2259,149 @@ the caller's intent apart (a parameter, or a distinct `Decision`), or recording
 the outcome at the two call sites instead of in the shared path. That is a small
 card, not a patch — and it should also pin the cancellation case, which nothing
 does today.
+
+### F40 follow-up — the hook path checked, and it is clean today
+
+F40 left two candidates open: the state-file writer and the hook payload
+assembly, both of which "take narrow structs today for reasons that may be
+incidental rather than designed". Checked by reading before T2-S7 was briefed.
+
+**The hook's `KITSU_AGENT_WAITING_FOR` already exists** — this card does not add
+it — and today it is populated from `progress.telemetry.last_activity`, passed
+through `safe_inline_label`.
+
+Two things follow:
+
+1. **There is no pre-existing leak.** Every activity string is built from a tool
+   *name* via a `safe_activity_name` helper, or is a fixed phrase: `"started
+   tool read"`, `"tool read ok"`, `"provider request round 3"`, `"usage
+   updated"`, `"started"`. No argument, path or argv word is ever formatted into
+   one. And the helper's existence suggests this was deliberate rather than
+   accidental — unlike the timeline's protection, which F40 found was an
+   accident of a dropped field.
+2. **But the filter would not stop one.** `safe_inline_label` is
+   `sanitize_and_redact_text` plus whitespace collapsing and truncation, so it
+   inherits exactly F40's limitation: credential-shaped, not privacy-shaped. A
+   path formatted into an activity string would reach the hook's environment
+   **verbatim**, and a hook runs an **external program** — strictly worse
+   exposure than the timeline, where a leak would at least stay inside kitsu's
+   own output.
+
+So the invariant to preserve in T2-S7 is: `waiting_for` may name the permission
+**kind** when an agent is blocked, and must never name its argument. The
+protection has to be the same structural one as T2-S6 — derive from
+`AgentApprovalKind`, never format from the payload — because nothing downstream
+will catch the mistake.
+
+The state-file writer remains unchecked at the time of writing; T2-S7 touches it
+and should answer the same question.
+
+## F44 — F40's two candidates, answered: the hook was the fragile one
+
+T2-S7 touches both places F40 flagged as possibly relying on "the sensitive
+field simply is not passed here". Both were read. The answers differ, and the
+hook's is the one that mattered.
+
+### The hook payload assembly was never narrow
+
+`AgentObservation` and `HookEvent` already carry `waiting_for` as a **free-form
+`String`**, assembled from `progress.telemetry.last_activity` and protected only
+by `safe_inline_label` — bounding, whitespace collapsing, and
+`sanitize_and_redact_text`, which by T2-S6's own test leaves paths and argv words
+**untouched**.
+
+So an argument could have reached an **external program** today **with no type
+change, no signature change and no public API change at all**. An implementer
+writing the natural phrase *"waiting for permission to write
+/work/notes.txt"* would have needed to change nothing, and nothing downstream
+would have caught it. That is F40's "protection by accident", one layer further
+out: the activity label is argument-free only because every call site happens to
+format a tool *name* (via `safe_activity_name`) and nobody ever plumbed
+arguments in.
+
+**This is the highest-risk line in milestone T2**, and it is riskier than the
+timeline it came from, because a hook leaves the process.
+
+**Mitigated structurally rather than by care:** `AgentProgress` and the thread
+snapshot DTO now carry `waiting_for: Option<AgentApprovalKind>` — a **unit
+enum** — so the blocked reason travels to the assembly sites in a type that
+cannot hold an argument, and the assembly only calls `.wire()`. The remaining
+`String` in `AgentObservation` is legitimate (it carries activity labels for
+*running* agents) so the guard there is an exact-equality test.
+
+### The state-file writer is a narrow struct wrapped around a wide one
+
+`AgentStateFile`'s own fields are fixed and safe, but it embeds the full thread
+snapshot, which carries free-form `task`, `model` and every timeline
+`entry.text`. So it is not narrow either; what protects it is one layer down —
+and that protection is **T2-S6's structural guarantee in the timeline**, not the
+wrapper and not `validate`, which runs the same credential-shaped redactor.
+Making the new field a typed kind extends that guarantee rather than leaning on
+the wrapper.
+
+### A real defect this card fixes, found by the tests
+
+A parked agent's `KITSU_AGENT_WAITING_FOR` reads the stale activity label
+**`"started"`** — the hook correctly reports `STATE=blocked` and then gives a
+nonsense reason, because `park_prompt` records no telemetry activity. The
+tempting fix (call `record_activity` with the request) **is the leak path**; the
+reason has to travel as the typed kind instead.
+
+## F45 — one machine vocabulary, one human vocabulary, one source each
+
+The three machine surfaces did **not** agree on how to spell a waiting reason,
+and before T2-S7 the divergence was invisible because only one of them had the
+field at all: the hook's free-form activity string. The state file and
+`kitsu agents --json` had nothing.
+
+Left alone, the natural implementations would have diverged — snake_case serde on
+the DTO side, the English `label()` ("write a file") on the hook side — and the
+mismatch would have been discovered by whoever first wrote a tool against both.
+
+**Resolved and approved at review:**
+- **`AgentApprovalKind::wire()`** → `read_file` / `write_file` / `run_command`
+  is the single **machine** vocabulary, shared by the state file, the hook
+  environment and `kitsu agents --json`, and equal to the serde spelling.
+- **`label()`** → "read a file" / "write a file" / "run a command" stays the
+  **human** text `/jobs` prints.
+
+One source per audience, and a test asserts the DTO spelling *is* `wire()`, so a
+second machine vocabulary cannot appear later. This is the same discipline as
+T2-S3's label table and F2's suggester test: the spelling lives in one place and
+a test fails if a copy appears.
+
+The general point: **a human label and a machine identifier are different
+things, and a surface that needs both should derive each from one source rather
+than reusing whichever exists.** Reusing the human label as a wire value is how
+`"write a file"` ends up in someone's JSON parser.
+
+## F46 — the PTY harness has two opposite polling traps, not one
+
+T2-S5a established: **poll `/jobs view`, never bare `/jobs`**, because
+`needs input` is a heading only `format_jobs_view` emits, and getting that wrong
+made a positive assertion unreachable at any timeout and two negative guards
+vacuous (F37).
+
+T2-S7's end-to-end test hit the **mirror image**. After replying to a parked
+agent, its first run parked correctly, captured both surfaces, replied, released
+the agent — and then died on the harness deadline, because the settle signal
+(`CHILD_SAW`, which proves the released agent's work actually ran) reaches the
+transcript only through the agent **deck**. `/jobs view` never prints a finished
+agent's result, so polling it alone made the completion signal unreachable.
+
+**The rule is therefore two-sided, and both halves are now paid for:**
+
+| what you are waiting for | poll |
+|---|---|
+| an agent to **park** (`needs input`) | `/jobs view` — the deck does not group by state |
+| an agent's **result** after release (`CHILD_SAW`) | the deck (`/agents`) — `/jobs view` omits finished work |
+
+The safe default is to poll **both** (`/jobs view\n/agents\n`), which is what
+the surviving drivers do.
+
+**The deeper point, now three findings old (F37, F39, this):** a pseudo-terminal
+test that "times out" is almost never a timing problem. In every case here it
+was a **surface problem** — the assertion was watching a view that could not
+print the thing it waited for. Raising the timeout would have hidden each one.
+When a PTY test reaches its deadline, the first question is *"can this command
+ever print what I am waiting for?"*, not *"is the machine slow?"*.

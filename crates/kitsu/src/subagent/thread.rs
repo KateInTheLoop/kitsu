@@ -141,7 +141,8 @@ impl AgentTimelineKind {
 /// record, and a permission request is precisely a tool plus its arguments,
 /// so only the kind crosses into the timeline. `/jobs explain`'s question
 /// ("what is this agent waiting on") is answered by the kind alone.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentApprovalKind {
     ReadFile,
     WriteFile,
@@ -149,6 +150,18 @@ pub enum AgentApprovalKind {
 }
 
 impl AgentApprovalKind {
+    /// The machine spelling, shared by every surface outside the process: the
+    /// state file's `waiting_for`, the `on_agent_state` hook's
+    /// `KITSU_AGENT_WAITING_FOR`, and `kitsu agents --json`. It is the serde
+    /// spelling too, so one vocabulary reaches an outside reader.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::ReadFile => "read_file",
+            Self::WriteFile => "write_file",
+            Self::RunCommand => "run_command",
+        }
+    }
+
     /// The phrase that follows "permission to".
     pub fn label(self) -> &'static str {
         match self {
@@ -260,6 +273,14 @@ pub struct AgentThreadSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub phase: AgentThreadPhase,
+    /// What this agent is parked on, when it is parked: the permission
+    /// **kind** and nothing else (T2-S7, N8). Absent from the JSON entirely
+    /// when the agent is not blocked, which keeps every pre-T2-S7 fixture
+    /// byte-identical. The type is a unit enum with no argument-bearing
+    /// field, so a path or an argv word cannot travel here without altering
+    /// a public type (F40).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<AgentApprovalKind>,
     pub handoff: AgentHandoffState,
     pub elapsed_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -476,6 +497,11 @@ pub(crate) struct AgentThreadState {
     model: String,
     profile: Option<String>,
     phase: AgentThreadPhase,
+    /// The argument-free kind this thread is parked on, set by
+    /// [`AgentThreadState::record_approval_request`] and cleared by
+    /// [`AgentThreadState::unblock`]. A unit enum, so no tool argument can
+    /// travel from here to the snapshot (F40).
+    waiting_for: Option<AgentApprovalKind>,
     handoff: AgentHandoffState,
     result_bytes: Option<usize>,
     steering_sender: Option<mpsc::Sender<AgentSteeringMessage>>,
@@ -506,6 +532,7 @@ impl AgentThreadState {
                 .0,
                 profile: profile.map(|name| safe_inline_label(name, 64)),
                 phase: AgentThreadPhase::Running,
+                waiting_for: None,
                 handoff: AgentHandoffState::Unavailable,
                 result_bytes: None,
                 steering_sender: Some(sender),
@@ -729,6 +756,10 @@ impl AgentThreadState {
     /// through `record_runtime_event`, which returns early unless the phase
     /// is `Running` — a park is precisely the `Blocked` phase.
     pub(crate) fn record_approval_request(&mut self, kind: AgentApprovalKind) {
+        // The blocked reason travels as this typed kind rather than as a
+        // free-form telemetry activity label, which would reach the hook
+        // environment as a string.
+        self.waiting_for = Some(kind);
         self.timeline.push(
             AgentTimelineKind::Approval,
             None,
@@ -770,6 +801,7 @@ impl AgentThreadState {
             return false;
         }
         self.phase = AgentThreadPhase::Running;
+        self.waiting_for = None;
         true
     }
 
@@ -823,6 +855,9 @@ impl AgentThreadState {
             profile: self.profile.clone(),
             name: None,
             phase: self.phase,
+            waiting_for: (self.phase == AgentThreadPhase::Blocked)
+                .then_some(self.waiting_for)
+                .flatten(),
             handoff: self.handoff,
             elapsed_ms,
             result_bytes: self.result_bytes,
@@ -1324,6 +1359,7 @@ mod tests {
             profile: Some("reviewer".to_string()),
             name: name.map(str::to_string),
             phase: AgentThreadPhase::Blocked,
+            waiting_for: None,
             handoff: AgentHandoffState::Unavailable,
             elapsed_ms: 12_500,
             result_bytes: None,
@@ -1657,5 +1693,116 @@ mod tests {
         AgentThreadSnapshotDto::from_snapshot(&snapshot)
             .validate(limits)
             .expect("approval entries satisfy the DTO's redaction and accounting rules");
+    }
+
+    // -----------------------------------------------------------------
+    // T2-S7: `waiting_for` on the wire. The DTO field exists as a STUB
+    // (`AgentThreadState::snapshot` always publishes `None`) and
+    // `AgentApprovalKind::wire` is a STUB returning "", so the two tests
+    // below that pin content FAIL until the implementer lands the card.
+    // -----------------------------------------------------------------
+
+    /// One machine vocabulary for the three surfaces outside the process.
+    /// `wire()` is what the state file, the hook environment and
+    /// `kitsu agents --json` all carry, and it is the serde spelling too, so a
+    /// reader of any one of them can compare bytes with a reader of another.
+    /// It is deliberately *not* `label()`: that is the English phrase `/jobs`
+    /// prints after "approval to".
+    #[test]
+    fn the_waiting_for_kind_has_one_machine_spelling_shared_with_serde() {
+        for (kind, wire, label) in [
+            (AgentApprovalKind::ReadFile, "read_file", "read a file"),
+            (AgentApprovalKind::WriteFile, "write_file", "write a file"),
+            (
+                AgentApprovalKind::RunCommand,
+                "run_command",
+                "run a command",
+            ),
+        ] {
+            assert_eq!(kind.wire(), wire, "{kind:?} has one machine spelling");
+            assert!(kind.wire().is_ascii(), "{kind:?} reaches a child's environ");
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!("\"{wire}\""),
+                "{kind:?}: the serde spelling is the machine spelling"
+            );
+            assert_eq!(kind.label(), label, "the human phrase is unchanged");
+            assert_ne!(
+                kind.wire(),
+                kind.label(),
+                "{kind:?}: the machine word and the human phrase are distinct"
+            );
+        }
+    }
+
+    /// The F40 guard, stated structurally: `waiting_for` is a closed unit enum,
+    /// so a path or an argv word is not merely absent from it -- it cannot be
+    /// *represented* in it. A foreign writer that put one there produces a DTO
+    /// this binary refuses to decode rather than one it prints.
+    ///
+    /// Not vacuous: the same slot with a real kind decodes, which is asserted
+    /// first, so the refusals below are about the value and not about the
+    /// field, the fixture or the surrounding JSON.
+    #[test]
+    fn a_waiting_for_field_cannot_represent_a_path_or_an_argv_word() {
+        let encode = |waiting_for: serde_json::Value| {
+            let mut dto = serde_json::to_value(AgentThreadSnapshotDto::from_snapshot(
+                &blocked_snapshot(None),
+            ))
+            .unwrap();
+            dto["thread"]["waiting_for"] = waiting_for;
+            dto
+        };
+
+        let good = encode(serde_json::json!("write_file"));
+        let decoded: AgentThreadSnapshotDto =
+            serde_json::from_value(good).expect("a real kind decodes in this slot");
+        assert_eq!(
+            decoded.thread.waiting_for,
+            Some(AgentApprovalKind::WriteFile)
+        );
+
+        for leak in [
+            serde_json::json!("/work/notes.txt"),
+            serde_json::json!("rm -rf /work/tmp"),
+            serde_json::json!("write a file"),
+            serde_json::json!({"write_file": "/work/notes.txt"}),
+        ] {
+            assert!(
+                serde_json::from_value::<AgentThreadSnapshotDto>(encode(leak.clone())).is_err(),
+                "waiting_for must not accept {leak}"
+            );
+        }
+    }
+
+    /// The shape on the wire: the kind's machine word when parked, and the key
+    /// gone entirely when not -- which is what keeps every pre-T2-S7 fixture
+    /// byte-identical.
+    #[test]
+    fn a_blocked_dto_publishes_its_waiting_for_kind_and_omits_it_when_absent() {
+        let mut snapshot = blocked_snapshot(None);
+        snapshot.waiting_for = Some(AgentApprovalKind::WriteFile);
+        let dto = AgentThreadSnapshotDto::from_snapshot(&snapshot);
+        dto.validate(AgentThreadLimits::default())
+            .expect("a parked thread is a valid non-terminal DTO");
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["thread"]["waiting_for"], "write_file");
+        assert_eq!(
+            value["thread"]["waiting_for"],
+            AgentApprovalKind::WriteFile.wire(),
+            "the DTO spelling is `wire()`, not a second vocabulary"
+        );
+        assert_eq!(value["thread"]["phase"], "blocked");
+        let decoded: AgentThreadSnapshotDto = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, dto, "the parked DTO survives a round trip");
+
+        let mut running = blocked_snapshot(None);
+        running.phase = AgentThreadPhase::Running;
+        running.waiting_for = None;
+        let value = serde_json::to_value(AgentThreadSnapshotDto::from_snapshot(&running)).unwrap();
+        assert!(
+            value["thread"].get("waiting_for").is_none(),
+            "an unparked thread carries no waiting_for key at all: {value}"
+        );
     }
 }

@@ -311,7 +311,13 @@ Background agents run in-process, so nothing outside kitsu can observe them.
 `[agents] state_file` publishes a small advisory JSON hint, one file per running
 process, that an outside tool such as a terminal multiplexer can read to tell
 whether this kitsu is `idle`, `working`, or `blocked`, alongside the same
-redacted thread records `/jobs` shows. `auto` (the default) writes only in an
+redacted thread records `/jobs` shows. A background agent parked on a permission
+raises the process state to `blocked`, is counted in `counts.blocked`, and
+carries a `waiting_for` naming the **kind** of permission it needs --
+`read_file`, `write_file` or `run_command`, the same vocabulary the
+`on_agent_state` hook and `kitsu agents --json` use, and never the path or
+command line. Answering the agent removes the key rather than leaving a stale
+reason for a poller to read. `auto` (the default) writes only in an
 interactive terminal session, so scripted, piped, `ask` and JSONL runs write
 nothing at all; `on` writes regardless of how kitsu was invoked, and `off`
 never writes. The file lives at `$XDG_RUNTIME_DIR/kitsu/<pid>.json`, falling
@@ -325,7 +331,14 @@ that died, and writing it never affects a turn — every failure is silent.
 
 `[hooks] on_agent_state` runs a local command when a background agent changes
 state, with `KITSU_AGENT_ID`, `KITSU_AGENT_STATE` and `KITSU_AGENT_WAITING_FOR`
-added to the inherited environment. The command is split into arguments and
+added to the inherited environment. An agent that parks on a permission reports
+`KITSU_AGENT_STATE=blocked` with `KITSU_AGENT_WAITING_FOR` naming the **kind**
+of permission -- `read_file`, `write_file` or `run_command` -- and never the
+path, URL or command line it asked about; a hook runs an external program, so
+the reason travels as a fixed vocabulary that cannot carry an argument. The same
+three words appear in the state file and in `kitsu agents --json`, so a tool can
+match on one spelling across all three. Releasing the agent fires a second
+transition with its running state and no waiting reason. The command is split into arguments and
 executed **directly — never through a shell, and with no variable expansion**,
 so a stray metacharacter in the config cannot become execution and the
 behaviour does not depend on which shell is installed; point it at a script, or

@@ -16501,16 +16501,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let Some(argv) = agent_hook_argv.as_ref() else {
             return;
         };
-        let current = agent_registry
-            .progress_snapshot()
-            .agents
-            .into_iter()
-            .map(|progress| agent_hook::AgentObservation {
-                id: progress.id,
-                state: agent_hook::agent_state_label(progress.status),
-                waiting_for: progress.telemetry.last_activity,
-            })
-            .collect::<Vec<_>>();
+        let current = agent_hook::observations(&agent_registry);
         let mut previous = previous_agent_observations.borrow_mut();
         for event in agent_hook::transitions(&previous, &current) {
             agent_hook::fire(argv, &event);
@@ -21632,6 +21623,7 @@ mod tests {
             profile: Some("reviewer".to_string()),
             name: None,
             phase: subagent::thread::AgentThreadPhase::Running,
+            waiting_for: None,
             handoff: subagent::thread::AgentHandoffState::Unavailable,
             elapsed_ms: 1200,
             result_bytes: None,
@@ -21837,6 +21829,7 @@ mod tests {
             task: "summarize the crate".to_string(),
             profile: Some("reviewer".to_string()),
             status: subagent::AgentProgressStatus::Blocked,
+            waiting_for: None,
             elapsed_ms: 12_500,
             result_bytes: None,
             last_activity_ms_ago: Some(3_200),
@@ -22283,6 +22276,7 @@ mod tests {
             task: "summarize the crate".to_string(),
             profile: Some("reviewer".to_string()),
             status,
+            waiting_for: None,
             elapsed_ms: 12_500,
             result_bytes: Some(42),
             last_activity_ms_ago: Some(3_200),
@@ -22299,6 +22293,7 @@ mod tests {
             profile: Some("reviewer".to_string()),
             name: None,
             phase,
+            waiting_for: None,
             handoff,
             elapsed_ms: 12_500,
             result_bytes: Some(42),

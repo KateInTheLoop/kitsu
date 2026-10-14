@@ -825,7 +825,11 @@ it won't ask again.
   rather than guessed at.
 - `[hooks] on_agent_state` runs a local command on each agent state change,
   exporting `KITSU_AGENT_ID`, `KITSU_AGENT_STATE` and
-  `KITSU_AGENT_WAITING_FOR`. It is executed **directly, never through a shell,
+  `KITSU_AGENT_WAITING_FOR`. A background agent parked on a permission reports
+  `STATE=blocked` and a `WAITING_FOR` of `read_file`, `write_file` or
+  `run_command` — the kind it asked for, **never** the path or command line,
+  since a hook runs an external program. The state file and
+  `kitsu agents --json` use those same three words. It is executed **directly, never through a shell,
   with no expansion**, so config text cannot turn into shell execution; use a
   script, or write `sh -c` yourself. Its output is discarded so it cannot
   disturb kitsu's own rendering, kitsu never waits for it, and a failure,

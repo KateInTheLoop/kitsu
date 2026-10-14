@@ -53,6 +53,17 @@ shapes may change in any minor release.
   A denial releases the agent to carry on with the refusal, exactly as the
   foreground prompt would. Replying to an agent that is not waiting says so
   rather than silently doing nothing.
+- A parked background agent is now visible **outside** the process: the state
+  file reports process state `blocked` with a per-agent `waiting_for`,
+  `[hooks] on_agent_state` fires `STATE=blocked` with the same value, and
+  `kitsu agents --json` reports both. All three use one machine vocabulary —
+  `read_file`, `write_file`, `run_command` — so a tool can match a single
+  spelling, and all three name the **kind** of permission and never the path,
+  URL or command line. Answering an agent removes the reason rather than leaving
+  a stale one behind.
+- Fixed: `KITSU_AGENT_WAITING_FOR` reported a stale activity label (often
+  `started`) for an agent that was in fact waiting for a permission, so a hook
+  was told the state was `blocked` but given a nonsense reason.
 - A background agent's bounded timeline now records **each permission it asked
   for and how that ended** — allowed once, allowed always, denied, or timed out
   — so `/jobs show` still shows that an agent asked, after it has been answered.

@@ -365,6 +365,11 @@ pub struct AgentProgress {
     /// only — the deck needs it to say *what kind* of worker a row is.
     pub profile: Option<String>,
     pub status: AgentProgressStatus,
+    /// What a parked agent is waiting on: the permission **kind** and nothing
+    /// else (T2-S7, N8). `Some` only while `status` is
+    /// [`AgentProgressStatus::Blocked`]. A unit enum deliberately, so no path
+    /// or argv word can ride out to the `on_agent_state` hook (F40).
+    pub waiting_for: Option<thread::AgentApprovalKind>,
     pub elapsed_ms: u64,
     pub result_bytes: Option<usize>,
     /// Milliseconds since the agent's last recorded activity (running rows).
@@ -1525,6 +1530,7 @@ fn agent_progress(id: u64, record: &AgentRecord) -> AgentProgress {
         task: record.task.clone(),
         profile: record.thread.profile().map(str::to_string),
         status,
+        waiting_for: record.pending_prompt.as_ref().map(|parked| parked.kind),
         elapsed_ms: elapsed_millis(record.started_at, record.finished_at),
         result_bytes,
         last_activity_ms_ago: record
@@ -4423,5 +4429,279 @@ mod tests {
             approvals[1].contains("timed out"),
             "a timeout is not a denial: {approvals:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // T2-S7: the blocked state reaches the outside world. Two of the three
+    // deliverable surfaces are assembled in this process and are exercised
+    // here through the real park path, so a path and an argv word genuinely
+    // enter the process before each absence is asserted.
+    //
+    // STUBS: `AgentThreadState::snapshot` publishes `waiting_for: None`,
+    // `agent_progress` sets `waiting_for: None`, `AgentApprovalKind::wire`
+    // returns "", and `agent_hook::observations` reports the last activity
+    // label for a blocked agent. Every test below fails until those land.
+    // ---------------------------------------------------------------------
+
+    /// The state-file payload for this registry, as the session loop builds it.
+    fn state_payload(registry: &AgentRegistry, turn_active: bool) -> serde_json::Value {
+        let built = crate::agent_state_file::build(
+            registry,
+            4242,
+            "/workspace/kitsu".to_string(),
+            Some("sess-7".to_string()),
+            turn_active,
+            "2026-10-14T12:00:00Z".to_string(),
+        );
+        serde_json::to_value(&built).expect("the state file payload serializes")
+    }
+
+    fn thread_in(payload: &serde_json::Value, id: u64) -> serde_json::Value {
+        payload["threads"]
+            .as_array()
+            .expect("threads is an array")
+            .iter()
+            .find(|dto| dto["thread"]["id"] == id)
+            .unwrap_or_else(|| panic!("no thread record for agent #{id} in {payload}"))
+            .clone()
+    }
+
+    /// Surface 1, the positive half: a parked agent publishes the process
+    /// state `blocked`, its tally, and -- per agent -- the permission *kind*
+    /// it waits on, spelled the one machine way.
+    #[tokio::test]
+    async fn the_state_file_publishes_the_kind_a_parked_agent_waits_on() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("needs an answer".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let _answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+
+        let payload = state_payload(&registry, true);
+        assert_eq!(
+            payload["state"], "blocked",
+            "a process with a parked agent is blocked, not working: {payload}"
+        );
+        assert_eq!(payload["counts"]["blocked"], 1, "{payload}");
+        let thread = thread_in(&payload, id);
+        assert_eq!(thread["thread"]["phase"], "blocked", "{thread}");
+        assert_eq!(
+            thread["thread"]["waiting_for"], "write_file",
+            "the parked agent publishes its permission kind: {thread}"
+        );
+        assert_eq!(
+            thread["thread"]["waiting_for"],
+            thread::AgentApprovalKind::WriteFile.wire(),
+            "the state file uses `wire()`, not a vocabulary of its own"
+        );
+    }
+
+    /// And the released half: answering the request takes `waiting_for` away
+    /// entirely rather than leaving a stale reason behind for a poller.
+    #[tokio::test]
+    async fn answering_a_parked_agent_removes_waiting_for_from_the_state_file() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("needs an answer".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+        assert_eq!(
+            thread_in(&state_payload(&registry, true), id)["thread"]["waiting_for"],
+            "write_file",
+            "the blocked half must hold before the released half means anything"
+        );
+
+        assert_eq!(
+            registry.answer(id, Decision::AllowOnce),
+            AgentAnswerOutcome::Answered
+        );
+        let _ = answer.await;
+
+        let payload = state_payload(&registry, true);
+        assert_eq!(payload["counts"]["blocked"], 0, "{payload}");
+        assert_eq!(payload["state"], "working", "{payload}");
+        let thread = thread_in(&payload, id);
+        assert_eq!(thread["thread"]["phase"], "running", "{thread}");
+        assert!(
+            thread["thread"].get("waiting_for").is_none(),
+            "a released agent carries no waiting_for key at all: {thread}"
+        );
+    }
+
+    /// Surface 1's leak test. The path `/work/notes.txt` and the argv
+    /// `rm -rf /work/tmp` are sent through the real `PromptRequestSender`, so
+    /// they are inside the process and one function call from the writer.
+    ///
+    /// Not vacuous, for three separate reasons, each asserted rather than
+    /// argued:
+    ///   * the writer *can* emit such a string -- a payload whose `cwd` is
+    ///     `/work/notes.txt` serializes with it present, so the sweep below is
+    ///     searching a surface that would show a leak;
+    ///   * the park really happened -- `waiting_for` is pinned to the kind
+    ///     first, so an empty or absent record cannot pass the sweep by
+    ///     carrying nothing at all;
+    ///   * the exact-equality assertion is the primary guard (F41): the field
+    ///     *is* the kind's word, so no argument can be inside it whatever the
+    ///     payload was. The sweep only catches a leak into some *other* field,
+    ///     and uses tokens distinctive enough that only a real leak matches.
+    #[tokio::test]
+    async fn the_state_file_never_carries_a_parked_path_or_argv_word() {
+        let probe = crate::agent_state_file::build(
+            &AgentRegistry::new(),
+            4242,
+            "/work/notes.txt".to_string(),
+            None,
+            false,
+            "2026-10-14T12:00:00Z".to_string(),
+        );
+        assert!(
+            serde_json::to_string(&probe)
+                .unwrap()
+                .contains("/work/notes.txt"),
+            "the writer would emit an argument if it were given one; \
+             an absence assertion against it therefore has teeth"
+        );
+
+        for (park, kind, arguments) in [
+            (
+                park_path_request as fn(&kitsu_tools::PromptRequestSender, u64) -> _,
+                "write_file",
+                &["/work/notes.txt", "notes.txt"][..],
+            ),
+            (
+                park_command_request as fn(&kitsu_tools::PromptRequestSender, u64) -> _,
+                "run_command",
+                &["/work/tmp", "/usr/bin/rm", "rm -rf", "-rf"][..],
+            ),
+        ] {
+            let registry = AgentRegistry::new();
+            let id = registry.start("needs an answer".to_string()).unwrap();
+            let sender = registry.prompt_sender();
+            let _answer = park(&sender, id);
+            await_blocked(&registry, id).await;
+
+            let payload = state_payload(&registry, true);
+            assert_eq!(
+                thread_in(&payload, id)["thread"]["waiting_for"],
+                kind,
+                "the field is the kind and nothing else: {payload}"
+            );
+            let encoded = serde_json::to_string(&payload).unwrap();
+            for argument in arguments {
+                assert!(
+                    !encoded.contains(argument),
+                    "the state file leaked a parked argument ({argument}): {encoded}"
+                );
+            }
+        }
+    }
+
+    /// Surface 2, the positive half: the hook's payload assembly reports a
+    /// parked agent as `blocked`, and tells the child what it waits on using
+    /// the same machine word the state file publishes.
+    #[tokio::test]
+    async fn the_agent_state_hook_fires_blocked_with_the_kind_it_waits_on() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("needs an answer".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let _answer = park_command_request(&sender, id);
+
+        let before = crate::agent_hook::observations(&registry);
+        await_blocked(&registry, id).await;
+        let current = crate::agent_hook::observations(&registry);
+
+        let events = crate::agent_hook::transitions(&before, &current);
+        assert_eq!(events.len(), 1, "the park is one transition: {events:?}");
+        assert_eq!(events[0].id, id);
+        assert_eq!(events[0].state, "blocked", "{events:?}");
+        assert_eq!(
+            events[0].waiting_for, "run_command",
+            "the event names the permission kind: {events:?}"
+        );
+
+        let env = crate::agent_hook::hook_env(&events[0]);
+        assert_eq!(env[1].0, "KITSU_AGENT_STATE");
+        assert_eq!(env[1].1, "blocked", "{env:?}");
+        assert_eq!(env[2].0, "KITSU_AGENT_WAITING_FOR");
+        assert_eq!(
+            env[2].1,
+            thread::AgentApprovalKind::RunCommand.wire(),
+            "the child's environment carries `wire()`: {env:?}"
+        );
+
+        // Released: the hook fires a second time, with the state moved into.
+        assert_eq!(
+            registry.answer(id, Decision::Deny),
+            AgentAnswerOutcome::Answered
+        );
+        let released = crate::agent_hook::observations(&registry);
+        let events = crate::agent_hook::transitions(&current, &released);
+        assert_eq!(events.len(), 1, "the release is one transition: {events:?}");
+        assert_eq!(events[0].state, "running", "{events:?}");
+        assert_ne!(
+            events[0].waiting_for, "run_command",
+            "a released agent is no longer waiting on its permission: {events:?}"
+        );
+    }
+
+    /// Surface 2's leak test: a hook runs an *external program*, so the parked
+    /// path and argv must not reach its environment.
+    ///
+    /// Not vacuous: `hook_env` is first shown to pass a path through intact --
+    /// `safe_inline_label` strips control characters and credential forms, and
+    /// leaves filesystem paths and argv words completely untouched (pinned in
+    /// `thread.rs`) -- so the absences below are about what is assembled, not
+    /// about a filter that would have hidden a leak anyway.
+    #[tokio::test]
+    async fn the_hook_environment_never_carries_a_parked_path_or_argv_word() {
+        let probe = crate::agent_hook::hook_env(&crate::agent_hook::HookEvent {
+            id: 1,
+            state: "blocked".to_string(),
+            waiting_for: "/work/notes.txt rm -rf /work/tmp".to_string(),
+        });
+        assert!(
+            probe[2].1.contains("/work/notes.txt") && probe[2].1.contains("/work/tmp"),
+            "hook_env passes a path and an argv word through intact ({probe:?}); \
+             an absence assertion against it therefore has teeth"
+        );
+
+        for (park, kind, arguments) in [
+            (
+                park_path_request as fn(&kitsu_tools::PromptRequestSender, u64) -> _,
+                "write_file",
+                &["/work/notes.txt", "notes.txt"][..],
+            ),
+            (
+                park_command_request as fn(&kitsu_tools::PromptRequestSender, u64) -> _,
+                "run_command",
+                &["/work/tmp", "/usr/bin/rm", "rm -rf", "-rf"][..],
+            ),
+        ] {
+            let registry = AgentRegistry::new();
+            let id = registry.start("needs an answer".to_string()).unwrap();
+            let sender = registry.prompt_sender();
+            let _answer = park(&sender, id);
+            await_blocked(&registry, id).await;
+
+            let current = crate::agent_hook::observations(&registry);
+            let events = crate::agent_hook::transitions(&[], &current);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(
+                events[0].waiting_for, kind,
+                "the event's reason is the kind and nothing else: {events:?}"
+            );
+            let env = crate::agent_hook::hook_env(&events[0]);
+            let exported = env
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for argument in arguments {
+                assert!(
+                    !exported.contains(argument),
+                    "the hook environment leaked a parked argument ({argument}): {exported}"
+                );
+            }
+        }
     }
 }
