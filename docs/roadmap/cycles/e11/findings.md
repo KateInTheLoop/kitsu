@@ -1342,6 +1342,128 @@ from T0-S14 — and did **not** reproduce in those 12 runs. Status: seen once,
 unreproduced. Recorded here rather than given its own number precisely because
 one sighting is not yet a finding.
 
+### RECLASSIFIED in T0-S18: this was never a flaky test. It is a production bug.
+
+**The test was a true positive all along**, and both I and an earlier agent
+spent three cards treating it as noise. My own narrowing — "cross-module
+interference, some other test mutates shared state" — was right in *shape* and
+wrong in *kind*: the interfering writer is not a test and not shared test
+state. It is **any subprocess spawn anywhere in the binary**, and the defect is
+in production code.
+
+**The mechanism.** `PhysicalFileStoreV1::acquire_writer_fence`
+(`crates/kitsu/src/session/physical.rs` ~1305-1375) takes
+`flock(LOCK_EX | LOCK_NB)` on `.locks/<session>.lock` and treats the **first**
+`EWOULDBLOCK`/`EAGAIN` as proof the session is held elsewhere. But `flock` locks
+live on the **open file description**, not the descriptor. The lock fd is
+`O_CLOEXEC` — and `O_CLOEXEC` closes at `exec`, **not** at `fork`. So while any
+other thread sits between `fork` and `execve`, the child holds a duplicate of
+our lock fd and therefore holds the lock. A fence taken in that window fails
+spuriously: no other process is contending, and the previous holder has already
+closed its own fd.
+
+Proven independently of kitsu with a standalone probe — one thread repeatedly
+flocking a file nobody else touched while another spawned a trivial command:
+**4973 spurious `EWOULDBLOCK` in 90533 attempts, 5.5%**.
+
+**Why it matters outside the suite.** kitsu spawns tool subprocesses, agent
+hooks and `git` on other threads as a matter of course. So a real session commit
+can report `physical session '<id>' is already active in this or another
+process` when nothing of the kind is true. That is a user-facing failure on a
+core path, not a test artifact.
+
+**Scale, measured rather than estimated.** Four runs of
+`cargo test -p kitsu --bins -- --test-threads=256` gave **17, 16, 28 and 7**
+failures, unioning to **46 distinct tests — every one in `session::*`, and none
+anywhere else**. (The "~70" figure elsewhere is a union over many more runs; per
+run it is a varying subset, which is why no single run looks alarming.) The test
+that kept failing merely takes the fence eleven times, so it trips first.
+**`#[serial]` — the fix both earlier guesses pointed at — would have fixed none
+of them** and left the production bug untouched.
+
+**There are TWO sites, not one.** `SessionLease::acquire`
+(`crates/kitsu/src/session.rs` ~1406, the `flock` at ~1478) makes the identical
+inference and emits `session '<id>' is already active in this or another
+process`. It is the path most of the 46 actually go through. This was proven,
+not assumed: with a retry added to `acquire_writer_fence` **alone**, the suite
+still failed in `session::tests`. A one-site fix would have made the new
+physical-fence regression test pass while leaving most of the exposure in place
+— i.e. it would have looked like success.
+
+**Why the apparently-better fix is not available.** Switching to `fcntl`
+`F_SETLK` record locks would dodge fd inheritance entirely, because record locks
+are **not** inherited across `fork`. But they are **per-process**, and
+same-process detection here is load-bearing and tested:
+`head_cas_requires_the_exact_fence_and_revision_then_advances_old_to_new`
+(`physical.rs` ~3441) takes a fence and then takes it **again on the same thread
+of the same process**, asserting the second fails. Record locks would let that
+succeed. `F_OFD_SETLK` has the identical inheritance problem and is not an
+escape. So the fix is a bounded retry, and it is a **mitigation**: under a
+sustained fork storm the window may never be empty. The complete fix — not
+leaking the lock fd across `fork` — would require every spawn site in the
+process, including ones inside dependencies, to cooperate.
+
+**Cost to be careful of:** roughly 40 call sites assert the *contended* case, so
+each pays the whole retry budget before getting its error. A crude 100 × 1 ms
+stand-in took `-p kitsu --bins` from 0.16 s to 0.78 s. The fork-to-exec window
+is microseconds, so a budget of a few milliseconds total is ample, and the
+exhaustion message must stay byte-identical because ~40 assertions match
+`"already active"`.
+
+**Deterministic reproduction**, verified by me at 20 failures in 20 runs:
+
+```
+cargo test --release -p kitsu --bins -- --test-threads=16 \
+  session::transaction::tests::branch_transaction_retries_only_exact_verified_residue workspace
+```
+
+**Recommended fix:** retry the non-blocking `flock` a bounded number of times
+with a short sleep — a fork-to-exec window is well under a millisecond — and
+only report "already active" if it still fails. That keeps the non-blocking
+contract and the honest contention error while removing the false positive.
+Converting to a blocking `LOCK_EX` would also work but would turn genuine
+contention into a hang.
+
+**RESOLVED in T0-S18**, at both sites, with a bounded retry behind one shared
+`flock_exclusive_with_fork_retry` helper whose doc comment records the mechanism,
+the measured spurious rate, that it is a **mitigation not a guarantee**, and an
+explicit instruction not to simplify it to a single attempt or switch to
+`F_SETLK`/`F_OFD_SETLK`.
+
+The budget was chosen **empirically, after a first attempt failed**: a flat
+64 × 50 µs (3.2 ms) still left session failures at 256 threads (runs of 4, 9 and
+2). The shipped budget is 32 × 50 µs then 47 × 500 µs — about 25 ms worst case —
+chosen so the cheap phase clears an ordinary single fork window and the longer
+phase exists only for overlapping windows from several spawning threads.
+
+Verified independently by me rather than taken from the report: **6 runs at
+`--test-threads=256`, zero failures each**, against my own before-figures of
+17/16/28/7. `-p kitsu --bins` is 726/0 in both profiles. Suite wall time moved
+0.19 s → 0.30 s, which is the ~40 contended-case assertions each paying the
+budget — the cost of the fix landing on the tests that *want* the error.
+
+**The lesson, and it is the sharpest in this file.** An intermittent failure is
+evidence of *something*, and the cheap reading — "flaky test, needs isolation" —
+was wrong three times in a row here. F23 was a real race in test
+synchronisation; this is a real race in production. Neither was noise. The
+pattern to distrust is not the flaky test but the explanation that lets you stop
+looking at it.
+
+## F31 — `agent_hook`'s null-stdio test reads the child's output too early
+
+Found incidentally during T0-S18's diagnosis, in 4 failures out of 500 runs, and
+**unrelated** to F28's production race.
+
+`agent_hook::tests::fire_gives_the_child_null_stdin_stdout_and_stderr`
+(`crates/kitsu/src/agent_hook.rs:650`) reads one line where it expects three: it
+inspects the child's output before the child has finished writing it.
+Reproducible with `--test-threads=256 agent_hook`.
+
+Unlike F28 this **is** a test defect rather than a production one — the
+production path gives the child null stdio correctly; only the test's
+observation of it is racy. The fix is to wait for the child to exit before
+reading, rather than to sleep or retry.
+
 ## F29 — the inline palette duplicates the classic one's frame and labels
 
 Found while reviewing T0-S15a. **Accepted deliberately, on evidence, with the
@@ -1481,3 +1603,38 @@ Both inherited the mid-turn ranking, which means the bug was never cosmetic —
 **Tab at an idle `/s` typed `/steer`**. Fixing only the display would have left
 the row showing one completion while the key inserted another. I verified both
 sites independently of the test author, and we agreed.
+
+
+## F32 — a third `flock` site has the same fork-inheritance defect
+
+Found in T0-S18 by the implementer, **outside its scoped files**, reported
+rather than quietly fixed.
+
+`crates/kitsu/src/config/publication.rs:516` takes the identical
+`flock(LOCK_EX | LOCK_NB)` and maps the first `WouldBlock` straight to
+`PinTargetError::Busy`. Same mechanism as F28, so the same false positive: a
+config publication can report the target busy because another thread was
+mid-`fork`.
+
+It is not hypothetical. It is the residual flake left after F28's fix:
+`config::publication::tests::parallel_publication_receipts_remain_exact_until_rollback`
+failed **2 of 20** runs at `--test-threads=256`, and **0 of 40** runs of that
+test alone — the signature of fork interference rather than an intra-test race.
+It did not appear in my own 6-run verification, so it is rarer than one in six.
+
+**The fix is known and already written**: the same
+`flock_exclusive_with_fork_retry` helper, which needs to become reachable from
+`config::publication` (`pub(crate)`, or moved somewhere both modules see).
+
+**Deliberately deferred one card** rather than fixed on the spot, to keep the
+loop's discipline: a regression test comes from a different agent than the fix,
+and the deterministic-reproduction pattern for this bug class is now established
+(spawner threads plus a tight acquisition loop), so writing one is cheap. The
+cost of waiting is one known-rare flake, already recorded; the cost of skipping
+the test would be a third fix with no evidence it worked.
+
+**A note on why three sites existed.** All three hand-rolled the same
+`flock(LOCK_EX | LOCK_NB)` → "busy" inference independently. The fix introduces
+the first shared helper for it; the lasting improvement is that there is now one
+place to be correct, and the next such lock should use it rather than add a
+fourth copy.

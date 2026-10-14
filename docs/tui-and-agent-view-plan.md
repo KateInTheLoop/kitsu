@@ -124,7 +124,9 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T0-S14 variable viewport height, so the composer can grow | done | this commit |
 | T0-S15a palette rows as data, built to the granted height | done | this commit |
 | T0-S16 palette wiring, repaint-all, `on_resize` height, F29 refactor | done | c1aa851 |
-| T0-S17 idle completion ranking, F30 closed | done | this commit |
+| T0-S17 idle completion ranking, F30 closed | done | 7efe8ae |
+| T0-S18 fork/flock fence race, F28 closed as a production bug | done | this commit |
+| T0-S19 the third flock site (F32) | next | — |
 
 With T1-S6 done, **milestone T1 is complete**: kitsu now exposes its
 background agents to the outside three ways — a grouped and explainable deck

@@ -1347,9 +1347,12 @@ impl PhysicalFileStoreV1 {
                     lock_path.display()
                 ));
             }
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if result != 0 {
-                let error = std::io::Error::last_os_error();
+            // See `super::flock_exclusive_with_fork_retry`: the bounded retry is
+            // there because our `O_CLOEXEC` lock descriptor is inherited by any
+            // child another thread forks until that child reaches `execve`, so a
+            // single attempt reports a spurious "already active". It mitigates
+            // the race rather than eliminating it.
+            if let Err(error) = super::flock_exclusive_with_fork_retry(file.as_raw_fd()) {
                 if error.raw_os_error() == Some(libc::EWOULDBLOCK)
                     || error.raw_os_error() == Some(libc::EAGAIN)
                 {
@@ -3534,6 +3537,72 @@ mod tests {
             store.read_head(&session).unwrap().unwrap().revision_id(),
             &revision_b
         );
+    }
+
+    /// `flock` locks belong to the open file description, not the descriptor, so a
+    /// `fork` on any other thread duplicates the writer-lock fd into the child and
+    /// the lock stays held until that child `exec`s and the `O_CLOEXEC` fd closes.
+    /// A `LOCK_NB` attempt inside that window fails with `EWOULDBLOCK` even though
+    /// nothing else holds the session, which the fence must not report as a
+    /// conflict. Nothing else here ever holds this session's lock, so every attempt
+    /// below must succeed.
+    #[cfg(unix)]
+    #[test]
+    fn writer_fence_is_not_spuriously_busy_while_another_thread_forks() {
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const SPAWNERS: usize = 4;
+        const ATTEMPTS: usize = 300;
+
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let session = session();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..SPAWNERS)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let Ok(mut child) = Command::new("/bin/true")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                        else {
+                            return;
+                        };
+                        let _ = child.wait();
+                    }
+                })
+            })
+            .collect();
+
+        let mut failure = None;
+        for attempt in 0..ATTEMPTS {
+            match store.acquire_writer_fence(&session) {
+                Ok(fence) => drop(fence),
+                Err(error) => {
+                    failure = Some((attempt, error));
+                    break;
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+
+        if let Some((attempt, error)) = failure {
+            panic!(
+                "uncontended writer fence failed on attempt {attempt} of {ATTEMPTS} \
+                 while another thread was forking: {error}"
+            );
+        }
     }
 
     #[cfg(unix)]
