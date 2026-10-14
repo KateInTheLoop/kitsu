@@ -118,7 +118,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T0-S8 verify F20 claims, close F22, fix F23 flake | done | be95229 |
 | T0-S9 the inline hint slot (search status, slash hint) | done | 85a8cab |
 | T0-S10 Tab accepts the inline slash hint | done | 4a3840c |
-| T0-S11 viewport resize, F16 resize half (F24, F25 raised) | done | this commit |
+| T0-S11 viewport resize, F16 resize half (F24, F25 raised) | done | 9a5e789 |
+| T0-S12 end-to-end resize tests, F25 closed, F24 in CI | done | this commit |
 
 With T1-S6 done, **milestone T1 is complete**: kitsu now exposes its
 background agents to the outside three ways — a grouped and explainable deck

@@ -980,9 +980,36 @@ So the correct installation is load-bearing and is recorded in a comment at the
 call site, specifically so a later "simplification" to `libc::signal` is
 recognisable as a regression rather than tidying.
 
-**This is now a human check**, added to the terminal matrix: resize a real
-window mid-draft and confirm the pinned row follows. It is the second item on
-that list that cannot be settled from inside this repository, after Q1.
+**Correction, made while scoping T0-S12: "only a human can catch this" was
+wrong.** A *reliable* pseudo-terminal test does catch it, and my reasoning for
+saying otherwise does not hold up. The harness signals a **separate process**
+that is genuinely blocked in a real `read` on a real tty — so with `SA_RESTART`
+set the child would not wake, the viewport would not move, and the test would
+fail. The property is only untestable *in-process*, where a raise from the same
+thread never blocks in `read`; that is a limitation of unit tests, not of
+testing.
+
+The decisive design constraint, which is what makes such a test worth anything:
+**no input may follow the resize before the assertion.** A keystroke after the
+resize wakes the blocking read by itself, the flag is then checked, and the
+viewport resizes *even with `SA_RESTART` set* — so a test that types afterwards
+passes under both installations and establishes nothing.
+
+**T0-S12 shipped that test, and proved it discriminates rather than asserting
+it:** with `sa_flags` temporarily set to `SA_RESTART` all three resize tests
+failed on the deadline; restored, all three pass. The stronger form was
+achieved too — the gate on sending the next byte *is* the new geometry
+appearing in the stream, so if the flag were only checked on the next keystroke
+there would be no next keystroke and the test times out with the transcript
+attached.
+
+So this class of regression is now caught in CI. The human check below stays on
+the matrix regardless, since a real terminal also exercises the window manager,
+the multiplexer and fonts, none of which a pty models.
+
+**The human check**, on the terminal matrix: resize a real window mid-draft and
+confirm the pinned row follows. It was the second item there that could not be
+settled from inside this repository, after Q1 — now partly reclaimed.
 
 Related, and the reason this class of bug is worth a finding of its own:
 `note_resize` may do nothing but store into an atomic, because a signal handler
@@ -1014,5 +1041,45 @@ And the one property only a real terminal adds — that `SIGWINCH` surfaces as
 `EINTR` rather than restarting the read — is a property of **how the handler is
 installed** (F24), which an intermittent test would not establish either.
 
-**Next card:** add it now that a passing baseline exists, where five-run
-evidence means something. Until then F24's human check is the coverage.
+**RESOLVED in T0-S12**, and it was worth the harness cost. Three tests, 12 in
+the suite, five consecutive green runs in each profile, verified independently.
+The harness gained a `Step` action that sends no bytes, a `set_window_size`
+helper, and — the part that was genuinely necessary — a `Session` that replays
+the byte stream in segments and calls `vt100::Parser::set_size` at exactly the
+offset where the child was resized. Without that split every post-resize
+absolute address is modelled against the old grid and silently discarded.
+
+The decisive outcome: **F24 is now caught in CI rather than by a human.** See
+F24's correction.
+
+
+## F26 — a `SIGWINCH` arriving mid-paint is latched but not acted on until the next wake
+
+Found: T0-S12, disclosed by the test author rather than hidden behind the
+harness accommodation it required. **Real, narrow, and currently untested.**
+
+The resize path's delivery mechanism is a signal interrupting the reader's
+blocking `read`. If the signal instead lands while the reader is **mid-paint** —
+between waking and blocking again — the flag latches, the reader then blocks,
+and nothing wakes it. The pending resize sits unapplied until the next event:
+another signal, or a keystroke.
+
+It self-corrects on any later event, and a real window drag emits many signals,
+so the realistic exposure is small. But it is genuine, and it is the one thing
+a human dragging a window *slowly* might still see — a viewport that catches up
+one event late.
+
+**Why this is recorded rather than fixed:** the honest fix is not a bigger
+handler (it may do nothing but an atomic store) but checking the flag at more
+points, or a self-pipe so the wake is a readable descriptor rather than an
+`EINTR`. That is a design change to the read loop, not a patch, and the current
+behaviour is a late update rather than a wrong one.
+
+**Why it must not be "cleaned up" out of the test harness:** the pseudo-terminal
+resize steps re-deliver the signal every 100 ms while the next step's trigger is
+outstanding, precisely because of this race — the trigger that fires a resize is
+the child's own paint output, so the child may still be inside that paint when
+the signal lands. Removing the re-arm reintroduces a narrow but real flake.
+Re-delivery is safe because a resize to unchanged dimensions is `Unchanged` and
+emits zero bytes, and it does **not** weaken the `SA_RESTART` discrimination,
+because a resize step writes no input byte.
