@@ -169,11 +169,36 @@ impl BridgeGuard {
     /// screen, so the guard exposes that rather than handing out the
     /// `Arc<InlineSurface>` and letting a caller `show`/`hide` it behind the
     /// guard's back.
-    pub(crate) fn paint_draft(&self, prompt: &str, draft: &str) {
-        let row = if draft.is_empty() {
+    /// The draft is composed through [`kitsu_render::live::compose_input_row`]
+    /// rather than concatenated here: `hint` is the row's hint slot and
+    /// `hint_reserved` says whether it claims its columns *before* the draft
+    /// is windowed (the reverse-search status) or only renders when the draft
+    /// already fits (the slash-completion suffix). That math lives in
+    /// `kitsu-render` for the classic row, so the guard is where the two
+    /// renderers converge on one value type instead of drifting apart.
+    pub(crate) fn paint_draft(
+        &self,
+        prompt: &str,
+        draft: &str,
+        cursor: usize,
+        hint: &str,
+        hint_reserved: bool,
+    ) {
+        let row = if draft.is_empty() && hint.is_empty() {
             self.status.clone()
         } else {
-            format!("{prompt}{draft}")
+            let composed = live::LiveDraft {
+                prompt: prompt.to_string(),
+                buffer: draft.to_string(),
+                cursor,
+                hint: hint.to_string(),
+                hint_reserved,
+            };
+            // The cursor column comes back too, but the viewport is one row
+            // and `InlineSurface::paint` parks the cursor back inside the
+            // scroll region, so there is nowhere to put a caret until the
+            // multi-row composer lands.
+            live::compose_input_row(&composed, live::terminal_columns()).0
         };
         self.viewport.paint(&[row]);
     }
@@ -254,19 +279,44 @@ pub(crate) enum InlineRead {
 /// That keeps the whole keymap-to-draft path unit-testable and leaves the PTY
 /// test with only the wiring to prove.
 ///
-/// `paint` receives the current draft and the cursor's column **within** the
-/// draft as a char offset. `history` seeds the up/down walk.
+/// `paint` receives `(draft, cursor, hint, hint_reserved)` -- the current
+/// draft, the cursor's column **within** the draft as a char offset, and the
+/// row's hint slot -- in the same order and with the same meanings as
+/// `kitsu_render::live::live_input_update`, so the inline row and the classic
+/// live row cannot drift in *what* they are told about a draft.
+/// `history` seeds the up/down walk.
 pub(crate) fn read_line_inline<R: std::io::Read>(
     input: &mut R,
-    paint: &mut dyn FnMut(&str, usize),
+    paint: &mut dyn FnMut(&str, usize, &str, bool),
     history: &[String],
 ) -> std::io::Result<InlineRead> {
     use kitsu_editor::{EditorAction, FeedOutcome, TypeaheadEditor};
 
+    /// The hint slot, derived exactly as `main.rs`'s `update_live_row`
+    /// derives it for the classic row: the reverse-search status while Ctrl+R
+    /// is active (reserved, so it keeps its columns against a long matched
+    /// draft), the inline slash-completion suffix otherwise (unreserved).
+    ///
+    /// `search_status` already carries its own two-space separator, so the
+    /// renderer must not add another one.
+    fn hint_of(editor: &TypeaheadEditor) -> (String, bool) {
+        let search_status = editor.search_status();
+        let hint_reserved = search_status.is_some();
+        let hint =
+            search_status.unwrap_or_else(|| crate::typeahead_slash_hint(&editor.buffer_string()));
+        (hint, hint_reserved)
+    }
+
     let mut editor = TypeaheadEditor::new(history.to_vec());
     // The first frame, before any byte arrives: the row must show the (possibly
     // empty) draft rather than whatever the previous paint left there.
-    paint(&editor.buffer_string(), editor.cursor());
+    let (mut last_hint, mut last_reserved) = hint_of(&editor);
+    paint(
+        &editor.buffer_string(),
+        editor.cursor(),
+        &last_hint,
+        last_reserved,
+    );
 
     let mut buffer = [0u8; 1024];
     loop {
@@ -313,8 +363,27 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
                 EditorAction::CompleteRequest | EditorAction::Quit => {}
             }
         }
-        if changed {
-            paint(&editor.buffer_string(), editor.cursor());
+        // Repaint when the draft changed OR when the hint slot changed.
+        //
+        // The second half is not redundant. Entering and leaving reverse
+        // search happens to set `outcome.changed` today, so the reserved
+        // status would repaint without this -- but that is the editor's
+        // goodwill, not a contract: an editor change that stops flagging a
+        // search transition as a draft change would silently strand a stale
+        // (or missing) status on the row, with nothing to catch it. Comparing
+        // the painted `(hint, hint_reserved)` pair against the last one makes
+        // the row's hint a function of editor state rather than of which
+        // transitions the editor chooses to report.
+        let (hint, hint_reserved) = hint_of(&editor);
+        if changed || hint != last_hint || hint_reserved != last_reserved {
+            paint(
+                &editor.buffer_string(),
+                editor.cursor(),
+                &hint,
+                hint_reserved,
+            );
+            last_hint = hint;
+            last_reserved = hint_reserved;
         }
     }
 }
@@ -734,14 +803,47 @@ mod tests {
         drive(Chunks::bytewise(bytes), history)
     }
 
-    /// Run the reader over an explicit chunking.
-    fn drive(mut input: Chunks, history: &[String]) -> (InlineRead, Vec<(String, usize)>) {
-        let mut paints: Vec<(String, usize)> = Vec::new();
+    /// One paint frame: the **whole** widened seam the reader hands its
+    /// painter -- `(draft, cursor, hint, hint_reserved)`, in the same order
+    /// and with the same meanings as `kitsu_render::live::live_input_update`,
+    /// so the inline row and the classic live row cannot drift in *what*
+    /// they are told about a draft.
+    type Frame = (String, usize, String, bool);
+
+    /// Run the reader over an explicit chunking, keeping every frame.
+    fn drive_frames(mut input: Chunks, history: &[String]) -> (InlineRead, Vec<Frame>) {
+        let mut frames: Vec<Frame> = Vec::new();
         let outcome = {
-            let mut paint = |draft: &str, cursor: usize| paints.push((draft.to_string(), cursor));
+            let mut paint = |draft: &str, cursor: usize, hint: &str, hint_reserved: bool| {
+                frames.push((draft.to_string(), cursor, hint.to_string(), hint_reserved))
+            };
             read_line_inline(&mut input, &mut paint, history).expect("inline read")
         };
-        (outcome, paints)
+        (outcome, frames)
+    }
+
+    /// Run the reader over an explicit chunking, projecting each frame down to
+    /// `(draft, cursor)` for the tests that predate the hint slot.
+    fn drive(input: Chunks, history: &[String]) -> (InlineRead, Vec<(String, usize)>) {
+        let (outcome, frames) = drive_frames(input, history);
+        (
+            outcome,
+            frames
+                .into_iter()
+                .map(|(draft, cursor, _, _)| (draft, cursor))
+                .collect(),
+        )
+    }
+
+    /// The reader's frames for `bytes` with no history. Input ends without a
+    /// terminator, so the read ends in `Eof` -- the frames are the subject.
+    fn frames(bytes: &[u8]) -> Vec<Frame> {
+        drive_frames(Chunks::bytewise(bytes), &[]).1
+    }
+
+    /// The last frame, which is the row as it stands when input runs out.
+    fn last_frame(bytes: &[u8]) -> Frame {
+        frames(bytes).pop().expect("at least one paint")
     }
 
     fn submitted(outcome: &InlineRead) -> &str {
@@ -883,6 +985,144 @@ mod tests {
         // Also after a draft was cleared by a first Ctrl+C: the second one
         // interrupts, which is the two-press behaviour users expect.
         assert_eq!(read_bytes(b"abc\x03\x03").0, InlineRead::Interrupted);
+    }
+
+    // ---------------------------------------------------------------------
+    // The hint slot (the third element of the seam).
+    //
+    // `update_live_row` in `main.rs` computes the classic row's hint as:
+    // the reverse-search status when Ctrl+R is active (RESERVED, so it keeps
+    // its columns even when the draft is windowed), and otherwise the inline
+    // slash-completion suffix from `typeahead_slash_hint` (unreserved, so a
+    // tight row drops it). The inline reader must derive exactly the same
+    // two things from the same editor, or the two renderers disagree about
+    // what the user is being shown.
+    //
+    // Out of scope on purpose: Tab completion (`CompleteRequest` is still
+    // dropped) and the bordered multi-row slash palette.
+    // ---------------------------------------------------------------------
+
+    /// Test 16. A bare slash prefix yields the completion remainder, and it
+    /// is **unreserved**: `/s` suggests `steer` (mid-turn-actionable commands
+    /// outrank registry order), so the hint is the suffix `teer` alone -- the
+    /// typed text is never repeated into the hint.
+    #[test]
+    fn inline_read_paints_the_slash_completion_suffix_as_an_unreserved_hint() {
+        let (draft, cursor, hint, reserved) = last_frame(b"/s");
+        assert_eq!(draft, "/s");
+        assert_eq!(cursor, 2);
+        assert_eq!(hint, "teer", "the hint is the remainder, not the command");
+        assert!(
+            !reserved,
+            "a completion hint must not claim columns from the draft"
+        );
+    }
+
+    /// Test 17. The three no-hint cases, which are `typeahead_slash_hint`'s
+    /// own rules and must not be re-invented here: text that is not a slash
+    /// prefix, a prefix followed by whitespace (the command is settled and
+    /// its arguments are being typed), and a bare `/`.
+    #[test]
+    fn inline_read_paints_no_hint_when_the_draft_is_not_a_slash_prefix() {
+        for bytes in [&b"hello"[..], &b"/s "[..], &b"/"[..]] {
+            let (draft, _, hint, reserved) = last_frame(bytes);
+            assert_eq!(hint, "", "no hint belongs on draft {draft:?}",);
+            assert!(!reserved, "an empty hint is never reserved: {draft:?}");
+        }
+    }
+
+    /// Test 18. **The headline.** Ctrl+R reverse search works at the inline
+    /// idle prompt today but its status indicator has nowhere to go, so the
+    /// user is left in a mode they cannot see. The status belongs in the hint
+    /// slot, **reserved**, exactly as `update_live_row` puts it there.
+    #[test]
+    fn inline_read_paints_the_reverse_search_status_as_a_reserved_hint() {
+        let history = vec!["deploy the thing".to_string()];
+
+        // Ctrl+R alone: the search is open with an empty query.
+        let (_, _, hint, reserved) = drive_frames(Chunks::bytewise(b"\x12"), &history)
+            .1
+            .pop()
+            .expect("at least one paint");
+        assert!(
+            hint.contains("⌕ reverse-search ''"),
+            "entering search must show its status: {hint:?}"
+        );
+        assert!(
+            reserved,
+            "the search status must be reserved -- it may not be dropped when \
+             the matched draft competes for columns"
+        );
+
+        // Ctrl+R then a query: the status carries the query, and the draft is
+        // the match the editor walked to.
+        let (draft, _, hint, reserved) = drive_frames(Chunks::bytewise(b"\x12dep"), &history)
+            .1
+            .pop()
+            .expect("at least one paint");
+        assert_eq!(draft, "deploy the thing");
+        assert!(
+            hint.contains("⌕ reverse-search 'dep'"),
+            "the status must track the query: {hint:?}"
+        );
+        assert!(reserved);
+
+        // Ctrl+G leaves the search, and the status goes with it.
+        let (_, _, hint, reserved) = drive_frames(Chunks::bytewise(b"\x12dep\x07"), &history)
+            .1
+            .pop()
+            .expect("at least one paint");
+        assert_eq!(hint, "", "leaving search clears the status: {hint:?}");
+        assert!(!reserved);
+    }
+
+    /// Test 19. The hint reaches the pinned row dimmed, immediately after the
+    /// draft, through `kitsu-render`'s composition rather than a `format!`
+    /// here -- the cursor column stays before the hint so typing continues
+    /// over it.
+    #[test]
+    #[serial]
+    fn paint_draft_renders_an_unreserved_hint_dimmed_after_the_draft() {
+        let _state = GlobalState::capture();
+        let (guard, _out, err) = install_inline(24, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        guard.paint_draft("kitsu> ", "/s", 2, "teer", false);
+
+        let painted = err.text();
+        assert!(
+            painted.contains("kitsu> /s\u{1b}[2mteer"),
+            "the hint belongs dimmed right after the draft on the pinned row: {painted:?}"
+        );
+    }
+
+    /// Test 20. The reserved case on the real row: a draft long enough to
+    /// claim every column must not push the reverse-search status off the
+    /// row. That is the entire purpose of the reserved flag, and the reason
+    /// this path composes through `kitsu-render` instead of concatenating.
+    #[test]
+    #[serial]
+    fn paint_draft_keeps_a_reserved_hint_against_a_long_draft() {
+        let _state = GlobalState::capture();
+        let (guard, _out, err) = install_inline(24, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let draft = "x".repeat(500);
+        guard.paint_draft(
+            "kitsu> ",
+            &draft,
+            draft.chars().count(),
+            "  ⌕ reverse-search 'match'",
+            true,
+        );
+
+        let painted = kitsu_render::sanitize_terminal_text(&err.text());
+        assert!(
+            painted.contains("⌕ reverse-search 'match'"),
+            "the reserved status must survive a windowed draft: {painted:?}"
+        );
+        assert!(
+            painted.contains('…'),
+            "the draft must window to make room: {painted:?}"
+        );
     }
 
     /// Test 15. A bracketed-paste block stays **one** draft: its newlines
@@ -1084,7 +1324,8 @@ mod tests {
         let mut paints: usize = 0;
         let started = std::time::Instant::now();
         let outcome = {
-            let mut paint = |_draft: &str, _cursor: usize| paints += 1;
+            let mut paint =
+                |_draft: &str, _cursor: usize, _hint: &str, _reserved: bool| paints += 1;
             read_line_inline(&mut input, &mut paint, &[]).expect("inline read")
         };
         let elapsed = started.elapsed();
@@ -1403,7 +1644,7 @@ mod tests {
         let _state = GlobalState::capture();
         let (guard, _out, err) = install_inline(24, 1, "status: idle");
         let guard = guard.expect("inline mode installs a guard");
-        guard.paint_draft("> ", "half-typed");
+        guard.paint_draft("> ", "half-typed", 10, "", false);
 
         let before = err.text().len();
         guard.release_for_suspend();

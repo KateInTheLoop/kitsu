@@ -29,9 +29,9 @@ shapes may change in any minor release.
   this process holds credentials and conversation text in memory.
 
   Command history persists across sessions in inline mode, and Ctrl+R reverse
-  search works — though not the status line that reports the query while you
-  search. Still missing from the inline prompt: the slash-command palette and
-  Tab completion.
+  search works, with its status line and the inline slash-completion hint both
+  shown on the pinned row. Still missing from the inline prompt: Tab completion,
+  and the bordered palette that lists and filters commands as you type.
 
 #### Background agents and herding
 

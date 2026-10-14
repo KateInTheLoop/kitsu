@@ -6007,12 +6007,21 @@ fn read_idle_chat_line(
 /// composer: `load_history` seeds the editor at startup, `read_idle_chat_line`
 /// hands the inline reader that same list, and `add_history_entry` sits on the
 /// common path after the read, so a line submitted here is saved like any
-/// other. Reverse search works too, though not its status indicator.
+/// other. Reverse search works too, **including** its status indicator, which
+/// the hint slot now carries.
 ///
-/// The completion and palette gaps share **one** cause, which is worth knowing
-/// before either is carded: both are rendered into the during-turn row's hint
-/// slot, and this path's paint callback is `(draft, cursor)` with nowhere to
-/// put a hint. One seam change restores both, plus the reverse-search status.
+/// Still missing here, and they are **not** one cause — an earlier version of
+/// this comment claimed they were, wrongly. The hint slot carries one line
+/// beside the draft, so widening it restored the reverse-search status and the
+/// inline slash-completion suffix, and nothing else. What remains:
+///
+/// * **Tab completion.** `EditorAction::CompleteRequest` is still dropped here.
+///   Reaching parity with the during-turn row is small — see
+///   `update_live_row`'s neighbourhood, where the whole of Tab is seven lines
+///   that append the showing hint to the buffer.
+/// * **The `@file` and slash-palette completion lists.** Rustyline helper
+///   surfaces that draw over several rows, so they need a viewport taller than
+///   one row and belong with the multi-row composer.
 #[cfg(unix)]
 fn read_chat_line_inline(
     bridge: &tui_bridge::BridgeGuard,
@@ -6048,17 +6057,15 @@ fn read_chat_line_inline(
         }
         let mut input = std::io::Cursor::new(carried.clone().into_bytes()).chain(std::io::stdin());
         let outcome = {
-            // The cursor column is not used yet: the viewport is one row and
-            // `InlineSurface::paint` parks the cursor back inside the scroll
-            // region, so there is nowhere to put a composer caret until the
-            // multi-row composer lands.
-            let mut paint = |draft: &str, _cursor: usize| bridge.paint_draft(prompt, draft);
+            let mut paint = |draft: &str, cursor: usize, hint: &str, hint_reserved: bool| {
+                bridge.paint_draft(prompt, draft, cursor, hint, hint_reserved)
+            };
             tui_bridge::read_line_inline(&mut input, &mut paint, history)
         };
         // Whatever happened, the row must not keep showing a draft that is
         // gone. On the suspend path the release below clears the row anyway,
         // but doing it here keeps the invariant on every outcome.
-        bridge.paint_draft(prompt, "");
+        bridge.paint_draft(prompt, "", 0, "", false);
         // Finding F21: Ctrl+Z. The reader is pure, so the whole suspend is
         // sequenced here, through the seam that makes the ordering testable.
         if let Ok(tui_bridge::InlineRead::Suspended(draft)) = outcome {
