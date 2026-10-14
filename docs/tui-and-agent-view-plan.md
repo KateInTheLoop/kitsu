@@ -121,7 +121,7 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T0-S11 viewport resize, F16 resize half (F24, F25 raised) | done | 9a5e789 |
 | T0-S12 end-to-end resize tests, F25 closed, F24 in CI | done | 3d087c8 |
 | T0-S13 escape-aware row fitting for `paint`, F16 closed | done | this commit |
-| T0-S14 variable viewport height, so the composer can grow | after S13 | — |
+| T0-S14 variable viewport height, so the composer can grow | done | this commit |
 | T0-S15 the bordered slash palette, completing R4 | after S14 | — |
 
 With T1-S6 done, **milestone T1 is complete**: kitsu now exposes its

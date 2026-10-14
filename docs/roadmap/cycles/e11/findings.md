@@ -1139,6 +1139,88 @@ a dependency rather than by preference:
 3. **T0-S15, the palette itself** — matching, filtering as you type, the
    border, and `Tab` semantics against a list rather than a single hint.
 
+### T0-S14's two decisions, taken rather than deferred
+
+**A requested height too tall for the window is clamped, not refused.** F19's
+bound still rules — the region needs two scrolling rows above the viewport — so
+the usable maximum is `terminal_rows - 2`. Refusing is the right answer only
+when *not even one row* can be pinned, which is T0-S11's release case and is
+already built. When some rows fit, a palette too tall for the window should be
+shortened rather than making the whole viewport vanish, because the composer
+lives in that viewport.
+
+**When rows must be dropped, the topmost ones go.** The composer is the bottom
+row and the palette sits above it, so dropping from the top keeps the row the
+user is actually typing into. Losing the thing you are typing into to make room
+for a list of suggestions would be the wrong trade, and it is the kind of
+default that is easy to get backwards and hard to notice in a test that only
+counts rows — so it is pinned by asserting the surviving rows are the **last**
+of the requested set, in order.
+
+A consequence worth stating: the row count painted must always equal the latched
+height. Painting more rows than the viewport is tall would put the extras inside
+the scroll region, where they scroll away with the transcript — which looks like
+a disappearing palette rather than an off-by-one.
+
+### Two things T0-S14 deliberately left to T0-S15, with the answers
+
+**1. Who learns the granted height.** `paint_rows` returns only whether a
+viewport is pinned, so a caller cannot find out *before* painting how many rows
+it was granted. The palette will need that: when rows are dropped it should
+mark its top visible row ("N more") rather than silently truncate, and it has
+to know the count while laying out, not after.
+
+The test author offered two shapes and declined to choose. **Decided: add
+`BridgeGuard::granted_rows(requested) -> u16`**, delegating to the same pure
+`clamp_viewport_rows`, and leave `paint_rows`'s return as it is. Reasoning:
+changing `paint_rows` to return the height tells the caller only *after* it has
+painted, so a palette wanting a marker would paint, discover it was clamped,
+and repaint — a visible flicker. A query answered before painting avoids that.
+And routing the query through the guard rather than letting the caller call the
+pure clamp itself keeps one source of truth for the terminal height, which is
+the whole reason `paint_rows` is a single operation.
+
+**1a. My "by construction" shape was wrong, and the implementer was right to
+refuse it.** I specified that `paint_draft` should route through `paint_rows`,
+so that the painted row count could not disagree with the latched height. Two
+**pre-existing** tests forbid it, and I verified both rather than taking the
+report:
+
+- one installs a 3-row viewport, resizes to `(40, 3)`, then calls `paint_draft`
+  and asserts exactly a **one-row** paint into a viewport that stays **3 tall**;
+- another resizes to `(2, 1)` — below the bound — then calls `paint_draft` and
+  asserts **zero** bytes.
+
+Through `paint_rows` a one-row draft clamps to height 1 and re-latches, which
+directly contradicts the first, and the second would emit bytes. So the two are
+genuinely different operations: **`paint_draft` draws into whatever viewport
+exists, while `paint_rows` lets the content choose the height.** The
+by-construction property therefore holds for every multi-row caller and only
+trivially for `paint_draft`.
+
+That is not a permanent answer. With a palette open, a keystroke must repaint
+*all* the rows, not just the composer — so `paint_draft`'s single-row semantics
+becomes wrong exactly when the palette lands, and reconciling them is T0-S15's
+job. It is the same shape of question as the hardcoded `1` below.
+
+**1b. A bug my specified shape would have introduced.** The implementer added an
+early return when the clamp is zero, which I had not asked for and which is
+necessary: `resize(2, 0)` is `plan_resize(None, 2, 0)` = `Install`, and
+`show(2, 0)` would latch a **full-screen** region — the clamp returning "no rows
+fit" would have been turned into "the region is the whole screen". Zero means
+leave the latched geometry alone, so a released viewport stays released and
+emits nothing. It is also the right answer for empty content.
+
+**2. `on_resize`'s hardcoded row count.** `main.rs` still calls
+`bridge.resize(rows, 1)` when the terminal changes size. That is correct while
+nothing requests more than one row, and **becomes a bug the moment the palette
+does**: a terminal resize would silently reset the viewport to one row,
+collapsing an open palette. The fix belongs to whichever card first requests a
+taller viewport — either `resize` should keep the guard's current
+`viewport_rows` when the caller does not specify one, or the caller should
+re-`paint_rows` after a resize. Left unpinned on purpose, because pinning it
+before a second row exists would have meant inventing the caller.
+
 `@file` path completion is a fourth, independent piece: it shares the "lists"
 label but not the geometry problem, since it can reuse whatever T0-S15 builds.
 
@@ -1172,3 +1254,23 @@ the next full pass, so any test that asserts a full repaint looks clean when it
 is not. Tests of painting defects must use a partial repaint, or the last row,
 or both. A green full-repaint test is weak evidence about a renderer of this
 shape.
+
+
+## F28 — an unrelated transaction test flaked once and has not reproduced
+
+Reported by the T0-S14 implementer, recorded so the next person to see it knows
+it is not new and not from the viewport work.
+
+`session::transaction::tests::branch_transaction_retries_only_exact_verified_residue`
+failed once during a parallel `cargo test -p kitsu --bins` run, and passed on
+every rerun and in isolation. It touches no viewport, render or terminal code.
+
+**I could not reproduce it:** 8 further full-suite parallel runs and 5 isolated
+runs, all green. So the honest status is *seen once, unreproduced in 13
+attempts* — not dismissed, not confirmed.
+
+The implementer's guess, untested, is a `#[serial]` or global-state gap in that
+module. Worth bearing in mind that F23 established this suite had a test failing
+roughly 7% of the time while appearing green on every manual run, so "I ran it
+and it passed" is weak evidence here. If it recurs, the cheap first step is a
+repeat-run loop on that module alone rather than the whole suite.
