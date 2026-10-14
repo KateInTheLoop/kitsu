@@ -167,8 +167,9 @@ pub(crate) async fn ask_registry(
 /// Test-side stand-in for the registry (T2-S4): answers every parked request
 /// with `decision` and records the payloads it saw.
 ///
-/// STUB — exists only so T2-S2 can be tested before the registry owns the
-/// receiver. Delete when `AgentRegistry::answer` lands.
+/// Permanent: `kitsu-tools` cannot name a type from `kitsu`, so the real
+/// `AgentRegistry` can never be the receiver in this crate's own tests. The
+/// registry's own receiving side is covered in `kitsu::subagent::tests`.
 #[cfg(test)]
 pub(crate) fn registry_prompt_stub(
     decision: Decision,

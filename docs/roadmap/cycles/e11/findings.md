@@ -1871,3 +1871,78 @@ leave the attribute), or remove it *together with* the two tests that call it �
 but not the function alone, because that silently drops the invariant check. If
 a future variant should permit prompting, the equivalence test is what will
 force that decision to be explicit.
+
+### Correction: the `kitsu-tools` test stub is permanent, not S4's to delete
+
+T2-S2's record said T2-S4 "must delete the `#[cfg(test)] registry_prompt_stub`".
+**That was wrong**, and the reason is the same dependency direction that has
+shaped three decisions in this milestone already: `kitsu-tools` **cannot name a
+type from `kitsu`**, so the real `AgentRegistry` can never be the receiver in
+`kitsu-tools`' own tests. The stub is that crate's permanent test scaffolding,
+not a placeholder.
+
+Worth stating as a pattern, because it keeps recurring: the gate lives in
+`kitsu-tools` and the registry lives in `kitsu`, so **every** seam between them
+is an opaque value (`u64` agent ids, a `PromptRequestSender`, a `Decision`) and
+every test of the lower crate needs its own stand-in. That is a constraint of
+the layering rather than a shortcoming of any card, and it is why the route
+carries an integer instead of an agent handle.
+
+
+## F36 — adding a non-terminal state means revisiting every "is it terminal?" decision
+
+The lesson from T2-S4, and the semantic twin of B5's "three vocabularies must
+change together".
+
+B5 made the *labelling* consequence explicit: a new phase touches three enums
+and one validator, and the compiler finds those because the matches are
+exhaustive. **It said nothing about the behavioural consequence**, which is
+larger and which the compiler cannot find: every place that asks "is this agent
+finished?" by testing `status == Running` now silently answers **wrong** for a
+blocked agent, because such tests are written as a positive match on `Running`
+rather than a negative match on the terminal variants.
+
+The implementer found ten such sites and widened each to `Running | Blocked`:
+cancellation matching, `cancel`'s pre-check **and** its completion-race
+re-check, capacity accounting (a blocked agent still holds a running slot),
+`running()`, two prune paths, a result-acknowledgement guard, and two
+`debug_assert`s.
+
+**One of those was a real leak, found without a test asking for it.** Both prune
+paths treated anything not `Running` as terminal, so a blocked record would have
+been pruned — **discarding its parked reply sender**, leaving the gate awaiting
+an answer that could never arrive. No test in the card covered pruning a blocked
+agent; it was found by enumerating the sites rather than by the suite.
+
+Three guards were deliberately **not** widened, and the reasoning is the useful
+part: `finish_with_telemetry`, `record_progress_event` and `steer` keep their
+`Running`-only checks, because resolution always restores `Running` before the
+gate wakes — so a timed-out agent's own error reaches `finish` through the normal
+path, which is exactly what makes the end-to-end timeout test pass. Widening
+those would have been cargo-culting the pattern.
+
+**Generalisable rule:** when a state machine gains a non-terminal state, grep
+for the *positive* test (`== Running`, `matches!(.., Running)`) rather than
+trusting exhaustive matches — the exhaustive ones are the safe half, and the
+positive tests are where silent misbehaviour lives.
+
+### Also from T2-S4
+
+- **A park token defends a race nothing asked about.** Each parked request
+  carries a monotonic token, so a timer that fires for an already-answered or
+  re-parked request is a no-op instead of spuriously interrupting the *next*
+  question on that agent. Unprompted and correct.
+- **Four disjoint routes guarantee B3's no-hang property**, each resolving the
+  gate's `oneshot` rather than dropping it: the human's answer, the 30-minute
+  timer, cancellation or teardown, and the registry being dropped (the receiver
+  loop breaks and `Drop` on the sender means `Interrupt` by contract). A request
+  that cannot be parked at all — unknown, terminal or already-blocked agent — is
+  resolved `Interrupt` **synchronously**, so no gate can ever wait on a request
+  nobody owns.
+- **`prompt_sender` holds a weak reference**, so handing a sender to a gate can
+  never keep the registry alive.
+- **The declared MSRV was respected even though F9 says it is already
+  unachievable.** `Option::is_none_or` is stable only from 1.82, so the token
+  comparison is a tuple `match`. Adding no *new* MSRV violation while an
+  existing one stands unresolved is the right call: F9 is a release decision for
+  the maintainer, not a licence to drift further.
