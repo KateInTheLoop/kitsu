@@ -6034,31 +6034,74 @@ fn read_chat_line_inline(
 ) -> ChatReadline {
     use std::io::Read as _;
 
-    // Bound, not discarded: `_raw` lives to the end of this function so the
-    // terminal stays in raw input mode for the whole read. A bare `_` would
-    // drop the guard immediately and restore canonical mode before the first
-    // keystroke. Nothing in the body refers to it -- the idle path no longer
-    // re-raises SIGINT, so there is no reason to drop it early any more.
-    let Some(_raw) = RawStdinGuard::engage() else {
-        return ChatReadline::Error("failed to switch stdin to raw mode".to_string());
-    };
     // A draft carried over from the during-turn live editor is replayed into
     // the editor as if it had just been typed, which keeps the "typing is
-    // never dropped" contract the rustyline path has.
-    let mut input = std::io::Cursor::new(initial.as_bytes().to_vec()).chain(std::io::stdin());
-    let outcome = {
-        // The cursor column is not used yet: the viewport is one row and
-        // `InlineSurface::paint` parks the cursor back inside the scroll
-        // region, so there is nowhere to put a composer caret until the
-        // multi-row composer lands.
-        let mut paint = |draft: &str, _cursor: usize| bridge.paint_draft(prompt, draft);
-        tui_bridge::read_line_inline(&mut input, &mut paint, history)
-    };
-    // Whatever happened, the row must not keep showing a draft that is gone.
-    bridge.paint_draft(prompt, "");
+    // never dropped" contract the rustyline path has. Finding F21 reuses the
+    // same replay for a draft that survived a suspend, which is why this is a
+    // `mut` binding and the read below sits in a loop.
+    let mut carried = initial.to_string();
+    // Raw mode spans the read, but not the *whole* function any more: a
+    // suspend must hand a canonical terminal back to the shell before the
+    // process stops and re-engage after it is foregrounded. So the guard
+    // lives in an `Option` owned by this frame rather than being bound once:
+    // every `return` below drops it (restoring termios), the suspend path
+    // takes it out before the stop and puts a fresh one back after, and a
+    // re-engage that fails leaves it `None` and returns. No path can therefore
+    // return with raw mode still engaged.
+    let mut raw: Option<RawStdinGuard> = None;
+    loop {
+        if raw.is_none() {
+            match RawStdinGuard::engage() {
+                Some(guard) => raw = Some(guard),
+                None => {
+                    return ChatReadline::Error("failed to switch stdin to raw mode".to_string())
+                }
+            }
+        }
+        let mut input = std::io::Cursor::new(carried.clone().into_bytes()).chain(std::io::stdin());
+        let outcome = {
+            // The cursor column is not used yet: the viewport is one row and
+            // `InlineSurface::paint` parks the cursor back inside the scroll
+            // region, so there is nowhere to put a composer caret until the
+            // multi-row composer lands.
+            let mut paint = |draft: &str, _cursor: usize| bridge.paint_draft(prompt, draft);
+            tui_bridge::read_line_inline(&mut input, &mut paint, history)
+        };
+        // Whatever happened, the row must not keep showing a draft that is
+        // gone. On the suspend path the release below clears the row anyway,
+        // but doing it here keeps the invariant on every outcome.
+        bridge.paint_draft(prompt, "");
+        // Finding F21: Ctrl+Z. The reader is pure, so the whole suspend is
+        // sequenced here, through the seam that makes the ordering testable.
+        if let Ok(tui_bridge::InlineRead::Suspended(draft)) = outcome {
+            let mut effects = InlineSuspendEffects {
+                bridge,
+                raw: &mut raw,
+            };
+            if !tui_bridge::suspend_and_resume(&mut effects) {
+                return ChatReadline::Error(
+                    "failed to switch stdin back to raw mode after a suspend".to_string(),
+                );
+            }
+            // Resume reading with the draft preserved: it replays through the
+            // same cursor-chain as a carried-over draft, so typing survives a
+            // suspend/resume cycle.
+            carried = draft;
+            continue;
+        }
+        return read_chat_line_inline_outcome(outcome);
+    }
+}
+
+/// The non-suspend outcomes of one inline read, split out so the loop above
+/// reads as the sequencing it is.
+#[cfg(unix)]
+fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead>) -> ChatReadline {
     match outcome {
         Ok(tui_bridge::InlineRead::Submitted(line)) => ChatReadline::Line(line),
         Ok(tui_bridge::InlineRead::Eof) => ChatReadline::Eof,
+        // Handled by the caller's loop before this is reached.
+        Ok(tui_bridge::InlineRead::Suspended(_)) => ChatReadline::Eof,
         Ok(tui_bridge::InlineRead::Interrupted) => {
             // Deliberately NOT re-raising SIGINT here, unlike the during-turn
             // collector. The collector raises because a turn is in flight and
@@ -6074,6 +6117,48 @@ fn read_chat_line_inline(
             ChatReadline::Interrupted
         }
         Err(error) => ChatReadline::Error(error.to_string()),
+    }
+}
+
+/// The real [`tui_bridge::SuspendEffects`]: the viewport guard for the screen
+/// and the frame's `RawStdinGuard` slot for termios (finding F21).
+#[cfg(unix)]
+struct InlineSuspendEffects<'a> {
+    bridge: &'a tui_bridge::BridgeGuard,
+    raw: &'a mut Option<RawStdinGuard>,
+}
+
+#[cfg(unix)]
+impl tui_bridge::SuspendEffects for InlineSuspendEffects<'_> {
+    fn release_viewport(&mut self) {
+        self.bridge.release_for_suspend();
+    }
+
+    fn restore_terminal_modes(&mut self) {
+        // Dropping the guard is the restore: canonical mode, `ISIG` back on
+        // and bracketed paste off. It must happen before the stop, so the
+        // shell does not inherit a raw terminal.
+        self.raw.take();
+    }
+
+    fn stop_process(&mut self) {
+        // SAFETY: raising a default-disposition job-control signal
+        // in-process, exactly as the during-turn collector does. The region
+        // is already released and termios already canonical, so the shell
+        // takes over a normal full-screen terminal. This blocks here until
+        // the job is foregrounded again (SIGCONT).
+        unsafe {
+            libc::raise(libc::SIGTSTP);
+        }
+    }
+
+    fn reengage_terminal_modes(&mut self) -> bool {
+        *self.raw = RawStdinGuard::engage();
+        self.raw.is_some()
+    }
+
+    fn reinstall_viewport(&mut self) {
+        self.bridge.reinstall_after_resume();
     }
 }
 
