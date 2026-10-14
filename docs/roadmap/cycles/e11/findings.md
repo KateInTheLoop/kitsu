@@ -2109,3 +2109,153 @@ pseudo-terminal tests in this area (`test_jobs_reply_*`,
 processes on real terminals with a 600-second block timeout and an exit guard
 in play — but that is a guess, and the point of this finding is that a guess is
 all anyone has until a failing run is captured.
+## F40 — redaction is credential-shaped, and the timeline's real protection was an accident
+
+Established while scoping T2-S6, by reading rather than by assuming.
+
+`docs/functionality.md` states an **absolute** about the agent inspection
+timeline: *"tool arguments/output and partial model bodies are never copied into
+that inspection record."* An approval entry is the first thing in this epic that
+runs straight into it, because a permission request **is** a tool plus its
+arguments — a path, a URL, a command line.
+
+### The protection was not the redaction
+
+`prompt_sender` destructures only `request.agent_id` and `request.reply`;
+**`request.payload` is dropped unread**, and `park_prompt`'s signature is
+`(id, reply)`. So no argument *could* reach the timeline — **not because
+anything removed it, but because the data never arrived.**
+
+That is protection by accident. It holds only while nobody has a reason to
+plumb the payload deeper, and T2-S6 is exactly that reason: recording *what* an
+agent asked for requires the request at the recording site.
+
+### And redaction would not have caught it
+
+The test author proved this rather than reasoning about it:
+`redaction_does_not_remove_a_path_or_an_argv_word` asserts
+`sanitize_and_redact_text(x) == x` for a filesystem path, a workspace path,
+`rm -rf /work/tmp` and a URL path. `sanitize_and_redact_text` strips terminal
+control sequences and **credential forms** — known key prefixes, `key=value`,
+`Bearer`, URL userinfo. Paths and argv words are left **completely untouched**,
+and `format_agent_thread`'s `sanitize_terminal_text` does not touch them either.
+
+So an implementation that formatted a request's arguments into an entry would
+have printed them verbatim at every surface — `/jobs show`, `/jobs explain`,
+and the JSONL snapshot — while passing `validate`, because the DTO's redaction
+check uses the same credential-shaped function.
+
+**The general rule: redaction in this codebase answers "is this a secret?", not
+"is this private?". A path is not a credential, and nothing in the redaction
+path will stop one.**
+
+### What T2-S6 does about it
+
+The entry carries a **kind and nothing else** — `AgentApprovalKind` is a unit
+enum (`ReadFile`, `WriteFile`, `RunCommand`) with no argument-bearing field, so
+the timeline can say *"waiting for permission to write a file"* and cannot say
+which file. The payload is converted to a kind at the boundary and never travels
+further.
+
+The unit enum is the durable part: a future change cannot slip a path into an
+approval entry **without altering a public type**, which is a review-visible
+act rather than a silent one. That is the same move as T2-S3's exhaustive
+`match` — making the compiler, not vigilance, the thing that notices.
+
+### Worth checking elsewhere
+
+Any other place that relies on "the sensitive field simply is not passed here"
+has the same fragility, and the grep for it is not redaction calls but
+**destructuring that drops a field**. Two candidates worth a later look: the
+hook payload assembly and the state-file writer, both of which take narrow
+structs today for reasons that may be incidental rather than designed.
+
+## F41 — a bare substring ban constrains the product instead of protecting it
+
+T2-S6's argv-absence test swept the serialized snapshot for
+`["rm", "-rf", "/work/tmp", "/usr/bin/rm"]`. The implementer's first attempt
+failed it — **on the word "permission"**, which contains `rm`. Nothing had
+leaked; the assertion simply cannot distinguish the command `rm` from the middle
+of an ordinary English word, and it equally forbids *format*, *confirm*,
+*transform* and *firmware*.
+
+The implementer worked around it by choosing wording with no argv substring
+(`"approval to …"`), flagged it rather than hiding it, and correctly did not
+touch the test. But that left the product's user-visible wording **constrained
+by an accident of a test assertion**, which is the wrong way round.
+
+**Fixed at review by making the assertion stronger, not weaker:** the entry text
+is now pinned with `assert_eq!` to the exact expected string. If the text is
+exactly `"approval to run a command requested"` and nothing else, **no argument
+can be inside it, whatever the argv happened to be** — a property a substring
+ban cannot express. The snapshot-wide sweep is kept, because an argument could
+leak into some other field, but with tokens distinctive enough that only a real
+leak matches (`-rf`, `/work/tmp`, `/usr/bin/rm`, `rm -rf`).
+
+Verified rather than assumed: injecting `/work/tmp` into the entry text makes
+the strengthened assertion fail, and removing it makes it pass.
+
+**General rule: to assert that something private is absent, pin what the output
+*is*, not a list of things it is not.** An exact match is both stronger and
+immune to coincidence; a substring blocklist is weaker and fires on innocent
+text. This is the fifth entry in this project's vacuity-and-assertion-quality
+family (F27, F32, F37's two, now this).
+
+## F42 — `git checkout <file>` destroyed uncommitted work, and the mistake was mine
+
+**Recorded because it cost real work and the lesson is operational, not
+intellectual.**
+
+While verifying F41's strengthened assertion, I injected a path into an entry
+text in `crates/kitsu/src/subagent/thread.rs` to prove the assertion failed on a
+real leak. It did. I then reverted that one-line injection with
+`git checkout crates/kitsu/src/subagent/thread.rs`.
+
+That file held **two agents' uncommitted T2-S6 work** — the test author's enums,
+stubs and six tests, and the implementer's wiring on top. `git checkout` reverts
+to the index, and nothing in that file had been staged, so it reverted to HEAD
+and **wiped all of it**. `subagent.rs` (+219) and `main.rs` (+183) survived and
+referenced the now-missing types, leaving 21 compile errors.
+
+Recovery was complete rather than reconstructive, because both agents still held
+their contributions and restored them in sequence — the test author its stubs and
+tests, then the implementer its wiring — so the TDD record stayed honest and
+nothing was rewritten from memory. The cost was time, not work.
+
+**The rules this produces:**
+1. **Never use `git checkout <path>` to undo a deliberate edit in a file that
+   holds uncommitted work.** Re-apply the inverse edit, or make the experiment
+   in a copy under the scratchpad and never in the live file.
+2. **Before any destructive git operation on a path, check
+   `git diff --numstat <path>`** — exactly the discipline already applied all
+   session to the maintainer's `fs.rs`, which stayed untouched at `54 20`
+   throughout. The protection existed; I simply did not extend it two files
+   over.
+3. **Verification experiments belong in a throwaway copy.** Proving an assertion
+   has teeth is valuable (F41 is better for it), but the proof should not
+   require mutating the file under review.
+
+## F43 — a cancelled approval is recorded as "timed out", which is untrue
+
+Noticed while reviewing T2-S6 and **not fixed in it**, because the fix is a
+design change rather than a line.
+
+`resolve_prompt` is the single resolution path, and `approval_outcome` maps
+`Decision::Interrupt` to `AgentApprovalOutcome::TimedOut`. The B3 timer resolves
+with `Interrupt` — correct. But **cancelling a blocked agent also resolves with
+`Interrupt`**, so a human cancellation is recorded in the timeline as
+`"approval to write a file timed out"`.
+
+The whole purpose of this card is a truthful record of what an agent asked and
+how it was decided, so a record that reports a deliberate human cancellation as
+an unattended timeout is a correctness defect in the record, not a cosmetic one.
+No test pins the cancellation case either way, which is why it passed review
+green.
+
+**Why it is not a one-liner:** the two cases arrive at `resolve_prompt` carrying
+the *same* `Decision` value, so they are indistinguishable at the recording
+site. Fixing it means either a fifth `AgentApprovalOutcome` plus a way to tell
+the caller's intent apart (a parameter, or a distinct `Decision`), or recording
+the outcome at the two call sites instead of in the shared path. That is a small
+card, not a patch — and it should also pin the cancellation case, which nothing
+does today.

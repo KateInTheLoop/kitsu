@@ -398,6 +398,25 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
 - **N8** Security: peek/attach show only redacted timelines; replies to blocked
   agents go through the two existing gates and are journaled like foreground
   approvals.
+
+  **Amended in T2-S6, because "redacted" was the wrong word for what protects
+  these entries.** An approval entry records the **kind** of permission and
+  nothing else -- "approval to write a file" -- never the path, URL or command
+  line. It has to, because redaction here cannot help: `sanitize_and_redact_text`
+  strips terminal controls and *credential* forms (key prefixes, `key=value`,
+  `Bearer`, URL userinfo) and leaves filesystem paths and argv words completely
+  untouched, as a test now pins. Redaction answers "is this a secret?", not "is
+  this private?", and the snapshot validator uses that same function -- so an
+  entry carrying a path would have reached `/jobs show`, `/jobs explain` and the
+  JSONL snapshot while passing validation.
+
+  The guarantee is therefore structural, not filtered: the request's payload is
+  converted to an `AgentApprovalKind` at the boundary and no argument travels to
+  the recording site, and that kind is a **unit enum with no argument-bearing
+  field**, so a future change cannot carry a path into a timeline entry without
+  altering a public type. See **F40**. The "journaled like foreground approvals"
+  clause holds with the same caveat: the journal records that an approval
+  happened and how it was decided, not what was asked for in detail.
 - **N9** `--reduced-motion` MAY enter TUI modes (it keeps styled output by
   definition, `cli.rs`); there it disables spinner animation, counter flashes,
   and periodic age refresh. Its output is not covered by N1's byte-identical

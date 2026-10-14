@@ -152,7 +152,40 @@ pub enum AgentStatus {
 /// a fired block timeout can never resolve a request it does not own.
 struct ParkedPrompt {
     token: u64,
+    /// What the parked request asks permission for, *without its arguments*
+    /// (T2-S6). Derived once at the channel boundary in
+    /// [`AgentRegistry::prompt_sender`]; the payload itself never travels
+    /// this far, so no path or argv word can reach the timeline.
+    kind: thread::AgentApprovalKind,
     reply: tokio::sync::oneshot::Sender<Decision>,
+}
+
+/// Collapse a parked request's payload to the argument-free approval kind.
+///
+/// This is the security boundary of T2-S6: it is the only place the payload
+/// is inspected, and the only thing it returns is a unit enum variant. The
+/// action verb plus the payload discriminant carry everything "permission to
+/// X" needs.
+fn approval_kind(payload: &kitsu_tools::PromptRequestPayload) -> thread::AgentApprovalKind {
+    match payload {
+        kitsu_tools::PromptRequestPayload::Path(request) => match request.action {
+            kitsu_tools::Action::Read => thread::AgentApprovalKind::ReadFile,
+            kitsu_tools::Action::Write => thread::AgentApprovalKind::WriteFile,
+        },
+        kitsu_tools::PromptRequestPayload::Command(_) => thread::AgentApprovalKind::RunCommand,
+    }
+}
+
+/// How a resolved decision is spelled in the approval record. `Interrupt` is
+/// never a human answer: it arrives from B3's timeout or a cancellation, so
+/// it is recorded as a timeout rather than a denial.
+fn approval_outcome(decision: Decision) -> thread::AgentApprovalOutcome {
+    match decision {
+        Decision::AllowOnce => thread::AgentApprovalOutcome::AllowedOnce,
+        Decision::AllowAlways => thread::AgentApprovalOutcome::AllowedAlways,
+        Decision::Deny => thread::AgentApprovalOutcome::Denied,
+        Decision::Interrupt => thread::AgentApprovalOutcome::TimedOut,
+    }
 }
 
 struct AgentRecord {
@@ -798,7 +831,10 @@ impl AgentRegistry {
                     break;
                 };
                 let agent_id = request.agent_id;
-                let Some(token) = registry.park_prompt(agent_id, request.reply) else {
+                // Derive the argument-free kind here, at the boundary, and
+                // carry only that onward (T2-S6).
+                let kind = approval_kind(&request.payload);
+                let Some(token) = registry.park_prompt(agent_id, kind, request.reply) else {
                     continue;
                 };
                 let timer_owner = Arc::downgrade(&registry);
@@ -864,7 +900,12 @@ impl AgentRegistry {
     /// Park one request on its agent, returning the park token. A request for
     /// an unknown, terminal, or already-blocked agent is resolved immediately
     /// as `Interrupt` rather than held, so no gate can wait forever.
-    fn park_prompt(&self, id: u64, reply: tokio::sync::oneshot::Sender<Decision>) -> Option<u64> {
+    fn park_prompt(
+        &self,
+        id: u64,
+        kind: thread::AgentApprovalKind,
+        reply: tokio::sync::oneshot::Sender<Decision>,
+    ) -> Option<u64> {
         let (token, update) = {
             let mut agents = self.agents.lock().expect("agent registry");
             let parkable = agents
@@ -878,7 +919,8 @@ impl AgentRegistry {
             let record = agents.get_mut(&id).expect("inspected agent record");
             record.status = AgentStatus::Blocked;
             record.thread.block();
-            record.pending_prompt = Some(ParkedPrompt { token, reply });
+            record.thread.record_approval_request(kind);
+            record.pending_prompt = Some(ParkedPrompt { token, kind, reply });
             (token, self.changed_snapshot(&agents))
         };
         // B4: publish a new generation so watchers observe the block.
@@ -914,6 +956,9 @@ impl AgentRegistry {
                 .expect("inspected parked prompt");
             record.status = AgentStatus::Running;
             record.thread.unblock();
+            record
+                .thread
+                .record_approval_outcome(parked.kind, approval_outcome(decision));
             (parked.reply, self.changed_snapshot(&agents))
         };
         self.publish(update);
@@ -4207,5 +4252,176 @@ mod tests {
             other => panic!("expected Failed(interrupted), got {other:?}"),
         }
         assert_eq!(registry.snapshot().blocked, 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // T2-S6: the approval record. The registry's park/resolve paths record
+    // nothing today, so every test below this banner is expected to fail.
+    // ---------------------------------------------------------------------
+
+    fn approval_entries(registry: &AgentRegistry, id: u64) -> Vec<String> {
+        registry
+            .thread_snapshot(id)
+            .expect("the agent is retained")
+            .timeline
+            .entries
+            .into_iter()
+            .filter(|entry| entry.kind == thread::AgentTimelineKind::Approval)
+            .map(|entry| entry.text)
+            .collect()
+    }
+
+    /// The argv/cwd a command gate would park. Every argument here is a
+    /// plausible leak target: none of them is touched by
+    /// `sanitize_and_redact_text` (proved in `thread.rs`).
+    fn park_command_request(
+        sender: &kitsu_tools::PromptRequestSender,
+        agent_id: u64,
+    ) -> tokio::sync::oneshot::Receiver<Decision> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        sender
+            .send(PromptRequest {
+                agent_id,
+                payload: PromptRequestPayload::Command(kitsu_tools::CommandApprovalRequest {
+                    argv: vec!["rm".to_string(), "-rf".to_string(), "/work/tmp".to_string()],
+                    cwd: "/work".to_string(),
+                    timeout_ms: 1_000,
+                    executable: kitsu_tools::CommandExecutableIdentity {
+                        invocation: "rm".to_string(),
+                        resolution: kitsu_tools::CommandExecutableResolution::InvocationPath,
+                        observed_path: Some("/usr/bin/rm".to_string()),
+                        pinned: false,
+                    },
+                    ambient_authority: kitsu_tools::CommandAmbientAuthority {
+                        inherits_environment: false,
+                        filesystem_confined_to_command_roots: true,
+                        network_confined: true,
+                        executable_identity_pinned: false,
+                    },
+                }),
+                reply,
+            })
+            .expect("the registry owns the receiver and keeps it open");
+        answer
+    }
+
+    /// Parking writes a request entry naming the permission kind, and only
+    /// the kind: the path `/work/notes.txt` and the grant dir `/work` that
+    /// `park_path_request` sends must not reach the timeline (N8, and the
+    /// documented absolute in `docs/functionality.md` that tool arguments are
+    /// never copied into the inspection record).
+    #[tokio::test]
+    async fn parking_a_path_request_records_an_argument_free_approval_entry() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("needs an answer".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let _answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+
+        let approvals = approval_entries(&registry, id);
+        assert_eq!(
+            approvals.len(),
+            1,
+            "the park leaves exactly one request entry: {approvals:?}"
+        );
+        assert!(
+            approvals[0].contains("write a file"),
+            "the entry says what was asked for: {approvals:?}"
+        );
+        let encoded = serde_json::to_string(&registry.thread_snapshot(id).unwrap()).unwrap();
+        for argument in ["notes.txt", "/work"] {
+            assert!(
+                !encoded.contains(argument),
+                "the approval record leaked a tool argument ({argument}): {encoded}"
+            );
+        }
+    }
+
+    /// The command gate's kind maps distinctly, and its argv stays out.
+    #[tokio::test]
+    async fn parking_a_command_request_records_the_command_kind_without_its_argv() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("needs an answer".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let _answer = park_command_request(&sender, id);
+        await_blocked(&registry, id).await;
+
+        let approvals = approval_entries(&registry, id);
+        assert_eq!(approvals.len(), 1, "{approvals:?}");
+        assert!(
+            approvals[0].contains("run a command"),
+            "a command gate is a distinct kind: {approvals:?}"
+        );
+        // The entry text is pinned *exactly*, which is the strongest form of
+        // this assertion: if the text is this and nothing else, no argument can
+        // be inside it, whatever the argv happened to be. A substring ban
+        // cannot say that, and a bare one is worse than useless here -- `"rm"`
+        // also forbids the words permission, format, confirm and firmware, so
+        // it constrains the product's wording by accident rather than
+        // protecting anything (F41).
+        assert_eq!(
+            approvals[0], "approval to run a command requested",
+            "the entry says the kind and nothing else: {approvals:?}"
+        );
+        // The snapshot-wide sweep stays, because an argument could leak into
+        // some *other* field, but it uses tokens distinctive enough that only a
+        // real leak matches.
+        let encoded = serde_json::to_string(&registry.thread_snapshot(id).unwrap()).unwrap();
+        for argument in ["-rf", "/work/tmp", "/usr/bin/rm", "rm -rf"] {
+            assert!(
+                !encoded.contains(argument),
+                "the approval record leaked an argv word ({argument}): {encoded}"
+            );
+        }
+    }
+
+    /// Every human answer completes the record with its own spelling.
+    #[tokio::test]
+    async fn answering_a_blocked_agent_completes_its_approval_record() {
+        for (decision, expected) in [
+            (Decision::AllowOnce, "allowed once"),
+            (Decision::AllowAlways, "allowed always"),
+            (Decision::Deny, "denied"),
+        ] {
+            let (registry, id, _resolved) = answered_registry(decision).await;
+            let approvals = approval_entries(&registry, id);
+            assert_eq!(
+                approvals.len(),
+                2,
+                "{decision:?}: a request and its decision: {approvals:?}"
+            );
+            assert!(
+                approvals[1].contains(expected),
+                "{decision:?} is recorded as {expected:?}: {approvals:?}"
+            );
+        }
+    }
+
+    /// B3's timeout is the one decision taken with no human present, so it
+    /// must leave a record too, spelled as a timeout rather than a denial.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_approval_is_recorded_as_timed_out() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("never answered".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+
+        tokio::time::advance(DEFAULT_AGENT_BLOCK_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        assert_eq!(
+            answer.await.expect("the timeout resolves the gate"),
+            Decision::Interrupt
+        );
+
+        let approvals = approval_entries(&registry, id);
+        assert_eq!(
+            approvals.len(),
+            2,
+            "an unanswered park is still a decided request: {approvals:?}"
+        );
+        assert!(
+            approvals[1].contains("timed out"),
+            "a timeout is not a denial: {approvals:?}"
+        );
     }
 }

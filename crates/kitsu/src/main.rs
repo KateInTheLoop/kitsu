@@ -11596,6 +11596,28 @@ fn format_agent_thread(snapshot: &subagent::thread::AgentThreadSnapshot) -> Stri
     output
 }
 
+/// The permission a blocked agent is still waiting for, as `permission to X`
+/// (T2-S6), or `None` once its newest approval entry is a decision.
+///
+/// Reads the bounded redacted timeline, which holds the approval *kind* and
+/// no tool argument, so this can never surface a path or an argv word.
+fn pending_approval_request(thread: &subagent::thread::AgentThreadSnapshot) -> Option<String> {
+    let latest = thread
+        .timeline
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == subagent::thread::AgentTimelineKind::Approval)?;
+    let pending = latest.text.strip_suffix(" requested")?;
+    // The recorded spelling is `approval to <kind>`; accept the equivalent
+    // `permission to <kind>` too, so the line reads the same either way.
+    let kind = pending
+        .strip_prefix("approval to ")
+        .or_else(|| pending.strip_prefix("permission to "))
+        .unwrap_or(pending);
+    Some(format!("permission to {}", terminal_inline(kind)))
+}
+
 /// Human `/jobs explain <id>`, borrowed from herdr's `agent explain`: why is
 /// this agent in this state, since when, and what is it waiting on.
 ///
@@ -11657,9 +11679,16 @@ fn format_agent_explain(
     });
 
     if running {
-        match activity.as_deref() {
-            Some(activity) => output.push_str(&format!("\n  waiting on: {activity}")),
-            None => output.push_str("\n  waiting on: no activity recorded yet"),
+        // T2-S6: a parked permission request is the real answer to "what is
+        // this agent waiting on", so it outranks the last tool activity. The
+        // pending request is the newest approval entry that no outcome entry
+        // has closed; the entry text carries the kind only, never an
+        // argument.
+        let pending_permission = pending_approval_request(thread);
+        match (pending_permission.as_deref(), activity.as_deref()) {
+            (Some(permission), _) => output.push_str(&format!("\n  waiting on: {permission}")),
+            (None, Some(activity)) => output.push_str(&format!("\n  waiting on: {activity}")),
+            (None, None) => output.push_str("\n  waiting on: no activity recorded yet"),
         }
     } else {
         if matches!(thread.phase, subagent::thread::AgentThreadPhase::Failed) {
@@ -26104,6 +26133,157 @@ mod tests {
         assert!(
             usage.contains("reply <id> <y|a|n>"),
             "the active-turn controls line must advertise reply: {usage}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // T2-S6: the approval record in the two inspection surfaces.
+    // `record_approval_request`/`record_approval_outcome` are STUBS, so
+    // every test below this banner is expected to fail.
+    // ------------------------------------------------------------------
+
+    /// `/jobs show` renders the approval entries in timeline order, and the
+    /// path the gate actually parked (`/work/notes.txt`, `/work`) does not
+    /// appear. Driven through the real registry rather than a hand-built
+    /// snapshot: `format_agent_thread` prints any entry generically, so a
+    /// fixture-built Approval entry would prove nothing about whether one is
+    /// ever recorded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jobs_show_lists_the_approval_request_and_its_decision_in_order() {
+        let (registry, id, answer) = registry_with_one_blocked_agent().await;
+
+        let blocked = format_agent_thread(&registry.thread_snapshot(id).unwrap());
+        assert_no_debug_leak(&blocked);
+        assert!(
+            blocked.contains("approval"),
+            "the timeline names the approval entry's kind: {blocked}"
+        );
+        assert!(
+            blocked.contains("write a file"),
+            "/jobs show says what the agent asked for: {blocked}"
+        );
+        // NON-VACUOUS: `format_agent_thread` prints every entry's text
+        // verbatim through `sanitize_terminal_text`, which does not touch
+        // paths (see `redaction_does_not_remove_a_path_or_an_argv_word` in
+        // `subagent/thread.rs`). Any implementation that formatted the
+        // request's arguments into the entry would print them here.
+        for argument in ["notes.txt", "/work"] {
+            assert!(
+                !blocked.contains(argument),
+                "/jobs show leaked a tool argument ({argument}): {blocked}"
+            );
+        }
+
+        assert_eq!(
+            registry.answer(id, Decision::Deny),
+            subagent::AgentAnswerOutcome::Answered
+        );
+        assert_eq!(answer.await.expect("the gate is resolved"), Decision::Deny);
+
+        let decided = format_agent_thread(&registry.thread_snapshot(id).unwrap());
+        assert_no_debug_leak(&decided);
+        let request_at = decided
+            .find("write a file")
+            .unwrap_or_else(|| panic!("no request entry: {decided}"));
+        let decision_at = decided
+            .find("denied")
+            .unwrap_or_else(|| panic!("no decision entry: {decided}"));
+        assert!(
+            request_at < decision_at,
+            "the request is shown before its decision: {decided}"
+        );
+        for argument in ["notes.txt", "/work"] {
+            assert!(
+                !decided.contains(argument),
+                "/jobs show leaked a tool argument ({argument}): {decided}"
+            );
+        }
+    }
+
+    /// `/jobs explain` answers "why is this agent in this state". For a
+    /// blocked agent that is "it is waiting for permission to X", so the
+    /// `waiting on` line must say so instead of reporting the last tool
+    /// activity.
+    #[test]
+    fn explaining_a_blocked_agent_says_what_permission_it_waits_for() {
+        let (progress, mut thread) = explain_fixture(
+            9,
+            subagent::AgentProgressStatus::Blocked,
+            subagent::thread::AgentThreadPhase::Blocked,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        thread
+            .timeline
+            .entries
+            .push(subagent::thread::AgentTimelineEntry {
+                sequence: 2,
+                elapsed_ms: 20,
+                kind: subagent::thread::AgentTimelineKind::Approval,
+                round: None,
+                text: format!(
+                    "permission to {} requested",
+                    subagent::thread::AgentApprovalKind::WriteFile.label()
+                ),
+                truncated: false,
+            });
+        thread.timeline.retained_bytes += thread.timeline.entries[1].text.len();
+
+        let explain = format_agent_explain(&progress, &thread);
+        assert_no_debug_leak(&explain);
+        let labels = explain_labels(&explain);
+        let waiting = explain_label_value(&labels, "waiting on")
+            .unwrap_or_else(|| panic!("a blocked agent is waiting on something: {explain}"));
+        assert!(
+            waiting.contains("permission to write a file"),
+            "explain names the permission, not the last tool: {explain}"
+        );
+        let body = explain
+            .strip_prefix(&kitsu_render::deck_marker(kitsu_render::DeckState::Running))
+            .unwrap_or_else(|| panic!("no deck marker: {explain}"));
+        assert!(body.is_ascii(), "{explain}");
+    }
+
+    /// Once the request is decided the agent is no longer waiting on it, so
+    /// `explain` must not keep claiming it is. Pins that the outcome entry
+    /// closes the pending request rather than the request entry alone
+    /// driving the line.
+    #[test]
+    fn explaining_a_resumed_agent_no_longer_claims_to_wait_for_permission() {
+        let (progress, mut thread) = explain_fixture(
+            9,
+            subagent::AgentProgressStatus::Running,
+            subagent::thread::AgentThreadPhase::Running,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        for (sequence, text) in [
+            (2u64, "permission to write a file requested".to_string()),
+            (3, "permission to write a file allowed once".to_string()),
+        ] {
+            thread.timeline.retained_bytes += text.len();
+            thread
+                .timeline
+                .entries
+                .push(subagent::thread::AgentTimelineEntry {
+                    sequence,
+                    elapsed_ms: 20,
+                    kind: subagent::thread::AgentTimelineKind::Approval,
+                    round: None,
+                    text,
+                    truncated: false,
+                });
+        }
+
+        let explain = format_agent_explain(&progress, &thread);
+        let labels = explain_labels(&explain);
+        let waiting = explain_label_value(&labels, "waiting on")
+            .unwrap_or_else(|| panic!("a running agent still has a waiting-on line: {explain}"));
+        // NON-VACUOUS: the sibling test above requires this exact string to
+        // be printed from an Approval entry, and this thread's timeline
+        // carries that very entry. Only the decision distinguishes them.
+        assert!(
+            !waiting.contains("permission to"),
+            "an answered agent is not waiting for permission any more: {explain}"
         );
     }
 }

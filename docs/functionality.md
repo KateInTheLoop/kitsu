@@ -292,7 +292,15 @@ is read-only and, unlike `/jobs show`, never acknowledges a ready result, so
 diagnosing an agent cannot quietly satisfy the unobserved-result exit guard.
 `/agent show`
 adds a bounded redacted event timeline; tool arguments/output and partial model
-bodies are never copied into that inspection record. Built-in `/profiles`
+bodies are never copied into that inspection record. That timeline also records
+each permission a background agent asked for and how it was decided -- allowed
+once, allowed always, denied, or timed out -- so an answered agent still shows
+that it asked. Those entries name the **kind** of permission and nothing else
+("approval to write a file"), never the path, URL or command line: the request's
+payload is converted to a kind at the boundary and no argument travels to the
+recording site, which is how the sentence above stays true of them. A blocked
+agent's `/jobs explain` reports the pending permission on its `waiting on:`
+line in preference to its last tool activity. Built-in `/profiles`
 select a read-only reviewer or a tool-free reasoning worker, and background
 spawns can name a profile without inheriting broader capabilities. `/agents`
 remains a compatibility alias: a bare call lists, a numeric argument shows
