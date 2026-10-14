@@ -154,12 +154,26 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   hid, not only the row cap. Below three rows of palette plus one of composer
   there is no palette at all rather than a partial frame.
 
-  The palette stands down in three cases, so it never contradicts the row it
-  sits above: when the draft is not a bare slash prefix, when the prefix is
-  already a command's whole name (there is nothing left to offer), and when a
-  completion hint is showing that is not the lead entry's own completion. The
-  third case is a consequence of the during-turn hint's priority list being
-  reused at the idle prompt, and is tracked rather than intended.
+  The palette stands down in two cases: when the draft is not a bare
+  single-token slash prefix, and when the prefix is already a command's whole
+  name, since there is nothing left to offer.
+
+  **Completions at the idle prompt rank by registry order**, which is what makes
+  those two cases sufficient: the hint, the text Tab inserts and the palette's
+  lead entry are the same completion by construction, so the palette can never
+  contradict the row it sits above. The **during-turn** row ranks differently
+  and deliberately — commands that act on the running turn come first there,
+  because they are the ones usable at that moment. The two policies are separate
+  named functions rather than one with a flag, so a call site declares which it
+  wants and cannot inherit the wrong one silently. (A third stand-down case
+  existed briefly, hiding the palette when a hint disagreed with it; it was a
+  symptom of the idle prompt having inherited the during-turn ranking, and went
+  away with the cause.)
+
+  When a prefix is already the lead entry's whole name the hint is **empty**
+  rather than completing a longer sibling — typing `/agent` suggests nothing
+  even though `/agents` exists, because the hint's job is to complete the entry
+  the palette leads with.
 
   Every keystroke repaints **every** pinned row, not just the composer —
   otherwise the palette above would show matches for a prefix already changed.

@@ -5841,20 +5841,20 @@ fn slash_palette_rows(prefix: &str, rich: bool, inner_width: usize, max_rows: u1
 /// its own hint slot does not already say.
 ///
 /// The palette is a menu and the hint is the keystroke's answer, so the two
-/// must not contradict each other on one screen. Three cases say no:
+/// must not contradict each other on one screen. Two cases say no:
 ///
 /// * the buffer is not a bare single-token slash prefix -- exactly
-///   [`typeahead_slash_hint`]'s and `ChatHelper::hint`'s own rule;
+///   [`idle_slash_hint`]'s and `ChatHelper::hint`'s own rule;
 /// * the prefix already **is** a command's full name (`/context`), so there is
-///   no choice left to offer and the row is the whole answer;
-/// * a hint is showing that is not the completion of the palette's *first*
-///   entry. That happens when [`MID_TURN_HINT_PRIORITY`] overrides registry
-///   order (`/s` hints `steer` while the list leads with `save`): the row
-///   would then point at one command and the list at another.
+///   no choice left to offer and the row is the whole answer.
+///
+/// The row's hint itself is no longer consulted: the idle prompt ranks by
+/// registry order, so [`idle_slash_hint`] always completes the palette's
+/// first entry and the two cannot disagree.
 ///
 /// A prefix that matches nothing does get the box, because its single
 /// `no matching command` row is the only thing that says so.
-fn slash_palette_adds_to_the_row(buffer: &str, hint: &str) -> bool {
+fn slash_palette_adds_to_the_row(buffer: &str, _hint: &str) -> bool {
     let Some(prefix) = buffer.strip_prefix('/') else {
         return false;
     };
@@ -5865,7 +5865,7 @@ fn slash_palette_adds_to_the_row(buffer: &str, hint: &str) -> bool {
     let Some(lead) = matches.first().map(|spec| spec.name) else {
         return true;
     };
-    lead != prefix && (hint.is_empty() || format!("{prefix}{hint}") == lead)
+    lead != prefix
 }
 
 /// A bounded, editor-owned palette rendered as a multi-line Rustyline hint.
@@ -14690,23 +14690,54 @@ const MID_TURN_HINT_PRIORITY: [&str; 5] = ["steer", "queue", "jobs", "quit", "ex
 /// commands first, then registry order (empty when the buffer is not a bare
 /// slash prefix or nothing matches).
 fn typeahead_slash_hint(buffer: &str) -> String {
+    slash_hint_ranked(buffer, |rest| {
+        MID_TURN_HINT_PRIORITY
+            .iter()
+            .copied()
+            .find(|name| name.starts_with(rest) && name.len() > rest.len())
+            .or_else(|| {
+                matching_slash_commands(rest)
+                    .iter()
+                    .map(|spec| spec.name)
+                    .find(|name| name.len() > rest.len())
+            })
+    })
+}
+
+/// Inline completion hint for the IDLE prompt: the remainder of the *first*
+/// registry match for the typed `/prefix`, in plain registry order.
+///
+/// Deliberately a second function rather than a parameter on
+/// [`typeahead_slash_hint`]: the name is how a call site declares which
+/// policy it wants, and there is no default to inherit silently --
+/// inheriting the during-turn default silently at the idle prompt was
+/// finding F30. [`MID_TURN_HINT_PRIORITY`] describes commands that act on a
+/// RUNNING turn, and no turn runs here, so it has no claim.
+///
+/// Unlike the during-turn ranking this does not skip over an exact match:
+/// registry order's lead for `/agent` is `agent` itself, so the hint is
+/// empty even though `agents` would complete it. That keeps the invariant
+/// `prefix + hint == matching_slash_commands(prefix).first().name`, which is
+/// what lets the palette trust the row's hint.
+fn idle_slash_hint(buffer: &str) -> String {
+    slash_hint_ranked(buffer, |rest| {
+        matching_slash_commands(rest).first().map(|spec| spec.name)
+    })
+}
+
+/// The structural rules both slash hints share -- strip the slash, reject an
+/// empty, whitespace-bearing or multi-line buffer -- with `ranking` choosing
+/// which matching command the hint completes. A ranking that returns the
+/// prefix itself yields an empty hint.
+fn slash_hint_ranked(buffer: &str, ranking: impl Fn(&str) -> Option<&'static str>) -> String {
     let Some(rest) = buffer.strip_prefix('/') else {
         return String::new();
     };
     if rest.is_empty() || rest.contains(char::is_whitespace) {
         return String::new();
     }
-    let prioritized = MID_TURN_HINT_PRIORITY
-        .iter()
-        .copied()
-        .find(|name| name.starts_with(rest) && name.len() > rest.len());
-    prioritized
-        .or_else(|| {
-            matching_slash_commands(rest)
-                .iter()
-                .map(|spec| spec.name)
-                .find(|name| name.len() > rest.len())
-        })
+    ranking(rest)
+        .filter(|name| name.len() > rest.len())
         .map(|name| name[rest.len()..].to_string())
         .unwrap_or_default()
 }
@@ -21239,6 +21270,94 @@ mod tests {
         assert_eq!(typeahead_slash_hint("/queue add x"), "");
         assert_eq!(typeahead_slash_hint("/zzz"), "");
         assert_eq!(typeahead_slash_hint("/"), "");
+    }
+
+    /// Card T0-S17, finding F30. At the idle prompt no turn is running, so
+    /// the mid-turn priority list has no claim: `/s` must complete `save`,
+    /// the first registry match, not `steer`.
+    ///
+    /// The `/st` expectation is derived from `matching_slash_commands` rather
+    /// than hardcoded, so adding a command cannot silently void the test.
+    #[test]
+    fn idle_slash_hint_follows_registry_order() {
+        assert_eq!(idle_slash_hint("/s"), "ave");
+        let lead_st = matching_slash_commands("st")
+            .first()
+            .map(|spec| spec.name)
+            .expect("/st matches at least one command");
+        assert_eq!(
+            idle_slash_hint("/st"),
+            lead_st["st".len()..],
+            "the idle hint must complete registry order's lead for /st ({lead_st})"
+        );
+        // The non-slash, argument, exact-name and no-match rules are unchanged.
+        assert_eq!(idle_slash_hint("/save"), "");
+        assert_eq!(idle_slash_hint("save"), "");
+        assert_eq!(idle_slash_hint("/queue add x"), "");
+        assert_eq!(idle_slash_hint("/zzz"), "");
+        assert_eq!(idle_slash_hint("/"), "");
+    }
+
+    /// Card T0-S17. The invariant that makes
+    /// `slash_palette_adds_to_the_row`'s third stand-down clause dead code:
+    /// at the idle prompt, for *any* slash prefix with at least one match,
+    /// the hint completes the palette's **lead** entry.
+    #[test]
+    fn idle_slash_hint_always_completes_the_lead_palette_entry() {
+        let mut prefixes: Vec<String> = Vec::new();
+        for spec in SLASH_COMMANDS {
+            for end in 1..=spec.name.len() {
+                let prefix = spec.name[..end].to_string();
+                if !prefixes.contains(&prefix) {
+                    prefixes.push(prefix);
+                }
+            }
+        }
+        assert!(
+            prefixes.len() > 50,
+            "the property needs a decent range of prefixes"
+        );
+        for prefix in prefixes {
+            let buffer = format!("/{prefix}");
+            let lead = matching_slash_commands(&prefix)
+                .first()
+                .map(|spec| spec.name)
+                .expect("a prefix taken from a command name matches that command");
+            let hint = idle_slash_hint(&buffer);
+            assert_eq!(
+                format!("{prefix}{hint}"),
+                lead,
+                "idle hint for {buffer:?} must complete the lead palette entry \
+                 {lead:?}, not {:?}",
+                format!("{prefix}{hint}")
+            );
+        }
+    }
+
+    /// Card T0-S17. With the idle hint fixed, `slash_palette_adds_to_the_row`
+    /// loses its third clause: a hint that disagrees with the lead entry no
+    /// longer suppresses a correct palette. The two surviving clauses -- not a
+    /// bare single-token slash prefix, and the prefix already being a
+    /// command's whole name -- still hold.
+    #[test]
+    fn slash_palette_adds_to_the_row_drops_the_disagreeing_hint_clause() {
+        // The case the clause was papering over: /s now hints `ave` and gets
+        // a palette.
+        assert!(slash_palette_adds_to_the_row("/s", &idle_slash_hint("/s")));
+        // And the clause is gone, not merely unreachable: even a hint that
+        // does not complete the lead entry no longer stands the palette down.
+        assert!(
+            slash_palette_adds_to_the_row("/s", "teer"),
+            "the third stand-down clause must be gone, not just unreachable"
+        );
+        // Clause one: not a bare single-token slash prefix.
+        assert!(!slash_palette_adds_to_the_row("/co ", ""));
+        assert!(!slash_palette_adds_to_the_row("hello /co", ""));
+        assert!(!slash_palette_adds_to_the_row("/co\nx", ""));
+        // Clause two: the prefix already is a command's whole name.
+        assert!(!slash_palette_adds_to_the_row("/context", ""));
+        // Unchanged: a prefix matching nothing still gets its own box.
+        assert!(slash_palette_adds_to_the_row("/zzz", ""));
     }
 
     #[test]

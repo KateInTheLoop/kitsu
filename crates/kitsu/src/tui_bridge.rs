@@ -613,8 +613,7 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
     fn hint_of(editor: &TypeaheadEditor) -> (String, bool) {
         let search_status = editor.search_status();
         let hint_reserved = search_status.is_some();
-        let hint =
-            search_status.unwrap_or_else(|| crate::typeahead_slash_hint(&editor.buffer_string()));
+        let hint = search_status.unwrap_or_else(|| crate::idle_slash_hint(&editor.buffer_string()));
         (hint, hint_reserved)
     }
 
@@ -699,7 +698,7 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
                 // arm runs -- the difference is reachable, not theoretical.
                 EditorAction::CompleteRequest => {
                     let buffer = editor.buffer_string();
-                    let hint = crate::typeahead_slash_hint(&buffer);
+                    let hint = crate::idle_slash_hint(&buffer);
                     if !hint.is_empty() {
                         editor.replace_buffer(&format!("{buffer}{hint}"));
                         // Set explicitly rather than leaning on the
@@ -1406,15 +1405,21 @@ mod tests {
     // ---------------------------------------------------------------------
 
     /// Test 16. A bare slash prefix yields the completion remainder, and it
-    /// is **unreserved**: `/s` suggests `steer` (mid-turn-actionable commands
-    /// outrank registry order), so the hint is the suffix `teer` alone -- the
-    /// typed text is never repeated into the hint.
+    /// is **unreserved**: at an idle prompt `/s` suggests `save`, the first
+    /// registry match, so the hint is the suffix `ave` alone -- the typed text
+    /// is never repeated into the hint.
+    ///
+    /// Card T0-S17, finding F30: this used to expect `teer`, because the idle
+    /// prompt inherited the during-turn ranking that puts `steer` first. That
+    /// ranking is for commands acting on a RUNNING turn, and no turn runs
+    /// here. The during-turn row still ranks that way; see
+    /// `typeahead_slash_hint_prefers_mid_turn_actionable_commands`.
     #[test]
     fn inline_read_paints_the_slash_completion_suffix_as_an_unreserved_hint() {
         let (draft, cursor, hint, reserved) = last_frame(b"/s");
         assert_eq!(draft, "/s");
         assert_eq!(cursor, 2);
-        assert_eq!(hint, "teer", "the hint is the remainder, not the command");
+        assert_eq!(hint, "ave", "the hint is the remainder, not the command");
         assert!(
             !reserved,
             "a completion hint must not claim columns from the draft"
@@ -1503,15 +1508,12 @@ mod tests {
     /// The accepted text is the draft **plus** the suffix, never the suffix
     /// alone and never the typed prefix twice; the cursor lands at the end;
     /// and the hint slot is now empty, because `/steer` is a whole command
-    /// and `typeahead_slash_hint` has nothing left to offer.
+    /// and `idle_slash_hint` has nothing left to offer.
     #[test]
     fn inline_read_tab_accepts_the_showing_slash_hint() {
         let (draft, cursor, hint, reserved) = last_frame(b"/s\t");
-        assert_eq!(
-            draft, "/steer",
-            "Tab accepts the suffix the row was showing"
-        );
-        assert_eq!(cursor, 6, "the cursor follows the accepted text");
+        assert_eq!(draft, "/save", "Tab accepts the suffix the row was showing");
+        assert_eq!(cursor, 5, "the cursor follows the accepted text");
         assert_eq!(
             hint, "",
             "an exactly-completed command leaves no further hint: {hint:?}"
@@ -1527,12 +1529,12 @@ mod tests {
         let painted = frames(b"/s\t");
         let hinted = painted
             .iter()
-            .position(|(draft, _, hint, _)| draft == "/s" && hint == "teer")
+            .position(|(draft, _, hint, _)| draft == "/s" && hint == "ave")
             .expect("the hint is painted before Tab is pressed");
         assert!(
             painted[hinted + 1..]
                 .iter()
-                .any(|(draft, cursor, _, _)| draft == "/steer" && *cursor == 6),
+                .any(|(draft, cursor, _, _)| draft == "/save" && *cursor == 5),
             "accepting a hint must repaint the row: {painted:?}"
         );
     }
@@ -1571,7 +1573,7 @@ mod tests {
         let (outcome, _) = read_bytes(b"/s\t\r");
         assert_eq!(
             submitted(&outcome),
-            "/steer",
+            "/save",
             "Enter after Tab submits the completed draft"
         );
     }
@@ -1583,7 +1585,7 @@ mod tests {
     /// invented here: a control byte during a search accepts the current
     /// match and leaves the search, and the re-fed Tab then raises
     /// `CompleteRequest` against that accepted draft. Since a history line is
-    /// not a bare slash prefix, `typeahead_slash_hint` is empty and Tab adds
+    /// not a bare slash prefix, `idle_slash_hint` is empty and Tab adds
     /// nothing -- the draft is the match, the status is gone from the row,
     /// and the read continues.
     #[test]
@@ -3935,6 +3937,33 @@ mod tests {
         }
     }
 
+    /// Card T0-S17, finding F30. `/s` at the idle prompt hints `ave`, which
+    /// completes the lead palette entry, so the row gets its palette instead
+    /// of standing down.
+    #[test]
+    #[serial]
+    fn paint_composer_opens_a_palette_for_a_single_letter_prefix() {
+        let _state = GlobalState::capture();
+        let (guard, _out, err) = install_inline(24, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let hint = crate::idle_slash_hint("/s");
+        assert_eq!(hint, "ave", "the idle hint must complete the lead entry");
+        let before = err.text().len();
+
+        guard.paint_composer("kitsu> ", "/s", 2, &hint, false, true);
+
+        let tail = err.text()[before..].to_string();
+        assert!(
+            tail.contains('\u{256d}') && tail.contains("slash commands"),
+            "/s must now open the palette box: {tail:?}"
+        );
+        assert!(
+            tail.contains("save"),
+            "and the box must lead with the registry's first /s match: {tail:?}"
+        );
+        drop(guard);
+    }
+
     /// Test S16-8. The regression net for the whole card: a draft that is not
     /// a slash prefix paints exactly the bytes it paints today -- one row,
     /// byte for byte `paint_draft`'s, with no region bytes, because the height
@@ -3948,7 +3977,13 @@ mod tests {
         let _state = GlobalState::capture();
         for (draft, cursor, hint, reserved) in [
             ("half-typed", 10usize, "", false),
-            ("/s", 2, "teer", false),
+            // Card T0-S17, finding F30: `/s` with the mid-turn hint `teer`
+            // used to land here, because the disagreeing hint stood the
+            // palette down. At the idle prompt `/s` now hints `ave`, which
+            // agrees with the lead entry, so it is a *palette* case --
+            // pinned by `paint_composer_opens_a_palette_for_a_single_letter_prefix`.
+            // `/context` replaces it: a whole command name, still one row.
+            ("/context", 8, "", false),
             ("hello /co", 9, "", false),
         ] {
             let (guard, _out, err) = install_inline(24, 1, "status: idle");
