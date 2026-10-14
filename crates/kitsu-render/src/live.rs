@@ -879,6 +879,28 @@ pub(crate) fn set_spinner_segment(segment: Option<String>) {
     redraw();
 }
 
+/// Compose the inline viewport's pinned input row: *exactly* the classic
+/// during-turn row for the same draft, minus the spinner and the queue and
+/// agent tags the inline surface does not have.
+///
+/// Additive by design. The inline renderer needs the same hint handling this
+/// module already implements -- a reserved reverse-search status that claims
+/// its columns before the draft is windowed, an unreserved completion suffix
+/// dropped when the row is tight -- and reimplementing that math in `kitsu`
+/// is how the two renderers drift. So the inline path delegates here instead
+/// of concatenating its own row, and `compose_row` stays untouched.
+pub fn compose_input_row(draft: &LiveDraft, cols: usize) -> (String, Option<usize>) {
+    compose_row(None, Some(draft), 0, 0, 0, cols)
+}
+
+/// The width of the terminal the live row draws on, shared so the inline
+/// guard -- which is handed only a row count -- does not re-probe the
+/// terminal itself. A second probe is a second source of truth, which is the
+/// drift this seam exists to prevent. Never 0: the probe falls back to 80.
+pub fn terminal_columns() -> usize {
+    terminal_cols()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1677,5 +1699,108 @@ mod tests {
             crate::stderr_styled() && !crate::plain_mode(),
             "re-enabling restores the original predicate exactly"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The inline viewport's shared composition surface.
+    //
+    // The inline renderer (`KITSU_TUI=inline`) paints its own pinned row and
+    // has no spinner, queue tag or agent tag to place, but it needs exactly
+    // the hint handling this module already implements: a reserved
+    // reverse-search status that claims its columns before the draft is
+    // windowed, and an unreserved slash-completion suffix that is dropped
+    // when the row is tight. Reimplementing that math in `kitsu` is how the
+    // two renderers drift, so the inline path composes through here.
+    //
+    // `compose_input_row` is therefore required to be a thin, *additive*
+    // wrapper over `compose_row` -- test 1 below pins equality with the
+    // classic row rather than re-deriving the expected string, so the two
+    // renderers cannot disagree about a draft they were told the same thing
+    // about.
+    // ------------------------------------------------------------------
+
+    /// The inline row is byte-identical to the classic row for the same
+    /// draft, with no spinner and no tags. Equality against `compose_row`,
+    /// not against a literal: the point is shared composition, so anything
+    /// that makes the inline row differ -- including a future change to
+    /// windowing or hint placement -- must break this.
+    #[test]
+    fn compose_input_row_is_the_classic_row_without_spinner_or_tags() {
+        for (buffer, cursor, hint, reserved, cols) in [
+            ("/s", 2usize, "teer", false, 80usize),
+            ("hello", 5, "", false, 80),
+            (
+                "a long matched history entry, long enough that it must window",
+                61,
+                "  ⌕ reverse-search 'match'",
+                true,
+                64,
+            ),
+            ("abcdefghij", 4, "klm", false, 14),
+        ] {
+            let draft = LiveDraft {
+                prompt: "kitsu> ".to_string(),
+                buffer: buffer.to_string(),
+                cursor,
+                hint: hint.to_string(),
+                hint_reserved: reserved,
+            };
+            assert_eq!(
+                compose_input_row(&draft, cols),
+                compose_row(None, Some(&draft), 0, 0, 0, cols),
+                "the inline row must BE the classic row for {buffer:?} at {cols} cols"
+            );
+        }
+    }
+
+    /// The unreserved slash hint renders dimmed immediately after the draft,
+    /// and the cursor column stays *before* it so typing continues over it.
+    #[test]
+    fn compose_input_row_renders_an_unreserved_hint_dimmed_after_the_draft() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "/s".to_string(),
+            cursor: 2,
+            hint: "teer".to_string(),
+            hint_reserved: false,
+        };
+        let (row, col) = compose_input_row(&draft, 80);
+        assert_eq!(sanitize_terminal_text(&row), "kitsu> /steer");
+        assert!(
+            row.contains("\u{1b}[2mteer"),
+            "hint must be dimmed: {row:?}"
+        );
+        // 7 prompt columns + 2 typed chars, 1-based: before the hint.
+        assert_eq!(col, Some(10));
+    }
+
+    /// The whole point of the reserved flag: a reverse-search status survives
+    /// a draft long enough to compete for every column on the row.
+    #[test]
+    fn compose_input_row_keeps_a_reserved_hint_against_a_competing_draft() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "a very long matched history entry indeed, long enough to window".to_string(),
+            cursor: 63,
+            hint: "  ⌕ reverse-search 'match'".to_string(),
+            hint_reserved: true,
+        };
+        let (row, _) = compose_input_row(&draft, 64);
+        let plain = sanitize_terminal_text(&row);
+        assert!(
+            plain.contains("⌕ reverse-search 'match'"),
+            "the reserved status must survive a windowed draft: {plain:?}"
+        );
+        assert!(plain.contains('…'), "the draft yields columns: {plain:?}");
+        assert!(display_width(&plain) <= 64, "row overflows: {plain:?}");
+    }
+
+    /// The inline guard has no column count of its own (it is handed only a
+    /// row count), so the width probe is shared from here too rather than
+    /// re-ioctl'd in `kitsu`. It must never be 0, or every draft would
+    /// compose to an empty row.
+    #[test]
+    fn terminal_columns_is_never_zero() {
+        assert!(terminal_columns() > 0);
     }
 }

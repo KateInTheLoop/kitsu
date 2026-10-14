@@ -1131,3 +1131,69 @@ fn inline_mode_suspends_and_resumes_with_the_draft_intact() {
         session.screen_dump()
     );
 }
+
+/// The hint script: type the slash prefix `/cont` at the idle prompt and
+/// leave it unsubmitted, then finish the command by hand and leave.
+///
+/// `/cont` is a prefix of exactly one registry command, `/context`, so the
+/// completion hint for it is the remainder `ext`. Both inputs trigger on
+/// something that exists today -- `RAW_MODE_MARKER` for the first keystroke
+/// (output proves the program is alive, not that it has taken the terminal)
+/// and the draft's own echo for the second -- so the measurement fails on its
+/// assertion rather than on the driver's deadline.
+fn type_slash_prefix_then_quit() -> Vec<Step> {
+    vec![
+        Step {
+            trigger: RAW_MODE_MARKER,
+            send: "/cont",
+        },
+        Step {
+            trigger: "/cont",
+            send: "ext\r",
+        },
+        Step {
+            trigger: "context window source",
+            send: "/quit\r",
+        },
+    ]
+}
+
+/// Test 9. **The hint slot, end to end.** With `/cont` typed and nothing
+/// submitted, the pinned viewport row must read `kitsu> /context`: the five
+/// typed characters plus the dimmed completion remainder `ext`. The draft
+/// itself is still only `/cont`, which the submission half proves -- the
+/// three characters sent next are `ext`, and that is what makes the command
+/// run.
+///
+/// Dimness is not asserted here (the screen model carries text, not
+/// attributes); the unit tests pin the SGR bytes. What this adds is that the
+/// hint is actually wired through the real reader, the real guard and the
+/// real viewport row, and lands on the pinned row rather than inside the
+/// scroll region.
+#[test]
+#[serial]
+fn inline_mode_shows_the_slash_completion_hint_on_the_viewport_row() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &type_slash_prefix_then_quit());
+
+    let typed = session.screen_at(1);
+    let viewport = &typed[(ROWS - 1) as usize];
+    assert!(
+        viewport.contains("/context"),
+        "the pinned row must show the draft plus its completion hint, but it \
+         reads {viewport:?}; whole screen:\n{}",
+        Session::dump(&typed)
+    );
+
+    // The hint is display-only: the three characters sent after it are what
+    // completes the command, so the submitted line was `/cont` + `ext`.
+    let after = session.screen_at(2);
+    assert!(
+        after[..(ROWS - 1) as usize]
+            .iter()
+            .any(|row| row.contains("context window source")),
+        "the hint must not have been submitted as text; whole screen:\n{}",
+        Session::dump(&after)
+    );
+}
