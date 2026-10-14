@@ -2873,3 +2873,117 @@ Recorded rather than fixed because it is a **mode-resolution decision** with its
 own acceptance, and T3-S7a had no mandate to change which renderer a flag
 selects. R7 has been clarified to state the exclusion explicitly rather than
 leave it implied.
+
+## F54 — "Ctrl+C is swallowed at an approval prompt" is measured, but its cause is probably the harness
+
+The T3-S7b test author measured, honestly and reproducibly, that sending `\x03`
+at an approval prompt does **nothing**: it is echoed as the two characters `^C`
+and left in the line buffer, so `\x03` followed by `/quit` is read as the single
+answer `^C/quit`, rejected as invalid, and denied. It reported this as a
+pre-existing UX hole identical in classic and inline.
+
+**The measurement is real. The stated cause is probably wrong, and I nearly let
+it through as a product defect.**
+
+The code's intent is explicit, at `main.rs:14668-14673`:
+
+> ISIG is cleared so Ctrl+C reaches the editor as a byte … **Approval handoffs
+> restore the original termios (ISIG on), so approval prompts keep kernel
+> Ctrl+C.**
+
+And `RawStdinGuard::drop` really does `tcsetattr(…, &self.original)` — the
+snapshot taken before `ICANON|ECHO|ISIG` were cleared. So at the approval read
+`ISIG` should be **on**, and `\x03` should raise `SIGINT`.
+
+**The likely explanation is the test harness, not the product.** The observed
+combination — `^C` **echoed** (so `ECHO` on) but **no signal** (so no SIGINT
+delivered) — is exactly what happens when the terminal discipline is restored
+correctly but the child **is not in the pseudo-terminal's foreground process
+group**. The kernel delivers `SIGINT` to the foreground group of the controlling
+terminal; a child that never called `setsid`/`tcsetpgrp` on the slave does not
+receive it, and `\x03` stays an ordinary byte. The harness spawns the child with
+the slave on all three descriptors and does not establish a session.
+
+**Two competing explanations, neither yet settled:**
+1. **Harness artefact** (my hypothesis, from the echo-without-signal signature
+   and the absence of any session setup): real users at a real terminal *do* get
+   Ctrl+C at approvals, exactly as the comment claims, and nothing is broken.
+2. **Real defect**: something between the handoff and the read leaves `ISIG`
+   off, and the comment documents an intent the code does not achieve.
+
+**Why this matters more than the bug would.** If (1) is true and someone
+"fixes" the hole — by mapping `\x03` in the reader, say — they would be adding a
+second Ctrl+C path that only exists because a test could not deliver a signal,
+and real terminals would then have two. Worse, a test asserting the mapped
+behaviour would **lock the artefact in**.
+
+**How to settle it, cheaply:** check whether the harness's child is the
+foreground process group of the slave (`tcgetpgrp` on the slave versus the
+child's pgid), or run kitsu by hand in a real terminal and press Ctrl+C at a
+permission prompt. One minute of either answers it. **Nobody should write code
+against this until that is done.**
+
+The general lesson, and it is the mirror of F43: **a measurement is evidence of
+behaviour, not evidence of cause.** F43 recorded a mechanism nobody had traced;
+this is a trace that stopped one layer short — the agent proved *what* happened
+inside its harness and then attributed it to the product, which is a different
+claim requiring different evidence.
+
+## F55 — an unfair mutex starved the in-loop approval read, and the hazard was already documented
+
+Hit and fixed inside T3-S7b. Worth recording because the bug was **predicted by a
+comment already in the file**, and because it is the exact failure the
+rendering/protocol split was created to isolate.
+
+**The bug.** The first version of the in-loop approval read serialized on
+`APPROVAL_INPUT_LOCK` — the mutex the existing claim path uses. In **release
+only**, three approval tests (two of them T3-S7a's, i.e. previously passing)
+timed out at the first script step with the modal never painted. Cause: the
+typeahead collector `try_lock`s that mutex **every 50 ms tick**, and
+`std::sync::Mutex` is **unfair**, so the prompter — which deliberately publishes
+no claim — was starved indefinitely. Release suite: **107.96 s with 3 failures**
+before, **12.4 s with 0** after.
+
+**The hazard was already written down.** `ApprovalInputGuard::enter`'s own
+comment describes precisely this: "the type-ahead loop can observe false … and
+reacquire it indefinitely". The first implementation reused the lock *because*
+it looked like the right lock, and walked into the failure the comment exists to
+warn about.
+
+**The fix** is a separate `APPROVAL_PANE_READ_LOCK` that the collector never
+touches, documented at the static with the measurement. Across the
+publish-and-block the prompter holds **only** that mutex, does not hold
+`APPROVAL_INPUT_LOCK`, and does not increment `APPROVAL_INPUT_ACTIVE` — so the
+collector never drops its guard and never waits on anything the prompter owns.
+
+**Three lessons, in order of how much they will save someone:**
+1. **A lock that "is clearly the right lock" may be the wrong one when one side
+   polls it.** `try_lock` in a tick loop is not a fair queue; it is a repeated
+   coin-toss that a blocked waiter loses forever. Any mutex touched by a polling
+   loop should be treated as unavailable to anything that needs to *wait*.
+2. **Release-only concurrency failures are real and cheap to miss.** All three
+   failures reproduced in release and none in debug — the tick loop simply wins
+   the race more reliably when the code is fast. A card gated only on a debug
+   run would have shipped this.
+3. **The bounded test is what turned a hang into a diagnosis.** Every PTY test
+   in this suite dies at a 20-second deadline with the whole transcript
+   attached, so the starvation surfaced as three named failures with evidence
+   rather than as a suite that hung. That bound was worth insisting on.
+
+## F45 closed — the duplicate command answer parser is retired
+
+F45's one-parser rule had a violation nobody had noticed: `CliCommandPrompter`
+carried its **own** inline `match` on `y|yes|a|always|n|no`, with its own
+trimming, bracketed-paste stripping and lowercasing, rather than calling the
+shared `parse_permission_answer` that the filesystem prompter and `/jobs reply`
+both use. The T3-S7b test author found it while checking how a keypress should
+map onto the shared parser.
+
+It is now retired: the command prompter calls `parse_permission_answer` and maps
+`Decision → CommandDecision`, with the invalid-answer branch unchanged.
+Behaviour-identical by inspection — same trims, same lowercase, same three
+answers — and confirmed by the unchanged binary, CLI and command-modal suites.
+
+**One parser now serves all three answer surfaces**: the filesystem approval, the
+command approval, and `/jobs reply`. The finding that named the rule is finally
+true of the code.

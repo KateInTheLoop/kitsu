@@ -3517,3 +3517,576 @@ fn classic_mode_approval_bytes_are_unchanged_by_the_pane_modal() {
         addressed_pane_writes(&session)
     );
 }
+
+// ===========================================================================
+// T3-S7b: the approval answer is read IN-LOOP and leaves the transcript alone.
+//
+// T3-S7a shipped the paint and deliberately left the read alone: the approval
+// reader runs in **canonical mode with echo** because `run_live_typeahead`'s
+// `if APPROVAL_INPUT_ACTIVE.load(..) > 0` arm drops the `RawStdinGuard` and
+// calls `live_input_end()` "for the approval reader", so the kernel echoes
+// the typed answer wherever the cursor is parked -- which in inline mode is
+// the scroll region, below a tidy modal. This section pins the fix.
+//
+// # What is being pinned, and what is deliberately not
+//
+// Nothing here says *how* the read moves in-loop, and nothing here mentions
+// `APPROVAL_INPUT_ACTIVE`. The protocol also serves **classic** styled mode
+// (`typeahead_live_prompt` is `Some` whenever `!assistive_input &&
+// stdin_is_tty() && stderr_styled()`, with no condition on `[tui] mode`), so
+// `classic_mode_still_echoes_the_approval_answer_in_the_transcript` below
+// pins that classic's canonical, echoing, line-edited read is **untouched** --
+// which it must be, since a raw single-key read would take line editing and
+// backspace away from a mode whose approval read is deliberately canonical.
+//
+// # Triggers (finding F46)
+//
+// Every trigger is a byte the child emits today *and* after the change: the
+// prompt's own header text (composed from the same strings either way),
+// `TURN_DONE_MARKER`, and `RAW_MODE_MARKER`. No test here triggers on a pane
+// paint or on the `> ` cue, because the cue is exactly what moves.
+//
+// # Bound (finding F46 again)
+//
+// Every session below runs under the harness's `DEADLINE` (20s): the driver
+// kills the child and panics with the whole transcript attached, so a read
+// that never resolves -- the deadlock this card's risk lives in -- **fails**
+// with evidence rather than hanging the suite.
+// ===========================================================================
+
+/// The trigger the interrupt test waits on once the approval read has been
+/// closed: the notice the failed turn prints, **discovered from a measured
+/// transcript** rather than guessed (finding **F46**).
+const INTERRUPTED_MARKER: &str = "authority input closed";
+
+/// How the interrupt test closes the approval read.
+///
+/// Measured, not assumed (findings **F43**/**F47**): under this harness
+/// **Ctrl+C does not interrupt an approval prompt at all**. At the approval
+/// moment the read is canonical and `ISIG` is *off*, so `\x03` is echoed as
+/// the two characters `^C` and left in the line buffer -- a probe that typed
+/// `\x03` and then `/quit` had `read_approval_line` return the single line
+/// `^C/quit` and answer "invalid permission response; denied". This is
+/// pre-existing and mode-independent: classic and inline behave identically.
+///
+/// `\x04` is the reachable driver. In canonical mode `ICANON` turns it into
+/// a zero-length read, which `read_approval_line` maps to `None` and the
+/// prompter to `Decision::Interrupt`; after the move in-loop it is the byte
+/// `kitsu_editor` already resolves to `EditorAction::Eof`. Either way it is
+/// "the approval read was closed without a decision", which is exactly the
+/// case T3-S7a's dismiss path exists for.
+const APPROVAL_EOF: &str = "\x04";
+
+/// Every cursor address `ESC[<n>;1H` in `text`, as `(start, line, end-of-sequence)`.
+///
+/// The same scan [`addressed_pane_writes`] performs inline, lifted to a bare
+/// `&str` so the helpers below can read a *window* of the stream (between two
+/// scripted marks) rather than only the whole session.
+fn cursor_addresses(text: &str) -> Vec<(usize, u16, usize)> {
+    let bytes = text.as_bytes();
+    let mut addresses = Vec::new();
+    let mut index = 0usize;
+    while index + 2 < bytes.len() {
+        if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 2;
+        let digits = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor > digits && bytes[cursor..].starts_with(b";1H") {
+            let line = text[digits..cursor].parse::<u16>().unwrap_or(0);
+            addresses.push((index, line, cursor + 3));
+            index = cursor + 3;
+            continue;
+        }
+        index += 1;
+    }
+    addresses
+}
+
+/// The part of `text` that **is the transcript**: everything no pinned-row
+/// write owns, with CSI escapes stripped.
+///
+/// This is the inverse of [`pane_rows`], and it rests on the same two facts
+/// that file documents: `InlineSurface::paint` draws a pinned row as
+/// `ESC[<line>;1H ESC[2K <row>`, and a transcript line is written with **no
+/// addressing at all** (`transcript_line`: text plus CRLF, "no escape bytes
+/// whatever"). So the stream splits at every cursor address: a segment
+/// introduced by an address that is immediately followed by `ESC[2K` is a
+/// pinned-row write and belongs to the pane; the stream's head, and the tail
+/// after a paint's cursor park, are transcript.
+///
+/// In classic mode no address is ever emitted, so this is the identity on
+/// classic's bytes -- which is what makes the classic guard below compare
+/// like with like.
+fn transcript_text(text: &str) -> String {
+    let addresses = cursor_addresses(text);
+    let mut out = String::new();
+    let mut keep_from = Some(0usize);
+    for (position, (start, _, end)) in addresses.iter().copied().enumerate() {
+        if let Some(from) = keep_from.take() {
+            out.push_str(&text[from..start]);
+        }
+        let row_write = text.as_bytes()[end..].starts_with(b"\x1b[2K");
+        if !row_write {
+            // A park, not a row write: what follows it is transcript, up to
+            // the next address (or the end of the window).
+            keep_from = Some(end);
+            continue;
+        }
+        let _ = position;
+    }
+    if let Some(from) = keep_from {
+        out.push_str(&text[from..]);
+    }
+    strip_csi(&out)
+}
+
+/// The transcript lines the child wrote **after** scripted action `step`,
+/// trimmed, with blanks dropped. `marks[step]` is the stream position just
+/// *before* that step's bytes went in, so `transcript_lines_after(s, 1)` of a
+/// gated-read session is "everything the transcript gained from the moment
+/// the answer was typed".
+fn transcript_lines_after(session: &Session, step: usize) -> Vec<String> {
+    let tail = String::from_utf8_lossy(&session.raw[session.marks[step]..]).into_owned();
+    transcript_text(&tail)
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The same, for the window between two scripted actions.
+fn transcript_lines_between(session: &Session, from: usize, to: usize) -> Vec<String> {
+    let window =
+        String::from_utf8_lossy(&session.raw[session.marks[from]..session.marks[to]]).into_owned();
+    transcript_text(&window)
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// [`pane_rows`] over a window of the stream: rows painted into the pinned
+/// pane after scripted action `step`.
+fn pane_rows_after(session: &Session, step: usize) -> Vec<String> {
+    let tail = String::from_utf8_lossy(&session.raw[session.marks[step]..]).into_owned();
+    let addresses = cursor_addresses(&tail);
+    let bytes = tail.as_bytes();
+    let mut rows = Vec::new();
+    for (position, (_, line, end)) in addresses.iter().copied().enumerate() {
+        if !bytes[end..].starts_with(b"\x1b[2K") {
+            continue;
+        }
+        if line <= ROWS - PANE_MAX || line > ROWS {
+            continue;
+        }
+        let from = end + 4;
+        let to = addresses
+            .get(position + 1)
+            .map(|(start, _, _)| *start)
+            .unwrap_or(bytes.len());
+        if to <= from {
+            continue;
+        }
+        rows.push(strip_csi(&tail[from..to]));
+    }
+    rows
+}
+
+/// A turn that asks to read **two** files, one gate round each, then answers
+/// in prose. `a` on the first prompt must grant the directory and skip the
+/// second gate; `y` must not.
+fn gated_two_read_turns(first: &Path, second: &Path) -> Vec<Turn> {
+    let mut turns = Vec::new();
+    for (index, path) in [first, second].iter().enumerate() {
+        turns.push(Turn {
+            events: vec![
+                tool_call(
+                    &format!("gated-two-{index}"),
+                    "fs_read_file",
+                    &format!(
+                        "{{\"path\":{}}}",
+                        serde_json_string(&path.to_string_lossy())
+                    ),
+                ),
+                finish("tool_calls"),
+            ],
+            gap: Duration::from_millis(30),
+        });
+    }
+    turns.push(Turn {
+        events: vec![delta("GATE_ROUND_DONE\n"), finish("stop")],
+        gap: Duration::from_millis(30),
+    });
+    turns
+}
+
+/// The receipt line an approved read of `path` leaves in the transcript.
+fn expected_receipt(path: &Path) -> String {
+    format!("◉ permission — kitsu wants to read {}", path.display())
+}
+
+/// Every `◉ permission — …` line in the **transcript**, in stream order.
+///
+/// [`permission_receipts`] reads the whole byte stream, so in inline mode it
+/// also matches the modal's own header *paint* -- a measured fact: a denied
+/// session's whole-stream receipts are
+/// `["◉ permission — … [y] allow once · … · [n] deny> n", "◉ permission — …"]`,
+/// because the pane's rows are addressed rather than newline-separated and so
+/// collapse into one "line". [`transcript_text`] drops every addressed row by
+/// construction, which leaves exactly the committed receipts.
+fn transcript_receipts(session: &Session) -> Vec<String> {
+    transcript_text(&session.raw_text())
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| line.starts_with("◉ permission —"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// **T3-S7b, the card's user-visible point.** In inline mode the typed answer
+/// is **not** echoed into the scroll region: the first thing the transcript
+/// gains from the moment the answer is typed is the `◉ permission —` receipt
+/// itself.
+///
+/// Per finding **F41** this pins what the transcript *is* rather than banning
+/// a substring: the assertion is an `assert_eq!` on the first transcript line
+/// after the answer. Today that line is `y` -- the kernel's echo, printed
+/// because the approval read is canonical with echo -- and after the change
+/// it must be the receipt.
+///
+/// The negative is not vacuous three times over: the gate demonstrably fired,
+/// the round-trip demonstrably **completed** (so a session that never
+/// answered, or one that deadlocked waiting for a key, fails here rather than
+/// passing by emitting nothing), and the receipt that must be first is
+/// asserted to be present at all.
+///
+/// Bound: the harness `DEADLINE` (20s), after which the driver kills the
+/// child and panics with the transcript.
+#[test]
+#[serial]
+fn inline_mode_approval_answer_never_reaches_the_transcript() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+
+    let session = gated_read_session(Some("inline"), &forbidden, &[]);
+    let text = strip_csi(&session.raw_text());
+
+    // Non-vacuity, part one: the gate fired and the answer carried the turn.
+    assert!(
+        text.contains("kitsu wants to read"),
+        "the read of {} must reach the approval gate; raw:\n{}",
+        forbidden.display(),
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        text.contains("GATE_ROUND_DONE"),
+        "the approval round-trip must COMPLETE -- this is what stops a \
+         never-answered or deadlocked read from satisfying the absence \
+         below; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    // Non-vacuity, part two: there IS a receipt in the window being read.
+    let lines = transcript_lines_after(&session, 1);
+    let receipt = expected_receipt(&forbidden);
+    assert!(
+        lines.contains(&receipt),
+        "the receipt {receipt:?} must be in the transcript after the answer; \
+         the transcript gained {lines:#?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    // The card: what the transcript gains first is the receipt, not the key.
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some(receipt.as_str()),
+        "T3-S7b: the first thing the transcript gains after the answer is \
+         typed must be the receipt and not the echoed answer; it gained \
+         {lines:#?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+}
+
+/// **T3-S7b, where the cue goes.** The `> ` cue belongs on a pinned pane row
+/// with the rest of the modal, not in the scroll region.
+///
+/// The negative is pinned over the window from the prompt submission to the
+/// answer, and it is not vacuous: the window is asserted to carry transcript
+/// lines at all (the turn's own output), and the cue is demonstrably in that
+/// window today -- it is the last thing `CliPrompter::ask` prints before the
+/// read (`eprint!("> ")` in the pane-painted branch).
+///
+/// The positive assertion -- a pinned row ending in the cue -- is the one
+/// place in this section that encodes a *design* choice: that the cue is
+/// relocated rather than replaced by something with no `>` in it. If the
+/// implementation renders the cue differently, this assertion is the one to
+/// revisit; the negative above is the requirement.
+///
+/// Bound: the harness `DEADLINE` (20s).
+#[test]
+#[serial]
+fn inline_mode_approval_cue_is_painted_on_a_pinned_row_not_in_the_transcript() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+
+    let session = gated_read_session(Some("inline"), &forbidden, &[]);
+
+    let window = transcript_lines_between(&session, 0, 1);
+    assert!(
+        !window.is_empty(),
+        "the transcript must gain lines between the prompt and the answer, \
+         or the absence below says nothing; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        !window.iter().any(|line| line == ">"),
+        "T3-S7b: the `> ` cue must not be written into the scroll region; \
+         the transcript gained {window:#?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    let rows = pane_rows(&session);
+    assert!(
+        !rows.is_empty(),
+        "this session must paint the pinned pane at all; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        rows.iter().any(|row| row.trim_end().ends_with('>')),
+        "T3-S7b: the cue the user types at belongs on a pinned pane row; the \
+         pane painted {} row(s): {rows:#?}",
+        rows.len()
+    );
+}
+
+/// **T3-S7b, the classic guard.** Classic styled mode's approval read stays
+/// canonical **with echo**: the cue is in the scroll region and the typed
+/// answer is echoed there, exactly as today.
+///
+/// This is the test that catches an over-broad fix. The typeahead collector
+/// and its `APPROVAL_INPUT_ACTIVE` protocol run in classic too
+/// (`typeahead_live_prompt` has no condition on `[tui] mode`), and classic has
+/// no pane to paint a modal into; a raw single-key read there would silently
+/// take line editing and backspace away from a mode whose approval read is
+/// deliberately canonical. Together with T3-S7a's
+/// `classic_mode_approval_bytes_are_unchanged_by_the_pane_modal` (the option
+/// line, the receipt and "no addressed rows at all") this is classic's
+/// byte-identity net.
+///
+/// Passes today, by construction: it is the regression half of the card.
+///
+/// Bound: the harness `DEADLINE` (20s).
+#[test]
+#[serial]
+fn classic_mode_still_echoes_the_approval_answer_in_the_transcript() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+
+    let session = gated_read_session(None, &forbidden, &[]);
+
+    let window = transcript_lines_between(&session, 0, 1);
+    assert!(
+        window.iter().any(|line| line == ">"),
+        "classic's `> ` cue stays in the scroll region; the transcript \
+         gained {window:#?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    let after = transcript_lines_after(&session, 1);
+    assert_eq!(
+        after.first().map(String::as_str),
+        Some("y"),
+        "classic's answer is still echoed by the kernel into the scroll \
+         region, so the first line the transcript gains after the answer is \
+         the echo; it gained {after:#?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        addressed_pane_writes(&session).is_empty(),
+        "classic installs no viewport, so it addresses no row at all; it \
+         wrote {:#?}",
+        addressed_pane_writes(&session)
+    );
+}
+
+/// **T3-S7b, `a` through the shared parser.** `a` is `AllowAlways`: the
+/// directory is granted, so the second file in it is **not** gated and there
+/// is exactly one receipt.
+///
+/// Not vacuous, and self-validating: the script answers **once**, so if `a`
+/// were resolved as anything but `AllowAlways` the second round would gate
+/// again, no answer would ever come, and the session would fail on its third
+/// trigger at the harness deadline. Passing therefore requires both that the
+/// second file was really read and that it was never gated.
+///
+/// Bound: the harness `DEADLINE` (20s).
+#[test]
+#[serial]
+fn inline_mode_allow_always_grants_the_whole_directory() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let first = outside.path().join("secret-one.txt");
+    let second = outside.path().join("secret-two.txt");
+    fs::write(&first, "one").expect("write the first gated file");
+    fs::write(&second, "two").expect("write the second gated file");
+    let home = TempDir::new().expect("temp home");
+
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "read the files\r"),
+            send("kitsu wants to read", "a\n"),
+            send(TURN_DONE_MARKER, "/quit\r"),
+        ],
+        gated_two_read_turns(&first, &second),
+        &[],
+    );
+
+    assert!(
+        strip_csi(&session.raw_text()).contains("GATE_ROUND_DONE"),
+        "the second read must run after the grant; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        strip_csi(&session.raw_text()).contains(&format!("{}", second.display())),
+        "the second file must really have been read; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert_eq!(
+        transcript_receipts(&session),
+        vec![expected_receipt(&first)],
+        "`a` grants the directory, so the second file is never gated and the \
+         session leaves exactly one receipt; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    let lines = transcript_lines_after(&session, 1);
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some(expected_receipt(&first).as_str()),
+        "and `a` is not echoed into the transcript either; it gained \
+         {lines:#?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+}
+
+/// **T3-S7b, `n` through the shared parser.** `n` is `Deny`: the tool call
+/// fails with the policy denial, the turn still finishes, one receipt is
+/// left, and the key is not echoed.
+///
+/// Bound: the harness `DEADLINE` (20s).
+#[test]
+#[serial]
+fn inline_mode_deny_refuses_the_read_and_the_turn_finishes() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+    let home = TempDir::new().expect("temp home");
+
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "read the file\r"),
+            send("kitsu wants to read", "n\n"),
+            send(TURN_DONE_MARKER, "/quit\r"),
+        ],
+        gated_read_turns(&forbidden),
+        &[],
+    );
+
+    let text = strip_csi(&session.raw_text());
+    assert!(
+        text.contains("GATE_ROUND_DONE"),
+        "a denial must still let the turn finish; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        text.contains("user denied read access to"),
+        "`n` must reach the gate as `Decision::Deny`, which is what makes \
+         this a test of the answer and not only of the turn; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert_eq!(
+        transcript_receipts(&session),
+        vec![expected_receipt(&forbidden)],
+        "a denial is a decision, so it leaves the same single receipt; \
+         raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    let lines = transcript_lines_after(&session, 1);
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some(expected_receipt(&forbidden).as_str()),
+        "and `n` is not echoed into the transcript; it gained {lines:#?}; \
+         raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+}
+
+/// **T3-S7b, the interrupt path T3-S7a added.** Closing the approval read
+/// without answering ([`APPROVAL_EOF`]) is `Decision::Interrupt`: there is
+/// no decision to record, so the modal is **dismissed** with no receipt, and the pane goes back to showing the
+/// status row.
+///
+/// The absences are not vacuous: the modal is asserted to have been painted
+/// in the first place (its header is on a pinned row), so there was something
+/// to dismiss, and the status row coming back on a pinned row *after* the
+/// interrupt is the positive proof the teardown ran rather than the pane
+/// simply having gone quiet.
+///
+/// Bound: the harness `DEADLINE` (20s). An interrupt that leaves the reader
+/// waiting fails on the third step's trigger, with the transcript attached.
+#[test]
+#[serial]
+fn inline_mode_interrupting_the_approval_dismisses_the_modal_without_a_receipt() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+    let home = TempDir::new().expect("temp home");
+
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "read the file\r"),
+            send("kitsu wants to read", APPROVAL_EOF),
+            send(INTERRUPTED_MARKER, "/quit\r"),
+        ],
+        gated_read_turns(&forbidden),
+        &[],
+    );
+
+    let rows = pane_rows(&session);
+    let header = expected_receipt(&forbidden);
+    assert!(
+        rows.iter().any(|row| row.trim() == header),
+        "the modal must have been painted before it can be dismissed; the \
+         pane painted {} row(s): {rows:#?}",
+        rows.len()
+    );
+    assert_eq!(
+        permission_receipts_after(&session, 1),
+        Vec::<String>::new(),
+        "an interrupt records no decision, so it commits no receipt; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    let after = pane_rows_after(&session, 1);
+    assert!(
+        after
+            .iter()
+            .any(|row| row.trim_start().starts_with(STATUS_ROW_MODEL)),
+        "after the dismissal the pane must go back to the status row, which \
+         is what proves the modal was torn down; the pane painted {} row(s) \
+         after the interrupt: {after:#?}",
+        after.len()
+    );
+}

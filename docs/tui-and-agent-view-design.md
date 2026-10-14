@@ -272,6 +272,24 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   re-parks the cursor and the receipt is glued to the status row instead of
   following the newline the kernel echoed with the answer.
 
+  **Where the answer is read, added in T3-S7b.** Where a pane is published the
+  answer is read **in-loop**, on the keypress, while the input collector still
+  holds its raw-mode guard — so the kernel echoes nothing and the answer never
+  reaches the transcript — and the `> ` cue is painted as a row of the modal.
+  Where no pane is published the read stays **canonical with echo**, which
+  classic and `--plain` rely on for line editing, backspace and the `yes` /
+  `always` / `no` long forms. That asymmetry is a **stated contract**, not an
+  implementation detail: a test pins that classic still echoes the answer into
+  its transcript, which is what catches a bypass that reaches too far.
+
+  Two consequences of the in-loop read, both deliberate: the long forms are
+  **unreachable by keypress** in the viewport (they remain available in classic
+  and in `/jobs reply`, which share the one parser), and a **bracketed paste**
+  at a viewport approval begins with `ESC`, which the parser rejects — so a
+  pasted answer is **denied** rather than accepted. Failing closed is the right
+  direction for a permission prompt, but it is a behaviour difference worth
+  knowing.
+
   **`--plain` is excluded.** The plain prompter has its own unstyled text
   (`permission> …`) and `--plain` is a **byte-contract tier**, so routing it
   through the shared modal composer would change bytes that other requirements
