@@ -781,17 +781,45 @@ explicitly drops. Ctrl+R narrows, a second Ctrl+R cycles, Ctrl+G restores the
 prior draft, and an accepted match is ordinary editable text. What is missing is
 the `⌕ reverse-search '…'` indicator.
 
-### The remaining losses share one cause, which makes them one card
+### A second correction: the remaining losses are not all one cause
 
-Tab completion, the slash-command palette **and** the reverse-search status
-indicator are all rendered into the during-turn row's **hint slot**. The inline
-paint callback is `(draft, cursor)` — there is nowhere to put a hint. So one
-seam change restores all three, and carding them separately would be three
-attempts at the same fix.
+**The first version of this section was also wrong**, and I caught it while
+scoping the follow-up card rather than after publishing it. It claimed Tab
+completion, the palette and the reverse-search indicator shared one cause and
+one fix. They do not.
 
-This narrows what blocks the default considerably: not "the inline prompt is
-missing most of what rustyline gave it", but "the inline paint seam carries no
-hint slot".
+What the during-turn row's **hint slot** actually carries is two things, both
+one line, both sharing the draft's row:
+- the **reverse-search status**, reserved, claiming its columns before the
+  draft is windowed;
+- the **inline slash-completion suffix** — `typeahead_slash_hint("/s")` returns
+  `"teer"`, the remainder of the best match, rendered dimmed after the draft and
+  dropped when the row is narrow.
+
+Widening the inline paint seam therefore restores **those two**, and that is
+T0-S9.
+
+The other two are separate — but they are **very** different sizes, which I
+also got wrong at first by assuming "completion" meant one thing:
+
+- **Tab completion has two tiers, and the cheap one is nearly free.** The
+  during-turn collector's entire Tab handling is seven lines
+  (`main.rs:14530-14538`): if an inline slash hint is showing, append it to the
+  buffer. Reaching parity with the during-turn row at the inline prompt is
+  therefore a *small* card, and a natural immediate follow-up to T0-S9 since
+  the hint is now computed there anyway. What is genuinely larger is
+  rustyline-level completion **lists** — `@file` path completion and the
+  bordered palette — which is the next bullet's problem.
+- **The bordered palette** (`╭ slash commands ╮`, filtered as you type, up to a
+  dozen rows) is a rustyline *helper* that draws over several rows. It needs a
+  viewport taller than one row, so it belongs with the multi-row composer and
+  interacts with F16 (resize) and F19 (short-terminal clamp).
+
+**Lesson, since this is the second over-claim in the same area:** "these share a
+cause" is a claim about code, and I made it twice from reading a summary rather
+than the call sites. Both times the correction came from reading what a function
+actually returns — `typeahead_slash_hint` returning `"teer"` is what settled it
+here.
 
 
 ## F22 — resolved: the suspend cycle now has end-to-end coverage

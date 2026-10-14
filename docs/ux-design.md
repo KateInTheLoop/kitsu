@@ -163,11 +163,20 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   resolved entirely inside `TypeaheadEditor`, which emits no action for it, so
   reverse search works at the inline prompt as it does in the during-turn row.
 
-  What does *not* work is Tab completion and the slash-command palette, and
-  the reverse-search status line goes with them: all three are rendered into
-  the during-turn row's **hint slot**, and the inline paint callback is
-  `(draft, cursor)` with nowhere to put a hint. One seam change restores all
-  three, which is why they are one card rather than three.
+  **The hint slot**, mirroring the during-turn row: the pinned row carries one
+  hint beside the draft — the reverse-search status (`⌕ reverse-search '…'`)
+  while Ctrl+R is active, otherwise the inline slash-completion suffix (typing
+  `/s` hints `teer`). The two differ in how they compete for columns, exactly as
+  in the classic row: the search status is **reserved** and claims its columns
+  before the draft is windowed, so it survives a long draft, while the
+  completion suffix is unreserved and is dropped when the row is too narrow.
+
+  Still absent at the inline prompt, and **separate pieces of work rather than
+  one** — an earlier version of this file wrongly said a single seam change
+  covered them: **Tab completion**, which needs the reader to act on the
+  editor's completion request rather than drop it, and **the bordered
+  slash-command palette**, which lists and filters commands over several rows
+  and so needs a viewport taller than one row.
 
   Tiering is unchanged: the viewport requires a styled interactive TTY, so
   non-TTY, `--plain`, assistive and JSONL sessions never enter it and stay
