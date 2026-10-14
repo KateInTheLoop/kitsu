@@ -28,9 +28,10 @@ shapes may change in any minor release.
   mode. Ctrl+\ is deliberately inert, because its usual action dumps core and
   this process holds credentials and conversation text in memory.
 
-  It is a preview and is still missing things Rustyline gave the idle prompt:
-  the slash-command palette, Tab completion, and history that persists across
-  sessions.
+  Command history persists across sessions in inline mode, and Ctrl+R reverse
+  search works — though not the status line that reports the query while you
+  search. Still missing from the inline prompt: the slash-command palette and
+  Tab completion.
 
 #### Background agents and herding
 

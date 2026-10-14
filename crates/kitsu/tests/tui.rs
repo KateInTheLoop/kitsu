@@ -79,6 +79,11 @@ struct Session {
     raw: Vec<u8>,
     parser: vt100::Parser,
     status: std::process::ExitStatus,
+    /// How many times the driver observed the child **stopped** (`WIFSTOPPED`)
+    /// and resumed it with `SIGCONT`. Always zero unless
+    /// [`Options::resume_on_stop`] was set, because the default poll cannot
+    /// see a stopped child at all (see `poll_child`).
+    stops: usize,
     /// `raw.len()` at the moment each scripted input was written, so a test
     /// can replay a *prefix* of the stream and see the screen as it stood
     /// mid-session rather than only after exit. `marks[1]` is the screen just
@@ -131,6 +136,44 @@ impl Session {
     }
 }
 
+/// What a session needs from the harness beyond its script.
+///
+/// The six measurements above all want the same thing — a throwaway session on
+/// a 24x80 PTY — and said so by passing nothing. Two later measurements need
+/// more: cross-session history cannot use `--no-session`, because loading and
+/// saving `~/.kitsu/history` is gated on `!no_session`; and the end-to-end
+/// suspend cycle needs a poll that can *see* a stopped child. Both are
+/// expressed here rather than by duplicating the ~120 lines of terminal setup,
+/// and `Default` is exactly what the six already-passing tests assume.
+#[derive(Clone, Copy)]
+struct Options {
+    /// Pass `--no-session` (the default). Clearing it turns session state on,
+    /// which is what makes `rl.load_history`/`rl.save_history` run.
+    no_session: bool,
+    /// Poll with `WUNTRACED` and send `SIGCONT` when the child is found
+    /// stopped, counting each stop into [`Session::stops`].
+    ///
+    /// Off by default because the default poll is `Child::try_wait`, i.e.
+    /// `waitpid(WNOHANG)` with no `WUNTRACED`: it reports a stopped child as
+    /// still running, so a session that suspends itself would simply poll to
+    /// the deadline.
+    resume_on_stop: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            no_session: true,
+            resume_on_stop: false,
+        }
+    }
+}
+
+/// The six original measurements' entry point: default [`Options`].
+fn run_styled_chat_pty(home: &Path, tui: Option<&str>, script: &[Step]) -> Session {
+    run_styled_chat_pty_with(home, tui, script, Options::default())
+}
+
 /// Run a **styled** interactive chat on a PTY of exactly `ROWS`x`COLS` and
 /// drive it with `script`.
 ///
@@ -138,7 +181,14 @@ impl Session {
 /// same discipline `tests/cli.rs` uses) and no `--plain`/`--no-stream`, so
 /// styling and the viewport are live. `tui` is the value of `KITSU_TUI`:
 /// `None` leaves it unset, which is classic mode.
-fn run_styled_chat_pty(home: &Path, tui: Option<&str>, script: &[Step]) -> Session {
+///
+/// `options` carries everything that is not the script; see [`Options`].
+fn run_styled_chat_pty_with(
+    home: &Path,
+    tui: Option<&str>,
+    script: &[Step],
+    options: Options,
+) -> Session {
     use std::io::{Read as _, Write as _};
     use std::os::fd::FromRawFd as _;
     use std::process::Stdio;
@@ -207,7 +257,58 @@ fn run_styled_chat_pty(home: &Path, tui: Option<&str>, script: &[Step]) -> Sessi
         .stdin(unsafe { Stdio::from_raw_fd(child_stdin) })
         .stdout(unsafe { Stdio::from_raw_fd(child_stdout) })
         .stderr(unsafe { Stdio::from_raw_fd(slave) })
-        .args(["--gateway", "example", "chat", "--no-session"]);
+        .args(["--gateway", "example", "chat"]);
+    if options.no_session {
+        command.arg("--no-session");
+    }
+    if options.resume_on_stop {
+        // Put the child in its own process group.
+        //
+        // This is what makes the suspend measurement independent of how the
+        // test runner was started, and it is not a nicety: POSIX says a
+        // process in an **orphaned** process group discards `SIGTSTP`
+        // entirely. Inherit the runner's group and whether Ctrl+Z stops the
+        // child depends on whether that group happens to be orphaned —
+        // measured here, the same test passed 5/5 under one shell invocation
+        // and failed 5/5 (never stopping, `stops == 0`) under a command
+        // substitution. With the child as its own group leader its parent is
+        // in a different group in the same session, so the group is never
+        // orphaned and the stop is deterministic.
+        //
+        // It cannot earn a `SIGTTIN` instead: this PTY is nobody's controlling
+        // terminal (the child is not a session leader and no `tcsetpgrp` is
+        // ever done), so the kernel applies no job-control access checks to
+        // it.
+        //
+        // SAFETY: `setpgid` is async-signal-safe and touches nothing in the
+        // forked child's address space, which is the whole constraint on
+        // `pre_exec`.
+        unsafe {
+            use std::os::unix::process::CommandExt as _;
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // ...and restore `SIGTSTP`'s default disposition, which is the
+                // other half of making this deterministic and was the half
+                // that actually bit. A `SIG_IGN` disposition survives both
+                // `fork` and `exec`, and a non-interactive shell ignores
+                // SIGTSTP/SIGTTIN/SIGTTOU in a forked subshell: measured on
+                // this machine, `/proc/self/status` reports `SigIgn`
+                // `0x0000000000001000` under a plain redirect but
+                // `0x0000000000381000` (bits 20/21/22 = SIGTSTP/TTIN/TTOU)
+                // inside a command substitution. The child inherited that, so
+                // `raise(SIGTSTP)` was a no-op and the test passed or failed
+                // according to how the suite happened to be invoked. Resetting
+                // it here gives the child the disposition a real user's
+                // terminal session would give it.
+                if libc::signal(libc::SIGTSTP, libc::SIG_DFL) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     match tui {
         Some(mode) => command.env("KITSU_TUI", mode),
         None => command.env_remove("KITSU_TUI"),
@@ -221,6 +322,7 @@ fn run_styled_chat_pty(home: &Path, tui: Option<&str>, script: &[Step]) -> Sessi
     let mut raw: Vec<u8> = Vec::new();
     let mut step = 0usize;
     let mut marks: Vec<usize> = Vec::new();
+    let mut stops = 0usize;
 
     let status = loop {
         let mut buffer = [0_u8; 8192];
@@ -245,7 +347,7 @@ fn run_styled_chat_pty(home: &Path, tui: Option<&str>, script: &[Step]) -> Sessi
             }
         }
 
-        if let Some(status) = child.try_wait().expect("poll styled carrier") {
+        if let Some(status) = poll_child(&mut child, options.resume_on_stop, &mut stops) {
             // Drain whatever the child wrote between the last read and exit.
             loop {
                 match terminal.read(&mut buffer) {
@@ -276,9 +378,62 @@ fn run_styled_chat_pty(home: &Path, tui: Option<&str>, script: &[Step]) -> Sessi
         raw,
         parser,
         status,
+        stops,
         marks,
     }
 }
+
+/// Poll the child once. `None` means still running.
+///
+/// With `resume_on_stop` clear this is plain `Child::try_wait`, which is what
+/// the original harness did and what the six measurements above run under.
+///
+/// With it set the poll becomes `waitpid(WNOHANG | WUNTRACED)`: `try_wait`
+/// omits `WUNTRACED`, so a child that has stopped itself with `SIGTSTP` is
+/// indistinguishable from one that is merely busy, and the driver would poll
+/// to its deadline. Here a stop is detected, counted, and answered with
+/// `SIGCONT` — which is the half of a suspend cycle the shell would normally
+/// perform — and the session continues.
+fn poll_child(
+    child: &mut std::process::Child,
+    resume_on_stop: bool,
+    stops: &mut usize,
+) -> Option<std::process::ExitStatus> {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    if !resume_on_stop {
+        return child.try_wait().expect("poll styled carrier");
+    }
+
+    let pid = child.id() as libc::pid_t;
+    let mut raw_status: libc::c_int = 0;
+    // SAFETY: `pid` is this harness's own child and `raw_status` is a valid
+    // out-pointer. Reaping here instead of through `Child::try_wait` is why
+    // the status is rebuilt with `ExitStatus::from_raw` below.
+    let waited = unsafe { libc::waitpid(pid, &mut raw_status, libc::WNOHANG | libc::WUNTRACED) };
+    if waited != pid {
+        // 0: nothing to report. -1: already reaped or gone; let the deadline
+        // or a later poll deal with it rather than panicking mid-session.
+        return None;
+    }
+    if libc::WIFSTOPPED(raw_status) {
+        *stops += 1;
+        // SAFETY: signalling a child this harness owns.
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+        return None;
+    }
+    Some(std::process::ExitStatus::from_raw(raw_status))
+}
+
+/// Every script that types at the *idle* prompt triggers its first input on
+/// `ESC[?2004h`, the bracketed-paste enable that `RawStdinGuard::engage`
+/// writes immediately after its `tcsetattr`. The banner is printed long before
+/// the reader engages, so a keystroke sent on it can reach a terminal that is
+/// still canonical with `ECHO`/`ISIG` on — where the tty echoes the draft
+/// itself (which is exactly what tests 5 and 6 assert must not happen) and
+/// swallows `0x1a` as its `VSUSP` character. Measured on the full suite, that
+/// race cost about 2 runs in 30 before this marker was adopted.
+const RAW_MODE_MARKER: &str = "\x1b[?2004h";
 
 /// The script both measurements run: submit `/help`, then `/quit`.
 ///
@@ -557,7 +712,7 @@ fn inline_mode_teardown_parks_below_the_transcript_and_clears_the_status_row() {
 fn type_context_then_quit() -> Vec<Step> {
     vec![
         Step {
-            trigger: "/help for commands",
+            trigger: RAW_MODE_MARKER,
             send: "/context",
         },
         Step {
@@ -718,4 +873,261 @@ fn inline_mode_raw_idle_input_does_not_staircase_command_output() {
             Session::dump(&screen)
         );
     }
+}
+
+/// Session 1 of the cross-session history measurement: submit `/context` at the
+/// idle prompt, then leave. `/context` is reused from the scripts above for the
+/// same reason — its name occurs nowhere in the startup output, so the first
+/// appearance of the string `/context` in session 2's stream can only be the
+/// recalled history entry being painted.
+fn submit_context_then_quit() -> Vec<Step> {
+    vec![
+        Step {
+            trigger: RAW_MODE_MARKER,
+            send: "/context\r",
+        },
+        Step {
+            trigger: "context window source",
+            send: "/quit\r",
+        },
+    ]
+}
+
+/// Session 2: walk back through history at the idle prompt, then abandon the
+/// recalled draft (Ctrl+C clears it) and leave.
+///
+/// **Two** Ups, not one: `add_history_entry` is on the common path, so session
+/// 1's `/quit` is itself the newest history entry and the first Up recalls it.
+/// The second reaches `/context`. (This is how the measurement was first taken:
+/// a single Up painted `/quit` onto the viewport row — already proof that the
+/// walk is reading session 1's saved file, since a fresh history would have
+/// nothing to paint at all.)
+fn recall_with_up_then_quit() -> Vec<Step> {
+    vec![
+        Step {
+            trigger: RAW_MODE_MARKER,
+            send: "\x1b[A\x1b[A",
+        },
+        Step {
+            trigger: "/context",
+            send: "\x03/quit\r",
+        },
+    ]
+}
+
+/// Test 39. **Finding F20, corrected: inline mode does _not_ lose history that
+/// persists across sessions.**
+///
+/// F20 recorded, and `README.md`, `CHANGELOG.md`, `docs/ux-design.md` and the
+/// T0 go/no-go record repeated, that the inline idle prompt loses cross-session
+/// history. This runs the real binary twice under one `HOME` and shows the
+/// first session's submitted line coming back on Up at the second session's
+/// inline prompt.
+///
+/// Why it works, which the three call sites make unsurprising once they are put
+/// together: `main.rs` loads `~/.kitsu/history` into the **rustyline** editor at
+/// startup and saves it at exit (both gated on `!no_session`);
+/// `read_idle_chat_line` seeds the inline reader with
+/// `editor.history().iter().cloned().collect()`, i.e. that same loaded list; and
+/// `rl.add_history_entry` sits on the common path *after* the read, outside the
+/// match on which reader produced the line, so a line submitted through the
+/// inline reader is recorded like any other. Inline mode therefore borrows
+/// rustyline's persistence wholesale while never running its composer.
+///
+/// This is the one test here that cannot use `--no-session`: both the load and
+/// the save are gated on it, hence [`Options::no_session`].
+#[test]
+#[serial]
+fn inline_mode_recalls_history_persisted_by_an_earlier_session() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session_options = Options {
+        no_session: false,
+        ..Options::default()
+    };
+
+    // Session 1: submit `/context` through the inline reader and exit cleanly,
+    // so the exit-time `save_history` runs.
+    let first = run_styled_chat_pty_with(
+        home.path(),
+        Some("inline"),
+        &submit_context_then_quit(),
+        session_options,
+    );
+    assert!(
+        first.status.success(),
+        "the first session must exit cleanly so its history is saved; screen:\n{}",
+        first.screen_dump()
+    );
+
+    // Direct evidence that the save happened, independently of what session 2
+    // then does with it: the file exists and holds the submitted line.
+    let history_path = home.path().join(".kitsu").join("history");
+    let persisted = fs::read_to_string(&history_path).unwrap_or_else(|error| {
+        panic!(
+            "the first session must write {}: {error}; screen:\n{}",
+            history_path.display(),
+            first.screen_dump()
+        )
+    });
+    assert!(
+        persisted.contains("/context"),
+        "the submitted line belongs in the history file, which instead holds \
+         {persisted:?}"
+    );
+
+    // Session 2: same `HOME`, so the same history file. One Up at the inline
+    // idle prompt must bring the line back.
+    let second = run_styled_chat_pty_with(
+        home.path(),
+        Some("inline"),
+        &recall_with_up_then_quit(),
+        session_options,
+    );
+    assert!(
+        second.status.success(),
+        "the second session exited {:?}; screen:\n{}",
+        second.status,
+        second.screen_dump()
+    );
+
+    // The screen as it stood with Up pressed and nothing submitted: the
+    // recalled entry is painted on the pinned viewport row, which is the row
+    // the inline reader owns.
+    let recalled = second.screen_at(1);
+    let viewport = &recalled[(ROWS - 1) as usize];
+    assert!(
+        viewport.contains("/context"),
+        "Up at the inline idle prompt must recall the previous session's line \
+         onto the pinned viewport row; whole screen:\n{}",
+        Session::dump(&recalled)
+    );
+    // The walk is the inline reader's, not rustyline's: nothing inside the
+    // scroll region echoed the recalled line, and rustyline's composer never
+    // drew a prompt there.
+    let stray = recalled[..(ROWS - 1) as usize]
+        .iter()
+        .position(|row| row.starts_with("kitsu>"));
+    assert!(
+        stray.is_none(),
+        "the recall must be the inline reader's, but row {} inside the region \
+         is rustyline's composer ({:?}); whole screen:\n{}",
+        stray.unwrap_or_default() + 1,
+        stray.map(|row| recalled[row].clone()).unwrap_or_default(),
+        Session::dump(&recalled)
+    );
+}
+
+/// The F22 script: type `/context` at the inline idle prompt, suspend with
+/// Ctrl+Z, submit the replayed draft once the session is back, then leave.
+///
+/// The trigger for the post-resume step is the **region release** (`ESC[r`),
+/// which `release_for_suspend` emits before the process stops and which
+/// nothing else emits until teardown. Writing to the PTY master while the
+/// child is stopped is safe: the bytes sit in the terminal's input queue and
+/// are read once `SIGCONT` lands, which is exactly how a real user's typing
+/// into a stopped job behaves.
+///
+/// The *first* step triggers on the bracketed-paste enable (`ESC[?2004h`)
+/// rather than on the banner the other scripts use, and that choice is
+/// load-bearing. The banner is printed long before the idle reader engages, so
+/// a Ctrl+Z sent on it can reach a terminal that is still **canonical** —
+/// where `0x1a` is the line discipline's `VSUSP` character, swallowed by the
+/// tty instead of delivered to the editor. Triggering on the banner made this
+/// test fail about one run in four, always by never reaching the suspend at
+/// all. `RawStdinGuard::engage` writes `ESC[?2004h` immediately *after* its
+/// `tcsetattr`, so that sequence appearing in the stream is proof that
+/// `ICANON`/`ISIG` are already cleared and `0x1a` will arrive as a byte.
+/// (The reader's own first paint is not usable as the marker: with an empty
+/// draft the viewport row shows the bare `kitsu` status, which the bridge
+/// already painted at startup.)
+fn type_context_suspend_then_quit() -> Vec<Step> {
+    vec![
+        Step {
+            trigger: RAW_MODE_MARKER,
+            send: "/context\x1a",
+        },
+        Step {
+            trigger: "\x1b[r",
+            send: "\r",
+        },
+        Step {
+            trigger: "context window source",
+            send: "/quit\r",
+        },
+    ]
+}
+
+/// Test 40. **Finding F22: the suspend cycle, end to end.**
+///
+/// The unit tests pin the *order* of the five suspend effects behind the
+/// `SuspendEffects` seam, because the real `stop_process` blocks inside
+/// `raise(SIGTSTP)` and cannot be observed from inside the process. This runs
+/// the real binary on a real PTY and observes the cycle from outside:
+///
+/// * the child really stops — the driver sees `WIFSTOPPED` and answers with
+///   `SIGCONT`, exactly once ([`Options::resume_on_stop`]);
+/// * the scroll region is released before the stop and set again after it, so
+///   the shell would have inherited an unpinned terminal;
+/// * the draft survives: the `/context` typed before the Ctrl+Z is replayed
+///   into the resumed read, and the bare carriage return written while the
+///   child was stopped submits it, so the command's output appears.
+///
+/// This was deferred on the previous card for want of `WUNTRACED` in the
+/// harness's poll; `poll_child` supplies it.
+#[test]
+#[serial]
+fn inline_mode_suspends_and_resumes_with_the_draft_intact() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty_with(
+        home.path(),
+        Some("inline"),
+        &type_context_suspend_then_quit(),
+        Options {
+            resume_on_stop: true,
+            ..Options::default()
+        },
+    );
+
+    assert_eq!(
+        session.stops,
+        1,
+        "the child must stop itself exactly once on Ctrl+Z; screen:\n{}",
+        session.screen_dump()
+    );
+    assert!(
+        session.status.success(),
+        "the resumed session must still exit cleanly on /quit, but exited {:?}; \
+         screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+
+    // Released before the stop and re-set after it: two sets, two releases
+    // (the second release being teardown's).
+    assert_eq!(
+        session.raw_count(&format!("\x1b[1;{}r", ROWS - 1)),
+        2,
+        "the region is set once at startup and once more on resume; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert_eq!(
+        session.raw_count("\x1b[r"),
+        2,
+        "the region is released once for the suspend and once at teardown; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    // The draft survived: `/context` was typed before the Ctrl+Z and never
+    // retyped, and the carriage return written during the stop submitted it.
+    let screen = session.screen();
+    assert!(
+        screen
+            .iter()
+            .any(|row| row.contains("context window source")),
+        "the draft typed before the suspend must be replayed and submitted \
+         after it; whole screen:\n{}",
+        session.screen_dump()
+    );
 }

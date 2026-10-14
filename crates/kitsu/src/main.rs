@@ -6000,8 +6000,19 @@ fn read_idle_chat_line(
 /// collector, this function returns rather than continuing to read, so it must
 /// not hand back a terminal that is still raw.
 ///
-/// Known preview gaps, carded rather than fixed here: no history persistence,
-/// no completion and no slash-command palette at the idle prompt.
+/// Known preview gaps, carded rather than fixed here: no Tab completion and no
+/// slash-command palette at the idle prompt. **History persistence is not one
+/// of them** — an earlier version of this comment said it was, wrongly. Inline
+/// mode borrows rustyline's persistence wholesale without running its
+/// composer: `load_history` seeds the editor at startup, `read_idle_chat_line`
+/// hands the inline reader that same list, and `add_history_entry` sits on the
+/// common path after the read, so a line submitted here is saved like any
+/// other. Reverse search works too, though not its status indicator.
+///
+/// The completion and palette gaps share **one** cause, which is worth knowing
+/// before either is carded: both are rendered into the during-turn row's hint
+/// slot, and this path's paint callback is `(draft, cursor)` with nowhere to
+/// put a hint. One seam change restores both, plus the reverse-search status.
 #[cfg(unix)]
 fn read_chat_line_inline(
     bridge: &tui_bridge::BridgeGuard,
