@@ -1308,6 +1308,40 @@ roughly 7% of the time while appearing green on every manual run, so "I ran it
 and it passed" is weak evidence here. If it recurs, the cheap first step is a
 repeat-run loop on that module alone rather than the whole suite.
 
+### CONFIRMED in T0-S17, and narrowed
+
+It recurred — a different agent hit it, and this time I reproduced it: **1
+failure in 12** consecutive full-suite `cargo test -p kitsu --bins` runs, which
+matches the original single sighting at roughly 8%.
+
+Then I ran the loop this finding itself recommended, and the result is a clear
+signature:
+
+| How it was run | Failures |
+|---|---|
+| the test alone, 15 runs | **0** |
+| its own module in parallel, 8 runs | **0** |
+| the whole `--bins` suite in parallel, 12 runs | **1** |
+
+So it is **cross-module interference**, not anything inside
+`session::transaction`: some other test elsewhere in the binary mutates shared
+state this one depends on. That rules out the implementer's guess of a gap
+*within* the module, and it rules out the test being inherently racy.
+
+**Next step, for whoever picks it up:** bisect by module rather than by test —
+run `session::transaction` together with each other top-level module group until
+the pair reproduces. The suspects are the globals this binary already serialises
+elsewhere (the render surface, the live-row state, the inference carrier, the
+process environment), since a test that mutates one without `#[serial]` is
+exactly this shape. Note it has never been observed outside a full parallel run,
+so a fix must be verified the same way — at least a dozen full-suite runs, not
+an isolated one.
+
+A second flake was reported in the same card — `paint_rows_growing_relatches_…`,
+from T0-S14 — and did **not** reproduce in those 12 runs. Status: seen once,
+unreproduced. Recorded here rather than given its own number precisely because
+one sighting is not yet a finding.
+
 ## F29 — the inline palette duplicates the classic one's frame and labels
 
 Found while reviewing T0-S15a. **Accepted deliberately, on evidence, with the
@@ -1387,6 +1421,63 @@ drive-by: it changes what `/s` hints at idle (user-visible), and it would turn
 the `/s` case in T0-S16's regression test from one row into a palette, so that
 test changes with it.
 
+**RESOLVED in T0-S17.** `idle_slash_hint` ranks by registry order; the
+during-turn row keeps `typeahead_slash_hint`. Both are thin wrappers over one
+`slash_hint_ranked` holding the shared structural rules, so only the ranking
+differs — and **the function name is how a call site declares its policy**,
+since there is no longer a default to inherit silently. That was the whole
+defect. The third stand-down clause is gone, pinned as *removed* rather than
+merely unreachable by a test that passes the old disagreeing hint explicitly and
+still requires a palette.
+
+The exact-match case is handled structurally rather than by special-casing: the
+length test moved out of the ranking into the shared tail, so when the lead
+entry *is* the prefix the hint empties instead of the ranking stepping past it
+to a longer sibling. `/agent` and `/save` both yield nothing, matching the
+during-turn path's own behaviour for its exact matches.
+
+**Four tests had to change, and they were pinning the defect.** The inline
+reader's hint and Tab group expected `/s` to hint `teer` and Tab to type
+`/steer` — one of them said so in its own prose: *"Tab at an idle `/s` types
+`/steer`"*. That is F30's symptom written down as an expectation, so no
+implementation could satisfy both it and the fix. The implementer correctly
+refused to touch them and escalated; I made the change, keeping `/s` as the
+input so the tests now assert the corrected behaviour rather than dodging the
+interesting case, and noting the cursor column moved with the shorter word.
+
 Worth noting as a general lesson: reusing a function across contexts carried
 its *policy* along with its mechanics, and the policy was named for the context
 it came from. The name said `MID_TURN` and was reused where no turn exists.
+
+### A second defect in the same area, found by the property rather than by examples
+
+While writing T0-S17's tests the author pinned the invariant the stand-down
+clause had been compensating for — *for any slash prefix with a match,
+`prefix + hint` equals the lead palette entry's name* — and it failed first not
+on `/s` but on **`/agent`**, which neither I nor T0-S16 had noticed.
+
+`typeahead_slash_hint` selects with
+`find(|name| name.starts_with(rest) && name.len() > rest.len())`, which **skips
+an exact match**. Both `agent` and `agents` are registered, so `/agent` hints
+`s`, completing `agents` — while registry order's lead for `agent` is `agent`
+itself. The correct idle hint there is **empty**, which is also what the
+during-turn path does for its own exact matches (`typeahead_slash_hint("/steer")`
+is empty) and what the palette's second stand-down clause already assumes.
+
+**The lesson is about the instrument, not the bug.** Example-based tests had
+covered this area for three cards — `/s`, `/co`, `/cont`, `/context`, `/mod` —
+and none of them happened to be a command name that is also a prefix of
+another. A property over every proper prefix of every registered command (about
+390 of them) found it on the first run. Where a relationship between two
+functions is the real contract, assert the relationship, not a handful of its
+instances.
+
+### Two call sites, not one
+
+Worth recording because a half-fix here would have been worse than the defect.
+The idle prompt reads the hint in **two** places: `hint_of`, which is what the
+row *displays*, and the `CompleteRequest` arm, which is what Tab *accepts*.
+Both inherited the mid-turn ranking, which means the bug was never cosmetic —
+**Tab at an idle `/s` typed `/steer`**. Fixing only the display would have left
+the row showing one completion while the key inserted another. I verified both
+sites independently of the test author, and we agreed.

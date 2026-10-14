@@ -47,6 +47,12 @@ shapes may change in any minor release.
   as soon as the prefix stops being one. Resizing the terminal keeps it open at
   the right height.
 
+  Completions at the inline prompt are ranked by command order, so the hint,
+  what Tab inserts, and the palette's first entry always agree — typing `/s`
+  suggests `save` and opens the palette, where it previously suggested `steer`
+  and opened nothing. The during-turn input row is unchanged: while a turn is
+  running, commands that act on that turn still come first.
+
   Still missing from the inline prompt: `@file` path completion, and syntax
   highlighting of the draft.
 
