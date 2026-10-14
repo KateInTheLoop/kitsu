@@ -21,10 +21,16 @@ shapes may change in any minor release.
   — only `inline` selects it — and with the variable unset output is
   byte-identical to before, so no existing session changes.
 
-  It is a preview and is missing things Rustyline gave the idle prompt: the
-  slash-command palette, Tab completion, history that persists across sessions,
-  and Ctrl+Z suspension. Ctrl+C clears the line and keeps the session, as it
-  does in classic mode.
+  Ctrl+Z suspends from the inline prompt, releasing the pinned row and the
+  terminal's scrolling restriction first so the shell is handed back an
+  ordinary terminal, then restoring both — and your unsubmitted draft — on
+  `fg`. Ctrl+C clears the line and keeps the session, as it does in classic
+  mode. Ctrl+\ is deliberately inert, because its usual action dumps core and
+  this process holds credentials and conversation text in memory.
+
+  It is a preview and is still missing things Rustyline gave the idle prompt:
+  the slash-command palette, Tab completion, and history that persists across
+  sessions.
 
 #### Background agents and herding
 
