@@ -1180,7 +1180,13 @@ one does, built on kitsu's own editor rather than Rustyline: command history
 persists across sessions, Ctrl+R reverse search works, Tab completes a slash
 command from the hint beside your draft, and typing a slash prefix opens the
 **bordered command palette** above the composer — it grows and narrows as you
-type, shrinks to fit a short window, and closes when the prefix does. `@file`
+type, shrinks to fit a short window, and closes when the prefix does. The pinned row itself is a live status row — model, an eight-cell context meter
+with its percentage, elapsed turn time, `[N queued]`, and the background-agent
+tag — refreshed while a turn runs and never wrapping, at any width from 40 to 200
+columns. When the terminal is too narrow for all of it, segments drop in a fixed
+order: the meter goes first, then elapsed, then the model (truncated before it is
+dropped), then `[N queued]`, and the agent tag is last to go, because a blocked
+agent is the one thing there you have to act on. `@file`
 path completion works here too, offering the same candidates in the same order
 as the classic prompt — both read from one completion source, so they cannot
 drift apart. Still missing: syntax highlighting of the draft. What it does

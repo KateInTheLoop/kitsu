@@ -60,6 +60,16 @@ const COLS: u16 = 80;
 /// How long a session may take before the harness kills the child and fails.
 const DEADLINE: Duration = Duration::from_secs(20);
 
+/// The model id both configs below declare, and therefore the leading segment
+/// of requirement **R5**'s composed status row in every session in this file.
+///
+/// Named once rather than spelled per assertion: the status-row tests all
+/// identify the pinned row by the segment R5's drop order keeps longest
+/// (`compose_status_row` truncates the model before it discards it), so a
+/// change to the fixture model must not be able to leave half of them
+/// matching a stale literal.
+const STATUS_ROW_MODEL: &str = "example-model-v1";
+
 /// How long the driver waits for a resize to show up in the stream before
 /// re-delivering `SIGWINCH`. See the `rearm` binding in
 /// [`run_styled_chat_pty_with`] for why re-delivery is both necessary and
@@ -717,11 +727,30 @@ fn inline_mode_pins_the_region_and_direct_writes_stay_inside_it() {
     // The screen as it stood with all of `/help` printed and `/quit` not yet
     // processed.
     let screen = session.screen_at(1);
-    assert_eq!(
-        screen[(ROWS - 1) as usize].trim_end(),
-        "kitsu",
-        "the pinned viewport row must still show the bridge's status text \
-         after /help printed; whole screen:\n{}",
+    // T3-S6 (the wiring card): the pinned row is no longer the literal
+    // `kitsu` placeholder but requirement R5's composed status row, so what
+    // survives `/help` is *that*. The row is model-led by construction — the
+    // model is the only segment R5 never drops outright at a 80-column
+    // terminal, and the drop order truncates it before discarding it — so the
+    // model name is what identifies the row as the status row rather than
+    // debris. The meter is deliberately not pinned here: this session is at
+    // the **idle** prompt with no turn and no usage recorded, so whether a
+    // meter has a denominator at all is the config's business, not this
+    // test's. `inline_mode_status_row_shows_r5_segments_during_a_streamed_turn`
+    // pins the full segment set where a turn makes them all real.
+    let row = screen[(ROWS - 1) as usize].trim_end();
+    assert!(
+        row.starts_with(STATUS_ROW_MODEL),
+        "the pinned viewport row must show R5's composed status row, which \
+         leads with the live model {STATUS_ROW_MODEL:?}, after /help printed; \
+         row {ROWS} reads {row:?}; whole screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        row.chars().count() <= COLS as usize,
+        "the status row must never exceed the terminal's {COLS} columns, but \
+         row {ROWS} is {} columns of {row:?}; whole screen:\n{}",
+        row.chars().count(),
         Session::dump(&screen)
     );
     // And the transcript really did reach the bottom of the region rather than
@@ -860,13 +889,42 @@ fn inline_mode_teardown_parks_below_the_transcript_and_clears_the_status_row() {
     );
 
     // And the viewport row no longer carries stale status text: `hide` cleared
-    // it. Whatever occupies row 24 is the summary the cursor was parked for,
-    // never the painted `kitsu` status.
-    assert_ne!(
+    // it.
+    //
+    // **This assertion used to be `assert_ne!(.., "kitsu")`, and the wiring
+    // card made that vacuous** — once the row carries R5's composed status row
+    // instead of the placeholder, "not `kitsu`" holds even if the row were
+    // left showing a frozen half-drawn status row, or arbitrary debris. Its
+    // *intent* (the row is cleared on the way out) survives; its *expression*
+    // did not. Finding **F41**: pin what the row IS.
+    //
+    // Measured, not guessed: `hide` clears row 24, releases the region and
+    // parks on row 24, and the closing summary printed there is wider than
+    // `COLS`, so it wraps and scrolls the screen up by one — leaving the
+    // summary's two physical rows on 22 and 23 and **row 24 genuinely
+    // empty**. That is the exact post-state, so that is what is asserted.
+    assert_eq!(
         screen[(ROWS - 1) as usize].trim_end(),
-        "kitsu",
-        "the painted status row must be cleared on the way out; screen:\n{}",
+        "",
+        "the painted status row must be cleared on the way out, leaving row \
+         {ROWS} empty; it reads {:?}; screen:\n{}",
+        screen[(ROWS - 1) as usize],
         session.screen_dump()
+    );
+    // ...and that is not vacuous, because the row genuinely *was* the status
+    // row until teardown: the same session's mid-run screen has R5's
+    // model-led row on 24. Without this, an inline mode that never painted a
+    // status row at all would satisfy the clear above.
+    let mid = session.screen_at(1);
+    assert!(
+        mid[(ROWS - 1) as usize]
+            .trim_end()
+            .starts_with(STATUS_ROW_MODEL),
+        "the clear is only meaningful if a status row was there to clear: \
+         mid-run row {ROWS} must lead with {STATUS_ROW_MODEL:?}, but reads \
+         {:?}; mid-run screen:\n{}",
+        mid[(ROWS - 1) as usize],
+        Session::dump(&mid)
     );
 
     // Finally the raw bytes, so a regression in the sequence itself is named
@@ -2209,10 +2267,26 @@ fn inline_mode_streams_a_turn_inside_the_region_with_the_status_row_intact() {
             Session::dump(&screen)
         );
     }
-    assert_eq!(
-        screen[region].trim_end(),
-        "kitsu",
-        "the pinned status row must survive a streamed turn; screen:\n{}",
+    // The wiring card (T3-S5's deferred half) replaced the `"kitsu"`
+    // placeholder this row used to hold with requirement R5's composed status
+    // row, so what must survive a streamed turn is **that**. The intent is
+    // unchanged and is the whole point of the assertion: the stream must not
+    // reach row 24. Pinned as what the row IS (finding F41) rather than as a
+    // literal — model-led, because the model is the segment R5's drop order
+    // keeps longest, and within `COLS`, R5's standing no-wrap rule.
+    let status = screen[region].trim_end();
+    assert!(
+        status.starts_with(STATUS_ROW_MODEL),
+        "the pinned status row must survive a streamed turn, still showing \
+         R5's composed row led by the live model {STATUS_ROW_MODEL:?}; row \
+         {ROWS} reads {status:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        status.chars().count() <= COLS as usize,
+        "the surviving status row must still fit the terminal's {COLS} \
+         columns, but is {} columns of {status:?}; screen:\n{}",
+        status.chars().count(),
         Session::dump(&screen)
     );
     assert_eq!(
@@ -2365,10 +2439,25 @@ fn inline_mode_wide_stream_wraps_and_scrolls_without_touching_the_status_row() {
 
     let region = (ROWS - 1) as usize;
     let screen = session.screen_at(1);
-    assert_eq!(
-        screen[region].trim_end(),
-        "kitsu",
-        "a stream in flight must not reach the pinned status row; screen:\n{}",
+    // Same treatment, same reason as
+    // `inline_mode_streams_a_turn_inside_the_region_with_the_status_row_intact`:
+    // the row is R5's composed status row now, not the `"kitsu"` placeholder.
+    // The claim being made is unchanged — a stream in flight must not reach
+    // row 24 — and it is stronger stated as what the row is: the model-led
+    // status row, intact and within `COLS`, mid-stream.
+    let status = screen[region].trim_end();
+    assert!(
+        status.starts_with(STATUS_ROW_MODEL),
+        "a stream in flight must not reach the pinned status row, which must \
+         still be R5's composed row led by the live model \
+         {STATUS_ROW_MODEL:?}; row {ROWS} reads {status:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        status.chars().count() <= COLS as usize,
+        "the untouched status row must still fit the terminal's {COLS} \
+         columns, but is {} columns of {status:?}; screen:\n{}",
+        status.chars().count(),
         Session::dump(&screen)
     );
 
@@ -2572,4 +2661,426 @@ fn kitsu_tui_environment_variable_no_longer_selects_the_viewport() {
         "--tui classic must stay classic with KITSU_TUI=inline set; raw:\n{}",
         both.raw_text().escape_debug()
     );
+}
+
+// ===========================================================================
+// The wiring card: requirement **R5**'s composed status row, on screen.
+//
+// `kitsu_render::live::compose_status_row` and the `Surface::queue` seam
+// shipped in T3-S5 with **no production caller**; the pinned row still
+// painted the literal `"kitsu"` that `main.rs` passed to
+// `tui_bridge::install` as a `status: &str`. These tests are the user-visible
+// half: the row reaches row 24, carries R5's segments at the terminal's real
+// width, and — the part a static string can never satisfy — **ticks**.
+//
+// # The repaint cadence these tests assume
+//
+// `main.rs`'s `run_live_typeahead` is the one loop that runs for the whole of
+// a foreground turn: it is started by `TypeaheadCollector::start` whenever
+// `typeahead_live_prompt` is `Some`, which is
+// `!assistive_input && stdin_is_tty() && stderr_styled()` — true of every
+// inline session, since inline mode *is* a styled tty. Its body polls stdin
+// with `libc::poll(&mut descriptor, 1, 50)` and already refreshes the ambient
+// agent tag once per tick through `sync_agent_counts`, which is the mechanism
+// requirement A8's 250 ms budget is met by. A 50 ms tick is twenty times
+// finer than the one-second granularity of R5's elapsed segment, so a row
+// repainted on that tick is never more than one tick stale, and the cadence
+// costs no new thread, no new timer and no new dependency.
+//
+// `read_line_inline` is deliberately *not* a cadence: it blocks in `read()`
+// with no timeout (that is how `SIGWINCH` is delivered — see
+// `install_sigwinch_handler`'s `SA_RESTART` warning), and between turns R5's
+// elapsed segment is `None` anyway, so the idle prompt has nothing to tick.
+//
+// **Measured before these tests were written** (the pre-wiring baseline, so
+// the assertions below are known not to pass for the wrong reason): over a
+// five-event streamed turn with 700 ms gaps, row 24 is painted exactly three
+// times, every one of them the string `"kitsu"`, and none of them during the
+// turn.
+// ===========================================================================
+
+/// Strip CSI escape sequences from `text`, leaving the printable cells.
+///
+/// Hand-rolled rather than borrowed from `kitsu_render::sanitize_terminal_text`
+/// on purpose: `kitsu` has no library target, so an integration test cannot
+/// reach into the workspace's render crate, and adding a dev-dependency to
+/// borrow one function is not worth it. The raw-byte tests below are the only
+/// callers; everything else asserts on `vt100`'s already-parsed screen.
+fn strip_csi(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            out.push(ch);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            // Consume parameter/intermediate bytes up to and including the
+            // final byte, which is the first in 0x40..=0x7e.
+            while let Some(&c) = chars.peek() {
+                chars.next();
+                if ('\x40'..='\x7e').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every row the inline viewport painted onto its pinned row, in stream
+/// order, with escapes stripped.
+///
+/// `InlineSurface::paint` writes `ESC[<line>;1H ESC[2K <row>` for each pinned
+/// row and then parks the cursor with `ESC[<bottom>;1H`, so one paint of row
+/// `ROWS` is exactly the bytes between those two addresses. Reading the
+/// *paint history* rather than two sampled screens is what makes the elapsed
+/// test honest: it observes every repaint the child actually performed,
+/// needs no second scripted mark, and contains no sleep.
+fn pinned_row_paints(session: &Session) -> Vec<String> {
+    let text = session.raw_text();
+    let open = format!("\x1b[{};1H\x1b[2K", ROWS);
+    let close = format!("\x1b[{};1H", ROWS - 1);
+    let mut painted = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(index) = rest.find(&open) {
+        rest = &rest[index + open.len()..];
+        let end = rest.find(&close).unwrap_or(rest.len());
+        painted.push(strip_csi(&rest[..end]));
+    }
+    painted
+}
+
+/// Every pinned-row paint that is R5's status row, i.e. model-led.
+///
+/// The teardown clear is a paint of row `ROWS` too, and the closing summary
+/// is written at the cursor it parks, so the raw window for the last paint
+/// carries both. Selecting on the model keeps those out without banning
+/// anything: a row that leads with the live model is the status row and
+/// nothing else in this binary writes one.
+fn status_row_paints(session: &Session) -> Vec<String> {
+    pinned_row_paints(session)
+        .into_iter()
+        .filter(|row| row.trim_start().starts_with(STATUS_ROW_MODEL))
+        .collect()
+}
+
+/// The elapsed segment of a composed status row, as whole seconds.
+///
+/// `kitsu_render::format_wait_elapsed` renders `{secs}s` under a minute and
+/// `{mins}m{secs:02}s` at or above one, and R5 places elapsed after the model
+/// and the meter, so the token is the row's last ` · `-joined content
+/// segment. `None` when the row carries no elapsed segment at all, which is
+/// a legitimate state (between turns, or at a width that dropped it) and so
+/// is not an assertion failure here.
+fn elapsed_secs(row: &str) -> Option<u64> {
+    row.split(" · ")
+        .map(str::trim)
+        .filter_map(|segment| {
+            let rest = segment.strip_suffix('s')?;
+            match rest.split_once('m') {
+                Some((mins, secs)) => {
+                    Some(mins.parse::<u64>().ok()? * 60 + secs.parse::<u64>().ok()?)
+                }
+                None => rest.parse::<u64>().ok(),
+            }
+        })
+        .last()
+}
+
+/// **The wiring acceptance test.** R5's composed status row is on the pinned
+/// row *during a real streamed turn*, through the T3-S1 streaming harness so
+/// the model name is the session's live one rather than a fixture's.
+///
+/// The screen is sampled at `marks[1]`, i.e. the moment `/quit` goes in,
+/// which `TURN_DONE_MARKER` places just after the turn finished. Asserted:
+///
+/// * the row leads with the live model — the segment R5's drop order keeps
+///   longest, and the thing that tells a status row from debris;
+/// * it carries the context meter, which the streaming config makes real by
+///   declaring `context_window = 4096`: R5's 8-cell meter plus a percentage,
+///   so the row shows how full the window is without `/context`;
+/// * it carries an elapsed segment, which is the whole reason the row needs
+///   a cadence;
+/// * it never wraps: at most `COLS` cells, R5's standing rule;
+/// * nothing is queued and no agent is detached in this session, so the
+///   `[N queued]` tag and the ambient tag are **absent** — and that absence
+///   is not vacuous, because the three positive segments above are present
+///   on the same row.
+#[test]
+#[serial]
+fn inline_mode_status_row_shows_r5_segments_during_a_streamed_turn() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty(
+        home.path(),
+        Some("inline"),
+        &ask_then_quit_inline("say hello\r"),
+        vec![Turn {
+            events: vec![
+                delta("STREAM_ALPHA\n"),
+                delta("STREAM_BETA\n"),
+                finish("stop"),
+            ],
+            gap: Duration::from_millis(400),
+        }],
+        false,
+    );
+
+    assert!(
+        session.status.success(),
+        "the streaming inline session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+
+    let screen = session.screen_at(1);
+    let row = screen[(ROWS - 1) as usize].trim_end().to_string();
+
+    assert!(
+        row.starts_with(STATUS_ROW_MODEL),
+        "the pinned row must be R5's status row, leading with the live model \
+         {STATUS_ROW_MODEL:?}; row {ROWS} reads {row:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+    // The meter: eight cells of `■`/`□` and a percentage, exactly what
+    // `compose_status_row` builds from `used`/`effective`.
+    let meter = row
+        .split(" · ")
+        .find(|segment| segment.contains('■') || segment.contains('□'))
+        .unwrap_or_else(|| {
+            panic!(
+                "R5's context meter must be on the status row; row {ROWS} \
+                 reads {row:?}; screen:\n{}",
+                Session::dump(&screen)
+            )
+        });
+    assert_eq!(
+        meter.chars().filter(|&c| c == '■' || c == '□').count(),
+        8,
+        "the status row's meter is eight cells (half of /context's sixteen), \
+         but {meter:?} has a different count; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        meter.trim_end().ends_with('%'),
+        "the meter carries its utilisation percentage, but reads {meter:?}; \
+         screen:\n{}",
+        Session::dump(&screen)
+    );
+    // The elapsed segment, present at all (its *advance* is the next test).
+    //
+    // Asserted on the paint **history** rather than this screen, because the
+    // screen is sampled once the turn has finished and R5's elapsed is `None`
+    // between turns -- a row with no elapsed segment there is correct, not a
+    // regression. The history says the segment was on the row *while the turn
+    // ran*, which is the claim.
+    let painted = status_row_paints(&session);
+    assert!(
+        painted.iter().any(|row| elapsed_secs(row).is_some()),
+        "R5's elapsed segment must be on the status row while the turn runs; \
+         the status row was painted {} time(s): {painted:#?}",
+        painted.len()
+    );
+    // It never wraps.
+    assert!(
+        row.chars().count() <= COLS as usize,
+        "the status row must never exceed {COLS} columns, but row {ROWS} is \
+         {} columns of {row:?}; screen:\n{}",
+        row.chars().count(),
+        Session::dump(&screen)
+    );
+    // Nothing queued and no detached agent, so neither optional tag renders.
+    // Not a bare substring ban (F41): the three segments above pin what the
+    // row IS, and these two say the row is *that and only that*.
+    assert!(
+        !row.contains("queued"),
+        "nothing was queued in this session, so R5's `[N queued]` tag must \
+         not render; row {ROWS} reads {row:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        !row.contains("agent"),
+        "no agent was detached in this session, so R5's ambient tag must not \
+         render; row {ROWS} reads {row:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+}
+
+/// **The cadence test.** R5's elapsed segment *advances* while a turn runs.
+///
+/// A status row that is composed once and painted once is indistinguishable
+/// from the old static `"kitsu"` by every assertion in the test above, so
+/// this is the one that pins the feature rather than its appearance. There is
+/// no sleep anywhere in it: the turn's own 900 ms inter-chunk gaps are what
+/// make real time pass inside the child, the script's two steps are
+/// trigger-driven as always, and the observation is the **complete paint
+/// history** recovered from the raw byte stream after the session ended —
+/// every repaint the child actually performed, in order.
+///
+/// Asserted:
+///
+/// * at least two status-row paints carry an elapsed segment, so there is
+///   something to compare (a single paint cannot show motion);
+/// * the elapsed values never go backwards — a row recomposed per tick from a
+///   turn-start `Instant` is monotone, and a decrease would mean the start
+///   instant is being reset or the segments are coming from different turns;
+/// * and at least one pair genuinely differs, which is the advance itself.
+///   Three chunks at 900 ms span over two seconds, so a 50 ms cadence has
+///   ~40 opportunities to observe the second tick over.
+///
+/// Pre-wiring baseline, measured: `status_row_paints` is **empty**, because
+/// every one of the three pinned-row paints is the literal `"kitsu"`.
+#[test]
+#[serial]
+fn inline_mode_status_row_elapsed_advances_while_a_turn_runs() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty(
+        home.path(),
+        Some("inline"),
+        &ask_then_quit_inline("say hello slowly\r"),
+        vec![Turn {
+            events: vec![
+                delta("TICK_ONE\n"),
+                delta("TICK_TWO\n"),
+                delta("TICK_THREE\n"),
+                finish("stop"),
+            ],
+            // Real time inside the child, not in the test process: the mock
+            // holds each chunk back, so the turn lasts ~2.7s of elapsed time
+            // the row has to show.
+            gap: Duration::from_millis(900),
+        }],
+        false,
+    );
+
+    let paints = status_row_paints(&session);
+    let samples: Vec<u64> = paints.iter().filter_map(|row| elapsed_secs(row)).collect();
+
+    assert!(
+        samples.len() >= 2,
+        "the status row must be repainted on the turn's cadence, so a turn \
+         lasting ~2.7s must leave at least two paints carrying an elapsed \
+         segment; got {} of {} pinned-row paint(s): {:#?}",
+        samples.len(),
+        pinned_row_paints(&session).len(),
+        paints
+    );
+    assert!(
+        samples.windows(2).all(|pair| pair[0] <= pair[1]),
+        "elapsed is measured from one turn-start instant, so the painted \
+         values can never go backwards; samples: {samples:?}; paints: {:#?}",
+        paints
+    );
+    assert!(
+        samples.first() < samples.last(),
+        "the elapsed segment must genuinely advance over a ~2.7s turn — a \
+         row frozen at {:?} is the static placeholder with extra steps; \
+         samples: {samples:?}; paints: {:#?}",
+        samples.first(),
+        paints
+    );
+}
+
+/// **The `[N queued]` tag, reusing R5's existing expectation.** A prompt
+/// submitted *while a turn is running* is queued rather than run, and the
+/// status row must say so.
+///
+/// The tag's text is `kitsu_render::live::queued_tag`'s — `[1 queued]` — the
+/// same literal the classic live row has shown since F38 named it; nothing
+/// new is invented here.
+///
+/// # The mid-turn trigger (finding **F46**)
+///
+/// **Measured first, because the obvious triggers do not work.** In inline
+/// mode a streamed answer does not reach the terminal progressively: the
+/// whole of `TICK_ONE`/`TWO`/`THREE` plus the turn summary arrives in one
+/// burst *after* the turn, so triggering the mid-turn submission on a
+/// streamed fragment (or on the `queued:` receipt that follows it) fires once
+/// the turn is already over, and the prompt is then queued against the next
+/// turn instead. The single thing the child emits at *turn start* is the
+/// bracketed-paste toggle — the idle reader releasing raw mode
+/// (`ESC[?2004l`) as the typeahead collector takes stdin — and it does not
+/// occur before the submission, so it is a usable and honest trigger: a byte
+/// the surface under test genuinely emits, at the moment the test needs.
+///
+/// With that trigger the receipt lands *before* the first streamed fragment
+/// (measured), leaving the rest of the turn for the row to be repainted on
+/// its cadence with the tag on it.
+///
+/// The observation is the paint history for the same reason the elapsed test
+/// uses it: the tag's whole life is inside the turn, and the screen after it
+/// has nothing left to show.
+///
+/// The second turn is what consumes the queued prompt, which is why the mock
+/// is given two.
+#[test]
+#[serial]
+fn inline_mode_status_row_shows_the_queued_tag_for_a_mid_turn_submission() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "say hello\r"),
+            // Turn start: the idle reader has just released raw mode.
+            send("\x1b[?2004l", "queue this\r"),
+            send(TURN_DONE_MARKER, "/quit\r"),
+        ],
+        vec![
+            Turn {
+                events: vec![
+                    delta("TICK_ONE\n"),
+                    delta("TICK_TWO\n"),
+                    delta("TICK_THREE\n"),
+                    finish("stop"),
+                ],
+                gap: Duration::from_millis(900),
+            },
+            Turn {
+                events: vec![delta("SECOND_TURN\n"), finish("stop")],
+                gap: Duration::from_millis(60),
+            },
+        ],
+        false,
+    );
+
+    // The queue really accepted it: the dispatcher's own live receipt. If this
+    // is missing the test below is measuring the wrong thing, so it is named
+    // separately rather than folded into the row assertion.
+    let text = session.raw_text();
+    assert!(
+        text.contains("queued: queue this"),
+        "the mid-turn submission must reach the prompt queue; raw:\n{}",
+        text.escape_debug()
+    );
+
+    let painted = status_row_paints(&session);
+    let tagged: Vec<&String> = painted
+        .iter()
+        .filter(|row| row.trim_end().ends_with("[1 queued]"))
+        .collect();
+    assert!(
+        !tagged.is_empty(),
+        "one prompt queued mid-turn must render `queued_tag`'s own \
+         `[1 queued]` at the end of R5's status row, after the content \
+         segments; the status row was painted {} time(s): {painted:#?}",
+        painted.len()
+    );
+    // ...and the tagged row is still a whole status row, not the tag alone:
+    // it leads with the live model and it still fits the terminal.
+    for row in tagged {
+        let row = row.trim_end();
+        assert!(
+            row.starts_with(STATUS_ROW_MODEL),
+            "a queued-tag paint must still be the model-led status row, but \
+             reads {row:?}; paints: {painted:#?}"
+        );
+        assert!(
+            row.chars().count() <= COLS as usize,
+            "the status row must never exceed {COLS} columns with the queue \
+             tag on it either, but {row:?} is {} columns; paints: {painted:#?}",
+            row.chars().count()
+        );
+    }
 }

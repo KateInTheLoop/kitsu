@@ -92,6 +92,13 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- The inline viewport's pinned bottom row is now a **live status row** instead of
+  the word `kitsu`: the model, a compact eight-cell context meter with its
+  utilisation percentage, the elapsed time in the current turn, `[N queued]` when
+  prompts were submitted mid-turn, and the background-agent tag. It refreshes
+  while a turn runs, never wraps between 40 and 200 columns, sheds segments in a
+  fixed order as the terminal narrows (the agent tag is last to go), and is
+  cleared on exit. Classic mode is unchanged.
 - The inline viewport's composer gained **`@file` path completion** and hint
   highlighting. It offers the same candidates in the same order as the classic
   prompt, because both read from one completion source rather than two
