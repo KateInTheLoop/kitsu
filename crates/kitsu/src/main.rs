@@ -9964,6 +9964,10 @@ struct PromptEnvironment {
     /// Count of pregrants omitted from `command_pregrants` because the cap
     /// was reached.
     command_pregrants_overflow: usize,
+    /// Ask mode: a read or write outside the granted roots prompts the user
+    /// instead of failing, so the model should attempt it rather than tell
+    /// the user to restart with grant flags.
+    access_prompts: bool,
 }
 
 /// Maximum number of exact command pregrants named verbatim in the system
@@ -10003,6 +10007,7 @@ impl PromptEnvironment {
             roots,
             command_pregrants: Vec::new(),
             command_pregrants_overflow: 0,
+            access_prompts: false,
         }
     }
 
@@ -10075,6 +10080,13 @@ fn chat_system_prompt(tool_names: &[String], environment: &PromptEnvironment) ->
         prompt.push_str(
             "Filesystem access is permission-gated; attempt only tools actually listed above. ",
         );
+        if environment.access_prompts && (has_read || has_write) {
+            prompt.push_str(
+                "Access outside the granted roots is not refused: the user is asked to approve \
+                 it when you call the tool, so when a task needs a file change, make it \
+                 directly instead of asking the user to grant access first. ",
+            );
+        }
         if has_commands {
             prompt.push_str(
                 "Use command_exec's literal argv/cwd interface for relevant builds, tests, and \
@@ -15283,8 +15295,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 read_only.push(cwd_text);
             }
         }
-        PromptEnvironment::from_grants(&cwd, &read_only, allow_write, allow_read_write)
-            .with_command_pregrants(&explicit_command_grants)
+        PromptEnvironment {
+            access_prompts: perms.mode() == Mode::Ask,
+            ..PromptEnvironment::from_grants(&cwd, &read_only, allow_write, allow_read_write)
+                .with_command_pregrants(&explicit_command_grants)
+        }
     };
     let base = chat_system_prompt(&tool_names, &prompt_environment);
     provenance.push(CtxEntry::new(
@@ -21402,6 +21417,23 @@ mod tests {
             directory.path().join("public.txt").as_path(),
             &alias
         ));
+    }
+
+    /// A read-only launch root made the model refuse edits and lecture about
+    /// grant flags, though interactive Ask mode would simply have prompted.
+    /// The prompt says so only when access really prompts.
+    #[test]
+    fn ask_mode_system_prompt_says_out_of_root_access_prompts_the_user() {
+        let tools = ["fs_read_file".to_string(), "fs_write_file".to_string()];
+        let asking = PromptEnvironment {
+            access_prompts: true,
+            ..PromptEnvironment::default()
+        };
+        assert!(chat_system_prompt(&tools, &asking).contains("the user is asked to approve"));
+        assert!(!chat_system_prompt(&tools, &PromptEnvironment::default())
+            .contains("the user is asked to approve"));
+        assert!(!chat_system_prompt(&["command_exec".to_string()], &asking)
+            .contains("the user is asked to approve"));
     }
 
     #[test]
