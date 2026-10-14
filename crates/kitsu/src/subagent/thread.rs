@@ -668,6 +668,27 @@ impl AgentThreadState {
         was_open
     }
 
+    /// Park a running thread on a user answer (B5). `Blocked` is
+    /// non-terminal: `finish` and the steering rules still treat it exactly
+    /// as they treat `Running` once [`AgentThreadState::unblock`] resumes it.
+    pub(crate) fn block(&mut self) -> bool {
+        if self.phase != AgentThreadPhase::Running {
+            return false;
+        }
+        self.phase = AgentThreadPhase::Blocked;
+        true
+    }
+
+    /// Resume a blocked thread. Every terminal transition goes through
+    /// `Running`, so a cancellation of a blocked agent unblocks first.
+    pub(crate) fn unblock(&mut self) -> bool {
+        if self.phase != AgentThreadPhase::Blocked {
+            return false;
+        }
+        self.phase = AgentThreadPhase::Running;
+        true
+    }
+
     pub(crate) fn finish(&mut self, phase: AgentThreadPhase, result_bytes: usize) {
         if self.phase != AgentThreadPhase::Running {
             return;

@@ -33,7 +33,7 @@ use kitsu_providers::{
     ChatMessage, Provider, ProviderAttemptCategory, ProviderAttemptOutcome, ProviderError,
     ToolDescriptor,
 };
-use kitsu_tools::{HandlerFn, Registry, ToolError};
+use kitsu_tools::{Decision, HandlerFn, Registry, ToolError};
 use tokio::sync::watch;
 
 #[derive(serde::Deserialize)]
@@ -140,16 +140,26 @@ pub enum AgentStatus {
     Running,
     /// Parked on a user answer. Non-terminal, like `Running`, and a unit
     /// variant because nothing carries a reason yet.
-    #[allow(dead_code)] // Nothing parks an agent yet; a later card constructs it.
     Blocked,
     Done(String),
     Failed(String),
     Cancelled(String),
 }
 
+/// One permission request parked on its agent, waiting for an answer.
+///
+/// The token distinguishes this park from any later one for the same agent, so
+/// a fired block timeout can never resolve a request it does not own.
+struct ParkedPrompt {
+    token: u64,
+    reply: tokio::sync::oneshot::Sender<Decision>,
+}
+
 struct AgentRecord {
     task: String,
     status: AgentStatus,
+    /// `Some` exactly while `status` is [`AgentStatus::Blocked`].
+    pending_prompt: Option<ParkedPrompt>,
     handle: Option<tokio::task::JoinHandle<()>>,
     started_at: Instant,
     finished_at: Option<Instant>,
@@ -371,6 +381,27 @@ pub struct AgentTerminalStatus {
     pub joined: bool,
 }
 
+/// B3's default blocking timeout: a blocked agent resolves `Interrupt` after
+/// this long, so a headless run cannot hang. The `agents.block_timeout`
+/// config key is T2-S5's; until it lands this constant is the only source of
+/// the value.
+pub const DEFAULT_AGENT_BLOCK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+/// Outcome of answering one agent's parked permission request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+// Nothing routes a `Registry` prompt route or calls `/jobs reply` until T2-S5
+// wires the spawn path and the command, so production never names a variant.
+pub enum AgentAnswerOutcome {
+    /// The agent was blocked; its gate received exactly this decision.
+    Answered,
+    /// The agent exists but has no parked request. Reported rather than
+    /// silently ignored so `/jobs reply` can tell the user why nothing moved.
+    NotBlocked,
+    NotFound,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCancelOutcome {
     Cancelled(AgentTerminalStatus),
@@ -417,6 +448,8 @@ pub struct AgentRegistry {
     agents: Mutex<HashMap<u64, AgentRecord>>,
     next: AtomicU64,
     generation: AtomicU64,
+    /// Monotonic park identifier; see [`ParkedPrompt::token`].
+    next_prompt_token: AtomicU64,
     changes: watch::Sender<AgentRegistrySnapshot>,
     limits: AgentRegistryLimits,
     thread_limits: AgentThreadLimits,
@@ -439,11 +472,9 @@ pub struct AgentRegistrySnapshot {
     /// a watcher must surface as "there is something here for you to read" and
     /// must drop again the moment the result is read or acknowledged.
     pub unacknowledged: usize,
-    /// Agents waiting on a user answer. Reserved: always 0 in this story, since
-    /// no agent state can express that wait yet. A later story (background
-    /// agents that block on a permission answer) populates it, and the guard
-    /// test asserting it is always zero must then be updated deliberately
-    /// rather than discovered as a surprise.
+    /// Agents parked on a user answer ([`AgentStatus::Blocked`]). Non-terminal
+    /// and disjoint from `running`, so `running + blocked + terminal` is the
+    /// retained record count.
     pub blocked: usize,
 }
 
@@ -460,6 +491,7 @@ impl AgentRegistry {
             agents: Mutex::new(HashMap::new()),
             next: AtomicU64::new(0),
             generation: AtomicU64::new(0),
+            next_prompt_token: AtomicU64::new(0),
             changes,
             limits,
             thread_limits: AgentThreadLimits::default(),
@@ -503,6 +535,7 @@ impl AgentRegistry {
                 AgentRecord {
                     task,
                     status: AgentStatus::Running,
+                    pending_prompt: None,
                     handle: None,
                     started_at: Instant::now(),
                     finished_at: None,
@@ -587,6 +620,7 @@ impl AgentRegistry {
                 AgentRecord {
                     task,
                     status: AgentStatus::Running,
+                    pending_prompt: None,
                     handle: None,
                     started_at: Instant::now(),
                     finished_at: None,
@@ -612,7 +646,7 @@ impl AgentRegistry {
     fn check_capacity(&self, agents: &HashMap<u64, AgentRecord>) -> Result<(), AgentStartError> {
         let running = agents
             .values()
-            .filter(|record| matches!(record.status, AgentStatus::Running))
+            .filter(|record| matches!(record.status, AgentStatus::Running | AgentStatus::Blocked))
             .count();
         if running >= self.limits.max_running {
             return Err(AgentStartError {
@@ -732,6 +766,118 @@ impl AgentRegistry {
     /// Return the most recently published registry snapshot.
     pub fn snapshot(&self) -> AgentRegistrySnapshot {
         *self.changes.borrow()
+    }
+
+    /// Channel the gates park ungranted decisions on (design §4.4, B1-B3).
+    ///
+    /// The returned sender's receiver is serviced by a detached task that marks
+    /// the requesting agent [`AgentStatus::Blocked`], holds its reply channel,
+    /// and arms a [`DEFAULT_AGENT_BLOCK_TIMEOUT`] timer resolving
+    /// [`Decision::Interrupt`] so a headless run cannot hang (B3). The task
+    /// holds only a weak reference, so handing out a sender never keeps the
+    /// registry alive.
+    #[cfg_attr(not(test), allow(dead_code))] // No route is set until T2-S5.
+    pub fn prompt_sender(self: &Arc<Self>) -> kitsu_tools::PromptRequestSender {
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::unbounded_channel::<kitsu_tools::PromptRequest>();
+        let owner = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while let Some(request) = receiver.recv().await {
+                let Some(registry) = owner.upgrade() else {
+                    // The registry is gone; dropping `reply` resolves
+                    // `Interrupt` for this and every later request.
+                    break;
+                };
+                let agent_id = request.agent_id;
+                let Some(token) = registry.park_prompt(agent_id, request.reply) else {
+                    continue;
+                };
+                let timer_owner = Arc::downgrade(&registry);
+                drop(registry);
+                tokio::spawn(async move {
+                    tokio::time::sleep(DEFAULT_AGENT_BLOCK_TIMEOUT).await;
+                    if let Some(registry) = timer_owner.upgrade() {
+                        registry.resolve_prompt(agent_id, Some(token), Decision::Interrupt);
+                    }
+                });
+            }
+        });
+        sender
+    }
+
+    /// Answer one blocked agent's parked request (design §4.4; B1).
+    ///
+    /// All three of `AllowOnce`, `AllowAlways` and `Deny` are answers: the gate
+    /// turns a denial into a `PolicyDenied` tool error itself, so the agent
+    /// resumes either way. A non-blocked agent and an unknown id are reported
+    /// distinctly and change no state, because `/jobs reply` takes a
+    /// human-typed id in a world where the agent may have just timed out,
+    /// been cancelled, or finished.
+    #[cfg_attr(not(test), allow(dead_code))] // `/jobs reply` is T2-S5's.
+    pub fn answer(&self, id: u64, decision: Decision) -> AgentAnswerOutcome {
+        self.resolve_prompt(id, None, decision)
+    }
+
+    /// Park one request on its agent, returning the park token. A request for
+    /// an unknown, terminal, or already-blocked agent is resolved immediately
+    /// as `Interrupt` rather than held, so no gate can wait forever.
+    fn park_prompt(&self, id: u64, reply: tokio::sync::oneshot::Sender<Decision>) -> Option<u64> {
+        let (token, update) = {
+            let mut agents = self.agents.lock().expect("agent registry");
+            let parkable = agents
+                .get(&id)
+                .is_some_and(|record| matches!(record.status, AgentStatus::Running));
+            if !parkable {
+                let _ = reply.send(Decision::Interrupt);
+                return None;
+            }
+            let token = self.next_prompt_token.fetch_add(1, Ordering::Relaxed) + 1;
+            let record = agents.get_mut(&id).expect("inspected agent record");
+            record.status = AgentStatus::Blocked;
+            record.thread.block();
+            record.pending_prompt = Some(ParkedPrompt { token, reply });
+            (token, self.changed_snapshot(&agents))
+        };
+        // B4: publish a new generation so watchers observe the block.
+        self.publish(update);
+        Some(token)
+    }
+
+    /// Resolve a parked request with exactly `decision` and resume its agent.
+    /// `token` of `None` matches whatever is parked (a user answer); `Some`
+    /// matches only that park, so a stale timeout is a no-op.
+    fn resolve_prompt(
+        &self,
+        id: u64,
+        token: Option<u64>,
+        decision: Decision,
+    ) -> AgentAnswerOutcome {
+        let (reply, update) = {
+            let mut agents = self.agents.lock().expect("agent registry");
+            let Some(record) = agents.get_mut(&id) else {
+                return AgentAnswerOutcome::NotFound;
+            };
+            let parked = match (&record.pending_prompt, token) {
+                (Some(parked), Some(token)) => parked.token == token,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if !parked {
+                return AgentAnswerOutcome::NotBlocked;
+            }
+            let parked = record
+                .pending_prompt
+                .take()
+                .expect("inspected parked prompt");
+            record.status = AgentStatus::Running;
+            record.thread.unblock();
+            (parked.reply, self.changed_snapshot(&agents))
+        };
+        self.publish(update);
+        // Outside the lock: the waiting gate wakes and may re-enter the
+        // registry immediately.
+        let _ = reply.send(decision);
+        AgentAnswerOutcome::Answered
     }
 
     /// Detailed capacity, terminal-outcome, and per-agent progress snapshot.
@@ -890,7 +1036,7 @@ impl AgentRegistry {
             let Some(record) = agents.get(&id) else {
                 return AgentCancelOutcome::NotFound;
             };
-            (!matches!(record.status, AgentStatus::Running))
+            (!matches!(record.status, AgentStatus::Running | AgentStatus::Blocked))
                 .then(|| terminal_status(id, record, true))
         };
         if let Some(existing) = existing {
@@ -907,7 +1053,9 @@ impl AgentRegistry {
             // cancellation lock. Report the authoritative terminal state.
             let agents = self.agents.lock().expect("agent registry");
             match agents.get(&id) {
-                Some(record) if !matches!(record.status, AgentStatus::Running) => {
+                Some(record)
+                    if !matches!(record.status, AgentStatus::Running | AgentStatus::Blocked) =>
+                {
                     AgentCancelOutcome::AlreadyTerminal(terminal_status(id, record, true))
                 }
                 Some(_) | None => AgentCancelOutcome::NotFound,
@@ -961,12 +1109,23 @@ impl AgentRegistry {
     where
         F: FnMut(u64) -> bool,
     {
-        let (mut statuses, handles, update) = {
+        let (mut statuses, handles, replies, update) = {
             let mut agents = self.agents.lock().expect("agent registry");
             let mut statuses = Vec::new();
             let mut handles = Vec::new();
+            let mut replies = Vec::new();
             for (id, record) in agents.iter_mut() {
-                if predicate(*id) && matches!(record.status, AgentStatus::Running) {
+                if predicate(*id)
+                    && matches!(record.status, AgentStatus::Running | AgentStatus::Blocked)
+                {
+                    // A blocked agent is cancellable like a running one; its
+                    // parked request resolves `Interrupt` rather than being
+                    // dropped silently, and the thread leaves `Blocked` so the
+                    // terminal transition starts from `Running` as ever.
+                    if let Some(parked) = record.pending_prompt.take() {
+                        replies.push(parked.reply);
+                    }
+                    record.thread.unblock();
                     record.status = AgentStatus::Cancelled(reason.to_string());
                     record
                         .thread
@@ -980,8 +1139,11 @@ impl AgentRegistry {
                 }
             }
             let update = (!statuses.is_empty()).then(|| self.changed_snapshot(&agents));
-            (statuses, handles, update)
+            (statuses, handles, replies, update)
         };
+        for reply in replies {
+            let _ = reply.send(Decision::Interrupt);
+        }
         // Abort every task before awaiting any one of them, then join outside
         // the registry lock. No cancellation notification is published early.
         for handle in &handles {
@@ -1004,7 +1166,7 @@ impl AgentRegistry {
             let Some(record) = agents.get(&id) else {
                 return AgentPruneOutcome::NotFound;
             };
-            if matches!(record.status, AgentStatus::Running) {
+            if matches!(record.status, AgentStatus::Running | AgentStatus::Blocked) {
                 return AgentPruneOutcome::Running;
             }
             let record = agents.remove(&id).expect("inspected agent record");
@@ -1030,7 +1192,8 @@ impl AgentRegistry {
             let ids = agents
                 .iter()
                 .filter_map(|(id, record)| {
-                    (!matches!(record.status, AgentStatus::Running)).then_some(*id)
+                    (!matches!(record.status, AgentStatus::Running | AgentStatus::Blocked))
+                        .then_some(*id)
                 })
                 .collect::<Vec<_>>();
             let mut pruned = Vec::with_capacity(ids.len());
@@ -1054,7 +1217,7 @@ impl AgentRegistry {
             .lock()
             .expect("agent registry")
             .values()
-            .filter(|r| matches!(r.status, AgentStatus::Running))
+            .filter(|r| matches!(r.status, AgentStatus::Running | AgentStatus::Blocked))
             .count()
     }
 
@@ -1064,9 +1227,10 @@ impl AgentRegistry {
     pub fn reset(&self) {
         let update = {
             let mut agents = self.agents.lock().expect("agent registry");
-            debug_assert!(!agents
-                .values()
-                .any(|record| matches!(record.status, AgentStatus::Running)));
+            debug_assert!(!agents.values().any(|record| matches!(
+                record.status,
+                AgentStatus::Running | AgentStatus::Blocked
+            )));
             agents.clear();
             self.changed_snapshot(&agents)
         };
@@ -1107,8 +1271,9 @@ impl AgentRegistry {
             let mut agents = self.agents.lock().expect("agent registry");
             let record = agents.get_mut(&id)?;
             let result = result_text(id, &record.status);
-            let acknowledged = !matches!(record.status, AgentStatus::Running)
-                && record.thread.acknowledge_handoff();
+            let acknowledged =
+                !matches!(record.status, AgentStatus::Running | AgentStatus::Blocked)
+                    && record.thread.acknowledge_handoff();
             let update = acknowledged.then(|| self.changed_snapshot(&agents));
             (result, update)
         };
@@ -1204,6 +1369,10 @@ impl AgentRegistry {
             .values()
             .filter(|record| matches!(record.status, AgentStatus::Running))
             .count();
+        let blocked = agents
+            .values()
+            .filter(|record| matches!(record.status, AgentStatus::Blocked))
+            .count();
         let failed = agents
             .values()
             .filter(|record| matches!(record.status, AgentStatus::Failed(_)))
@@ -1215,10 +1384,10 @@ impl AgentRegistry {
         AgentRegistrySnapshot {
             generation,
             running,
-            terminal: agents.len().saturating_sub(running),
+            terminal: agents.len().saturating_sub(running).saturating_sub(blocked),
             failed,
             unacknowledged,
-            blocked: 0,
+            blocked,
         }
     }
 
@@ -1279,7 +1448,10 @@ fn agent_progress(id: u64, record: &AgentRecord) -> AgentProgress {
 }
 
 fn terminal_status(id: u64, record: &AgentRecord, joined: bool) -> AgentTerminalStatus {
-    debug_assert!(!matches!(record.status, AgentStatus::Running));
+    debug_assert!(!matches!(
+        record.status,
+        AgentStatus::Running | AgentStatus::Blocked
+    ));
     AgentTerminalStatus {
         id,
         task: record.task.clone(),
@@ -3293,5 +3465,348 @@ mod tests {
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.terminal, 0);
         assert_eq!(snapshot.unacknowledged, 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // T2-S4: the registry's receiving side for parked permission requests
+    // (design B1/B3/B4). These are failing-first tests; `prompt_sender` and
+    // `answer` are STUBS until the implementer lands the receiver.
+    // ---------------------------------------------------------------------
+
+    use kitsu_tools::{
+        Action, PermissionRequest, PromptRequest, PromptRequestPayload, ToolInterruption,
+    };
+
+    /// The exact request a path gate would park for `agent_id`.
+    fn park_path_request(
+        sender: &kitsu_tools::PromptRequestSender,
+        agent_id: u64,
+    ) -> tokio::sync::oneshot::Receiver<Decision> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        sender
+            .send(PromptRequest {
+                agent_id,
+                payload: PromptRequestPayload::Path(PermissionRequest {
+                    action: Action::Write,
+                    path: "/work/notes.txt".to_string(),
+                    grant_dir: "/work".to_string(),
+                }),
+                reply,
+            })
+            .expect("the registry owns the receiver and keeps it open");
+        answer
+    }
+
+    fn progress_status(registry: &AgentRegistry, id: u64) -> Option<AgentProgressStatus> {
+        registry
+            .progress_snapshot()
+            .agents
+            .into_iter()
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.status)
+    }
+
+    /// Yield until the registry has observed the parked request. No sleeping,
+    /// so this is safe under `start_paused`.
+    async fn await_blocked(registry: &AgentRegistry, id: u64) {
+        for _ in 0..1_000 {
+            if progress_status(registry, id) == Some(AgentProgressStatus::Blocked) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("agent #{id} never became blocked after a request was parked");
+    }
+
+    async fn answered_registry(decision: Decision) -> (Arc<AgentRegistry>, u64, Decision) {
+        let registry = AgentRegistry::new();
+        let id = registry.start("needs an answer".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+
+        assert_eq!(
+            registry.answer(id, decision),
+            AgentAnswerOutcome::Answered,
+            "a blocked agent accepts an answer"
+        );
+        let resolved = answer.await.expect("the gate's oneshot is resolved");
+        (registry, id, resolved)
+    }
+
+    #[tokio::test]
+    async fn answering_a_blocked_agent_with_allow_once_resolves_its_gate_and_resumes_it() {
+        let (registry, id, resolved) = answered_registry(Decision::AllowOnce).await;
+        assert_eq!(
+            resolved,
+            Decision::AllowOnce,
+            "the gate sees exactly the answer"
+        );
+        assert_eq!(
+            progress_status(&registry, id),
+            Some(AgentProgressStatus::Running)
+        );
+        assert_eq!(
+            registry.snapshot().blocked,
+            0,
+            "an answered agent is no longer counted"
+        );
+        assert_eq!(
+            registry.thread_snapshot(id).unwrap().phase,
+            AgentThreadPhase::Running,
+            "the thread phase leaves Blocked too"
+        );
+    }
+
+    #[tokio::test]
+    async fn answering_a_blocked_agent_with_allow_always_resolves_its_gate_and_resumes_it() {
+        let (registry, id, resolved) = answered_registry(Decision::AllowAlways).await;
+        assert_eq!(resolved, Decision::AllowAlways);
+        assert_eq!(
+            progress_status(&registry, id),
+            Some(AgentProgressStatus::Running)
+        );
+        assert_eq!(registry.snapshot().blocked, 0);
+    }
+
+    #[tokio::test]
+    async fn answering_a_blocked_agent_with_deny_resolves_its_gate_and_resumes_it() {
+        let (registry, id, resolved) = answered_registry(Decision::Deny).await;
+        assert_eq!(
+            resolved,
+            Decision::Deny,
+            "deny is an answer, not an interruption: the agent keeps running"
+        );
+        assert_eq!(
+            progress_status(&registry, id),
+            Some(AgentProgressStatus::Running)
+        );
+        assert_eq!(registry.snapshot().blocked, 0);
+    }
+
+    #[tokio::test]
+    async fn answering_an_agent_that_is_not_blocked_reports_why_and_changes_nothing() {
+        let registry = AgentRegistry::new();
+        let running = registry.start("running".to_string()).unwrap();
+        let done = registry.start("done".to_string()).unwrap();
+        registry.finish(done, Ok("ok".to_string()));
+
+        assert_eq!(
+            registry.answer(running, Decision::AllowOnce),
+            AgentAnswerOutcome::NotBlocked,
+            "a running agent has no parked request to answer"
+        );
+        assert_eq!(
+            registry.answer(done, Decision::AllowOnce),
+            AgentAnswerOutcome::NotBlocked,
+            "a terminal agent has no parked request to answer"
+        );
+        assert_eq!(
+            registry.answer(9_999, Decision::AllowOnce),
+            AgentAnswerOutcome::NotFound,
+            "an unknown id is distinguishable from a known, unblocked one"
+        );
+
+        assert_eq!(
+            progress_status(&registry, running),
+            Some(AgentProgressStatus::Running)
+        );
+        assert_eq!(
+            progress_status(&registry, done),
+            Some(AgentProgressStatus::Done)
+        );
+        assert_eq!(registry.snapshot().blocked, 0);
+    }
+
+    #[tokio::test]
+    async fn a_parked_request_blocks_its_agent_and_the_blocked_count_is_real() {
+        let registry = AgentRegistry::new();
+        let blocked = registry.start("will block".to_string()).unwrap();
+        let busy = registry.start("stays running".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+
+        let before = registry.snapshot().generation;
+        let _answer = park_path_request(&sender, blocked);
+        await_blocked(&registry, blocked).await;
+
+        assert_eq!(
+            registry.snapshot().blocked,
+            1,
+            "AgentRegistrySnapshot::blocked is a real count, not a literal 0"
+        );
+        assert!(
+            registry.snapshot().generation > before,
+            "blocking publishes a new generation so watchers see it (B4)"
+        );
+        assert_eq!(
+            progress_status(&registry, blocked),
+            Some(AgentProgressStatus::Blocked)
+        );
+        assert_eq!(
+            progress_status(&registry, busy),
+            Some(AgentProgressStatus::Running)
+        );
+        assert_eq!(
+            registry.thread_snapshot(blocked).unwrap().phase,
+            AgentThreadPhase::Blocked,
+            "the thread DTO phase blocks with the record (B5)"
+        );
+        let progress = registry.progress_snapshot();
+        assert_eq!(progress.blocked, 1);
+        assert_eq!(
+            progress.running
+                + progress.blocked
+                + progress.done
+                + progress.failed
+                + progress.cancelled,
+            progress.total,
+            "the per-state counts still sum to total"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_agent_times_out_to_interrupt_after_the_default_block_timeout() {
+        assert_eq!(
+            DEFAULT_AGENT_BLOCK_TIMEOUT,
+            std::time::Duration::from_secs(30 * 60),
+            "B3's default is 30 minutes"
+        );
+
+        let registry = AgentRegistry::new();
+        let id = registry.start("waits forever".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let mut answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+
+        tokio::time::advance(DEFAULT_AGENT_BLOCK_TIMEOUT - std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            answer.try_recv().is_err(),
+            "the request is still parked one second before the timeout"
+        );
+        assert_eq!(registry.snapshot().blocked, 1);
+
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(
+            answer
+                .await
+                .expect("the timeout resolves the gate rather than dropping it"),
+            Decision::Interrupt,
+            "B3: the timeout answers Interrupt, which the gates map to AuthorityInputClosed"
+        );
+        assert_eq!(
+            registry.snapshot().blocked,
+            0,
+            "a timed-out agent is no longer blocked"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_blocked_agent_ends_as_failed_interrupted() {
+        let registry = AgentRegistry::new();
+        let sender = registry.prompt_sender();
+        let gate_sender = sender.clone();
+        // Stands in for the gate: park the request, then map the answer the way
+        // `Permissions::resolve` already maps `Decision::Interrupt`.
+        let id = registry
+            .spawn_background("gated write".to_string(), async move {
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                let _ = gate_sender.send(PromptRequest {
+                    agent_id: 1,
+                    payload: PromptRequestPayload::Path(PermissionRequest {
+                        action: Action::Write,
+                        path: "/work/notes.txt".to_string(),
+                        grant_dir: "/work".to_string(),
+                    }),
+                    reply,
+                });
+                match answer.await.unwrap_or(Decision::Interrupt) {
+                    Decision::Interrupt => Err(ToolInterruption::AuthorityInputClosed.to_string()),
+                    other => Ok(format!("{other:?}")),
+                }
+            })
+            .unwrap();
+        await_blocked(&registry, id).await;
+
+        tokio::time::advance(DEFAULT_AGENT_BLOCK_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        for _ in 0..1_000 {
+            if progress_status(&registry, id) == Some(AgentProgressStatus::Failed) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let status = registry
+            .take_unobserved_terminal_results()
+            .into_iter()
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.status)
+            .expect("the timed-out agent is retained");
+        assert_eq!(
+            status,
+            AgentStatus::Failed(ToolInterruption::AuthorityInputClosed.to_string()),
+            "B3: a headless run cannot hang; it fails as interrupted"
+        );
+        assert_eq!(registry.snapshot().blocked, 0);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_blocked_agent_resolves_its_pending_request_as_interrupt() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("stopped while blocked".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+
+        let outcome = registry.cancel(id).await;
+        assert!(
+            matches!(outcome, AgentCancelOutcome::Cancelled(_)),
+            "/jobs stop stops a blocked agent, it is not already terminal: {outcome:?}"
+        );
+        assert_eq!(
+            answer
+                .await
+                .expect("stop resolves the gate rather than leaving it awaiting"),
+            Decision::Interrupt,
+            "/jobs stop on a blocked agent resolves Interrupt"
+        );
+        assert_eq!(registry.snapshot().blocked, 0);
+        assert_eq!(
+            progress_status(&registry, id),
+            Some(AgentProgressStatus::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn tearing_down_a_blocked_agent_leaves_no_request_parked() {
+        let registry = AgentRegistry::new();
+        let id = registry
+            .start("torn down while blocked".to_string())
+            .unwrap();
+        let sender = registry.prompt_sender();
+        let answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+
+        let cancelled = registry.cancel_all().await;
+        assert_eq!(
+            cancelled.len(),
+            1,
+            "a blocked agent is cancellable like a running one"
+        );
+        assert_eq!(
+            answer
+                .await
+                .expect("teardown resolves the gate rather than dropping it silently"),
+            Decision::Interrupt
+        );
+        assert_eq!(
+            registry.snapshot().blocked,
+            0,
+            "no request stays parked after teardown"
+        );
+        assert_eq!(
+            registry.answer(id, Decision::AllowOnce),
+            AgentAnswerOutcome::NotBlocked,
+            "the parked request is gone, so a late answer finds nothing to resolve"
+        );
     }
 }

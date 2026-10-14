@@ -129,7 +129,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T0-S19 the three remaining flock sites, F32 closed | done | 187e120 |
 | T2-S1 `PromptRoute` task-local seam | done | c4bd57b |
 | T2-S3 `Blocked` vocabulary + validator + schema v2 | done, **taken before S2** | 68c7e54 |
-| T2-S2 both gates consult the route (absorbs S1's gate half) | done | this commit |
+| T2-S2 both gates consult the route (absorbs S1's gate half) | done | 14a9c85 |
+| T2-S4 registry parks, answers, times out | done | this commit |
 
 With T1-S6 done, **milestone T1 is complete**: kitsu now exposes its
 background agents to the outside three ways — a grouped and explainable deck
