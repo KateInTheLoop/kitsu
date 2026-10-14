@@ -309,6 +309,12 @@ that thread, and any other argument is forwarded verbatim to `/jobs`, so every
 subcommand is reachable through either name.
 
 Background agents run in-process, so nothing outside kitsu can observe them.
+In the viewport the answer is read on the keypress while the input collector
+still holds raw mode, so nothing is echoed and the transcript keeps only the
+receipt; the cue is a row of the modal. Classic reads the answer canonically and
+still echoes it, which is what keeps line editing and the `yes`/`always`/`no`
+long forms working there. One parser serves the filesystem approval, the command
+approval and `/jobs reply`, so the accepted answers cannot drift apart.
 In the inline viewport a permission prompt renders as a bottom-pane modal
 rather than scrolling past: the same option line the classic prompt shows, from
 the same composer, and for a command approval the same provenance rows. Because

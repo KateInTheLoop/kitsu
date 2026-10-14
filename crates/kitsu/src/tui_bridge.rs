@@ -323,11 +323,37 @@ static MODAL_PANE: std::sync::Mutex<Option<Arc<PinnedPane>>> = std::sync::Mutex:
 /// caller's own header, provenance and option strings, painted through
 /// [`PinnedPane::paint_rows`] so the clamp, the re-latch and the paint are
 /// one operation with F19's and F16's behaviour intact.
-pub(crate) fn paint_approval_modal(header: &str, details: &[String], options: &str) -> bool {
+/// Card **T3-S7b**: `cue` is the row the user types at, appended below the
+/// option line when the answer is read in-loop. It is a *row* rather than a
+/// `> ` written into the scroll region, which is the whole point of the card:
+/// the modal owns the cue, so nothing about the prompt lands in the
+/// transcript. `None` keeps the modal exactly as T3-S7a painted it.
+pub(crate) fn paint_approval_modal(
+    header: &str,
+    details: &[String],
+    options: &str,
+    cue: Option<&str>,
+) -> bool {
     let Some(pane) = lock(&MODAL_PANE).clone() else {
         return false;
     };
-    pane.paint_rows(&kitsu_render::approval_modal(header, details, options))
+    let mut rows = kitsu_render::approval_modal(header, details, options);
+    if let Some(cue) = cue {
+        rows.push(cue.to_string());
+    }
+    pane.paint_rows(&rows)
+}
+
+/// Whether a pinned pane is published at all: card **T3-S7b**'s "is there a
+/// pane" question, asked *before* anything is claimed or printed.
+///
+/// Deliberately cheap and deliberately not the whole answer: a published pane
+/// whose viewport is released still paints nothing, so the bypass decision is
+/// taken from [`paint_approval_modal`]'s own return value. This only says
+/// whether it is worth asking -- in classic mode it is not, and the prompter
+/// must then not disturb a byte.
+pub(crate) fn approval_pane_published() -> bool {
+    lock(&MODAL_PANE).is_some()
 }
 
 /// Take the modal back down once the decision has been read, leaving the one

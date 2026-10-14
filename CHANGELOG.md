@@ -92,6 +92,13 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- In the inline viewport, answering a permission prompt no longer leaves the
+  typed letter and a stray `> ` in your transcript: the answer is read on the
+  keypress and the cue is drawn in the modal, so the transcript keeps only the
+  `◉ permission —` record. Classic mode still echoes the answer as it always
+  has. Note that in the viewport a *pasted* answer is denied rather than
+  accepted, and the long forms `yes`/`always`/`no` need classic or
+  `/jobs reply`.
 - In the inline viewport, **permission prompts now appear as a modal in the
   bottom pane** instead of scrolling past in the transcript, with the same
   option line as the classic prompt and, for command approvals, the same
