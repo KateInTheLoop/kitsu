@@ -53,6 +53,14 @@ shapes may change in any minor release.
   A denial releases the agent to carry on with the refusal, exactly as the
   foreground prompt would. Replying to an agent that is not waiting says so
   rather than silently doing nothing.
+- A background agent's bounded timeline now records **each permission it asked
+  for and how that ended** — allowed once, allowed always, denied, or timed out
+  — so `/jobs show` still shows that an agent asked, after it has been answered.
+  `/jobs explain` reports a pending permission on its `waiting on:` line instead
+  of the agent's last tool activity. These entries name the kind of permission
+  ("approval to write a file") and deliberately **never** the path, URL or
+  command line, keeping the timeline's existing promise that tool arguments are
+  never copied into an inspection record.
 - An unknown `/jobs` subcommand now names what you typed even when it is too
   far from any real one to suggest a correction — previously a far miss printed
   only the usage line, leaving you to spot your own typo in it.

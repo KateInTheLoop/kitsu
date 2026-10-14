@@ -113,6 +113,8 @@ pub enum AgentTimelineKind {
     Usage,
     Steering,
     Lifecycle,
+    /// One permission request parked on this agent, and its decision (T2-S6).
+    Approval,
 }
 
 impl AgentTimelineKind {
@@ -127,6 +129,54 @@ impl AgentTimelineKind {
             Self::Usage => "usage",
             Self::Steering => "steering",
             Self::Lifecycle => "lifecycle",
+            Self::Approval => "approval",
+        }
+    }
+}
+
+/// What a parked permission request is asking for, *without its arguments*.
+///
+/// Deliberately argument-free. `docs/functionality.md` states as an absolute
+/// that tool arguments and output are never copied into the inspection
+/// record, and a permission request is precisely a tool plus its arguments,
+/// so only the kind crosses into the timeline. `/jobs explain`'s question
+/// ("what is this agent waiting on") is answered by the kind alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentApprovalKind {
+    ReadFile,
+    WriteFile,
+    RunCommand,
+}
+
+impl AgentApprovalKind {
+    /// The phrase that follows "permission to".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReadFile => "read a file",
+            Self::WriteFile => "write a file",
+            Self::RunCommand => "run a command",
+        }
+    }
+}
+
+/// How a parked permission request was decided.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentApprovalOutcome {
+    AllowedOnce,
+    AllowedAlways,
+    Denied,
+    /// No human answered within `agents.block_timeout_secs` (B3). This is the
+    /// one outcome with nobody present, so the record matters most here.
+    TimedOut,
+}
+
+impl AgentApprovalOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AllowedOnce => "allowed once",
+            Self::AllowedAlways => "allowed always",
+            Self::Denied => "denied",
+            Self::TimedOut => "timed out",
         }
     }
 }
@@ -666,6 +716,40 @@ impl AgentThreadState {
             );
         }
         was_open
+    }
+
+    /// Record that this agent parked on a permission request (T2-S6).
+    ///
+    /// The entry reads `approval to <kind> requested`, built only from
+    /// `&'static str` labels and pinned by the registry's park tests.
+    ///
+    /// Takes the kind and nothing else: the path, grant dir, argv and cwd the
+    /// gate parked never reach this function, so no tool argument can be
+    /// formatted into the inspection record. Deliberately *not* routed
+    /// through `record_runtime_event`, which returns early unless the phase
+    /// is `Running` — a park is precisely the `Blocked` phase.
+    pub(crate) fn record_approval_request(&mut self, kind: AgentApprovalKind) {
+        self.timeline.push(
+            AgentTimelineKind::Approval,
+            None,
+            &format!("approval to {} requested", kind.label()),
+        );
+    }
+
+    /// Record how a parked permission request was decided (T2-S6).
+    ///
+    /// Reached by every resolution path, including B3's timeout, which is the
+    /// one decision taken with nobody present.
+    pub(crate) fn record_approval_outcome(
+        &mut self,
+        kind: AgentApprovalKind,
+        outcome: AgentApprovalOutcome,
+    ) {
+        self.timeline.push(
+            AgentTimelineKind::Approval,
+            None,
+            &format!("approval to {} {}", kind.label(), outcome.label()),
+        );
     }
 
     /// Park a running thread on a user answer (B5). `Blocked` is
@@ -1363,5 +1447,215 @@ mod tests {
             error.to_string().contains("expected 2"),
             "the error names the current schema: {error}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // T2-S6: the approval record. `record_approval_request` and
+    // `record_approval_outcome` are STUBS; every test below this banner is
+    // expected to fail until they append entries.
+    // -----------------------------------------------------------------
+
+    /// The wire and human vocabulary. Satisfied by the vocabulary stub alone
+    /// (the enums and labels), so it is a spelling pin, not a behaviour one.
+    #[test]
+    fn the_approval_timeline_kind_and_its_labels_have_one_spelling() {
+        assert_eq!(AgentTimelineKind::Approval.label(), "approval");
+        let kind = serde_json::to_string(&AgentTimelineKind::Approval).unwrap();
+        assert_eq!(kind, "\"approval\"", "the DTO spelling matches the label");
+        for (kind, label) in [
+            (AgentApprovalKind::ReadFile, "read a file"),
+            (AgentApprovalKind::WriteFile, "write a file"),
+            (AgentApprovalKind::RunCommand, "run a command"),
+        ] {
+            assert_eq!(kind.label(), label);
+            assert!(kind.label().is_ascii(), "approval labels reach the deck");
+        }
+        for (outcome, label) in [
+            (AgentApprovalOutcome::AllowedOnce, "allowed once"),
+            (AgentApprovalOutcome::AllowedAlways, "allowed always"),
+            (AgentApprovalOutcome::Denied, "denied"),
+            (AgentApprovalOutcome::TimedOut, "timed out"),
+        ] {
+            assert_eq!(outcome.label(), label);
+            assert!(outcome.label().is_ascii());
+        }
+    }
+
+    /// NON-VACUITY PROOF for every "the path does not appear" assertion in
+    /// this file and in `main.rs`.
+    ///
+    /// `sanitize_and_redact_text` redacts credentials. It does *not* redact a
+    /// filesystem path, a URL path, or an argv word. So an implementation
+    /// that formatted the request's arguments into the entry text would put
+    /// them into the snapshot verbatim, and the absence assertions below
+    /// would fail. They are claims about construction (kind-only entries),
+    /// not restatements of what redaction already does.
+    #[test]
+    fn redaction_does_not_remove_a_path_or_an_argv_word() {
+        for argument in [
+            "/work/secrets/notes.txt",
+            "/home/mmpg/workspace/kitsu",
+            "rm -rf /work/tmp",
+            "https://internal.invalid/private/report",
+        ] {
+            assert_eq!(
+                sanitize_and_redact_text(argument),
+                argument,
+                "redaction passes arguments through unchanged, so a kind-only \
+                 approval entry is the only thing keeping them out"
+            );
+        }
+    }
+
+    /// Parking records a request entry; deciding records the outcome. The
+    /// entries carry the kind and nothing else — no path, no grant dir, no
+    /// argv.
+    #[test]
+    fn an_approval_request_and_its_outcome_are_recorded_without_arguments() {
+        let (mut state, _runtime) = AgentThreadState::new(
+            "summarize the crate",
+            "model",
+            None,
+            AgentThreadLimits::default(),
+        );
+        assert!(state.block());
+        state.record_approval_request(AgentApprovalKind::WriteFile);
+        state.record_approval_outcome(
+            AgentApprovalKind::WriteFile,
+            AgentApprovalOutcome::AllowedOnce,
+        );
+        assert!(state.unblock());
+
+        let snapshot = state.snapshot(7, 12);
+        let approvals = snapshot
+            .timeline
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == AgentTimelineKind::Approval)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            approvals.len(),
+            2,
+            "one entry for the request and one for the decision: {:?}",
+            snapshot.timeline.entries
+        );
+        assert!(
+            approvals[0].text.contains("write a file"),
+            "the request names what it asks for: {:?}",
+            approvals[0]
+        );
+        assert!(
+            approvals[1].text.contains("allowed once"),
+            "the decision names the outcome: {:?}",
+            approvals[1]
+        );
+        assert!(
+            approvals[0].sequence < approvals[1].sequence,
+            "the request precedes its decision"
+        );
+
+        // N8 / docs/functionality.md: no tool argument crosses into the
+        // inspection record. See `redaction_does_not_remove_a_path_or_an_argv_word`
+        // for why this cannot pass vacuously.
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        for argument in ["/work", "notes.txt", "rm -rf", "https://"] {
+            assert!(
+                !encoded.contains(argument),
+                "an approval entry leaked an argument ({argument}): {encoded}"
+            );
+        }
+    }
+
+    /// Every outcome is recordable and spelled distinctly, including the
+    /// timeout, which is the one case with no human present.
+    #[test]
+    fn each_approval_outcome_including_the_timeout_leaves_a_distinct_record() {
+        for (outcome, expected) in [
+            (AgentApprovalOutcome::AllowedOnce, "allowed once"),
+            (AgentApprovalOutcome::AllowedAlways, "allowed always"),
+            (AgentApprovalOutcome::Denied, "denied"),
+            (AgentApprovalOutcome::TimedOut, "timed out"),
+        ] {
+            let (mut state, _runtime) =
+                AgentThreadState::new("task", "model", None, AgentThreadLimits::default());
+            state.record_approval_request(AgentApprovalKind::RunCommand);
+            state.record_approval_outcome(AgentApprovalKind::RunCommand, outcome);
+            let snapshot = state.snapshot(1, 1);
+            let texts = snapshot
+                .timeline
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == AgentTimelineKind::Approval)
+                .map(|entry| entry.text.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                texts.len(),
+                2,
+                "{outcome:?}: {:?}",
+                snapshot.timeline.entries
+            );
+            assert!(
+                texts[1].contains(expected),
+                "{outcome:?} is recorded as {expected:?}: {texts:?}"
+            );
+        }
+    }
+
+    /// An approval entry is recorded while the thread is `Blocked`.
+    /// `record_runtime_event` returns early unless the phase is `Running`, so
+    /// an implementation that routed the approval through that path would
+    /// record nothing at all — this is the test that catches it.
+    #[test]
+    fn an_approval_is_recorded_while_the_thread_is_blocked() {
+        let (mut state, _runtime) =
+            AgentThreadState::new("task", "model", None, AgentThreadLimits::default());
+        assert!(state.block());
+        assert_eq!(state.snapshot(1, 1).phase, AgentThreadPhase::Blocked);
+        state.record_approval_request(AgentApprovalKind::ReadFile);
+        assert!(
+            state
+                .snapshot(1, 1)
+                .timeline
+                .entries
+                .iter()
+                .any(|entry| entry.kind == AgentTimelineKind::Approval),
+            "the park itself happens in the Blocked phase, so the entry must \
+             be recordable there"
+        );
+    }
+
+    /// Item 5: a parked-and-answered agent cannot grow the timeline without
+    /// limit, and the DTO it produces still validates (which re-checks the
+    /// redaction and accounting invariants for the new entries).
+    #[test]
+    fn repeated_approvals_stay_within_the_timeline_budget_and_validate() {
+        let limits = tiny_limits();
+        let (mut state, _runtime) = AgentThreadState::new("task", "model", None, limits);
+        for _ in 0..64 {
+            state.record_approval_request(AgentApprovalKind::WriteFile);
+            state.record_approval_outcome(
+                AgentApprovalKind::WriteFile,
+                AgentApprovalOutcome::Denied,
+            );
+        }
+        let snapshot = state.snapshot(3, 4);
+        assert!(
+            snapshot
+                .timeline
+                .entries
+                .iter()
+                .any(|entry| entry.kind == AgentTimelineKind::Approval),
+            "approvals are recorded at all: {:?}",
+            snapshot.timeline.entries
+        );
+        assert!(snapshot.timeline.entries.len() <= limits.max_events);
+        assert!(snapshot.timeline.retained_bytes <= limits.max_bytes);
+        assert!(
+            snapshot.timeline.dropped_entries > 0,
+            "128 approval entries do not fit in a 3-event budget"
+        );
+        AgentThreadSnapshotDto::from_snapshot(&snapshot)
+            .validate(limits)
+            .expect("approval entries satisfy the DTO's redaction and accounting rules");
     }
 }

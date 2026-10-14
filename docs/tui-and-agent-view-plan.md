@@ -131,8 +131,9 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T2-S3 `Blocked` vocabulary + validator + schema v2 | done, **taken before S2** | 68c7e54 |
 | T2-S2 both gates consult the route (absorbs S1's gate half) | done | 14a9c85 |
 | T2-S4 registry parks, answers, times out | done | cdac378 |
-| T2-S5a `agents.blocking` + `block_timeout_secs` + spawn wiring | done | this commit |
-| T2-S5b `/jobs reply` in all **seven** sites (F38), F2 closed by test | done | this commit |
+| T2-S5a `agents.blocking` + `block_timeout_secs` + spawn wiring | done | 57a2e90 |
+| T2-S5b `/jobs reply` in all **seven** sites (F38), F2 closed by test | done | 13f12ea |
+| T2-S6 approval entries in `/jobs show` and `/jobs explain`, argument-free by construction (F40) | done | this commit |
 
 With T1-S6 done, **milestone T1 is complete**: kitsu now exposes its
 background agents to the outside three ways — a grouped and explainable deck
