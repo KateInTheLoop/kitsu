@@ -12,7 +12,11 @@ mod onboarding;
 mod publication;
 
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -47,7 +51,21 @@ pub struct Config {
     pub theme: Option<String>,
     #[serde(default)]
     pub gateways: BTreeMap<String, Gateway>,
+    /// `--gateway local` with no `[gateways.local]` profile: the first local
+    /// server found on a well-known port and the models it lists, probed once
+    /// on first use.
+    #[serde(skip)]
+    detected_local: OnceLock<Option<(Gateway, Vec<String>)>>,
 }
+
+/// Well-known loopback ports of OpenAI-compatible local runtimes, probed in
+/// order by the zero-config `local` gateway.
+const LOCAL_SERVERS: &[(u16, &str)] = &[
+    (11434, "Ollama"),
+    (1234, "LM Studio"),
+    (8080, "llama.cpp"),
+    (8000, "vLLM"),
+];
 
 /// A single named gateway profile. Unknown keys are rejected loudly: a typo
 /// like `token_env` (the real key is `auth.env`) silently changing behavior
@@ -192,6 +210,11 @@ pub enum ConfigError {
         defined: String,
     },
     NoGateway,
+    NoLocalServer,
+    AmbiguousLocalModel {
+        model: String,
+        matches: String,
+    },
     UnsupportedFlavor {
         flavor: String,
     },
@@ -237,6 +260,21 @@ impl std::fmt::Display for ConfigError {
             ConfigError::NoGateway => write!(
                 f,
                 "config error: no gateway selected — pass --gateway <name>, set KITSU_GATEWAY, or set default_gateway"
+            ),
+            ConfigError::NoLocalServer => {
+                let probed = LOCAL_SERVERS
+                    .iter()
+                    .map(|(port, runtime)| format!("{runtime} :{port}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "config error: gateway 'local' found no running local server with models (probed {probed}) — start one, or define [gateways.local]"
+                )
+            }
+            ConfigError::AmbiguousLocalModel { model, matches } => write!(
+                f,
+                "config error: model '{model}' matches several local models: {matches} — pass the full id"
             ),
             ConfigError::UnsupportedFlavor { flavor } => write!(
                 f,
@@ -336,6 +374,16 @@ impl Config {
         };
         match self.gateways.get(name) {
             Some(g) => Ok((name, g)),
+            None if name == "local" => self
+                .local()
+                .map(|(g, _)| (name, g))
+                .ok_or(ConfigError::NoLocalServer),
+            // `remote` names whatever default_gateway points at, so scripts can
+            // say local vs remote without knowing profile names.
+            None if name == "remote" => match self.default_gateway.as_deref() {
+                Some(default) if default != "remote" => self.select_gateway(Some(default)),
+                _ => Err(ConfigError::NoGateway),
+            },
             None => {
                 let defined = self.gateways.keys().cloned().collect::<Vec<_>>().join(", ");
                 Err(ConfigError::UnknownGateway {
@@ -345,6 +393,96 @@ impl Config {
             }
         }
     }
+
+    fn local(&self) -> Option<&(Gateway, Vec<String>)> {
+        self.detected_local
+            .get_or_init(detect_local_gateway)
+            .as_ref()
+    }
+
+    /// Best-effort routing for `--model` without `--gateway`: a model the
+    /// detected local server lists (the exact id, or a unique case-insensitive
+    /// substring such as `glm`) resolves to that full local id; anything else
+    /// returns `None` and stays with the default gateway. A configured
+    /// `[gateways.local]` profile opts out of routing entirely.
+    pub fn route_model_to_local(&self, model: &str) -> Result<Option<String>, ConfigError> {
+        if self.gateways.contains_key("local") {
+            return Ok(None);
+        }
+        let Some((_, models)) = self.local() else {
+            return Ok(None);
+        };
+        if models.iter().any(|m| m == model) {
+            return Ok(Some(model.to_string()));
+        }
+        let needle = model.to_lowercase();
+        let hits: Vec<&String> = models
+            .iter()
+            .filter(|m| m.to_lowercase().contains(&needle))
+            .collect();
+        match hits.as_slice() {
+            [] => Ok(None),
+            [hit] => Ok(Some((*hit).clone())),
+            _ => Err(ConfigError::AmbiguousLocalModel {
+                model: model.to_string(),
+                matches: hits
+                    .iter()
+                    .map(|m| m.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }),
+        }
+    }
+}
+
+/// The first well-known local runtime that answers `/v1/models` with at least
+/// one model, as a no-auth OpenAI-compatible profile defaulting to that first
+/// model, plus everything it lists.
+fn detect_local_gateway() -> Option<(Gateway, Vec<String>)> {
+    LOCAL_SERVERS.iter().find_map(|&(port, _)| {
+        let models = probe_local_models(port)?;
+        let gateway = Gateway {
+            flavor: "openai".to_string(),
+            adapter: GatewayAdapter::default(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            chat_path: default_chat_path(),
+            models_path: Some("/v1/models".to_string()),
+            model: models.first().cloned(),
+            context_window: None,
+            auth: AuthConfig {
+                method: "none".to_string(),
+                ..AuthConfig::default()
+            },
+        };
+        Some((gateway, models))
+    })
+}
+
+/// Model ids a loopback server lists at `/v1/models`, or `None` if nothing
+/// answers or the list is empty. HTTP/1.0 keeps the reply un-chunked so a plain read works.
+// ponytail: blocking std probe at startup (≤ ~1s per closed-but-hung port);
+// move onto the async provider client if selection ever runs mid-session.
+fn probe_local_models(port: u16) -> Option<Vec<String>> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+    stream
+        .write_all(b"GET /v1/models HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+        .ok()?;
+    let mut reply = Vec::new();
+    stream.take(1 << 20).read_to_end(&mut reply).ok()?;
+    let reply = String::from_utf8_lossy(&reply);
+    let (head, body) = reply.split_once("\r\n\r\n")?;
+    if head.split_whitespace().nth(1) != Some("200") {
+        return None;
+    }
+    let catalog: serde_json::Value = serde_json::from_str(body).ok()?;
+    let models: Vec<String> = catalog["data"]
+        .as_array()?
+        .iter()
+        .filter_map(|model| model["id"].as_str().map(str::to_string))
+        .collect();
+    (!models.is_empty()).then_some(models)
 }
 
 impl Gateway {
@@ -439,6 +577,94 @@ mod tests {
             !format!("{gw:?}").contains("super-secret-token-value"),
             "token leaked through Gateway Debug"
         );
+    }
+
+    /// The zero-config `local` gateway takes the first listed model from a
+    /// 200 catalog, and treats an empty catalog or an error status as absent.
+    #[test]
+    fn local_probe_reads_first_model_and_rejects_empty_or_error_replies() {
+        let serve = |reply: &'static str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.read(&mut [0; 1024]);
+                stream.write_all(reply.as_bytes()).unwrap();
+            });
+            port
+        };
+        let ok = serve(
+            "HTTP/1.0 200 OK\r\n\r\n{\"data\":[{\"id\":\"glm-4.7-flash:q4_K_M\"},{\"id\":\"other\"}]}",
+        );
+        assert_eq!(
+            probe_local_models(ok),
+            Some(vec![
+                "glm-4.7-flash:q4_K_M".to_string(),
+                "other".to_string()
+            ])
+        );
+        let empty = serve("HTTP/1.0 200 OK\r\n\r\n{\"data\":[]}");
+        assert_eq!(probe_local_models(empty), None);
+        let missing = serve("HTTP/1.0 404 Not Found\r\n\r\n{\"data\":[{\"id\":\"x\"}]}");
+        assert_eq!(probe_local_models(missing), None);
+    }
+
+    /// `--model` routes to the detected local server on an exact id or a unique
+    /// substring, refuses an ambiguous one, and leaves everything else (and any
+    /// configured `[gateways.local]`) to the default gateway. `remote` aliases
+    /// default_gateway.
+    #[test]
+    fn model_routing_prefers_unique_local_matches_and_remote_aliases_default() {
+        let local = |gateways: &str| {
+            let mut config: Config = toml::from_str(gateways).unwrap();
+            let models = ["glm-4.7-flash:q4_K_M", "qwen3-coder-next:q4_K_M"];
+            config.detected_local = OnceLock::from(Some((
+                Gateway {
+                    flavor: "openai".to_string(),
+                    adapter: GatewayAdapter::default(),
+                    base_url: "http://127.0.0.1:11434".to_string(),
+                    chat_path: default_chat_path(),
+                    models_path: Some("/v1/models".to_string()),
+                    model: Some(models[0].to_string()),
+                    context_window: None,
+                    auth: AuthConfig::default(),
+                },
+                models.map(str::to_string).to_vec(),
+            )));
+            config
+        };
+        let config = local(
+            "default_gateway = \"anthropic1m\"\n[gateways.anthropic1m]\nflavor = \"openai\"\nbase_url = \"https://x\"\n",
+        );
+        let route = |model| config.route_model_to_local(model);
+        assert_eq!(
+            route("glm").unwrap().as_deref(),
+            Some("glm-4.7-flash:q4_K_M")
+        );
+        assert_eq!(
+            route("qwen3-coder-next:q4_K_M").unwrap().as_deref(),
+            Some("qwen3-coder-next:q4_K_M")
+        );
+        assert!(matches!(
+            route("q4_k_m"),
+            Err(ConfigError::AmbiguousLocalModel { .. })
+        ));
+        assert_eq!(route("global.anthropic.claude-opus-5-5").unwrap(), None);
+        assert_eq!(
+            config.select_gateway(Some("remote")).unwrap().0,
+            "anthropic1m"
+        );
+        assert_eq!(
+            config.select_gateway(Some("local")).unwrap().1.base_url,
+            "http://127.0.0.1:11434"
+        );
+
+        let pinned = local("[gateways.local]\nflavor = \"openai\"\nbase_url = \"http://h\"\n");
+        assert_eq!(pinned.route_model_to_local("glm").unwrap(), None);
+        assert!(matches!(
+            pinned.select_gateway(Some("remote")),
+            Err(ConfigError::NoGateway)
+        ));
     }
 
     /// A typo'd config key (the cycle-14 audit hit `token_env` for `env`) must

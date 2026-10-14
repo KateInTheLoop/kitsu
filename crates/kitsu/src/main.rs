@@ -9070,6 +9070,36 @@ async fn refresh_cached_context_window_explicit(
 
 /// Resolve config + gateway profile and build the provider/auth/model. Emits the
 /// best-effort token-expiry warning (warn-but-send, design §3).
+/// Best-effort gateway choice: `--model` without `--gateway` goes to the
+/// auto-detected local server when it lists that model (exactly, or as a unique
+/// substring like `glm`), resolved to the full local id. Otherwise the
+/// requested gateway and model pass through unchanged.
+fn route_model_selection<'a>(
+    cli: &'a Cli,
+    config: &Config,
+) -> Result<(Option<&'a str>, Option<String>), CliError> {
+    let requested_model = cli.model.clone();
+    let (None, Some(model)) = (cli.gateway.as_deref(), requested_model.as_deref()) else {
+        return Ok((cli.gateway.as_deref(), requested_model));
+    };
+    match config
+        .route_model_to_local(model)
+        .map_err(|error| CliError::user(error.to_string()))?
+    {
+        Some(local_model) => {
+            if !cli.jsonl {
+                eprintln!(
+                    "~ --model {} found on the local server; using gateway local ({})",
+                    terminal_inline(model),
+                    terminal_inline(&local_model)
+                );
+            }
+            Ok((Some("local"), Some(local_model)))
+        }
+        None => Ok((None, requested_model)),
+    }
+}
+
 async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     let path = Config::resolve_path(cli.config.as_deref());
     let selected_config = cli.config.is_some()
@@ -9112,8 +9142,9 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     // continue to work in containers with a read-only HOME.
     let state_dir = runtime_state_dir(&path);
 
+    let (requested_gateway, requested_model) = route_model_selection(cli, &config)?;
     let (gateway_name, gateway) = config
-        .select_gateway(cli.gateway.as_deref())
+        .select_gateway(requested_gateway)
         .map_err(|e| CliError::user(e.to_string()))?;
     let gateway_name = gateway_name.to_string();
     let provider_diagnostics = ProviderDiagnosticContext::from_gateway(&gateway_name, gateway);
@@ -9127,7 +9158,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
             ))
         })?;
     let model = gateway
-        .resolve_model(cli.model.as_deref())
+        .resolve_model(requested_model.as_deref())
         .map_err(|e| CliError::user(e.to_string()))?;
     let managed_token = managed_credential(&state_dir, &gateway_name, gateway)?;
     let provider_auth_source = current_provider_auth_source(gateway, managed_token.is_some());
@@ -9573,8 +9604,9 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
         )));
     }
     let config = Config::load(&path).map_err(|error| CliError::user(safe_config_error(&error)))?;
+    let (requested_gateway, requested_model) = route_model_selection(cli, &config)?;
     let (gateway_name, gateway) = config
-        .select_gateway(cli.gateway.as_deref())
+        .select_gateway(requested_gateway)
         .map_err(|error| CliError::user(error.to_string()))?;
     let provider_diagnostics = ProviderDiagnosticContext::from_gateway(gateway_name, gateway);
     gateway
@@ -9582,7 +9614,7 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
         .map_err(|error| CliError::user(error.to_string()))?;
     // Catalog discovery remains usable without a configured model. When one
     // does resolve, human TTY output can orient the user by pinning it first.
-    let current_model = gateway.resolve_model(cli.model.as_deref()).ok();
+    let current_model = gateway.resolve_model(requested_model.as_deref()).ok();
     let state_dir = runtime_state_dir_read_only(&path);
     let managed_token = managed_credential(&state_dir, gateway_name, gateway)?;
     let auth_source = current_provider_auth_source(gateway, managed_token.is_some());
