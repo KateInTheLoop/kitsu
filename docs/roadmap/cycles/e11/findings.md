@@ -366,6 +366,61 @@ is already the first to draw. Resize reflow is already scoped as T3-S8; row
 truncation needs a `cols` input the current API does not take, and belongs with
 it.
 
+### Truncation: half of it was closed in T0-S9, and the note above is now stale
+
+The claim that truncation "needs a `cols` input the current API does not take"
+was true when written and is only **partly** true now. T0-S9 gave the bridge
+`live::compose_input_row(draft, cols)` and `live::terminal_columns()`, so the
+**draft row** is composed through the classic row's own width fitting — the
+same windowing, ellipsis and hint-reservation logic, not a reimplementation.
+That row can no longer overflow.
+
+What remains open is `InlineSurface::paint` itself, which still emits `ESC[2K`
+plus the row text with **no width limit**. Any caller handing it a long row —
+the status string today, palette rows tomorrow — can still wrap into the next
+viewport row and corrupt it. So the precedent to reuse already exists and is
+already wired for one row; extending it to `paint` is the remaining work.
+
+### Resize decision, taken in T0-S11
+
+What happens when a resize crosses F19's `rows >= viewport_rows + 2` bound was
+undecided, and a resize can cross it in either direction. The decision:
+
+- **Below the bound, the viewport releases** — region reset, rows cleared,
+  nothing pinned — and stays released while the terminal is too short.
+- **Back above the bound, it re-installs.**
+
+Rationale: a pinned row that cannot be drawn correctly is worse than no pinned
+row, and the alternative — keeping a region whose margins no longer fit the
+screen — is precisely the corruption F19 exists to prevent. The tall → short →
+tall round trip must therefore end with a correctly installed viewport, and the
+short interval must emit a real release rather than leaving a stale region.
+
+Detection is `SIGWINCH` with a handler that does nothing but store into an
+`AtomicBool`, which is the only async-signal-safe action available to it. The
+reader already retries on `EINTR`, so a signal interrupting the blocking read
+is the natural wake-up: on waking it checks the flag, re-latches, and repaints.
+Re-latching re-sets the region rather than patching it, because DECSTBM margins
+are absolute row numbers.
+
+### RESOLVED in T0-S11 — the resize half
+
+`plan_resize(installed, rows, viewport_rows)` is the pure decision table
+(`Unchanged` / `Relatch` / `Release` / `Install`), pinned by a property test
+over `rows 0..=40 × viewport_rows 0..=8` asserting that a plan pins a geometry
+**iff** `show` would emit one for it, so the plan and F19's bound cannot drift
+apart. `BridgeGuard::resize` applies it as a single hide-then-show pair at the
+new dimensions — **not** four branches — because `hide` is inert without a
+latched geometry and `show` is inert below the bound, so every arm falls out of
+that one pair. It emits no paint: a resize happens mid-read, so the row's
+content is the live draft and the reader draws it immediately after.
+
+The truncation half of F16 remains open for `paint` in general (see above).
+
+**The one property no in-repo test reaches is recorded separately as F24**: the
+handler must be installed via `sigaction` with `sa_flags` omitting
+`SA_RESTART`, or the interrupted read restarts and the loop never wakes.
+
 **F15 RESOLVED in T0-S5a** (recorded here since F15 sits above): the viewport
 replaces the live row. `kitsu-render` gained `set_live_rows_enabled`, which
 `live_rows_supported` consults, and the bridge disables the live row for as
@@ -900,3 +955,64 @@ something. Triggering on output proves the program is alive, not that it is
 ready. Third, it is a reminder that a green suite is not evidence of a
 deterministic suite — this one had been green every time I ran it, and was
 nonetheless failing one run in fifteen.
+
+## F24 — `SA_RESTART` would make resize handling silently dead, and no in-repo test can catch it
+
+Found: T0-S11, by the test author, as the limit of what its own tests reach.
+
+The resize path depends on a `SIGWINCH` arriving while the reader blocks in
+`read()` and surfacing as `EINTR`, so the loop wakes and checks the pending
+flag. **Whether that happens depends entirely on how the handler is
+installed:**
+
+- `libc::signal` on Linux/glibc implies **`SA_RESTART`**, which restarts the
+  interrupted read. The flag is set and the loop never wakes to look at it.
+- `sigaction` with `sa_flags` that omit `SA_RESTART` returns `EINTR` and the
+  loop wakes.
+
+**The failure mode is the dangerous kind: invisible.** Every unit test passes
+either way, because a test raises the signal from the same thread and never
+blocks in `read`. The feature would look complete, ship, and do nothing — a
+resized window would leave the viewport stranded exactly as F16 describes,
+with no error anywhere.
+
+So the correct installation is load-bearing and is recorded in a comment at the
+call site, specifically so a later "simplification" to `libc::signal` is
+recognisable as a regression rather than tidying.
+
+**This is now a human check**, added to the terminal matrix: resize a real
+window mid-draft and confirm the pinned row follows. It is the second item on
+that list that cannot be settled from inside this repository, after Q1.
+
+Related, and the reason this class of bug is worth a finding of its own:
+`note_resize` may do nothing but store into an atomic, because a signal handler
+runs in a context where allocation, locking and printing are all unsafe. A
+handler that "just logs" would be a far more spectacular version of the same
+mistake.
+
+## F25 — the pseudo-terminal resize test was deferred, and why five runs could not settle it
+
+Found: T0-S11. Recorded so the next card inherits the reasoning rather than
+re-deriving it.
+
+The standing rule for a new pseudo-terminal test is five consecutive green runs
+or drop it. The test author could not meet that bar **and explained why the bar
+was unmeetable rather than gaming it**: the implementation did not exist yet, so
+the test had to fail by design, and five runs of a designed failure cannot
+distinguish a flake from the intended red. The evidence the rule asks for was
+unobtainable at that moment.
+
+Two further costs it identified:
+
+- `Step` has no action that sends no bytes, so a resize step does not fit the
+  existing script shape;
+- `Session`'s emulator is fixed at the harness's `ROWS × COLS`, so a resized
+  screen cannot be modelled by any existing accessor. Both would change for
+  every existing script.
+
+And the one property only a real terminal adds — that `SIGWINCH` surfaces as
+`EINTR` rather than restarting the read — is a property of **how the handler is
+installed** (F24), which an intermittent test would not establish either.
+
+**Next card:** add it now that a passing baseline exists, where five-run
+evidence means something. Until then F24's human check is the coverage.

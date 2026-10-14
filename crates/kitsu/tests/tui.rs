@@ -21,6 +21,22 @@
 //!
 //! Every read loop here has a deadline and fails with the transcript attached
 //! rather than blocking the suite.
+//!
+//! # No resize test here, deliberately (finding F16)
+//!
+//! Resizing a session mid-script is `TIOCSWINSZ` on the master plus a
+//! `SIGWINCH` to the child, and it is feasible — but it needs more than a step
+//! kind. [`Step`] has no notion of an action that sends no bytes, and
+//! [`Session`]'s emulator is fixed at `ROWS` x `COLS`, so a resized screen
+//! cannot be modelled by the accessors below at all: both would have to change
+//! for every existing script. More to the point, the one thing only a real
+//! terminal can exercise — that a `SIGWINCH` arriving while the reader blocks
+//! in `read()` surfaces as `EINTR` rather than being restarted under
+//! `SA_RESTART` — is a property of how the handler is installed, and a PTY
+//! test that fails intermittently would say nothing about it. **The F16
+//! contract is pinned in unit tests (`kitsu_tui::viewport::plan_resize` and
+//! `tui_bridge`'s resize tests); the signal-delivery half needs a human at a
+//! real terminal, resizing the window mid-draft.**
 
 #![cfg(unix)]
 

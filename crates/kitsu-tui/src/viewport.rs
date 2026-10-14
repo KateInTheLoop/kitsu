@@ -77,6 +77,74 @@ impl Inner {
     }
 }
 
+/// What a resize should do to an inline viewport (finding F16).
+///
+/// DECSTBM margins are **absolute row numbers**, so a latched geometry is
+/// wrong the instant the terminal is resized: shrinking strands the pinned row
+/// off-screen or leaves margins past the bottom of the screen, growing leaves
+/// the region covering only part of the window, and either way
+/// [`InlineSurface::paint`] goes on addressing rows from the stale geometry.
+///
+/// The decision is kept in this pure value so the policy -- in particular what
+/// happens when a resize crosses finding F19's `rows >= viewport_rows + 2`
+/// bound in either direction -- is testable without a terminal, a signal or a
+/// blocking read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResizePlan {
+    /// Emit nothing: either the dimensions did not change, or the viewport is
+    /// already released and the terminal is still too short to pin one.
+    ///
+    /// The first half is what keeps a spurious `SIGWINCH` from flickering the
+    /// pinned row.
+    Unchanged,
+    /// A viewport is pinned and stays pinned at a new size: tear the old
+    /// geometry down and set the new one up, so both margins and the pinned
+    /// rows are right for the new size. Never patch one margin in place.
+    Relatch { rows: u16, viewport_rows: u16 },
+    /// A viewport is pinned and the new size is below F19's bound: release it
+    /// -- region reset, rows cleared, nothing pinned -- and stay released
+    /// while the terminal is too short. A pinned row that cannot be drawn
+    /// correctly is worse than no pinned row, and keeping a region whose
+    /// margins exceed the screen is exactly the corruption F19 was about.
+    Release,
+    /// No viewport is pinned and the new size clears F19's bound: install one.
+    /// This is the second half of the round trip -- a terminal made too short
+    /// and then tall again ends up correctly pinned.
+    Install { rows: u16, viewport_rows: u16 },
+}
+
+/// Decide what a resize to `rows` x `viewport_rows` should do, given the
+/// dimensions currently installed (`None` when nothing is pinned).
+///
+/// The bound is [`InlineSurface::show`]'s own, `rows >= viewport_rows + 2`, and
+/// must stay that way: a plan that says install where `show` declines would
+/// leave the caller believing a region is pinned when none is.
+pub fn plan_resize(installed: Option<(u16, u16)>, rows: u16, viewport_rows: u16) -> ResizePlan {
+    // A spurious notification carries no dimensions, so the redundant resize
+    // is the common case and has to be the cheapest one: nothing at all.
+    if installed == Some((rows, viewport_rows)) {
+        return ResizePlan::Unchanged;
+    }
+    // `show`'s own bound, and `saturating_add` for the same reason it uses
+    // one: a nonsensical `viewport_rows` near `u16::MAX` must decline rather
+    // than wrap into an apparently workable geometry.
+    let workable = rows >= viewport_rows.saturating_add(2);
+    match (installed.is_some(), workable) {
+        (true, true) => ResizePlan::Relatch {
+            rows,
+            viewport_rows,
+        },
+        (true, false) => ResizePlan::Release,
+        (false, true) => ResizePlan::Install {
+            rows,
+            viewport_rows,
+        },
+        // Released and still too short: there is nothing to tear down and
+        // nothing that can be pinned, so no bytes.
+        (false, false) => ResizePlan::Unchanged,
+    }
+}
+
 /// An inline viewport: a pinned region at the bottom of the terminal with the
 /// transcript scrolling in a DECSTBM region above it.
 ///
@@ -834,6 +902,196 @@ mod tests {
                 "show({rows}, {viewport_rows}) then paint must emit nothing, got {:?}",
                 sink.text()
             );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Finding F16: the viewport has no resize handling.
+    //
+    // Geometry is latched once at install and never updated, and DECSTBM
+    // margins are absolute row numbers. `plan_resize` is the pure half of the
+    // fix: it takes the dimensions currently installed plus the new ones and
+    // says what should happen, so the policy is pinned here rather than in a
+    // signal handler nobody can drive from a unit test.
+    //
+    // The decided policy, which these tests pin:
+    //
+    //   * same dimensions            -> nothing at all (a spurious SIGWINCH
+    //                                   must not flicker the pinned row);
+    //   * new size, bound cleared    -> release the old geometry and set up
+    //                                   the new one, never patch a margin;
+    //   * resize below F19's bound   -> release and stay released;
+    //   * released, still too short  -> nothing;
+    //   * released, bound cleared    -> install.
+    // ---------------------------------------------------------------------
+
+    use super::{plan_resize, ResizePlan};
+
+    #[test]
+    fn plan_resize_does_nothing_when_the_dimensions_are_unchanged() {
+        // The spurious-SIGWINCH case. A resize notification carries no
+        // dimensions, so a redundant one is the common case, not the odd one:
+        // re-latching here would tear the region down and set it back up on
+        // every window focus change that happens to raise the signal, which
+        // the user sees as the pinned row flickering.
+        assert_eq!(
+            plan_resize(Some((24, 1)), 24, 1),
+            ResizePlan::Unchanged,
+            "a resize to the same dimensions must emit nothing"
+        );
+        assert_eq!(
+            plan_resize(Some((40, 3)), 40, 3),
+            ResizePlan::Unchanged,
+            "and the same with a taller viewport"
+        );
+    }
+
+    #[test]
+    fn plan_resize_relatches_when_the_terminal_changes_size_above_the_bound() {
+        // Both directions. Shrinking is the dangerous one -- the old bottom
+        // margin may now be past the bottom of the screen -- but growing is
+        // just as wrong, leaving the transcript scrolling in a subset of the
+        // window with dead space below it.
+        assert_eq!(
+            plan_resize(Some((24, 1)), 40, 1),
+            ResizePlan::Relatch {
+                rows: 40,
+                viewport_rows: 1
+            },
+            "growing must re-latch so the region covers the whole new screen"
+        );
+        assert_eq!(
+            plan_resize(Some((40, 1)), 24, 1),
+            ResizePlan::Relatch {
+                rows: 24,
+                viewport_rows: 1
+            },
+            "shrinking must re-latch so the margins stay on screen"
+        );
+        // A changed viewport row count is a resize too: this is the seam the
+        // multi-row composer and the slash palette will drive.
+        assert_eq!(
+            plan_resize(Some((24, 1)), 24, 3),
+            ResizePlan::Relatch {
+                rows: 24,
+                viewport_rows: 3
+            },
+            "a changed pinned row count re-latches at the same height"
+        );
+    }
+
+    #[test]
+    fn plan_resize_releases_the_viewport_when_a_resize_crosses_below_the_bound() {
+        // The decision this card makes: a pinned row that cannot be drawn
+        // correctly is worse than no pinned row, so the viewport releases
+        // rather than keeping a region whose margins no longer fit.
+        for (rows, viewport_rows) in TOO_SHORT {
+            assert_eq!(
+                plan_resize(Some((24, 1)), rows, viewport_rows),
+                ResizePlan::Release,
+                "a resize to ({rows}, {viewport_rows}) is below F19's bound, so the \
+                 viewport must release rather than keep a broken region"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_resize_stays_released_while_the_terminal_is_too_short() {
+        // Released and still too short: nothing to tear down and nothing that
+        // can be pinned, so no bytes. Without this, every SIGWINCH while a
+        // window is dragged through a too-short size would emit a teardown for
+        // a geometry that was never latched.
+        for (rows, viewport_rows) in TOO_SHORT {
+            assert_eq!(
+                plan_resize(None, rows, viewport_rows),
+                ResizePlan::Unchanged,
+                "released and still too short at ({rows}, {viewport_rows}): no bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_resize_reinstalls_once_a_later_resize_clears_the_bound() {
+        // The other half of the round trip. A terminal dragged too short and
+        // then tall again must end up with a correctly pinned viewport, not
+        // permanently without one.
+        assert_eq!(
+            plan_resize(None, 24, 1),
+            ResizePlan::Install {
+                rows: 24,
+                viewport_rows: 1
+            },
+            "a released viewport re-installs as soon as the terminal is tall enough"
+        );
+        assert_eq!(
+            plan_resize(None, 3, 1),
+            ResizePlan::Install {
+                rows: 3,
+                viewport_rows: 1
+            },
+            "including at the smallest workable geometry, rows == viewport_rows + 2"
+        );
+    }
+
+    #[test]
+    fn plan_resize_pins_a_geometry_exactly_when_show_would_emit_one() {
+        // The property, driven over every small geometry: the plan may only
+        // ask for a pinned viewport where `show` actually emits a region. A
+        // plan that said install where `show` declines would leave the caller
+        // believing a region is pinned when none is -- finding F19's defect
+        // moved one layer up.
+        for rows in 0u16..=40 {
+            for viewport_rows in 0u16..=8 {
+                let workable = rows >= viewport_rows + 2;
+                for installed in [None, Some((24u16, 1u16)), Some((40u16, 3u16))] {
+                    let plan = plan_resize(installed, rows, viewport_rows);
+                    let pins = match plan {
+                        ResizePlan::Relatch { .. } | ResizePlan::Install { .. } => true,
+                        ResizePlan::Release | ResizePlan::Unchanged => false,
+                    };
+                    if installed == Some((rows, viewport_rows)) {
+                        assert_eq!(
+                            plan,
+                            ResizePlan::Unchanged,
+                            "plan_resize({installed:?}, {rows}, {viewport_rows}) must be inert"
+                        );
+                        continue;
+                    }
+                    assert_eq!(
+                        pins,
+                        workable,
+                        "plan_resize({installed:?}, {rows}, {viewport_rows}) returned {plan:?}, \
+                         but show() {} emit a region for that geometry",
+                        if workable { "would" } else { "would not" }
+                    );
+                    // And a plan that pins must carry the *new* dimensions:
+                    // carrying the old ones is the stale-geometry bug itself.
+                    if let ResizePlan::Relatch {
+                        rows: r,
+                        viewport_rows: v,
+                    }
+                    | ResizePlan::Install {
+                        rows: r,
+                        viewport_rows: v,
+                    } = plan
+                    {
+                        assert_eq!(
+                            (r, v),
+                            (rows, viewport_rows),
+                            "the plan must carry the new dimensions, not the latched ones"
+                        );
+                    }
+                    // Release only ever applies to a viewport there is
+                    // something to release.
+                    if plan == ResizePlan::Release {
+                        assert!(
+                            installed.is_some(),
+                            "plan_resize({installed:?}, {rows}, {viewport_rows}) asked to \
+                             release a viewport that was never pinned"
+                        );
+                    }
+                }
+            }
         }
     }
 
