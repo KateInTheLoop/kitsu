@@ -5753,68 +5753,131 @@ fn fit_palette_text_with_padding(text: &str, width: usize, padding: char) -> Str
     fitted
 }
 
-/// A bounded, editor-owned palette rendered as a multi-line Rustyline hint.
-/// Keeping it in the hint layout means every keystroke redraws/clears it with
-/// the input buffer instead of leaving stale rows in terminal scrollback.
-fn slash_palette(prefix: &str, rich: bool, inner_width: usize) -> String {
-    let matches = matching_slash_commands(prefix);
+/// The bordered slash-command palette as **rows**, laid out to `max_rows`.
+///
+/// The single renderer for the palette's text: the labels, both frame
+/// character sets, the `no matching command` line and the row-selection step
+/// exist here and nowhere else. [`slash_palette`] is the classic Rustyline
+/// hint's join over it, and `tui_bridge::palette_rows` is the inline
+/// viewport's -- the same relationship `kitsu_render::live::compose_input_row`
+/// has to `compose_row`.
+///
+/// Every row is a complete line and none is newline-terminated; the first is
+/// always the top border and the last always the footer separator, so the
+/// result is a well-formed box at any height. `max_rows` is the whole box's
+/// height and must be at least `3` (border, one content row, footer); a
+/// smaller value is treated as `3`, because a partial frame is worse than a
+/// minimal one. Height is taken out of the *entries*, and the trailing
+/// "N more" row counts everything actually hidden, whether the
+/// [`SLASH_PALETTE_ROWS`] cap or the height is what hid it.
+fn slash_palette_rows(prefix: &str, rich: bool, inner_width: usize, max_rows: u16) -> Vec<String> {
+    // A box needs its lid, a content row and its footer; below that a caller
+    // must decline the palette entirely rather than ask for a partial frame.
+    let max_rows = max_rows.max(3);
     let top_label = " slash commands ";
-    let footer_label = " type to filter · Tab to complete ";
+    let footer_label = " type to filter \u{b7} Tab to complete ";
     let (top_left, horizontal, top_right, vertical, separator_left, separator_right) = if rich {
-        ('╭', '─', '╮', '│', '├', '┤')
+        (
+            '\u{256d}', '\u{2500}', '\u{256e}', '\u{2502}', '\u{251c}', '\u{2524}',
+        )
     } else {
         ('+', '-', '+', '|', '+', '+')
     };
+    let framed = |text: &str| {
+        format!(
+            "{vertical}{}{vertical}",
+            fit_palette_text(text, inner_width)
+        )
+    };
 
-    let mut palette = String::from("\n");
-    palette.push(top_left);
-    palette.push_str(&fit_palette_text_with_padding(
-        top_label,
-        inner_width,
-        horizontal,
-    ));
-    palette.push(top_right);
-    palette.push('\n');
+    let mut rows = vec![format!(
+        "{top_left}{}{top_right}",
+        fit_palette_text_with_padding(top_label, inner_width, horizontal)
+    )];
 
+    let matches = matching_slash_commands(prefix);
+    // The content budget is everything but the top border and the footer
+    // separator; there is no bottom border, because the composer status line
+    // supplies the `\u{2570}\u{2026}\u{256f}` that closes the box.
+    let budget = usize::from(max_rows - 2);
     if matches.is_empty() {
-        palette.push(vertical);
-        palette.push_str(&fit_palette_text(
-            " no matching command — /help lists everything",
-            inner_width,
+        rows.push(framed(
+            " no matching command \u{2014} /help lists everything",
         ));
-        palette.push(vertical);
-        palette.push('\n');
     } else {
-        for spec in matches.iter().take(SLASH_PALETTE_ROWS) {
-            let row = if inner_width >= SLASH_DESCRIPTION_MIN_INNER_WIDTH {
+        let entry = |spec: &SlashCommandSpec| {
+            if inner_width >= SLASH_DESCRIPTION_MIN_INNER_WIDTH {
                 format!(" /{:<22} {}", spec.name, spec.description)
             } else {
                 format!(" {}", spec.syntax())
-            };
-            palette.push(vertical);
-            palette.push_str(&fit_palette_text(&row, inner_width));
-            palette.push(vertical);
-            palette.push('\n');
-        }
-        if matches.len() > SLASH_PALETTE_ROWS {
-            let remaining = format!(
-                " … {} more — keep typing to narrow the list",
-                matches.len() - SLASH_PALETTE_ROWS
-            );
-            palette.push(vertical);
-            palette.push_str(&fit_palette_text(&remaining, inner_width));
-            palette.push(vertical);
-            palette.push('\n');
+            }
+        };
+        if matches.len() <= SLASH_PALETTE_ROWS.min(budget) {
+            // Everything fits: no "more" row to carry, so the entries take
+            // the whole budget.
+            rows.extend(matches.iter().map(|spec| framed(&entry(spec))));
+        } else {
+            // One content row goes to the "more" line, so the entries get
+            // `max_rows - 3`. At the minimum height that is zero entries and
+            // a "more" row carrying the full match count: a well-formed,
+            // honest minimal box.
+            let shown = SLASH_PALETTE_ROWS.min(usize::from(max_rows - 3));
+            rows.extend(matches.iter().take(shown).map(|spec| framed(&entry(spec))));
+            rows.push(framed(&format!(
+                " \u{2026} {} more \u{2014} keep typing to narrow the list",
+                matches.len() - shown
+            )));
         }
     }
 
-    palette.push(separator_left);
-    palette.push_str(&fit_palette_text_with_padding(
-        footer_label,
-        inner_width,
-        horizontal,
+    rows.push(format!(
+        "{separator_left}{}{separator_right}",
+        fit_palette_text_with_padding(footer_label, inner_width, horizontal)
     ));
-    palette.push(separator_right);
+    rows
+}
+
+/// Whether the bordered palette would tell the inline composer's row anything
+/// its own hint slot does not already say.
+///
+/// The palette is a menu and the hint is the keystroke's answer, so the two
+/// must not contradict each other on one screen. Three cases say no:
+///
+/// * the buffer is not a bare single-token slash prefix -- exactly
+///   [`typeahead_slash_hint`]'s and `ChatHelper::hint`'s own rule;
+/// * the prefix already **is** a command's full name (`/context`), so there is
+///   no choice left to offer and the row is the whole answer;
+/// * a hint is showing that is not the completion of the palette's *first*
+///   entry. That happens when [`MID_TURN_HINT_PRIORITY`] overrides registry
+///   order (`/s` hints `steer` while the list leads with `save`): the row
+///   would then point at one command and the list at another.
+///
+/// A prefix that matches nothing does get the box, because its single
+/// `no matching command` row is the only thing that says so.
+fn slash_palette_adds_to_the_row(buffer: &str, hint: &str) -> bool {
+    let Some(prefix) = buffer.strip_prefix('/') else {
+        return false;
+    };
+    if buffer.contains('\n') || prefix.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let matches = matching_slash_commands(prefix);
+    let Some(lead) = matches.first().map(|spec| spec.name) else {
+        return true;
+    };
+    lead != prefix && (hint.is_empty() || format!("{prefix}{hint}") == lead)
+}
+
+/// A bounded, editor-owned palette rendered as a multi-line Rustyline hint.
+/// Keeping it in the hint layout means every keystroke redraws/clears it with
+/// the input buffer instead of leaving stale rows in terminal scrollback.
+///
+/// A thin join over [`slash_palette_rows`] at the classic height, which is
+/// whatever the content needs: the Rustyline hint has no height bound of its
+/// own, so it asks for every row the palette would ever produce.
+fn slash_palette(prefix: &str, rich: bool, inner_width: usize) -> String {
+    let mut palette = String::from("\n");
+    palette.push_str(&slash_palette_rows(prefix, rich, inner_width, u16::MAX).join("\n"));
     palette
 }
 
@@ -6043,6 +6106,10 @@ fn read_chat_line_inline(
     static SIGWINCH: std::sync::Once = std::sync::Once::new();
     SIGWINCH.call_once(tui_bridge::install_sigwinch_handler);
 
+    // The frame characters follow the renderer's styling, not this process's
+    // stderr: the surface is the renderer's, so it is the renderer that says
+    // whether this terminal gets Unicode borders.
+    let rich = kitsu_render::stderr_styled();
     let mut carried = initial.to_string();
     // Raw mode spans the read, but not the *whole* function any more: a
     // suspend must hand a canonical terminal back to the shell before the
@@ -6065,14 +6132,22 @@ fn read_chat_line_inline(
         let mut input = std::io::Cursor::new(carried.clone().into_bytes()).chain(std::io::stdin());
         let outcome = {
             let mut paint = |draft: &str, cursor: usize, hint: &str, hint_reserved: bool| {
-                bridge.paint_draft(prompt, draft, cursor, hint, hint_reserved)
+                // The whole composer, not just its row: the slash palette
+                // above the draft, re-derived and fully repainted on every
+                // keystroke (finding F27). `rich` is the *renderer's* styling
+                // decision, which is what picks Unicode or ASCII frames.
+                bridge.paint_composer(prompt, draft, cursor, hint, hint_reserved, rich);
             };
             // Finding F16: re-probe and re-latch. The notification carries
             // no dimensions, so the terminal is the only source of truth for
-            // the new size; `1` is the pinned row count the install used.
+            // the new size.
             let mut on_resize = || {
                 if let Ok((_cols, rows)) = crossterm::terminal::size() {
-                    bridge.resize(rows, 1);
+                    // The height is the viewport's own, not a hardcoded row:
+                    // an open palette must survive a resize instead of
+                    // collapsing to its bottom row and leaving the rest of
+                    // the box inside the scroll region.
+                    bridge.resize_rows(rows);
                 }
             };
             tui_bridge::read_line_inline(&mut input, &mut paint, history, &mut on_resize)
@@ -6080,7 +6155,11 @@ fn read_chat_line_inline(
         // Whatever happened, the row must not keep showing a draft that is
         // gone. On the suspend path the release below clears the row anyway,
         // but doing it here keeps the invariant on every outcome.
-        bridge.paint_draft(prompt, "", 0, "", false);
+        // Through `paint_composer`, not `paint_draft`: an empty draft has no
+        // palette, and this is the call that must take the viewport back down
+        // to one row. `paint_draft` would paint the status row and leave an
+        // open palette's frame pinned above it until something else repainted.
+        bridge.paint_composer(prompt, "", 0, "", false, rich);
         // Finding F21: Ctrl+Z. The reader is pure, so the whole suspend is
         // sequenced here, through the seam that makes the ordering testable.
         if let Ok(tui_bridge::InlineRead::Suspended(draft)) = outcome {

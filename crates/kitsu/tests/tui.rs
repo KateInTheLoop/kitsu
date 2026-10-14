@@ -1599,3 +1599,116 @@ fn inline_mode_resize_round_trip_ends_correctly_pinned() {
         session.screen_dump()
     );
 }
+
+// ---------------------------------------------------------------------------
+// T0-S16: the slash palette above the composer, end to end
+// ---------------------------------------------------------------------------
+
+/// The palette script: type `/co` at the idle prompt and leave it unsubmitted,
+/// then finish `/context` by hand and leave.
+///
+/// `/co` is a prefix of three registry commands, so the palette has entries to
+/// show and is strictly taller than its minimal box. Both inputs trigger on
+/// something that exists **today** -- `RAW_MODE_MARKER` for the first
+/// keystroke and the draft's own echo for the second -- so a missing palette
+/// fails this test on its assertion rather than on the driver's deadline.
+fn type_slash_co_then_quit() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/co"),
+        send("/co", "ntext\r"),
+        send("context window source", "/quit\r"),
+    ]
+}
+
+/// Test 13. **The composer, end to end.** With `/co` typed and nothing
+/// submitted, the pinned viewport must be a real bordered palette with the
+/// composer as its bottom row: the lid and its ` slash commands ` label, the
+/// matching entries, the footer separator, and the draft on row 24.
+///
+/// This is the first end-to-end proof that the inline composer draws anything
+/// above one row. The unit tests in `tui_bridge` pin the bytes; this one pins
+/// that the palette is wired through the real reader, the real guard and a
+/// real pseudo-terminal, and that its rows land on **pinned** rows rather than
+/// inside the scroll region where the next transcript line would scroll them
+/// away.
+#[test]
+#[serial]
+fn inline_mode_shows_the_slash_palette_above_the_composer() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &type_slash_co_then_quit());
+
+    let typed = session.screen_at(1);
+    let composer = &typed[(ROWS - 1) as usize];
+    assert!(
+        composer.contains("/co"),
+        "the bottom row must still be the composer, but it reads {composer:?}; \
+         whole screen:\n{}",
+        Session::dump(&typed)
+    );
+
+    // The palette sits directly above it: the footer separator on row 23 and
+    // the lid above the entries, all of them inside the pinned region.
+    let lid = typed
+        .iter()
+        .position(|row| row.contains("slash commands"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the palette's lid must be on screen; whole screen:\n{}",
+                Session::dump(&typed)
+            )
+        });
+    let footer = typed
+        .iter()
+        .position(|row| row.contains("type to filter"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the palette's footer separator must be on screen; whole screen:\n{}",
+                Session::dump(&typed)
+            )
+        });
+    assert_eq!(
+        footer,
+        (ROWS - 2) as usize,
+        "the footer separator must sit directly above the composer; whole \
+         screen:\n{}",
+        Session::dump(&typed)
+    );
+    assert!(
+        lid < footer,
+        "the lid must be above the footer; whole screen:\n{}",
+        Session::dump(&typed)
+    );
+    assert!(
+        typed[lid + 1..footer]
+            .iter()
+            .any(|row| row.contains("/context")),
+        "and the matching entries between them; whole screen:\n{}",
+        Session::dump(&typed)
+    );
+
+    // The pinned rows really are pinned: the region the child set must be
+    // tall enough for the whole box, not the startup one-row region.
+    assert!(
+        // The region's BOTTOM MARGIN, which is the screen height less the
+        // viewport's own height -- not the viewport height itself, and not a
+        // three-parameter cursor address the viewport never emits.
+        session.raw_count(&format!(
+            "\x1b[1;{}r",
+            usize::from(ROWS) - (footer - lid + 2)
+        )) > 0,
+        "the child must latch a region that leaves the palette pinned; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    // And the palette is display-only: the draft was `/co`, so the three
+    // characters sent next are what completes the command.
+    let after = session.screen_at(2);
+    assert!(
+        after[..(ROWS - 1) as usize]
+            .iter()
+            .any(|row| row.contains("context window source")),
+        "the palette must not have been submitted as text; whole screen:\n{}",
+        Session::dump(&after)
+    );
+}

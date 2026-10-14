@@ -37,9 +37,18 @@ shapes may change in any minor release.
   Command history persists across sessions in inline mode, Ctrl+R reverse
   search works with its status line on the pinned row, and Tab completes a
   slash command from the hint beside the draft — the same behaviour the
-  during-turn row has. Still missing from the inline prompt: Rustyline's
-  completion *lists*, meaning `@file` path completion and the bordered palette
-  that lists and filters commands over several rows.
+  during-turn row has.
+
+  Typing a slash prefix opens the **bordered command palette** above the
+  composer. It is the same palette the classic prompt draws, from the same
+  renderer, so the two cannot drift. The viewport grows to hold it and narrows
+  as you type; on a window too short for the full list the box is **built
+  smaller** rather than clipped, so it never loses its border; and it closes
+  as soon as the prefix stops being one. Resizing the terminal keeps it open at
+  the right height.
+
+  Still missing from the inline prompt: `@file` path completion, and syntax
+  highlighting of the draft.
 
 #### Background agents and herding
 

@@ -182,6 +182,12 @@ impl BridgeGuard {
     /// already fits (the slash-completion suffix). That math lives in
     /// `kitsu-render` for the classic row, so the guard is where the two
     /// renderers converge on one value type instead of drifting apart.
+    // `paint_composer` is the production painter now -- it is this method plus
+    // the palette, and routing every production paint through one of them
+    // keeps a keystroke from repainting fewer rows than the viewport has. What
+    // remains here is the one-row composition the tests measure parity
+    // against, so in a non-test build nothing calls it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn paint_draft(
         &self,
         prompt: &str,
@@ -215,6 +221,95 @@ impl BridgeGuard {
             .paint(std::slice::from_ref(&row), live::terminal_columns());
     }
 
+    /// The palette-aware composer paint: the bordered slash palette's rows,
+    /// if this draft has one, followed by the composer row as the **last**
+    /// row, painted through [`paint_rows`](Self::paint_rows) so the
+    /// viewport's height follows the content.
+    ///
+    /// The height is asked for **before** the palette is laid out. A box
+    /// cannot be built full and then clamped: `fit_viewport_rows` drops rows
+    /// from the top, which for a box is its lid. So the terminal's grant
+    /// comes first, one row of it is spent on the composer, and the palette
+    /// is built into what is left -- which below
+    /// [`PALETTE_MIN_ROWS`] is nothing at all, and then the composer paints
+    /// alone with no partial frame.
+    ///
+    /// With no palette the content is one row, so this is exactly
+    /// [`paint_draft`](Self::paint_draft)'s bytes: the composer row is
+    /// composed through the same [`kitsu_render::live::compose_input_row`] at
+    /// the same width, and a one-row paint through `paint_rows` re-latches
+    /// nothing when the height is already one.
+    ///
+    /// `rich` is a parameter rather than something read here because the
+    /// surface's styling is the *renderer's* state, not this process's
+    /// stderr: `main.rs` passes what the renderer decided.
+    ///
+    /// The palette is recomputed on every call rather than cached. It is a
+    /// few `format!`s over a static registry once per keystroke, and a cache
+    /// would need the granted height in its key -- a palette rebuilt at the
+    /// old budget surviving a resize is exactly the defect
+    /// `resize_rows_preserves_an_open_palettes_height` pins.
+    pub(crate) fn paint_composer(
+        &self,
+        prompt: &str,
+        draft: &str,
+        cursor: usize,
+        hint: &str,
+        hint_reserved: bool,
+        rich: bool,
+    ) -> bool {
+        let columns = live::terminal_columns();
+        // What this terminal will actually grant, less the composer's own
+        // row: the palette's whole budget. `granted_rows` is the same clamp
+        // `paint_rows` latches, so there is no second bound to drift.
+        let budget = self.granted_rows(u16::MAX).saturating_sub(1);
+        // Whether a palette belongs on screen at all is the slash registry's
+        // call, not this module's: a draft that already names a command, or
+        // whose hint points somewhere the list does not lead, gets the row
+        // alone rather than a menu that contradicts it.
+        let mut content = if crate::slash_palette_adds_to_the_row(draft, hint) {
+            palette_rows(
+                draft,
+                rich,
+                crate::composer_surface_inner_width(Some(columns)),
+                budget,
+            )
+        } else {
+            Vec::new()
+        };
+        content.push(if draft.is_empty() && hint.is_empty() {
+            // Exactly `paint_draft`'s rule: an idle row reads the status
+            // text, so the bottom row says the same whether or not a read is
+            // in flight. Keeping the rule here is what lets the post-read
+            // reset route through this method -- it then collapses an open
+            // palette *and* leaves today's status row behind.
+            self.status.clone()
+        } else {
+            let composed = live::LiveDraft {
+                prompt: prompt.to_string(),
+                buffer: draft.to_string(),
+                cursor,
+                hint: hint.to_string(),
+                hint_reserved,
+            };
+            live::compose_input_row(&composed, columns).0
+        });
+        self.paint_rows(&content)
+    }
+
+    /// A terminal resize that keeps the viewport's **current** height, for
+    /// `main.rs`'s `on_resize` to call instead of `resize(rows, 1)`.
+    ///
+    /// The hardcoded one row is the defect: a resize with the palette open
+    /// collapsed it to its bottom row and left the rest of the box inside the
+    /// scroll region, where the next transcript line scrolled it away. The
+    /// height already lives in the guard, so the re-probe preserves it --
+    /// genuinely latched, so the next paint lands on the right absolute
+    /// lines.
+    pub(crate) fn resize_rows(&self, rows: u16) -> bool {
+        self.resize(rows, self.viewport_rows.get())
+    }
+
     /// T0-S15: how many rows a [`paint_rows`](Self::paint_rows) request for
     /// `requested` rows would actually be granted on this terminal.
     ///
@@ -229,7 +324,6 @@ impl BridgeGuard {
     /// clamped: `fit_viewport_rows` drops rows from the **top**, which for a
     /// list is right and for a box removes the lid. The palette therefore asks
     /// what height it will get *before* laying its content out.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn granted_rows(&self, requested: u16) -> u16 {
         clamp_viewport_rows(self.rows.get(), requested)
     }
@@ -257,7 +351,6 @@ impl BridgeGuard {
     // that actually requests more than one row; the draft deliberately does
     // not route through here (see `paint_draft`), so in a non-test build
     // nothing calls it yet.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn paint_rows(&self, content: &[String]) -> bool {
         // No geometry logic below the guard: the clamp is the pure function
         // `show`'s bound lives in, and the re-latch is `resize`'s own path
@@ -703,7 +796,6 @@ pub(crate) fn suspend_and_resume(effects: &mut dyn SuspendEffects) -> bool {
 /// content row, and the footer separator. Below this height there is no
 /// palette at all -- a frame with no lid, or a lid with no frame, is worse
 /// than nothing.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const PALETTE_MIN_ROWS: u16 = 3;
 
 /// T0-S15: the bordered slash-command palette as **rows**, already sized to
@@ -713,7 +805,7 @@ pub(crate) const PALETTE_MIN_ROWS: u16 = 3;
 /// a single-token slash prefix (an empty buffer, ordinary text, a buffer with
 /// whitespace or a newline) has no palette, exactly as `ChatHelper::hint`
 /// decides in `main.rs`. The content itself comes from
-/// [`crate::slash_palette`] -- there is deliberately no second palette
+/// [`crate::slash_palette_rows`] -- there is deliberately no second palette
 /// renderer, because two that drift would be worse than one.
 ///
 /// Returns at most `max_rows` complete lines, none of them newline-terminated,
@@ -722,7 +814,6 @@ pub(crate) const PALETTE_MIN_ROWS: u16 = 3;
 /// **empty**: never a partial box. Height is taken out of the *entries*, and
 /// the trailing "N more" row counts everything actually hidden, whether the
 /// `SLASH_PALETTE_ROWS` cap or the height is what hid it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn palette_rows(
     buffer: &str,
     rich: bool,
@@ -741,67 +832,12 @@ pub(crate) fn palette_rows(
         return Vec::new();
     }
 
-    let top_label = " slash commands ";
-    let footer_label = " type to filter \u{b7} Tab to complete ";
-    let (top_left, horizontal, top_right, vertical, separator_left, separator_right) = if rich {
-        (
-            '\u{256d}', '\u{2500}', '\u{256e}', '\u{2502}', '\u{251c}', '\u{2524}',
-        )
-    } else {
-        ('+', '-', '+', '|', '+', '+')
-    };
-    let framed = |text: &str| {
-        format!(
-            "{vertical}{}{vertical}",
-            crate::fit_palette_text(text, inner_width)
-        )
-    };
-
-    let mut rows = vec![format!(
-        "{top_left}{}{top_right}",
-        crate::fit_palette_text_with_padding(top_label, inner_width, horizontal)
-    )];
-
-    let matches = crate::matching_slash_commands(prefix);
-    // The content budget is everything but the top border and the footer
-    // separator; there is no bottom border, because the composer status line
-    // supplies the `\u{2570}\u{2026}\u{256f}` that closes the box.
-    let budget = usize::from(max_rows - 2);
-    if matches.is_empty() {
-        rows.push(framed(
-            " no matching command \u{2014} /help lists everything",
-        ));
-    } else {
-        let entry = |spec: &crate::SlashCommandSpec| {
-            if inner_width >= crate::SLASH_DESCRIPTION_MIN_INNER_WIDTH {
-                format!(" /{:<22} {}", spec.name, spec.description)
-            } else {
-                format!(" {}", spec.syntax())
-            }
-        };
-        if matches.len() <= crate::SLASH_PALETTE_ROWS.min(budget) {
-            // Everything fits: no "more" row to carry, so the entries take
-            // the whole budget.
-            rows.extend(matches.iter().map(|spec| framed(&entry(spec))));
-        } else {
-            // One content row goes to the "more" line, so the entries get
-            // `max_rows - 3`. At exactly `PALETTE_MIN_ROWS` that is zero
-            // entries and a "more" row carrying the full match count: a
-            // well-formed, honest minimal box.
-            let shown = crate::SLASH_PALETTE_ROWS.min(usize::from(max_rows - 3));
-            rows.extend(matches.iter().take(shown).map(|spec| framed(&entry(spec))));
-            rows.push(framed(&format!(
-                " \u{2026} {} more \u{2014} keep typing to narrow the list",
-                matches.len() - shown
-            )));
-        }
-    }
-
-    rows.push(format!(
-        "{separator_left}{}{separator_right}",
-        crate::fit_palette_text_with_padding(footer_label, inner_width, horizontal)
-    ));
-    rows
+    // The one palette renderer, which the classic Rustyline hint joins at its
+    // own height. Everything that is palette *text* -- the labels, the two
+    // frame character sets, the `no matching command` line and the
+    // row-selection step -- lives there, so there is nothing here to drift
+    // from it.
+    crate::slash_palette_rows(prefix, rich, inner_width, max_rows)
 }
 
 #[cfg(test)]
@@ -3465,6 +3501,485 @@ mod tests {
                      (rich={rich})"
                 );
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // T0-S16: the palette, wired. The last card for R4.
+    //
+    // T0-S15 built the palette as *data* (`palette_rows`) and the height
+    // *query* (`granted_rows`); T0-S14 built the multi-row paint
+    // (`paint_rows`). Nothing joined them up: the reader still paints through
+    // the one-row `paint_draft`. These tests pin the join, through one new
+    // seam -- `BridgeGuard::paint_composer`, which is the whole composer for
+    // one draft: the palette's rows, if the draft has one, followed by the
+    // composer row as the **last** row.
+    //
+    // The seam is on the guard rather than inside `read_line_inline`'s paint
+    // closure on purpose. The closure is the *caller's* (the test's, in this
+    // module), so a reader-level test would be asserting on its own painter
+    // and could not observe a partial repaint at all. On the guard the bytes
+    // one call emits are observable, which is what finding F27 says to
+    // measure: a full repaint repairs its own damage, so only the emission of
+    // a *single* paint can tell a stale palette from a fresh one.
+    // ---------------------------------------------------------------------
+
+    /// The content `paint_composer` must paint, derived the only way that
+    /// leaves a bordered box well formed: ask what height the viewport will
+    /// grant **first**, spend one row of it on the composer, and build the
+    /// palette into what is left. Never build the palette full and let
+    /// `fit_viewport_rows` clamp it -- that drops rows from the top, which for
+    /// a box is its lid.
+    fn expected_composer_content(
+        guard: &BridgeGuard,
+        prompt: &str,
+        draft: &str,
+        cursor: usize,
+        hint: &str,
+        hint_reserved: bool,
+        rich: bool,
+    ) -> Vec<String> {
+        let columns = live::terminal_columns();
+        // Everything the terminal would grant, less the composer's own row.
+        let budget = guard.granted_rows(u16::MAX).saturating_sub(1);
+        let mut content = palette_rows(
+            draft,
+            rich,
+            crate::composer_surface_inner_width(Some(columns)),
+            budget,
+        );
+        let composed = live::LiveDraft {
+            prompt: prompt.to_string(),
+            buffer: draft.to_string(),
+            cursor,
+            hint: hint.to_string(),
+            hint_reserved,
+        };
+        content.push(live::compose_input_row(&composed, columns).0);
+        content
+    }
+
+    /// The bytes those rows paint at this geometry.
+    fn expected_composer_paint(rows: u16, content: &[String]) -> String {
+        let borrowed: Vec<&str> = content.iter().map(String::as_str).collect();
+        expected_rows_paint(
+            rows,
+            u16::try_from(content.len()).expect("a viewport height fits a u16"),
+            &borrowed,
+        )
+    }
+
+    /// The absolute screen lines a run of bytes positioned, cleared and wrote,
+    /// in emission order: every row write is `ESC[<line>;1H` then `ESC[2K`
+    /// then the text, so each clear is preceded by exactly its own address.
+    ///
+    /// This is the F27 instrument. The *count* is what a partial repaint gets
+    /// wrong: a reader that repaints through the one-row path emits one row
+    /// per keystroke no matter how tall the viewport is, and the palette above
+    /// it keeps showing matches for a prefix the user has already changed.
+    fn painted_lines(bytes: &str) -> Vec<u16> {
+        bytes
+            .match_indices("\x1b[2K")
+            .map(|(at, _)| {
+                let before = &bytes[..at];
+                let start = before.rfind("\x1b[").unwrap_or_else(|| {
+                    panic!("a clear with no cursor address before it: {bytes:?}")
+                });
+                before[start + 2..]
+                    .strip_suffix(";1H")
+                    .unwrap_or_else(|| panic!("a clear not preceded by a row address: {bytes:?}"))
+                    .parse()
+                    .unwrap_or_else(|_| panic!("a row address that is not a number: {bytes:?}"))
+            })
+            .collect()
+    }
+
+    /// The prefixes the narrowing tests type, with the palette height each
+    /// implies on a terminal tall enough for all of it. Derived from the
+    /// registry rather than written down, so adding a command cannot silently
+    /// turn these into assertions about nothing.
+    fn palette_height(prefix: &str) -> usize {
+        palette_rows(
+            prefix,
+            true,
+            crate::COMPOSER_SURFACE_DEFAULT_INNER_WIDTH,
+            u16::MAX,
+        )
+        .len()
+    }
+
+    /// Test S16-1. **The headline.** A slash prefix at the inline prompt
+    /// paints the palette's rows followed by the composer row, in that order,
+    /// and the viewport grows to hold both -- the top border on the topmost
+    /// pinned row, the footer separator directly above the composer.
+    #[test]
+    #[serial]
+    fn paint_composer_puts_the_palette_above_the_composer_and_grows_the_viewport() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline(24, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let before = err.text().len();
+
+        let content = expected_composer_content(&guard, "kitsu> ", "/co", 3, "", false, true);
+        let height = u16::try_from(content.len()).expect("height");
+        assert!(
+            height > 1,
+            "the fixture is only meaningful if `/co` has a palette at all: {content:?}"
+        );
+
+        assert!(guard.paint_composer("kitsu> ", "/co", 3, "", false, true));
+
+        let tail = err.text()[before..].to_string();
+        assert_eq!(
+            tail,
+            expected_hide(24, 1)
+                + &expected_show(24, height)
+                + &expected_composer_paint(24, &content),
+            "a slash prefix must re-latch taller and paint the palette above the composer"
+        );
+        // Independently of the derivation above: what landed on screen is a
+        // box whose lid is the topmost pinned row and whose last row is the
+        // composer.
+        let painted: Vec<String> = tail
+            .split("\x1b[2K")
+            .skip(1)
+            .map(|chunk| {
+                chunk
+                    .split_once("\x1b[")
+                    .map_or(chunk, |(text, _)| text)
+                    .to_string()
+            })
+            .collect();
+        let rows: Vec<&String> = painted.iter().filter(|row| !row.is_empty()).collect();
+        assert!(
+            is_top_border(rows[0], true),
+            "the topmost pinned row must be the palette's lid, but it is {:?}",
+            rows[0]
+        );
+        assert!(
+            is_footer(rows[rows.len() - 2], true),
+            "the footer separator must sit directly above the composer, but \
+             that row is {:?}",
+            rows[rows.len() - 2]
+        );
+        assert!(
+            rows[rows.len() - 1].contains("/co"),
+            "and the composer must be the last row, but it is {:?}",
+            rows[rows.len() - 1]
+        );
+        assert!(out.is_empty(), "no viewport control bytes reach stdout");
+        drop(guard);
+    }
+
+    /// Test S16-2. Typing narrows the list, so the viewport's height follows
+    /// it down: `/co` matches three commands and `/cont` one, so the second
+    /// paint re-latches **shorter** and the entries left are only the ones
+    /// that still match.
+    #[test]
+    #[serial]
+    fn paint_composer_narrows_the_palette_as_the_prefix_grows() {
+        let _state = GlobalState::capture();
+        assert!(
+            palette_height("/cont") < palette_height("/co"),
+            "the fixture needs a prefix that genuinely narrows: /co gives {} rows \
+             and /cont {}",
+            palette_height("/co"),
+            palette_height("/cont")
+        );
+        let (guard, _out, err) = install_inline(24, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        let wide = expected_composer_content(&guard, "kitsu> ", "/co", 3, "", false, true);
+        guard.paint_composer("kitsu> ", "/co", 3, "", false, true);
+        let before = err.text().len();
+
+        let narrow = expected_composer_content(&guard, "kitsu> ", "/cont", 5, "", false, true);
+        guard.paint_composer("kitsu> ", "/cont", 5, "", false, true);
+
+        assert!(
+            narrow.len() < wide.len(),
+            "narrowing must shorten the content: {} rows then {}",
+            wide.len(),
+            narrow.len()
+        );
+        let height = u16::try_from(narrow.len()).expect("height");
+        let tail = err.text()[before..].to_string();
+        assert_eq!(
+            tail,
+            expected_hide(24, u16::try_from(wide.len()).expect("height"))
+                + &expected_show(24, height)
+                + &expected_composer_paint(24, &narrow),
+            "a narrowed list must re-latch at the shorter height and repaint there"
+        );
+        assert!(
+            !tail.contains("/compact"),
+            "and must not leave an entry that no longer matches: {tail:?}"
+        );
+        drop(guard);
+    }
+
+    /// Test S16-3. The other direction, which matters more: a palette that
+    /// appears and never leaves is worse than none. Clearing the slash prefix
+    /// **and** making it no longer a bare single-token slash prefix (a space
+    /// is enough) both dismiss it and put the viewport back to one row.
+    #[test]
+    #[serial]
+    fn paint_composer_dismisses_the_palette_and_returns_the_viewport_to_one_row() {
+        let _state = GlobalState::capture();
+        for (draft, cursor) in [("/co ", 4usize), ("", 0)] {
+            let (guard, _out, err) = install_inline(24, 1, "status: idle");
+            let guard = guard.expect("inline mode installs a guard");
+            let open = expected_composer_content(&guard, "kitsu> ", "/co", 3, "", false, true);
+            guard.paint_composer("kitsu> ", "/co", 3, "", false, true);
+            let before = err.text().len();
+
+            guard.paint_composer("kitsu> ", draft, cursor, "", false, true);
+
+            let tail = err.text()[before..].to_string();
+            // Count over the PAINT only, not the whole tail: the re-latch's
+            // teardown clears every row of the old viewport, row 24 among
+            // them, so counting across both double-counts and no
+            // implementation could reach 1. S16-4 splits the same way.
+            let paint = tail
+                .split_once(&expected_show(24, 1))
+                .map(|(_, after)| after.to_string())
+                .unwrap_or_else(|| tail.clone());
+            assert_eq!(
+                painted_lines(&paint)
+                    .into_iter()
+                    .filter(|line| *line == 24)
+                    .count(),
+                1,
+                "dismissing to {draft:?} must leave exactly the bottom row \
+                 painted: {tail:?}"
+            );
+            assert!(
+                tail.starts_with(&expected_hide(
+                    24,
+                    u16::try_from(open.len()).expect("height")
+                )),
+                "the taller region must be torn down: {tail:?}"
+            );
+            assert!(
+                tail.contains(&expected_show(24, 1)),
+                "and a one-row viewport latched again: {tail:?}"
+            );
+            assert!(
+                !tail.contains("slash commands") && !tail.contains("type to filter"),
+                "and no frame may survive the dismissal: {tail:?}"
+            );
+            drop(guard);
+        }
+    }
+
+    /// Test S16-4. **Finding F27, applied.** One keystroke must redraw
+    /// **every** pinned row, not just the composer.
+    ///
+    /// This is asserted on what a *single* `paint_composer` emits, and the
+    /// load-bearing assertion is the row **count**: F27 recorded that a full
+    /// repaint repairs its own damage, so a test that paints everything and
+    /// then reads the screen cannot see a partial repaint at all. A reader
+    /// that repaints through the one-row `paint_draft` -- which is what the
+    /// code does today -- emits exactly one row here however tall the viewport
+    /// is, leaving the palette above the composer showing matches for a prefix
+    /// the user has already changed.
+    #[test]
+    #[serial]
+    fn paint_composer_repaints_every_pinned_row_on_one_keystroke() {
+        let _state = GlobalState::capture();
+        let (guard, _out, err) = install_inline(24, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        // The palette is open and latched before the keystroke under test.
+        guard.paint_composer("kitsu> ", "/co", 3, "", false, true);
+        let before = err.text().len();
+
+        let content = expected_composer_content(&guard, "kitsu> ", "/cont", 5, "", false, true);
+        let height = u16::try_from(content.len()).expect("height");
+        assert!(height >= 4, "the fixture needs a real box: {content:?}");
+
+        guard.paint_composer("kitsu> ", "/cont", 5, "", false, true);
+
+        // Only the paint's own rows, with the re-latch's teardown clears
+        // dropped: the teardown is `expected_hide`, whose length is known.
+        let tail = err.text()[before..].to_string();
+        let paint = tail
+            .split_once(&expected_show(24, height))
+            .map(|(_, rest)| rest.to_string())
+            .unwrap_or_else(|| panic!("the keystroke must latch {height} rows: {tail:?}"));
+        let lines = painted_lines(&paint);
+        let expected: Vec<u16> = (24 - height + 1..=24).collect();
+        assert_eq!(
+            lines,
+            expected,
+            "one keystroke must redraw every pinned row from the top border down \
+             to the composer, in order; it redrew {} of {height} rows ({lines:?}) \
+             -- a repaint that touches only the composer leaves a stale palette \
+             above it: {paint:?}",
+            lines.len()
+        );
+        drop(guard);
+    }
+
+    /// Test S16-5. A resize with the palette open keeps the palette's height.
+    ///
+    /// `main.rs`'s `on_resize` calls `bridge.resize(rows, 1)` -- a hardcoded
+    /// one row, which silently collapses an open palette to its bottom row and
+    /// leaves the rest of the box inside the scroll region, where the next
+    /// transcript line scrolls it away. `resize_rows` is the same re-probe
+    /// with the *current* height preserved.
+    #[test]
+    #[serial]
+    fn resize_rows_preserves_an_open_palettes_height() {
+        let _state = GlobalState::capture();
+        let (guard, _out, err) = install_inline(24, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let content = expected_composer_content(&guard, "kitsu> ", "/co", 3, "", false, true);
+        let height = u16::try_from(content.len()).expect("height");
+        guard.paint_composer("kitsu> ", "/co", 3, "", false, true);
+        let before = err.text().len();
+
+        assert!(guard.resize_rows(30));
+
+        let tail = err.text()[before..].to_string();
+        assert_eq!(
+            tail,
+            expected_hide(24, height) + &expected_show(30, height),
+            "a resize must re-latch at the taller terminal with the palette's \
+             own height, not collapse it to one row"
+        );
+        // And the height really is latched, not merely emitted: the next paint
+        // lands on the new terminal's rows for that height.
+        let after = err.text().len();
+        guard.paint_composer("kitsu> ", "/co", 3, "", false, true);
+        assert_eq!(
+            painted_lines(&err.text()[after..]),
+            (30 - height + 1..=30).collect::<Vec<_>>(),
+            "the repaint after the resize must use the preserved height"
+        );
+        drop(guard);
+    }
+
+    /// Test S16-6. A terminal too short for the whole palette gets a
+    /// **smaller box**, not a clamped one: the rows are requested at the
+    /// height that will be granted, so the lid survives.
+    ///
+    /// Six rows leaves four for the viewport (F19), one of which is the
+    /// composer, so the palette is exactly `PALETTE_MIN_ROWS` -- a top border,
+    /// one content row and the footer.
+    #[test]
+    #[serial]
+    fn paint_composer_on_a_short_terminal_yields_a_smaller_well_formed_box() {
+        let _state = GlobalState::capture();
+        let (guard, _out, err) = install_inline(6, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let before = err.text().len();
+
+        let content = expected_composer_content(&guard, "kitsu> ", "/co", 3, "", false, true);
+        assert_eq!(
+            content.len(),
+            usize::from(PALETTE_MIN_ROWS) + 1,
+            "the fixture: a minimal box plus the composer"
+        );
+        assert!(
+            is_top_border(&content[0], true) && is_footer(&content[content.len() - 2], true),
+            "and it is a box with both a lid and a footer: {content:?}"
+        );
+
+        assert!(guard.paint_composer("kitsu> ", "/co", 3, "", false, true));
+
+        let tail = err.text()[before..].to_string();
+        assert_eq!(
+            tail,
+            expected_hide(6, 1)
+                + &expected_show(6, PALETTE_MIN_ROWS + 1)
+                + &expected_composer_paint(6, &content),
+            "a short terminal must get a box built to fit, never a full box \
+             with its top rows clamped off"
+        );
+        drop(guard);
+    }
+
+    /// Test S16-7. Below `PALETTE_MIN_ROWS + 1` there is no palette at all:
+    /// just the composer, and not one row of frame. A partial frame -- a
+    /// footer with no lid, or a lid with no footer -- is worse than no
+    /// palette.
+    #[test]
+    #[serial]
+    fn paint_composer_below_the_palette_minimum_paints_only_the_composer() {
+        let _state = GlobalState::capture();
+        for rows in 3..=PALETTE_MIN_ROWS + 2 {
+            let (guard, _out, err) = install_inline(rows, 1, "status: idle");
+            let guard = guard.expect("inline mode installs a guard");
+            let before = err.text().len();
+
+            guard.paint_composer("kitsu> ", "/co", 3, "", false, true);
+
+            let tail = err.text()[before..].to_string();
+            assert_eq!(
+                painted_lines(&tail).len(),
+                1,
+                "a {rows}-row terminal cannot hold a box and a composer, so the \
+                 composer is all there is: {tail:?}"
+            );
+            assert!(
+                !tail.contains('\u{256d}')
+                    && !tail.contains('\u{251c}')
+                    && !tail.contains("slash commands"),
+                "and no partial frame may be drawn on a {rows}-row terminal: {tail:?}"
+            );
+            assert!(
+                tail.contains("/co"),
+                "the composer itself must still be painted: {tail:?}"
+            );
+            drop(guard);
+        }
+    }
+
+    /// Test S16-8. The regression net for the whole card: a draft that is not
+    /// a slash prefix paints exactly the bytes it paints today -- one row,
+    /// byte for byte `paint_draft`'s, with no region bytes, because the height
+    /// did not change.
+    ///
+    /// This is the test that must keep passing while the seven above go green,
+    /// together with the existing `paint_draft_*` byte assertions.
+    #[test]
+    #[serial]
+    fn paint_composer_of_a_plain_draft_is_byte_identical_to_paint_draft() {
+        let _state = GlobalState::capture();
+        for (draft, cursor, hint, reserved) in [
+            ("half-typed", 10usize, "", false),
+            ("/s", 2, "teer", false),
+            ("hello /co", 9, "", false),
+        ] {
+            let (guard, _out, err) = install_inline(24, 1, "status: idle");
+            let guard = guard.expect("inline mode installs a guard");
+            guard.paint_draft("kitsu> ", draft, cursor, hint, reserved);
+            let expected = err.text();
+            let before = expected.len();
+
+            guard.paint_composer("kitsu> ", draft, cursor, hint, reserved, true);
+
+            let tail = err.text()[before..].to_string();
+            assert_eq!(
+                tail,
+                expected_status_paint(
+                    24,
+                    1,
+                    &live::compose_input_row(
+                        &live::LiveDraft {
+                            prompt: "kitsu> ".to_string(),
+                            buffer: draft.to_string(),
+                            cursor,
+                            hint: hint.to_string(),
+                            hint_reserved: reserved,
+                        },
+                        live::terminal_columns()
+                    )
+                    .0
+                ),
+                "a draft with no palette must paint exactly today's one row"
+            );
+            drop(guard);
         }
     }
 }

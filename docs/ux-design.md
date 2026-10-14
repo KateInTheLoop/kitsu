@@ -140,6 +140,30 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   rather than re-raising `SIGINT`, because at an idle prompt there is no turn to
   cancel and the raise would take the default disposition and exit.
 
+  **The slash-command palette** sits above the composer whenever the draft is a
+  bare single-token slash prefix. It is the **same renderer** the classic
+  Rustyline prompt uses — one function owns the labels, both frame sets, the
+  entry formatting, the row cap and the "N more" row — so the two surfaces
+  cannot drift; a test asserts the inline rows equal the classic output. The
+  composer is always the **last** row, the palette above it.
+
+  It is **built to the height it will be granted**, never built full and then
+  clipped: clipping would drop the top row, which is the frame and its label,
+  leaving a box with no lid. On a short window the box is simply smaller, with
+  fewer entries and an honest "N more" count that reflects what the *height*
+  hid, not only the row cap. Below three rows of palette plus one of composer
+  there is no palette at all rather than a partial frame.
+
+  The palette stands down in three cases, so it never contradicts the row it
+  sits above: when the draft is not a bare slash prefix, when the prefix is
+  already a command's whole name (there is nothing left to offer), and when a
+  completion hint is showing that is not the lead entry's own completion. The
+  third case is a consequence of the during-turn hint's priority list being
+  reused at the idle prompt, and is tracked rather than intended.
+
+  Every keystroke repaints **every** pinned row, not just the composer —
+  otherwise the palette above would show matches for a prefix already changed.
+
   **The viewport's height follows its content, clamped to what the window can
   hold.** A caller hands over the rows it wants drawn and the viewport becomes
   that tall, re-latching the region on each change — the same operation a
