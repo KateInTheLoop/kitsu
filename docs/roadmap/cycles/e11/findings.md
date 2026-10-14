@@ -2546,3 +2546,48 @@ is drawn, so they are theoretical **today** and would become real the moment a
 live row were painted concurrently. No test covers any of them. A regression
 test for the credential prompt under a drawn live row is the gap worth taking
 next.
+
+## F48 — policy: a value from argv is echoed, a value from the config file is not
+
+Settled in T3-S2 while making `[tui]` errors name their key. Recorded because it
+is a **policy future cards need**, not a detail of one table, and because the two
+cases differ in kind rather than degree.
+
+**The rule.** An error about a value the user typed on the command line may
+quote that value. An error about a value read from the config file names the
+**key and the permitted set**, never the value.
+
+**Why the config side suppresses.** The threat is **adjacency**, not the value
+itself. The file holds gateway tokens the user did not type in this breath; a
+parse error can quote a line they never meant to expose; and the error
+**travels** — into `doctor --json`, logs, CI output, and pasted bug reports. The
+user cannot predict which line the parser will quote, so the safe default is
+that no config value crosses the boundary.
+
+**Why the flag side echoes.** A flag value was typed on the line the user is
+looking at, is one argument long, and is already in their shell history and
+terminal scrollback, so echoing adds **no disclosure**. Withholding it costs
+real diagnostic value: `--tui inlien`, `--tui ìnline` (a Unicode look-alike) and
+a shell-mangled `--tui $MODE` that expanded to empty are **indistinguishable**
+without the value. The empty case is why that flag needed a hand-written parser
+at all — clap's own message for an empty value says "a value is required … but
+none was supplied", which is actively misleading when the user did supply one.
+It is also what every other flag in the binary already does, so suppressing only
+one would read as a bug rather than a policy.
+
+**The exception to apply if it ever arises:** if a flag's value is itself a
+credential — a `--token`-shaped argument — suppress **at that flag**, not
+everywhere. None exists today.
+
+**How the config side is enforced**, since "remember not to" is not an
+enforcement mechanism: each `[tui]` field's `deserialize_with` **drops** serde's
+error with `.map_err(|_| …)` rather than wrapping it, and substitutes a message
+the codebase owns. There is no `other =>` binding anywhere in that path, so no
+code **can** interpolate the input. The error allow-list then admits exactly two
+classes — serde's `unknown field` (which enumerates key *names*) and the local
+`invalid value for `[tui]` key …` prefix.
+
+The decisive property, verified by running the real loader: a typo and a
+credential in the same key produce **byte-identical messages**, differing only
+in the reported column. A message that cannot depend on the value cannot leak
+it — which is a stronger guarantee than one that merely tries not to.
