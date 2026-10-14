@@ -111,6 +111,21 @@ pub(crate) fn install(
         TuiMode::Inline => {}
     }
 
+    // Finding F19: the policy gate. The viewport needs a scrolling region of
+    // at least two rows above it, because DECSTBM's bottom margin must *exceed*
+    // its top margin of 1 -- `ESC[1;1r` is a one-row region real terminals
+    // ignore, just like the `ESC[1;0r` a saturating `rows - viewport_rows` used
+    // to produce. So `+ 2`, never `+ 1`: declining is the useful outcome here,
+    // since the caller falls back to the classic renderer, whereas installing a
+    // viewport the terminal silently discards would stand the classic live row
+    // down and leave nothing pinned in its place.
+    //
+    // The refusal happens *before* anything is touched: no bytes on either
+    // sink, the surface slot left as it was, and the live row left enabled.
+    if rows < viewport_rows.saturating_add(2) {
+        return None;
+    }
+
     let viewport = Arc::new(InlineSurface::new(out, err));
     viewport.show(rows, viewport_rows);
     viewport.paint(&[status.to_string()]);
@@ -792,6 +807,197 @@ mod tests {
     fn inline_read_handles_an_escape_sequence_split_across_reads() {
         let (outcome, _) = drive(Chunks::new([b"ac\x1b", b"[D", b"B\r"]), &[]);
         assert_eq!(submitted(&outcome), "aBc");
+    }
+
+    // ---------------------------------------------------------------------
+    // Finding F19: `install` is the policy gate for a terminal too short to
+    // hold one scrolling transcript row plus the viewport.
+    //
+    // The bound is `rows >= viewport_rows + 2`: DECSTBM requires the bottom
+    // margin to exceed the top, so with a top of 1 the bottom must be at least
+    // 2, and `bottom = rows - viewport_rows` must therefore reach 2. A `+ 1`
+    // bound would admit `ESC[1;1r`, a one-row region terminals ignore just as
+    // they ignore `ESC[1;0r` -- the guard would then swap the surface and stand
+    // the live row down with nothing actually pinned, which is worse than no
+    // guard. Below the bound the viewport is not
+    // installed at all and the session keeps the classic renderer: the classic
+    // live row needs no scroll region and degrades gracefully on any geometry,
+    // whereas installing a viewport that cannot work would constrain the
+    // terminal and show nothing. A refused install must therefore leave the
+    // process exactly as it found it -- no bytes, the surface slot untouched,
+    // and the live row still enabled.
+    // ---------------------------------------------------------------------
+
+    /// The geometries below cannot fit a usable scrolling region plus the
+    /// viewport. `rows == 0` is among them -- a failed `TIOCGWINSZ` probe can
+    /// report it, and it is the case that used to produce `ESC[1;0r` -- as are
+    /// `(2, 1)` and `(4, 3)`, which would leave the one-row region `ESC[1;1r`.
+    const TOO_SHORT: [(u16, u16); 12] = [
+        (0, 0),
+        (1, 0),
+        (0, 1),
+        (0, 3),
+        (1, 1),
+        (2, 1),
+        (1, 3),
+        (2, 3),
+        (3, 3),
+        (4, 3),
+        (3, 24),
+        (24, 23),
+    ];
+
+    /// Test 18. The refusal itself, over the exact boundary cases.
+    #[test]
+    #[serial]
+    fn install_inline_refuses_a_terminal_too_short_for_a_transcript_row() {
+        let _state = GlobalState::capture();
+        let expected_live = live::set_live_rows_enabled(true);
+        for (rows, viewport_rows) in TOO_SHORT {
+            let before = active_surface();
+            let (guard, out, err) = install_inline(rows, viewport_rows, "status: idle");
+            assert!(
+                guard.is_none(),
+                "install({rows}, {viewport_rows}) must decline: the terminal cannot hold a \
+                 usable scrolling region (bottom margin >= 2) plus the viewport"
+            );
+            assert!(
+                out.is_empty() && err.is_empty(),
+                "a refused install writes nothing at all, got out {:?} err {:?}",
+                out.text(),
+                err.text()
+            );
+            assert!(
+                Arc::ptr_eq(&before, &active_surface()),
+                "a refused install must leave the surface slot untouched ({rows}, {viewport_rows})"
+            );
+            assert!(
+                live_rows_enabled(),
+                "a refused install must leave the classic live row enabled \
+                 ({rows}, {viewport_rows})"
+            );
+        }
+        live::set_live_rows_enabled(expected_live);
+    }
+
+    /// Test 19. The smallest workable geometry still installs, and the region
+    /// it emits is a valid one: a bottom margin of at least the top margin of
+    /// 1, with the viewport's row below it rather than on top of it.
+    #[test]
+    #[serial]
+    fn install_inline_succeeds_at_the_smallest_workable_geometry() {
+        let _state = GlobalState::capture();
+        // rows == viewport_rows + 2: two transcript rows (1 and 2), the
+        // viewport on row 3.
+        let (guard, out, err) = install_inline(3, 1, "status: idle");
+        let guard = guard.expect("rows == viewport_rows + 2 is workable and installs");
+
+        let expected = expected_show(3, 1) + &expected_status_paint(3, 1, "status: idle");
+        assert_eq!(err.text(), expected);
+        assert!(
+            err.text().starts_with("\x1b[1;2r"),
+            "the region's bottom margin must exceed its top of 1: {:?}",
+            err.text()
+        );
+        for ignored in ["\x1b[1;0r", "\x1b[1;1r"] {
+            assert!(
+                !err.text().contains(ignored),
+                "{ignored:?} is a DECSTBM real terminals ignore, which is what finding F19 \
+                 is about: {:?}",
+                err.text()
+            );
+        }
+        assert!(out.is_empty(), "nothing reaches stdout");
+        drop(guard);
+
+        // And with a taller viewport at the same bound.
+        let (guard, _out, err) = install_inline(5, 3, "status: idle");
+        let guard = guard.expect("rows == viewport_rows + 2 installs for any viewport height");
+        assert!(err.text().starts_with("\x1b[1;2r"));
+        drop(guard);
+    }
+
+    // ---------------------------------------------------------------------
+    // The paste latency measurement the milestone record owes.
+    // ---------------------------------------------------------------------
+
+    /// A 10 KiB paste payload with embedded newlines and tabs, deterministic so
+    /// the assertion can compare content exactly. No carriage returns: the
+    /// editor collapses CR LF inside a paste to one newline, which would make
+    /// the length assertion about that collapse rather than about the paste.
+    fn paste_payload(len: usize) -> String {
+        let mut payload = String::with_capacity(len + 64);
+        let mut line = 0usize;
+        while payload.len() < len {
+            payload.push_str(&format!("line {line:04}\tcolumn two\tcolumn three\n"));
+            line += 1;
+        }
+        payload.truncate(len);
+        // Never end on a partial escape-looking tail or a trailing newline-less
+        // cut mid-word is fine, but a payload must stay valid UTF-8; all bytes
+        // above are ASCII, so truncation is safe.
+        payload
+    }
+
+    /// Test 20. A 10 KiB bracketed-paste block stays **one** draft and arrives
+    /// intact, and the whole read completes well inside a generous wall-clock
+    /// bound.
+    ///
+    /// The bound is about shape, not microseconds: a quadratic insert path
+    /// (re-scanning or re-allocating the draft per byte) turns 10 KiB into tens
+    /// of millions of operations and blows any bound by orders of magnitude,
+    /// while the linear path finishes in single-digit milliseconds. Five
+    /// seconds is therefore loose enough never to flake on a loaded machine or
+    /// under an unoptimised debug build, and still catches the pathology this
+    /// measurement exists to rule out.
+    ///
+    /// The payload is fed in 1 KiB chunks, which is what a real terminal
+    /// delivers: `read_line_inline`'s buffer is 1024 bytes, so a read can never
+    /// hand the editor more than that however the paste was written.
+    #[test]
+    fn inline_read_keeps_a_ten_kib_paste_as_one_draft_without_pathological_latency() {
+        const LEN: usize = 10 * 1024;
+        let payload = paste_payload(LEN);
+        assert_eq!(payload.len(), LEN);
+        assert!(payload.contains('\n') && payload.contains('\t'));
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"\x1b[200~");
+        stream.extend_from_slice(payload.as_bytes());
+        stream.extend_from_slice(b"\x1b[201~");
+        stream.extend_from_slice(b"\r");
+
+        let chunks: Vec<Vec<u8>> = stream.chunks(1024).map(|chunk| chunk.to_vec()).collect();
+        let mut input = Chunks(chunks.into_iter().collect());
+
+        let mut paints: usize = 0;
+        let started = std::time::Instant::now();
+        let outcome = {
+            let mut paint = |_draft: &str, _cursor: usize| paints += 1;
+            read_line_inline(&mut input, &mut paint, &[]).expect("inline read")
+        };
+        let elapsed = started.elapsed();
+
+        // One draft: the whole payload arrives as a single submission with its
+        // newlines intact, not split at the first one.
+        let line = submitted(&outcome);
+        assert_eq!(
+            line.len(),
+            LEN,
+            "the paste must submit as one draft of its full length, not be split at a newline"
+        );
+        assert_eq!(line, payload, "the paste's content must be exact");
+        assert!(
+            line.contains("line 0000\tcolumn two"),
+            "tabs and the first line survive"
+        );
+        assert!(paints >= 1, "the draft is painted at least once");
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "a 10 KiB paste took {elapsed:?}, which indicates pathological (quadratic) \
+             behaviour rather than a slow machine"
+        );
     }
 
     /// Test 17. A read returning zero bytes is EOF: the descriptor is closed
