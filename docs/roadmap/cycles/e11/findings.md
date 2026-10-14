@@ -496,8 +496,56 @@ changes `show`'s emitted bytes and so breaks the tests that pin them. That is a
 card, not a drive-by. The fix also needs a decision this project has not yet
 made — whether an impossibly short terminal should fall back to the classic
 renderer or run with no status row — so it is recorded here rather than guessed
-at. T0-S5c's `hide` is correct for every geometry `show` can currently produce,
-including the degenerate one.
+at.
+
+### Worse than first recorded: it eats transcript rows
+
+Established in T0-S6 while writing the tests. The original note treated this as
+emitting a sequence terminals ignore. That is only true of `show`. The other two
+entry points are actively destructive on the same geometry:
+
+- **`paint` overwrites the transcript.** With `bottom = 0` it positions to
+  `ESC[1;1H`, clears with `ESC[2K`, and writes the status row **on top of
+  transcript row 1**. Every repaint eats that row again.
+- **`hide` parks the cursor on row 1**, so the closing run summary lands on the
+  top of the transcript — the exact failure mode F18 was fixed to prevent,
+  reached again through a different door.
+
+So a short terminal does not merely fail to pin a viewport; it corrupts the
+session's output. That is user-visible, which raises this from a tidiness item
+to a defect worth fixing before the milestone closes.
+
+### The bound, and the off-by-one I had to be corrected on
+
+My first instinct was `rows >= viewport_rows + 1`, reasoning that the region
+needs at least one scrolling row. **That is wrong**, and the test author
+refused to pin it without asking. DECSTBM requires the bottom margin to
+*exceed* the top, so with a top of 1 the bottom must be at least 2:
+
+```
+bottom = rows - viewport_rows >= 2   =>   rows >= viewport_rows + 2
+```
+
+At `+ 1` the region is `ESC[1;1r`, a single-row region that VT-series terminals
+ignore for exactly the reason they ignore `ESC[1;0r`. The guard would then have
+admitted a geometry the terminal discards — with the surface already swapped and
+the classic live row already stood down, so nothing is pinned and the fallback
+never happens. **A guard that admits an ignored geometry is worse than no
+guard.**
+
+### Resolution
+
+Fixed in T0-S6 with the bound above, enforced in **both** places:
+
+- **`install` is the policy gate**, because it is the only place that can
+  decline *and* leave the live status row enabled and the surface slot
+  untouched — a declined install must leave the process exactly as it found it,
+  so the classic renderer takes over cleanly.
+- **`show` is defensive**, because it is what emits the bytes and is `pub` on a
+  library type with other potential callers, including a future resize path. Its
+  defensive behaviour is to write nothing and latch nothing, which is the only
+  choice that makes `paint` and `hide` fall onto their existing "no geometry"
+  paths without introducing new state.
 
 ## F20 — the inline idle prompt loses rustyline's history and completion
 
