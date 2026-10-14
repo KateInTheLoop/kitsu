@@ -49,7 +49,9 @@ use std::sync::Arc;
 
 use kitsu_render::live;
 use kitsu_render::surface::{set_surface, Surface};
-use kitsu_tui::viewport::{plan_resize, InlineSurface, ResizePlan};
+use kitsu_tui::viewport::{
+    clamp_viewport_rows, fit_viewport_rows, plan_resize, InlineSurface, ResizePlan,
+};
 
 /// Which renderer a session runs: the classic line renderer, or the inline
 /// viewport preview.
@@ -204,7 +206,64 @@ impl BridgeGuard {
             // multi-row composer lands.
             live::compose_input_row(&composed, live::terminal_columns()).0
         };
-        self.viewport.paint(&[row], live::terminal_columns());
+        // Deliberately *not* `paint_rows`: that one makes the viewport as
+        // tall as its content, and the draft is one row, so routing the draft
+        // through it would shrink a viewport another caller made taller --
+        // which `resize_relatches_by_tearing_down_the_old_geometry_and_setting_up_the_new`
+        // pins against. The draft paints into whatever height is latched.
+        self.viewport
+            .paint(std::slice::from_ref(&row), live::terminal_columns());
+    }
+
+    /// T0-S14: draw `content` on the pinned viewport, making the viewport as
+    /// tall as the content needs.
+    ///
+    /// One operation on purpose: the clamp, the re-latch when the height
+    /// changed, and the paint. A caller that could latch one height and then
+    /// paint a different number of rows would spill rows into the scroll
+    /// region, where they scroll away with the transcript -- so the guard owns
+    /// the row count and the caller only says what it wants drawn.
+    ///
+    /// The height is [`kitsu_tui::viewport::clamp_viewport_rows`] of the
+    /// request against the stored terminal height, and the rows drawn are
+    /// [`kitsu_tui::viewport::fit_viewport_rows`] of the request -- dropped
+    /// from the top, so the composer survives. A height change is a re-latch
+    /// through the same [`resize`](Self::resize) path a terminal resize takes,
+    /// with a different second argument, which is also what keeps an
+    /// **unchanged** height from emitting any region bytes.
+    ///
+    /// Returns whether a viewport is pinned once the paint has been applied.
+    ///
+    // The first production caller is the bordered slash palette, the card
+    // that actually requests more than one row; the draft deliberately does
+    // not route through here (see `paint_draft`), so in a non-test build
+    // nothing calls it yet.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn paint_rows(&self, content: &[String]) -> bool {
+        // No geometry logic below the guard: the clamp is the pure function
+        // `show`'s bound lives in, and the re-latch is `resize`'s own path
+        // with the terminal height unchanged -- so `Unchanged` still emits
+        // nothing and `Release` still releases.
+        let height = clamp_viewport_rows(
+            self.rows.get(),
+            u16::try_from(content.len()).unwrap_or(u16::MAX),
+        );
+        if height == 0 {
+            // Nothing fits: a terminal under three rows, or no content at
+            // all. Leave the latched geometry alone rather than asking
+            // `show` for a zero-row viewport, which it would accept as a
+            // full-screen region -- a released viewport stays released and
+            // emits no bytes.
+            return self.installed().is_some();
+        }
+        self.resize(self.rows.get(), height);
+        // The rows painted are `fit_viewport_rows`' slice, whose `len()` is
+        // the very height just latched: there is no second count to drift.
+        self.viewport.paint(
+            fit_viewport_rows(content, self.rows.get()),
+            live::terminal_columns(),
+        );
+        self.installed().is_some()
     }
 
     /// Finding F21, step 1: hand the terminal back as a normal full-screen
@@ -2660,5 +2719,300 @@ mod tests {
             vec!["paint:".to_string(), "paint:a".to_string()],
             "a bare EINTR adds no frame at all: {log:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // T0-S14: the viewport's height follows its content.
+    //
+    // `install` is still called with a hardcoded `1` from `main.rs`, and the
+    // bordered slash palette needs several rows that grow and shrink as the
+    // user types. The height therefore becomes a property of what a caller
+    // hands the viewport rather than a constant.
+    //
+    // The two decisions pinned here:
+    //
+    //   * the height follows the content, clamped to `terminal_rows - 2`
+    //     (F19's bound) -- a request that is too tall is **shortened**, not
+    //     refused, because some rows fit;
+    //   * when rows must be dropped they go from the **top**, so the composer
+    //     (the bottom row) always survives.
+    //
+    // And the invariants: an unchanged height emits no region bytes, a changed
+    // height re-latches through `resize`'s own path, the number of rows painted
+    // always equals the latched height, and a suspend after a height change
+    // round-trips the *current* height.
+    // ---------------------------------------------------------------------
+
+    /// The bytes a multi-row `paint` emits for this geometry: each row
+    /// positioned absolutely from the first viewport row down, cleared and
+    /// written, then the cursor re-parked inside the region. Derived rather
+    /// than literal, exactly as `expected_show`/`expected_status_paint` are.
+    fn expected_rows_paint(rows: u16, viewport_rows: u16, content: &[&str]) -> String {
+        let bottom = rows - viewport_rows;
+        let mut expected = String::new();
+        for (i, row) in content.iter().enumerate() {
+            let line = bottom as usize + 1 + i;
+            expected.push_str(&format!("\x1b[{line};1H\x1b[2K{row}"));
+        }
+        expected.push_str(&format!("\x1b[{bottom};1H"));
+        expected
+    }
+
+    fn owned(content: &[&str]) -> Vec<String> {
+        content.iter().map(|row| row.to_string()).collect()
+    }
+
+    /// Test S14-1. The regression net: one row of content still produces
+    /// exactly the bytes it produces today -- the same single positioned,
+    /// cleared, written row and the re-park, with **no** region bytes, because
+    /// the height did not change from the one `install` latched.
+    #[test]
+    #[serial]
+    fn paint_rows_of_one_row_is_byte_identical_to_todays_one_row_paint() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline(24, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let before = err.text().len();
+
+        assert!(guard.paint_rows(&owned(&["status: idle"])));
+
+        assert_eq!(
+            err.text()[before..].to_string(),
+            expected_status_paint(24, 1, "status: idle"),
+            "one row of content must emit exactly the bytes the one-row viewport \
+             emits today"
+        );
+        assert!(out.is_empty(), "no viewport control bytes reach stdout");
+        drop(guard);
+    }
+
+    /// Test S14-2. An unchanged height must not re-latch: no DECSTBM set, no
+    /// release, no cleared rows beyond the paint's own -- exactly as a
+    /// same-dimensions resize is `Unchanged` today. Otherwise every keystroke
+    /// would tear the region down and set it back up, which the user sees as
+    /// the whole viewport flickering.
+    #[test]
+    #[serial]
+    fn paint_rows_at_an_unchanged_height_emits_no_region_bytes() {
+        let _state = GlobalState::capture();
+        let (guard, _out, err) = install_inline(24, 3, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        // Latch three rows first, then repaint the same height twice.
+        guard.paint_rows(&owned(&["palette", "entry", "> draft"]));
+        let before = err.text().len();
+
+        guard.paint_rows(&owned(&["palette", "entry", "> draft!"]));
+        guard.paint_rows(&owned(&["palette", "entry", "> draft!!"]));
+
+        let tail = err.text()[before..].to_string();
+        assert!(
+            !tail.contains("\x1b[1;"),
+            "a repaint at an unchanged height must set no scroll region: {tail:?}"
+        );
+        assert!(!tail.contains("\x1b[r"), "nor release one: {tail:?}");
+        assert_eq!(
+            tail,
+            expected_rows_paint(24, 3, &["palette", "entry", "> draft!"])
+                + &expected_rows_paint(24, 3, &["palette", "entry", "> draft!!"]),
+            "and the two repaints are exactly two paints: {tail:?}"
+        );
+        drop(guard);
+    }
+
+    /// Test S14-3. Growing re-latches, and it is the same operation a terminal
+    /// resize performs with a different second argument: the old geometry's
+    /// teardown, the new geometry's setup, then the rows -- which must land at
+    /// the **new** absolute lines (on a 10-row terminal a 3-row viewport starts
+    /// at row 8, not at row 10).
+    #[test]
+    #[serial]
+    fn paint_rows_growing_relatches_and_paints_at_the_new_absolute_lines() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline(10, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let before = err.text().len();
+
+        assert!(guard.paint_rows(&owned(&["palette", "entry", "> draft"])));
+
+        assert_eq!(
+            err.text()[before..].to_string(),
+            expected_hide(10, 1)
+                + &expected_show(10, 3)
+                + &expected_rows_paint(10, 3, &["palette", "entry", "> draft"]),
+            "a taller request re-latches -- teardown then setup, never a patched \
+             margin -- and then paints at the new geometry"
+        );
+        assert!(out.is_empty(), "no viewport control bytes reach stdout");
+        drop(guard);
+    }
+
+    /// Test S14-4. Shrinking re-latches too, and the rows move back down: a
+    /// one-row viewport on a 10-row terminal is row 10. A shrink that skipped
+    /// the re-latch would leave the region's bottom margin two rows high and a
+    /// stale painted row stranded above the composer.
+    #[test]
+    #[serial]
+    fn paint_rows_shrinking_relatches_and_paints_at_the_new_absolute_lines() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline(10, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        guard.paint_rows(&owned(&["palette", "entry", "> draft"]));
+        let before = err.text().len();
+
+        assert!(guard.paint_rows(&owned(&["> draft"])));
+
+        assert_eq!(
+            err.text()[before..].to_string(),
+            expected_hide(10, 3)
+                + &expected_show(10, 1)
+                + &expected_rows_paint(10, 1, &["> draft"]),
+            "a shorter request re-latches at the smaller height and paints there"
+        );
+        assert!(out.is_empty(), "no viewport control bytes reach stdout");
+        drop(guard);
+    }
+
+    /// Test S14-5. **The headline.** Five rows requested on a terminal that can
+    /// hold three: the request is clamped rather than refused, and the three
+    /// rows that remain are the **last** three, in order -- the composer, the
+    /// row the user is typing into, is never the row that goes.
+    #[test]
+    #[serial]
+    fn paint_rows_clamps_a_too_tall_request_and_keeps_the_last_rows() {
+        let _state = GlobalState::capture();
+        // Five rows: two must stay scrolling above the viewport (F19), so the
+        // usable height is three.
+        let (guard, out, err) = install_inline(5, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let before = err.text().len();
+
+        let pinned = guard.paint_rows(&owned(&["one", "two", "three", "four", "> composer"]));
+
+        assert!(
+            pinned,
+            "a request too tall for the terminal is shortened, not refused: some \
+             rows fit, so a viewport stays pinned"
+        );
+        assert_eq!(
+            err.text()[before..].to_string(),
+            expected_hide(5, 1)
+                + &expected_show(5, 3)
+                + &expected_rows_paint(5, 3, &["three", "four", "> composer"]),
+            "the viewport latches three rows and paints the LAST three of the five \
+             requested, in order -- rows are dropped from the top so the composer \
+             survives"
+        );
+        assert!(out.is_empty(), "no viewport control bytes reach stdout");
+        drop(guard);
+    }
+
+    /// Test S14-6. The property: the number of rows painted always equals the
+    /// latched height. Painting more would put the extra rows inside the scroll
+    /// region, where they scroll away with the transcript -- and painting fewer
+    /// would leave a stale row pinned.
+    ///
+    /// Finding F27: a full repaint repairs its own damage, so the count is taken
+    /// from a **second** paint at the same height, which emits the paint alone
+    /// with no teardown clears mixed into it.
+    #[test]
+    #[serial]
+    fn paint_rows_never_paints_more_rows_than_the_viewport_is_tall() {
+        let _state = GlobalState::capture();
+        for rows in 3u16..=12 {
+            for requested in 1usize..=8 {
+                let content: Vec<String> = (0..requested).map(|i| format!("row {i}")).collect();
+                let expected = (requested as u16).min(rows - 2);
+
+                let (guard, _out, err) = install_inline(rows, 1, "status: idle");
+                let guard = guard.expect("inline mode installs a guard");
+                guard.paint_rows(&content);
+                let before = err.text().len();
+                guard.paint_rows(&content);
+                let tail = err.text()[before..].to_string();
+
+                assert!(
+                    !tail.contains("\x1b[1;") && !tail.contains("\x1b[r"),
+                    "the second paint at the same height must not re-latch \
+                     ({rows}, {requested}): {tail:?}"
+                );
+                assert_eq!(
+                    tail.matches("\x1b[2K").count(),
+                    expected as usize,
+                    "paint_rows on a {rows}-row terminal with {requested} rows requested \
+                     must draw exactly {expected} rows -- any extra lands inside the \
+                     scroll region and scrolls away with the transcript: {tail:?}"
+                );
+                // And they are the last `expected` rows, at the right lines.
+                let kept: Vec<&str> = content[requested - expected as usize..]
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                assert_eq!(
+                    tail,
+                    expected_rows_paint(rows, expected, &kept),
+                    "and at the latched geometry's own lines ({rows}, {requested})"
+                );
+                drop(guard);
+            }
+        }
+    }
+
+    /// Test S14-7. A height change followed by a suspend/resume round trip must
+    /// reinstall the **current** height, not the one `install` was given --
+    /// `BridgeGuard` stores its dimensions, so this is the same trap
+    /// `resize_updates_the_geometry_the_next_reinstall_uses` pinned for a
+    /// terminal resize.
+    #[test]
+    #[serial]
+    fn paint_rows_updates_the_height_the_next_reinstall_uses() {
+        let _state = GlobalState::capture();
+        let (guard, _out, err) = install_inline(24, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        guard.paint_rows(&owned(&["palette", "entry", "> draft"]));
+        let before = err.text().len();
+
+        guard.release_for_suspend();
+        guard.reinstall_after_resume();
+
+        assert_eq!(
+            err.text()[before..].to_string(),
+            expected_hide(24, 3)
+                + &expected_show(24, 3)
+                + &expected_status_paint(24, 3, "status: idle"),
+            "a suspend after a height change must round-trip the *current* height"
+        );
+        drop(guard);
+    }
+
+    /// Test S14-8. Each row is still width-fitted (T0-S13), so a long palette
+    /// row cannot wrap into its neighbour -- the fitting is `paint`'s and must
+    /// not be bypassed by the taller viewport.
+    #[test]
+    #[serial]
+    fn paint_rows_width_fits_every_row_so_none_can_wrap_into_its_neighbour() {
+        let _state = GlobalState::capture();
+        let (guard, _out, err) = install_inline(24, 1, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let long = "x".repeat(live::terminal_columns() + 40);
+        let before = err.text().len();
+
+        guard.paint_rows(&owned(&[&long, "> draft"]));
+
+        let tail = err.text()[before..].to_string();
+        let painted = tail
+            .split("\x1b[2K")
+            .nth(1)
+            .unwrap_or_else(|| panic!("a row is painted: {tail:?}"));
+        let body = painted
+            .split("\x1b[")
+            .next()
+            .expect("the row's text precedes the next position");
+        assert!(
+            kitsu_render::sanitize_terminal_text(body).chars().count() <= live::terminal_columns(),
+            "an over-long palette row must be cut to the terminal's width, not \
+             wrapped into the row below: {} columns",
+            kitsu_render::sanitize_terminal_text(body).chars().count()
+        );
+        drop(guard);
     }
 }

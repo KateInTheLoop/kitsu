@@ -140,6 +140,21 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   rather than re-raising `SIGINT`, because at an idle prompt there is no turn to
   cancel and the raise would take the default disposition and exit.
 
+  **The viewport's height follows its content, clamped to what the window can
+  hold.** A caller hands over the rows it wants drawn and the viewport becomes
+  that tall, re-latching the region on each change — the same operation a
+  terminal resize performs. The ceiling is the minimum-height rule: two
+  scrolling rows must remain above the viewport, so a request taller than that
+  is **shortened rather than refused**, because a palette too tall for the
+  window should lose rows, not take the composer down with it. Refusing is
+  reserved for a window so short that not even one row can be pinned.
+
+  When rows must be dropped, **the topmost go first**: the composer is the
+  bottom row and the palette sits above it, so the row being typed into is the
+  last thing lost. The count drawn always equals the latched height — extra rows
+  would land inside the scroll region and scroll away with the transcript, which
+  looks like a vanishing palette rather than an off-by-one.
+
   **Rows are fitted to the terminal's width before they are drawn.** A pinned
   row wider than the terminal would wrap into the row below it and overwrite
   it — harmless with one row, corrupting with several, which is why this is

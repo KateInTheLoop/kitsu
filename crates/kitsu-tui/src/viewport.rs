@@ -145,6 +145,47 @@ pub fn plan_resize(installed: Option<(u16, u16)>, rows: u16, viewport_rows: u16)
     }
 }
 
+/// The usable viewport height on a `terminal_rows`-high terminal for a caller
+/// that wants `requested` rows drawn (T0-S14).
+///
+/// F19's bound still rules -- the region needs two scrolling rows above the
+/// viewport -- so the usable maximum is `terminal_rows - 2`. A request above
+/// that is **clamped, not refused**: a palette too tall for the window is
+/// shortened, and only a terminal that cannot pin even one row ends up with no
+/// viewport at all (which is `plan_resize`'s `Release`, already built).
+///
+/// Pure, for the same reason [`plan_resize`] is: the property that the height
+/// latched is always one [`InlineSurface::show`] would accept has to be
+/// checkable without a terminal.
+///
+pub fn clamp_viewport_rows(terminal_rows: u16, requested: u16) -> u16 {
+    // `saturating_sub` is the whole of the degenerate case: a terminal under
+    // three rows has no usable height at all, and zero is the honest answer
+    // rather than a geometry `show` would decline.
+    requested.min(terminal_rows.saturating_sub(2))
+}
+
+/// The rows of `content` that survive the clamp on a `terminal_rows`-high
+/// terminal: the **last** [`clamp_viewport_rows`]`(terminal_rows,
+/// content.len())` of them, in order.
+///
+/// Rows are dropped from the **top**. The composer is the bottom row and the
+/// palette sits above it, so the row the user is typing into must be the last
+/// thing to go; losing it to make room for a list of suggestions would be the
+/// wrong trade.
+///
+/// Returning the slice rather than a count is deliberate: its `len()` *is*
+/// the height, so the two cannot disagree even in here.
+pub fn fit_viewport_rows(content: &[String], terminal_rows: u16) -> &[String] {
+    // `content.len()` may exceed `u16::MAX`; the clamp's own ceiling is well
+    // under that, so saturating the cast cannot change the answer.
+    let height = clamp_viewport_rows(
+        terminal_rows,
+        u16::try_from(content.len()).unwrap_or(u16::MAX),
+    );
+    &content[content.len() - height as usize..]
+}
+
 /// An inline viewport: a pinned region at the bottom of the terminal with the
 /// transcript scrolling in a DECSTBM region above it.
 ///
@@ -1297,6 +1338,137 @@ mod tests {
             !second.fgcolor().eq(&vt100::Color::Idx(1)),
             "the second row must not inherit the first row's colour"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // T0-S14: a dynamic viewport height.
+    //
+    // The height follows the content a caller hands the viewport, clamped to
+    // what the terminal can hold: F19's bound means the usable maximum is
+    // `terminal_rows - 2`. A request above that is **clamped rather than
+    // refused** -- a palette too tall for the window is shortened, not made to
+    // take the whole viewport down with it -- and when rows must be dropped
+    // they go from the **top**, so the composer, the bottom row, always
+    // survives.
+    //
+    // Both decisions live in pure functions for the reason `plan_resize` does.
+    // ---------------------------------------------------------------------
+
+    use super::{clamp_viewport_rows, fit_viewport_rows};
+
+    fn rows_of(labels: &[&str]) -> Vec<String> {
+        labels.iter().map(|row| row.to_string()).collect()
+    }
+
+    #[test]
+    fn clamp_viewport_rows_leaves_a_request_the_terminal_can_hold_alone() {
+        // Two scrolling rows above the viewport is the whole of the bound, so
+        // on 24 rows anything up to 22 passes through untouched -- and one row
+        // (today's hardcoded height) must be untouched on every terminal that
+        // can pin it at all.
+        assert_eq!(clamp_viewport_rows(24, 1), 1);
+        assert_eq!(clamp_viewport_rows(24, 5), 5);
+        assert_eq!(clamp_viewport_rows(24, 22), 22, "rows - 2 is usable");
+        assert_eq!(
+            clamp_viewport_rows(3, 1),
+            1,
+            "the smallest workable geometry"
+        );
+    }
+
+    #[test]
+    fn clamp_viewport_rows_shortens_a_request_taller_than_the_terminal_can_hold() {
+        // The decision: clamp, do not refuse. Some rows fit, so some rows are
+        // drawn.
+        assert_eq!(
+            clamp_viewport_rows(5, 5),
+            3,
+            "a five-row palette on a five-row terminal is cut to the three rows \
+             that fit below two scrolling rows"
+        );
+        assert_eq!(clamp_viewport_rows(24, 40), 22);
+        assert_eq!(clamp_viewport_rows(4, 9), 2);
+        // And where not even one row can be pinned the clamp is zero, which is
+        // F19's release case rather than a geometry anyone installs.
+        assert_eq!(clamp_viewport_rows(2, 1), 0);
+        assert_eq!(clamp_viewport_rows(1, 3), 0);
+        assert_eq!(clamp_viewport_rows(0, 1), 0);
+    }
+
+    #[test]
+    fn fit_viewport_rows_drops_rows_from_the_top_so_the_composer_survives() {
+        // The headline, pinned exactly as the card states it: five rows
+        // requested on a terminal that can hold three, and the three that
+        // remain are the **last** three, in order.
+        let content = rows_of(&["one", "two", "three", "four", "> composer"]);
+        assert_eq!(
+            fit_viewport_rows(&content, 5),
+            &content[2..],
+            "the topmost rows go first: the composer is the bottom row and must \
+             be the last thing dropped"
+        );
+        assert_eq!(
+            fit_viewport_rows(&content, 5).last().map(String::as_str),
+            Some("> composer")
+        );
+        // A request the terminal can hold is handed back whole.
+        assert_eq!(fit_viewport_rows(&content, 24), &content[..]);
+        // And where nothing can be pinned, nothing survives.
+        assert!(fit_viewport_rows(&content, 2).is_empty());
+    }
+
+    #[test]
+    fn fit_viewport_rows_always_matches_the_clamp_and_show_accepts_that_height() {
+        // The property that makes the clamp worth having as a pure function,
+        // and the same one `plan_resize_pins_a_geometry_exactly_when_show_would_emit_one`
+        // pins for the resize path: the height a request ends up with is
+        // always a height `show` would latch.
+        for terminal_rows in 0u16..=16 {
+            for requested in 0usize..=12 {
+                let content: Vec<String> = (0..requested).map(|i| format!("row {i}")).collect();
+                let height = clamp_viewport_rows(terminal_rows, requested as u16);
+                let fitted = fit_viewport_rows(&content, terminal_rows);
+
+                assert!(
+                    height <= requested as u16,
+                    "clamp_viewport_rows({terminal_rows}, {requested}) grew the request to \
+                     {height}"
+                );
+                assert_eq!(
+                    fitted.len(),
+                    height as usize,
+                    "fit_viewport_rows must hand back exactly the clamped height for \
+                     ({terminal_rows}, {requested})"
+                );
+                assert_eq!(
+                    fitted,
+                    &content[requested - fitted.len()..],
+                    "the surviving rows are the last ones, in order, for \
+                     ({terminal_rows}, {requested})"
+                );
+
+                if height > 0 {
+                    let (surface, sink) = shared();
+                    surface.show(terminal_rows, height);
+                    assert!(
+                        !sink.bytes().is_empty(),
+                        "clamp_viewport_rows({terminal_rows}, {requested}) returned {height}, \
+                         a height show() declines to latch -- the clamp must never admit a \
+                         geometry the terminal discards"
+                    );
+                    assert_eq!(
+                        surface.lock().geometry,
+                        Some((terminal_rows - height, height))
+                    );
+                } else {
+                    assert!(
+                        terminal_rows < 3 || requested == 0,
+                        "clamp_viewport_rows({terminal_rows}, {requested}) refused a height \
+                         the terminal could hold: at least one row fits"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
