@@ -2702,3 +2702,30 @@ could plausibly fail, write the full output to a file **first** and read the fil
 project's unidentified failures would have been diagnosable under that rule.
 
 Neither occurrence has recurred, neither is characterised, and both remain open.
+
+## F50 — A8's 250 ms latency requirement has no test, and "shipped" was true only of the mechanism
+
+Found while scoping T3-S5, by searching rather than assuming. Requirement **A8**
+says the ambient background-agent counter "MUST update within 250 ms of a
+registry change". That requirement is **satisfied in practice and asserted
+nowhere.**
+
+- The mechanism: `sync_agent_counts` runs once per input poll tick
+  (`main.rs:15071`), and the tick is `libc::poll(..., 50)` (`main.rs:15084`) —
+  50 ms, comfortably inside the budget.
+- The coverage: searches for `250 ms`, `250ms` and `A8` across `crates/` return
+  **nothing**. The five `agents_tag_*` tests pin the tag's **content** — the
+  truth table, blocked outranking running, hidden when both are zero — and not
+  its **latency**. No test asserts the poll interval, and nothing fails if
+  someone raises it to a second.
+
+**The distinction worth keeping:** "A8 is shipped" was true of the mechanism and
+false of the test, and only a search established which. A requirement whose
+number appears nowhere in the test suite is a requirement nobody is holding.
+
+This is the same shape as **F49**'s latent `load_history` panic and **F47**'s
+erased line: a property that holds today by a construction nobody wrote a test
+against. The cheap fix is a unit assertion on the poll interval constant plus a
+comment tying it to A8, so raising the interval fails loudly rather than
+silently breaking a numbered requirement. Not taken in T3-S5, which was told not
+to re-test A8; worth a small card.

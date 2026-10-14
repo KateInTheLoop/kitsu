@@ -233,6 +233,22 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   mode MAY adopt `← N agents` once A1's left-arrow affordance exists, and
   not before. Promising a key that does nothing is the kind of dishonest
   decoration the rest of this design avoids.
+
+  **Drop order, added in T3-S5 because R5 did not state one.** When the row
+  cannot fit, segments are dropped in this order, first to go listed first:
+  **context meter, elapsed, model, `[N queued]`, ambient tag.** The model is
+  **truncated before it is dropped**. The reasoning, so an edge case can be
+  judged rather than guessed: decoration yields to content, as the spinner
+  already yields to the draft; the meter goes first because `/context` renders
+  it on demand; elapsed follows because the spinner itself carries elapsed past
+  five seconds; the model is long and static; and the ambient tag is last
+  standing because a blocked agent is the one thing in the row the user must
+  act on.
+
+  This order was derived from the classic row's precedent in T3-S5 and labelled
+  an inference at the time rather than passed off as a requirement. It is stated
+  here because a drop order that lives only in a test's doc comment is at the
+  wrong altitude for something every implementer of this row must honour.
 - **R6** Transcript overlay (`Ctrl+O`): scroll, `/` search, `n`/`N`, `{`/`}`
   prompt jumps, `[` dump the cell ring to native scrollback (fullscreen only),
   `v` open in `$EDITOR`, `q`/`Esc` close.
