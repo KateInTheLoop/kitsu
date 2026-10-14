@@ -456,6 +456,21 @@ Codex's approach, adapted to kitsu's two-fd transcript:
     **real** terminal keeps the transcript is strictly a live-matrix question
     for the proof of concept. That is Q1, and it is why the fallback below
     stays unbuilt until the matrix reports.
+
+    **T0-S6 verdict: region flow is the chosen mechanism, and the fallback is
+    not built.** The two mechanisms trade against each other on exactly two
+    questions: insert-history buys native scrollback (Q1) at the price of
+    routing every transcript writer through the seam (Q3). Q3 was measured and
+    answered — a writer that bypasses the seam flows into the region harmlessly,
+    in cooked *and* raw input mode, because a direct write inherits the cursor
+    parked inside the region and the terminal scrolls that region on a line feed
+    whoever wrote the bytes. That removed region flow's cost without removing
+    insert-history's price, so region flow wins on the evidence in hand. **Q1
+    remains unmeasured and is the one input that could overturn this**; the
+    matrix in `docs/roadmap/cycles/e11/terminal-matrix.md` states in advance
+    what each outcome means, so the decision cannot be rationalised after the
+    fact. Keeping the fallback unbuilt is therefore the deliberate position, not
+    an omission.
   - **Insert-history (Codex-style fallback):** on cell completion, set the
     region, write the cell's text on its own fd inside a synchronized update,
     flush, reset — the interleaving `with_live_row_suspended` already relies

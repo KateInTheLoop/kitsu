@@ -113,8 +113,31 @@ impl InlineSurface {
     ///
     /// The region is set **once**, here: `transcript_line` must never re-emit
     /// it, because DECSTBM homes the cursor and would undo the park.
+    ///
+    /// # Too short to pin: write nothing, latch nothing (finding F19)
+    ///
+    /// A terminal needs `rows >= viewport_rows + 2` for this to mean anything,
+    /// and the `+ 2` is **not** a spare row for comfort. DECSTBM requires the
+    /// bottom margin to *exceed* the top, so with a top of 1 the bottom must be
+    /// at least 2, i.e. `bottom = rows - viewport_rows >= 2`. At `+ 1` the
+    /// region would be `ESC[1;1r` -- one row -- which real terminals ignore for
+    /// exactly the reason they ignore the `ESC[1;0r` a saturating subtraction
+    /// used to produce. **Do not relax this to `+ 1`:** a guard that admits a
+    /// geometry the terminal discards is worse than no guard, because the code
+    /// then believes a region is pinned when none is, and `paint` goes on
+    /// addressing rows 1.. inside the transcript.
+    ///
+    /// Below the bound this writes nothing and latches no geometry. Latching
+    /// nothing is the load-bearing half: it leaves [`hide`](Self::hide) and
+    /// [`paint`](Self::paint) on their existing "no geometry" paths, both
+    /// already inert, so neither needs a second copy of this bound.
     pub fn show(&self, rows: u16, viewport_rows: u16) {
-        let bottom = rows.saturating_sub(viewport_rows);
+        // `saturating_add` so a nonsensical `viewport_rows` near `u16::MAX`
+        // declines rather than wrapping into an apparently workable bound.
+        if rows < viewport_rows.saturating_add(2) {
+            return;
+        }
+        let bottom = rows - viewport_rows;
         let mut inner = self.lock();
         inner.geometry = Some((bottom, viewport_rows));
         // Deliberately swallowed: there is nothing to report a failed escape
@@ -640,6 +663,178 @@ mod tests {
             10,
             "without a region the same lines reach the emulator's scrollback"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Finding F19: a terminal too short for a transcript row plus the viewport.
+    //
+    // `show` used to compute `bottom = rows.saturating_sub(viewport_rows)`,
+    // which saturates to 0 on a short terminal and emits `ESC[1;0r` -- an
+    // invalid DECSTBM, because the bottom margin must exceed the top. Terminals
+    // disagree about what to do with it and some ignore it outright, leaving no
+    // region at all while this code believes one is installed; the same clamp
+    // then paints the viewport at rows `1..=viewport_rows`, on top of the
+    // region's own first rows instead of below them.
+    //
+    // DECSTBM needs the bottom margin to *exceed* the top, so with a top of 1
+    // the bottom must be at least 2: a one-row region `ESC[1;1r` is ignored by
+    // VT-series terminals for exactly the reason `ESC[1;0r` is. The bound is
+    // therefore `rows >= viewport_rows + 2`, two scrolling transcript rows
+    // above the viewport.
+    //
+    // The pinned decision: when the terminal cannot fit a usable scrolling
+    // region *plus* the viewport -- that is, when
+    // `rows < viewport_rows + 2` -- no viewport is installed and the session
+    // keeps the classic renderer, which needs no scroll region and degrades on
+    // any geometry. `show` is made defensive about the same bound here because
+    // it is the code emitting the bytes: it writes nothing, latches nothing,
+    // and so leaves `paint` and `hide` inert rather than addressing rows that
+    // were never pinned.
+    // ---------------------------------------------------------------------
+
+    /// Every `(rows, viewport_rows)` pair below is too short for a usable
+    /// scrolling region plus the viewport, `rows == 0` among them (a failed
+    /// `TIOCGWINSZ` probe can plausibly report it). `(2, 1)` and `(4, 3)` are
+    /// the cases that would leave `bottom == 1`, a single-row region real
+    /// terminals ignore.
+    const TOO_SHORT: [(u16, u16); 12] = [
+        (0, 0),
+        (1, 0),
+        (0, 1),
+        (0, 3),
+        (1, 1),
+        (2, 1),
+        (1, 3),
+        (2, 3),
+        (3, 3),
+        (4, 3),
+        (3, 24),
+        (24, 23),
+    ];
+
+    #[test]
+    fn show_writes_nothing_and_latches_nothing_on_a_geometry_too_short_for_a_transcript_row() {
+        for (rows, viewport_rows) in TOO_SHORT {
+            let (surface, sink) = shared();
+            surface.show(rows, viewport_rows);
+            assert!(
+                sink.bytes().is_empty(),
+                "show({rows}, {viewport_rows}) must emit no bytes at all, got {:?}",
+                sink.text()
+            );
+            assert_eq!(
+                surface.lock().geometry,
+                None,
+                "show({rows}, {viewport_rows}) must latch no geometry"
+            );
+        }
+    }
+
+    #[test]
+    fn show_succeeds_at_the_smallest_workable_geometry() {
+        // rows == viewport_rows + 2 is the pinned minimum: two scrolling
+        // transcript rows, then the viewport. With rows = 3 and a 1-row
+        // viewport the region is rows 1..=2 -- a bottom margin that genuinely
+        // exceeds the top, so the terminal installs it -- the cursor parks on
+        // row 2, and the viewport is row 3, below the region rather than over
+        // it.
+        let (surface, sink) = shared();
+        surface.show(3, 1);
+        assert_eq!(sink.bytes(), b"\x1b[1;2r\x1b[2;1H".to_vec());
+        assert_eq!(surface.lock().geometry, Some((2, 1)));
+
+        // And the same bound with a taller viewport.
+        let (surface, sink) = shared();
+        surface.show(5, 3);
+        assert_eq!(sink.bytes(), b"\x1b[1;2r\x1b[2;1H".to_vec());
+        assert_eq!(surface.lock().geometry, Some((2, 3)));
+    }
+
+    #[test]
+    fn show_never_emits_a_region_whose_bottom_is_above_its_top() {
+        // The property, driven over every small geometry rather than the
+        // boundary cases alone: either nothing is emitted, or the emitted
+        // DECSTBM has a bottom margin that genuinely *exceeds* its top margin
+        // of 1, sits on screen, leaves room for the viewport below it, and has
+        // the parked cursor inside it. `ESC[1;0r` and `ESC[1;1r` both fail that
+        // and are the byte sequences finding F19 is about: a terminal ignores
+        // either, so the code believes a region is pinned when none is.
+        for rows in 0u16..=40 {
+            for viewport_rows in 0u16..=8 {
+                let (surface, sink) = shared();
+                surface.show(rows, viewport_rows);
+                let text = sink.text();
+                if text.is_empty() {
+                    assert!(
+                        rows < viewport_rows + 2,
+                        "show({rows}, {viewport_rows}) declined a workable geometry"
+                    );
+                    continue;
+                }
+                let bottom = text
+                    .strip_prefix("\x1b[1;")
+                    .and_then(|rest| rest.split_once('r'))
+                    .map(|(bottom, _)| bottom.to_string())
+                    .unwrap_or_else(|| panic!("show({rows}, {viewport_rows}) emitted {text:?}"));
+                let bottom: u16 = bottom
+                    .parse()
+                    .unwrap_or_else(|_| panic!("non-numeric bottom margin in {text:?}"));
+                assert!(
+                    bottom >= 2,
+                    "show({rows}, {viewport_rows}) emitted a region with bottom margin \
+                     {bottom}: DECSTBM requires the bottom margin to exceed the top, so a \
+                     bottom of 1 is a one-row region and a bottom of 0 is backwards -- real \
+                     terminals ignore both and pin no region at all: {text:?}"
+                );
+                assert!(
+                    bottom <= rows,
+                    "show({rows}, {viewport_rows}) put the region's bottom off-screen: {text:?}"
+                );
+                assert!(
+                    bottom + viewport_rows <= rows,
+                    "show({rows}, {viewport_rows}) overlaps the viewport with the region: {text:?}"
+                );
+                assert!(
+                    text.ends_with(&format!("\x1b[{bottom};1H")),
+                    "the cursor must park on the region's last row: {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hide_stays_consistent_with_a_declined_show() {
+        // Whatever `show` does on a degenerate geometry, `hide` must agree with
+        // it: a declined show pinned no rows, so teardown has nothing to clear,
+        // no region to release and no row to park on. Positioning anything here
+        // would scribble on a screen the viewport never touched.
+        for (rows, viewport_rows) in TOO_SHORT {
+            let (surface, sink) = shared();
+            surface.show(rows, viewport_rows);
+            surface.hide();
+            assert!(
+                sink.bytes().is_empty(),
+                "show({rows}, {viewport_rows}) then hide must emit nothing, got {:?}",
+                sink.text()
+            );
+        }
+    }
+
+    #[test]
+    fn paint_stays_consistent_with_a_declined_show() {
+        // Same argument for `paint`: without a latched geometry it is already a
+        // no-op, and a declined show must leave it one rather than letting the
+        // old saturating clamp address rows 1.. inside the transcript.
+        for (rows, viewport_rows) in TOO_SHORT {
+            let (surface, sink) = shared();
+            surface.show(rows, viewport_rows);
+            surface.paint(&["> composer".to_string()]);
+            assert!(
+                sink.bytes().is_empty(),
+                "show({rows}, {viewport_rows}) then paint must emit nothing, got {:?}",
+                sink.text()
+            );
+        }
     }
 
     #[test]
