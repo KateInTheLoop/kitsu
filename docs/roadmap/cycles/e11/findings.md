@@ -381,6 +381,39 @@ the status string today, palette rows tomorrow — can still wrap into the next
 viewport row and corrupt it. So the precedent to reuse already exists and is
 already wired for one row; extending it to `paint` is the remaining work.
 
+**RESOLVED in T0-S13**, which closes F16 entirely. `kitsu-render` gained
+`fit_row_to_width(row, cols)` — escape-aware, beside the width primitives it
+reuses — and `paint` takes `cols` and applies it per row. The contract is six
+numbered rules in application order, and the ordering is itself pinned:
+
+1. **Byte-identity first.** A row whose visible width fits is returned
+   byte-identical, with no allocation path reachable — which is what keeps every
+   exact-byte assertion in `paint` true, and the output-tier discipline intact.
+2. Escapes cost zero columns, so a heavily styled row is not truncated because
+   its escape bytes inflated a byte count.
+3. Visible columns are counted with the existing `char_display_width`, so a
+   wide character costs two.
+4. A wide character is never split: the fit stops before it and the leftover
+   column stays **unpadded**, since `paint` has already cleared the row and a
+   pad would advance the cursor past the text.
+5. Exactly one reset is appended, and only when the row was **both** truncated
+   **and** carried SGR. The predicate is SGR-specific rather than any-escape:
+   only SGR leaves colour or attributes behind, so a reset after a cursor move
+   or an OSC sequence would be bytes emitted for no reason into a stream other
+   tests assert exactly.
+6. Zero columns yields nothing for a row of visible width above zero, while a
+   zero-width row satisfies rule 1 first and returns identical.
+
+`cols` is a parameter rather than latched at `show`, for two stated reasons: a
+second terminal probe inside `kitsu-tui` would be a second source of truth, and
+a latched width would go stale after a resize exactly as the row geometry did.
+
+The scanner is local to `fit_row_to_width` rather than reused from
+`TerminalTextSanitizer`, deliberately: that type is a char-at-a-time *stripping*
+machine with no notion of sequence boundaries or SGR-ness, so getting offsets
+out of it would mean restructuring the code the byte-identity invariant runs
+through. The helper mirrors its byte classes so the two cannot drift silently.
+
 ### Resize decision, taken in T0-S11
 
 What happens when a resize crosses F19's `rows >= viewport_rows + 2` bound was
@@ -1083,3 +1116,59 @@ the signal lands. Removing the re-arm reintroduces a narrow but real flake.
 Re-delivery is safe because a resize to unchanged dimensions is `Unchanged` and
 emits zero bytes, and it does **not** weaken the `SA_RESTART` discrimination,
 because a resize step writes no input byte.
+
+## The composer and palette are three cards, in a forced order
+
+Recorded in T0-S13 so the sequence is not rediscovered. R4's remaining gap —
+Rustyline's completion lists, meaning `@file` paths and the bordered
+slash-command palette — cannot be done as one card, and the order is forced by
+a dependency rather than by preference:
+
+1. **T0-S13, escape-aware row fitting for `paint`** (F16's truncation half).
+   This must come first. With a single viewport row an over-long row merely
+   wraps untidily; with several rows **it wraps into and overwrites the row
+   below**. Building a multi-row composer on an unbounded `paint` would mean
+   debugging corruption that has nothing to do with the composer.
+2. **T0-S14, a variable viewport height.** The bridge installs with
+   `viewport_rows = 1` hardcoded. A palette that grows and shrinks as you type
+   needs the height to change at runtime, which means re-latching the region
+   on every change — the same operation T0-S11's resize already does, so this
+   is more plumbing than new mechanism. It also interacts with F19's minimum
+   height: a palette that would not fit must be truncated or suppressed rather
+   than pushing the region to an invalid geometry.
+3. **T0-S15, the palette itself** — matching, filtering as you type, the
+   border, and `Tab` semantics against a list rather than a single hint.
+
+`@file` path completion is a fourth, independent piece: it shares the "lists"
+label but not the geometry problem, since it can reuse whatever T0-S15 builds.
+
+## F27 — the obvious test for viewport row overflow is vacuous
+
+Found: T0-S13, by the test author, while trying to write the test the card was
+*about*. Worth recording because the trap is not obvious and the next person to
+test viewport painting will walk into it.
+
+The natural test for "a row wider than the terminal corrupts the row below" is:
+paint a two-row viewport with an over-long first row, then assert the second row
+is intact. **That test passes even with no width fitting at all.** `paint`
+writes each row as `ESC[{line};1H ESC[2K {row}`, so the over-long first row does
+smear into the second row's cells — and then the second row's own `ESC[2K`
+erases the smear before writing. Within a single full repaint the corruption is
+always repaired by the very next row.
+
+Two shapes do observe it, and both are in the suite:
+
+- **A partial repaint.** Redrawing only the composer row — which is what a
+  keystroke does — leaves the row below unrepaired, because nothing clears it.
+  This is the realistic case: full repaints are the exception, per-keystroke
+  redraws are the norm.
+- **An overflow on the last pinned row.** There is no row below it to repair
+  anything, so the overflow autowraps off the bottom of the screen and scrolls
+  the transcript *and* the viewport up by a line. The symptom is not a corrupt
+  row but a scrolled screen, which is worse and harder to attribute.
+
+**The lesson generalises:** a repaint-based renderer repairs its own damage on
+the next full pass, so any test that asserts a full repaint looks clean when it
+is not. Tests of painting defects must use a partial repaint, or the last row,
+or both. A green full-repaint test is weak evidence about a renderer of this
+shape.

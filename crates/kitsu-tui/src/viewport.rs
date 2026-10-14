@@ -256,15 +256,34 @@ impl InlineSurface {
     /// on, and emitting absolute positions against a guess would scribble over
     /// the transcript. Doing nothing is the only choice that cannot corrupt
     /// the screen.
-    pub fn paint(&self, viewport: &[String]) {
+    /// # Width fitting (finding F16, truncation half)
+    ///
+    /// Every row passes through [`fit_row_to_width`] against `cols` before it
+    /// is written, so no painted row can wrap into the row below it. With a
+    /// one-row viewport an over-long row merely wrapped untidily; with the
+    /// multi-row composer and the slash palette it wraps *into and corrupts*
+    /// the next pinned row, which is why the fitting is here and not left to
+    /// each caller.
+    ///
+    /// A row already within `cols` visible columns is written byte-for-byte as
+    /// before -- that is `fit_row_to_width`'s first rule and what keeps the
+    /// paint byte sequences above unchanged.
+    ///
+    /// `cols` is a **parameter** rather than part of the latched geometry:
+    /// `InlineSurface` lives in `kitsu-tui` and must not probe the terminal
+    /// itself (a second probe is a second source of truth), and a column count
+    /// latched at `show` would be stale after a resize for exactly the reason
+    /// the row geometry is. Callers pass
+    /// [`kitsu_render::live::terminal_columns`], the shared probe the live row
+    /// already uses.
+    pub fn paint(&self, viewport: &[String], cols: usize) {
         let mut inner = self.lock();
         let Some((bottom, _)) = inner.geometry else {
             return;
         };
         for (i, row) in viewport.iter().enumerate() {
             let line = bottom as usize + 1 + i;
-            // No width fitting: a row wider than the terminal wraps into the
-            // next viewport row. Recorded as a known gap for a later card.
+            let row = kitsu_render::fit_row_to_width(row, cols);
             let _ = write!(inner.err, "\x1b[{line};1H\x1b[2K{row}");
         }
         let _ = write!(inner.err, "\x1b[{bottom};1H");
@@ -556,7 +575,7 @@ mod tests {
         surface.show(24, 3);
         assert_eq!(sink.bytes(), b"\x1b[1;21r\x1b[21;1H".to_vec());
         let before = sink.bytes().len();
-        surface.paint(&["composer".to_string()]);
+        surface.paint(&["composer".to_string()], 80);
         assert_eq!(
             &sink.bytes()[before..],
             b"\x1b[22;1H\x1b[2Kcomposer\x1b[21;1H"
@@ -573,7 +592,7 @@ mod tests {
         // 10, and the cursor goes back to row 8 inside the region.
         surface.show(10, 2);
         let before = sink.bytes().len();
-        surface.paint(&["composer".to_string(), "status".to_string()]);
+        surface.paint(&["composer".to_string(), "status".to_string()], 80);
         assert_eq!(
             &sink.bytes()[before..],
             b"\x1b[9;1H\x1b[2Kcomposer\x1b[10;1H\x1b[2Kstatus\x1b[8;1H"
@@ -648,11 +667,14 @@ mod tests {
             let fd = if i % 2 == 1 { Fd::Stdout } else { Fd::Stderr };
             surface.transcript_line(fd, &format!("line {i:02}"));
         }
-        surface.paint(&[
-            "> composer".to_string(),
-            "status: 2 agents".to_string(),
-            "hint: ctrl-c".to_string(),
-        ]);
+        surface.paint(
+            &[
+                "> composer".to_string(),
+                "status: 2 agents".to_string(),
+                "hint: ctrl-c".to_string(),
+            ],
+            80,
+        );
         sink.bytes()
     }
 
@@ -896,7 +918,7 @@ mod tests {
         for (rows, viewport_rows) in TOO_SHORT {
             let (surface, sink) = shared();
             surface.show(rows, viewport_rows);
-            surface.paint(&["> composer".to_string()]);
+            surface.paint(&["> composer".to_string()], 80);
             assert!(
                 sink.bytes().is_empty(),
                 "show({rows}, {viewport_rows}) then paint must emit nothing, got {:?}",
@@ -1093,6 +1115,188 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Finding F16, truncation half: `paint` fits each row to the terminal.
+    //
+    // `paint` used to write every row with no width limit, so a row wider
+    // than the terminal wrapped into the next viewport row. With a one-row
+    // viewport that was untidy; with the multi-row composer and the slash
+    // palette it overwrites the row below. The fitting itself is pinned in
+    // `kitsu_render::fit_row_to_width`; these tests pin the wiring, and the
+    // existing byte-exact paint tests above are the regression net for rows
+    // that already fit.
+    // ---------------------------------------------------------------------
+
+    /// Visible width of a styled row, the in-tree idiom: sanitise the escapes
+    /// away, then measure.
+    fn visible_cols(row: &str) -> usize {
+        kitsu_render::sanitize_terminal_text(row).chars().count()
+    }
+
+    #[test]
+    fn paint_leaves_a_row_within_the_terminal_width_byte_identical() {
+        // The property the fitting may not cost us: a row that fits produces
+        // exactly the bytes it produced before this card, the trailing park
+        // included and with nothing appended to the row itself -- even when it
+        // leaves styling active.
+        let (surface, sink) = shared();
+        surface.show(10, 2);
+        let before = sink.bytes().len();
+        surface.paint(&["composer".to_string(), "\x1b[31mstatus".to_string()], 80);
+        assert_eq!(
+            &sink.bytes()[before..],
+            b"\x1b[9;1H\x1b[2Kcomposer\x1b[10;1H\x1b[2K\x1b[31mstatus\x1b[8;1H",
+            "a fitting row is written byte-for-byte, with no reset appended"
+        );
+    }
+
+    #[test]
+    fn paint_truncates_an_over_long_row_so_it_cannot_wrap() {
+        let (surface, sink) = shared();
+        surface.show(10, 2);
+        let before = sink.bytes().len();
+        // 30 visible columns into a 12-column terminal.
+        surface.paint(&["0123456789abcdefghijklmnopqrst".to_string()], 12);
+        let tail = String::from_utf8(sink.bytes()[before..].to_vec()).expect("UTF-8");
+        assert_eq!(
+            tail, "\x1b[9;1H\x1b[2K0123456789ab\x1b[8;1H",
+            "the row is cut to the terminal's width, got {tail:?}"
+        );
+
+        // And the property rather than the literal: the text written between
+        // the clear and the park is at most `cols` visible columns, for every
+        // width.
+        for cols in 1usize..=40 {
+            let (surface, sink) = shared();
+            surface.show(10, 2);
+            let before = sink.bytes().len();
+            surface.paint(&["0123456789abcdefghijklmnopqrst".to_string()], cols);
+            let tail = String::from_utf8(sink.bytes()[before..].to_vec()).expect("UTF-8");
+            let body = tail
+                .strip_prefix("\x1b[9;1H\x1b[2K")
+                .and_then(|rest| rest.strip_suffix("\x1b[8;1H"))
+                .unwrap_or_else(|| panic!("paint at {cols} cols emitted {tail:?}"));
+            assert!(
+                visible_cols(body) <= cols,
+                "paint at {cols} cols wrote {} visible columns: {body:?}",
+                visible_cols(body)
+            );
+        }
+    }
+
+    #[test]
+    fn paint_keeps_an_over_long_row_from_disturbing_another_viewport_row() {
+        // The case this card exists for, driven through the emulator because
+        // wrapping is a property of the terminal and not of the byte stream.
+        //
+        // The row painted *after* an over-long one happens to repair the
+        // damage, since it clears its own line; so the corruption shows where
+        // a real multi-row viewport will show it -- a partial repaint. Here
+        // the status row is painted once and the composer row alone is
+        // repainted, exactly as a keystroke redraw would.
+        let (surface, sink) = shared();
+        surface.show(6, 2);
+        surface.paint(&["> ".to_string(), "status: ok".to_string()], 12);
+        surface.paint(&["0123456789abcdefghijklmnopqrst".to_string()], 12);
+        let mut parser = vt100::Parser::new(6, 12, 0);
+        parser.process(&sink.bytes());
+        let screen: Vec<String> = parser.screen().rows(0, 12).collect();
+        assert_eq!(
+            screen[4], "0123456789ab",
+            "the composer row holds exactly the terminal's width"
+        );
+        assert_eq!(
+            screen[5], "status: ok",
+            "and the status row below it survives the repaint rather than \
+             being overwritten by the composer's overflow"
+        );
+    }
+
+    #[test]
+    fn paint_keeps_an_over_long_last_row_from_scrolling_the_whole_screen() {
+        // The worse half of the same defect: the *last* pinned row sits on the
+        // last row of the screen, so its overflow autowraps off the bottom and
+        // scrolls everything -- the transcript above and the viewport itself
+        // move up a row, which is precisely the corruption the viewport exists
+        // to avoid.
+        let (surface, sink) = shared();
+        surface.show(6, 2);
+        // Deliberately within the 12-column width: a longer line autowraps
+        // and scrolls the region by itself, which would confound the very
+        // thing asserted below. The transcript's own clipping is the
+        // terminal's business; this test is about the viewport's last row.
+        surface.transcript_line(Fd::Stdout, "transcript");
+        surface.paint(
+            &[
+                "> composer".to_string(),
+                "0123456789abcdefghijklmnopqrst".to_string(),
+            ],
+            12,
+        );
+        let mut parser = vt100::Parser::new(6, 12, 0);
+        parser.process(&sink.bytes());
+        let screen: Vec<String> = parser.screen().rows(0, 12).collect();
+        assert_eq!(
+            screen[2], "transcript",
+            "the over-long pinned row caused no FURTHER scroll. One scroll is \
+             expected and is the transcript's own newline: the cursor is \
+             parked on the region's last row, so writing a line there scrolls \
+             the region once by itself. If the last pinned row had wrapped off \
+             the bottom instead of being cut, everything would have shifted \
+             again and this would read one row higher"
+        );
+        assert_eq!(screen[4], "> composer", "the first pinned row stayed put");
+        assert_eq!(
+            screen[5], "0123456789ab",
+            "and the last pinned row is cut rather than wrapping off the \
+             bottom of the screen"
+        );
+    }
+
+    #[test]
+    fn paint_resets_style_after_truncating_a_styled_row_so_it_cannot_bleed() {
+        // The bleed case: cutting a row mid-style leaves SGR active, and the
+        // next row painted immediately after would inherit it. The reset is
+        // owed by the fitter, so this is a wiring test -- what reaches the
+        // sink must end the row's styling before the next position.
+        let (surface, sink) = shared();
+        surface.show(10, 2);
+        let before = sink.bytes().len();
+        surface.paint(
+            &[
+                "\x1b[31mred row that overflows the terminal".to_string(),
+                "plain".to_string(),
+            ],
+            8,
+        );
+        let tail = String::from_utf8(sink.bytes()[before..].to_vec()).expect("UTF-8");
+        let (first, rest) = tail
+            .split_once("\x1b[10;1H")
+            .unwrap_or_else(|| panic!("two rows are painted: {tail:?}"));
+        assert!(
+            first.ends_with("\x1b[0m"),
+            "the truncated styled row ends with a reset: {first:?}"
+        );
+        assert_eq!(
+            // Eight columns means eight: "red row" is seven, so the eighth
+            // visible character -- the space -- is kept. Reserving a column
+            // would contradict `fit_row_to_width("abcdefghij", 9)`.
+            first,
+            "\x1b[9;1H\x1b[2K\x1b[31mred row \x1b[0m",
+            "and the whole first row is exactly that: {first:?}"
+        );
+        assert_eq!(rest, "\x1b[2Kplain\x1b[8;1H");
+
+        // Through the emulator: the second row is not red.
+        let mut parser = vt100::Parser::new(10, 8, 0);
+        parser.process(&sink.bytes());
+        let second = parser.screen().cell(9, 0).expect("row 10, column 1");
+        assert!(
+            !second.fgcolor().eq(&vt100::Color::Idx(1)),
+            "the second row must not inherit the first row's colour"
+        );
     }
 
     #[test]

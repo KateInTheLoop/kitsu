@@ -915,6 +915,176 @@ fn fit_banner_value(value: &str, width: usize) -> String {
     result
 }
 
+/// Fit one physical terminal row to `cols` **visible** columns, escape-aware
+/// (the truncation half of finding F16).
+///
+/// This is the primitive the inline viewport needs and the crate did not have:
+/// [`display_width`] is not escape-aware (it counts the bytes of an ANSI
+/// sequence as visible columns) and [`fit_banner_value`] elides middle-out
+/// keeping the *tail*, which is right for a path and wrong for a row of text.
+/// It lives here, beside the width and sanitisation primitives, so `kitsu-tui`
+/// shares the one measurement rather than growing a second.
+///
+/// The contract, in the order the rules apply:
+///
+/// 1. **A row that already fits is returned byte-identical.** Not re-encoded,
+///    not normalised, with no reset appended -- even when it leaves styling
+///    active. Every `InlineSurface::paint` test asserts exact bytes and the
+///    output tier's whole discipline rests on byte-identity, so a fitter that
+///    rewrote short rows would be worse than no fitter.
+/// 2. Escape sequences cost **zero** columns, so a heavily styled row whose
+///    visible text fits is never truncated for its escapes.
+/// 3. Truncation counts visible columns through [`char_display_width`], so a
+///    wide CJK character costs 2.
+/// 4. **A wide character is never split.** If a 2-column character would land
+///    in the last single column the fit stops before it, and the leftover
+///    column is left **unpadded**: `paint` has already cleared the row with
+///    `ESC[2K`, so an unwritten cell shows the terminal's background, while
+///    padding with a space would both diverge from the byte-identical path and
+///    advance the cursor a column further than the text occupies.
+/// 5. If truncation cuts a row that had styling active, exactly one `ESC[0m`
+///    is appended so the style cannot bleed into whatever is drawn next. This
+///    is deliberately conditional on *both* halves: unconditionally appending
+///    a reset would break rule 1, and appending it to a truncated row that
+///    carried no escapes at all would make plain text no longer plain.
+/// 6. `cols == 0` yields an empty string for any row with visible width above
+///    zero -- nothing can be drawn in zero columns, and emitting the row's SGR
+///    into no columns would only bleed. A row of width zero (empty, or escapes
+///    alone) fits under rule 1 and so comes back byte-identical, rule 1 being
+///    first.
+pub fn fit_row_to_width(row: &str, cols: usize) -> String {
+    // Rule 1 first, and before anything can modify the string: measure the
+    // visible width and, if it fits, hand back the very same bytes. No
+    // allocation path below can run for a fitting row, which is what keeps
+    // every byte-identity assertion in `InlineSurface::paint` true. Rule 6
+    // falls out of the ordering: a zero-width row (empty, or escapes alone)
+    // fits even in zero columns and so returns here.
+    let mut visible = 0usize;
+    let mut cursor = 0usize;
+    while cursor < row.len() {
+        if let Some((len, _)) = escape_sequence_at(row, cursor) {
+            // Rule 2: an escape sequence costs zero columns.
+            cursor += len;
+            continue;
+        }
+        let ch = row[cursor..].chars().next().expect("non-empty remainder");
+        // Rule 3: visible columns, so a wide character costs 2.
+        visible += char_display_width(ch);
+        cursor += ch.len_utf8();
+    }
+    if visible <= cols {
+        return row.to_string();
+    }
+
+    // The row is over-long. Copy escapes through unconditionally (they are
+    // free) and visible characters until the next one would not fit.
+    let mut fitted = String::with_capacity(row.len());
+    let mut used = 0usize;
+    let mut wrote_visible = false;
+    // Rule 5's predicate is SGR specifically -- a CSI sequence whose final
+    // byte is `m` -- rather than "any escape seen". The appended reset exists
+    // to stop *colour and attributes* bleeding into whatever is drawn next,
+    // and only SGR leaves such state behind: a cursor move or an OSC sequence
+    // leaves nothing to reset, so a reset after one would be bytes emitted
+    // for no reason into a stream other tests assert exactly. Do not
+    // "simplify" this to any-escape.
+    let mut saw_sgr = false;
+    let mut cursor = 0usize;
+    while cursor < row.len() {
+        if let Some((len, is_sgr)) = escape_sequence_at(row, cursor) {
+            fitted.push_str(&row[cursor..cursor + len]);
+            saw_sgr |= is_sgr;
+            cursor += len;
+            continue;
+        }
+        let ch = row[cursor..].chars().next().expect("non-empty remainder");
+        let width = char_display_width(ch);
+        if used + width > cols {
+            // Rule 4: a wide character that would land in the final single
+            // column stops the fit, and the leftover column stays unpadded.
+            break;
+        }
+        fitted.push(ch);
+        used += width;
+        wrote_visible = true;
+        cursor += ch.len_utf8();
+    }
+
+    if !wrote_visible {
+        // Rule 6, and its generalisation: with no visible text drawn there is
+        // nothing for the surviving escapes to style, so emitting them would
+        // only bleed into the next row.
+        return String::new();
+    }
+    if saw_sgr {
+        fitted.push_str("\x1b[0m");
+    }
+    fitted
+}
+
+/// If `row[at..]` begins an ANSI escape sequence, its byte length and whether
+/// it is SGR (a CSI sequence with final byte `m`). Mirrors the state machine
+/// in [`TerminalTextSanitizer`], which only exists in stripping form and whose
+/// restructuring the output tier's byte-identity invariant runs through; this
+/// is a small read-only scanner instead.
+fn escape_sequence_at(row: &str, at: usize) -> Option<(usize, bool)> {
+    let bytes = row.as_bytes();
+    if bytes.get(at) != Some(&0x1b) {
+        return None;
+    }
+    let mut i = at + 1;
+    match bytes.get(i) {
+        // CSI: parameter and intermediate bytes, then a final byte.
+        Some(b'[') => {
+            i += 1;
+            while let Some(&b) = bytes.get(i) {
+                if (0x20..=0x3f).contains(&b) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            match bytes.get(i) {
+                Some(&b) if (0x40..=0x7e).contains(&b) => Some((i + 1 - at, b == b'm')),
+                // Unterminated: the rest of the row is the sequence.
+                _ => Some((row.len() - at, false)),
+            }
+        }
+        // OSC and the other control strings, terminated by BEL or ST.
+        Some(b']') | Some(b'P') | Some(b'X') | Some(b'^') | Some(b'_') => {
+            i += 1;
+            while let Some(&b) = bytes.get(i) {
+                if b == 0x07 {
+                    return Some((i + 1 - at, false));
+                }
+                if b == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                    return Some((i + 2 - at, false));
+                }
+                i += 1;
+            }
+            Some((row.len() - at, false))
+        }
+        // An escape with intermediate bytes, then a final byte.
+        Some(&b) if (0x20..=0x2f).contains(&b) => {
+            while let Some(&b) = bytes.get(i) {
+                if (0x20..=0x2f).contains(&b) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            Some((bytes.get(i).map_or(i, |_| i + 1) - at, false))
+        }
+        // A single-character escape.
+        Some(_) => {
+            let ch = row[i..].chars().next().expect("non-empty remainder");
+            Some((i + ch.len_utf8() - at, false))
+        }
+        // A lone trailing ESC.
+        None => Some((1, false)),
+    }
+}
+
 /// Content cells between the banner box's side bars.
 const BANNER_INNER_WIDTH: usize = 56;
 
@@ -2233,7 +2403,7 @@ mod tests {
     use super::{
         approval_header_with_mode, approval_options_with_mode, context_lines,
         deck_header_with_mode, deck_marker_with_mode, display_width, error_display_lines,
-        fit_banner_value, format_message, grouped_count, human_turn_stats,
+        fit_banner_value, fit_row_to_width, format_message, grouped_count, human_turn_stats,
         milestone_line_with_mode, sanitize_plain_inline, sanitize_terminal_inline,
         sanitize_terminal_text, section_heading, spinner_mode, static_spinner_line, theme_row,
         tool_activity_line, write_run_timing_with_mode, write_static_spinner, write_turn_stats,
@@ -3278,6 +3448,193 @@ mod tests {
 
             // Styled row should contain bullet dots
             assert!(styled_row.contains('●'));
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Finding F16, truncation half: `fit_row_to_width`.
+    //
+    // The inline viewport writes each pinned row with no width limit, so an
+    // over-long row wraps into the row below -- harmless with a one-row
+    // viewport, corruption once the multi-row composer and the slash palette
+    // make the viewport several rows tall. These tests pin the escape-aware
+    // fitter that fixes it; see the function's own documentation for the
+    // numbered contract they correspond to.
+    // ---------------------------------------------------------------------
+
+    /// The *visible* width of a styled string: the in-tree idiom, sanitising
+    /// the escapes away before measuring, exactly as `compose_row` measures a
+    /// styled prompt.
+    fn visible_width(s: &str) -> usize {
+        display_width(&sanitize_terminal_text(s))
+    }
+
+    #[test]
+    fn fit_row_to_width_returns_a_fitting_row_byte_identical() {
+        // Rule 1, the property this card pins hardest. Byte-identity, not
+        // merely equal-looking: no re-encoding, no normalisation, no appended
+        // reset -- including for the last case, a row that ends with styling
+        // still active. `InlineSurface::paint`'s existing tests all assert
+        // exact bytes, so anything else here breaks them.
+        for (row, cols) in [
+            ("", 80usize),
+            ("composer", 80),
+            ("composer", 8), // exactly the width
+            ("> ", 2),
+            ("日本語", 6),                       // exactly the width, wide chars
+            ("\x1b[1mbold\x1b[0m", 80),          // styled and already reset
+            ("\x1b[31mred and never reset", 80), // styling left active
+        ] {
+            let fitted = fit_row_to_width(row, cols);
+            assert_eq!(
+                fitted.as_bytes(),
+                row.as_bytes(),
+                "fit_row_to_width({row:?}, {cols}) must return the row byte-identical, got {fitted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_row_to_width_counts_escapes_as_zero_width() {
+        // Rule 2. `display_width` counts the bytes of an ANSI sequence as
+        // visible columns, so a naive fitter truncates a heavily styled row
+        // whose visible text fits comfortably. Here the visible text is 11
+        // columns and the byte count far more.
+        let row = "\x1b[1m\x1b[38;2;255;0;0mhello\x1b[0m \x1b[2mworld\x1b[0m";
+        assert_eq!(visible_width(row), 11, "the visible text is 11 columns");
+        assert!(
+            row.len() > 40,
+            "and its byte count is far larger: {}",
+            row.len()
+        );
+        let fitted = fit_row_to_width(row, 20);
+        assert_eq!(
+            fitted.as_bytes(),
+            row.as_bytes(),
+            "escapes cost no columns, so this row fits and is returned identical: {fitted:?}"
+        );
+    }
+
+    #[test]
+    fn fit_row_to_width_truncates_a_plain_row_to_the_visible_column_count() {
+        // Rule 3 on the simple case: a plain row is cut, nothing is elided
+        // with an ellipsis (that is `fit_banner_value`'s job and the wrong
+        // shape here) and nothing is appended.
+        assert_eq!(fit_row_to_width("abcdefghij", 4), "abcd");
+        assert_eq!(fit_row_to_width("abcdefghij", 9), "abcdefghi");
+        assert_eq!(fit_row_to_width("> composer text", 10), "> composer");
+    }
+
+    #[test]
+    fn fit_row_to_width_charges_two_columns_for_a_wide_character() {
+        // Rule 3 with wide characters: three CJK characters are six columns,
+        // so a four-column fit keeps two of them.
+        assert_eq!(fit_row_to_width("日本語", 4), "日本");
+        assert_eq!(fit_row_to_width("日本語", 2), "日");
+        // And mixed: "a" plus one wide character is three columns.
+        assert_eq!(fit_row_to_width("a日本", 3), "a日");
+    }
+
+    #[test]
+    fn fit_row_to_width_never_splits_a_wide_character_and_leaves_the_gap_unpadded() {
+        // Rule 4. A 2-column character that would land in the last single
+        // column is dropped entirely rather than written into half a cell,
+        // and the leftover column is left blank rather than padded: `paint`
+        // has already cleared the row, so an unwritten cell is background,
+        // while a pad space would diverge from the byte-identical path and
+        // push the cursor a column too far.
+        assert_eq!(
+            fit_row_to_width("日本語", 3),
+            "日",
+            "the second wide character does not fit in the one remaining column"
+        );
+        assert_eq!(
+            fit_row_to_width("a日", 2),
+            "a",
+            "and the row comes back one column narrower, not space-padded"
+        );
+        assert_eq!(fit_row_to_width("日", 1), "", "nor at the very first cell");
+    }
+
+    #[test]
+    fn fit_row_to_width_appends_one_reset_only_when_it_truncates_a_styled_row() {
+        // Rule 5, and the distinction is the whole point: the reset is owed
+        // only when the row was *both* truncated and styled.
+        let styled = "\x1b[31mred text that runs well past the end";
+        let fitted = fit_row_to_width(styled, 7);
+        assert_eq!(
+            fitted, "\x1b[31mred tex\x1b[0m",
+            "a truncated styled row ends with exactly one reset so the colour \
+             cannot bleed into the next row, got {fitted:?}"
+        );
+        assert_eq!(
+            fitted.matches("\x1b[0m").count(),
+            1,
+            "exactly one reset, not one per surviving escape: {fitted:?}"
+        );
+
+        // Truncated but never styled: still plain bytes, no reset.
+        assert_eq!(
+            fit_row_to_width("plain text that is far too long", 5),
+            "plain",
+            "a truncated plain row stays plain"
+        );
+
+        // Styled but fitting: rule 1 wins and nothing is appended, even
+        // though the styling is left active.
+        let short = "\x1b[31mred";
+        assert_eq!(
+            fit_row_to_width(short, 80).as_bytes(),
+            short.as_bytes(),
+            "a fitting styled row is byte-identical -- the reset is a \
+             truncation remedy, not a general one"
+        );
+    }
+
+    #[test]
+    fn fit_row_to_width_with_zero_columns_yields_nothing_unless_the_row_is_already_zero_width() {
+        // Rule 6. Nothing can be drawn in zero columns, and emitting the
+        // row's SGR into no columns would bleed style for no visible text --
+        // so a row with any visible width fits to the empty string, reset
+        // included.
+        assert_eq!(fit_row_to_width("composer", 0), "");
+        assert_eq!(fit_row_to_width("\x1b[31mred", 0), "");
+        assert_eq!(fit_row_to_width("日", 0), "");
+        // A zero-width row, however, already fits: rule 1 is first, so it
+        // comes back byte-identical rather than being emptied.
+        for row in ["", "\x1b[0m", "\x1b[1m\x1b[31m"] {
+            assert_eq!(
+                fit_row_to_width(row, 0).as_bytes(),
+                row.as_bytes(),
+                "a row of visible width 0 fits in 0 columns: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_row_to_width_output_never_exceeds_the_column_count() {
+        // The property behind every case above, driven over a mixed corpus and
+        // every width: whatever comes out is at most `cols` visible columns,
+        // which is what makes a painted row unable to wrap.
+        let rows = [
+            "",
+            "composer",
+            "> kitsu ready",
+            "日本語のテキスト",
+            "a日b本c語",
+            "\x1b[1mbold\x1b[0m plain \x1b[31mred",
+            "\x1b[38;2;1;2;3m色\x1b[0mmixed 日 text",
+            "\x1b[2m…\x1b[0m",
+        ];
+        for row in rows {
+            for cols in 0usize..=24 {
+                let fitted = fit_row_to_width(row, cols);
+                assert!(
+                    visible_width(&fitted) <= cols,
+                    "fit_row_to_width({row:?}, {cols}) = {fitted:?} is {} visible columns wide",
+                    visible_width(&fitted)
+                );
+            }
         }
     }
 }
