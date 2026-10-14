@@ -92,9 +92,15 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
-- `KITSU_TUI=inline` opts into an inline viewport: a status row pinned to the
-  bottom of the terminal with the transcript scrolling above it, instead of one
-  status row repainted in place. The idle prompt inside it is kitsu's own
+- `--tui inline`, or `[tui] mode = "inline"` in the config, opts into an inline
+  viewport: a status row pinned to the bottom of the terminal with the
+  transcript scrolling above it, instead of one status row repainted in place.
+  The flag wins over the config key and the config key over the `classic`
+  default; no environment variable selects it. The rest of the `[tui]` table —
+  `alternate_screen`, `prefix`, `title`, `left_arrow_opens_agents` and
+  `cell_ring_lines` — is parsed and validated now, and a mistyped key or value
+  is an error that **names the key** instead of being quietly ignored. Adding a
+  `[tui]` table makes older kitsu builds reject the config file. The idle prompt inside it is kitsu's own
   editor, so typing is echoed on the pinned row rather than by the terminal,
   and a draft is carried over rather than dropped. The gate is matched exactly
   — only `inline` selects it — and with the variable unset output is

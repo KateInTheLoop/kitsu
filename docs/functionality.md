@@ -309,6 +309,17 @@ that thread, and any other argument is forwarded verbatim to `/jobs`, so every
 subcommand is reachable through either name.
 
 Background agents run in-process, so nothing outside kitsu can observe them.
+`--tui <classic|inline>` and the `[tui]` table select the renderer: `mode`
+(default `classic`), `alternate_screen` (`auto|always|never`, forced to `never`
+by `--no-alt-screen`), `prefix` (default `ctrl+x`), `title`,
+`left_arrow_opens_agents`, and `cell_ring_lines` (default 10000, range
+1-1000000). The flag wins over the config key, the config key over the default,
+and **no environment variable participates**. A misspelled key or an invalid
+value is a startup error that names the key and lists what it accepts -- never a
+silent fallback -- and `kitsu doctor` reports it as a blocking issue. The error
+names the key and the permitted values but never echoes the offending value,
+because a config file can hold credentials. `fullscreen` appears in the design
+but is not accepted yet.
 `[agents] state_file` publishes a small advisory JSON hint, one file per running
 process, that an outside tool such as a terminal multiplexer can read to tell
 whether this kitsu is `idle`, `working`, or `blocked`, alongside the same

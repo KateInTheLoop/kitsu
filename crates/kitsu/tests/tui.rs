@@ -282,6 +282,12 @@ struct Options {
     /// still running, so a session that suspends itself would simply poll to
     /// the deadline.
     resume_on_stop: bool,
+    /// Set `KITSU_TUI=inline` in the child's environment anyway.
+    ///
+    /// Only the T3-S2 removal test sets this: it exists so one test can prove
+    /// the retired variable has no effect, and every other session in this
+    /// file keeps the variable removed.
+    legacy_env_gate: bool,
 }
 
 impl Default for Options {
@@ -289,6 +295,7 @@ impl Default for Options {
         Self {
             no_session: true,
             resume_on_stop: false,
+            legacy_env_gate: false,
         }
     }
 }
@@ -303,8 +310,9 @@ fn run_styled_chat_pty(home: &Path, tui: Option<&str>, script: &[Step]) -> Sessi
 ///
 /// The child gets all three descriptors on the PTY slave (one `dup` each, the
 /// same discipline `tests/cli.rs` uses) and no `--plain`/`--no-stream`, so
-/// styling and the viewport are live. `tui` is the value of `KITSU_TUI`:
-/// `None` leaves it unset, which is classic mode.
+/// styling and the viewport are live. `tui` is the value passed to the
+/// `--tui <MODE>` flag: `None` passes no flag at all, which is classic mode
+/// (plan row T3-S2 retired the `KITSU_TUI` gate).
 ///
 /// `options` carries everything that is not the script; see [`Options`].
 fn run_styled_chat_pty_with(
@@ -436,10 +444,18 @@ fn run_styled_chat_pty_core(
             });
         }
     }
-    match tui {
-        Some(mode) => command.env("KITSU_TUI", mode),
-        None => command.env_remove("KITSU_TUI"),
-    };
+    // T3-S2: the renderer is selected by the `--tui <MODE>` flag. The
+    // `KITSU_TUI` preview gate is gone, so it is actively REMOVED from the
+    // child's environment here: were a stray `KITSU_TUI=inline` in the test
+    // runner's shell still able to select the viewport, the classic-mode
+    // measurements in this file would be silently measuring inline mode.
+    command.env_remove("KITSU_TUI");
+    if options.legacy_env_gate {
+        command.env("KITSU_TUI", "inline");
+    }
+    if let Some(mode) = tui {
+        command.args(["--tui", mode]);
+    }
 
     let mut child = command.spawn().expect("spawn styled carrier chat");
     // SAFETY: ownership of the remaining master descriptor transfers once.
@@ -620,7 +636,7 @@ fn help_then_quit() -> Vec<Step> {
     ]
 }
 
-/// Test 1. **The harness itself.** Classic mode, `KITSU_TUI` unset: the
+/// Test 1. **The harness itself.** Classic mode, no `--tui` flag: the
 /// session must start, run `/help`, print the command list, and exit on
 /// `/quit`. If this fails the harness is wrong and nothing after it means
 /// anything.
@@ -2474,5 +2490,86 @@ fn classic_mode_keeps_the_final_unterminated_line_of_a_streamed_answer() {
         "a streamed answer's last line must survive even without a trailing \
          newline, but it was written and then erased; screen:\n{}",
         Session::dump(&screen)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T3-S2: the environment gate is gone (plan row T3-S2, "env gate removed").
+// FAILING-FIRST: `--tui` does not exist yet, so the flag halves of this test
+// fail on an argument error, and `main.rs` still reads `KITSU_TUI`, so the
+// env half fails by pinning the region it must no longer pin.
+// ---------------------------------------------------------------------------
+
+/// `KITSU_TUI` no longer selects anything, and `--tui` is the only thing that
+/// does.
+///
+/// The variable was a T0 preview gate. Keeping it alongside `[tui] mode` and
+/// `--tui` would be three ways to set one thing with no written precedence,
+/// which is how the three drift apart (F45); it is removed instead, and this
+/// test is what keeps it removed.
+///
+/// The negative is proved not to be vacuous inside the test itself: the same
+/// script, same harness, same geometry, run once with the variable and once
+/// with the flag. The flag run must contain the DECSTBM the variable run must
+/// not, so an absence caused by a broken harness would fail the second half.
+#[test]
+#[serial]
+fn kitsu_tui_environment_variable_no_longer_selects_the_viewport() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+
+    let bottom = ROWS - 1; // rows - viewport_rows, with viewport_rows = 1
+    let region = format!("\x1b[1;{bottom}r");
+
+    // The variable alone: classic, i.e. no scroll region is ever set.
+    let via_env = run_styled_chat_pty_with(
+        home.path(),
+        None,
+        &help_then_quit(),
+        Options {
+            legacy_env_gate: true,
+            ..Options::default()
+        },
+    );
+    assert_eq!(
+        via_env.raw_count(&region),
+        0,
+        "KITSU_TUI=inline must no longer set a scroll region; raw:\n{}",
+        via_env.raw_text().escape_debug()
+    );
+    assert!(
+        via_env.raw_text().contains("commands:"),
+        "the session must still have run /help, or the absence above proves \
+         nothing; raw:\n{}",
+        via_env.raw_text().escape_debug()
+    );
+
+    // The flag alone: inline, i.e. the region this harness can observe.
+    let via_flag = run_styled_chat_pty(home.path(), Some("inline"), &help_then_quit());
+    assert_eq!(
+        via_flag.raw_count(&region),
+        1,
+        "--tui inline must set the region exactly once, which is what makes \
+         the assertion above a real absence; raw:\n{}",
+        via_flag.raw_text().escape_debug()
+    );
+
+    // And the flag wins over the leftover variable, in the direction that
+    // would be a silent surprise: an explicit `--tui classic` with
+    // `KITSU_TUI=inline` set stays classic.
+    let both = run_styled_chat_pty_with(
+        home.path(),
+        Some("classic"),
+        &help_then_quit(),
+        Options {
+            legacy_env_gate: true,
+            ..Options::default()
+        },
+    );
+    assert_eq!(
+        both.raw_count(&region),
+        0,
+        "--tui classic must stay classic with KITSU_TUI=inline set; raw:\n{}",
+        both.raw_text().escape_debug()
     );
 }
