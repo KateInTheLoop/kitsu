@@ -141,7 +141,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T3-S3 one completion source for both hosts; `@file` in the inline composer; closes F20's list half, **not** the palette | done | 11cf2d1 |
 | T3-S4 history sharing pinned by test; **no code needed**, plan row amended (F49) | done | 4d85e4a |
 | T3-S5 `compose_status_row` + `Surface::queue` seam, drop order now in R5; row not yet wired | done | 8277767 |
-| T3-S5b **wiring**: the live row replaces the `"kitsu"` placeholder, refreshed on the 50 ms tick (F51 noted) | done | this commit |
+| T3-S5b **wiring**: the live row replaces the `"kitsu"` placeholder, refreshed on the 50 ms tick (F51 noted) | done | bbf7570 |
+| T3-S6 bounded fd-tagged cell ring in `kitsu-tui`; **not fed in production until R6 reads it**; N4 amended (F52) | done | this commit |
 
 > **`KITSU_TUI` is retired as of T3-S2.** Mentions of it in the T0-T2 rows and
 > requirement text below are **historical** — they record how the preview was

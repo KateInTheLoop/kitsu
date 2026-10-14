@@ -2781,3 +2781,59 @@ samples what it calls mid-stream, and with tools enabled there is no mid-stream
 to sample — the burst arrives whole. The assertion is still valid (a wide
 transcript must not reach the pinned row) but it is not testing the in-flight
 case its name implies. Worth renaming when someone next touches it.
+
+## F52 — N4 said "memory" and specified lines; a single huge line is still unbounded
+
+Found by the T3-S6 test author while deciding what the ring stores, and raised
+rather than quietly patched.
+
+**N4 reads "Memory in `fullscreen` MUST be bounded by a configurable cell ring
+(default 10 000 lines, oldest evicted)".** Those two clauses are not the same
+claim. The ring caps **lines**; memory is lines × line length, and nothing
+bounds the second factor. Ten thousand lines of unbounded width is unbounded
+memory, so the requirement's guarantee held only under an unstated assumption
+about line length.
+
+Storing **styled** bytes makes each retained line longer than its plain form
+too, which is the right call for other reasons (the ring is the only copy, and
+styling can be stripped but never reconstructed) but does widen the gap between
+"10 000 lines" and any particular byte figure.
+
+**Why it was not simply fixed.** A per-line byte clamp is cheap to write and
+would make the bound literal — but the ring is **the sole source for the
+transcript overlay and the `[` dump**, so clamping truncates content nothing
+else retains. That is a product trade: a hard memory ceiling bought with silent
+loss of the widest lines, which are often exactly the ones worth reading
+(wide tables, long tool output). It deserves a decision, not a patch slipped
+into an unrelated card.
+
+**Amended rather than papered over:** N4 now says the bound is in lines, states
+that a pathological line still costs what it costs, and names the clamp as a
+deliberate trade rather than an oversight.
+
+**Options, for whoever takes it:**
+- a per-line byte clamp with a visible marker on truncated rows, so the overlay
+  shows that something was cut rather than silently shortening it;
+- a byte-budget ring that evicts on total bytes rather than line count, which
+  makes the bound literal and the line count variable — closer to what N4's
+  first clause promises;
+- leave it, and rely on the line bound plus the fact that terminal-destined
+  output is usually already wrapped to the terminal's width.
+
+**Two cautions for whoever writes the clamp**, from the implementer that
+deliberately did not:
+- **Truncating styled bytes can cut an SGR sequence in half**, leaving the
+  terminal in whatever colour the severed escape implied. A clamped line must
+  either be cut at a character boundary **and** have a reset appended, or be
+  sanitized before truncation — which forfeits the "styling can be stripped but
+  never reconstructed" property, though only for over-long lines.
+- **The clamp must be reported.** An overlay that silently shows a shortened
+  line is exactly the kind of quiet loss N4 exists to prevent. The assertion
+  worth writing is *"a clamped line is marked"*, not merely
+  `len() <= cap` — a length test passes for an implementation that lies about
+  what it kept.
+
+The general lesson is the one this epic keeps producing: **a requirement that
+states a guarantee and a mechanism in one sentence can be wrong about the
+guarantee while being right about the mechanism**, and only someone implementing
+the mechanism notices.
