@@ -70,7 +70,24 @@ pub(crate) struct BridgeGuard {
     previous_live_rows: bool,
     /// The status text [`install`] painted, so the row can fall back to it
     /// whenever there is no draft to show.
+    ///
+    /// The *fallback*, not the row: once [`enable_live_status`] has handed the
+    /// guard a [`StatusSource`], every idle paint re-reads that instead (see
+    /// [`status_row`]). It is still carried, because `install` is reached by
+    /// callers with no live session behind them -- this module's own tests --
+    /// and a renderer with nothing to compose from must still paint something
+    /// rather than an empty row.
+    ///
+    /// [`enable_live_status`]: Self::enable_live_status
+    /// [`status_row`]: Self::status_row
     status: String,
+    /// Requirement **R5**'s live status row, once a session has one.
+    ///
+    /// `RefCell` because the guard is held by shared reference everywhere
+    /// (exactly as [`rows`](Self::rows) is a `Cell`) and the session that owns
+    /// the fields does not exist yet when `install` runs: the viewport is
+    /// installed before the prompt queue the queue tag counts.
+    live_status: std::cell::RefCell<Option<Arc<StatusSource>>>,
     /// The terminal height [`install`] was given.
     ///
     /// Finding F21: the guard carries its own geometry because
@@ -137,12 +154,204 @@ pub(crate) fn install(
         previous_surface,
         previous_live_rows,
         status: status.to_string(),
+        live_status: std::cell::RefCell::new(None),
         rows: std::cell::Cell::new(rows),
         viewport_rows: std::cell::Cell::new(viewport_rows),
     })
 }
 
+/// Requirement **R5**'s status row as *live state*, re-read on every paint
+/// rather than captured once (card T3-S5 left the row composed but
+/// unreachable because [`install`]'s `status` was a `&str`).
+///
+/// Three kinds of field, separated because they change at three cadences:
+///
+/// * `usage` -- the model id and the context meter's numerator and
+///   denominator. These change at turn boundaries, where the one place that
+///   owns the message history recomputes them (`session_context_used`), so
+///   they are *pushed* in.
+/// * `turn_start` -- the instant R5's elapsed segment counts from, `None`
+///   between turns so the idle row carries no elapsed at all.
+/// * `counts` -- the queue depth and the detached-agent counts, which are
+///   **pulled** through a closure instead of pushed. The queue is drained by
+///   the main loop *between* turns, so a stored depth is stale exactly when
+///   the idle row is painted; a closure over the queue and the registry can
+///   only ever report what is true at paint time.
+pub(crate) struct StatusSource {
+    usage: std::sync::Mutex<StatusUsage>,
+    turn_start: std::sync::Mutex<Option<std::time::Instant>>,
+    counts: Box<dyn Fn() -> StatusCounts + Send + Sync>,
+    /// The row the cadence painter last put on screen, so an unchanged row
+    /// costs no bytes -- the same "no-op when nothing changed" rule
+    /// `live_agents_state` applies, and what keeps a 50 ms tick from emitting
+    /// twenty identical paints a second into the transcript's stream.
+    painted: std::sync::Mutex<Option<String>>,
+}
+
+/// The model and meter numbers, pushed at turn boundaries.
+#[derive(Clone, Debug, Default)]
+struct StatusUsage {
+    model: String,
+    used: u64,
+    effective: u64,
+}
+
+/// What the row's two optional tags count, as of paint time.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct StatusCounts {
+    pub(crate) queued: usize,
+    pub(crate) blocked: usize,
+    pub(crate) running: usize,
+}
+
+impl StatusSource {
+    /// A source whose tags are read through `counts` on every paint.
+    pub(crate) fn new(counts: Box<dyn Fn() -> StatusCounts + Send + Sync>) -> Arc<Self> {
+        Arc::new(Self {
+            usage: std::sync::Mutex::new(StatusUsage::default()),
+            turn_start: std::sync::Mutex::new(None),
+            counts,
+            painted: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Record the live model and the context meter's numbers.
+    pub(crate) fn set_usage(&self, model: &str, used: u64, effective: u64) {
+        *lock(&self.usage) = StatusUsage {
+            model: model.to_string(),
+            used,
+            effective,
+        };
+    }
+
+    /// Start R5's elapsed segment: a turn is now running.
+    pub(crate) fn begin_turn(&self) {
+        *lock(&self.turn_start) = Some(std::time::Instant::now());
+    }
+
+    /// Stop it. Between turns `elapsed` is `None`, so the idle row has
+    /// nothing to tick and needs no cadence of its own.
+    pub(crate) fn end_turn(&self) {
+        *lock(&self.turn_start) = None;
+    }
+
+    /// The composer's input, as of now.
+    fn fields(&self) -> live::StatusFields {
+        let usage = lock(&self.usage).clone();
+        let counts = (self.counts)();
+        live::StatusFields {
+            model: usage.model,
+            used: usage.used,
+            effective: usage.effective,
+            elapsed: lock(&self.turn_start).map(|start| start.elapsed()),
+            queued: counts.queued,
+            blocked: counts.blocked,
+            running: counts.running,
+        }
+    }
+
+    /// Compose the row at `cols`. Nothing is cached: the point of the type is
+    /// that the row is built from the fields as they stand.
+    fn compose(&self, cols: usize) -> String {
+        live::compose_status_row(&self.fields(), cols)
+    }
+
+    /// Forget what the cadence painter last painted, so its next tick paints
+    /// unconditionally. Called whenever anything *else* writes the pinned row
+    /// (every idle paint does), because the dedupe above is only sound while
+    /// the painter is the row's sole author.
+    fn invalidate(&self) {
+        *lock(&self.painted) = None;
+    }
+}
+
+/// Take a mutex ignoring poisoning, for the same reason
+/// `InlineSurface::lock` does: a panic mid-paint leaves a usable terminal,
+/// and refusing to draw afterwards would only strand a pinned region with a
+/// frozen row on it.
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The painter the during-turn cadence reaches: the installed viewport and
+/// the live fields, published by [`BridgeGuard::enable_live_status`] and
+/// taken back by the guard's `Drop`.
+///
+/// Process-global because the cadence runs on the type-ahead collector's
+/// thread (`run_live_typeahead`'s 50 ms `libc::poll` tick) while the guard is
+/// a `run_chat` local that is neither `Send` nor `Sync`. Both halves stored
+/// together so a painter can never be published without the fields it paints
+/// from.
+static STATUS_PAINTER: std::sync::Mutex<Option<(Arc<InlineSurface>, Arc<StatusSource>)>> =
+    std::sync::Mutex::new(None);
+
+/// Repaint R5's status row on the pinned viewport row, if one is installed
+/// and a session has published its fields.
+///
+/// **The cadence.** Called from `run_live_typeahead`'s existing 50 ms poll
+/// tick, which runs for the whole of every foreground turn in inline mode and
+/// already syncs the agent counts there -- so elapsed ticks over inside 50 ms
+/// of the second changing, twenty times finer than R5's one-second
+/// granularity, with no new thread, timer or dependency. Inert in classic
+/// mode and in any session that never enabled a live status row, which is
+/// what keeps the classic byte stream identical.
+pub(crate) fn repaint_status_row() {
+    let painter = lock(&STATUS_PAINTER).clone();
+    let Some((viewport, source)) = painter else {
+        return;
+    };
+    let cols = live::terminal_columns();
+    let row = source.compose(cols);
+    {
+        let mut painted = lock(&source.painted);
+        if painted.as_deref() == Some(row.as_str()) {
+            return;
+        }
+        *painted = Some(row.clone());
+    }
+    viewport.paint(std::slice::from_ref(&row), cols);
+}
+
 impl BridgeGuard {
+    /// Hand the guard requirement **R5**'s live fields, replacing the fixed
+    /// `status` text for every idle paint, and publish the during-turn
+    /// cadence's painter.
+    ///
+    /// Called once per session, by the one caller that owns the fields. The
+    /// registration is the guard's, so `Drop` takes it back and a released
+    /// viewport can never be painted by a late tick.
+    pub(crate) fn enable_live_status(&self, source: Arc<StatusSource>) {
+        *lock(&STATUS_PAINTER) = Some((self.viewport.clone(), source.clone()));
+        *self.live_status.borrow_mut() = Some(source);
+        // Paint at once rather than at the next read: `install` has already
+        // put the fallback text on the row, and leaving it there until the
+        // first keystroke would show a frame of a row this session does not
+        // use.
+        let row = self.status_row();
+        self.viewport
+            .paint(std::slice::from_ref(&row), live::terminal_columns());
+    }
+
+    /// What belongs on the pinned row when there is no draft to show:
+    /// requirement **R5**'s composed status row once a session has published
+    /// its fields, and `install`'s fixed text until then.
+    ///
+    /// Re-read, never captured: each call composes from the fields as they
+    /// stand, which is the whole difference between this and the `&str`
+    /// T3-S5 left behind.
+    fn status_row(&self) -> String {
+        match self.live_status.borrow().as_ref() {
+            Some(source) => {
+                // This paint is about to author the row, so the cadence
+                // painter's dedupe no longer describes what is on screen.
+                source.invalidate();
+                source.compose(live::terminal_columns())
+            }
+            None => self.status.clone(),
+        }
+    }
     /// Paint the idle prompt's draft onto the pinned viewport row.
     ///
     /// The row is the *status* row until the user starts typing and the
@@ -176,7 +385,7 @@ impl BridgeGuard {
         hint_reserved: bool,
     ) {
         let row = if draft.is_empty() && hint.is_empty() {
-            self.status.clone()
+            self.status_row()
         } else {
             let composed = live::LiveDraft {
                 prompt: prompt.to_string(),
@@ -262,7 +471,7 @@ impl BridgeGuard {
             // in flight. Keeping the rule here is what lets the post-read
             // reset route through this method -- it then collapses an open
             // palette *and* leaves today's status row behind.
-            self.status.clone()
+            self.status_row()
         } else {
             let composed = live::LiveDraft {
                 prompt: prompt.to_string(),
@@ -440,8 +649,9 @@ impl BridgeGuard {
         // it re-enters the reader.
         self.viewport
             .show(self.rows.get(), self.viewport_rows.get());
+        let row = self.status_row();
         self.viewport
-            .paint(std::slice::from_ref(&self.status), live::terminal_columns());
+            .paint(std::slice::from_ref(&row), live::terminal_columns());
     }
 }
 
@@ -526,6 +736,10 @@ impl Drop for BridgeGuard {
     /// last bytes the viewport's descriptor sees are exactly the region reset
     /// and no transcript line can arrive through the seam after it.
     fn drop(&mut self) {
+        // The cadence painter first: it holds an `Arc` to this viewport and
+        // runs on another thread, so it must be unpublished before the region
+        // is released rather than after.
+        *lock(&STATUS_PAINTER) = None;
         set_surface(self.previous_surface.clone());
         live::set_live_rows_enabled(self.previous_live_rows);
         self.viewport.hide();

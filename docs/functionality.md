@@ -309,6 +309,13 @@ that thread, and any other argument is forwarded verbatim to `/jobs`, so every
 subcommand is reachable through either name.
 
 Background agents run in-process, so nothing outside kitsu can observe them.
+In the inline viewport the pinned bottom row carries the model, a compact
+context meter, the elapsed time in the current turn, `[N queued]` and the
+background-agent tag, refreshed on the same 50 ms input tick that keeps the
+ambient counter current, and deduplicated so an unchanged row writes no bytes.
+The meter reads the same session usage and effective budget `/context` reports,
+so the two cannot disagree. It never wraps between 40 and 200 columns and sheds
+segments in the order R5 documents.
 In the inline viewport the composer offers `@file` path completion and slash
 completion with the **same candidates, in the same order**, as the classic
 prompt: both hosts call one completion source, and a test sweeps every prefix of

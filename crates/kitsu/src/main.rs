@@ -8818,6 +8818,34 @@ fn session_context_used(
     (used, estimated)
 }
 
+/// Push the model and the context meter's numbers onto the inline status
+/// row's live fields (requirement **R5**).
+///
+/// It reads the *same* `session_context_used` and `ContextBudget::effective`
+/// that `/context` renders, so the row's meter and the command can never
+/// disagree -- the cycle-23 audit's lesson, applied before a second reader
+/// exists rather than after.
+///
+/// Called at both turn boundaries rather than per paint: the numbers only
+/// change when the history does, and the paint runs on another thread that
+/// cannot borrow the history at all.
+#[cfg(unix)]
+fn refresh_status_usage(
+    source: Option<&Arc<tui_bridge::StatusSource>>,
+    model: &str,
+    messages: &[ChatMessage],
+    session: &SessionInfo,
+    state: &kitsu_core::AgentSessionState,
+) {
+    let Some(source) = source else {
+        return;
+    };
+    let (used, _) = session_context_used(messages, session, state);
+    let window = session.window.get().unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let effective = ContextBudget::new(window, session.max_tokens).effective;
+    source.set_usage(model, used, effective);
+}
+
 fn render_context_command(
     model: &str,
     messages: &[ChatMessage],
@@ -15034,6 +15062,9 @@ fn run_live_typeahead(
     // agent counts are synced ahead of the first paint for the same reason.
     sync_queue_depth(dispatcher);
     sync_agent_counts(dispatcher);
+    // The turn's first frame, before the first poll: the row must show the
+    // turn it is in, not the idle row the reader left behind.
+    tui_bridge::repaint_status_row();
     live::live_input_begin(prompt.clone());
     update_live_row(&editor);
     while !stop.load(Ordering::Acquire) {
@@ -15073,6 +15104,12 @@ fn run_live_typeahead(
         // work happens while the approval reader owns the terminal and the
         // row is torn down.
         sync_agent_counts(dispatcher);
+        // ...and repaint R5's status row on the same tick (card T3-S5's
+        // deferred wiring). This is the row's whole cadence: elapsed ticks
+        // every second and 50 ms is twenty times finer, so the row is never
+        // more than a tick stale. `repaint_status_row` paints nothing when
+        // the composed row is unchanged, and nothing at all in classic mode.
+        tui_bridge::repaint_status_row();
 
         let mut descriptor = libc::pollfd {
             fd: libc::STDIN_FILENO,
@@ -17457,6 +17494,27 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .enqueue(first)
             .expect("the initial prompt fits an empty queue");
     }
+    // Requirement **R5**: the inline viewport's pinned row becomes the
+    // composed status row now that everything it counts exists. The queue and
+    // the registry are read through a closure rather than copied in, because
+    // the main loop drains the queue *between* turns -- a depth captured here
+    // would be stale exactly when the idle row is painted.
+    #[cfg(unix)]
+    let status_source = tui_bridge_guard.as_ref().map(|guard| {
+        let queue = prompt_queue.clone();
+        let registry = agent_registry.clone();
+        let source = tui_bridge::StatusSource::new(Box::new(move || {
+            let agents = registry.snapshot();
+            tui_bridge::StatusCounts {
+                queued: queue.lock().expect("prompt queue").status().queued,
+                blocked: agents.blocked,
+                running: agents.running,
+            }
+        }));
+        refresh_status_usage(Some(&source), &model, &messages, &session, &session_state);
+        guard.enable_live_status(source.clone());
+        source
+    });
     let mut exit_after_queue = false;
     // Session transitions are control-plane actions, not user prompts. They
     // always run before queued model work and never consume bounded queue
@@ -17529,6 +17587,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             }
             (None, None) => {
                 let initial = std::mem::take(&mut pending_draft);
+                // The idle row's meter reflects the history as it stands now,
+                // after the previous turn committed or rolled back.
+                #[cfg(unix)]
+                refresh_status_usage(
+                    status_source.as_ref(),
+                    &model,
+                    &messages,
+                    &session,
+                    &session_state,
+                );
                 // Inline mode replaces rustyline on this path rather than
                 // adding to it: two composers drawing a draft at once would
                 // put one copy inside the scroll region and one on the pinned
@@ -18106,6 +18174,22 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             (!assistive_input && kitsu_render::stdin_is_tty() && kitsu_render::stderr_styled())
                 .then(kitsu_render::prompt_string);
         let typeahead_history: Vec<String> = rl.history().iter().cloned().collect();
+        // The turn is now running, so R5's elapsed segment starts counting
+        // and the row's meter picks up the prompt just pushed. Both before
+        // the collector starts, because its first poll tick paints the row.
+        #[cfg(unix)]
+        {
+            refresh_status_usage(
+                status_source.as_ref(),
+                &model,
+                &messages,
+                &session,
+                &session_state,
+            );
+            if let Some(source) = status_source.as_ref() {
+                source.begin_turn();
+            }
+        }
         let typeahead = TypeaheadCollector::start(
             prompt_queue.clone(),
             steering.clone(),
@@ -18130,6 +18214,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             )
             .await;
         let captured = typeahead.finish();
+        // Between turns `elapsed` is `None`: the idle row carries no elapsed
+        // segment, so it has nothing to tick and needs no cadence.
+        #[cfg(unix)]
+        if let Some(source) = status_source.as_ref() {
+            source.end_turn();
+        }
         foreground_typeahead_active.store(false, Ordering::Release);
         pending_draft = captured.pending_draft;
         while let Ok(notice) = deferred_notice_receiver.try_recv() {

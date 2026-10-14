@@ -89,8 +89,23 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   a rendering detail, and is stated in **R5** of
   `docs/tui-and-agent-view-design.md`.
 
-  The meter is **8 cells** here against `/context`'s sixteen, because a
-  one-line row shares its width with four other segments. It degrades to ASCII
+  **The row is live, not a captured string** (wired after T3-S5). The viewport's
+  guard re-reads its fields on every paint, and three kinds of field change at
+  three different cadences: model and usage are **pushed** at turn boundaries by
+  the code that owns the message history; the turn's start instant is set and
+  cleared at those boundaries; and queue depth and agent counts are **pulled**
+  through a closure on every paint, because the main loop drains the queue
+  *between* turns — a captured depth would be stale at exactly the moment the
+  idle row is painted. The refresh rides the existing 50 ms input poll tick, the
+  same one that keeps the ambient counter inside A8's 250 ms budget, so there is
+  no second timer and no new thread. An unchanged row emits **no bytes**, the
+  rule the ambient counter already follows; without it a 50 ms tick would write
+  twenty identical rows a second.
+
+  The meter reads the **same** session usage and effective budget `/context`
+  renders, so the row and the command cannot disagree. It is **8 cells** here
+  against `/context`'s sixteen, because a one-line row shares its width with four
+  other segments. It degrades to ASCII
   in `--plain` for free, since the structural-marker mapping already handles
   those glyphs — though the inline viewport never runs in plain mode, so nothing
   depends on that today.

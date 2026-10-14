@@ -2729,3 +2729,55 @@ against. The cheap fix is a unit assertion on the poll interval constant plus a
 comment tying it to A8, so raising the interval fails loudly rather than
 silently breaking a numbered requirement. Not taken in T3-S5, which was told not
 to re-test A8; worth a small card.
+
+## F51 — with tools enabled, an ordinary answer does not stream; it arrives in one burst
+
+Measured during the status-row wiring card, then traced. The agent observed that
+in inline mode a streamed answer reaches the terminal as a **single burst after
+the turn ends** rather than progressively, and **labelled it an open question**
+rather than guessing a cause. I read the path.
+
+**The mechanism is F47's**, at `orchestrator.rs:1728`:
+
+```rust
+if cfg.stream && !tools_were_offered {
+    kitsu_render::print_fragment(&t);
+}
+```
+
+with a comment explaining that a streaming round can emit a tool call as JSON,
+"we suppress that and only print real answers", and that "the final round
+withholds tools, so final answers still stream live".
+
+**The consequence, which is probably not what anyone intended.** That last
+sentence is true of a round that *follows* a tool call. But an ordinary
+single-round answer with tools enabled — **the default configuration** — has
+tools offered in that very round, so `tools_were_offered` is true and **nothing
+streams**. The user types a question, sees a spinner, and then the whole answer
+appears at once. Visible streaming happens only *after* a tool call, in the
+follow-up round that withholds tools.
+
+So the product streams least in the common case and most in the uncommon one.
+
+**It is pre-existing, deliberate at the line level, and identical in classic
+mode** — this is not a regression and not the TUI's doing. F47 found the same
+branch from the other side: it is why a classic streamed answer's last line was
+being erased by `print_message` rather than by the fragment path.
+
+**Not fixed here**, because the suppression exists for a real reason (tool-call
+JSON must not leak into the transcript) and the fix is a product decision rather
+than a bug fix. The options worth weighing, none of them this card's:
+- stream fragments while **withholding** text that parses as a tool call, which
+  needs incremental detection and is the only option that keeps the default
+  fast-feeling;
+- offer tools only on rounds where they are plausibly needed, which changes
+  model behaviour, not just rendering;
+- accept it and say so in the documentation, so "streaming" is not promised
+  where it does not happen.
+
+**It also means one existing test's name overstates what it measures:**
+`inline_mode_wide_stream_wraps_and_scrolls_without_touching_the_status_row`
+samples what it calls mid-stream, and with tools enabled there is no mid-stream
+to sample — the burst arrives whole. The assertion is still valid (a wide
+transcript must not reach the pinned row) but it is not testing the in-flight
+case its name implies. Worth renaming when someone next touches it.
