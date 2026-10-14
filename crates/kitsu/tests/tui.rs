@@ -543,3 +543,179 @@ fn inline_mode_teardown_parks_below_the_transcript_and_clears_the_status_row() {
         text.escape_debug()
     );
 }
+
+/// The script the two T0-S5b measurements run: type `/context` at the idle
+/// prompt **without** submitting, submit it with a bare carriage return (what
+/// a raw-mode terminal actually sends for Enter), then leave.
+///
+/// `/context` rather than `/help` because its name does not occur anywhere in
+/// the startup output — the banner says `/help for commands` and the splash
+/// says `25 enabled (use /tools)` — so the first appearance of the string
+/// `/context` in the stream is the draft being echoed back, which makes it a
+/// usable trigger for the submit step. Its output is also a dozen plain
+/// left-aligned lines, which is what the staircase check needs.
+fn type_context_then_quit() -> Vec<Step> {
+    vec![
+        Step {
+            trigger: "/help for commands",
+            send: "/context",
+        },
+        Step {
+            trigger: "/context",
+            send: "\r",
+        },
+        Step {
+            trigger: "context window source",
+            send: "/quit\r",
+        },
+    ]
+}
+
+/// Test 5. **The wiring (T0-S5b).** Inline mode's idle prompt is the inline
+/// reader: the draft is echoed into the pinned viewport row by the paint
+/// callback, not by the terminal and not by rustyline's own repaints, and a
+/// carriage return submits it.
+///
+/// The screen is sampled at the moment the carriage return is written, i.e.
+/// with `/context` fully typed and nothing submitted yet. Two halves:
+///
+/// * row 24 (the viewport row) shows the draft, so something painted it there;
+/// * no row **inside** the scroll region shows it, so the echo is the
+///   viewport's and not the terminal's or rustyline's.
+///
+/// Today the second half is what fails: `ECHO` is off only during a turn, the
+/// idle prompt is still rustyline's, and rustyline repaints `kitsu> /context`
+/// inside the region while row 24 keeps the static `kitsu` status.
+#[test]
+#[serial]
+fn inline_mode_echoes_the_idle_draft_in_the_viewport_row() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &type_context_then_quit());
+
+    let typed = session.screen_at(1);
+    let viewport = &typed[(ROWS - 1) as usize];
+    assert!(
+        viewport.contains("/context"),
+        "the unsubmitted draft belongs on the pinned viewport row; whole screen:\n{}",
+        Session::dump(&typed)
+    );
+    let stray = typed[..(ROWS - 1) as usize]
+        .iter()
+        .position(|row| row.contains("/context"));
+    assert!(
+        stray.is_none(),
+        "the draft must be echoed only by the viewport, but row {} inside the \
+         scroll region shows it too ({:?}); whole screen:\n{}",
+        stray.unwrap_or_default() + 1,
+        stray.map(|row| typed[row].clone()).unwrap_or_default(),
+        Session::dump(&typed)
+    );
+
+    // And the carriage return really submitted: the command ran and its output
+    // flowed into the scroll region, with the region still pinned exactly once.
+    let after = session.screen_at(2);
+    assert!(
+        after[..(ROWS - 1) as usize]
+            .iter()
+            .any(|row| row.contains("context window source")),
+        "the submitted command's output belongs inside the scroll region; \
+         whole screen:\n{}",
+        Session::dump(&after)
+    );
+    assert_eq!(
+        session.raw_count(&format!("\x1b[1;{}r", ROWS - 1)),
+        1,
+        "the viewport survives the idle read: the region is still set once only"
+    );
+}
+
+/// Test 6. **The staircase question, re-asked for raw input mode.**
+///
+/// Test 2 measured that direct `println!` writers flow harmlessly into the
+/// scroll region, but only in cooked mode, where the terminal supplies the
+/// carriage return. T0-S5b holds raw input mode across the *idle* prompt, so
+/// the question is open again: if the line discipline's output post-processing
+/// were off, every `\n` would be a bare line feed and successive lines would
+/// march rightwards from where the previous one ended.
+///
+/// It should not, because `RawStdinGuard` touches only `c_lflag` (`ICANON`,
+/// `ECHO`, `ISIG`) and leaves `c_oflag` — hence `OPOST`/`ONLCR` — alone. That
+/// is the whole reason the ~392 direct writers survive raw mode today. This
+/// asserts it instead of assuming it, on the output of a command submitted
+/// through the raw reader: every line of `/context`'s report must begin at
+/// column 1, and no transcript line may be indented beyond what the report
+/// itself indents (its table rows use two spaces).
+#[test]
+#[serial]
+fn inline_mode_raw_idle_input_does_not_staircase_command_output() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &type_context_then_quit());
+
+    let screen = session.screen_at(2);
+    // Precondition, so the measurement below is taken on the path it is about:
+    // in inline mode the idle prompt is the inline reader, so rustyline's
+    // composer must not have drawn its own prompt inside the scroll region. If
+    // this fires, the alignment assertions that follow measured the cooked
+    // rustyline path all over again and say nothing new.
+    let composer = screen[..(ROWS - 1) as usize]
+        .iter()
+        .position(|row| row.starts_with("kitsu>"));
+    assert!(
+        composer.is_none(),
+        "inline mode must not run rustyline's composer at the idle prompt, but \
+         row {} is its prompt ({:?}); whole screen:\n{}",
+        composer.unwrap_or_default() + 1,
+        composer.map(|row| screen[row].clone()).unwrap_or_default(),
+        Session::dump(&screen)
+    );
+
+    // The report's own left-aligned lines, in the order it prints them. Each
+    // must *start* the row it lands on: a staircase shows up as leading
+    // whitespace that grows line by line.
+    for needle in [
+        "context window source:",
+        "context window cache:",
+        "context window discovery:",
+        "compaction:",
+    ] {
+        let row = screen
+            .iter()
+            .find(|row| row.contains(needle))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{needle:?} must be on the screen after submitting /context \
+                     through the raw reader; whole screen:\n{}",
+                    Session::dump(&screen)
+                )
+            });
+        assert!(
+            row.starts_with(needle),
+            "output printed under the raw idle reader must be left-aligned, but \
+             {needle:?} starts at column {} ({:?}); whole screen:\n{}",
+            row.find(needle).unwrap_or_default() + 1,
+            row,
+            Session::dump(&screen)
+        );
+    }
+
+    // And nothing anywhere in the region has drifted: `/context`'s deepest
+    // deliberate indent is four spaces, so a bound of six catches a staircase
+    // long before it reaches the right margin while leaving the report's own
+    // shape alone.
+    for (index, row) in screen[..(ROWS - 1) as usize].iter().enumerate() {
+        if row.trim().is_empty() {
+            continue;
+        }
+        let indent = row.len() - row.trim_start().len();
+        assert!(
+            indent <= 6,
+            "row {} is indented {indent} columns ({:?}), which is the shape of a \
+             staircase; whole screen:\n{}",
+            index + 1,
+            row,
+            Session::dump(&screen)
+        );
+    }
+}

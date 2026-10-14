@@ -71,11 +71,18 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   registry watch once per input poll tick) followed by `[N queued]`. Both tag
   widths participate in the row's fit math, so the cursor column accounts for
   them and the spinner is still the first segment dropped on a narrow
-  terminal. stdin drops to raw mode (`ICANON|ECHO` off,
-  `ISIG` kept so Ctrl+C still cancels) and bytes feed the pure
+  terminal. stdin drops to raw mode on the **input** flags only
+  (`ICANON|ECHO|ISIG` off in `c_lflag`, `c_oflag` untouched so `OPOST|ONLCR`
+  keep supplying the carriage return every ordinary `println!` relies on) and
+  bytes feed the pure
   `TypeaheadEditor` keymap: printable insert, ←/→/Home/End, Backspace/Delete,
   ↑/↓ history (seeded from the rustyline history, with a draft stash),
-  Ctrl+U/K/W kills, Ctrl+D EOF on an empty draft. Raw mode enables
+  Ctrl+U/K/W kills, Ctrl+D EOF on an empty draft. Ctrl+C is deliberately
+  **not** left to the kernel: clearing `ISIG` delivers it as a byte, so a
+  non-empty draft is cleared rather than the turn cancelled, and only on an
+  empty draft does the collector `raise(SIGINT)` itself — the same signal the
+  kernel would have sent, so cancellation is unchanged. Approval handoffs
+  restore the original termios, so approval prompts keep kernel Ctrl+C. Raw mode enables
   bracketed paste (`ESC[?2004h`, off again on release): a pasted block stays
   ONE draft — its newlines insert literally (`\r\n` collapsed, tabs kept)
   and render as `⏎`/`⇥` placeholders on the row — and Alt+Enter inserts a
@@ -115,6 +122,26 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   `crates/kitsu/tests/tui.rs`. The measurement holds **at idle in cooked
   mode**, where the terminal still supplies the carriage return those writers
   omit; a session that holds raw mode throughout needs them re-measured.
+
+  **What the pinned row shows.** It is the status row while the draft is empty
+  and the composer (`kitsu> <draft>`) as soon as anything is typed, rather than
+  an always-on composer. An empty draft showing `kitsu> ` would claim the row
+  for an editor that has nothing in it, and the row is the only place a status
+  can live once the live status row stands down.
+
+  **The idle prompt in inline mode is kitsu's own editor, not Rustyline**,
+  because Rustyline would draw its prompt line inside the scroll region with no
+  knowledge of the region. stdin uses the same input-flags-only raw mode as the
+  during-turn type-ahead row — `ICANON|ECHO|ISIG` cleared in `c_lflag`,
+  `c_oflag` untouched — which is what lets ordinary `println!` output keep
+  working while the reader holds the terminal. The editor is the same pure
+  `TypeaheadEditor`, so the keymap matches the during-turn row. One divergence
+  from that row: Ctrl+C on an empty draft clears the line and keeps the session
+  rather than re-raising `SIGINT`, because at an idle prompt there is no turn to
+  cancel and the raise would take the default disposition and exit.
+
+  Not yet present at the inline idle prompt, and tracked: the slash-command
+  palette, Tab completion, cross-session history, and Ctrl+Z suspension.
 
   Tiering is unchanged: the viewport requires a styled interactive TTY, so
   non-TTY, `--plain`, assistive and JSONL sessions never enter it and stay
