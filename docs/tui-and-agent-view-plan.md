@@ -135,7 +135,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T2-S5b `/jobs reply` in all **seven** sites (F38), F2 closed by test | done | 13f12ea |
 | T2-S6 approval entries in `/jobs show` and `/jobs explain`, argument-free by construction (F40) | done | 420be74 |
 | T2-S7 blocked state on the state file, `on_agent_state` and `kitsu agents --json`, one machine vocabulary (F44, F45) | done | 74ae7f3 |
-| F43 fix: a cancelled approval is recorded (was recorded as nothing); five of five resolutions | done | this commit |
+| F43 fix: a cancelled approval is recorded (was recorded as nothing); five of five resolutions | done | 6e843de |
+| T3-S1 streaming/tool-calling PTY harness + 5 tests; found and fixed F47 (erased final line) | done | this commit |
 
 With T1-S6 done, **milestone T1 is complete**: kitsu now exposes its
 background agents to the outside three ways — a grouped and explainable deck

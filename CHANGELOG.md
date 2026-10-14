@@ -25,6 +25,10 @@ shapes may change in any minor release.
   still in use, so it was never cleaned up; and taking an artifact generation
   lock could report failure and skip work. All five lock sites now share one
   implementation, so there is a single place for this to be right.
+- In the styled terminal, the **last line of a streamed answer could vanish**
+  when the model's final chunk did not end in a newline — the usual shape — so
+  an answer could appear to end a line early. The line was written and then
+  painted over by the live status row.
 - Cancelling a background agent that was waiting for a permission left **no
   record of how the request ended** — `/jobs show` kept the request with nothing
   after it, so the timeline said the agent had asked and never said what
