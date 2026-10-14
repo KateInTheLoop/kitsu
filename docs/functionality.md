@@ -180,6 +180,14 @@ the agent carry on, while `ask` makes the agent report as `blocked` and wait
 for a human answer, which then applies through the same grant code the
 foreground prompter uses — `allow always` installs the identical minimal root
 or exact argv/cwd grant, so no second permission path exists.
+`/jobs reply <id> <y|a|n>` answers a parked agent — allow once, allow always,
+or deny — and works from an idle prompt, during a running turn, and through the
+`/agent` and `/agents` spellings, which forward every `/jobs` subcommand
+verbatim. It accepts exactly the keys the foreground approval prompt accepts
+(`y|yes`, `a|always`, `n|no`, case-insensitively) because it calls that same
+parser, so the two cannot drift. A denial releases the agent to continue with
+the refusal rather than interrupting it, and replying to an agent that is not
+waiting reports that instead of silently succeeding.
 `[agents] block_timeout_secs` bounds that wait at 1800 seconds by default,
 after which the agent ends failed-interrupted rather than waiting forever. The
 unit is in the key name deliberately and a bare `block_timeout` is rejected,

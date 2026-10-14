@@ -5227,7 +5227,7 @@ impl SlashCommandSpec {
 const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "agent",
-        args: "[list|show <id>|steer <id> <text>|stop <id>|close <id>]",
+        args: "[list|view|show <id>|explain <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>|close <id>|reply <id> <y|a|n>]",
         description: "inspect and control one background agent thread",
         details: "Per-thread control of one background agent: `show` streams its bounded transcript, `steer` injects a correction, `stop` cancels, `close` acknowledges a finished thread. Ids come from /jobs.",
         group: CommandGroup::AgentsJobs,
@@ -5387,7 +5387,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "jobs",
-        args: "[list|view|show <id>|explain <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>]",
+        args: "[list|view|show <id>|explain <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>|reply <id> <y|a|n>]",
         description: "inspect, steer, stop, prune, and close background agent threads",
         details: "The agent deck: every background agent thread with state glyphs (filled = running, hollow = spent, half = result awaiting pickup), token/tool telemetry, and ids for /agent.",
         group: CommandGroup::AgentsJobs,
@@ -11719,6 +11719,66 @@ fn agent_explain_view(registry: &subagent::AgentRegistry, id: u64) -> Option<Str
     Some(format_agent_explain(&progress, &thread))
 }
 
+/// The one advertised form of `/jobs reply`, shared by both dispatchers so a
+/// bad argument reads identically whether a turn is running or not.
+const JOBS_REPLY_USAGE: &str = "usage: /jobs reply <id> <y|a|n>";
+
+/// Parse `<id> <y|a|n>` for `/jobs reply`.
+///
+/// The key is read by [`parse_permission_answer`], the very function the
+/// foreground approval prompt uses, rather than by a second match: that is what
+/// keeps the two prompts' vocabularies from drifting apart, and it is why
+/// `yes`/`always`/`no` and any casing work here too. `Interrupt` is
+/// unreachable, because that spelling is not in the accepted vocabulary.
+fn parse_jobs_reply(parts: &mut std::str::SplitWhitespace<'_>) -> Option<(u64, Decision)> {
+    let id = parts.next()?.parse::<u64>().ok()?;
+    let decision = parse_permission_answer(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((id, decision))
+}
+
+/// Machine label for one answered decision, for the `/jobs reply` payload.
+fn permission_decision_label(decision: Decision) -> &'static str {
+    match decision {
+        Decision::AllowOnce => "allow_once",
+        Decision::AllowAlways => "allow_always",
+        Decision::Deny => "deny",
+        Decision::Interrupt => "interrupt",
+    }
+}
+
+/// Machine label for one answer outcome. Spelled out rather than derived from
+/// `Debug`, so `NotBlocked` reads as `not_blocked` in the payload.
+fn agent_answer_outcome_label(outcome: subagent::AgentAnswerOutcome) -> &'static str {
+    match outcome {
+        subagent::AgentAnswerOutcome::Answered => "answered",
+        subagent::AgentAnswerOutcome::NotBlocked => "not_blocked",
+        subagent::AgentAnswerOutcome::NotFound => "not_found",
+    }
+}
+
+/// What the user reads after `/jobs reply`. A non-blocked agent is a reported
+/// no-op, not a failure: the id may have been answered, timed out, or finished
+/// between reading the deck and typing.
+fn jobs_reply_receipt(
+    id: u64,
+    outcome: subagent::AgentAnswerOutcome,
+    decision: Decision,
+) -> String {
+    match outcome {
+        subagent::AgentAnswerOutcome::Answered => format!(
+            "answered background agent #{id}: {}",
+            permission_decision_label(decision)
+        ),
+        subagent::AgentAnswerOutcome::NotBlocked => {
+            format!("background agent #{id} is not waiting on an answer")
+        }
+        subagent::AgentAnswerOutcome::NotFound => format!("no background job #{id}"),
+    }
+}
+
 async fn handle_jobs_command(
     registry: &Arc<subagent::AgentRegistry>,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
@@ -11961,11 +12021,38 @@ async fn handle_jobs_command(
                 }
             }
         }
-        _ => {
-            if let Some(suggestion) = closest_jobs_subcommand(action) {
-                eprintln!("unknown action '{action}' - did you mean '{suggestion}'?");
+        "reply" => {
+            let Some((id, decision)) = parse_jobs_reply(&mut parts) else {
+                eprintln!("{JOBS_REPLY_USAGE}");
+                return Err(());
+            };
+            let outcome = registry.answer(id, decision);
+            if matches!(outcome, subagent::AgentAnswerOutcome::NotFound) {
+                eprintln!("no background job #{id}");
+                return Err(());
             }
-            eprintln!("usage: /jobs [list|view|show <id>|explain <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>]");
+            eprintln!("~ {}", jobs_reply_receipt(id, outcome, decision));
+            Ok(serde_json::json!({
+                "kind": "jobs",
+                "action": "reply",
+                "changed": matches!(outcome, subagent::AgentAnswerOutcome::Answered),
+                "id": id,
+                "outcome": agent_answer_outcome_label(outcome),
+                "decision": permission_decision_label(decision),
+                "snapshot": jobs_snapshot_payload(registry),
+            }))
+        }
+        _ => {
+            // The unknown action is always named: a spelling far enough from
+            // every subcommand to have no nearest suggestion is exactly the
+            // one the user most needs told back to them.
+            match closest_jobs_subcommand(action) {
+                Some(suggestion) => {
+                    eprintln!("unknown action '{action}' - did you mean '{suggestion}'?")
+                }
+                None => eprintln!("unknown action '{action}'"),
+            }
+            eprintln!("usage: /jobs [list|view|show <id>|explain <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>|reply <id> <y|a|n>]");
             Err(())
         }
     }
@@ -14250,8 +14337,17 @@ fn handle_active_jobs_command(
                 stopped.len()
             ))
         }
+        "reply" => {
+            let (id, decision) =
+                parse_jobs_reply(&mut parts).ok_or_else(|| JOBS_REPLY_USAGE.to_string())?;
+            let outcome = registry.answer(id, decision);
+            if matches!(outcome, subagent::AgentAnswerOutcome::NotFound) {
+                return Err(format!("no background job #{id}"));
+            }
+            Ok(jobs_reply_receipt(id, outcome, decision))
+        }
         _ => Err(
-            "active-turn controls: /jobs [list|view|show <id>|explain <id>|steer <id> <text>|stop <id>|stop-all]"
+            "active-turn controls: /jobs [list|view|show <id>|explain <id>|steer <id> <text>|stop <id>|stop-all|reply <id> <y|a|n>]"
                 .to_string(),
         ),
     }
@@ -18524,6 +18620,7 @@ fn closest_jobs_subcommand(name: &str) -> Option<&'static str> {
         "stop",
         "stop-all",
         "prune",
+        "reply",
     ];
     SUBCOMMANDS
         .iter()
@@ -25603,5 +25700,410 @@ mod tests {
             .resolve()
             .expect_err("unset bare passthrough must error, not silently drop the flag");
         assert!(error.to_string().contains(name));
+    }
+
+    // ------------------------------------------------------------------
+    // T2-S5b: `/jobs reply <id> <y|a|n>` releases a parked agent.
+    //
+    // FAILING-FIRST. No dispatcher has a `reply` arm yet, so every test
+    // below currently fails: the two dispatch sites fall through to their
+    // unknown-subcommand branch, and the discoverability strings and the
+    // suggester table do not mention `reply`.
+    // ------------------------------------------------------------------
+
+    /// Park the exact request a path gate would park for `agent_id`, and hand
+    /// back the oneshot the gate itself is waiting on. Mirrors the registry's
+    /// own `park_path_request` fixture, which is private to `subagent`.
+    #[cfg(unix)]
+    fn park_a_path_request(
+        sender: &kitsu_tools::PromptRequestSender,
+        agent_id: u64,
+    ) -> tokio::sync::oneshot::Receiver<Decision> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        sender
+            .send(kitsu_tools::PromptRequest {
+                agent_id,
+                payload: kitsu_tools::PromptRequestPayload::Path(kitsu_tools::PermissionRequest {
+                    action: kitsu_tools::Action::Write,
+                    path: "/work/notes.txt".to_string(),
+                    grant_dir: "/work".to_string(),
+                }),
+                reply,
+            })
+            .expect("the registry owns the receiver and keeps it open");
+        answer
+    }
+
+    /// A registry holding exactly one agent parked on a permission request,
+    /// plus the gate's oneshot. Yields rather than sleeps, so it is safe under
+    /// a paused clock.
+    #[cfg(unix)]
+    async fn registry_with_one_blocked_agent() -> (
+        Arc<subagent::AgentRegistry>,
+        u64,
+        tokio::sync::oneshot::Receiver<Decision>,
+    ) {
+        let registry = subagent::AgentRegistry::new();
+        let id = registry.start("needs an answer".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let answer = park_a_path_request(&sender, id);
+        for _ in 0..1_000 {
+            let blocked = registry
+                .progress_snapshot()
+                .agents
+                .into_iter()
+                .any(|agent| {
+                    agent.id == id && agent.status == subagent::AgentProgressStatus::Blocked
+                });
+            if blocked {
+                return (registry, id, answer);
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("agent #{id} never became blocked after a request was parked");
+    }
+
+    // --- site 2: the mid-turn dispatcher (the plan's named acceptance) ---
+
+    /// T2-S5's acceptance verbatim: "reply during a running turn releases the
+    /// agent". The mid-turn dispatcher is the only `/jobs` route reachable
+    /// while a turn is in flight, so this is where that sentence is pinned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mid_turn_reply_releases_a_blocked_agent_with_the_decision_typed() {
+        for (letter, expected) in [
+            ("y", Decision::AllowOnce),
+            ("a", Decision::AllowAlways),
+            ("n", Decision::Deny),
+        ] {
+            let (registry, id, answer) = registry_with_one_blocked_agent().await;
+            let reported = handle_active_jobs_command(
+                &registry,
+                &tokio::runtime::Handle::current(),
+                &format!("reply {id} {letter}"),
+            )
+            .expect("replying to a blocked agent is not an error");
+            assert!(
+                reported.contains(&format!("#{id}")),
+                "the receipt names the agent it released: {reported}"
+            );
+            assert_eq!(
+                answer.await.expect("the gate's oneshot is resolved"),
+                expected,
+                "the gate sees exactly the decision `{letter}` spells"
+            );
+            // Released, not terminated: the agent goes back to running.
+            let status = registry
+                .progress_snapshot()
+                .agents
+                .into_iter()
+                .find(|agent| agent.id == id)
+                .map(|agent| agent.status);
+            assert_eq!(
+                status,
+                Some(subagent::AgentProgressStatus::Running),
+                "an answered agent resumes rather than ending"
+            );
+        }
+    }
+
+    /// The same three decisions under their long spellings, which the
+    /// foreground approval prompt already accepts (`parse_permission_answer`:
+    /// `y|yes`, `a|always`, `n|no`, case-insensitively). `/jobs reply` reads
+    /// its key the same way, so the two prompts never disagree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mid_turn_reply_accepts_the_same_keys_the_foreground_prompt_accepts() {
+        for (word, expected) in [
+            ("yes", Decision::AllowOnce),
+            ("ALWAYS", Decision::AllowAlways),
+            ("No", Decision::Deny),
+        ] {
+            let (_registry, id, answer) = registry_with_one_blocked_agent().await;
+            handle_active_jobs_command(
+                &_registry,
+                &tokio::runtime::Handle::current(),
+                &format!("reply {id} {word}"),
+            )
+            .expect("a long-form key is accepted");
+            assert_eq!(
+                answer.await.expect("the gate's oneshot is resolved"),
+                expected,
+                "`{word}` means the same thing at both prompts"
+            );
+        }
+    }
+
+    /// The three outcomes are distinguishable in what the user reads. A human
+    /// typing an id into a racy world must be able to tell "nothing happened"
+    /// from "it worked".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mid_turn_reply_distinguishes_answered_from_not_waiting_and_unknown() {
+        let (registry, blocked, _answer) = registry_with_one_blocked_agent().await;
+        let running = registry.start("busy, not parked".to_string()).unwrap();
+
+        let answered = handle_active_jobs_command(
+            &registry,
+            &tokio::runtime::Handle::current(),
+            &format!("reply {blocked} y"),
+        )
+        .expect("the blocked agent is answered");
+
+        let not_blocked = handle_active_jobs_command(
+            &registry,
+            &tokio::runtime::Handle::current(),
+            &format!("reply {running} y"),
+        );
+        let unknown = handle_active_jobs_command(
+            &registry,
+            &tokio::runtime::Handle::current(),
+            "reply 9999 y",
+        );
+
+        assert!(
+            not_blocked
+                .as_ref()
+                .err()
+                .or(not_blocked.as_ref().ok())
+                .expect("some message")
+                .contains("not waiting on an answer"),
+            "a running agent is reported as not waiting: {not_blocked:?}"
+        );
+        assert_eq!(
+            unknown,
+            Err("no background job #9999".to_string()),
+            "an unknown id reuses the one wording every other subcommand uses"
+        );
+        assert_ne!(
+            Ok(answered.clone()),
+            not_blocked,
+            "answered and not-waiting must not read alike"
+        );
+        assert_ne!(
+            Ok(answered),
+            unknown,
+            "answered and unknown must not read alike"
+        );
+    }
+
+    /// Bad input answers nothing. A missing id, a non-numeric id, a missing
+    /// key and an unknown key are all usage errors, and the parked agent is
+    /// still parked afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mid_turn_reply_rejects_bad_input_and_answers_nothing() {
+        let (registry, id, mut answer) = registry_with_one_blocked_agent().await;
+        for argument in [
+            "reply".to_string(),
+            "reply y".to_string(),
+            format!("reply {id}"),
+            "reply notanumber y".to_string(),
+            format!("reply {id} maybe"),
+            format!("reply {id} y extra"),
+        ] {
+            let error = handle_active_jobs_command(
+                &registry,
+                &tokio::runtime::Handle::current(),
+                &argument,
+            )
+            .expect_err(&format!("`{argument}` must be rejected"));
+            assert!(
+                error.contains("usage: /jobs reply <id> <y|a|n>"),
+                "`{argument}` must print the reply usage line, not {error}"
+            );
+            assert!(
+                matches!(
+                    answer.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "`{argument}` must not resolve the parked gate"
+            );
+        }
+        let status = registry
+            .progress_snapshot()
+            .agents
+            .into_iter()
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.status);
+        assert_eq!(
+            status,
+            Some(subagent::AgentProgressStatus::Blocked),
+            "the agent is still parked after every rejection"
+        );
+    }
+
+    // --- site 1: the idle dispatcher, and its JSON payload ---
+
+    /// The idle path releases the agent too, and its JSON payload matches the
+    /// shape `stop` emits: `kind`/`action`/`changed`/`snapshot`, plus the
+    /// `id`/`outcome` pair `close-steering` uses to report an outcome enum.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn idle_reply_releases_the_agent_and_emits_a_stop_shaped_payload() {
+        let (registry, id, answer) = registry_with_one_blocked_agent().await;
+        let journal = kitsu_tools::builtins::fs::WriteJournal::new();
+
+        let payload = handle_jobs_command(&registry, &journal, &format!("reply {id} a"))
+            .await
+            .expect("replying to a blocked agent succeeds");
+
+        assert_eq!(payload["kind"], "jobs");
+        assert_eq!(payload["action"], "reply");
+        assert_eq!(payload["changed"], true);
+        assert_eq!(payload["id"], id);
+        assert_eq!(payload["outcome"], "answered");
+        assert_eq!(payload["decision"], "allow_always");
+        assert!(
+            payload.get("snapshot").is_some(),
+            "every /jobs payload carries the deck snapshot: {payload}"
+        );
+        assert_eq!(
+            answer.await.expect("the gate's oneshot is resolved"),
+            Decision::AllowAlways
+        );
+    }
+
+    /// The two no-op outcomes on the idle path. `NotBlocked` is a reported
+    /// no-op (`changed: false`), exactly as `stop` reports an already-terminal
+    /// job; an unknown id is the usual `Err(())` rejection.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn idle_reply_reports_not_waiting_as_an_unchanged_payload_and_unknown_as_an_error() {
+        let registry = subagent::AgentRegistry::new();
+        let running = registry.start("busy, not parked".to_string()).unwrap();
+        let journal = kitsu_tools::builtins::fs::WriteJournal::new();
+
+        let payload = handle_jobs_command(&registry, &journal, &format!("reply {running} y"))
+            .await
+            .expect("a reported no-op is not a failure");
+        assert_eq!(payload["action"], "reply");
+        assert_eq!(payload["changed"], false);
+        assert_eq!(payload["outcome"], "not_blocked");
+
+        assert_eq!(
+            handle_jobs_command(&registry, &journal, "reply 9999 y").await,
+            Err(()),
+            "an unknown id is rejected"
+        );
+        assert_eq!(
+            handle_jobs_command(&registry, &journal, "reply").await,
+            Err(()),
+            "a missing id is a usage error"
+        );
+        assert_eq!(
+            handle_jobs_command(&registry, &journal, &format!("reply {running} maybe")).await,
+            Err(()),
+            "an unknown key is a usage error"
+        );
+    }
+
+    // --- sites 4-7: discoverability ---
+
+    #[test]
+    fn a_near_miss_for_reply_is_suggested_as_a_jobs_subcommand() {
+        assert_eq!(closest_jobs_subcommand("reply"), Some("reply"));
+        assert_eq!(closest_jobs_subcommand("repl"), Some("reply"));
+        assert_eq!(closest_jobs_subcommand("replyy"), Some("reply"));
+    }
+
+    /// Finding F2: `SUBCOMMANDS` drifts from the dispatcher silently. Every
+    /// subcommand the idle dispatcher serves must be suggestible, so the list
+    /// is pinned whole rather than one entry at a time.
+    #[test]
+    fn every_jobs_subcommand_is_its_own_nearest_suggestion() {
+        for subcommand in [
+            "list",
+            "view",
+            "show",
+            "explain",
+            "steer",
+            "close-steering",
+            "stop",
+            "stop-all",
+            "prune",
+            "reply",
+        ] {
+            assert_eq!(
+                closest_jobs_subcommand(subcommand),
+                Some(subcommand),
+                "`{subcommand}` is dispatched but not in the suggester table"
+            );
+        }
+    }
+
+    /// The advertised syntax for `/jobs`, for the `/agent` spelling that
+    /// forwards to the same dispatcher, and for the `/agents` alias.
+    #[test]
+    fn the_command_registry_advertises_jobs_reply_on_every_spelling() {
+        let jobs = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "jobs")
+            .expect("/jobs is registered");
+        assert!(jobs.args.contains("reply"), "{}", jobs.args);
+        assert!(
+            jobs.args.contains("reply <id> <y|a|n>"),
+            "the advertised form names the keys: {}",
+            jobs.args
+        );
+
+        // `/agent` is not a cosmetic row: it forwards its argument verbatim to
+        // `handle_jobs_command`, so anything it fails to advertise is a
+        // subcommand that works and cannot be found.
+        let agent = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "agent")
+            .expect("/agent is registered");
+        assert!(agent.args.contains("reply"), "{}", agent.args);
+
+        let agents = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "agents")
+            .expect("/agents is registered");
+        assert_eq!(agents.alias_of, Some("jobs"));
+        assert!(
+            agents.args.contains("any /jobs subcommand"),
+            "{}",
+            agents.args
+        );
+    }
+
+    /// Pre-existing drift from T1-S3, in the same breath: `/agent` reaches the
+    /// identical dispatcher as `/jobs`, so it must not advertise a smaller
+    /// vocabulary than the one it serves.
+    #[test]
+    fn the_agent_spelling_advertises_everything_it_forwards() {
+        let agent = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "agent")
+            .expect("/agent is registered");
+        for subcommand in ["view", "explain", "stop-all", "prune", "reply"] {
+            assert!(
+                agent.args.contains(subcommand),
+                "/agent forwards `{subcommand}` but does not advertise it: {}",
+                agent.args
+            );
+        }
+    }
+
+    /// Site 7: the usage line an unknown subcommand prints is the other half
+    /// of discoverability, and it is a separate literal from the `args:` row.
+    /// The mid-turn dispatcher returns its own line, so it is asserted here;
+    /// the idle dispatcher prints to stderr and is covered by the scripted
+    /// `test_script_jobs_reply_*` tests in `tests/cli.rs`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_mid_turn_usage_line_lists_reply() {
+        let registry = subagent::AgentRegistry::new();
+        let usage = handle_active_jobs_command(
+            &registry,
+            &tokio::runtime::Handle::current(),
+            "definitely-not-a-subcommand",
+        )
+        .expect_err("an unknown subcommand is a usage error");
+        assert!(
+            usage.contains("reply <id> <y|a|n>"),
+            "the active-turn controls line must advertise reply: {usage}"
+        );
     }
 }

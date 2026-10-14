@@ -45,8 +45,17 @@ shapes may change in any minor release.
   runs are unaffected even then: they never reach the question, because their
   permission mode short-circuits before the route is consulted.
 
-  Answering from the prompt arrives in the next change; for now a parked agent
-  is visible in `/jobs view` and bounded by the timeout.
+  Answer a parked agent with **`/jobs reply <id> <y|a|n>`** — allow once, allow
+  always, or deny — from an idle prompt *or* while a turn is running, and with
+  either spelling (`/agent` and `/agents` forward it too). It takes the same
+  keys the foreground approval prompt takes, including the long forms `yes`,
+  `always` and `no`, because it calls the same parser rather than a second copy.
+  A denial releases the agent to carry on with the refusal, exactly as the
+  foreground prompt would. Replying to an agent that is not waiting says so
+  rather than silently doing nothing.
+- An unknown `/jobs` subcommand now names what you typed even when it is too
+  far from any real one to suggest a correction — previously a far miss printed
+  only the usage line, leaving you to spot your own typo in it.
 - An interrupted background agent now says **why**: the failure reads
   `run interrupted before completion: authority input closed before a decision`
   where it previously stopped at the first clause. The old text is still the

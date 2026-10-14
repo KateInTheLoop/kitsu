@@ -857,7 +857,6 @@ impl AgentRegistry {
     /// distinctly and change no state, because `/jobs reply` takes a
     /// human-typed id in a world where the agent may have just timed out,
     /// been cancelled, or finished.
-    #[cfg_attr(not(test), allow(dead_code))] // `/jobs reply` is T2-S5b's.
     pub fn answer(&self, id: u64, decision: Decision) -> AgentAnswerOutcome {
         self.resolve_prompt(id, None, decision)
     }
