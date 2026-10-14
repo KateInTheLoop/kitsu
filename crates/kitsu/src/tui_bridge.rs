@@ -354,13 +354,35 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
                 // resumed read, not to this one. Nothing is raised and nothing
                 // is painted: the signal and the terminal are the caller's.
                 EditorAction::Suspend => return Ok(InlineRead::Suspended(editor.buffer_string())),
-                // Tab completion at the idle prompt is deliberately out of
-                // scope for the preview. Ctrl+\ stays inert on purpose: its
-                // conventional action is to re-raise SIGQUIT, which terminates
-                // *and dumps core*, and this process holds API tokens and
-                // conversation text in memory -- writing those to disk because
-                // of a stray keystroke is worse than the key doing nothing.
-                EditorAction::CompleteRequest | EditorAction::Quit => {}
+                // Tab accepts the inline slash hint, if one is showing --
+                // parity with the during-turn collector's arm in `main.rs`.
+                //
+                // The hint is recomputed from the buffer here rather than
+                // reusing `hint_of`: that helper returns the reverse-search
+                // *status* while a search is armed, and the status is display
+                // text (`  ⌕ reverse-search '..'`), so appending it would
+                // type the indicator into the user's prompt. Actions are
+                // processed after the whole `feed` returns, so a later Ctrl+R
+                // in the same chunk can have armed the status by the time this
+                // arm runs -- the difference is reachable, not theoretical.
+                EditorAction::CompleteRequest => {
+                    let buffer = editor.buffer_string();
+                    let hint = crate::typeahead_slash_hint(&buffer);
+                    if !hint.is_empty() {
+                        editor.replace_buffer(&format!("{buffer}{hint}"));
+                        // Set explicitly rather than leaning on the
+                        // hint-difference repaint below: an accept that leaves
+                        // a non-empty hint would not change the slot, and the
+                        // row must still show the accepted draft.
+                        changed = true;
+                    }
+                }
+                // Ctrl+\ stays inert on purpose: its conventional action is to
+                // re-raise SIGQUIT, which terminates *and dumps core*, and this
+                // process holds API tokens and conversation text in memory --
+                // writing those to disk because of a stray keystroke is worse
+                // than the key doing nothing.
+                EditorAction::Quit => {}
             }
         }
         // Repaint when the draft changed OR when the hint slot changed.
@@ -998,8 +1020,8 @@ mod tests {
     // two things from the same editor, or the two renderers disagree about
     // what the user is being shown.
     //
-    // Out of scope on purpose: Tab completion (`CompleteRequest` is still
-    // dropped) and the bordered multi-row slash palette.
+    // Tab completion over that hint is covered by its own group below.
+    // Out of scope on purpose: the bordered multi-row slash palette.
     // ---------------------------------------------------------------------
 
     /// Test 16. A bare slash prefix yields the completion remainder, and it
@@ -1074,6 +1096,157 @@ mod tests {
             .expect("at least one paint");
         assert_eq!(hint, "", "leaving search clears the status: {hint:?}");
         assert!(!reserved);
+    }
+
+    // ---------------------------------------------------------------------
+    // Tab at the idle prompt: accepting the showing slash hint.
+    //
+    // Parity with the during-turn collector's `CompleteRequest` arm in
+    // `main.rs`, which takes the buffer, computes `typeahead_slash_hint` on
+    // it, and -- only when that is non-empty -- replaces the buffer with
+    // buffer + hint and asks for a redraw. Nothing else: no completion list,
+    // no cycling, no `@file` paths.
+    //
+    // The trap this group exists for: the inline reader's hint slot is the
+    // slash suffix OR the reverse-search status, and the status is display
+    // text (`  ⌕ reverse-search 'dep'`, leading spaces and all). An
+    // implementation that appends "the hint the row is showing" rather than
+    // `typeahead_slash_hint(&buffer)` would type that status into the user's
+    // prompt. The reverse-search test below drives the orderings where the
+    // two differ, including a single read in which the Tab is processed only
+    // after a later Ctrl+R in the same chunk has already armed the status.
+    // ---------------------------------------------------------------------
+
+    /// Test 21. The headline: `/s` then Tab leaves the draft completed.
+    ///
+    /// The accepted text is the draft **plus** the suffix, never the suffix
+    /// alone and never the typed prefix twice; the cursor lands at the end;
+    /// and the hint slot is now empty, because `/steer` is a whole command
+    /// and `typeahead_slash_hint` has nothing left to offer.
+    #[test]
+    fn inline_read_tab_accepts_the_showing_slash_hint() {
+        let (draft, cursor, hint, reserved) = last_frame(b"/s\t");
+        assert_eq!(
+            draft, "/steer",
+            "Tab accepts the suffix the row was showing"
+        );
+        assert_eq!(cursor, 6, "the cursor follows the accepted text");
+        assert_eq!(
+            hint, "",
+            "an exactly-completed command leaves no further hint: {hint:?}"
+        );
+        assert!(!reserved);
+    }
+
+    /// Test 22. The row repaints after an accepted Tab, so the user sees the
+    /// completed draft rather than the stale one: the `/s` + `teer` frame
+    /// must be followed by a `/steer` frame.
+    #[test]
+    fn inline_read_tab_repaints_the_row_with_the_accepted_draft() {
+        let painted = frames(b"/s\t");
+        let hinted = painted
+            .iter()
+            .position(|(draft, _, hint, _)| draft == "/s" && hint == "teer")
+            .expect("the hint is painted before Tab is pressed");
+        assert!(
+            painted[hinted + 1..]
+                .iter()
+                .any(|(draft, cursor, _, _)| draft == "/steer" && *cursor == 6),
+            "accepting a hint must repaint the row: {painted:?}"
+        );
+    }
+
+    /// Test 23. Tab with no hint showing does nothing at all: the draft is
+    /// unchanged and nothing is submitted. These are `typeahead_slash_hint`'s
+    /// own empty cases -- plain text, a bare `/`, a settled command with
+    /// arguments being typed, and a command already complete.
+    #[test]
+    fn inline_read_tab_does_nothing_when_no_hint_is_showing() {
+        for (bytes, expected) in [
+            (&b"hello\t"[..], "hello"),
+            (&b"/\t"[..], "/"),
+            (&b"/s \t"[..], "/s "),
+            (&b"/steer\t"[..], "/steer"),
+        ] {
+            let (outcome, painted) = drive(Chunks::bytewise(bytes), &[]);
+            let (draft, _) = painted.last().expect("at least one paint").clone();
+            assert_eq!(
+                draft, expected,
+                "Tab must leave {expected:?} untouched when no hint is showing"
+            );
+            assert_eq!(
+                outcome,
+                InlineRead::Eof,
+                "Tab is never a submission: {expected:?}"
+            );
+        }
+    }
+
+    /// Test 24. Tab is not submission. Accepting a hint leaves the read
+    /// running, and the following Enter submits the **completed** text -- the
+    /// two halves of the contract in one drive.
+    #[test]
+    fn inline_read_tab_continues_the_read_and_enter_submits_the_completed_draft() {
+        let (outcome, _) = read_bytes(b"/s\t\r");
+        assert_eq!(
+            submitted(&outcome),
+            "/steer",
+            "Enter after Tab submits the completed draft"
+        );
+    }
+
+    /// Test 25. **The trap.** Tab while a reverse search is active must never
+    /// insert the search status into the draft.
+    ///
+    /// What Tab *does* mid-search is the editor's own rule, not a new one
+    /// invented here: a control byte during a search accepts the current
+    /// match and leaves the search, and the re-fed Tab then raises
+    /// `CompleteRequest` against that accepted draft. Since a history line is
+    /// not a bare slash prefix, `typeahead_slash_hint` is empty and Tab adds
+    /// nothing -- the draft is the match, the status is gone from the row,
+    /// and the read continues.
+    #[test]
+    fn inline_read_tab_during_a_reverse_search_never_inserts_the_search_status() {
+        let history = vec!["deploy the thing".to_string()];
+
+        let (outcome, painted) = drive_frames(Chunks::bytewise(b"\x12dep\t"), &history);
+        let (draft, cursor, hint, reserved) = painted.last().expect("at least one paint").clone();
+        assert_eq!(
+            draft, "deploy the thing",
+            "Tab accepts the match the search walked to, and nothing more"
+        );
+        assert_eq!(cursor, "deploy the thing".chars().count());
+        assert_eq!(
+            hint, "",
+            "the status leaves the row with the search: {hint:?}"
+        );
+        assert!(!reserved);
+        assert_eq!(outcome, InlineRead::Eof, "Tab mid-search is no submission");
+
+        // The orderings in which a naive "append whatever the row is showing"
+        // differs from `typeahead_slash_hint(&buffer)`: the Tab's action is
+        // processed only after the whole read is fed, so a later Ctrl+R in the
+        // same chunk leaves the status armed at exactly that moment.
+        for chunk in [
+            &b"\x12dep\t"[..],
+            &b"\t\x12dep"[..],
+            &b"/s\t\x12dep"[..],
+            &b"\x12dep\tx"[..],
+        ] {
+            let (_, painted) = drive_frames(Chunks::new([chunk]), &history);
+            for (draft, _, _, _) in &painted {
+                assert!(
+                    !draft.contains('⌕') && !draft.contains("reverse-search"),
+                    "the search status is display text and must never enter the draft \
+                     (chunk {:?}): {draft:?}",
+                    String::from_utf8_lossy(chunk)
+                );
+            }
+        }
+
+        // And it must not reach a submission either.
+        let (outcome, _) = drive(Chunks::new([b"\x12dep\t", b"\r"]), &history);
+        assert_eq!(submitted(&outcome), "deploy the thing");
     }
 
     /// Test 19. The hint reaches the pinned row dimmed, immediately after the
@@ -1784,14 +1957,18 @@ mod tests {
     // 0x12 to `search_enter_or_cycle` and resolves the whole of search mode
     // *internally* -- it emits no `EditorAction` for it -- so the reader has
     // nothing to swallow and reverse search is live at the inline prompt.
-    // Contrast `EditorAction::CompleteRequest` (Tab), which the reader
-    // explicitly drops: that loss is real, this one is not.
+    // Both of F20's claims about this prompt were wrong, and both are now
+    // settled in code: reverse search was never lost (the editor resolves it
+    // internally), and the `⌕ reverse-search '..'` indicator -- originally
+    // unshowable because the paint callback was `(draft, cursor)` -- is
+    // carried by the hint slot since T0-S9. Tab is no longer dropped either,
+    // as of T0-S10.
     //
-    // What inline mode genuinely does not get is the `⌕ reverse-search '..'`
-    // indicator: the paint callback's signature is `(draft, cursor)`, so
-    // `TypeaheadEditor::search_status` has nowhere to go. The search works;
-    // only its status line is invisible. The last test here pins that, so a
-    // later card that widens the paint seam has a failing test to update.
+    // What the last test here guards is subtler and did NOT go away when the
+    // seam was widened: the status is **display text** and must never become
+    // draft text. That matters more now than when it was written, because Tab
+    // exists -- an implementation that appended "the current hint" would type
+    // the indicator into the user's prompt.
     // ---------------------------------------------------------------------
 
     /// History for the search tests, oldest first, with two `cargo` entries so
@@ -1872,16 +2049,16 @@ mod tests {
     /// its hint slot never reaches the inline viewport row. Nothing painted
     /// while searching mentions it.
     #[test]
-    fn inline_read_cannot_paint_the_reverse_search_status_line() {
+    fn inline_read_never_lets_the_search_status_become_draft_text() {
         let history = reverse_search_history();
         let (_, paints) = read_with_history(b"\x12cargo\r\r", &history);
         assert!(
             !paints
                 .iter()
                 .any(|(draft, _)| draft.contains("reverse-search")),
-            "the paint seam has no hint slot, so the search status cannot be \
-             shown inline; if this now fails the seam was widened and the \
-             documented gap should be closed: {paints:?}"
+            "the search status is display text: it belongs in the hint slot \
+             (T0-S9) and must never appear as draft text, or Tab would type \
+             the indicator into the prompt: {paints:?}"
         );
     }
 }

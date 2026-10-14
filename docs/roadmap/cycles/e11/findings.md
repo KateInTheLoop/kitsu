@@ -802,6 +802,25 @@ T0-S9.
 The other two are separate — but they are **very** different sizes, which I
 also got wrong at first by assuming "completion" meant one thing:
 
+- **Tab completion, cheap tier: DONE in T0-S10.** Tab now accepts the showing
+  slash hint at the inline prompt, which is parity with the during-turn row.
+  Two things made it more than a transplant. The suffix must be recomputed from
+  the draft rather than read back out of the hint slot, because the slot holds
+  the *search status* while Ctrl+R is armed — appending that would type
+  `⌕ reverse-search '…'` into the prompt, and it is reachable rather than
+  theoretical, since actions are handled after a whole read completes and a
+  later Ctrl+R in the same read can arm the status first. The test author
+  proved the trap bites by implementing the naive version and watching the
+  draft become `"deploy the thing  ⌕ reverse-search 'dep'"`. And no
+  special-case for search was needed: the editor treats any control key in
+  search mode as accept-exit-refeed, so by the time Tab is seen the draft is
+  the matched history line and no slash hint applies — readline's own
+  "accept and act". My instinct had been to pin "Tab does nothing mid-search",
+  which would have contradicted the editor's rule.
+
+  What remains is only the **lists**: `@file` path completion and the bordered
+  palette. Original note follows.
+
 - **Tab completion has two tiers, and the cheap one is nearly free.** The
   during-turn collector's entire Tab handling is seven lines
   (`main.rs:14530-14538`): if an inline slash hint is showing, append it to the

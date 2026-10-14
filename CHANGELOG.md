@@ -28,10 +28,12 @@ shapes may change in any minor release.
   mode. Ctrl+\ is deliberately inert, because its usual action dumps core and
   this process holds credentials and conversation text in memory.
 
-  Command history persists across sessions in inline mode, and Ctrl+R reverse
-  search works, with its status line and the inline slash-completion hint both
-  shown on the pinned row. Still missing from the inline prompt: Tab completion,
-  and the bordered palette that lists and filters commands as you type.
+  Command history persists across sessions in inline mode, Ctrl+R reverse
+  search works with its status line on the pinned row, and Tab completes a
+  slash command from the hint beside the draft — the same behaviour the
+  during-turn row has. Still missing from the inline prompt: Rustyline's
+  completion *lists*, meaning `@file` path completion and the bordered palette
+  that lists and filters commands over several rows.
 
 #### Background agents and herding
 

@@ -209,17 +209,16 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
 - **R4** The composer MUST keep every current editing feature: history,
   Ctrl+R search, slash hint and Tab completion, the `@file` and slash-palette
   completion lists, hint and highlight now hosted by rustyline's `ChatHelper`,
-  **[Status, T0-S9] R4 is partially met by the inline preview and the gap is
-  deliberate.** Met: history (including across sessions — it reuses rustyline's
-  own persistence), Ctrl+R search, and the slash hint, which is this card. Not
-  met: Tab completion and the `@file` / slash-palette completion lists. Tab is
-  the cheaper of the two by far — the during-turn collector's whole Tab
-  handling is seven lines that append the showing inline hint to the buffer, so
-  parity with *that* is a small card; the rustyline-level completion **lists**
-  (`@file` paths, the bordered palette) are the larger piece, because the
-  palette draws over several rows and so needs a viewport taller than one.
-  Highlighting is also absent. None of this blocks the opt-in preview; all of it
-  blocks R4 being called satisfied.
+  **[Status, T0-S10] R4 is nearly met by the inline preview; what is left is
+  one piece, not four.** Met: history (including across sessions — it reuses
+  rustyline's own persistence), Ctrl+R search with its status indicator, the
+  slash hint, and **Tab accepting that hint**, which is parity with the
+  during-turn row. Not met: rustyline's completion **lists** — `@file` path
+  completion and the bordered slash-command palette — plus highlighting. The
+  palette draws over several rows, so it needs a viewport taller than one and
+  carries F16 (resize) and F19 (short-terminal clamp) with it; that is the last
+  in-repo blocker to calling R4 satisfied. None of it blocks the opt-in
+  preview.
   bracketed paste as one draft, Alt+Enter newline, Esc clears draft,
   draft-aware Ctrl+C, `↑`-on-empty queue recall, queue preview rows,
   `[N queued]`, approval handoff.
