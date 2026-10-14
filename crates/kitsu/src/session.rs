@@ -498,7 +498,9 @@ const FLOCK_FENCE_LONG_WAIT: std::time::Duration = std::time::Duration::from_mic
 /// On exhaustion this returns the kernel's own `EWOULDBLOCK`/`EAGAIN` error, so
 /// callers keep reporting the same "already active" message byte for byte.
 #[cfg(unix)]
-fn flock_exclusive_with_fork_retry(fd: std::os::fd::RawFd) -> Result<(), std::io::Error> {
+pub(crate) fn flock_exclusive_with_fork_retry(
+    fd: std::os::fd::RawFd,
+) -> Result<(), std::io::Error> {
     for attempt in 1..=FLOCK_FENCE_ATTEMPTS {
         if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(());

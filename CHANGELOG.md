@@ -20,6 +20,12 @@ shapes may change in any minor release.
   reporting a conflict, which leaves genuine cross-process contention reported
   exactly as before. Under a sustained burst of subprocess spawning the retry
   can still be exhausted, so this reduces the window rather than closing it.
+- The same false conflict affected three more places, each failing quietly
+  rather than loudly: pinning a config target could report the target busy; an
+  artifact generation that was finished and reclaimable could be reported as
+  still in use, so it was never cleaned up; and taking an artifact generation
+  lock could report failure and skip work. All five lock sites now share one
+  implementation, so there is a single place for this to be right.
 
 ### Added
 
