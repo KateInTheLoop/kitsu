@@ -1535,4 +1535,112 @@ mod tests {
             effects.calls
         );
     }
+    // ---------------------------------------------------------------------
+    // Verification card: reverse search (Ctrl+R) at an inline idle prompt.
+    //
+    // Finding F20 listed reverse search among the things the inline prompt
+    // loses. These tests establish what actually happens. The editor maps
+    // 0x12 to `search_enter_or_cycle` and resolves the whole of search mode
+    // *internally* -- it emits no `EditorAction` for it -- so the reader has
+    // nothing to swallow and reverse search is live at the inline prompt.
+    // Contrast `EditorAction::CompleteRequest` (Tab), which the reader
+    // explicitly drops: that loss is real, this one is not.
+    //
+    // What inline mode genuinely does not get is the `⌕ reverse-search '..'`
+    // indicator: the paint callback's signature is `(draft, cursor)`, so
+    // `TypeaheadEditor::search_status` has nowhere to go. The search works;
+    // only its status line is invisible. The last test here pins that, so a
+    // later card that widens the paint seam has a failing test to update.
+    // ---------------------------------------------------------------------
+
+    /// History for the search tests, oldest first, with two `cargo` entries so
+    /// cycling has somewhere to go.
+    fn reverse_search_history() -> Vec<String> {
+        vec![
+            "cargo build".to_string(),
+            "git status".to_string(),
+            "cargo test".to_string(),
+        ]
+    }
+
+    /// Test 34. Ctrl+R at an inline prompt really searches: the query narrows
+    /// to the newest matching history entry and the match is painted as the
+    /// draft.
+    ///
+    /// Note the two-Enter shape, which is the editor's readline-compatible
+    /// behaviour and not a quirk of the reader: the first Enter *accepts* the
+    /// match into the draft and leaves search mode, the second submits it.
+    #[test]
+    fn inline_read_runs_a_reverse_search_on_ctrl_r() {
+        let history = reverse_search_history();
+        let (outcome, paints) = read_with_history(b"\x12cargo\r\r", &history);
+        assert_eq!(
+            submitted(&outcome),
+            "cargo test",
+            "Ctrl+R must narrow history to the newest match and submit it; \
+             paints: {paints:?}"
+        );
+        assert!(
+            paints_in_order(&paints, &[("cargo test", "cargo test".len())]),
+            "the match must be painted as the draft while searching: {paints:?}"
+        );
+        assert!(
+            !paints.iter().any(|(draft, _)| draft == "cargo"),
+            "the query must go to the search, not into the draft: {paints:?}"
+        );
+    }
+
+    /// Test 35. A second Ctrl+R cycles to the next-older match, so the walk is
+    /// not a single lookup.
+    #[test]
+    fn inline_read_cycles_to_older_matches_on_repeated_ctrl_r() {
+        let history = reverse_search_history();
+        let (outcome, _) = read_with_history(b"\x12cargo\x12\r\r", &history);
+        assert_eq!(
+            submitted(&outcome),
+            "cargo build",
+            "a second Ctrl+R must cycle past the newest match to the older one"
+        );
+    }
+
+    /// Test 36. Ctrl+G aborts the search and restores the pre-search draft, so
+    /// an abandoned search costs the user nothing.
+    #[test]
+    fn inline_read_restores_the_draft_when_a_reverse_search_is_cancelled() {
+        let history = reverse_search_history();
+        let (outcome, _) = read_with_history(b"half\x12cargo\x07\r", &history);
+        assert_eq!(
+            submitted(&outcome),
+            "half",
+            "Ctrl+G must put the pre-search draft back, not the match"
+        );
+    }
+
+    /// Test 37. The accepted match is editable before it is submitted: search
+    /// leaves ordinary draft text behind, not a special mode.
+    #[test]
+    fn inline_read_lets_an_accepted_search_match_be_edited_before_submitting() {
+        let history = reverse_search_history();
+        let (outcome, _) = read_with_history(b"\x12build\r --release\r", &history);
+        assert_eq!(submitted(&outcome), "cargo build --release");
+    }
+
+    /// Test 38. **The real loss**, pinned so the record is honest: the search
+    /// works, but the reader's paint seam carries only `(draft, cursor)`, so
+    /// the `⌕ reverse-search '..'` status the during-turn collector renders in
+    /// its hint slot never reaches the inline viewport row. Nothing painted
+    /// while searching mentions it.
+    #[test]
+    fn inline_read_cannot_paint_the_reverse_search_status_line() {
+        let history = reverse_search_history();
+        let (_, paints) = read_with_history(b"\x12cargo\r\r", &history);
+        assert!(
+            !paints
+                .iter()
+                .any(|(draft, _)| draft.contains("reverse-search")),
+            "the paint seam has no hint slot, so the search status cannot be \
+             shown inline; if this now fails the seam was widened and the \
+             documented gap should be closed: {paints:?}"
+        );
+    }
 }

@@ -155,8 +155,19 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   tokens and conversation text in memory, so honouring the convention would
   write credentials to disk on a stray keystroke.
 
-  Not yet present at the inline idle prompt, and tracked: the slash-command
-  palette, Tab completion, and cross-session history.
+  **History and reverse search work; completion and the palette do not, for one
+  shared reason.** Inline mode borrows rustyline's history persistence wholesale
+  without ever running its composer — the file is loaded at startup, the inline
+  reader is handed that same list, and submitted lines are recorded on the
+  common path after the read — so Up/Down walks previous sessions. Ctrl+R is
+  resolved entirely inside `TypeaheadEditor`, which emits no action for it, so
+  reverse search works at the inline prompt as it does in the during-turn row.
+
+  What does *not* work is Tab completion and the slash-command palette, and
+  the reverse-search status line goes with them: all three are rendered into
+  the during-turn row's **hint slot**, and the inline paint callback is
+  `(draft, cursor)` with nowhere to put a hint. One seam change restores all
+  three, which is why they are one card rather than three.
 
   Tiering is unchanged: the viewport requires a styled interactive TTY, so
   non-TTY, `--plain`, assistive and JSONL sessions never enter it and stay
