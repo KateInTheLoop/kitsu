@@ -122,7 +122,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T0-S12 end-to-end resize tests, F25 closed, F24 in CI | done | 3d087c8 |
 | T0-S13 escape-aware row fitting for `paint`, F16 closed | done | this commit |
 | T0-S14 variable viewport height, so the composer can grow | done | this commit |
-| T0-S15 the bordered slash palette, completing R4 | after S14 | — |
+| T0-S15a palette rows as data, built to the granted height | done | this commit |
+| T0-S15b palette wiring, repaint-all, `on_resize` height | after S15a | — |
 
 With T1-S6 done, **milestone T1 is complete**: kitsu now exposes its
 background agents to the outside three ways — a grouped and explainable deck
