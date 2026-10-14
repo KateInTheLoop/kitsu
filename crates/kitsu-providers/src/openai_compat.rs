@@ -2,6 +2,7 @@
 //! AI gateway — they share one wire shape; only base_url/path/auth differ
 //! (design §1, §4).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -334,7 +335,7 @@ struct StreamOptions {
 #[derive(Serialize, Debug)]
 struct WireMessage<'a> {
     role: &'a str,
-    content: &'a str,
+    content: Cow<'a, str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -369,6 +370,35 @@ struct WireToolFn<'a> {
     parameters: &'a serde_json::Value,
 }
 
+/// One message of tool history rendered as text: an assistant tool call
+/// becomes a note in the assistant turn, a tool result becomes a user turn.
+fn flattened_tool_message(m: &ChatMessage) -> WireMessage<'_> {
+    let content = match m.role {
+        Role::Tool => Cow::Owned(format!("[tool result]\n{}", m.content)),
+        _ if !m.tool_calls.is_empty() => {
+            let mut text = m.content.clone();
+            for tc in &m.tool_calls {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&format!("[called tool {} with {}]", tc.tool_name, tc.args));
+            }
+            Cow::Owned(text)
+        }
+        _ => Cow::Borrowed(m.content.as_str()),
+    };
+    WireMessage {
+        role: if m.role == Role::Tool {
+            "user"
+        } else {
+            role_str(m.role)
+        },
+        content,
+        tool_call_id: None,
+        tool_calls: None,
+    }
+}
+
 fn role_str(role: Role) -> &'static str {
     match role {
         Role::System => "system",
@@ -379,10 +409,24 @@ fn role_str(role: Role) -> &'static str {
 }
 
 fn build_body<'a>(req: &'a ChatRequest) -> Result<WireRequest<'a>, ProviderError> {
+    // A tools-free request (the final "answer now" round) can still carry
+    // earlier tool calls and results. Bedrock-routed Anthropic rejects such
+    // history without tool definitions (HTTP 400 "toolConfig field must be
+    // defined"), and declaring stub tools invites runtimes that ignore
+    // `tool_choice` (Ollama) to keep calling them. Replay that history as
+    // plain text instead, which every backend accepts.
+    let flatten_tool_history = req.tools.is_none()
+        && req
+            .messages
+            .iter()
+            .any(|m| m.role == Role::Tool || !m.tool_calls.is_empty());
     let messages = req
         .messages
         .iter()
         .map(|m: &ChatMessage| {
+            if flatten_tool_history {
+                return flattened_tool_message(m);
+            }
             let tool_calls = if m.tool_calls.is_empty() {
                 None
             } else {
@@ -394,7 +438,13 @@ fn build_body<'a>(req: &'a ChatRequest) -> Result<WireRequest<'a>, ProviderError
                             kind: "function",
                             function: WireToolCallFn {
                                 name: &tc.tool_name,
-                                arguments: &tc.args,
+                                // A no-argument call streams no argument deltas;
+                                // Bedrock rejects the replayed "" as non-JSON.
+                                arguments: if tc.args.trim().is_empty() {
+                                    "{}"
+                                } else {
+                                    &tc.args
+                                },
                             },
                         })
                         .collect(),
@@ -402,7 +452,7 @@ fn build_body<'a>(req: &'a ChatRequest) -> Result<WireRequest<'a>, ProviderError
             };
             WireMessage {
                 role: role_str(m.role),
-                content: &m.content,
+                content: Cow::Borrowed(&m.content),
                 tool_call_id: m.tool_call_id.as_deref(),
                 tool_calls,
             }
