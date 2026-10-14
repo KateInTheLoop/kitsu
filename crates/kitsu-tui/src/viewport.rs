@@ -65,6 +65,15 @@ struct Inner {
     /// clear exactly the rows `show` pinned, and a separately stored row count
     /// could outlive or contradict the bottom row it belongs to.
     geometry: Option<(u16, u16)>,
+    /// The bounded cell ring, or `None` on a surface built with
+    /// [`InlineSurface::new`] (requirement **N4**, plan row T3-S6).
+    ///
+    /// It lives behind the *same* mutex as the sinks rather than one of its
+    /// own so that the retained order cannot disagree with the written order:
+    /// two threads writing transcript lines serialise on this lock, and a
+    /// separate ring lock would let their pushes land in the opposite order
+    /// from their bytes.
+    cells: Option<crate::cells::CellRing>,
 }
 
 impl Inner {
@@ -203,8 +212,47 @@ impl InlineSurface {
                 out,
                 err,
                 geometry: None,
+                cells: None,
             }),
         }
+    }
+
+    /// Wrap the two descriptors **and** feed a bounded cell ring of
+    /// `cell_ring_lines` lines (requirement **N4**, plan row T3-S6).
+    ///
+    /// Opt-in on purpose: only a backend with a transcript overlay and a `[`
+    /// dump has a reader for the ring, so a surface built with
+    /// [`new`](Self::new) retains nothing and pays nothing.
+    // Constructed by tests only for now: nothing reads the ring until the
+    // transcript overlay (`Ctrl+O`, requirement R6) and the `[` dump land in
+    // T5, and feeding an unread ring would spend up to `DEFAULT_CELL_RING_LINES`
+    // styled lines of memory for no benefit. The production constructor arrives
+    // with R6's overlay, which is also what `InlineComposerHost` is waiting on.
+    #[allow(dead_code)]
+    pub fn with_cell_ring(
+        out: Box<dyn Write + Send>,
+        err: Box<dyn Write + Send>,
+        cell_ring_lines: usize,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                out,
+                err,
+                geometry: None,
+                // The bound is the caller's: `CellRing` defines no constants of
+                // its own, so nothing here can drift from
+                // `TuiConfig::{MIN,DEFAULT,MAX}_CELL_RING_LINES`.
+                cells: Some(crate::cells::CellRing::new(cell_ring_lines)),
+            }),
+        }
+    }
+
+    /// The retained cells, oldest first, or `None` when this surface was built
+    /// without a ring.
+    // Reader-less for the same reason `with_cell_ring` is; see its note.
+    #[allow(dead_code)]
+    pub fn cells(&self) -> Option<Vec<crate::cells::CellLine>> {
+        self.lock().cells.as_ref().map(|ring| ring.lines())
     }
 
     /// Take the lock, ignoring poisoning: a panic inside a write leaves the
@@ -342,6 +390,14 @@ impl Surface for InlineSurface {
         let _ = sink.write_all(text.as_bytes());
         let _ = sink.write_all(b"\r\n");
         let _ = sink.flush();
+        // After the write, inside the lock already held for it: the lock is not
+        // widened by one byte, the bytes reach the terminal before any
+        // bookkeeping, and the ring's order is the written order by
+        // construction. The ring is fed the line's bytes verbatim -- the CRLF
+        // is this backend's line ending, not part of the line.
+        if let Some(ring) = inner.cells.as_mut() {
+            ring.push(fd, text);
+        }
     }
 
     /// Hand the block a writer and forward its bytes verbatim to the sink for
@@ -1491,5 +1547,68 @@ mod tests {
             "one\r\ntwo\r\nthree\r\nfour\n",
             "the per-descriptor split must not reorder output"
         );
+    }
+
+    /// A surface built with [`InlineSurface::new`] feeds no ring: classic and
+    /// any ring-less backend pay nothing for T3-S6.
+    ///
+    /// Not vacuous: the surface is written to first and the write is asserted
+    /// to have produced bytes, so `cells()` is `None` on a surface that really
+    /// did carry transcript lines.
+    #[test]
+    fn an_inline_surface_without_a_cell_ring_retains_no_cells() {
+        let (surface, sink) = shared();
+        surface.transcript_line(Fd::Stdout, "assistant");
+        surface.transcript_line(Fd::Stderr, "tool");
+        assert_eq!(sink.text(), "assistant\r\ntool\r\n");
+        assert_eq!(
+            surface.cells(),
+            None,
+            "no ring was asked for, so nothing is retained"
+        );
+    }
+
+    /// Feeding the ring must not change a single byte: the same calls against
+    /// a ring-fed surface and a ring-less one produce identical streams, and
+    /// only the ring-fed one retains cells.
+    ///
+    /// Not vacuous: the shared sink is asserted non-empty, and the ring-fed
+    /// surface is asserted to have retained both lines, so the byte equality
+    /// is between two surfaces that both actually wrote.
+    #[test]
+    fn feeding_the_cell_ring_changes_no_bytes() {
+        let plain_sink = SharedSink::new();
+        let plain = InlineSurface::new(Box::new(plain_sink.clone()), Box::new(plain_sink.clone()));
+        let ringed_sink = SharedSink::new();
+        let ringed = InlineSurface::with_cell_ring(
+            Box::new(ringed_sink.clone()),
+            Box::new(ringed_sink.clone()),
+            8,
+        );
+        for surface in [&plain, &ringed] {
+            surface.show(24, 2);
+            surface.transcript_line(Fd::Stdout, "assistant");
+            surface.transcript_line(Fd::Stderr, "\x1b[1mtool\x1b[0m");
+            surface.paint(&["row".to_string()], 80);
+            surface.hide();
+        }
+        assert!(!plain_sink.bytes().is_empty(), "the control surface wrote");
+        assert_eq!(
+            ringed_sink.bytes(),
+            plain_sink.bytes(),
+            "the ring is a reader, not a writer"
+        );
+        let cells = ringed.cells().expect("a ring was asked for");
+        assert_eq!(
+            cells
+                .iter()
+                .map(|line| (line.fd(), line.styled().to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Fd::Stdout, "assistant".to_string()),
+                (Fd::Stderr, "\x1b[1mtool\x1b[0m".to_string()),
+            ]
+        );
+        assert_eq!(plain.cells(), None);
     }
 }

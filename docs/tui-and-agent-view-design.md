@@ -403,6 +403,29 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   Kitsu persists only `messages`, so the ring is the sole source for the
   transcript overlay and the `[` dump; evicted content is reachable through
   `/export`.
+
+  **Amended in T3-S6, because the original wording overpromised.** The bound is
+  in **lines, not bytes.** Ten thousand lines of unbounded length is unbounded
+  memory, so "memory MUST be bounded" was true only under an assumption about
+  line length that nothing enforces. A single pathological line — a model
+  emitting one enormous unbroken row — still costs whatever it costs. Closing
+  that would need a per-line byte clamp, which **truncates content the ring is
+  the only copy of**, so it is a deliberate trade and not an oversight to be
+  quietly patched. See **F52**.
+
+  **A stored line is the surface's bytes verbatim, styling included**, with the
+  stripped form derived on demand. The overlay repaints these rows, so storing
+  stripped text would silently decolour it; and since the ring is the only copy,
+  styling can be stripped later but never reconstructed. The `--plain` tier's
+  structural-marker substitution is **not** applied at storage — it is an output
+  transform, not a storage one.
+
+  **The ring is an opt-in field on the TUI backend, not a process global**, and
+  `classic` cannot construct one: the renderer crate has no dependency path to
+  the viewport crate, which makes "classic pays nothing for this" a
+  **compile-time** property rather than a runtime guard. The ring is therefore
+  **not fed in production until R6's overlay reads it** — feeding an unread ring
+  would spend up to ten thousand styled lines of memory for no benefit.
 - **N5** Terminal restore MUST happen on every exit path including panics and
   `SIGINT` (raw mode off, alt screen left, bracketed paste off, title reset).
   Known today: `kill -9` mid-turn leaves raw mode; the TUI must not add paths.
