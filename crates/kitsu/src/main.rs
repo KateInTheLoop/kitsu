@@ -11177,6 +11177,7 @@ fn background_agent_notice(
 fn agent_progress_status_label(status: subagent::AgentProgressStatus) -> &'static str {
     match status {
         subagent::AgentProgressStatus::Running => "running",
+        subagent::AgentProgressStatus::Blocked => "blocked",
         subagent::AgentProgressStatus::Done => "done",
         subagent::AgentProgressStatus::Failed => "failed",
         subagent::AgentProgressStatus::Cancelled => "cancelled",
@@ -11186,6 +11187,7 @@ fn agent_progress_status_label(status: subagent::AgentProgressStatus) -> &'stati
 fn terminal_agent_status_label(status: &subagent::AgentStatus) -> &'static str {
     match status {
         subagent::AgentStatus::Running => "running",
+        subagent::AgentStatus::Blocked => "blocked",
         subagent::AgentStatus::Done(_) => "done",
         subagent::AgentStatus::Failed(_) => "failed",
         subagent::AgentStatus::Cancelled(_) => "cancelled",
@@ -11200,7 +11202,12 @@ fn agent_deck_state(
     result_collected: bool,
 ) -> kitsu_render::DeckState {
     match status {
-        subagent::AgentProgressStatus::Running => kitsu_render::DeckState::Running,
+        // A blocked agent is non-terminal, and `kitsu-render` has no
+        // `Blocked` state: the live marker is the honest reuse. `ResultReady`
+        // would imply there is something to collect.
+        subagent::AgentProgressStatus::Running | subagent::AgentProgressStatus::Blocked => {
+            kitsu_render::DeckState::Running
+        }
         subagent::AgentProgressStatus::Done if !result_collected => {
             kitsu_render::DeckState::ResultReady
         }
@@ -11240,12 +11247,13 @@ fn agent_activity_child_row(activity: Option<&str>, ms_ago: Option<u64>, plain: 
 /// grouped view can never disagree on the numbers they report.
 fn jobs_deck_counts(snapshot: &subagent::AgentProgressSnapshot) -> String {
     format!(
-        "{} total \u{b7} {} running \u{b7} {} done \u{b7} {} failed \u{b7} {} cancelled \u{b7} {} running slot(s) free \u{b7} {} record slot(s) free",
+        "{} total \u{b7} {} running \u{b7} {} done \u{b7} {} failed \u{b7} {} cancelled \u{b7} {} blocked \u{b7} {} running slot(s) free \u{b7} {} record slot(s) free",
         snapshot.total,
         snapshot.running,
         snapshot.done,
         snapshot.failed,
         snapshot.cancelled,
+        snapshot.blocked,
         snapshot.available_running_slots,
         snapshot.available_record_slots,
     )
@@ -11388,11 +11396,12 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
 }
 
 /// Which `/jobs view` group one agent belongs to. `needs input` is
-/// unreachable today — no agent state parks on a user answer yet — so the
-/// group is never produced, and a later story only has to add its arm.
+/// unreachable today — nothing can put an agent into `Blocked` yet — so the
+/// group is still never produced, but the arm that will produce it is here.
 fn jobs_view_group(agent: &subagent::AgentProgress, result_collected: bool) -> &'static str {
     match agent.status {
         subagent::AgentProgressStatus::Running => "working",
+        subagent::AgentProgressStatus::Blocked => "needs input",
         subagent::AgentProgressStatus::Done if !result_collected => "done, result ready",
         subagent::AgentProgressStatus::Done => "done, collected",
         subagent::AgentProgressStatus::Failed => "failed",
@@ -11486,6 +11495,7 @@ fn jobs_snapshot_payload(registry: &subagent::AgentRegistry) -> serde_json::Valu
         "done": snapshot.done,
         "failed": snapshot.failed,
         "cancelled": snapshot.cancelled,
+        "blocked": snapshot.blocked,
         "max_running": snapshot.max_running,
         "max_records": snapshot.max_records,
         "available_running_slots": snapshot.available_running_slots,
@@ -11525,7 +11535,8 @@ fn format_steering_receipt(receipt: &subagent::thread::AgentSteeringReceipt) -> 
 /// terminal and the JSONL `thread` payload read identically.
 fn format_agent_thread(snapshot: &subagent::thread::AgentThreadSnapshot) -> String {
     let state = match snapshot.phase {
-        subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+        subagent::thread::AgentThreadPhase::Running
+        | subagent::thread::AgentThreadPhase::Blocked => kitsu_render::DeckState::Running,
         subagent::thread::AgentThreadPhase::Done
             if snapshot.handoff == subagent::thread::AgentHandoffState::Ready =>
         {
@@ -11594,7 +11605,8 @@ fn format_agent_explain(
     thread: &subagent::thread::AgentThreadSnapshot,
 ) -> String {
     let state = match thread.phase {
-        subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+        subagent::thread::AgentThreadPhase::Running
+        | subagent::thread::AgentThreadPhase::Blocked => kitsu_render::DeckState::Running,
         subagent::thread::AgentThreadPhase::Done
             if thread.handoff == subagent::thread::AgentHandoffState::Ready =>
         {
@@ -11604,7 +11616,12 @@ fn format_agent_explain(
         subagent::thread::AgentThreadPhase::Failed => kitsu_render::DeckState::Failed,
         subagent::thread::AgentThreadPhase::Cancelled => kitsu_render::DeckState::Stopped,
     };
-    let running = matches!(thread.phase, subagent::thread::AgentThreadPhase::Running);
+    // Non-terminal, not just `Running`: a blocked agent takes the live shape
+    // (`since: started …`, a steering line, no handoff line).
+    let running = matches!(
+        thread.phase,
+        subagent::thread::AgentThreadPhase::Running | subagent::thread::AgentThreadPhase::Blocked
+    );
     let elapsed = thread.elapsed_ms as f64 / 1000.0;
     let mut output = format!(
         "{} agent #{} explained | {}",
@@ -12409,7 +12426,9 @@ fn print_background_results(results: &[subagent::AgentTerminalStatus]) {
         let body = match &result.status {
             subagent::AgentStatus::Done(body) => body.clone(),
             subagent::AgentStatus::Cancelled(reason) => format!("cancelled: {reason}"),
-            subagent::AgentStatus::Failed(_) | subagent::AgentStatus::Running => continue,
+            subagent::AgentStatus::Failed(_)
+            | subagent::AgentStatus::Running
+            | subagent::AgentStatus::Blocked => continue,
         };
         eprintln!("{}", kitsu_render::sanitize_terminal_text(&body));
     }
@@ -12420,7 +12439,11 @@ fn background_result_payload(result: &subagent::AgentTerminalStatus) -> serde_js
         subagent::AgentStatus::Done(body) => ("done", body.clone()),
         subagent::AgentStatus::Failed(error) => ("failed", error.clone()),
         subagent::AgentStatus::Cancelled(reason) => ("cancelled", reason.clone()),
-        subagent::AgentStatus::Running => ("running", String::new()),
+        // B4: no fifth status word. A blocked agent is non-terminal and so
+        // reports as `running`; a later stage needing it adds its own event.
+        subagent::AgentStatus::Running | subagent::AgentStatus::Blocked => {
+            ("running", String::new())
+        }
     };
     serde_json::json!({
         "id": result.id,
@@ -21468,6 +21491,7 @@ mod tests {
             task: "review the parser".to_string(),
             model: "test-model".to_string(),
             profile: Some("reviewer".to_string()),
+            name: None,
             phase: subagent::thread::AgentThreadPhase::Running,
             handoff: subagent::thread::AgentHandoffState::Unavailable,
             elapsed_ms: 1200,
@@ -21661,6 +21685,180 @@ mod tests {
         assert!(!view.contains("done, "), "{view}");
         // No state can reach "needs input" yet, so the group is unreachable.
         assert!(!view.contains("needs input"), "{view}");
+    }
+
+    // -----------------------------------------------------------------
+    // T2-S3 (B5): the `Blocked` vocabulary on every /jobs surface. Nothing
+    // enters `Blocked` in this story, so each fixture is built by hand.
+    // -----------------------------------------------------------------
+
+    fn blocked_progress(id: u64) -> subagent::AgentProgress {
+        subagent::AgentProgress {
+            id,
+            task: "summarize the crate".to_string(),
+            profile: Some("reviewer".to_string()),
+            status: subagent::AgentProgressStatus::Blocked,
+            elapsed_ms: 12_500,
+            result_bytes: None,
+            last_activity_ms_ago: Some(3_200),
+            telemetry: subagent::AgentTelemetry {
+                model: "qwen2.5-coder".to_string(),
+                last_activity: Some("tool read".to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// One wire word, three vocabularies: the `/jobs` JSON `status`, the
+    /// terminal-status label and the thread DTO `phase` all spell the new
+    /// state `blocked`, so the deck, the JSON and the hook cannot drift.
+    #[test]
+    fn every_blocked_label_is_the_single_word_blocked() {
+        assert_eq!(
+            agent_progress_status_label(subagent::AgentProgressStatus::Blocked),
+            "blocked"
+        );
+        assert_eq!(
+            terminal_agent_status_label(&subagent::AgentStatus::Blocked),
+            "blocked"
+        );
+        assert_eq!(
+            subagent::thread::AgentThreadPhase::Blocked.label(),
+            "blocked"
+        );
+        for label in [
+            agent_progress_status_label(subagent::AgentProgressStatus::Blocked),
+            subagent::thread::AgentThreadPhase::Blocked.label(),
+        ] {
+            assert!(label.is_ascii(), "deck labels stay ASCII: {label}");
+        }
+    }
+
+    /// T1 built the `needs input` group ahead of the state. `Blocked` maps
+    /// onto it rather than introducing a seventh heading.
+    #[test]
+    fn a_blocked_agent_belongs_to_the_needs_input_group() {
+        let agent = blocked_progress(3);
+        assert_eq!(jobs_view_group(&agent, false), "needs input");
+        assert_eq!(
+            jobs_view_group(&agent, true),
+            "needs input",
+            "collection state cannot move a non-terminal agent"
+        );
+    }
+
+    /// The deck row for a blocked agent: a live, non-terminal marker (there is
+    /// no `Blocked` `DeckState`, and B5 does not extend `kitsu-render`), and
+    /// the row's own status word is `blocked`.
+    #[test]
+    fn the_blocked_deck_row_is_marked_live_and_reads_blocked() {
+        assert_eq!(
+            agent_deck_state(subagent::AgentProgressStatus::Blocked, false),
+            kitsu_render::DeckState::Running
+        );
+        assert_eq!(
+            agent_deck_state(subagent::AgentProgressStatus::Blocked, true),
+            kitsu_render::DeckState::Running
+        );
+        let row = agent_deck_row_block(&blocked_progress(3), false, 2, 6);
+        assert!(row.contains("blocked"), "{row}");
+    }
+
+    /// The deck header counts gain a `blocked` term after `cancelled`, so the
+    /// per-state counts still sum to `total`. The existing count prefix is
+    /// unchanged, which is why the new term is appended rather than inserted.
+    #[test]
+    fn the_deck_counts_report_blocked_after_cancelled() {
+        let snapshot = subagent::AgentProgressSnapshot {
+            generation: 1,
+            total: 5,
+            running: 1,
+            done: 1,
+            failed: 1,
+            cancelled: 1,
+            blocked: 1,
+            max_running: 4,
+            max_records: 32,
+            available_running_slots: 3,
+            available_record_slots: 27,
+            agents: Vec::new(),
+        };
+        let counts = jobs_deck_counts(&snapshot);
+        assert!(
+            counts.contains("5 total · 1 running · 1 done · 1 failed · 1 cancelled · 1 blocked"),
+            "{counts}"
+        );
+    }
+
+    /// B4: JSONL output is unchanged. `background_result` keeps exactly
+    /// `done|failed|cancelled|running`; a blocked agent is non-terminal, so it
+    /// reports as `running` and never adds a fifth status word. A later stage
+    /// that needs it must add a `background_blocked` event instead.
+    #[test]
+    fn a_blocked_agent_adds_no_jsonl_status_value() {
+        let payload = background_result_payload(&subagent::AgentTerminalStatus {
+            id: 4,
+            task: "summarize the crate".to_string(),
+            status: subagent::AgentStatus::Blocked,
+            joined: false,
+        });
+        assert_eq!(payload["status"], "running");
+        assert_eq!(payload["result"], "");
+    }
+
+    /// `/jobs explain` on a blocked agent: the phase line says `blocked`, and
+    /// because `Blocked` is non-terminal the explanation keeps the live
+    /// shape (`since: started …`, steering reported) rather than the
+    /// past-tense terminal shape.
+    #[test]
+    fn explain_reads_a_blocked_agent_as_live() {
+        let (progress, thread) = explain_fixture(
+            9,
+            subagent::AgentProgressStatus::Blocked,
+            subagent::thread::AgentThreadPhase::Blocked,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        let explain = format_agent_explain(&progress, &thread);
+        assert_no_debug_leak(&explain);
+        let header = explain.lines().next().unwrap();
+        assert!(header.ends_with("| blocked"), "{header}");
+
+        let labels = explain_labels(&explain);
+        assert_eq!(labels[0].0, "since");
+        assert!(
+            labels[0].1.starts_with("started"),
+            "a blocked agent has not finished running: {explain}"
+        );
+        assert!(
+            labels.iter().any(|(label, _)| label == "steering"),
+            "steering stays answerable while blocked: {explain}"
+        );
+        assert!(
+            !labels.iter().any(|(label, _)| label == "handoff"),
+            "a non-terminal agent has no handoff line: {explain}"
+        );
+        let body = explain
+            .strip_prefix(&kitsu_render::deck_marker(kitsu_render::DeckState::Running))
+            .unwrap_or_else(|| panic!("no deck marker: {explain}"));
+        assert!(body.is_ascii(), "{explain}");
+    }
+
+    /// `/jobs show` on a blocked thread prints the DTO's own spelling.
+    #[test]
+    fn the_thread_view_names_the_blocked_phase() {
+        let (_progress, thread) = explain_fixture(
+            9,
+            subagent::AgentProgressStatus::Blocked,
+            subagent::thread::AgentThreadPhase::Blocked,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        let shown = format_agent_thread(&thread);
+        assert_no_debug_leak(&shown);
+        assert!(shown.contains("blocked"), "{shown}");
+        assert!(
+            shown.contains("handoff: unavailable"),
+            "a blocked thread offers no result: {shown}"
+        );
     }
 
     #[test]
@@ -21960,6 +22158,7 @@ mod tests {
             task: "summarize the crate".to_string(),
             model: "qwen2.5-coder".to_string(),
             profile: Some("reviewer".to_string()),
+            name: None,
             phase,
             handoff,
             elapsed_ms: 12_500,
@@ -22281,7 +22480,8 @@ mod tests {
             // every byte it adds to the state marker must already be ASCII and
             // every separator must be `|`.
             let marker = kitsu_render::deck_marker(match phase {
-                subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+                subagent::thread::AgentThreadPhase::Running
+                | subagent::thread::AgentThreadPhase::Blocked => kitsu_render::DeckState::Running,
                 subagent::thread::AgentThreadPhase::Done
                     if handoff == subagent::thread::AgentHandoffState::Ready =>
                 {

@@ -27,6 +27,16 @@ shapes may change in any minor release.
   lock could report failure and skip work. All five lock sites now share one
   implementation, so there is a single place for this to be right.
 
+### Changed
+
+- `/jobs --json` reports `thread.schema_version` as **2**, and a thread object
+  may now carry an optional `thread.name`. The version rose because the agent
+  phase vocabulary gained a `blocked` value, which a closed enum cannot accept
+  without one. `name` is omitted entirely when unset rather than sent as null,
+  so existing readers see no new key unless a name exists. Nothing reports
+  `blocked` yet — no agent can enter that state until a later change — so the
+  only difference visible today is the version number and the optional field.
+
 ### Added
 
 #### Terminal UI (preview)

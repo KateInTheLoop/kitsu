@@ -1790,3 +1790,59 @@ Worth noting for F1's eventual fix: the four violations are all pre-existing
 committed code, so formatting them is safe **once the maintainer's `fs.rs`
 work is committed or set aside** — and doing it then removes this trap
 permanently.
+
+## F34 — a blocked agent's deck marker is identical to a running one
+
+Decided in T2-S3, recorded because it is a deliberate gap rather than an
+oversight, and because the agent-view milestone is where it should be closed.
+
+`kitsu-render`'s `DeckState` has no `Blocked` variant, and B5 scopes T2-S3 to
+three vocabularies plus one validator — extending another crate would widen the
+card. So a blocked agent reuses `DeckState::Running`: it is non-terminal and
+still alive, `ResultReady` would imply something to collect, and the terminal
+states are plainly wrong.
+
+**The cost:** in the `/jobs` deck the glyph beside a blocked agent is the same
+as beside a running one. The state is distinguished only by the word `blocked`
+in the row text.
+
+**Why that is tolerable for now, and it is a genuine question rather than an
+assumption.** Three other signals already exist, all built in T1 before
+anything could reach them:
+
+- the live status row renders `[N blocked] `, and **blocked outranks running**
+  in that tag, so the count is the first thing the row reports;
+- `/jobs view` groups blocked agents under `needs input`, which is ordered
+  **first** among the groups;
+- the row text and `/jobs explain` both say `blocked`.
+
+So a user is not relying on the glyph to notice. But the glyph is the densest
+signal in the deck, and "needs your answer" is exactly the state that should be
+scannable — so this should not stay as it is.
+
+**Where it belongs:** milestone T4, the agent view, which is where blocked
+agents get real visual treatment (design A-series and B4). That is a
+`kitsu-render` story: add a `DeckState::Blocked` with its own marker, and the
+only test that changes is T2-S3's `the_blocked_deck_row_is_marked_live_and_reads_blocked`.
+
+### Also recorded from T2-S3
+
+- **`AgentStatus::Blocked` is a unit variant**, unlike `Done(String)` /
+  `Failed(String)` / `Cancelled(String)`. Nothing carries a reason yet, so the
+  smallest honest surface wins — the same call made for T2-S1's route payload.
+  If T2-S4 needs `Blocked(..)` to carry the pending request, that is **one**
+  construction site to change, and it must be called out rather than reshaped
+  silently.
+- **`jobs_snapshot_payload`'s `"blocked"` key is deliberately unpinned.** It is
+  added so the payload keeps mirroring the deck counts key-for-key, but it
+  cannot be exercised until an agent can block, so T2-S4 owns its test. Added
+  rather than omitted, because an inconsistent payload is worse than an untested
+  key.
+- **The plan's "state-file reader accepts v1 and v2" line is moot.**
+  `agent_state_file.rs` has its own independent schema and never embeds
+  `AgentThreadSnapshotDto`, and `kitsu agents --json` (H1) does not exist yet.
+  So there is no cross-process reader of the thread DTO today and no
+  v1-tolerance path to test. T2-S3 pins the strict in-process behaviour instead
+  (schema 1 is rejected, naming the expected version); if a later milestone
+  needs v1 tolerance it must be a deliberate accept-older-version path, and that
+  test revisited on purpose.

@@ -203,10 +203,13 @@ mod tests {
     use super::*;
     use crate::subagent::AgentProgressStatus;
 
-    /// Every variant, so adding one breaks the label tests rather than
-    /// silently going unlabelled.
-    const ALL_STATUSES: [AgentProgressStatus; 4] = [
+    /// Every variant, listed by hand. A fixed-size array does not break when
+    /// a variant is added, which is why `agent_state_label` also has an
+    /// explicit per-variant test: this fixture pins the cross-surface
+    /// agreement, not the exhaustiveness.
+    const ALL_STATUSES: [AgentProgressStatus; 5] = [
         AgentProgressStatus::Running,
+        AgentProgressStatus::Blocked,
         AgentProgressStatus::Done,
         AgentProgressStatus::Failed,
         AgentProgressStatus::Cancelled,
@@ -332,6 +335,14 @@ mod tests {
 
     /// One agent must never be described by two vocabularies: the hook's word
     /// and the word `/jobs` prints are the same bytes for the same status.
+    /// T2-S3 (B5/H3): the hook's `STATE=` word for a parked agent is the same
+    /// `blocked` the `/jobs` JSON reports, so an outer herder reads one
+    /// vocabulary.
+    #[test]
+    fn agent_state_label_names_the_blocked_status() {
+        assert_eq!(agent_state_label(AgentProgressStatus::Blocked), "blocked");
+    }
+
     #[test]
     fn agent_state_label_matches_the_jobs_vocabulary_byte_for_byte() {
         for status in ALL_STATUSES {

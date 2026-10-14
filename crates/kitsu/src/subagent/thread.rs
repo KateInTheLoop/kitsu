@@ -15,7 +15,9 @@ use kitsu_providers::{ProviderAttemptCategory, ProviderAttemptOutcome};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-pub const AGENT_THREAD_SCHEMA_VERSION: u32 = 1;
+/// Version 2 added the non-terminal `blocked` phase to a closed serde enum,
+/// so a v1 reader cannot decode a v2 DTO.
+pub const AGENT_THREAD_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_AGENT_TIMELINE_EVENTS: usize = 128;
 pub const DEFAULT_AGENT_TIMELINE_BYTES: usize = 64 * 1024;
 pub const DEFAULT_AGENT_TIMELINE_ENTRY_BYTES: usize = 4 * 1024;
@@ -154,6 +156,10 @@ pub struct AgentTimelineSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum AgentThreadPhase {
     Running,
+    /// Parked on a user answer. Non-terminal: the thread's timeline stays
+    /// open, it offers no handoff, and steering remains answerable. No agent
+    /// can enter this phase yet; a later story populates it.
+    Blocked,
     Done,
     Failed,
     Cancelled,
@@ -164,6 +170,7 @@ impl AgentThreadPhase {
     pub fn label(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Blocked => "blocked",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -198,6 +205,10 @@ pub struct AgentThreadSnapshot {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Optional display name. Absent from the JSON entirely when `None`,
+    /// which keeps pre-`name` fixtures byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub phase: AgentThreadPhase,
     pub handoff: AgentHandoffState,
     pub elapsed_ms: u64,
@@ -280,7 +291,10 @@ impl AgentThreadSnapshotDto {
                 "agent thread metadata contains oversized or unsafe text".to_string(),
             ));
         }
-        let terminal = self.thread.phase != AgentThreadPhase::Running;
+        let terminal = !matches!(
+            self.thread.phase,
+            AgentThreadPhase::Running | AgentThreadPhase::Blocked
+        );
         if terminal != self.thread.timeline.closed
             || (terminal && self.thread.handoff == AgentHandoffState::Unavailable)
             || (!terminal && self.thread.handoff != AgentHandoffState::Unavailable)
@@ -670,7 +684,7 @@ impl AgentThreadState {
                 AgentThreadPhase::Done => "agent completed; result ready for handoff",
                 AgentThreadPhase::Failed => "agent failed; result ready for handoff",
                 AgentThreadPhase::Cancelled => "agent cancelled; result ready for handoff",
-                AgentThreadPhase::Running => unreachable!(),
+                AgentThreadPhase::Running | AgentThreadPhase::Blocked => unreachable!(),
             },
         );
         self.timeline.closed = true;
@@ -702,6 +716,7 @@ impl AgentThreadState {
             task: self.task.clone(),
             model: self.model.clone(),
             profile: self.profile.clone(),
+            name: None,
             phase: self.phase,
             handoff: self.handoff,
             elapsed_ms,
@@ -1185,5 +1200,147 @@ mod tests {
         let mut invalid = dto;
         invalid.thread.timeline.retained_bytes += 1;
         assert!(invalid.validate(limits).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // T2-S3 (B5): the `Blocked` phase. Nothing can enter it yet, so every
+    // fixture below is built by hand rather than driven through
+    // `AgentThreadState`.
+    // -----------------------------------------------------------------
+
+    /// A non-terminal `Blocked` thread, built to satisfy the post-B5
+    /// lifecycle rules: `handoff == Unavailable`, `timeline.closed == false`,
+    /// and steering still open.
+    fn blocked_snapshot(name: Option<&str>) -> AgentThreadSnapshot {
+        AgentThreadSnapshot {
+            id: 7,
+            task: "summarize the crate".to_string(),
+            model: "qwen2.5-coder".to_string(),
+            profile: Some("reviewer".to_string()),
+            name: name.map(str::to_string),
+            phase: AgentThreadPhase::Blocked,
+            handoff: AgentHandoffState::Unavailable,
+            elapsed_ms: 12_500,
+            result_bytes: None,
+            steering_open: true,
+            pending_steering: 0,
+            timeline: AgentTimelineSnapshot {
+                entries: vec![AgentTimelineEntry {
+                    sequence: 1,
+                    elapsed_ms: 10,
+                    kind: AgentTimelineKind::UserTask,
+                    round: None,
+                    text: "summarize the crate".to_string(),
+                    truncated: false,
+                }],
+                dropped_entries: 0,
+                retained_bytes: 19,
+                closed: false,
+            },
+        }
+    }
+
+    /// The wire vocabulary: `blocked` on the phase enum, and the schema
+    /// version bumped to 2 because a closed serde enum gained a value.
+    #[test]
+    fn the_blocked_phase_label_is_blocked_at_schema_version_two() {
+        assert_eq!(AgentThreadPhase::Blocked.label(), "blocked");
+        assert!(
+            AgentThreadPhase::Blocked.label().is_ascii(),
+            "phase labels reach the ASCII-only deck"
+        );
+        assert_eq!(AGENT_THREAD_SCHEMA_VERSION, 2);
+    }
+
+    /// The round trip, and `skip_serializing_if` on the new `name`: an absent
+    /// name must not appear in the JSON at all, which is what keeps existing
+    /// fixtures byte-identical.
+    #[test]
+    fn a_blocked_dto_round_trips_and_omits_an_absent_name() {
+        let snapshot = blocked_snapshot(None);
+        let dto = AgentThreadSnapshotDto::from_snapshot(&snapshot);
+        dto.validate_default()
+            .expect("a blocked thread is a valid non-terminal DTO");
+
+        let encoded = serde_json::to_string(&dto).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["thread"]["phase"], "blocked");
+        assert!(
+            value["thread"].get("name").is_none(),
+            "an absent name is skipped entirely, not serialized as null: {encoded}"
+        );
+
+        let decoded: AgentThreadSnapshotDto = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, dto, "the blocked DTO survives a round trip");
+        decoded.validate_default().unwrap();
+    }
+
+    /// A present `name` is carried, and `deny_unknown_fields` still accepts
+    /// the field it now declares.
+    #[test]
+    fn a_present_thread_name_round_trips() {
+        let dto = AgentThreadSnapshotDto::from_snapshot(&blocked_snapshot(Some("reviewer-1")));
+        let encoded = serde_json::to_string(&dto).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["thread"]["name"], "reviewer-1");
+        let decoded: AgentThreadSnapshotDto = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.thread.name.as_deref(), Some("reviewer-1"));
+        decoded.validate_default().unwrap();
+    }
+
+    /// `terminal = phase not in {Running, Blocked}`: every lifecycle rule in
+    /// `validate()` must treat `Blocked` exactly as it treats `Running`.
+    #[test]
+    fn validate_treats_blocked_as_non_terminal() {
+        let dto = |snapshot: AgentThreadSnapshot| AgentThreadSnapshotDto::from_snapshot(&snapshot);
+
+        // A closed timeline is a terminal-only trait.
+        let mut closed = blocked_snapshot(None);
+        closed.timeline.closed = true;
+        assert!(
+            dto(closed).validate_default().is_err(),
+            "a blocked thread's timeline is still open"
+        );
+
+        // `handoff == Unavailable` iff non-terminal, so a blocked thread must
+        // never advertise a result to collect.
+        for handoff in [AgentHandoffState::Ready, AgentHandoffState::Acknowledged] {
+            let mut offered = blocked_snapshot(None);
+            offered.handoff = handoff;
+            assert!(
+                dto(offered).validate_default().is_err(),
+                "a blocked thread has no handoff: {handoff:?}"
+            );
+        }
+
+        // Steering stays available while an agent waits for its answer.
+        let mut open = blocked_snapshot(None);
+        open.steering_open = true;
+        assert!(
+            dto(open).validate_default().is_ok(),
+            "steering is open on a non-terminal thread"
+        );
+        let mut shut = blocked_snapshot(None);
+        shut.steering_open = false;
+        assert!(
+            dto(shut).validate_default().is_ok(),
+            "a closed steering channel is permitted, just not required"
+        );
+    }
+
+    /// The version bump is load-bearing: a v1 reader-written DTO carries the
+    /// old closed enum and must be rejected by this process's validator.
+    #[test]
+    fn the_previous_schema_version_is_rejected_by_validate() {
+        let mut dto = AgentThreadSnapshotDto::from_snapshot(&blocked_snapshot(None));
+        dto.schema_version = 1;
+        let error = dto
+            .validate_default()
+            .expect_err("version 1 is not this process's schema");
+        assert!(
+            error.to_string().contains("expected 2"),
+            "the error names the current schema: {error}"
+        );
     }
 }
