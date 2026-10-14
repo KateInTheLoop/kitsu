@@ -57,6 +57,7 @@ Then record, per terminal:
 | **No corruption on exit** | After `/quit`, is the shell prompt in a sane place, with no leftover region (type a long command — does it wrap normally)? |
 | **Resize behaviour** | Resize the window mid-session. Does the pinned row follow, or is it stranded? (F16 — known unhandled; record what actually happens.) |
 | **Short window** | Shrink to 2-3 rows. The viewport must not install at all and the classic renderer takes over (the F19 guard). |
+| **Suspend and resume** | Press Ctrl+Z at an idle prompt. kitsu must stop and the shell must come back with a *normal* terminal — type a long line and confirm it wraps against the full screen, not a subset. Then `fg`: the pinned row must come back and any draft you had typed must still be there. (F22 — no automated coverage; this row is the only check.) |
 
 ## The matrix to fill in
 
