@@ -83,6 +83,34 @@ fn state() -> &'static Mutex<LiveRowState> {
 /// outermost suspension owns the terminal row.
 static SUSPEND_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
+/// Does the terminal cursor stand part way along a row that already holds
+/// assistant text?
+///
+/// The region is painted with no absolute positioning — `render_region`'s fast
+/// path writes `\r\x1b[2K{status}` and `clear_region_locked` walks upward
+/// clearing rows — so it always acts on whatever row the cursor occupies. Every
+/// transcript writer but one leaves the cursor at column 0 of a fresh row,
+/// which is what makes that safe. A message or streamed answer whose last line
+/// carries no terminating newline does not: the row under the cursor is the
+/// answer's last line, and painting the region there erases it. Writers that
+/// can leave such a row set this flag (see `set_partial_line`); the next paint
+/// steps down onto a fresh row first and clears it.
+static PARTIAL_LINE: AtomicBool = AtomicBool::new(false);
+
+/// Record whether the last stdout transcript write left an unterminated line
+/// on the live row's terminal. Only writers that share the row's terminal need
+/// call this; a stdout that is redirected away cannot move the row's cursor.
+pub fn set_partial_line(partial: bool) {
+    PARTIAL_LINE.store(partial, Ordering::Release);
+}
+
+/// Whether a partial line is still unprotected. Consumes the flag: the caller
+/// is about to step the cursor onto a fresh row, after which the text row is
+/// out of the region's reach.
+fn take_partial_line() -> bool {
+    PARTIAL_LINE.swap(false, Ordering::AcqRel)
+}
+
 /// Finding F15's off switch: whether a live status row may be painted at all.
 ///
 /// Default `true`, so a session without the inline viewport is byte-identical
@@ -661,6 +689,14 @@ fn render_region(err: &mut impl Write, row_state: &mut LiveRowState, cols: usize
             row_state.drawn_rows = 0;
         }
         return;
+    }
+    // The region is about to be painted on the row the cursor occupies. When
+    // that row holds the unterminated last line of an answer, step down onto a
+    // fresh row first: otherwise the paint (or the clear that precedes the
+    // next one) erases text the user is meant to keep. Only reachable with no
+    // region drawn — a drawn region already owns the cursor's row.
+    if row_state.drawn_rows == 0 && take_partial_line() {
+        let _ = write!(err, "\r\n");
     }
     // A resize invalidates the painted stack rows (they hold the old
     // width); force the full-repaint path (sonnet review, cycle 9).

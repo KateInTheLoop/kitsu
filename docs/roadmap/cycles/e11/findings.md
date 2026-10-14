@@ -2480,3 +2480,69 @@ was a **surface problem** — the assertion was watching a view that could not
 print the thing it waited for. Raising the timeout would have hidden each one.
 When a PTY test reaches its deadline, the first question is *"can this command
 ever print what I am waiting for?"*, not *"is the machine slow?"*.
+
+## F47 — a streamed answer's last line was being erased, and the first hypothesis was wrong
+
+Found by T3-S1's new streaming PTY harness, on its first real turn. **The TUI
+tests had never talked to a reachable gateway** — `write_config` pointed at
+`https://gateway.invalid` — so in thirteen tests nothing had ever rendered a
+streaming turn or a tool call. The defect was waiting there the whole time.
+
+### The defect
+
+In **classic styled mode**, when an answer's final line carries **no trailing
+newline** — the usual provider shape — that line was written to the terminal and
+then **erased**. It appeared on no screen, final or mid-session. Inline mode was
+unaffected, which is what localised it.
+
+Deterministic: 20 runs, both profiles, no flake.
+
+### The first hypothesis was wrong, and that is the reusable part
+
+The test author proposed that `finish_line`'s two separate writes (the partial
+line, then its newline) left a window in which a live-row writer landed — and
+**labelled it a hypothesis** rather than asserting it, which is what made the
+next step cheap.
+
+It was wrong in its central claim. The fixer instrumented `kitsu-render`, ran
+the failing test, and found **`print_fragment` never appears in the trace at
+all**: in classic mode with tools advertised, deltas are **buffered rather than
+streamed live** (`orchestrator.rs:1725-1731`), and the whole answer is printed
+in one shot by `print_message` (`orchestrator.rs:1869-1871`). The streaming path
+the hypothesis blamed was not running.
+
+**The verified cause:** `print_message` renders inside
+`live::with_live_row_suspended`, and for text not ending in a newline the
+suspension **closes with the cursor mid-row** on the row holding the last line.
+The guard's `Drop` calls `redraw` → `render_region`, which paints with no
+absolute positioning — **on that same row** — and `finish_line`'s following
+`clear_row` wipes the remainder. `SUSPEND_DEPTH` and `write_block` are innocent;
+the spinner thread never raced; the whole thing is single-threaded.
+
+Two lessons, and the first is the same one F43 taught at my expense: **a
+mechanism is a hypothesis until someone reads the path, and the cheapest way to
+settle it is instrumentation rather than argument.** The second: a label of
+"hypothesis" is not a weakness in a report — it is what tells the next person
+the claim still needs settling, and it saved this fix from being applied to the
+wrong writer.
+
+### The invariant that was never written down
+
+The region's painters are **relative** (`\r\x1b[2K`, `\x1b[1A\x1b[2K`), so each
+acts on whatever row the cursor occupies. The unwritten contract is: *when the
+region takes a fresh row, the cursor is at column 0 of a row the region owns.*
+Nothing in `docs/ux-design.md` stated it, which is why a writer could violate it
+silently. The fix makes it explicit — writers that may end mid-row declare it,
+and the region steps down one row before taking ownership — and the invariant is
+now documented in `ux-design.md` as load-bearing, with the requirement that any
+new writer able to finish without a newline must declare it too.
+
+### Still uncovered, flagged by the fixer
+
+Three other writers can leave the cursor mid-row: the credential prompt
+(`main.rs:2306`, mid-row **by design**) and two bare `print!` calls
+(`main.rs:2967`, `main.rs:9982`). All three are non-chat paths where no live row
+is drawn, so they are theoretical **today** and would become real the moment a
+live row were painted concurrently. No test covers any of them. A regression
+test for the credential prompt under a drawn live row is the gap worth taking
+next.

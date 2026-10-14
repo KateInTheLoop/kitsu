@@ -65,7 +65,25 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
 - **Live status row** (`kitsu-render::live`): during a foreground turn on a
   styled interactive TTY, one rewritable stderr row at the transcript bottom
   holds the spinner segment, two dimmed ambient tags, and a live type-ahead
-  draft — `kitsu> <text>` with a real terminal cursor. The tags sit leftmost
+  draft — `kitsu> <text>` with a real terminal cursor.
+
+  **The row's positioning is relative, and that is a load-bearing invariant.**
+  Every painter writes `\r\x1b[2K` (and `\x1b[1A\x1b[2K` per extra row) with
+  **no absolute cursor positioning**, so each one acts on whatever row the
+  cursor currently occupies. The contract this depends on is: *when the region
+  takes a fresh row, the cursor is at column 0 of a row the region owns, never
+  inside a row holding transcript text.* "At the transcript bottom" is
+  therefore literal — the region must never occupy a row that already holds
+  output.
+
+  A writer that leaves the cursor **mid-row** breaks that contract, and the
+  consequence is silent: the next repaint erases the transcript text sharing
+  that row. This is not hypothetical — it is exactly how a streamed answer's
+  final unterminated line was being destroyed before T3-S1 (see
+  `docs/roadmap/cycles/e11/findings.md` **F47**). Writers that may end mid-row
+  therefore declare it, and the region steps down one row before taking
+  ownership. **Any new writer that can finish without a trailing newline must
+  do the same**, because the painters cannot discover it for themselves. The tags sit leftmost
   in the order background agents then queue: `[N blocked]` or `[N agent(s)]`
   (blocked outranks running, hidden when both are zero, refreshed from the
   registry watch once per input poll tick) followed by `[N queued]`. Both tag
