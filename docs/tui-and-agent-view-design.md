@@ -209,16 +209,17 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
 - **R4** The composer MUST keep every current editing feature: history,
   Ctrl+R search, slash hint and Tab completion, the `@file` and slash-palette
   completion lists, hint and highlight now hosted by rustyline's `ChatHelper`,
-  **[Status, T0-S10] R4 is nearly met by the inline preview; what is left is
-  one piece, not four.** Met: history (including across sessions — it reuses
-  rustyline's own persistence), Ctrl+R search with its status indicator, the
-  slash hint, and **Tab accepting that hint**, which is parity with the
-  during-turn row. Not met: rustyline's completion **lists** — `@file` path
-  completion and the bordered slash-command palette — plus highlighting. The
-  palette draws over several rows, so it needs a viewport taller than one and
-  carries F16 (resize) and F19 (short-terminal clamp) with it; that is the last
-  in-repo blocker to calling R4 satisfied. None of it blocks the opt-in
-  preview.
+  **[Status, T0-S16] R4 is met apart from two named items.** Met: history
+  (including across sessions — it reuses rustyline's own persistence), Ctrl+R
+  search with its status indicator, the slash hint, **Tab accepting that
+  hint**, and the **bordered slash-command palette**, which shares the classic
+  prompt's own renderer rather than reimplementing it. Still absent: **`@file`
+  path completion** and **highlighting** of the draft. Neither needs more
+  viewport machinery — the palette's arrival settled the geometry questions
+  (F16's resize and truncation halves, F19's minimum height) — so both are
+  ordinary features rather than blockers. None of this blocks the opt-in
+  preview; what still gates making it the default is Q1, the live terminal
+  matrix.
   bracketed paste as one draft, Alt+Enter newline, Esc clears draft,
   draft-aware Ctrl+C, `↑`-on-empty queue recall, queue preview rows,
   `[N queued]`, approval handoff.

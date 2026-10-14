@@ -1138,7 +1138,8 @@ a dependency rather than by preference:
    than pushing the region to an invalid geometry.
 3. **T0-S15, the palette itself** — matching, filtering as you type, the
    border, and `Tab` semantics against a list rather than a single hint. Split
-   again on contact: **S15a** the rows as data, **S15b** the wiring.
+   again on contact: **S15a** the rows as data, **S16** the wiring (named S16
+   rather than S15b to match the `S16-*` references in the committed tests).
 
 ### The drop-from-the-top rule collides with a bordered box
 
@@ -1342,3 +1343,50 @@ true, and the inline path stops carrying copies. It was not done in S15a because
 that card was scoped to tests-then-implementation of the data, and refactoring
 the classic Rustyline hint path mid-card would have put a shared, separately
 tested surface at risk for no test-visible gain.
+
+**RESOLVED in T0-S16, as that card's first step.** `slash_palette_rows(prefix,
+rich, inner_width, max_rows)` now owns the labels, both frame sets, the entry
+formatting, the row cap and the "N more" step, and `slash_palette` is a thin
+join over it — exactly the `compose_input_row`/`compose_row` shape. The
+implementer ran the suite between the refactor and the wiring and saw the
+identical 6 + 1 failures and nothing new, which is what "behaviour-preserving"
+has to mean in practice.
+
+Verified by classifying every occurrence rather than taking the report: the
+` slash commands ` label exists **once** in production, four lines into
+`slash_palette_rows`; the two other non-comment hits are assertions in the
+classic path's own tests, and `tui_bridge.rs` retains only a doc comment. The
+inline palette now contains no palette text at all.
+
+
+## F30 — the during-turn hint's priority list is reused at the idle prompt
+
+Found in T0-S16, and the cause is **mine**: T0-S9 and T0-S10 reused
+`typeahead_slash_hint` verbatim at the inline idle prompt. That function ranks
+matches through `MID_TURN_HINT_PRIORITY`, whose own doc comment says
+*"Commands that act on the RUNNING turn, in preference order. While a turn is
+live these outrank plain registry order"*.
+
+At an **idle** prompt no turn is running, so that ranking is wrong on its own
+terms. Concretely: registry order for `s` is `save`, `sessions`, `skill`,
+`skills`, `status`, but the priority list puts `steer` first — so typing `/s`
+hints `teer` while a palette would lead with `save`.
+
+The implementer hit this while wiring the palette and handled it locally, with
+a third stand-down clause: the palette hides when a hint is showing that is not
+the lead entry's own completion. That is defensible — the hint is the
+keystroke's answer and the palette is its menu, so a menu contradicting the
+answer is worse than no menu — and it is documented at the function. But it is
+**symptom-level**: it suppresses a correct palette because an inappropriate
+hint disagrees with it.
+
+**The principled fix** is to rank by registry order at the idle prompt and keep
+the mid-turn priority for the during-turn row, after which hint and palette
+agree by construction and the third clause can go. It is a real card, not a
+drive-by: it changes what `/s` hints at idle (user-visible), and it would turn
+the `/s` case in T0-S16's regression test from one row into a palette, so that
+test changes with it.
+
+Worth noting as a general lesson: reusing a function across contexts carried
+its *policy* along with its mechanics, and the policy was named for the context
+it came from. The name said `MID_TURN` and was reused where no turn exists.
