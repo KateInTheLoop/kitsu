@@ -92,6 +92,13 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- In the inline viewport, **permission prompts now appear as a modal in the
+  bottom pane** instead of scrolling past in the transcript, with the same
+  option line as the classic prompt and, for command approvals, the same
+  provenance rows (working directory, executable, timeout, authority). Once you
+  answer, the viewport leaves the same `◉ permission —` line in the transcript
+  that classic leaves, so the record of what was asked and allowed is identical.
+  Classic output is unchanged, and `--plain` keeps its existing prompt.
 - The inline viewport's pinned bottom row is now a **live status row** instead of
   the word `kitsu`: the model, a compact eight-cell context meter with its
   utilisation percentage, the elapsed time in the current turn, `[N queued]` when

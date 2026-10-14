@@ -1799,6 +1799,28 @@ fn approval_options_with_mode(always_label: &str, styled: bool) -> String {
     )
 }
 
+/// The bottom-pane approval modal's rows, in paint order: the [`approval_header`] row, every
+/// [`approval_detail`] provenance row the surface has, then the one shared
+/// [`approval_options`] line.
+///
+/// Composition only, as requirement **R7** needs it: the caller composes each
+/// row with the existing helpers above and this says what order they are
+/// painted in, so the pane modal and the classic stderr prompt cannot drift
+/// into two different option lines. Painting belongs to the `kitsu` crate's
+/// `tui_bridge` (it owns the pinned `InlineSurface`); this crate cannot see
+/// it, and `kitsu-tui` cannot see a `PermissionRequest`.
+///
+/// The rows are the caller's own strings, cloned and never re-composed: the
+/// option line the pane paints is the very [`approval_options`] value the
+/// classic prompt prints, so the two cannot drift into two spellings.
+pub fn approval_modal(header: &str, details: &[String], options: &str) -> Vec<String> {
+    let mut rows = Vec::with_capacity(details.len() + 2);
+    rows.push(header.to_string());
+    rows.extend(details.iter().cloned());
+    rows.push(options.to_string());
+    rows
+}
+
 /// A dimmed detail row beneath an approval header (cwd, executable, timeout).
 pub fn approval_detail(text: &str) -> String {
     let text = sanitize_terminal_inline(text);
@@ -2423,7 +2445,7 @@ pub fn emit_usage(prompt_tokens: u64, completion_tokens: u64, total_tokens: u64)
 #[cfg(test)]
 mod tests {
     use super::{
-        approval_header_with_mode, approval_options_with_mode, context_lines,
+        approval_header_with_mode, approval_modal, approval_options_with_mode, context_lines,
         deck_header_with_mode, deck_marker_with_mode, display_width, error_display_lines,
         fit_banner_value, fit_row_to_width, format_message, grouped_count, human_turn_stats,
         milestone_line_with_mode, sanitize_plain_inline, sanitize_terminal_inline,
@@ -3256,6 +3278,74 @@ mod tests {
         );
         assert!(options.contains("\x1b[1m"));
         assert!(!approval_options_with_mode("always (/etc)", false).contains('\u{1b}'));
+    }
+
+    /// **T3-S7a.** The bottom-pane modal's rows are exactly the surfaces that
+    /// already exist, in paint order: the header, then every provenance
+    /// detail row the caller has, then the option line last.
+    ///
+    /// Requirement **R7** is a parity requirement, so the modal is a
+    /// *composition* of the three helpers above rather than a second set of
+    /// strings: everything asserted here is a value produced by one of them.
+    #[test]
+    fn approval_modal_paints_header_then_details_then_the_option_line() {
+        let header = approval_header_with_mode("kitsu wants to read /etc/hostname", false);
+        let options = approval_options_with_mode("always (/etc)", false);
+        let rows = approval_modal(&header, &[], &options);
+        assert_eq!(
+            rows,
+            vec![header.clone(), options.clone()],
+            "with no provenance rows the modal is the header and the option \
+             line, in that order"
+        );
+    }
+
+    /// **T3-S7a, R7's `command approvals keep their provenance rows`.** Every
+    /// detail row survives, in order, between the header and the option line
+    /// -- the five the command prompter composes today (cwd, executable,
+    /// timeout, authority) must not be dropped to make the modal fit.
+    #[test]
+    fn approval_modal_keeps_every_provenance_row_in_order() {
+        let header = approval_header_with_mode("run /bin/true", false);
+        let options = approval_options_with_mode("allow this exact argv/cwd for session", false);
+        let details = vec![
+            "  cwd: /repo".to_string(),
+            "  executable: /bin/true (ambient PATH lookup; observed: /bin/true; bytes not pinned)"
+                .to_string(),
+            "  timeout: 30000 ms".to_string(),
+            "  authority: session".to_string(),
+        ];
+        let rows = approval_modal(&header, &details, &options);
+        let mut expected = vec![header.clone()];
+        expected.extend(details.iter().cloned());
+        expected.push(options.clone());
+        assert_eq!(
+            rows, expected,
+            "the modal is header + every provenance row + option line, with \
+             nothing dropped or reordered"
+        );
+    }
+
+    /// **T3-S7a, the one-source rule.** The modal's last row is the
+    /// `approval_options` value *itself*, byte for byte. A re-typed option
+    /// line in the pane -- the drift R7 exists to forbid -- fails here even
+    /// if it reads the same to a human, because the composer's own output is
+    /// the expected value.
+    #[test]
+    fn approval_modal_option_line_is_the_shared_composer_byte_for_byte() {
+        let header = approval_header_with_mode("kitsu wants to write /tmp/x", false);
+        let options = approval_options_with_mode("always (/tmp)", false);
+        let rows = approval_modal(&header, &["  cwd: /tmp".to_string()], &options);
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some(options.as_str()),
+            "the option line must be the shared composer's string, not a copy"
+        );
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some("  [y] allow once \u{b7} [a] always (/tmp) \u{b7} [n] deny"),
+            "...and that string is still the classic prompt's own text"
+        );
     }
 
     #[test]

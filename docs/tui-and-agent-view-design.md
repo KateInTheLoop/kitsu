@@ -256,6 +256,31 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   with the same `[y] allow once · [a] always (<dir>) · [n] deny` option line
   (command approvals keep their provenance rows) and the same `◉ permission —`
   text in the transcript receipt afterwards.
+
+  **Clarified in T3-S7a, after implementing it.** The "receipt afterwards" is
+  **new behaviour in the viewport only, and that is not a parity break.** In
+  `classic` the prompt *is* the transcript line: it is printed into the scroll
+  region and stays there, so the record already exists. The pane modal is
+  **transient**, so the viewport must author a receipt to leave the same trace
+  classic leaves by accident of where it prints. Classic's bytes are therefore
+  unchanged, and a test pins that it emits exactly one `◉ permission —` line per
+  approval.
+
+  Ordering matters and is easy to get wrong: **the receipt must be written
+  before the modal is cleared.** A transcript line is text plus CRLF with no
+  addressing, so it lands at the parked cursor; tearing the modal down first
+  re-parks the cursor and the receipt is glued to the status row instead of
+  following the newline the kernel echoed with the answer.
+
+  **`--plain` is excluded.** The plain prompter has its own unstyled text
+  (`permission> …`) and `--plain` is a **byte-contract tier**, so routing it
+  through the shared modal composer would change bytes that other requirements
+  promise are stable. `--plain --tui inline` is reachable today — the viewport
+  installs on `mode` alone, not on styling — and in that combination the prompt
+  stays on stderr and **R7 is not satisfied**. See **F53**: the better fix is
+  probably for `--plain` to resolve to `classic` rather than for the plain
+  prompter to grow a modal, but that is a mode-resolution decision and not R7's
+  to make.
 - **R8** `Ctrl+L` MUST repaint. Resize MUST reflow the viewport without
   duplicating history lines.
 

@@ -2082,8 +2082,6 @@ fn run_styled_streaming_chat_pty(
     turns: Vec<Turn>,
     allow_path: bool,
 ) -> StreamSession {
-    let mock = SseMock::start(turns);
-    write_streaming_config(home, &mock.base_url());
     let extra = if allow_path {
         vec![
             "--allow-path".to_string(),
@@ -2092,7 +2090,26 @@ fn run_styled_streaming_chat_pty(
     } else {
         Vec::new()
     };
-    let session = run_styled_chat_pty_core(home, tui, script, Options::default(), &extra);
+    run_styled_streaming_chat_pty_with_args(home, tui, script, turns, &extra)
+}
+
+/// [`run_styled_streaming_chat_pty`] with the child's extra arguments spelled
+/// out instead of reduced to `allow_path`.
+///
+/// T3-S7a needs two things the boolean cannot say: a run with **no** grant at
+/// all (so a tool call reaches the approval gate) and `--enable-commands` (so
+/// the *command* gate exists). The boolean form above is unchanged and
+/// delegates here.
+fn run_styled_streaming_chat_pty_with_args(
+    home: &Path,
+    tui: Option<&str>,
+    script: &[Step],
+    turns: Vec<Turn>,
+    extra_args: &[String],
+) -> StreamSession {
+    let mock = SseMock::start(turns);
+    write_streaming_config(home, &mock.base_url());
+    let session = run_styled_chat_pty_core(home, tui, script, Options::default(), extra_args);
     let bodies = mock.bodies();
     StreamSession { session, bodies }
 }
@@ -3083,4 +3100,420 @@ fn inline_mode_status_row_shows_the_queued_tag_for_a_mid_turn_submission() {
             row.chars().count()
         );
     }
+}
+
+// ===========================================================================
+// T3-S7a: the approval modal RENDERS in the bottom pane.
+//
+// Requirement **R7**: an approval prompt in a TUI mode must render as a
+// bottom-pane modal carrying the same `[y] allow once · [a] always (<dir>) ·
+// [n] deny` option line (command approvals keeping their provenance rows),
+// and the same `◉ permission —` text must be in the transcript receipt
+// afterwards. The risk gate is the *receipt*: its sanitize must equal
+// classic's.
+//
+// This card is the rendering half only. The `APPROVAL_INPUT_ACTIVE` protocol
+// is deliberately untouched (card T3-S7b), so the sessions below are driven
+// exactly as a user drives one today: the approval reader runs in **canonical
+// mode with echo**, which `run_live_typeahead` restores the moment the claim
+// is observed (`main.rs`, the `if APPROVAL_INPUT_ACTIVE.load(..) > 0` arm of
+// its poll loop), so an answer is terminated by `\n` and not `\r` even in
+// inline mode.
+//
+// # Triggers (finding F46)
+//
+// Every trigger here is a byte the child emits **today** *and* after the
+// change: the header and the provenance rows are composed from the same
+// strings whether they go to stderr in the scroll region (today) or onto the
+// pinned rows (after). A test that triggered on a pane paint would time out
+// before it could fail.
+// ===========================================================================
+
+/// Every `ESC[<line>;1H ESC[2K <row>` write in the stream, as `(line, row)`
+/// with CSI escapes stripped from the row.
+///
+/// This is [`pinned_row_paints`] generalized from one row to any: the modal
+/// is taller than the status row, so a paint of it addresses several
+/// consecutive lines before parking the cursor. The write is the *only* way
+/// a pinned row is ever drawn (`InlineSurface::paint`, pinned by
+/// `paint_positions_clears_and_writes_each_row_then_reparks`), and a
+/// transcript line is written with no addressing at all
+/// (`transcript_line`: text plus CRLF, "no escape bytes whatever"), so a row
+/// that appears here appeared in the pinned pane and nowhere else.
+fn addressed_pane_writes(session: &Session) -> Vec<(u16, String)> {
+    let text = session.raw_text();
+    let bytes = text.as_bytes();
+    // Every cursor address `ESC[<n>;1H`: (start, line, end-of-sequence).
+    let mut addresses: Vec<(usize, u16, usize)> = Vec::new();
+    let mut index = 0usize;
+    while index + 2 < bytes.len() {
+        if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 2;
+        let digits = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor > digits && bytes[cursor..].starts_with(b";1H") {
+            let line = text[digits..cursor].parse::<u16>().unwrap_or(0);
+            addresses.push((index, line, cursor + 3));
+            index = cursor + 3;
+            continue;
+        }
+        index += 1;
+    }
+    let mut writes = Vec::new();
+    for (position, (_, line, end)) in addresses.iter().copied().enumerate() {
+        if !bytes[end..].starts_with(b"\x1b[2K") {
+            continue;
+        }
+        let from = end + 4;
+        let to = addresses
+            .get(position + 1)
+            .map(|(start, _, _)| *start)
+            .unwrap_or(bytes.len());
+        if to <= from {
+            continue;
+        }
+        writes.push((line, strip_csi(&text[from..to])));
+    }
+    writes
+}
+
+/// Rows the inline viewport painted into the bottom pane, in stream order.
+///
+/// The pane is pinned to the bottom of the screen, so every row of it
+/// addresses a line in `(ROWS - PANE_MAX)..=ROWS`. The bound exists so a
+/// modal cannot satisfy R7 by being painted somewhere in the scroll region
+/// that happens to carry a `ESC[2K`.
+const PANE_MAX: u16 = 8;
+
+fn pane_rows(session: &Session) -> Vec<String> {
+    addressed_pane_writes(session)
+        .into_iter()
+        .filter(|(line, _)| *line > ROWS - PANE_MAX && *line <= ROWS)
+        .map(|(_, row)| row)
+        .collect()
+}
+
+/// Every `◉ permission — …` line in the stream, sanitized and trimmed.
+///
+/// `strip_csi` is this file's stand-in for `sanitize_terminal_text` (see its
+/// docs: an integration test cannot link the render crate), so this is R7's
+/// "the sanitize of the receipt" for a whole session's bytes. Split on both
+/// terminators because the transcript's own line ending in inline mode is
+/// CRLF and the classic prompt's is LF.
+fn permission_receipts(session: &Session) -> Vec<String> {
+    strip_csi(&session.raw_text())
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| line.starts_with("◉ permission —"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The same, over only the bytes the child wrote **after** scripted action
+/// `step` -- R7's "afterwards".
+fn permission_receipts_after(session: &Session, step: usize) -> Vec<String> {
+    let tail = String::from_utf8_lossy(&session.raw[session.marks[step]..]).into_owned();
+    strip_csi(&tail)
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| line.starts_with("◉ permission —"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A tool round that touches the filesystem gate: round one asks to read
+/// `forbidden`, round two answers in prose.
+fn gated_read_turns(forbidden: &Path) -> Vec<Turn> {
+    vec![
+        Turn {
+            events: vec![
+                tool_call(
+                    "gated-read-1",
+                    "fs_read_file",
+                    &format!(
+                        "{{\"path\":{}}}",
+                        serde_json_string(&forbidden.to_string_lossy())
+                    ),
+                ),
+                finish("tool_calls"),
+            ],
+            gap: Duration::from_millis(30),
+        },
+        Turn {
+            events: vec![delta("GATE_ROUND_DONE\n"), finish("stop")],
+            gap: Duration::from_millis(30),
+        },
+    ]
+}
+
+/// A tool round that touches the *command* gate. The answer is a denial, so
+/// nothing is ever executed and the test does not depend on OS containment
+/// being available at all -- only on the prompt being rendered.
+fn gated_command_turns(cwd: &Path) -> Vec<Turn> {
+    vec![
+        Turn {
+            events: vec![
+                tool_call(
+                    "gated-command-1",
+                    "command_exec",
+                    &format!(
+                        "{{\"argv\":[\"/bin/true\"],\"cwd\":{}}}",
+                        serde_json_string(&cwd.to_string_lossy())
+                    ),
+                ),
+                finish("tool_calls"),
+            ],
+            gap: Duration::from_millis(30),
+        },
+        Turn {
+            events: vec![delta("COMMAND_GATE_DONE\n"), finish("stop")],
+            gap: Duration::from_millis(30),
+        },
+    ]
+}
+
+/// A gated read answered `y`, in one mode. `marks[1]` is the answer.
+fn gated_read_session(tui: Option<&str>, forbidden: &Path, extra: &[String]) -> StreamSession {
+    let home = TempDir::new().expect("temp home");
+    let script: Vec<Step> = match tui {
+        Some(_) => vec![
+            send(RAW_MODE_MARKER, "read the file\r"),
+            send("kitsu wants to read", "y\n"),
+            send(TURN_DONE_MARKER, "/quit\r"),
+        ],
+        None => vec![
+            send("/help for commands", "read the file\n"),
+            send("kitsu wants to read", "y\n"),
+            send(TURN_DONE_MARKER, "/quit\n"),
+        ],
+    };
+    run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        tui,
+        &script,
+        gated_read_turns(forbidden),
+        extra,
+    )
+}
+
+/// **T3-S7a, the acceptance round-trip.** A real PTY approval in inline mode:
+/// the modal's header and its option line are painted into the pinned bottom
+/// pane, and `y` from the same stdin the protocol already hands over carries
+/// the turn through.
+///
+/// The gate is real: the child is given no `--allow-path`, its only read root
+/// is its launch directory (`home`), and the model asks to read a file in a
+/// different temporary directory.
+///
+/// The absence this test depends on is proved not vacuous by the positives
+/// around it: the gate fired (the prompt's own text is in the stream), the
+/// turn completed after the answer, and the pane was painted many times in
+/// this session -- so "the option line is not among the pane's rows" is a
+/// statement about the pane, not about an empty list.
+#[test]
+#[serial]
+fn inline_mode_renders_the_approval_modal_in_the_bottom_pane() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+
+    let session = gated_read_session(Some("inline"), &forbidden, &[]);
+    let text = strip_csi(&session.raw_text());
+
+    // The gate really fired, and the answer really carried the turn.
+    assert!(
+        text.contains("kitsu wants to read"),
+        "the model's read of {} must reach the approval gate; raw:\n{}",
+        forbidden.display(),
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        text.contains("GATE_ROUND_DONE"),
+        "answering `y` must let the turn finish; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    let rows = pane_rows(&session);
+    assert!(
+        !rows.is_empty(),
+        "this session must paint the pinned pane at all, or the two \
+         assertions below say nothing; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    let expected_header = format!("◉ permission — kitsu wants to read {}", forbidden.display());
+    assert!(
+        rows.iter().any(|row| row.trim() == expected_header),
+        "R7: the approval header must be painted on a pinned pane row as \
+         {expected_header:?}; the pane painted {} row(s): {rows:#?}",
+        rows.len()
+    );
+    let expected_options = format!(
+        "[y] allow once · [a] always ({}) · [n] deny",
+        outside.path().display()
+    );
+    assert!(
+        rows.iter().any(|row| row.trim() == expected_options),
+        "R7: the option line must be painted on a pinned pane row as \
+         {expected_options:?}; the pane painted {} row(s): {rows:#?}",
+        rows.len()
+    );
+}
+
+/// **T3-S7a, R7's risk gate.** The `◉ permission —` receipt in inline mode is
+/// byte-identical, after sanitize, to the one classic leaves in the
+/// transcript -- and it is there *afterwards*, i.e. in the bytes the child
+/// wrote after the answer went in, because the modal itself is transient.
+///
+/// Both sessions are given the **same** forbidden path, so the two receipts
+/// are comparable as bytes rather than as shapes.
+#[test]
+#[serial]
+fn inline_mode_commits_the_same_permission_receipt_as_classic() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+
+    let classic = gated_read_session(None, &forbidden, &[]);
+    let classic_receipts = permission_receipts(&classic);
+    assert_eq!(
+        classic_receipts,
+        vec![format!(
+            "◉ permission — kitsu wants to read {}",
+            forbidden.display()
+        )],
+        "the classic receipt is the baseline this test compares against; \
+         raw:\n{}",
+        classic.raw_text().escape_debug()
+    );
+
+    let inline = gated_read_session(Some("inline"), &forbidden, &[]);
+    let after = permission_receipts_after(&inline, 1);
+    assert_eq!(
+        after,
+        classic_receipts,
+        "R7: after the modal closes, inline mode must leave classic's exact \
+         sanitized receipt in the transcript; inline's whole-session \
+         receipts were {:#?}; raw:\n{}",
+        permission_receipts(&inline),
+        inline.raw_text().escape_debug()
+    );
+}
+
+/// **T3-S7a, R7's `command approvals keep their provenance rows`.** The
+/// command modal carries all four provenance rows the classic command prompt
+/// composes -- cwd, executable, timeout, authority -- on pinned pane rows,
+/// with the command option line.
+///
+/// Answered `n`: the denial is what keeps this test independent of whether
+/// OS containment is available on the machine running it. The prompt is
+/// rendered before any execution either way.
+#[test]
+#[serial]
+fn inline_mode_command_approval_modal_keeps_its_provenance_rows() {
+    let home = TempDir::new().expect("temp home");
+    // A command root that is **not** the launch directory: `HOME` is the
+    // launch directory here, so `--enable-commands` alone would default the
+    // root to it and be refused for intersecting `~/.kitsu` ("managed
+    // credential namespace", measured).
+    let work = TempDir::new().expect("temp command root");
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "run the command\r"),
+            send("authority:", "n\n"),
+            send(TURN_DONE_MARKER, "/quit\r"),
+        ],
+        gated_command_turns(work.path()),
+        &[
+            "--command-root".to_string(),
+            work.path().to_string_lossy().into_owned(),
+        ],
+    );
+
+    let text = strip_csi(&session.raw_text());
+    assert!(
+        text.contains("authority:"),
+        "the command gate must fire at all; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    let rows = pane_rows(&session);
+    assert!(
+        !rows.is_empty(),
+        "this session must paint the pinned pane at all; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    for provenance in ["cwd:", "executable:", "timeout:", "authority:"] {
+        assert!(
+            rows.iter().any(|row| row.trim().starts_with(provenance)),
+            "R7: the command modal must keep its {provenance:?} provenance \
+             row on a pinned pane row; the pane painted {} row(s): {rows:#?}",
+            rows.len()
+        );
+    }
+    let expected_options = "[y] allow once · [a] allow this exact argv/cwd for session · [n] deny";
+    assert!(
+        rows.iter().any(|row| row.trim() == expected_options),
+        "R7: the command modal's option line must be the shared composer's \
+         own text {expected_options:?}; the pane painted {} row(s): \
+         {rows:#?}",
+        rows.len()
+    );
+}
+
+/// **T3-S7a, the classic guard.** Classic mode's approval bytes do not change:
+/// the prompt is the header, the option line and the `> ` cue in the scroll
+/// region, and classic paints **no** pinned pane at all -- it installs no
+/// viewport (`tui_bridge::install` returns `None` for `TuiMode::Classic`
+/// before emitting a byte), so there is nothing for a modal to be painted
+/// onto.
+///
+/// Passes today. It is the regression half of the card: the pane modal must
+/// be added without any classic byte moving.
+#[test]
+#[serial]
+fn classic_mode_approval_bytes_are_unchanged_by_the_pane_modal() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+
+    let session = gated_read_session(None, &forbidden, &[]);
+    let text = strip_csi(&session.raw_text());
+
+    assert_eq!(
+        permission_receipts(&session),
+        vec![format!(
+            "◉ permission — kitsu wants to read {}",
+            forbidden.display()
+        )],
+        "classic's receipt text is fixed; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    let expected_options = format!(
+        "  [y] allow once · [a] always ({}) · [n] deny",
+        outside.path().display()
+    );
+    assert!(
+        text.contains(&expected_options),
+        "classic's option line is fixed at {expected_options:?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        text.contains("GATE_ROUND_DONE"),
+        "the classic round-trip still completes; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        addressed_pane_writes(&session).is_empty(),
+        "classic mode installs no viewport, so it must address and clear no \
+         row at all; it wrote {:#?}",
+        addressed_pane_writes(&session)
+    );
 }

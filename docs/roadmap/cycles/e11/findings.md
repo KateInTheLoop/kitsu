@@ -2837,3 +2837,39 @@ The general lesson is the one this epic keeps producing: **a requirement that
 states a guarantee and a mechanism in one sentence can be wrong about the
 guarantee while being right about the mechanism**, and only someone implementing
 the mechanism notices.
+
+## F53 — `--plain --tui inline` installs a viewport that plain output cannot use
+
+Found by the T3-S7a implementer, which asked rather than deciding for itself.
+
+The inline viewport is installed on **mode alone**: the block at
+`main.rs:16585` resolves `[tui] mode` and calls `tui_bridge::install`, with no
+condition on styling, `--plain`, or assistive output. So `--plain --tui inline`
+really does install the viewport, pin a scroll region, and paint a status row —
+while every *content* path takes the plain, unstyled branch.
+
+For approvals that means **R7 is not satisfied in that combination**: the plain
+prompter keeps its own `permission> …` text on stderr and never paints the pane
+modal. Routing it through the shared composer would have "fixed" R7 by changing
+plain's bytes, and `--plain` is a **byte-contract tier** — a weaker parity
+requirement must not be bought with a stronger stability guarantee. The
+implementer flagged it instead of trading them, which was right.
+
+**The combination is incoherent beyond approvals.** `--plain` exists for
+screen readers and byte-stable capture; a pinned pane, a DEC scroll region and a
+repainting status row are the opposite of that. The viewport's own status row
+*does* get painted in this mode, which is already questionable on the same
+grounds.
+
+**The likely right fix is mode resolution, not more branches:** have `--plain`
+(and assistive output) resolve to `classic` regardless of `[tui] mode`, so the
+contradiction cannot be configured. That would make R7 vacuously satisfied
+there, delete a reachable-but-unsupported combination, and remove the need for
+every future TUI surface to carry a plain-mode branch. It is a small card and it
+should come with a test that `--plain --tui inline` is byte-identical to
+`--plain` alone.
+
+Recorded rather than fixed because it is a **mode-resolution decision** with its
+own acceptance, and T3-S7a had no mandate to change which renderer a flag
+selects. R7 has been clarified to state the exclusion explicitly rather than
+leave it implied.
