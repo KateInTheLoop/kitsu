@@ -171,12 +171,23 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   before the draft is windowed, so it survives a long draft, while the
   completion suffix is unreserved and is dropped when the row is too narrow.
 
-  Still absent at the inline prompt, and **separate pieces of work rather than
-  one** — an earlier version of this file wrongly said a single seam change
-  covered them: **Tab completion**, which needs the reader to act on the
-  editor's completion request rather than drop it, and **the bordered
-  slash-command palette**, which lists and filters commands over several rows
-  and so needs a viewport taller than one row.
+  **Tab accepts the hint**, which is parity with the during-turn row and the
+  same seven-line behaviour: take the draft, compute the slash-completion
+  suffix, and append it if one is showing. Two details are load-bearing. The
+  suffix is recomputed from the draft rather than read back out of the hint
+  slot, because the slot holds the *search status* while Ctrl+R is armed and
+  appending that would type `⌕ reverse-search '…'` into the prompt — reachable,
+  not theoretical, since actions are handled after a whole read completes and a
+  later Ctrl+R in the same read can arm the status first. And a search is not
+  special-cased: the editor treats any control key in search mode as accept,
+  exit, re-feed, so by the time Tab is seen the draft is the matched history
+  line and no slash hint applies.
+
+  Still absent at the inline prompt: Rustyline's completion **lists** — `@file`
+  path completion and the bordered slash-command palette, which lists and
+  filters commands over several rows and so needs a viewport taller than one
+  row. (An earlier version of this file wrongly bundled Tab in with those; it
+  is a hint, they are lists, and only the lists need the extra rows.)
 
   Tiering is unchanged: the viewport requires a styled interactive TTY, so
   non-TTY, `--plain`, assistive and JSONL sessions never enter it and stay

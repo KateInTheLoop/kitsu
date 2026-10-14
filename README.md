@@ -1134,10 +1134,11 @@ unset by default and a session without it is byte-identical to one from before
 the viewport existed.
 
 It is a preview, and the idle prompt inside it is kitsu's own editor rather
-than Rustyline, so it does not yet have Tab completion or the bordered
-slash-command palette that lists and filters commands as you type. Command
-history **does** persist across sessions, and Ctrl+R reverse search works.
-What it does have:
+than Rustyline. Command history **does** persist across sessions, Ctrl+R
+reverse search works, and Tab completes a slash command from the hint shown
+beside your draft. What it does not have is Rustyline's completion *lists* —
+`@file` path completion, and the bordered palette that lists and filters
+commands over several rows as you type. What it does have:
 insertion and cursor motion, Home/End, Backspace/Delete, the Ctrl+U/K/W kills,
 Up/Down through the current session's history, bracketed paste kept as one
 draft, Ctrl+D to exit on an empty line, Ctrl+C to clear the line, and Ctrl+Z to
