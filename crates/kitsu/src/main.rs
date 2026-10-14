@@ -5955,6 +5955,105 @@ fn read_chat_line(
     }
 }
 
+/// The idle prompt's reader: the inline one when the viewport is installed on
+/// an interactive terminal, rustyline otherwise.
+///
+/// History comes from rustyline either way — `add_history_entry` still runs on
+/// every submitted line — so Up/Down at the inline prompt walks the same list,
+/// even though rustyline's own composer never runs.
+#[cfg(unix)]
+fn read_idle_chat_line(
+    editor: &mut rustyline::Editor<ChatHelper, rustyline::history::DefaultHistory>,
+    bridge: Option<&tui_bridge::BridgeGuard>,
+    prompt: &str,
+    assistive: bool,
+    initial: &str,
+) -> ChatReadline {
+    if let Some(bridge) = bridge {
+        // Assistive and non-TTY carriers keep their existing readers: neither
+        // can be painted into a viewport row.
+        if !assistive && kitsu_render::stdin_is_tty() && kitsu_render::stderr_styled() {
+            let history: Vec<String> = editor.history().iter().cloned().collect();
+            return read_chat_line_inline(bridge, prompt, &history, initial);
+        }
+    }
+    read_chat_line(editor, prompt, assistive, initial)
+}
+
+/// The inline mode's idle prompt (story T0-S5d): one line read through
+/// [`tui_bridge::read_line_inline`] instead of rustyline, with the draft
+/// painted onto the pinned viewport row.
+///
+/// # Raw mode is `RawStdinGuard`'s, and only `RawStdinGuard`'s
+///
+/// The guard clears `ICANON`, `ECHO` and `ISIG` in `c_lflag` and leaves
+/// `c_oflag` alone, so `OPOST`/`ONLCR` stay on and the binary's several
+/// hundred direct `println!`/`eprintln!` writers keep getting a carriage
+/// return with every line feed. Enabling a second, fuller raw mode here
+/// (crossterm's, which clears `OPOST`) would staircase all of them down the
+/// screen, so this path engages the existing guard and nothing else.
+///
+/// Because `ISIG` is masked, Ctrl+C arrives as a byte rather than a signal.
+/// On an empty draft the reader reports `Interrupted` and this caller raises
+/// the `SIGINT` the kernel would have sent — the same division of labour the
+/// during-turn collector uses. Termios is restored first: unlike the
+/// collector, this function returns rather than continuing to read, so it must
+/// not hand back a terminal that is still raw.
+///
+/// Known preview gaps, carded rather than fixed here: no history persistence,
+/// no completion and no slash-command palette at the idle prompt.
+#[cfg(unix)]
+fn read_chat_line_inline(
+    bridge: &tui_bridge::BridgeGuard,
+    prompt: &str,
+    history: &[String],
+    initial: &str,
+) -> ChatReadline {
+    use std::io::Read as _;
+
+    // Bound, not discarded: `_raw` lives to the end of this function so the
+    // terminal stays in raw input mode for the whole read. A bare `_` would
+    // drop the guard immediately and restore canonical mode before the first
+    // keystroke. Nothing in the body refers to it -- the idle path no longer
+    // re-raises SIGINT, so there is no reason to drop it early any more.
+    let Some(_raw) = RawStdinGuard::engage() else {
+        return ChatReadline::Error("failed to switch stdin to raw mode".to_string());
+    };
+    // A draft carried over from the during-turn live editor is replayed into
+    // the editor as if it had just been typed, which keeps the "typing is
+    // never dropped" contract the rustyline path has.
+    let mut input = std::io::Cursor::new(initial.as_bytes().to_vec()).chain(std::io::stdin());
+    let outcome = {
+        // The cursor column is not used yet: the viewport is one row and
+        // `InlineSurface::paint` parks the cursor back inside the scroll
+        // region, so there is nowhere to put a composer caret until the
+        // multi-row composer lands.
+        let mut paint = |draft: &str, _cursor: usize| bridge.paint_draft(prompt, draft);
+        tui_bridge::read_line_inline(&mut input, &mut paint, history)
+    };
+    // Whatever happened, the row must not keep showing a draft that is gone.
+    bridge.paint_draft(prompt, "");
+    match outcome {
+        Ok(tui_bridge::InlineRead::Submitted(line)) => ChatReadline::Line(line),
+        Ok(tui_bridge::InlineRead::Eof) => ChatReadline::Eof,
+        Ok(tui_bridge::InlineRead::Interrupted) => {
+            // Deliberately NOT re-raising SIGINT here, unlike the during-turn
+            // collector. The collector raises because a turn is in flight and
+            // the signal is what cancels it; at an idle prompt there is
+            // nothing to cancel, and every `ctrl_c()` in this binary sits
+            // inside a `select!` scoped to one operation rather than being a
+            // process-lifetime handler -- so at the *first* idle prompt no
+            // handler is installed and the raise would take the default
+            // disposition and kill kitsu. Classic mode prints `^C` and keeps
+            // the session, so raising here would make Ctrl+C mean "exit" in
+            // inline mode and "clear the line" in classic. `Interrupted` is
+            // handled by the caller, which prints exactly that notice.
+            ChatReadline::Interrupted
+        }
+        Err(error) => ChatReadline::Error(error.to_string()),
+    }
+}
+
 impl rustyline::completion::Completer for ChatHelper {
     type Candidate = rustyline::completion::Pair;
 
@@ -15972,7 +16071,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // the variable unset the mode is classic, `install` writes nothing and
     // touches no global state, so the session is byte-identical.
     #[cfg(unix)]
-    let _tui_bridge_guard = {
+    let tui_bridge_guard = {
         let mode = tui_bridge::mode_from_value(std::env::var_os("KITSU_TUI").as_deref());
         // A failed geometry probe (not a terminal, or an ioctl refusal) falls
         // back to the conventional 80x24, the same fallback the renderer's own
@@ -16941,34 +17040,46 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 run_aggregate.observe_cleanup(cleanup);
                 break;
             }
-            (None, None) => match read_chat_line(
-                &mut rl,
-                &visible_prompt,
-                assistive_input,
-                &std::mem::take(&mut pending_draft),
-            ) {
-                ChatReadline::Line(line) => line,
-                ChatReadline::Eof => {
-                    let running = agent_registry.running();
-                    if running > 0 {
-                        eprintln!(
+            (None, None) => {
+                let initial = std::mem::take(&mut pending_draft);
+                // Inline mode replaces rustyline on this path rather than
+                // adding to it: two composers drawing a draft at once would
+                // put one copy inside the scroll region and one on the pinned
+                // row.
+                #[cfg(unix)]
+                let read = read_idle_chat_line(
+                    &mut rl,
+                    tui_bridge_guard.as_ref(),
+                    &visible_prompt,
+                    assistive_input,
+                    &initial,
+                );
+                #[cfg(not(unix))]
+                let read = read_chat_line(&mut rl, &visible_prompt, assistive_input, &initial);
+                match read {
+                    ChatReadline::Line(line) => line,
+                    ChatReadline::Eof => {
+                        let running = agent_registry.running();
+                        if running > 0 {
+                            eprintln!(
                             "exit waiting for {running} background agent(s); detached work will not be discarded"
                         );
-                        exit_after_queue = true;
+                            exit_after_queue = true;
+                            continue;
+                        }
+                        break;
+                    }
+                    ChatReadline::Interrupted => {
+                        eprintln!("^C (input cleared; Ctrl+D or /quit exits)");
                         continue;
                     }
-                    break;
+                    ChatReadline::Error(error) => {
+                        run_aggregate.record_non_success(kitsu_core::RunOutcomeClass::UserFault);
+                        eprintln!("input error: {error}");
+                        break;
+                    }
                 }
-                ChatReadline::Interrupted => {
-                    eprintln!("^C (input cleared; Ctrl+D or /quit exits)");
-                    continue;
-                }
-                ChatReadline::Error(error) => {
-                    run_aggregate.record_non_success(kitsu_core::RunOutcomeClass::UserFault);
-                    eprintln!("input error: {error}");
-                    break;
-                }
-            },
+            }
         };
         let line = line.trim().to_string();
         if line.is_empty() {

@@ -11,6 +11,21 @@ shapes may change in any minor release.
 
 ### Added
 
+#### Terminal UI (preview)
+
+- `KITSU_TUI=inline` opts into an inline viewport: a status row pinned to the
+  bottom of the terminal with the transcript scrolling above it, instead of one
+  status row repainted in place. The idle prompt inside it is kitsu's own
+  editor, so typing is echoed on the pinned row rather than by the terminal,
+  and a draft is carried over rather than dropped. The gate is matched exactly
+  — only `inline` selects it — and with the variable unset output is
+  byte-identical to before, so no existing session changes.
+
+  It is a preview and is missing things Rustyline gave the idle prompt: the
+  slash-command palette, Tab completion, history that persists across sessions,
+  and Ctrl+Z suspension. Ctrl+C clears the line and keeps the session, as it
+  does in classic mode.
+
 #### Background agents and herding
 
 - `/jobs view` groups the agent deck by state — agents needing input first,

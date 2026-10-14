@@ -87,6 +87,9 @@ pub(crate) struct BridgeGuard {
     previous_surface: Arc<dyn Surface>,
     /// The live-row setting as it was found, which may itself be `false`.
     previous_live_rows: bool,
+    /// The status text [`install`] painted, so the row can fall back to it
+    /// whenever there is no draft to show.
+    status: String,
 }
 
 /// Install the inline viewport, or do nothing at all in classic mode.
@@ -121,7 +124,30 @@ pub(crate) fn install(
         viewport,
         previous_surface,
         previous_live_rows,
+        status: status.to_string(),
     })
+}
+
+impl BridgeGuard {
+    /// Paint the idle prompt's draft onto the pinned viewport row.
+    ///
+    /// The row is the *status* row until the user starts typing and the
+    /// composer only while a draft exists: an empty draft repaints the status
+    /// text [`install`] put there, so an idle session's bottom row reads the
+    /// same whether or not a read is in flight.
+    ///
+    /// The viewport itself stays private. The wiring only ever needs a row on
+    /// screen, so the guard exposes that rather than handing out the
+    /// `Arc<InlineSurface>` and letting a caller `show`/`hide` it behind the
+    /// guard's back.
+    pub(crate) fn paint_draft(&self, prompt: &str, draft: &str) {
+        let row = if draft.is_empty() {
+            self.status.clone()
+        } else {
+            format!("{prompt}{draft}")
+        };
+        self.viewport.paint(&[row]);
+    }
 }
 
 impl Drop for BridgeGuard {
@@ -132,6 +158,90 @@ impl Drop for BridgeGuard {
         set_surface(self.previous_surface.clone());
         live::set_live_rows_enabled(self.previous_live_rows);
         self.viewport.hide();
+    }
+}
+
+/// How one inline idle-prompt read ended.
+///
+/// T0-S5b. The reader is the inline mode's answer to rustyline: with the
+/// classic live row stood down (finding F15) nothing paints a draft, so inline
+/// mode has no idle input path at all. This gives it one, built on the *same*
+/// [`kitsu_editor::TypeaheadEditor`] the during-turn collector uses, so the
+/// keymap is shared rather than reimplemented.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InlineRead {
+    /// Enter: the submitted line, without its terminator.
+    Submitted(String),
+    /// Ctrl+D on an empty draft, or a read that returned zero bytes.
+    Eof,
+    /// Ctrl+C on an empty draft. A non-empty draft is cleared instead and the
+    /// read continues, which is what the editor already does.
+    Interrupted,
+}
+
+/// Read one line from `input` through the shared editor, repainting through
+/// `paint` after every change.
+///
+/// Deliberately generic over the reader and the painter: no real descriptor,
+/// no termios, no viewport. Raw mode is the caller's business (it reuses
+/// `RawStdinGuard`, which leaves `c_oflag` alone so `ONLCR` keeps turning
+/// line feeds into CR LF), and `paint` is where the viewport row is drawn.
+/// That keeps the whole keymap-to-draft path unit-testable and leaves the PTY
+/// test with only the wiring to prove.
+///
+/// `paint` receives the current draft and the cursor's column **within** the
+/// draft as a char offset. `history` seeds the up/down walk.
+pub(crate) fn read_line_inline<R: std::io::Read>(
+    input: &mut R,
+    paint: &mut dyn FnMut(&str, usize),
+    history: &[String],
+) -> std::io::Result<InlineRead> {
+    use kitsu_editor::{EditorAction, FeedOutcome, TypeaheadEditor};
+
+    let mut editor = TypeaheadEditor::new(history.to_vec());
+    // The first frame, before any byte arrives: the row must show the (possibly
+    // empty) draft rather than whatever the previous paint left there.
+    paint(&editor.buffer_string(), editor.cursor());
+
+    let mut buffer = [0u8; 1024];
+    loop {
+        let count = match input.read(&mut buffer) {
+            // A descriptor that is done, not an empty raw read: the terminal
+            // is configured VMIN=1, so zero bytes means end of input.
+            Ok(0) => return Ok(InlineRead::Eof),
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        // Fed verbatim: the editor owns the keymap, the escape-sequence state
+        // machine and the bracketed-paste block, so the reader must not look
+        // for terminators itself (that would split a paste at its newlines).
+        let outcome = editor.feed(&buffer[..count]);
+        let mut changed = outcome.changed;
+        for action in outcome.actions {
+            match action {
+                EditorAction::Submit(line) => return Ok(InlineRead::Submitted(line)),
+                EditorAction::Eof => return Ok(InlineRead::Eof),
+                EditorAction::Interrupt => return Ok(InlineRead::Interrupted),
+                EditorAction::RecallRequest => {
+                    // Up on an empty, walk-free draft offers the *during-turn*
+                    // collector first refusal for the prompt queue. The idle
+                    // reader has no queue to recall from, so it declines and
+                    // takes the plain history walk; without this, Up would do
+                    // nothing at all here.
+                    let mut forced = FeedOutcome::default();
+                    editor.history_prev_forced(&mut forced);
+                    changed |= forced.changed;
+                }
+                // Tab completion at the idle prompt is deliberately out of
+                // scope for the preview, and Ctrl+Z/Ctrl+\ have no outcome
+                // variant yet, so both are swallowed rather than guessed at.
+                EditorAction::CompleteRequest | EditorAction::Suspend | EditorAction::Quit => {}
+            }
+        }
+        if changed {
+            paint(&editor.buffer_string(), editor.cursor());
+        }
     }
 }
 
@@ -440,5 +550,257 @@ mod tests {
             out.is_empty() && err.is_empty(),
             "and write no bytes at all"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // T0-S5b: the inline idle-prompt reader.
+    //
+    // These tests are pure: a chunked in-memory reader stands in for stdin and
+    // a closure stands in for the viewport, so none of them touch
+    // process-global state and none of them need `#[serial]`. What they pin is
+    // that bytes reach the shared `TypeaheadEditor` and that the paint callback
+    // reflects the result — the keymap itself is already covered by
+    // `kitsu-editor`'s own tests, so only a representative subset appears here.
+    // ---------------------------------------------------------------------
+
+    use super::{read_line_inline, InlineRead};
+
+    /// A reader that hands out one chunk per `read`, so a test can control how
+    /// input is split across reads the way a real terminal does. Returns
+    /// `Ok(0)` once drained, which the reader must treat as EOF.
+    struct Chunks(std::collections::VecDeque<Vec<u8>>);
+
+    impl Chunks {
+        fn new<const N: usize>(chunks: [&[u8]; N]) -> Self {
+            Self(chunks.iter().map(|chunk| chunk.to_vec()).collect())
+        }
+
+        /// One byte per `read`, which is what `RawStdinGuard` actually sets up:
+        /// it writes `VMIN = 1`, so a keystroke is a read. Feeding a whole
+        /// script as a single slice would make every per-keystroke paint
+        /// assertion vacuous, so the default helper below uses this.
+        fn bytewise(bytes: &[u8]) -> Self {
+            Self(bytes.iter().map(|byte| vec![*byte]).collect())
+        }
+    }
+
+    impl std::io::Read for Chunks {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some(chunk) = self.0.pop_front() else {
+                return Ok(0);
+            };
+            assert!(
+                chunk.len() <= buf.len(),
+                "test chunk larger than the buffer"
+            );
+            buf[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    /// Drive the reader over `bytes` with no history, returning the outcome and
+    /// every `(draft, cursor)` the paint callback was given, in order.
+    fn read_bytes(bytes: &[u8]) -> (InlineRead, Vec<(String, usize)>) {
+        read_with_history(bytes, &[])
+    }
+
+    fn read_with_history(bytes: &[u8], history: &[String]) -> (InlineRead, Vec<(String, usize)>) {
+        drive(Chunks::bytewise(bytes), history)
+    }
+
+    /// Run the reader over an explicit chunking.
+    fn drive(mut input: Chunks, history: &[String]) -> (InlineRead, Vec<(String, usize)>) {
+        let mut paints: Vec<(String, usize)> = Vec::new();
+        let outcome = {
+            let mut paint = |draft: &str, cursor: usize| paints.push((draft.to_string(), cursor));
+            read_line_inline(&mut input, &mut paint, history).expect("inline read")
+        };
+        (outcome, paints)
+    }
+
+    fn submitted(outcome: &InlineRead) -> &str {
+        match outcome {
+            InlineRead::Submitted(line) => line,
+            other => panic!("expected a submission, got {other:?}"),
+        }
+    }
+
+    /// Is `wanted` a subsequence of `paints`? The reader may coalesce or add
+    /// repaints (an initial empty paint, a repaint after submit), so the
+    /// assertions below pin the *order* of the interesting frames rather than
+    /// an exact frame list.
+    fn paints_in_order(paints: &[(String, usize)], wanted: &[(&str, usize)]) -> bool {
+        let mut it = paints.iter();
+        wanted
+            .iter()
+            .all(|(draft, cursor)| it.any(|(d, c)| d == draft && c == cursor))
+    }
+
+    /// Test 7. Printable bytes insert and a carriage return submits: a raw-mode
+    /// terminal sends CR for Enter, never LF, so CR is the case that matters
+    /// most. The submitted line excludes the terminator.
+    #[test]
+    fn inline_read_inserts_printables_and_submits_on_carriage_return() {
+        let (outcome, paints) = read_bytes(b"/help\r");
+        assert_eq!(submitted(&outcome), "/help");
+        assert!(
+            paints_in_order(&paints, &[("/", 1), ("/h", 2), ("/help", 5)]),
+            "every keystroke must be painted with its cursor column: {paints:?}"
+        );
+    }
+
+    /// Test 8. A line feed submits too: a scripted or `\n`-sending carrier must
+    /// not stall waiting for a CR.
+    #[test]
+    fn inline_read_also_submits_on_a_line_feed() {
+        let (outcome, _) = read_bytes(b"hi\n");
+        assert_eq!(submitted(&outcome), "hi");
+    }
+
+    /// Test 9. A representative slice of the shared keymap reaches the editor
+    /// through the reader: ←, Home/End, Backspace, Delete and the Ctrl+U/K/W
+    /// kills. Each is checked by what it leaves in the submitted line, which is
+    /// the editor's buffer, so this pins delivery rather than re-testing the
+    /// keymap.
+    #[test]
+    fn inline_read_delivers_the_editor_keymap() {
+        // Backspace (0x7f) deletes behind the cursor.
+        assert_eq!(submitted(&read_bytes(b"abc\x7f\r").0), "ab");
+        // Left arrow then an insert lands before the last char.
+        assert_eq!(submitted(&read_bytes(b"ac\x1b[DB\r").0), "aBc");
+        // Home (CSI H) then an insert goes to the front; End (CSI F) returns.
+        assert_eq!(submitted(&read_bytes(b"bc\x1b[Ha\x1b[Fd\r").0), "abcd");
+        // Delete (CSI 3~) removes ahead of the cursor.
+        assert_eq!(submitted(&read_bytes(b"abc\x1b[H\x1b[3~\r").0), "bc");
+        // Ctrl+U kills to the start, Ctrl+K to the end, Ctrl+W a word behind.
+        assert_eq!(submitted(&read_bytes(b"abc\x15xyz\r").0), "xyz");
+        assert_eq!(submitted(&read_bytes(b"abcdef\x1b[H\x1b[C\x0b\r").0), "a");
+        assert_eq!(submitted(&read_bytes(b"one two\x17\r").0), "one ");
+    }
+
+    /// Test 10. ↑/↓ walk the `history` argument, and the paint callback shows
+    /// the recalled line.
+    ///
+    /// Load-bearing detail: on an empty, walk-free draft the editor emits
+    /// `EditorAction::RecallRequest` rather than walking, because the
+    /// during-turn collector wants first refusal for the prompt queue. The idle
+    /// reader has no queue, so it must decline by calling
+    /// `history_prev_forced` — otherwise ↑ does nothing at the idle prompt.
+    #[test]
+    fn inline_read_walks_the_history_argument_with_the_arrows() {
+        let history = vec!["first".to_string(), "second".to_string()];
+
+        let (outcome, paints) = read_with_history(b"\x1b[A\r", &history);
+        assert_eq!(
+            submitted(&outcome),
+            "second",
+            "one Up from an empty draft recalls the most recent entry"
+        );
+        assert!(
+            paints_in_order(&paints, &[("second", 6)]),
+            "the recalled line must be painted: {paints:?}"
+        );
+
+        let (outcome, _) = read_with_history(b"\x1b[A\x1b[A\r", &history);
+        assert_eq!(
+            submitted(&outcome),
+            "first",
+            "two Ups walk one further back"
+        );
+
+        let (outcome, _) = read_with_history(b"\x1b[A\x1b[A\x1b[B\r", &history);
+        assert_eq!(submitted(&outcome), "second", "Down walks forwards again");
+    }
+
+    /// Test 11. Ctrl+D on an empty draft ends input.
+    #[test]
+    fn inline_read_reports_eof_for_ctrl_d_on_an_empty_draft() {
+        assert_eq!(read_bytes(b"\x04").0, InlineRead::Eof);
+    }
+
+    /// Test 12. Ctrl+D on a **non-empty** draft is not EOF. The editor already
+    /// decides this and what it does is delete-ahead (readline's behaviour), so
+    /// the reader must keep reading and the deletion must show up in the draft.
+    #[test]
+    fn inline_read_treats_ctrl_d_on_a_non_empty_draft_as_delete_ahead() {
+        let (outcome, _) = read_bytes(b"ab\x1b[D\x04\r");
+        assert_eq!(
+            submitted(&outcome),
+            "a",
+            "Ctrl+D mid-draft deletes the char under the cursor and keeps reading"
+        );
+        // And with the cursor at the end there is nothing to delete, so it is
+        // simply inert rather than an EOF.
+        let (outcome, _) = read_bytes(b"ab\x04\r");
+        assert_eq!(submitted(&outcome), "ab");
+    }
+
+    /// Test 13. Ctrl+C with a non-empty draft abandons the draft and keeps
+    /// reading; the paint callback must show the cleared row, so the user can
+    /// see the draft went away.
+    #[test]
+    fn inline_read_clears_a_non_empty_draft_on_ctrl_c_and_keeps_reading() {
+        let (outcome, paints) = read_bytes(b"abc\x03xy\r");
+        assert_eq!(submitted(&outcome), "xy");
+        assert!(
+            paints_in_order(&paints, &[("abc", 3), ("", 0), ("xy", 2)]),
+            "the cleared draft must be painted between the two drafts: {paints:?}"
+        );
+    }
+
+    /// Test 14. Ctrl+C on an empty draft is the interrupt. The reader only
+    /// reports it; re-raising `SIGINT` (raw mode masks `ISIG`) stays with the
+    /// caller, exactly as in the during-turn collector.
+    #[test]
+    fn inline_read_reports_interrupted_for_ctrl_c_on_an_empty_draft() {
+        assert_eq!(read_bytes(b"\x03").0, InlineRead::Interrupted);
+        // Also after a draft was cleared by a first Ctrl+C: the second one
+        // interrupts, which is the two-press behaviour users expect.
+        assert_eq!(read_bytes(b"abc\x03\x03").0, InlineRead::Interrupted);
+    }
+
+    /// Test 15. A bracketed-paste block stays **one** draft: its newlines
+    /// insert literally instead of submitting at the first one. The editor
+    /// implements this; what is pinned here is that the reader does not defeat
+    /// it by looking for `\r`/`\n` itself before handing bytes over.
+    #[test]
+    fn inline_read_keeps_a_bracketed_paste_as_one_draft() {
+        let (outcome, _) = read_bytes(b"\x1b[200~one\ntwo\x1b[201~\r");
+        assert_eq!(
+            submitted(&outcome),
+            "one\ntwo",
+            "a paste's newlines are content, not Enter"
+        );
+
+        // Same block arriving split across reads, including a split *inside*
+        // the paste's start marker, which is how a slow link delivers it.
+        let (outcome, _) = drive(
+            Chunks::new([b"\x1b[20", b"0~one\r\ntwo", b"\x1b[201~", b"\r"]),
+            &[],
+        );
+        assert_eq!(
+            submitted(&outcome),
+            "one\ntwo",
+            "the paste survives being split across reads (CR LF collapses to one newline)"
+        );
+    }
+
+    /// Test 16. An escape sequence split across two reads is still one key:
+    /// the editor is stateful across `feed` calls, so the reader must feed what
+    /// it got rather than requiring whole sequences per read.
+    #[test]
+    fn inline_read_handles_an_escape_sequence_split_across_reads() {
+        let (outcome, _) = drive(Chunks::new([b"ac\x1b", b"[D", b"B\r"]), &[]);
+        assert_eq!(submitted(&outcome), "aBc");
+    }
+
+    /// Test 17. A read returning zero bytes is EOF: the descriptor is closed
+    /// (a piped carrier draining, or the terminal going away), so the reader
+    /// must not spin on it.
+    #[test]
+    fn inline_read_reports_eof_when_the_reader_is_drained() {
+        assert_eq!(read_bytes(b"").0, InlineRead::Eof);
+        // Including mid-draft: unterminated typing then a closed descriptor.
+        assert_eq!(read_bytes(b"half-typed").0, InlineRead::Eof);
     }
 }

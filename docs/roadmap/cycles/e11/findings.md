@@ -498,3 +498,113 @@ made — whether an impossibly short terminal should fall back to the classic
 renderer or run with no status row — so it is recorded here rather than guessed
 at. T0-S5c's `hide` is correct for every geometry `show` can currently produce,
 including the degenerate one.
+
+## F20 — the inline idle prompt loses rustyline's history and completion
+
+Found: T0-S5d, while scoping the idle input path. Not a defect in new code — a
+consequence of the design, recorded so it is a known cost rather than a
+surprise.
+
+Inline mode replaces rustyline at the idle prompt with a raw-byte reader
+feeding `kitsu_editor::TypeaheadEditor`, because the viewport owns the bottom
+rows and rustyline would draw its own prompt line inside the scroll region
+with no knowledge of the region at all.
+
+What the editor already provides: insertion, cursor motion, Home/End,
+Backspace/Delete, the Ctrl+U/K/W kills, Up/Down history over a list it is
+handed, bracketed paste as a single draft, and Ctrl+D EOF on an empty draft.
+
+What is lost at the idle prompt in inline mode:
+- **persistent history across sessions** — the editor is handed a history
+  list, but nothing yet seeds it from, or appends it to, rustyline's history
+  file, so Up/Down sees only what the current session typed;
+- **completion** — rustyline's slash-command and path completion has no
+  equivalent in the editor's keymap, so Tab does nothing;
+- **reverse search** (Ctrl+R) and the rest of rustyline's emacs bindings
+  beyond the subset the editor implements;
+- **the live slash-command palette** — and this is the big one, which I
+  undersold when first writing this finding. T0-S5d's pseudo-terminal
+  transcript shows that typing `/cont` at the idle prompt opens a bordered
+  palette, filtered as you type, with `type to filter · Tab to complete`, up
+  to a dozen rows of it. That is a rustyline *helper*, so it goes with
+  rustyline. It is the most visible thing a user loses, far more so than
+  history;
+- **the composer footer** (`╰ model … │ cwd … ╯`), likewise a helper.
+
+A geometry consequence that follows from the above: the classic composer is
+already **two** rows (prompt plus footer) and the palette up to twelve, while
+the bridge installs the viewport with `viewport_rows = 1`. Restoring the
+palette therefore cannot be done without raising the viewport row count and
+re-pinning the region arithmetic, and the existing tests derive their expected
+bottom row as `height - 1`, so they change with it. That makes the palette and
+the multi-line composer **one** card rather than two, and it interacts with
+F16 (resize unhandled) and F19 (short-terminal clamp).
+
+This is acceptable for a renderer gated behind `KITSU_TUI=inline` and
+documented as a preview, and it is exactly the sort of regression that must not
+reach a default. **Inline mode cannot become the default until history
+persistence and completion are answered**, which is a milestone exit condition,
+not a detail. The design's composer requirement already implies both.
+
+Carded rather than fixed here because each is independently sizeable: seeding
+and appending the history file is a small card, while completion needs a
+decision about whether the editor grows a completion hook or the binary drives
+it around the editor.
+
+## F21 — the inline reader swallows Ctrl+Z and Ctrl+backslash
+
+Found: T0-S5d, by the test author, as a gap it deliberately did not pin.
+
+`RawStdinGuard` clears `ISIG`, so the suspend and quit characters arrive as
+bytes rather than signals. The during-turn collector handles this by
+re-raising the signal the kernel would have sent, and the idle reader does the
+same for Ctrl+C — but `InlineRead` has no variant for suspend or quit, so the
+editor sees them as unhandled bytes and the reader drops them.
+
+The user-visible effect: **Ctrl+Z does not suspend kitsu** at an inline idle
+prompt. It is not a corruption and nothing is lost, but it breaks a shell
+convention every terminal program is expected to honour, and silently.
+
+Deliberately not fixed in T0-S5d, which was already the largest card in the
+milestone. The fix is small but not free: `InlineRead` grows `Suspend` (and
+probably `Quit`), the caller re-raises `SIGTSTP`, **and** the viewport must
+release its scroll region before the process stops and reinstall it on
+`SIGCONT` — otherwise the shell inherits a terminal with a region still set,
+which is the one genuinely user-hostile outcome here. That resume path is the
+real work, and it belongs with the other signal handling rather than bolted
+onto a reader.
+
+
+## F14 — resolved: raw INPUT mode does not staircase, because output flags stay on
+
+F14 warned that a raw-mode backend must emit CRLF, since raw mode clears
+`ONLCR` and a lone line feed then moves down without returning to column 1.
+That drove `InlineSurface::transcript_line` to emit `\r\n` explicitly, and it
+left the open question of what would happen to the binary's several hundred
+direct `println!` writers once a session held raw mode.
+
+**Resolved in T0-S5d, and the premise was too broad.** There are two different
+raw modes in this tree:
+
+- `crossterm::terminal::enable_raw_mode`, used by `TuiRuntime`, goes through
+  `cfmakeraw` and **does** clear `OPOST`/`ONLCR`. F14 is correct about this one.
+- `RawStdinGuard`, the live row's own, modifies **only `c_lflag`**
+  (`ICANON|ECHO|ISIG`) and leaves `c_oflag` entirely alone. `OPOST`/`ONLCR`
+  stay on, so the terminal keeps turning a line feed into a carriage-return
+  line feed.
+
+The inline idle reader reuses `RawStdinGuard`, so **nothing staircases and no
+writer needs routing**. Measured rather than assumed: on a real
+pseudo-terminal, with the guard demonstrably engaged (the bracketed-paste
+toggles bracket the lines in question), the child emits `\n` and the master
+reads `\r\n`; every report line of a command run on the raw idle path starts
+at column 1. A regression test holds this, and its precondition fails if
+Rustyline is still running the prompt, so it cannot silently degrade into
+re-measuring the cooked path.
+
+This also completes the Q3 answer that T0-S5b could only give for cooked mode.
+The remaining exposure is narrow and worth stating: anything that reaches for
+crossterm's raw mode on the binary's path would clear `OPOST` and break every
+one of those writers at once. `transcript_line` keeps its explicit CRLF, which
+is harmless when `ONLCR` is on (a redundant carriage return) and correct if a
+future path does clear `OPOST`.
