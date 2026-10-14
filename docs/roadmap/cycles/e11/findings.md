@@ -563,13 +563,12 @@ Backspace/Delete, the Ctrl+U/K/W kills, Up/Down history over a list it is
 handed, bracketed paste as a single draft, and Ctrl+D EOF on an empty draft.
 
 What is lost at the idle prompt in inline mode:
-- **persistent history across sessions** — the editor is handed a history
-  list, but nothing yet seeds it from, or appends it to, rustyline's history
-  file, so Up/Down sees only what the current session typed;
+- ~~**persistent history across sessions**~~ — **this was false, see the
+  correction below**;
 - **completion** — rustyline's slash-command and path completion has no
   equivalent in the editor's keymap, so Tab does nothing;
-- **reverse search** (Ctrl+R) and the rest of rustyline's emacs bindings
-  beyond the subset the editor implements;
+- ~~**reverse search** (Ctrl+R)~~ — **this was false, see the correction
+  below**;
 - **the live slash-command palette** — and this is the big one, which I
   undersold when first writing this finding. T0-S5d's pseudo-terminal
   transcript shows that typing `/cont` at the idle prompt opens a bordered
@@ -750,3 +749,107 @@ several consecutive runs, and dropped if it cannot be made deterministic. Until
 then the gap is covered by the human terminal matrix, which should include
 Ctrl+Z at an idle prompt followed by `fg`, confirming both the screen and the
 shell's own scrolling area afterwards.
+
+
+## F20 — correction: two of the claimed losses were never real
+
+Established in T0-S8 by testing rather than reading. **I wrote two false claims
+into this finding and then repeated them in `README.md`, `CHANGELOG.md`,
+`docs/ux-design.md`, the T0-S6 go/no-go record and a production doc comment.**
+Telling users a feature is missing when it works is a defect in its own right,
+so the correction is recorded here in full rather than quietly edited in.
+
+**Cross-session history works.** Inline mode borrows rustyline's persistence
+wholesale while never running its composer: `main.rs:17033` loads the history
+file at startup (gated on `!no_session`), `read_idle_chat_line` hands the inline
+reader exactly that list, `add_history_entry` at `:17174` sits on the **common
+path** after the read — outside the match on which reader produced the line — and
+`:18010` saves on exit. Proven end to end: two real sessions sharing one `HOME`,
+with the test also reading `$HOME/.kitsu/history` directly as independent
+evidence the save ran.
+
+A detail worth keeping, because it reads as a bug until explained: the first
+version of that test pressed Up **once** and recalled `/quit`, because
+`add_history_entry` is on the common path and therefore records `/quit` too. A
+genuinely empty history would have had nothing to paint at all, so that failure
+was itself proof the walk was reading the saved file.
+
+**Reverse search works, but not its status line.** `TypeaheadEditor` resolves
+the whole of search mode internally and emits no `EditorAction` for any of it,
+so the reader has nothing to swallow — unlike `CompleteRequest`, which it
+explicitly drops. Ctrl+R narrows, a second Ctrl+R cycles, Ctrl+G restores the
+prior draft, and an accepted match is ordinary editable text. What is missing is
+the `⌕ reverse-search '…'` indicator.
+
+### The remaining losses share one cause, which makes them one card
+
+Tab completion, the slash-command palette **and** the reverse-search status
+indicator are all rendered into the during-turn row's **hint slot**. The inline
+paint callback is `(draft, cursor)` — there is nowhere to put a hint. So one
+seam change restores all three, and carding them separately would be three
+attempts at the same fix.
+
+This narrows what blocks the default considerably: not "the inline prompt is
+missing most of what rustyline gave it", but "the inline paint seam carries no
+hint slot".
+
+
+## F22 — resolved: the suspend cycle now has end-to-end coverage
+
+Closed in T0-S8, deliberately on the second attempt rather than the first. Both
+reasons for deferring it had expired: the feature existed, so stability could be
+measured, and the shared harness was open to change.
+
+The test types a draft, sends Ctrl+Z, and from **outside** the process observes
+that the child really stops (`WIFSTOPPED`, answered with one `SIGCONT`), that
+the scroll region is released before the stop and set again after it, and that
+the draft survives — a bare carriage return written *while the child was
+stopped* submits the replayed draft.
+
+Two environmental hazards had to be found and handled, and both generalise to
+any future test of this kind:
+
+- **An inherited `SIGTSTP` disposition silently defeats it.** `SIG_IGN`
+  survives fork and exec, and a non-interactive shell ignores job-control
+  signals in a forked subshell — `/proc/self/status` showed `SigIgn` bits
+  20-22 set inside a command substitution but clear under a plain redirect. The
+  child inherited that, so raising the stop signal was a no-op and the test
+  failed 5/5 under one invocation while passing 5/5 under another. The harness
+  now resets the disposition to `SIG_DFL` in `pre_exec` and calls
+  `setpgid(0,0)`, since POSIX discards the stop signal in an orphaned process
+  group.
+- **`waitpid` needs `WUNTRACED`** to see a stopped child at all; the previous
+  card had already identified this, and it is why the harness could tolerate a
+  stop without detecting one.
+
+Evidence: 40 consecutive full-suite runs in debug and 5 in release, plus 5/5
+under the invocation that had failed 5/5 before the fix.
+
+
+## F23 — a pseudo-terminal test was failing ~7% of the time on this branch
+
+Found in T0-S8, in a test I committed two cards earlier, and measured properly:
+on the **unmodified baseline** with the new work stashed,
+`inline_mode_echoes_the_idle_draft_in_the_viewport_row` failed **2 of 30**
+full-suite runs.
+
+**Cause: a race on the very first keystroke.** The scripts triggered their first
+input on the banner, which can arrive while the terminal is still canonical with
+echo and signal generation on. In that window the terminal echoes the typed
+characters itself, *inside* the scroll region — which is precisely what that
+test asserts must not happen — and a control byte like Ctrl+Z is swallowed by
+the terminal as its own suspend character rather than reaching the editor.
+
+**Fix:** every script that types at the idle prompt now triggers on the
+bracketed-paste enable sequence, which `RawStdinGuard::engage` writes
+immediately after its `tcsetattr`, making it proof that raw mode is already on.
+Measured 0 failures in 40 full-suite runs afterwards.
+
+**Why this is worth a finding rather than a quiet fix.** First, it was a real
+intermittent on this branch, not a hypothetical. Second, the lesson generalises:
+*any* pseudo-terminal test that sends input must synchronise on evidence that
+the program has taken the terminal, not on the program having merely printed
+something. Triggering on output proves the program is alive, not that it is
+ready. Third, it is a reminder that a green suite is not evidence of a
+deterministic suite — this one had been green every time I ran it, and was
+nonetheless failing one run in fifteen.

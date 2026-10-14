@@ -114,7 +114,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T0-S5c fix the F18 teardown defect | done | this commit |
 | T0-S5d idle input path | done | f9cdd75 |
 | T0-S6 go/no-go record, F19 fix, Q4 measured | done | fabbee3 |
-| T0-S7 Ctrl+Z suspend/resume (F21) | done | this commit |
+| T0-S7 Ctrl+Z suspend/resume (F21) | done | 516aaa6 |
+| T0-S8 verify F20 claims, close F22, fix F23 flake | done | this commit |
 
 With T1-S6 done, **milestone T1 is complete**: kitsu now exposes its
 background agents to the outside three ways — a grouped and explainable deck
