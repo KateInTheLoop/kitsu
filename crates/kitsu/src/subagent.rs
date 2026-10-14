@@ -1215,10 +1215,18 @@ impl AgentRegistry {
                     // parked request resolves `Interrupt` rather than being
                     // dropped silently, and the thread leaves `Blocked` so the
                     // terminal transition starts from `Running` as ever.
+                    record.thread.unblock();
                     if let Some(parked) = record.pending_prompt.take() {
+                        // Recorded here, not through `resolve_prompt`: the
+                        // prompt is already taken under this lock, and the
+                        // outcome must land before `finish` closes the
+                        // timeline (F43).
+                        record.thread.record_approval_outcome(
+                            parked.kind,
+                            thread::AgentApprovalOutcome::Cancelled,
+                        );
                         replies.push(parked.reply);
                     }
-                    record.thread.unblock();
                     record.status = AgentStatus::Cancelled(reason.to_string());
                     record
                         .thread
@@ -4429,6 +4437,186 @@ mod tests {
             approvals[1].contains("timed out"),
             "a timeout is not a denial: {approvals:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // F43: a cancellation is recorded as a cancellation, not as a timeout.
+    //
+    // Found while writing these tests, and WIDER than the finding states:
+    // `cancel_matching` does not go through `resolve_prompt` at all. It
+    // takes `pending_prompt` itself and sends `Decision::Interrupt` on the
+    // reply channel directly, so today a cancelled park records **no
+    // outcome entry whatsoever** — the request entry is left dangling. The
+    // first assertion each test below makes is therefore a count.
+    //
+    // STUB: `AgentApprovalOutcome::Cancelled` does not exist, so these
+    // tests fail to COMPILE until it does.
+    // ---------------------------------------------------------------------
+
+    /// `/jobs stop <id>` on a parked agent. The record must say the approval
+    /// was cancelled, and the exact-equality assertion is what keeps it from
+    /// being recorded as the timeout it is not.
+    #[tokio::test]
+    async fn cancelling_a_blocked_agent_records_the_approval_as_cancelled() {
+        let registry = AgentRegistry::new();
+        let id = registry
+            .start("cancelled while blocked".to_string())
+            .unwrap();
+        let sender = registry.prompt_sender();
+        let answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+
+        assert!(matches!(
+            registry.cancel(id).await,
+            AgentCancelOutcome::Cancelled(_)
+        ));
+
+        let approvals = approval_entries(&registry, id);
+        assert_eq!(
+            approvals,
+            vec![
+                "approval to write a file requested".to_string(),
+                "approval to write a file cancelled".to_string(),
+            ],
+            "a deliberate cancellation is recorded as a cancellation"
+        );
+
+        // Requirement 4: the cancellation itself must not regress.
+        assert_eq!(
+            answer
+                .await
+                .expect("cancellation resolves the gate rather than dropping it"),
+            Decision::Interrupt
+        );
+        assert_eq!(
+            progress_status(&registry, id),
+            Some(AgentProgressStatus::Cancelled)
+        );
+        assert_eq!(registry.snapshot().blocked, 0);
+        assert_eq!(
+            registry.answer(id, Decision::AllowOnce),
+            AgentAnswerOutcome::NotBlocked
+        );
+    }
+
+    /// `/jobs stop-all` takes the same path for a parked agent, so it must
+    /// leave the same record.
+    #[tokio::test]
+    async fn cancelling_all_records_a_blocked_agent_s_approval_as_cancelled() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("cancelled by stop-all".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+
+        assert_eq!(registry.cancel_all().await.len(), 1);
+        assert_eq!(
+            approval_entries(&registry, id),
+            vec![
+                "approval to write a file requested".to_string(),
+                "approval to write a file cancelled".to_string(),
+            ],
+        );
+        assert_eq!(
+            answer.await.expect("stop-all resolves the gate"),
+            Decision::Interrupt
+        );
+    }
+
+    /// The T2-S6 invariant, restated for the fix: EVERY resolution leaves
+    /// exactly one outcome entry — never none, never two. A cancelled park
+    /// still has B3's timer armed against it, and that timer later calls
+    /// `resolve_prompt(.., Some(token), Interrupt)`; if the fix records at
+    /// the cancel site without the timer's park check still rejecting the
+    /// dead park, the entry would be followed by a second "timed out".
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_park_records_exactly_one_outcome_even_after_its_timer_fires() {
+        let registry = AgentRegistry::new();
+        let id = registry
+            .start("cancelled then timed out".to_string())
+            .unwrap();
+        let sender = registry.prompt_sender();
+        let answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+
+        assert!(matches!(
+            registry.cancel(id).await,
+            AgentCancelOutcome::Cancelled(_)
+        ));
+        assert_eq!(
+            answer.await.expect("cancellation resolves the gate"),
+            Decision::Interrupt
+        );
+
+        // Let the armed B3 timer fire on the park it no longer owns.
+        tokio::time::advance(DEFAULT_AGENT_BLOCK_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            approval_entries(&registry, id),
+            vec![
+                "approval to write a file requested".to_string(),
+                "approval to write a file cancelled".to_string(),
+            ],
+            "one park, one outcome: the late timer must not append a second \
+             outcome nor rewrite the cancellation as a timeout"
+        );
+    }
+
+    /// Requirement 2: the case that already worked must keep working, and it
+    /// is the case with no human present. Exact equality, so the fix cannot
+    /// blur the timeout into the new cancellation spelling either.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_approval_is_still_recorded_as_timed_out_exactly() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("never answered".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+
+        tokio::time::advance(DEFAULT_AGENT_BLOCK_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        assert_eq!(
+            answer.await.expect("the timeout resolves the gate"),
+            Decision::Interrupt
+        );
+
+        assert_eq!(
+            approval_entries(&registry, id),
+            vec![
+                "approval to write a file requested".to_string(),
+                "approval to write a file timed out".to_string(),
+            ],
+            "an unattended timeout stays a timeout"
+        );
+        assert_eq!(
+            progress_status(&registry, id),
+            Some(AgentProgressStatus::Running),
+            "a timeout resumes the agent; it does not cancel it"
+        );
+    }
+
+    /// An answered park is unaffected by the fix: `answer()` still routes
+    /// through the shared path and records the human's decision.
+    #[tokio::test]
+    async fn answering_a_blocked_agent_is_not_recorded_as_a_cancellation() {
+        for (decision, expected) in [
+            (Decision::AllowOnce, "approval to write a file allowed once"),
+            (
+                Decision::AllowAlways,
+                "approval to write a file allowed always",
+            ),
+            (Decision::Deny, "approval to write a file denied"),
+        ] {
+            let (registry, id, _resolved) = answered_registry(decision).await;
+            assert_eq!(
+                approval_entries(&registry, id),
+                vec![
+                    "approval to write a file requested".to_string(),
+                    expected.to_string(),
+                ],
+                "{decision:?} is the human's answer, not a cancellation"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
