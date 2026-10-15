@@ -92,6 +92,14 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- `--reduced-motion` (and `KITSU_REDUCED_MOTION=1`) now affects the inline
+  viewport, not just the wait indicator: the status row stops repainting just
+  because the clock moved. It still updates the moment something actually
+  changes — a prompt queued, an agent needing input — because hiding that to
+  keep the row quiet would defeat the point of the tag.
+- The viewport's status row is now capped at 60 repaints a second in the painter
+  itself, rather than relying on how often its caller happens to ask. Collapsed
+  frames keep the newest state rather than dropping it.
 - **`/tui [classic|inline]`** switches the renderer mid-session without losing
   the conversation, and reports the live renderer when called bare. `fullscreen`
   is refused until it exists, and `/tui` typed during a turn is refused rather

@@ -470,6 +470,36 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   Measured by a benchmark, not a CI gate (see Stage 2).
 - **N3** Frame budget: coalesce redraws to ≤ 60 fps; use synchronized output
   (`CSI ?2026 h/l`) when the terminal supports it; never redraw history.
+
+  **Amended in T3-S12 on two points, because the original said what but not
+  where.**
+
+  **(a) The budget is enforced in the painter, not inherited from a caller.**
+  Before this card it held only because one caller slept 50 ms between ticks.
+  Measured: a loop moving a single **non-elapsed** field defeated the
+  byte-identity dedupe entirely and reached roughly **109 000 frames per second
+  in debug and 400 000 in release**. After the fix both profiles sit flat at
+  **60**. That matters because the epic had already grown a **second** author of
+  this row (`clear_approval_modal`), and a budget that lives in one caller's
+  sleep is not a budget.
+
+  **Coalescing means collapse the intermediate frames and keep the latest —
+  never discard what arrived during the window.** The implementation records the
+  dedupe key only when it actually paints, so a suppressed call consumes
+  nothing and the next call past the window recomposes from the fields **as they
+  stand then**. Nothing is latched and no timer thread exists. The dedupe is
+  checked **before** the window, so an unchanged row still costs zero bytes and
+  does not burn a frame.
+
+  **(b) Synchronized output is DEFERRED, with the reason recorded.** Mode 2026
+  can only be detected in band with DECRQM and **reading the reply on stdin** —
+  which the input loop owns in raw mode while also serving approval reads. A
+  probe that waits for a report that may never arrive is a **hang**; with a
+  timeout it is a **sleep on the first frame**; emitting the mode blind leaves
+  `?2026h` as **visible garbage** on terminals that do not implement it. The row
+  is one line, so tearing is not a live defect. Two tests pin that the bytes are
+  **never emitted**, each documenting the test to write once a probe exists:
+  emitted after a positive report, never without one.
 - **N4** Memory in `fullscreen` MUST be bounded by a configurable **cell
   ring** (default 10 000 lines, oldest evicted), not by conversation length.
   Kitsu persists only `messages`, so the ring is the sole source for the
@@ -598,6 +628,23 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   definition, `cli.rs`); there it disables spinner animation, counter flashes,
   and periodic age refresh. Its output is not covered by N1's byte-identical
   rule.
+
+  **Clarified in T3-S12, because this listed what stops and not what must
+  keep going.** "Static" must not be read as "frozen". Under reduced motion the
+  status row **does not repaint merely because time passed** — the elapsed
+  segment's periodic refresh is the animation this requirement names. But the
+  **queue tag and the ambient agent tag keep updating**, because those are
+  **state, not animation**: `[2 blocked]` appearing is an event the user must
+  act on, and suppressing it to make the row quiet would hide a blocked agent —
+  defeating the very affordance R5 and A8 exist for.
+
+  The implementation draws that line in the **dedupe key** rather than in what
+  is painted: the key is the row recomposed with `elapsed: None`, so a
+  clock-only change compares equal and no paint follows, while every other field
+  still changes the key. The bytes written are always the real row **including**
+  elapsed, so when a state change does paint, the age shown is current rather
+  than stale by construction. **Reduced motion removes the periodic refresh, not
+  the field.**
 
 ---
 
