@@ -1287,7 +1287,25 @@ Attach does not move the agent to the foreground or take its stdin; it is a
   via `x` in the view or `/jobs stop`). `Ctrl+Z` keeps its existing meaning
   (suspend kitsu) and is not a detach key.
 
-  **`/detach` is registered and dispatched but NOT wired (F77).** Its arm is
+  **`/detach` is wired (F77, F79).** It answers `detached from agent N; it keeps
+  running` and records `{"kind":"detach","agent":N}`; with nothing attached it
+  answers `not attached to a background agent` as an error. **The division is
+  deliberate: the two keys are silent and the command answers.** `←` and
+  `Ctrl+X d` deliver their feedback where the eye already is — the prompt label
+  changing under the caret — while a submitted line moves the eye into the scroll
+  region, which is the surface with somewhere to put a reply (T2-S5b). The
+  success line repeats the "stops nothing" clause because it is the last moment
+  a user who read `/detach` as "cancel the agent" can be told otherwise.
+
+  **F79, fixed in the same card:** `/jobs view` kept only the overlay's `shown`
+  and **discarded the attachment**, so attaching from that route silently
+  attached to nothing while the chord and arrow routes worked. Attachment now
+  works from every route into the view. The lesson is recorded in F79: **when a
+  function starts returning something new, every caller is a suspect, and callers
+  are enumerable** — this one changed from `-> bool` to `-> AgentViewExit` and
+  had exactly two callers.
+
+  **Superseded note (F77, kept for the record):** Its arm is
   unconditional — it always answers `not attached to a background agent` —
   because the slash dispatcher has no access to the composer's session binding.
   The arm's own comment says *"nothing in this card can attach"*, which was

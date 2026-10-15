@@ -95,9 +95,12 @@ shapes may change in any minor release.
 - **Attach to a background agent from the agent view.** `Enter` or `→` on the
   selected row attaches and closes the view; the composer prompt then names the
   agent, so you can see what your next line is aimed at. `←` on an empty
-  composer or `Ctrl+X d` returns you to the session. (`/detach` is registered but
-  **not yet wired** — it always reports that nothing is attached, because the
-  slash dispatcher cannot yet see the composer's attachment.)
+  composer, `Ctrl+X d`, or **`/detach`** returns you to the session. The keys are
+  silent, because the prompt label changing back is the answer; `/detach` says
+  `detached from agent N; it keeps running`, since a typed command deserves a
+  reply and that is the last moment to say that detaching is not stopping.
+  Attaching works from **either** route into the view — the `Ctrl+X a` chord, the
+  double `←`, or `/jobs view`.
   Attaching a finished agent counts as collecting its result, exactly as `Space`
   does. Detaching stops nothing. Leaving the view with `q` or `Esc` does not
   detach.
