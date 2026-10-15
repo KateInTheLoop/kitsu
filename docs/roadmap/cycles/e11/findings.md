@@ -3763,3 +3763,93 @@ This is not new with `n` — `s` and `/` already have it. `n` only makes it thre
 The honest fix is for the editor to learn an "unbracketed burst" rule of its own, or for the overlay to bracket-wrap what it hands a line. Either is a change to a parser three surfaces now depend on, with F68's rejection as the precedent for how badly that can go — so it is a card, not a side effect of a rename fix.
 
 **The consequence for this card:** the existing test `a_multi_line_paste_into_an_overlay_text_prompt_is_content_and_its_tail_never_runs` passes today only because the burst heuristic turns its **unbracketed** chunk into one paste. Once `n` is on the bypass that premise is gone and both its assertions fail. **Re-expressing it with a bracketed paste is authorised** — the overlay enables `ESC[?2004h` on entry, so a real paste in this surface *is* bracketed, which makes the bracketed form the more faithful test, not the weaker one. Its intent — a paste is content and its tail never runs — must survive unchanged.
+
+## F73 — `overlay_visible_rows` is registry order, not the order the user sees
+
+Found by an agent **implementing** a test rather than reading about it: its first custody test asserted a row order taken from `overlay_visible_rows` and failed on **its own precondition**.
+
+`overlay_visible_rows` returns `agent_view_rows(registry)` filtered — verified, it is the **registry's** order. **A2's display order is computed elsewhere**, inside the selection, via `agents_view::group_rows`/`display_order`. So the function whose name says "visible" does not yield the sequence the user sees.
+
+**Anyone writing a row-order expectation from it will get this wrong the same way.** The honest fix in a test is to derive the order through `group_rows`, which is what the passing version does.
+
+Worth noting *why* the naming misleads: the function is the single place the **filter** is applied (T4-S5), which is what "visible" refers to — membership, not sequence. Both facts are true and the name only carries one of them.
+
+## F74 — `StatusFields` has twelve construction sites and not one uses `..Default::default()`
+
+Raised as a blocker rather than worked around: A5's `attached · agent N` status segment needs a new field on `kitsu_render::live::StatusFields`, and **adding a field is a compile error in nine existing test modules** across `kitsu-tui` and `tui_bridge`.
+
+Verified by counting: **12 sites** (`kitsu-tui/src/status.rs` 8, `kitsu-render/src/live.rs` 1, `kitsu/src/tui_bridge.rs` 3), and **zero** of them use `..Default::default()`.
+
+**So every future field on this struct is a cross-crate, multi-test mechanical edit** — which is a standing tax on exactly the kind of change this epic keeps making (T3-S5 added the status row, T4 keeps adding things to it). It also pushes an implementer toward the wrong instinct: a struct that is painful to extend invites a second struct beside it, which is the duplication **F45** was closed by removing.
+
+**Not fixed here**, and the status segment is **its own card**: there is no failing test driving the field yet, so authorising the mechanical edit now would mean an implementer changing nine test modules with nothing red to justify it. The card writes the test first, then takes the edit with that authorisation. The prompt label carries the legibility argument for the `←` rule on its own meanwhile.
+
+The cheap mitigation when that card runs is to give the struct a `Default` and convert the sites to `..Default::default()`, so the *next* field costs one line instead of twelve.
+
+## The two rulings that go with T4-S6a
+
+**`Ctrl+X 1..9` is correctly out of scope, and the reason is a design constraint worth keeping.** §4.7 says "attach agent N", and the digit **cannot be an id**: ids pass 9 after nine spawns, so a digit-keyed id binding would be dead for `#10` — and *worse than dead*, it would be **wrong** once `#1` is pruned and `#11` exists. So the digit must be a **1-based ordinal over A2's display order**, which means resolving it against the registry at the composer's byte filter, a point that **has no registry**. That coupling is its own card.
+
+**The `⛩` milestone seam was rejected as a card, correctly.** It would pin two format strings over a `milestone_line` helper that already exists — so asserting the wording proves nothing — and **F71** says a visibility claim must go through the surface that paints it. The attach milestone is only observable where something can attach, and the detach-recap milestone is the recap's header and meaningless without the buffer. Neither was pinned, and the test banner says so. **Declining to write a test that would pass by construction is the right outcome**, and this is the fourth time in this epic.
+
+## F75 — REJECTED: `Enter` closes the agent view and attaches nothing, because the attachment has no reader
+
+**T4-S6a was rejected on review for this, and the gap is mine as much as the agents'.**
+
+`OverlayState::attaching` is **written** in the overlay's `Enter`/`→` arm (`main.rs:7956`) and **never read by production code** — verified: every other occurrence in the file is a test. Meanwhile `read_chat_line_inline` hardcodes `let attached: Option<u64> = None;` (`main.rs:6292`), so `composer_prompt` never shows a label and `read_line_inline_with_keys` can never see an attachment, which means **`←` and `Ctrl+X d` can never detach in production** either.
+
+All twelve tests pass, because they call the reader with `attached: Some(3)` directly and the overlay's state directly. **The two halves are each tested and nothing tests that they are connected.**
+
+### Why this is a rejection and not a follow-up
+
+Before this card, `Enter` and `→` were **not decoded at all** — pressing them did nothing. After it, `Enter` **closes the view** and still does nothing. That is **worse than the starting state**: closing the view is a visible response that implies the action succeeded, so the user believes they attached and then finds no label, no stream and no detach. A key that silently does nothing is a missing feature; a key that *appears* to work is a defect.
+
+This project has rejected "half-shipped" twice already on weaker grounds — **F38**'s lesson that a command which works but cannot be found is half-shipped, and the two cards that added a key to the help because a working-but-unadvertised key is a defect a user meets. This is the same standard pointed the other way.
+
+### How it got through, which is the part worth keeping
+
+**The test author designed the gap in, flagged it honestly, and gave a reason I should have challenged:** that production passes `None` because "nothing can attach yet, and inventing a carrier for session state would be a second source of truth". **I read that and briefed the implementer without questioning it**, so the implementer built exactly what it was asked for and reported exactly what it did.
+
+The reason does not hold. Attachment must **outlive** the overlay — `OverlayState` is per-invocation — so the composer loop's session state is not a *second* home for it, it is the **only** home it can have. Calling a necessary carrier a second source of truth is how a real wiring gap gets a principled-sounding justification.
+
+**This is the F57 family again, and the fifth time in this epic**: *a single source of truth guarantees readers agree with it; it guarantees nothing about whether anyone acts on what they read.* The variants so far — a registered command nobody dispatched, a mirror that no longer reflects, a legality rule no keystroke could satisfy, a message only the test could see, and now **a state nobody reads.**
+
+### What the rework must deliver
+
+Carry the attachment **out of the overlay and into the composer loop**, so the three keys work end to end: `Enter`/`→` attaches and the prompt says so, `←` on an empty composer detaches, `Ctrl+X d` detaches. The seam is the implementer's to find — I am not specifying a mechanism I have not read — but **if it genuinely cannot be done without duplicating state, that is a stop-and-report, not a workaround.**
+
+**And it needs a test that fails when the halves are disconnected**, which is the assertion this card never had. The twelve existing tests stay as they are.
+
+### F75 resolved, and the rework proved it the hard way
+
+The attachment now has a reader. It lives as **one local in `run_interactive`'s composer loop**, borrowed down into the inline reader, with two production carriers connecting the halves: the overlay runner returns `AgentViewExit { shown, attached }`, and `apply_agent_view_exit` applies it. Verified: `apply_agent_view_exit` is called from production (`main.rs:6382`), the session binding exists (`:19761`) and is passed down (`:19844`), and the hardcoded `let attached: Option<u64> = None;` is **gone** — zero occurrences.
+
+**Why that is the only honest home, which is the answer the first attempt got wrong:** `OverlayState` is per-invocation *and attach closes the view*, so by the time a composer could read `state.attaching` the state holding it no longer exists; and `read_chat_line_inline` returns on every submitted line, so a local there cannot hold it either. Everything else is **derived** from it per read — the prompt label and the reader's key routes — so there is no second field to drift.
+
+A distinction the rework added that nobody asked for and that is right: **leaving the view is not detaching.** A view closed with `q`/`Esc`, or never shown, leaves an existing attachment alone.
+
+### The demonstration is the part worth reusing
+
+I asked for a test that fails when the halves are disconnected. The agent produced **two** demonstrations and said which was weaker:
+
+1. Against a mechanically reconstructed pre-wiring tree: **six compile errors.** It labelled this the weaker proof itself — a test that fails to compile has not shown that it *notices* the defect.
+2. With the carriers **present but no-op'd** (`apply_agent_view_exit` body replaced by `let _ = (exit, attached);`) — *exactly* F75's shape — it fails at runtime on the load-bearing assertion:
+
+```
+assertion `left == right` failed: F75: the agent the view attached to must reach
+the composer's binding, which is the only home that outlives the overlay
+  left: None
+ right: Some(1)
+```
+
+**That second construction is the real gate**, and it is the "break the surviving copy on purpose" method from the F69 follow-up, applied here without being asked for. The general rule: **when a test exists to catch a wiring gap, re-create the gap rather than deleting the wiring** — deletion proves the test compiles against the wiring, not that it detects its absence.
+
+## F76 — `Ctrl+X d` discards a non-empty draft
+
+Flagged by the implementer for my attention rather than silently shipped or silently fixed.
+
+`InlineRead::Detached` carries no draft back, and its doc comment says it is "only ever reached on an empty one" — **true of `←`, which requires an empty composer, and not true of the chord.** `Ctrl+X d` has no such precondition, so pressing it with text typed clears the line: the loop's detach arm has nothing to replay and sets the carried draft to empty.
+
+**Not fixed in T4-S6a**, because carrying the draft means changing the `Detached` variant, which changes the twelve tests written for this card — an authorised test edit, which belongs in a card with a failing test of its own rather than in a rework whose contract was one added test.
+
+The shape is familiar: **a variant documented by the narrowest route that reaches it.** `←`'s empty-composer precondition got written into the type's comment, and then a second route was given the same variant without the precondition. The comment was accurate when written and became wrong when the second caller arrived — which is the same mechanism as **F69**'s mirror and **F70**'s unreachable rule, one level down in the type system rather than in a test or a validator.

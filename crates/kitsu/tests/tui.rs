@@ -6259,3 +6259,109 @@ fn inline_mode_agent_view_treats_a_bracketed_paste_as_text_and_not_as_keys() {
     );
     assert_opened_and_restored(&session, 0, 1, 9);
 }
+
+// ----------------------------------------------------------------------
+// Card T4-S6a: attach/detach, the routing half the PTY can measure.
+//
+// **What this harness can and cannot reach.** A fixture PTY session has
+// **zero agents** and no way to spawn one (the gateway is unreachable by
+// construction), so nothing here can attach: `Enter`/`→`, the `⛩ attached
+// to agent N` milestone and requirement A7's custody are pinned at unit
+// level against a real `AgentRegistry` in `main.rs`, and the `←`-detaches
+// rule against the reader in `tui_bridge.rs`. What is left for the PTY is
+// what the PTY is for (T4-S2's division): that the keys are routed and
+// that no byte of them reaches the draft.
+// ----------------------------------------------------------------------
+
+/// `Ctrl+X d`: detach, as the two bytes a terminal sends for it
+/// (design §4.7). `d` is not bound in the editor's keymap, so with the
+/// prefix stripped it would otherwise be typed into the draft.
+const CTRL_X_D: &str = "\x18d";
+
+/// The refusal a `/detach` typed with nothing attached gets.
+///
+/// **The division this card settles between the chord and the command**:
+/// `Ctrl+X d` with nothing attached is **inert and silent**, exactly as
+/// `Ctrl+X b` is (T4-S2: "any other letter is inert"), because a chord
+/// pressed in the wrong state is a slip and a transcript line is a worse
+/// answer than none. `/detach` is a line the user typed and submitted, so
+/// it is answered — requirement T2-S5b's rule applied to the surface that
+/// has somewhere to put the answer.
+const DETACH_WITHOUT_ATTACHMENT: &str = "not attached to a background agent";
+
+/// Card T4-S6a. **`Ctrl+X d` is a chord, not a `d`; `/detach` answers.**
+///
+/// Four observations in one session, so the detector that finds the
+/// refusal is proven live at the same geometry (**F41**/the non-vacuity
+/// rule): a typed `d` really does land in the draft, the chord's `d` does
+/// not, a known command's output really does reach the region, and
+/// `/detach` is answered rather than reported as an unknown command.
+#[test]
+#[serial]
+fn inline_mode_routes_the_detach_chord_and_answers_detach_without_an_attachment() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let script = vec![
+        // 0..1 A typed `d` lands in the draft: the detector is live.
+        send(RAW_MODE_MARKER, "zd"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        // 2..4 The same letter behind the chord prefix does not.
+        send(RAW_MODE_MARKER, "\x15"),
+        send(RAW_MODE_MARKER, "z"),
+        send(RAW_MODE_MARKER, CTRL_X_D),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        // 6..7 A known command's output reaches the region.
+        send(RAW_MODE_MARKER, "\x15"),
+        send(RAW_MODE_MARKER, "/context\r"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        // 9..10 And `/detach` is answered.
+        send(RAW_MODE_MARKER, "/detach\r"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+    ];
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &script);
+
+    let typed = session.screen_at(1);
+    assert!(
+        pinned_row(&typed).contains("zd"),
+        "NON-VACUOUS: a typed `d` must reach the draft, but the pinned row \
+         reads {:?}; whole screen:\n{}",
+        pinned_row(&typed),
+        Session::dump(&typed)
+    );
+
+    let chorded = session.screen_at(5);
+    assert!(
+        pinned_row(&chorded).contains('z') && !pinned_row(&chorded).contains("zd"),
+        "`Ctrl+X d` is one keystroke and its `d` must not reach the draft, \
+         which still reads {:?}; whole screen:\n{}",
+        pinned_row(&chorded),
+        Session::dump(&chorded)
+    );
+    assert!(
+        !agent_view_open(&chorded),
+        "and it is not the agent view's chord either; whole screen:\n{}",
+        Session::dump(&chorded)
+    );
+
+    let command = session.screen_at(8);
+    assert!(
+        command[..(ROWS - 1) as usize]
+            .iter()
+            .any(|row| row.contains("context window source")),
+        "NON-VACUOUS: a known command's output must reach the region, so the \
+         refusal below is measured by a detector that fires; whole screen:\n{}",
+        Session::dump(&command)
+    );
+
+    let detached = session.screen_at(10);
+    assert!(
+        detached[..(ROWS - 1) as usize]
+            .iter()
+            .any(|row| row.contains(DETACH_WITHOUT_ATTACHMENT)),
+        "`/detach` with nothing attached must say so (A5 names it beside \
+         `\u{2190}`), rather than being reported as an unknown command; whole \
+         screen:\n{}",
+        Session::dump(&detached)
+    );
+}

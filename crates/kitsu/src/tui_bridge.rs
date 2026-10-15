@@ -1221,6 +1221,12 @@ pub(crate) fn chord_prefix_byte(spelling: &str) -> Option<u8> {
 /// The letter that, after the chord prefix, opens the agent view (A1).
 const AGENT_VIEW_CHORD_KEY: u8 = b'a';
 
+/// `<prefix> d`: detach from the attached agent (card **T4-S6a**, design
+/// \u{00a7}4.7). It sits beside [`AGENT_VIEW_CHORD_KEY`] because the filter
+/// treats the two the same way: the letter is lifted out of the byte stream,
+/// and what it *means* is the reader's to decide.
+const DETACH_CHORD_KEY: u8 = b'd';
+
 /// `ESC [ D`, the left arrow as every terminal sends it, and what the editor
 /// reads as backward-char.
 const LEFT_ARROW: &[u8] = b"\x1b[D";
@@ -1240,6 +1246,11 @@ enum KeyItem {
     Left,
     /// `<prefix> a`: open the agent view.
     Open,
+    /// `<prefix> d`: detach from the attached agent (card **T4-S6a**,
+    /// design §4.7). Lifted out for `Open`'s reason: the letter must not
+    /// reach the draft, and the *decision* about whether anything is attached
+    /// belongs to the reader and not to this filter.
+    Detach,
 }
 
 /// Splits a read chunk into [`KeyItem`]s: the chord prefix and its letter are
@@ -1311,11 +1322,15 @@ impl KeyFilter {
             }
             if self.pending_prefix {
                 self.pending_prefix = false;
-                if data[index] == AGENT_VIEW_CHORD_KEY {
+                if let Some(item) = match data[index] {
+                    AGENT_VIEW_CHORD_KEY => Some(KeyItem::Open),
+                    DETACH_CHORD_KEY => Some(KeyItem::Detach),
+                    _ => None,
+                } {
                     if !bytes.is_empty() {
                         items.push(KeyItem::Bytes(std::mem::take(&mut bytes)));
                     }
-                    items.push(KeyItem::Open);
+                    items.push(item);
                 }
                 // Any other letter is inert. Dropping it rather than typing it
                 // into the draft is what makes a mistyped chord a no-op
@@ -1407,6 +1422,15 @@ pub(crate) enum InlineRead {
     /// this draft as its `initial`, which is why typing survives a
     /// suspend/resume cycle.
     Suspended(String),
+    /// Card **T4-S6a**: `\u{2190}` on an empty composer **while attached**, the
+    /// return path requirement A5 names beside `/detach`.
+    ///
+    /// The reader stays pure for [`InlineRead::Suspended`]'s reason: leaving
+    /// attachment prints a milestone, replays a recap and re-labels the
+    /// composer, none of which belong in a function whose value is being
+    /// testable without a terminal. The draft is **not** carried back, because
+    /// this outcome is only ever reached on an empty one.
+    Detached,
 }
 
 /// Read one line from `input` through the shared editor, repainting through
@@ -1436,7 +1460,14 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
     history: &[String],
     on_resize: &mut dyn FnMut(),
 ) -> std::io::Result<InlineRead> {
-    read_line_inline_with_keys(input, paint, history, on_resize, InlineKeys::disabled())
+    read_line_inline_with_keys(
+        input,
+        paint,
+        history,
+        on_resize,
+        InlineKeys::disabled(),
+        None,
+    )
 }
 
 /// What the **first** `\u{2190}` on an untouched empty composer puts in the hint
@@ -1447,6 +1478,28 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
 /// arrow glyph: the slot is text on a row whose styling tier is the
 /// renderer's, and the hint has to read the same in all of them.
 const LEFT_ARM_HINT: &str = "  press left again for the agent view";
+
+/// The composer's prompt label, given the session's base prompt and the agent
+/// it is attached to (card **T4-S6a**, design §4.5: “the prompt label changes
+/// to `agent 3>`”).
+///
+/// One function because the label is the **only** standing evidence that a
+/// submitted line goes to a background agent rather than to the model, and
+/// that evidence is what makes `\u{2190}` safe to overload (see
+/// [`read_line_inline_with_keys`]): the context the keystroke depends on is on
+/// screen in front of the caret, not something the user did minutes ago.
+///
+/// It **replaces** the base rather than decorating it: the base prompt is
+/// configurable and `agent 3> kitsu> ` would be absurd.
+///
+/// Returns the base unchanged while detached, which is all this card ships;
+/// the attached arm is what T4-S6a's test pins.
+pub(crate) fn composer_prompt(base: &str, attached: Option<u64>) -> String {
+    match attached {
+        Some(id) => format!("agent {id}> "),
+        None => base.to_string(),
+    }
+}
 
 /// [`read_line_inline`] with card T4-S2's key routes live.
 ///
@@ -1472,6 +1525,7 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
     history: &[String],
     on_resize: &mut dyn FnMut(),
     keys: InlineKeys,
+    attached: Option<u64>,
 ) -> std::io::Result<InlineRead> {
     use kitsu_editor::{EditorAction, FeedOutcome, TypeaheadEditor};
 
@@ -1560,6 +1614,19 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
                     actions.extend(outcome.actions);
                 }
                 KeyItem::Left => {
+                    // Card **T4-S6a**: attachment is asked **before** the
+                    // press count, and that order is the whole decision. A5
+                    // makes `\u{2190}` on an empty composer the return path,
+                    // and an implementation that counted presses first would
+                    // turn `\u{2190}\u{2190}` in one read into a detach *and*
+                    // a view. The rule is deliberately not gated by
+                    // `left_arrow_opens_agents`: A1 scopes that key to the
+                    // agent view's route alone, and A5 names this one with no
+                    // condition. The draft is not carried back because this
+                    // arm is only reached on an empty one.
+                    if attached.is_some() && editor.buffer_string().is_empty() {
+                        return Ok(InlineRead::Detached);
+                    }
                     // The composer's emptiness is asked *here*, after every
                     // earlier item in the chunk has been applied, so a
                     // `x<BS><left><left>` chunk is judged on the draft the
@@ -1588,6 +1655,17 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
                     left_presses = 0;
                     open_agent_view = true;
                     break;
+                }
+                // Card **T4-S6a**: `<prefix> d`. With an agent attached this
+                // is the detach route (`InlineRead::Detached`); with nothing
+                // attached it is **inert and silent**, exactly as every other
+                // chord letter is today -- a chord is a slip, and `/detach` is
+                // where a deliberate detach gets an answer.
+                KeyItem::Detach => {
+                    left_presses = 0;
+                    if attached.is_some() {
+                        return Ok(InlineRead::Detached);
+                    }
                 }
             }
         }
@@ -1897,6 +1975,11 @@ mod tests {
     use super::{
         install, palette_rows, suspend_and_resume, BridgeGuard, SuspendEffects, TuiMode,
         PALETTE_MIN_ROWS, SIGNAL_RESTORE,
+    };
+    // Card T4-S6a's surfaces, in their own `use` so the list above is the
+    // one the earlier cards wrote.
+    use super::{
+        composer_prompt, read_line_inline_with_keys, InlineKeys, KeyFilter, KeyItem, LEFT_ARROW,
     };
 
     /// A sink whose buffer outlives the surface that owns it, so bytes written
@@ -5721,6 +5804,237 @@ mod tests {
             seen.len(),
             JOBS_VIEW_GROUPS.len(),
             "the table must cover every /jobs view group, or a reorder could hide here"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Card T4-S6a: **attach/detach -- what attachment is, and the keys
+    // that enter and leave it.** Requirement A5, design §4.5 and §4.7.
+    //
+    // Every test under this banner FAILS today: `KeyFilter` does not know
+    // the detach letter, the reader does not know what `attached` means,
+    // and `composer_prompt` returns the base prompt whatever it is given.
+    //
+    // **The `←` rule this card settles.** T4-S2 bound `←` on an empty
+    // composer to the agent view, two presses, and decided that any other
+    // keystroke disarms the chord. A5 now wants `←` to *detach*. The rule
+    // pinned here:
+    //
+    // * **While attached, the first `←` on an empty composer detaches**, and
+    //   never reaches the two-press count. Two reasons, and the first is the
+    //   one T4-S2 made the two-press rule for. T4-S2's objection to a durable
+    //   armed state was that it makes a keystroke's meaning depend on
+    //   something the user did minutes ago *and can no longer see*;
+    //   attachment is the opposite case -- it is on screen in front of the
+    //   caret for as long as it lasts (`composer_prompt`, pinned below, and
+    //   the status row's `attached · agent N`), so the context that decides
+    //   this keystroke is legible at the moment it is pressed. Second, the
+    //   two costs are not comparable: opening a full-screen overlay by
+    //   accident interrupts you, while detaching by accident costs one
+    //   keystroke to undo and **stops nothing** (§4.5: stopping is `x` or
+    //   `/jobs stop`, never a detach).
+    // * A **non-empty** draft keeps `←` as cursor movement while attached,
+    //   exactly as detached. A draft is content; this is unchanged.
+    // * The rule does **not** consult `[tui] left_arrow_opens_agents`. A1
+    //   says that key "disables that route alone", and the route it names is
+    //   the agent view's; A5 names `←` as the return path without
+    //   conditioning it. With the key off and nothing attached, `←` on an
+    //   empty composer stays plain backward-char -- a no-op at column 0.
+    //
+    // **`Ctrl+C` is deliberately absent.** §4.5 asks for `Ctrl+C` =
+    // clear draft / detach, and finding **F54** records that "`Ctrl+C` is
+    // swallowed at an approval prompt" is measured but *unexplained* -- the
+    // cause is probably the harness rather than the code. The clear-draft
+    // half already ships in `kitsu-editor` (`0x03` clears a non-empty
+    // buffer, `lib.rs:529`) and is not this card's to re-pin; the detach
+    // half would bind the one byte whose signal behaviour is unresolved, so
+    // it waits for a human with a real terminal.
+    // ------------------------------------------------------------------
+
+    /// The default `[tui] prefix` as the byte a terminal sends for it.
+    const DETACH_PREFIX: u8 = 0x18;
+
+    /// Both routes live, as a shipped default configuration has them.
+    fn attach_keys() -> InlineKeys {
+        InlineKeys {
+            prefix: Some(DETACH_PREFIX),
+            left_arrow_opens_agents: true,
+        }
+    }
+
+    /// Drive the reader with the key routes live and a stated attachment.
+    fn read_attached(input: Chunks, keys: InlineKeys, attached: Option<u64>) -> InlineRead {
+        let mut input = input;
+        let mut paint = |_: &str, _: usize, _: &str, _: bool| {};
+        read_line_inline_with_keys(&mut input, &mut paint, &[], &mut || {}, keys, attached)
+            .expect("inline read")
+    }
+
+    /// **The `←` rule, positive half.** One `←` on an empty composer while
+    /// attached detaches; it does not arm anything and it does not wait for a
+    /// second press.
+    ///
+    /// Both controls are in this test rather than beside it, because each is
+    /// what stops the claim being vacuous in one direction: a reader that
+    /// returned `Detached` for every `←` would pass the first assertion and
+    /// fail the other two.
+    #[test]
+    fn left_arrow_detaches_on_the_first_press_while_attached() {
+        assert_eq!(
+            read_attached(Chunks::bytewise(LEFT_ARROW), attach_keys(), Some(3)),
+            InlineRead::Detached,
+            "A5: `\u{2190}` on an empty composer returns from an attached agent, \
+             on the first press"
+        );
+        // CONTROL 1: a non-empty draft keeps the arrow as cursor movement,
+        // attached or not. `ac` then `\u{2190}` then `B` submits `aBc` only if
+        // the cursor really moved.
+        assert_eq!(
+            submitted(&read_attached(
+                Chunks::bytewise(b"ac\x1b[DB\r"),
+                attach_keys(),
+                Some(3),
+            )),
+            "aBc",
+            "a draft is content: `\u{2190}` in a non-empty draft is backward-char \
+             while attached too"
+        );
+        // CONTROL 2: with nothing attached the same single press detaches
+        // nothing -- it arms T4-S2's affordance and the read continues, so the
+        // drained reader reports EOF.
+        assert_eq!(
+            read_attached(Chunks::bytewise(LEFT_ARROW), attach_keys(), None),
+            InlineRead::Eof,
+            "NON-VACUOUS: one `\u{2190}` with nothing attached is still T4-S2's \
+             first press and nothing else"
+        );
+    }
+
+    /// **The binding conflict, settled.** Two `←`s in one read while attached
+    /// are a detach and **not** the agent view: the first press consumed the
+    /// keystroke, so there is no second press to count.
+    ///
+    /// This is the case T4-S2's `LEFT_TWICE` constant exists for -- the whole
+    /// affordance inside a single `read` -- and the one an implementation that
+    /// counted presses before asking about attachment would get wrong.
+    #[test]
+    fn two_left_arrows_in_one_read_detach_rather_than_opening_the_agent_view() {
+        assert_eq!(
+            read_attached(Chunks::new([b"\x1b[D\x1b[D"]), attach_keys(), Some(5),),
+            InlineRead::Detached,
+            "attached, `\u{2190}\u{2190}` is one detach and no view"
+        );
+        // NON-VACUOUS: the same two bytes with nothing attached still open the
+        // view, so this test measures the attachment and not the chunking.
+        assert_eq!(
+            read_attached(Chunks::new([b"\x1b[D\x1b[D"]), attach_keys(), None),
+            InlineRead::OpenAgentView(String::new()),
+            "detached, `\u{2190}\u{2190}` is still T4-S2's agent view"
+        );
+    }
+
+    /// **`left_arrow_opens_agents = false` does not disable the return path.**
+    /// A1 scopes that key to the agent view's route; A5 names `←` as the way
+    /// back with no condition on it.
+    #[test]
+    fn left_arrow_detaches_while_attached_even_with_the_agent_view_route_off() {
+        let route_off = InlineKeys {
+            prefix: Some(DETACH_PREFIX),
+            left_arrow_opens_agents: false,
+        };
+        assert_eq!(
+            read_attached(Chunks::bytewise(LEFT_ARROW), route_off, Some(7)),
+            InlineRead::Detached,
+            "A5's return path is not the agent view's route and is not gated \
+             by its switch"
+        );
+        // NON-VACUOUS: with the route off and nothing attached the arrow is
+        // plain backward-char, which `ab` + `\u{2190}` + `c` proves by order.
+        assert_eq!(
+            submitted(&read_attached(
+                Chunks::bytewise(b"ab\x1b[Dc\r"),
+                route_off,
+                None,
+            )),
+            "acb",
+            "with the route off the arrow reaches the editor as before"
+        );
+    }
+
+    /// **`Ctrl+X d`.** The chord is lifted out of the byte stream by the one
+    /// filter that already lifts `Ctrl+X a`, so the letter can never reach the
+    /// draft and the *decision* about whether anything is attached stays in
+    /// the reader.
+    ///
+    /// The three controls are the rules this new letter must not break
+    /// (**F68** and T4-S2's): a bare `d` is content, a chord split across two
+    /// reads is still one keystroke, and `Ctrl+X d` **inside a bracketed
+    /// paste** is text.
+    #[test]
+    fn the_key_filter_lifts_the_detach_chord_out_of_the_byte_stream() {
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"\x18d"),
+            vec![KeyItem::Detach],
+            "design \u{00a7}4.7: `Ctrl+X d` detaches, so the filter must lift it"
+        );
+        // Split across two reads, as two keystrokes routinely are.
+        let mut split = KeyFilter::new(attach_keys());
+        assert_eq!(
+            split.feed(b"\x18"),
+            Vec::new(),
+            "the prefix alone yields nothing"
+        );
+        assert_eq!(
+            split.feed(b"d"),
+            vec![KeyItem::Detach],
+            "and the letter in the next read completes the chord"
+        );
+        // CONTROL: a bare `d` is a character in the draft.
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"d"),
+            vec![KeyItem::Bytes(b"d".to_vec())],
+            "NON-VACUOUS: without the prefix, `d` is content"
+        );
+        // CONTROL: inside a bracketed paste the same two bytes are text
+        // (**F68**: a chunk of bytes is not a sequence of intentions).
+        let pasted = b"\x1b[200~\x18d\x1b[201~";
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(pasted),
+            vec![KeyItem::Bytes(pasted.to_vec())],
+            "a pasted chord is pasted text, not a chord"
+        );
+        // CONTROL: the letter that already existed still routes.
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"\x18a"),
+            vec![KeyItem::Open],
+            "`Ctrl+X a` is unchanged by a second chord letter"
+        );
+    }
+
+    /// **The prompt label is the standing evidence of attachment** (design
+    /// §4.5), and it is what makes the `←` rule above legible rather than
+    /// modal: the context the keystroke depends on is in front of the caret.
+    ///
+    /// The label **replaces** the base prompt rather than decorating it: the
+    /// base is configurable and `agent 12> kitsu> ` would be absurd.
+    #[test]
+    fn the_composer_prompt_names_the_attached_agent() {
+        assert_eq!(
+            composer_prompt("> ", Some(3)),
+            "agent 3> ",
+            "design \u{00a7}4.5: the prompt label changes to `agent 3>`"
+        );
+        assert_eq!(
+            composer_prompt("kitsu> ", Some(12)),
+            "agent 12> ",
+            "the label replaces the base prompt, and an id is not one digit"
+        );
+        // NON-VACUOUS: detached, the base prompt is handed back untouched, so
+        // the label cannot be a constant.
+        assert_eq!(
+            composer_prompt("kitsu> ", None),
+            "kitsu> ",
+            "detached, the composer is the session's own prompt"
         );
     }
 }
