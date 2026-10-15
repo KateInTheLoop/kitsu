@@ -6406,6 +6406,29 @@ fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead
 /// snapshot fills in the three fields the DTO cannot carry (the tokens and the
 /// activity with its age, which live on `AgentTelemetry`). Nothing is invented
 /// where neither source has an answer: the fields stay absent.
+/// The rows the overlay is showing **right now**: the registry's rows with the
+/// filter line's filter applied (card T4-S5, requirement A3's `/ filter`).
+///
+/// It exists so that the loop and the registry-level tests ask the same
+/// question once. The selection is synced against *these* rows and
+/// [`handle_overlay_input`] is handed *these* rows, which is the card's safety
+/// answer: a filter that hid the selected agent while the selection still
+/// pointed at it would let `x`, `r` or `n` act on an agent the user cannot
+/// see, which is **F68**'s family — a privileged action without visible
+/// intent.
+#[cfg(unix)]
+fn overlay_visible_rows(
+    registry: &subagent::AgentRegistry,
+    state: &OverlayState,
+) -> Vec<kitsu_tui::agents_view::AgentRow> {
+    // The **one** place the filter is applied. The empty filter matches every
+    // row, so an unfiltered view is this same expression and not a branch.
+    agent_view_rows(registry)
+        .into_iter()
+        .filter(|row| state.filter.matches(row))
+        .collect()
+}
+
 #[cfg(unix)]
 fn agent_view_rows(registry: &subagent::AgentRegistry) -> Vec<kitsu_tui::agents_view::AgentRow> {
     let progress = registry.progress_snapshot();
@@ -6798,19 +6821,17 @@ enum SteerLineStep {
 /// submits. The `Enter` that submits is one typed outside a paste.
 #[cfg(unix)]
 struct SteerLine {
-    editor: kitsu_editor::TypeaheadEditor,
+    line: OverlayLine,
     id: u64,
 }
 
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))] // Bound to `s` by T4-S4b's loop.
 impl SteerLine {
-    /// A fresh, empty line for one agent. No history: the agent view's steer
-    /// line is not the composer, and recalling a prompt into a correction
-    /// would be a surprise with a real effect.
+    /// A fresh, empty line for one agent.
     fn new(id: u64) -> Self {
         Self {
-            editor: kitsu_editor::TypeaheadEditor::new(Vec::new()),
+            line: OverlayLine::new(),
             id,
         }
     }
@@ -6823,12 +6844,68 @@ impl SteerLine {
 
     /// The echo, for `agents_view::steer_prompt_rows`.
     fn draft(&self) -> String {
-        self.editor.buffer_string()
+        self.line.draft()
     }
 
     /// The caret, as a char offset into [`SteerLine::draft`].
     fn cursor(&self) -> usize {
+        self.line.cursor()
+    }
+
+    /// Feed one chunk of raw bytes.
+    fn feed(&mut self, bytes: &[u8]) -> SteerLineStep {
+        self.line.feed(bytes)
+    }
+
+    /// What the overlay does when the grace expires with no byte waiting.
+    fn quiet_tick(&mut self) -> SteerLineStep {
+        self.line.quiet_tick()
+    }
+
+    /// Whether a lone `ESC` is held, so the overlay knows to spend the grace
+    /// period on it and nothing else.
+    fn escape_held(&self) -> bool {
+        self.line.escape_held()
+    }
+}
+
+/// One line of text collected inside the overlay, over `kitsu-editor`.
+///
+/// Two keys open one of these: `s`'s correction (card T4-S4b-ii) and `/`'s
+/// filter (card T4-S5). What they do with the submitted string differs and
+/// lives at the call site; the *editing* is identical and lives here, so
+/// there is one parser of these bytes and not two (**F45**).
+#[cfg(unix)]
+struct OverlayLine {
+    editor: kitsu_editor::TypeaheadEditor,
+}
+
+#[cfg(unix)]
+impl OverlayLine {
+    /// A fresh, empty line. No history: neither of these lines is the
+    /// composer, and recalling a prompt into a correction — or into a filter —
+    /// would be a surprise with a real effect.
+    fn new() -> Self {
+        Self {
+            editor: kitsu_editor::TypeaheadEditor::new(Vec::new()),
+        }
+    }
+
+    /// The echo, for the frame that paints it.
+    fn draft(&self) -> String {
+        self.editor.buffer_string()
+    }
+
+    /// The caret, as a char offset into [`OverlayLine::draft`].
+    fn cursor(&self) -> usize {
         self.editor.cursor()
+    }
+
+    /// Put a submitted string back into the line, because the caller refused
+    /// it: `/`'s parser rejects a malformed term and the line stays open, so
+    /// the user corrects the one wrong character rather than retyping.
+    fn restore(&mut self, text: &str) {
+        self.editor.replace_buffer(text);
     }
 
     /// Feed one chunk of raw bytes.
@@ -7356,6 +7433,18 @@ struct OverlayState {
     /// [`OverlayPrompt`], because the prompts are fed decoded keys and this is
     /// fed bytes.
     steering: Option<SteerLine>,
+    /// `/`'s filter line while it is being typed, read as raw bytes for the
+    /// same reasons `s`'s is — a term may be non-ASCII, a paste is content,
+    /// and a character may arrive split across two reads (card T4-S5).
+    filtering: Option<OverlayLine>,
+    /// The filter in force, which is what [`overlay_visible_rows`] applies.
+    ///
+    /// It lives here and nowhere else, so it survives every repaint and every
+    /// regroup and dies with the view: a reopen builds a fresh `OverlayState`,
+    /// and a filter outliving the screen it was set on would hide agents for a
+    /// reason nothing on screen explains. The default is the empty filter,
+    /// which matches every row.
+    filter: kitsu_tui::agents_view::AgentFilter,
 }
 
 #[cfg(unix)]
@@ -7368,6 +7457,8 @@ impl OverlayState {
             report: None,
             prompt: None,
             steering: None,
+            filtering: None,
+            filter: kitsu_tui::agents_view::AgentFilter::default(),
         }
     }
 }
@@ -7396,6 +7487,159 @@ enum OverlayStep {
 /// registry-level tests call this same function. A test model that mirrored
 /// these arms could stop reflecting them without anything failing, which is
 /// finding **F69**; there is no model to diverge from now.
+/// Whether a lone `ESC` is held and the 50 ms grace is therefore the next
+/// thing to spend (**F65**, card T4-S4a).
+///
+/// An open line holds its own `ESC`, inside the editor, and takes precedence:
+/// while a line is up the decoder is not in the path at all.
+#[cfg(unix)]
+fn overlay_escape_held(state: &OverlayState, decoder: &OverlayDecoder) -> bool {
+    if state.steering.is_some() {
+        return state.steering.as_ref().is_some_and(SteerLine::escape_held);
+    }
+    if state.filtering.is_some() {
+        return state
+            .filtering
+            .as_ref()
+            .is_some_and(OverlayLine::escape_held);
+    }
+    decoder.escape_pending()
+}
+
+/// The grace expired with nothing waiting: the held `ESC` was the `Esc` key.
+///
+/// `Esc` means *step back out of the frame you are in*, and the frames nest:
+/// an open line, then a prompt, then the help, then a peek, then the view
+/// itself. Returns whether the view is closing.
+///
+/// Extracted from the loop for [`overlay_feed_chunk`]'s reason (**F69**): the
+/// resolution is state, the *waiting* is the terminal's, and a test that
+/// re-spelled the resolution would be a mirror.
+#[cfg(unix)]
+fn overlay_resolve_held_escape(state: &mut OverlayState, decoder: &mut OverlayDecoder) -> bool {
+    // The line resolves its own held `ESC`, on the same grace and for the same
+    // reason: inside it, `Esc` cancels the line and sends nothing.
+    if state.steering.is_some() {
+        if let Some(line) = state.steering.as_mut() {
+            if line.quiet_tick() == SteerLineStep::Cancelled {
+                state.steering = None;
+                state.report = None;
+            }
+        }
+        return false;
+    }
+    // `/`'s line resolves its own held `ESC` the same way, and cancelling it
+    // is **not** clearing the filter already in force: `Esc` steps out of one
+    // frame, and a cancel that also cleared would do two things at once.
+    if state.filtering.is_some() {
+        if let Some(line) = state.filtering.as_mut() {
+            if line.quiet_tick() == SteerLineStep::Cancelled {
+                state.filtering = None;
+                state.report = None;
+            }
+        }
+        return false;
+    }
+    decoder.resolve_escape();
+    if state.prompt.is_some() {
+        state.prompt = None;
+        state.report = None;
+    } else if state.helping {
+        state.helping = false;
+    } else if state.peeking.is_some() {
+        state.peeking = None;
+    } else {
+        return true;
+    }
+    false
+}
+
+/// Everything one `read` of the descriptor does to the overlay's state, with
+/// nothing terminal-owned in it: an open line's **byte** bypass first, then
+/// the decoder's keys and pastes through the one dispatch.
+///
+/// Extracted for the same reason [`handle_overlay_input`] was (finding
+/// **F69**): a chunk of bytes now has **one** path, which the loop and the
+/// registry-level tests both take. The byte bypass is not a detail the tests
+/// may re-spell — it is what makes a non-ASCII character and a bracketed
+/// paste work in a line at all — so a test-local copy of it would be a mirror
+/// that can stop reflecting.
+///
+/// Returns whether the view is closing.
+#[cfg(unix)]
+fn overlay_feed_chunk(
+    registry: &subagent::AgentRegistry,
+    state: &mut OverlayState,
+    decoder: &mut OverlayDecoder,
+    view_rows: &[kitsu_tui::agents_view::AgentRow],
+    cols: usize,
+    bytes: &[u8],
+) -> bool {
+    // An open steer line reads the bytes itself, bypassing the decoder
+    // entirely: the editor needs the real `ESC[200~`/`ESC[201~` to apply
+    // its "a paste never submits" rule, and it is also what makes a
+    // multi-byte character split across two reads work here.
+    if let Some(line) = state.steering.as_mut() {
+        match line.feed(bytes) {
+            SteerLineStep::Editing => {}
+            SteerLineStep::Submit(correction) => {
+                state.report = Some(agent_view_steer(registry, line.id(), &correction).line);
+                state.steering = None;
+            }
+            SteerLineStep::Cancelled => {
+                state.steering = None;
+                state.report = None;
+            }
+        }
+        return false;
+    }
+    // `/`'s filter line, on the same byte bypass and for the same three
+    // reasons: a non-ASCII term is legal and `OverlayKey::Char` is ASCII-only
+    // by construction, a bracketed paste must not submit, and a multi-byte
+    // character really does arrive split across two reads.
+    if let Some(line) = state.filtering.as_mut() {
+        match line.feed(bytes) {
+            SteerLineStep::Editing => {}
+            SteerLineStep::Submit(text) => match kitsu_tui::agents_view::parse_filter(&text) {
+                // An empty line parses to the empty filter, which is how the
+                // filter is cleared without closing and reopening the view.
+                Ok(filter) => {
+                    state.filter = filter;
+                    state.filtering = None;
+                    state.report = None;
+                }
+                // Refused: the rows are left exactly as they were and the
+                // line stays **open**, carrying the text back so the one
+                // wrong character can be corrected. Filtering to nothing
+                // would be the worst reading of a bad term — an empty view
+                // says nothing about why, and in this view an empty view can
+                // mean failing to show the agent waiting on an answer.
+                Err(error) => {
+                    line.restore(&text);
+                    state.report = Some(error.message().to_string());
+                }
+            },
+            SteerLineStep::Cancelled => {
+                state.filtering = None;
+                state.report = None;
+            }
+        }
+        return false;
+    }
+    let mut closing = false;
+    for input in decoder.feed(bytes) {
+        match handle_overlay_input(registry, state, view_rows, cols, input) {
+            OverlayStep::Continue => {}
+            OverlayStep::Closing => closing = true,
+            // `s` opened the steer line: the rest of this chunk is not a
+            // correction anybody typed, and the bytes after it are read by
+            // the line itself from here on.
+            OverlayStep::StopChunk => break,
+        }
+    }
+    closing
+}
+
 #[cfg(unix)]
 fn handle_overlay_input(
     registry: &subagent::AgentRegistry,
@@ -7593,6 +7837,24 @@ fn handle_overlay_input(
                     }
                 }
             }
+            // `/` opens the filter line (card T4-S5, requirement A3's last
+            // unbound key). Unlike the action keys beside it, it needs no
+            // selection: a filter is about the rows on screen, not about one
+            // agent, and it is how a user *finds* the agent to select. It is
+            // a keystroke that is not `x`, so it disarms a half-pressed stop.
+            OverlayKey::Char('/') => {
+                if !state.helping && state.peeking.is_none() {
+                    state.selection.disarm();
+                    state.filtering = Some(OverlayLine::new());
+                    // The previous key's report is not this frame's: the
+                    // filter frame paints a refusal of what is typed *into*
+                    // it, and a stale line there would read as one.
+                    state.report = None;
+                    // The bytes after `/` in this very chunk are the line's to
+                    // read, exactly as they are after `s`.
+                    return OverlayStep::StopChunk;
+                }
+            }
             // `x` is two presses: the first arms, the second stops a
             // live agent and prunes an already-terminal one. The
             // arming is T4-S4a's and is not changed here; what the
@@ -7705,7 +7967,7 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
     let mut buffer = [0u8; 256];
     let mut decoder = OverlayDecoder::new();
     loop {
-        let view_rows = agent_view_rows(registry);
+        let view_rows = overlay_visible_rows(registry, &state);
         state.selection.sync(&view_rows);
         let content = if let Some(line) = state.steering.as_ref() {
             // The innermost frame of all: while a correction is being typed
@@ -7716,6 +7978,15 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
                 &line.draft(),
                 line.cursor(),
                 cols as usize,
+            )
+        } else if let Some(line) = state.filtering.as_ref() {
+            // The filter line is an innermost frame too, for the same reason:
+            // it owns the caret the view otherwise hides.
+            kitsu_tui::agents_view::filter_prompt_rows(
+                &line.draft(),
+                line.cursor(),
+                cols as usize,
+                state.report.as_deref(),
             )
         } else if state.helping {
             kitsu_tui::agents_view::overlay_help_rows(cols as usize)
@@ -7757,32 +8028,8 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
         // for the same reason: inside it, `Esc` cancels the line and sends
         // nothing. A tick with no `ESC` held is not even waited for, so the
         // line costs no latency per keystroke.
-        if state.steering.as_ref().is_some_and(SteerLine::escape_held)
-            && !stdin_waiting(ESC_SEQUENCE_GRACE)
-        {
-            if let Some(line) = state.steering.as_mut() {
-                if line.quiet_tick() == SteerLineStep::Cancelled {
-                    state.steering = None;
-                    state.report = None;
-                }
-            }
-            continue;
-        }
-        if state.steering.is_none()
-            && decoder.escape_pending()
-            && !stdin_waiting(ESC_SEQUENCE_GRACE)
-        {
-            decoder.resolve_escape();
-            // A real `Esc`: step back out of a prompt, out of the help, out of
-            // a peek, or out of the view.
-            if state.prompt.is_some() {
-                state.prompt = None;
-                state.report = None;
-            } else if state.helping {
-                state.helping = false;
-            } else if state.peeking.is_some() {
-                state.peeking = None;
-            } else {
+        if overlay_escape_held(&state, &decoder) && !stdin_waiting(ESC_SEQUENCE_GRACE) {
+            if overlay_resolve_held_escape(&mut state, &mut decoder) {
                 break;
             }
             continue;
@@ -7798,36 +8045,14 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        // An open steer line reads the bytes itself, bypassing the decoder
-        // entirely: the editor needs the real `ESC[200~`/`ESC[201~` to apply
-        // its "a paste never submits" rule, and it is also what makes a
-        // multi-byte character split across two reads work here.
-        if let Some(line) = state.steering.as_mut() {
-            match line.feed(&buffer[..count]) {
-                SteerLineStep::Editing => {}
-                SteerLineStep::Submit(correction) => {
-                    state.report = Some(agent_view_steer(registry, line.id(), &correction).line);
-                    state.steering = None;
-                }
-                SteerLineStep::Cancelled => {
-                    state.steering = None;
-                    state.report = None;
-                }
-            }
-            continue;
-        }
-        let mut closing = false;
-        for input in decoder.feed(&buffer[..count]) {
-            match handle_overlay_input(registry, &mut state, &view_rows, cols as usize, input) {
-                OverlayStep::Continue => {}
-                OverlayStep::Closing => closing = true,
-                // `s` opened the steer line: the rest of this chunk is not a
-                // correction anybody typed, and the bytes after it are read by
-                // the line itself from here on.
-                OverlayStep::StopChunk => break,
-            }
-        }
-        if closing {
+        if overlay_feed_chunk(
+            registry,
+            &mut state,
+            &mut decoder,
+            &view_rows,
+            cols as usize,
+            &buffer[..count],
+        ) {
             break;
         }
     }
@@ -30988,26 +31213,55 @@ mod tests {
         /// the loop's `for input in decoder.feed(..)`, with the report row
         /// collected instead of painted.
         fn feed(&mut self, registry: &subagent::AgentRegistry, chunk: &[u8]) {
-            let rows = agent_view_rows(registry);
+            let rows = overlay_visible_rows(registry, &self.state);
             self.state.selection.sync(&rows);
-            for input in self.decoder.feed(chunk) {
-                let step = handle_overlay_input(
-                    registry,
-                    &mut self.state,
-                    &rows,
-                    OVERLAY_TEST_COLS,
-                    input,
-                );
-                // The loop paints the report row and keeps the last one; the
-                // tests want every line a key produced, so they are taken as
-                // they appear. Nothing in the dispatch reads the field back.
-                if let Some(line) = self.state.report.take() {
-                    self.reports.push(line);
-                }
-                if step == OverlayStep::StopChunk {
-                    break;
-                }
+            // The loop's own byte path, whole: the open line's bypass and the
+            // decoder's keys through the one dispatch (**F69**). The report
+            // row is collected instead of painted; the loop paints it and
+            // keeps the last one, and nothing in the dispatch reads it back.
+            let _ = overlay_feed_chunk(
+                registry,
+                &mut self.state,
+                &mut self.decoder,
+                &rows,
+                OVERLAY_TEST_COLS,
+                chunk,
+            );
+            if let Some(line) = self.state.report.take() {
+                self.reports.push(line);
             }
+        }
+
+        /// The loop's 50 ms grace, resolved: the *waiting* is the terminal's
+        /// and the resolution is not, so the tests take the same two
+        /// functions the loop takes (**F69**). Returns whether the view is
+        /// closing.
+        fn quiet_tick(&mut self) -> bool {
+            if !overlay_escape_held(&self.state, &self.decoder) {
+                return false;
+            }
+            let closing = overlay_resolve_held_escape(&mut self.state, &mut self.decoder);
+            if let Some(line) = self.state.report.take() {
+                self.reports.push(line);
+            }
+            closing
+        }
+
+        /// The rows the frame would be painting: what `/`'s filter leaves
+        /// visible, which is also what the selection is synced against.
+        fn visible(
+            &self,
+            registry: &subagent::AgentRegistry,
+        ) -> Vec<kitsu_tui::agents_view::AgentRow> {
+            overlay_visible_rows(registry, &self.state)
+        }
+
+        /// Which agent the action keys would act on, after the same sync the
+        /// loop does every repaint.
+        fn selected(&mut self, registry: &subagent::AgentRegistry) -> Option<u64> {
+            let rows = overlay_visible_rows(registry, &self.state);
+            self.state.selection.sync(&rows);
+            self.state.selection.selected()
         }
 
         fn draft(&self) -> Option<&str> {
@@ -31351,6 +31605,560 @@ mod tests {
         assert!(
             typed.draft().is_none(),
             "and the prompt is closed after a submit"
+        );
+    }
+
+    // --- card T4-S5: the filter line (`/`), requirement A3's last unbound key
+    //
+    // Where each assertion lives follows the split that has held for four
+    // cards: the help row is `kitsu-tui`'s (it is painting), key *routing* is
+    // the PTY's, and everything a filter *does* is here, against a real
+    // registry — a fixture PTY session has zero agents, so a filter could not
+    // hide one there.
+    //
+    // The two decisions this card had to take, and the reasoning each test
+    // carries:
+    //
+    // * **The filter's rows are the selection's rows.** `AgentSelection::sync`
+    //   is handed the **filtered** rows, not the registry's. Handing it the
+    //   full rows would leave the selection on an agent the filter has hidden,
+    //   and then `x`, `r` or `n` would act on an agent **not on screen** —
+    //   a privileged action with no visible intent, which is **F68**'s family
+    //   and cost this epic a rejection. `sync` already does the right thing
+    //   with a shorter list: it falls to the row holding the old display index
+    //   and reports `None` only when the list is empty.
+    // * **The line is an editor line, not a decoded prompt.** `OverlayKey::Char`
+    //   is ASCII-only by construction (`0x20..=0x7e`), while a name may be
+    //   non-ASCII — `AgentRegistry::rename` refuses control characters and
+    //   nothing else — so a filter line fed decoded keys could not express
+    //   `n:café`, a filter for a name the registry accepts. The steer line
+    //   already reads raw bytes through `kitsu-editor` for exactly this
+    //   reason (card T4-S4b-ii), and a second line editor here would be a
+    //   second parser of the same bytes (**F45**).
+
+    /// Three agents whose rows differ in the fields `/`'s grammar reads: the
+    /// task (`o:`) and the name (`n:`). Real task text, which is also the
+    /// source of every expectation below rather than a letter picked to make
+    /// a point (**F58**).
+    #[cfg(unix)]
+    fn registry_with_three_agents() -> (Arc<subagent::AgentRegistry>, [u64; 3]) {
+        let registry = subagent::AgentRegistry::new();
+        let first = registry
+            .start("alpha: audit the overlay decoder".to_string())
+            .unwrap();
+        let second = registry
+            .start("beta: rewrite the repaint loop".to_string())
+            .unwrap();
+        let third = registry
+            .start("gamma: measure the paste latency".to_string())
+            .unwrap();
+        (registry, [first, second, third])
+    }
+
+    /// Type one filter into an open line, byte by byte, the way a terminal
+    /// delivers typing: one `read` per keystroke.
+    #[cfg(unix)]
+    fn type_filter(overlay: &mut OverlayUnderTest, registry: &subagent::AgentRegistry, text: &str) {
+        for byte in text.as_bytes() {
+            overlay.feed(registry, &[*byte]);
+        }
+    }
+
+    /// Requirement A3, `/ filter`: **the key opens a line and the filter it
+    /// collects applies to the rows.**
+    ///
+    /// The filter is `o:beta`, read off the second agent's own task text, and
+    /// `o:` is the task by T4-S1's decision. The NON-VACUOUS halves are the
+    /// three rows visible before it and the row that is left after it: a view
+    /// that showed nothing, or everything, fails one of them.
+    ///
+    /// **F65:** `/` is `0x2f`, which is not in a CSI sequence's final-byte
+    /// range (`0x40..=0x7e`), so it cannot be mistaken for the end of an
+    /// arrow — asserted here rather than reasoned about.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_filter_line_opens_on_slash_and_its_filter_applies_to_the_rows() {
+        assert_eq!(
+            OverlayDecoder::new().feed(b"\x1b[B/"),
+            vec![
+                OverlayInput::Key(OverlayKey::Down),
+                OverlayInput::Key(OverlayKey::Char('/')),
+            ],
+            "F65: `/` is a key in its own right and no sequence's final byte, \
+             so an arrow immediately before it is still an arrow"
+        );
+
+        let (registry, ids) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            ids.to_vec(),
+            "NON-VACUOUS: all three agents are on screen before any filter"
+        );
+
+        overlay.feed(&registry, b"/");
+        type_filter(&mut overlay, &registry, "o:beta");
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            ids.to_vec(),
+            "and nothing is filtered while the line is still being typed: the \
+             filter applies on Enter, not per keystroke"
+        );
+        overlay.feed(&registry, b"\r");
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![ids[1]],
+            "`o:beta` leaves the one agent whose task says `beta`, which is \
+             the task text the fixture gave it. Reports: {:?}",
+            overlay.reports
+        );
+    }
+
+    /// The card's safety question: **a filter that hides the selected agent
+    /// moves the selection; it never leaves a destructive key pointed at an
+    /// agent that is not on screen.**
+    ///
+    /// This is the F68 family under another name — `x` is a privileged action
+    /// and the user's intent for it is the row they can see — and it is the
+    /// reason `AgentSelection::sync` is handed the **filtered** rows. The
+    /// POSITIVE CONTROL is the second half: the same two `x` presses with no
+    /// filter really do stop the first agent, so this is not a test that
+    /// passes because `x` stopped working.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_filter_that_hides_the_selected_agent_moves_the_selection_off_it() {
+        let (registry, ids) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        assert_eq!(
+            overlay.selected(&registry),
+            Some(ids[0]),
+            "NON-VACUOUS: the first row is selected before the filter, so the \
+             filter below really does hide the selected agent"
+        );
+
+        overlay.feed(&registry, b"/");
+        type_filter(&mut overlay, &registry, "o:beta");
+        overlay.feed(&registry, b"\r");
+        assert_eq!(
+            overlay.selected(&registry),
+            Some(ids[1]),
+            "the selection is on the row the user can see: the filtered rows \
+             are what `sync` is handed, so a hidden agent cannot stay \
+             selected. Reports: {:?}",
+            overlay.reports
+        );
+
+        overlay.feed(&registry, b"x");
+        overlay.feed(&registry, b"x");
+        let rows = agent_view_rows(&registry);
+        let state_of = |id: u64| rows.iter().find(|row| row.id == id).map(|row| row.state);
+        assert_eq!(
+            state_of(ids[0]),
+            Some(kitsu_render::AgentViewState::Working),
+            "the hidden agent #{} was not stopped: `x` acted on the visible \
+             row. Rows: {rows:?}, reports: {:?}",
+            ids[0],
+            overlay.reports
+        );
+        assert_ne!(
+            state_of(ids[1]),
+            Some(kitsu_render::AgentViewState::Working),
+            "POSITIVE CONTROL: `x` twice really did stop the *visible* agent \
+             #{}, so the assertion above is about which agent it hit and not \
+             about a key that does nothing. Rows: {rows:?}, reports: {:?}",
+            ids[1],
+            overlay.reports
+        );
+    }
+
+    /// The same question with the filter matching **nothing**: there is no row
+    /// to fall to, so there is **no selection**, and the action keys say so
+    /// rather than acting on the agent that was selected before.
+    ///
+    /// `sync` already answers this — `None` when the displayed list is empty —
+    /// and the point of the test is that it is the *filtered* list it is asked
+    /// about. The NON-VACUOUS half is the three agents the registry still
+    /// holds: nothing was stopped, they are merely not shown.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_filter_that_matches_nothing_leaves_no_selection_for_a_key_to_act_on() {
+        let (registry, ids) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        overlay.feed(&registry, b"/");
+        type_filter(&mut overlay, &registry, "o:delta");
+        overlay.feed(&registry, b"\r");
+        assert!(
+            overlay.visible(&registry).is_empty(),
+            "`o:delta` matches no task the fixture gave: the view is empty"
+        );
+        assert_eq!(
+            agent_view_rows(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            ids.to_vec(),
+            "NON-VACUOUS: the agents are all still there — hidden, not gone"
+        );
+        assert_eq!(
+            overlay.selected(&registry),
+            None,
+            "and nothing is selected, so no key can act on an agent that is \
+             not on screen"
+        );
+
+        let before = overlay.reports.len();
+        overlay.feed(&registry, b"x");
+        assert_eq!(
+            overlay.reports[before..],
+            [agent_view_no_selection('x').line],
+            "`x` reports that there is nothing selected — the view's own \
+             no-selection line, not a stop"
+        );
+        assert!(
+            agent_view_rows(&registry)
+                .iter()
+                .all(|row| row.state == kitsu_render::AgentViewState::Working),
+            "and every agent is still running: {:?}",
+            agent_view_rows(&registry)
+        );
+    }
+
+    /// **An invalid filter term is refused, and the rows are left exactly as
+    /// they were.**
+    ///
+    /// A3 already decided a malformed filter is an error and never a silently
+    /// dropped term; what this card had to decide is what the *key* does with
+    /// that error, and the answer is: report the parser's own message and keep
+    /// the line open. Filtering to nothing would be the worst of the three
+    /// readings — the user sees an empty view and nothing says why — and
+    /// closing the line would make the user retype a filter that is one
+    /// character wrong.
+    ///
+    /// The message is read **out of the parser** rather than retyped, so the
+    /// two cannot drift (**F58**).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_invalid_filter_term_is_refused_and_leaves_the_rows_alone() {
+        let rejection = kitsu_tui::agents_view::parse_filter("z:foo")
+            .expect_err("NON-VACUOUS: `z:` is not a key the grammar has")
+            .message()
+            .to_string();
+
+        let (registry, ids) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        overlay.feed(&registry, b"/");
+        type_filter(&mut overlay, &registry, "z:foo");
+        overlay.feed(&registry, b"\r");
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            ids.to_vec(),
+            "a refused filter is not applied: all three rows are still on \
+             screen, rather than a view filtered to nothing. Reports: {:?}",
+            overlay.reports
+        );
+        assert!(
+            overlay
+                .reports
+                .last()
+                .is_some_and(|line| line.contains(&rejection)),
+            "and the report is the parser's own message, which names the key \
+             and lists the grammar: {rejection:?} is not in {:?}",
+            overlay.reports
+        );
+
+        // The line is still open, so the filter can be corrected rather than
+        // retyped from `/`. Observable without an accessor: over the row list
+        // `x` would arm a stop and say so, and inside an open line it is text.
+        let before = overlay.reports.len();
+        overlay.feed(&registry, b"x");
+        assert_eq!(
+            overlay.reports.len(),
+            before,
+            "the line is still open: `x` is a character in it, not an armed \
+             stop. Reports: {:?}",
+            overlay.reports
+        );
+
+        // POSITIVE CONTROL for that reading: with no line open, the same byte
+        // really does arm a stop and report it.
+        let mut over_rows = OverlayUnderTest::new();
+        over_rows.feed(&registry, b"x");
+        assert_eq!(
+            over_rows.reports.len(),
+            1,
+            "POSITIVE CONTROL: over the row list `x` arms and reports, so the \
+             silence above is the open line and not a dead key: {:?}",
+            over_rows.reports
+        );
+    }
+
+    /// **An empty line clears the filter.**
+    ///
+    /// The parser already says so — an empty string is the empty filter, which
+    /// matches every row — and this pins that `/` then Enter is the way back
+    /// to the whole list, rather than needing the view closed and reopened.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_empty_filter_line_clears_the_filter() {
+        let (registry, ids) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        overlay.feed(&registry, b"/");
+        type_filter(&mut overlay, &registry, "o:gamma");
+        overlay.feed(&registry, b"\r");
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![ids[2]],
+            "NON-VACUOUS: a filter really is in force before it is cleared. \
+             Reports: {:?}",
+            overlay.reports
+        );
+        overlay.feed(&registry, b"/");
+        overlay.feed(&registry, b"\r");
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            ids.to_vec(),
+            "an empty line is the empty filter: every row is back. Reports: \
+             {:?}",
+            overlay.reports
+        );
+    }
+
+    /// **`Esc` cancels the line and leaves the filter in force**, on the same
+    /// 50 ms grace every other frame of this overlay uses (**F65**): `Esc`
+    /// steps back out of the frame you are in, and the line is the innermost
+    /// frame.
+    ///
+    /// Cancelling is not clearing. A cancelled line that cleared the filter
+    /// would make `Esc` do two things at once, and the user who meant to
+    /// abandon a half-typed correction would lose the view they had set up.
+    ///
+    /// The grace is the loop's and not the dispatch's, so the resolved `Esc`
+    /// is delivered here the way the loop delivers it: `ESC` and then a byte
+    /// that cannot be part of a sequence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escape_cancels_the_filter_line_and_keeps_the_filter_already_in_force() {
+        let (registry, ids) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        overlay.feed(&registry, b"/");
+        type_filter(&mut overlay, &registry, "o:beta");
+        overlay.feed(&registry, b"\r");
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![ids[1]],
+            "NON-VACUOUS: the filter is in force before the cancelled line"
+        );
+
+        overlay.feed(&registry, b"/");
+        type_filter(&mut overlay, &registry, "o:gamma");
+        // One `ESC` byte, then the grace expiring with nothing behind it —
+        // which is the only thing that distinguishes `Esc` from the first byte
+        // of an arrow, and the loop's own two steps.
+        overlay.feed(&registry, b"\x1b");
+        assert!(
+            !overlay.quiet_tick(),
+            "and the cancelled line did not close the view: `Esc` steps out of \
+             one frame at a time"
+        );
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![ids[1]],
+            "the cancelled line changed nothing: `o:beta` is still the filter, \
+             and `Esc` neither applied `o:gamma` nor cleared it. Reports: {:?}",
+            overlay.reports
+        );
+    }
+
+    /// **The filter survives an agent finishing and the rows re-grouping, and
+    /// does not survive the view being closed.**
+    ///
+    /// A filter that evaporated on a regroup would be useless: the rows
+    /// regroup constantly, which is T4-S4a's whole premise. A filter that
+    /// outlived the screen it was set on would be worse — the next `claude
+    /// agents` would open hiding agents for a reason nothing on screen
+    /// explains, and the keys would act inside that hidden state.
+    ///
+    /// A reopen is a fresh [`OverlayState`], which is exactly what the loop
+    /// builds on entry, so a fresh harness is the reopen.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_filter_survives_a_regroup_and_not_a_reopen() {
+        let (registry, ids) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        overlay.feed(&registry, b"/");
+        type_filter(&mut overlay, &registry, "s:working");
+        overlay.feed(&registry, b"\r");
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            ids.to_vec(),
+            "NON-VACUOUS: `s:working` matches all three while all three are \
+             working. Reports: {:?}",
+            overlay.reports
+        );
+
+        // The regroup: one agent leaves `working`, which in A2's order is a
+        // move to a later group.
+        let _ = agent_view_stop_or_prune(&registry, ids[2]).await;
+        assert_ne!(
+            agent_view_rows(&registry)
+                .iter()
+                .find(|row| row.id == ids[2])
+                .map(|row| row.state),
+            Some(kitsu_render::AgentViewState::Working),
+            "NON-VACUOUS: agent #{} really did leave `working`",
+            ids[2]
+        );
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![ids[0], ids[1]],
+            "the filter is still in force across the regroup: the agent that \
+             left `working` left the view with it"
+        );
+
+        let reopened = OverlayUnderTest::new();
+        assert_eq!(
+            reopened
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+                .len(),
+            3,
+            "and a reopened view shows every agent: a filter does not outlive \
+             the screen it was set on"
+        );
+    }
+
+    /// **The filter line takes a non-ASCII term**, which is why it is an
+    /// editor line over raw bytes and not a prompt fed `OverlayKey::Char`.
+    ///
+    /// `AgentRegistry::rename` accepts `café` — its rule is control
+    /// characters, not ASCII — so `n:café` is a filter for a name the registry
+    /// really can hold. `OverlayKey::Char` is `0x20..=0x7e` by construction,
+    /// asserted here: a line fed decoded keys could not express this filter at
+    /// all, which is the same shipped defect the `n` key has today.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_filter_line_takes_a_non_ascii_term_because_a_name_may_be_non_ascii() {
+        const NAME: &str = "café";
+        assert!(
+            OverlayDecoder::new().feed(NAME.as_bytes()).iter().all(|input| {
+                !matches!(input, OverlayInput::Key(OverlayKey::Char(typed)) if !typed.is_ascii())
+            }),
+            "NON-VACUOUS: the overlay's key decoder cannot carry a non-ASCII \
+             character, so this filter is only expressible by a line that \
+             reads the raw bytes: {:?}",
+            OverlayDecoder::new().feed(NAME.as_bytes())
+        );
+
+        let (registry, ids) = registry_with_three_agents();
+        assert!(
+            matches!(
+                registry.rename(ids[0], NAME),
+                subagent::AgentRenameOutcome::Renamed { .. }
+            ),
+            "NON-VACUOUS: the registry really does accept the name `{NAME}` — \
+             its rule is control characters, not ASCII-only"
+        );
+
+        let mut overlay = OverlayUnderTest::new();
+        overlay.feed(&registry, b"/");
+        // Byte by byte, as a terminal delivers typing: the multi-byte
+        // character arrives split across reads, which is the other thing the
+        // editor is here for.
+        type_filter(&mut overlay, &registry, &format!("n:{NAME}"));
+        overlay.feed(&registry, b"\r");
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![ids[0]],
+            "`n:{NAME}` leaves the agent that carries that name. Reports: {:?}",
+            overlay.reports
+        );
+    }
+
+    /// **F68 in the filter line: a paste is content, and it never submits.**
+    ///
+    /// Consistent with every other text field in this view — `kitsu-editor`'s
+    /// rule, T4-S2's prefix-byte rule and T4-S4b-ii's steer line. The
+    /// POSITIVE CONTROL is the Enter the user types afterwards, which applies
+    /// the pasted filter: the paste really did land in the line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_paste_into_the_filter_line_is_content_and_never_submits() {
+        let (registry, ids) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        overlay.feed(&registry, b"/");
+        let mut pasted = Vec::from(OVERLAY_PASTE_START);
+        pasted.extend_from_slice(b"o:beta");
+        pasted.extend_from_slice(OVERLAY_PASTE_END);
+        overlay.feed(&registry, &pasted);
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            ids.to_vec(),
+            "the paste did not submit the line: the rows are untouched until \
+             the user presses Enter. Reports: {:?}",
+            overlay.reports
+        );
+        overlay.feed(&registry, b"\r");
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![ids[1]],
+            "POSITIVE CONTROL: the typed Enter applies the pasted filter, so \
+             the paste was content in the line and not nothing at all. \
+             Reports: {:?}",
+            overlay.reports
         );
     }
 }

@@ -299,6 +299,19 @@ clamps at the ends instead of wrapping, moving it never collects a result, and
 if the selected agent is pruned the selection falls to the row that took its
 place.
 
+`/` opens a filter line: `s:<state> n:<text> o:<text> p:<profile>`, each term
+confined to its own field, so a name filter cannot match a task. A term it
+cannot read is refused with the key it did not recognise, and what you typed
+stays in the line so one wrong character can be corrected rather than retyped;
+an empty filter clears it. `Esc` abandons a half-typed term without clearing the
+filter already in force.
+
+The filter decides which agents the keys act on, not just what you see: if it
+hides the selected agent the selection moves to a visible row, and if it matches
+nothing there is no selection for `x`, `r`, `n` or `p` to act on. The filter
+survives an agent finishing and the rows re-grouping, and closing the view
+clears it -- the view always opens showing everything.
+
 `s` steers the selected agent, opening an editable line with a caret that
 windows around the cursor so a correction longer than the terminal still shows
 where you are typing. `Enter` sends it; `Esc` cancels and sends nothing; an

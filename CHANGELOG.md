@@ -92,6 +92,14 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- In the agent view, **`/` filters the rows** — `s:<state>`, `n:<text>`,
+  `o:<text>` and `p:<profile>`, each confined to its own field. A term it cannot
+  read is refused on the spot, naming the key it did not recognise and leaving
+  what you typed in place to be corrected; an empty filter clears it. **The
+  filter also governs which agent the keys act on**, so a filter that hides the
+  selected agent moves the selection to one you can see, and a filter matching
+  nothing leaves nothing for `x` or `p` to act on. The filter survives agents
+  finishing and re-grouping, and the view always opens showing everything.
 - In the agent view, **`s` steers the selected agent**: a real editable line
   with a caret, which windows around the cursor so a long correction still shows
   where you are typing. `Enter` sends it, `Esc` cancels and sends nothing, and a
