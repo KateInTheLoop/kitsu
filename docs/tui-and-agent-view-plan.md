@@ -161,7 +161,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | F69 follow-up: the loop's input dispatch extracted to one `handle_overlay_input` the tests call; the mirror retired, `OverlayTextPrompt::Steer` deleted; **three** silent divergences erased | done | this commit |
 | **F39 resolved** — the byte-identity flake made deterministic (11/20 failures standalone → 50 green runs), with a guard that fails loudly if the ordering ever inverts | done | this commit |
 | T4-S5 the filter line (`/`) over `kitsu-editor`; the filter governs the selection's rows (a safety property); **F71** | done | this commit |
-| **F70**: route `n`'s name through `kitsu-editor` so a non-ASCII name the registry accepts can actually be typed — removes the last consumer of the decoded text prompt | **not started** | — |
+| **F70 fixed**: `n` reads its line through `kitsu-editor`; `OverlayPrompt::Text` and `OverlayTextPrompt` deleted, so no decoded key can fill a name; **F72** recorded | done | this commit |
+| **F72**: an unbracketed paste submits early in all three editor lines (`s`, `/`, `n`) — the decoder's burst fallback does not reach them | **not started** | — |
 
 > **`KITSU_TUI` is retired as of T3-S2.** Mentions of it in the T0-T2 rows and
 > requirement text below are **historical** — they record how the preview was

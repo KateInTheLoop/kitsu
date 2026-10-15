@@ -92,6 +92,12 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- **Fixed:** in the agent view, `n` silently dropped non-ASCII characters from a
+  name — typing `café` named the agent `caf`, even though `/jobs` would accept
+  the full name. The rename line now takes any name the agent registry accepts,
+  including one whose characters arrive split across reads, and a refused name
+  stays on screen with the message so the one wrong character can be corrected
+  rather than the whole name retyped.
 - In the agent view, **`/` filters the rows** — `s:<state>`, `n:<text>`,
   `o:<text>` and `p:<profile>`, each confined to its own field. A term it cannot
   read is refused on the spot, naming the key it did not recognise and leaving

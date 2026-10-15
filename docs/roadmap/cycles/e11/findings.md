@@ -3741,3 +3741,25 @@ This is the same family as **F57** (readers agree with the source; nobody checks
 ### The unidentified `--test tui` flake did not reproduce
 
 Five green runs across both profiles — three of mine with one output file each, two of the implementer's. **That is not proof of absence**, and the original failing test's name was never captured, so it stays open. Recorded so the next occurrence is the second and not the first.
+
+## F72 — an unbracketed paste submits early in all three editor lines, and the heuristic that used to cover it is out of the path
+
+Raised by the test author as a blocker, and the safety half **traced by me before authorising anything**, because the shape resembles the defect that cost this epic a rejection.
+
+### The safety question, answered: no, F68 is not re-opened
+
+An open editor line (`s`, `/`, and `n` after this card) **bypasses the decoder entirely**, and `overlay_feed_chunk` ends that branch with `return false` — so the **whole chunk** is consumed by the line and the decoder is never reached. Verified by reading. Therefore when an unbracketed paste makes a line submit at its first newline, **the tail cannot become keys**: there is no path from it to `handle_overlay_input`. The `r`+`y` and double-`x` hazards of **F68** stay closed.
+
+### The real gap
+
+On a terminal that **does not report pastes**, a pasted multi-line value is not content — the editor submits at the first newline (its own documented rule for unbracketed input, pinned by `unbracketed_newlines_still_submit_each_line`) and the rest stays in the line. So the paste rule A3 states — *a paste is content, newlines included, and the line waits for your own `Enter`* — holds **only where the terminal brackets pastes.**
+
+**And the protection that used to cover this is now structurally absent.** F68 added the unbracketed-burst heuristic precisely because some terminals do not bracket; but that heuristic lives in the decoder, and these three lines bypass the decoder by design — for good reasons (non-ASCII, split multi-byte characters, and the editor's own paste rule). **The fix for one hazard removed the mitigation for another**, which is worth stating plainly: the bypass was introduced in T4-S4b-ii to *protect* the paste rule, and it simultaneously dropped the fallback that made the rule hold without terminal cooperation.
+
+This is not new with `n` — `s` and `/` already have it. `n` only makes it three, and removes the burst heuristic's incidental coverage of the rename path.
+
+### Why it is recorded rather than fixed here
+
+The honest fix is for the editor to learn an "unbracketed burst" rule of its own, or for the overlay to bracket-wrap what it hands a line. Either is a change to a parser three surfaces now depend on, with F68's rejection as the precedent for how badly that can go — so it is a card, not a side effect of a rename fix.
+
+**The consequence for this card:** the existing test `a_multi_line_paste_into_an_overlay_text_prompt_is_content_and_its_tail_never_runs` passes today only because the burst heuristic turns its **unbracketed** chunk into one paste. Once `n` is on the bypass that premise is gone and both its assertions fail. **Re-expressing it with a bracketed paste is authorised** — the overlay enables `ESC[?2004h` on entry, so a real paste in this surface *is* bracketed, which makes the bracketed form the more faithful test, not the weaker one. Its intent — a paste is content and its tail never runs — must survive unchanged.
