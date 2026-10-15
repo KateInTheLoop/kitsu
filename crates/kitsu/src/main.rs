@@ -19512,6 +19512,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 &[],
                 rows,
                 kitsu_render::live::terminal_columns(),
+                setup.tui.cell_ring_lines,
             )
         });
         (installed, fullscreen)
@@ -20530,6 +20531,19 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             }
             (None, None) => {
                 let initial = std::mem::take(&mut pending_draft);
+                // Finding **F97**: the fullscreen frame follows the ring, and
+                // the idle prompt is where it catches up. A fullscreen session
+                // writes its transcript onto the alternate screen as it
+                // streams, so the frame is stale by exactly the lines that
+                // arrived since the last paint; repainting here -- no turn
+                // running, nothing else writing -- puts the retained lines
+                // back above them. A prompt that follows no new output
+                // repaints nothing.
+                #[cfg(unix)]
+                if let Some(segment) = fullscreen_segment.as_mut() {
+                    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                    segment.repaint_if_the_ring_grew(rows, cols as usize);
+                }
                 // The idle row's meter reflects the history as it stands now,
                 // after the previous turn committed or rolled back.
                 #[cfg(unix)]
@@ -20809,6 +20823,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                         &retained,
                                         rows,
                                         cols as usize,
+                                        setup.tui.cell_ring_lines,
                                     ));
                                     eprintln!(
                                         "~ switched to the {} renderer; the conversation is unchanged",

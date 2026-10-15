@@ -4471,3 +4471,58 @@ The fix gained an `else` branch: `tcgetattr`, OR `ICANON|ECHO|ISIG` back on, `tc
 **`SIGNAL_RESTORE_WITH_SCREEN` is composed at compile time** from the two existing constants rather than written out — so there is no third copy of either sequence and no new drift surface, and `SIGNAL_RESTORE` stays a **prefix**, which is what keeps an existing `contains` assertion and a byte-parity test green without being touched.
 
 **The double-restore case was handled too:** a main-thread panic in fullscreen would have had both `Drop` and the panic hook writing a leave, so `write_restore_sequences` **clears the flag after writing** — one take still yields one leave. The implementer also verified the overlay **cannot nest inside** fullscreen, so a single boolean has no nesting case to get wrong today.
+
+## F97 — fullscreen paints one frame and never repaints, and my docs oversold it
+
+Found while scoping the paging card, by asking where fullscreen reads input. **It does not read input, and it does not repaint.**
+
+Verified: `FullscreenView` is constructed in exactly **one** production place — inside `enter_fullscreen` (`tui_bridge.rs:334`) — which paints a single frame and **returns**. `FULLSCREEN_ACTIVE` is read only by `live_mode()` and the exit restore. There is no loop, no repaint, and no output routing.
+
+**So `/tui fullscreen` currently means: take the alternate screen, clear it, print the ring's tail once, and then carry on writing to that screen normally.** The frame is a **snapshot**, and the conversation scrolls over it from the moment the next line is printed.
+
+### What I wrote about it, which is true and incomplete
+
+The CHANGELOG says it *"takes the terminal's alternate screen and paints the viewport's scrollback"*. Accurate — **once**. `docs/functionality.md` says it *"paints the retained lines"* and that *"paging is not wired, so the view shows the newest lines that fit"* — which reads as *the view keeps showing the newest lines*, when in fact it shows the lines that fitted **at the moment you switched**.
+
+**I accepted "B without paging is coherent — it shows the tail, which is strictly more than today."** That was true of the frame at entry, and I did not ask what happened to it afterwards. **A one-shot paint and a live tail are different features, and "shows the tail" describes both.**
+
+### Why no test caught it
+
+T5-S2's four transition tests all assert what is on screen **around the switch** — the alternate screen is taken, the marker is repainted, the screen is given back. **Every one of them is satisfied by a single paint.** The repaint assertion I was most proud of — the marker appearing again after the alternate screen opens — is *also* satisfied by one frame. **A test that proves the ring was read does not prove the ring is being read.**
+
+### Scope consequence for T5-S1c
+
+The paging card is therefore **not** "decode four keys". Paging is meaningless without something that repaints on demand, and a mode that freezes is worth fixing whether or not paging lands. **And there is a prior architectural question I had not seen:** with no input loop, fullscreen leaves the composer reading underneath — so paging keys have nowhere to live yet.
+
+Two shapes, and the choice decides what fullscreen *is*:
+
+- **A modal viewer** with its own read loop, like the agent-view overlay. Paging is natural; but **R2 calls `/tui` a renderer switch that keeps the conversation**, and a modal viewer you cannot type into is a different thing.
+- **A live renderer**: the composer keeps reading, the frame repaints as the ring grows, and the paging keys are decoded in the composer's key filter beside the existing chords. This matches "renderer" — and note those chord keys are **deliberately outside** `keys::BINDINGS` because their labels are not static (§4.7), which may mean my instruction to build "a second table with its own sweep" was aimed at the wrong surface.
+
+**Not decided here.** The next card's test author should settle it with the requirement in hand, and the docs need qualifying either way.
+
+### F97 sharpened — the frame is not merely frozen, rustyline paints over it
+
+I recorded fullscreen as painting one frame that *"the conversation scrolls over"*. **Measured by the next test author, it is worse:** the failure dump shows **rustyline's own `ChatHelper`** painting `kitsu>`, the `╰ model … ╯` hint row and the **full `╭ slash commands ╮` palette** directly onto the frame.
+
+**Why:** `read_idle_chat_line` reaches the inline composer only inside `if let Some(bridge) = bridge`, and `install` returns `None` for `TuiMode::Fullscreen`. So **a fullscreen session's idle prompt is rustyline, in cooked mode** — no `RawStdinGuard`, no `KeyFilter`, no chord decoder. Verified structurally.
+
+**Two consequences.**
+
+**My own brief's second option was impossible.** I offered *"the paging keys are decoded in the composer's `KeyFilter` beside the existing `Ctrl+X` chords"* — **that surface does not exist in fullscreen.** Giving fullscreen a raw composer is a prerequisite card in its own right, and a terminal-state one: raw termios, bracketed paste, masked `ISIG`, `Ctrl+C`-as-byte, and a new exit path per **F94**/**F96**.
+
+**And the docs I wrote are not merely incomplete, they are wrong about the experience.** "Paints the viewport's scrollback" describes a frame a user never sees intact.
+
+### The decision, and what it kills
+
+**Live renderer, not modal viewer** — argued against the requirements rather than taste: R2 says the switch keeps *the conversation*, and `--tui fullscreen` **starts** a session, so *"a start mode you cannot talk to is not a renderer, it is a pager that must be dismissed before kitsu is usable"*. R1 already calls fullscreen a **"self-scrolled transcript"** — self-scrolled is the repaint, not a read loop. And the modal shape already exists as the agent view, which hard-declines unless the mode is inline.
+
+**So the plan row's "a second table with its own sweep" is not to be built**, which confirms what I suspected when I wrote it. §4.7 keeps the chords out of `keys::BINDINGS` because they never reach the swept dispatch and their labels are computed from a configurable prefix; paging keys on that surface inherit both, **plus a third reason — they are live only while fullscreen holds the screen, so a static row would advertise them in inline and classic where they do nothing.** The honest advertisement is `/tui`'s own `details` string, which R2 already pins across four spellings and T4-S10's test already asserts.
+
+### The assertion that catches F97, which is the shape to copy
+
+`raw_count(RING_ALPHA) >= 3`. **A single paint can produce exactly two** — the inline transcript's write, and the entry frame. Nothing else in the process holds that line. **A third occurrence is a repaint.** It is deliberately silent about *how* the new line arrives, so both plausible wirings pass and the implementation stays open.
+
+Paired with a guard that inline and classic paint each line **exactly once**, which refuses the tempting wiring: repainting at the **surface seam** would duplicate inline's transcript and break classic's byte-identity.
+
+**This is F97's own lesson turned on the test that missed it:** the existing assertion proves the ring **was** read; the count-of-three proves it **keeps** being read.
