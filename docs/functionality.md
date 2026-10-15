@@ -285,7 +285,10 @@ oldest verified artifact. `/artifacts` lists usage and prunes by ID or all.
 usage, tool/write counts, safe recent activity, failure class, terminal result
 handoff, targeted steering, joined cancellation, and pruning. `/jobs view`
 presents the same deck grouped by state, with agents needing input first and
-empty groups omitted. `/jobs explain <id>` answers why one agent is in its
+empty groups omitted. A blocked agent carries its own marker -- `◉`, or `[blk]`
+under `--plain` -- in every agent surface, so the one waiting on an answer is
+distinguishable from the ones merely working; the marker vocabulary is shared
+with the deck rather than duplicated. `/jobs explain <id>` answers why one agent is in its
 state, since when, and what it is waiting on, drawn from the phase, elapsed
 time, last activity, failure class, steering and handoff already recorded; it
 is read-only and, unlike `/jobs show`, never acknowledges a ready result, so

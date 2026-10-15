@@ -3354,3 +3354,60 @@ was **eleven**, by counting only the non-terminal-with-handoff cases and missing
 terminal-without-handoff. The real count is **eight**. A guard built on the wrong
 number would have skipped nothing and still failed; the count assertion is what
 makes the number checkable rather than assumed.
+
+
+## F34 and F3 CLOSED — the blocked marker, and one vocabulary for both surfaces
+
+Both closed in the marker story, taken between T4-S1 and T4-S2 because the gap
+had to shut **before** the agent-view overlay rendered rows or the overlay would
+ship it too.
+
+**F34 — a blocked agent no longer looks like a busy one.** `DeckState::Blocked`
+exists, with `◉` in the styled tier (the approval glyph, which §4.4 itself had
+nominated, and apt because a blocked agent **is** a pending approval), cream in
+colour (the "look here" slot — reusing the accent would have left blocked
+*colour-identical* to running and cured only half the finding), and `[blk]`
+under `--plain`.
+
+**F3 — one vocabulary, and §4.4 amended rather than obeyed.** The design banned
+`◆`/`◇`/`◈` as row glyphs so a plain row could never read as `tool>` or
+`result>`. The implementer read that reason before agreeing it should change,
+and found the ban was **the wrong instrument**: `deck_marker` checks `plain`
+**first** and returns a bracketed token, so a row glyph never reaches
+`ascii_structural_markers`. The hazard is prevented structurally; the
+prohibition was redundant — and the shipped deck had already broken it, using
+`◈` for result-ready rows since D1. The view now reaches the deck's vocabulary
+through `AgentViewState::deck_state()`: **one function, not two tables that
+agree today.**
+
+### The finding's own scope was wrong, and that is the lesson
+
+F34 said *"the only test that changes is T2-S3's"*. The test author **counted
+and found four**: two further production sites mapped blocked to running
+independently — `format_agent_thread` and `format_agent_explain` — each pinned
+by an existing test that strips the running marker off the output.
+
+Closing only the deck path would have moved the defect rather than fixed it:
+`/jobs list` and `/jobs view` showing `◉` while `/jobs show` and `/jobs explain`
+still showed `◆`. **Inconsistency across subcommands is worse than a uniform
+uninformative marker**, because it teaches a user to distrust the glyph
+everywhere. The authorisation was extended to all four tests; each pinned the
+**deferral**, not a behaviour.
+
+Verified after the fact: **zero** remaining blocked-to-running mappings, and all
+four sites return `Blocked`.
+
+**A trap worth remembering**, flagged in advance and then hit: those explain
+tests assert the body `is_ascii()` **after** stripping the marker. `◉` is
+non-ASCII, so it satisfies that assertion *only because it is stripped* —
+changing the enum without the `strip_prefix` fails the test on an ASCII
+assertion that looks entirely unrelated to the change.
+
+**Plain-mode bytes:** `[blk]` is added and **no shipped marker moved** —
+pinned by a dedicated test so a sixth state cannot renumber the five.
+
+**Loose end:** F34's text names the old test by its pre-rename name
+(`the_blocked_deck_row_is_marked_live_and_reads_blocked`), which no longer
+exists; the rename was correct, since "marked_live" was the claim being
+retracted. Anyone following that reference should look for
+`the_blocked_deck_row_is_marked_blocked_and_reads_blocked`.

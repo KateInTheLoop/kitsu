@@ -381,6 +381,21 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   groups omitted. Those headings bypass `deck_header`, so they are pure ASCII
   in every tier; both views build their counts from one shared expression and
   their rows from one shared helper, so they cannot drift. `/jobs explain <id>`
+  **The deck's marker vocabulary, one source for every agent surface** (the
+  marker story, closing F34/F3): `deck_marker` maps each state to a glyph in the
+  styled and colourless tiers and to a **bracketed ASCII token** under
+  `--plain` — `◉`/`[blk]` **blocked**, `◆`/`[run]` working, `◈`/`[rdy]` done with
+  a result waiting, `◇`/`[err]` failed, `◇`/`[stp]` stopped. `--plain` is
+  checked **first**, so a glyph never reaches the structural-marker mapping;
+  that is what makes sharing `◈` with a section header safe, since a plain row
+  can never read as `#`. A blocked agent had shared the working glyph until that
+  story; it now has its own in all four of `/jobs list`, `/jobs view`,
+  `/jobs show` and `/jobs explain`, because those are the only places that map a
+  phase to a deck state and all four were changed together. Adding a sixth state
+  means adding a glyph, a colour **and** a plain token, and a test asserts the
+  plain tokens of the shipped five are byte-stable.
+
+  `/jobs explain <id>`
   renders one agent as a `deck_marker` header `agent #N explained | <phase>`
   followed by `  <label>: <value>` lines in a fixed order — `since`,
   `waiting on`, `because`, `last activity`, `steering`, `handoff` — each
