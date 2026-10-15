@@ -251,6 +251,11 @@ pub(crate) struct StatusCounts {
     pub(crate) queued: usize,
     pub(crate) blocked: usize,
     pub(crate) running: usize,
+    /// The agent the composer is attached to, read off the session binding at
+    /// paint time -- a pull, like the two counts above, because the binding
+    /// moves between paints and a value copied in would be stale exactly when
+    /// the user looks (card **T4-S6-status**).
+    pub(crate) attached: Option<u64>,
 }
 
 impl StatusSource {
@@ -297,12 +302,17 @@ impl StatusSource {
             queued: counts.queued,
             blocked: counts.blocked,
             running: counts.running,
+            // The attachment is pulled with the counts, so the row the
+            // painter composes on the cadence tick is derived from the
+            // composer's session binding as it stands at paint time -- never
+            // a copy taken when the source was built (card **T4-S6-status**).
+            attached: counts.attached,
         }
     }
 
     /// Compose the row at `cols`. Nothing is cached: the point of the type is
     /// that the row is built from the fields as they stand.
-    fn compose(&self, cols: usize) -> String {
+    pub(crate) fn compose(&self, cols: usize) -> String {
         live::compose_status_row(&self.fields(), cols)
     }
 
@@ -5264,7 +5274,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{repaint_status_row, StatusCounts, StatusSource};
+    use super::{repaint_status_row, StatusCounts, StatusSource, STATUS_FRAME_INTERVAL};
 
     /// Process-wide reduced-motion override, restored on the way out.
     ///
@@ -5328,8 +5338,7 @@ mod tests {
         let cell = queued.clone();
         let source = StatusSource::new(Box::new(move || StatusCounts {
             queued: cell.load(Ordering::Relaxed),
-            blocked: 0,
-            running: 0,
+            ..Default::default()
         }));
         source.set_usage("example-model-v1", 1_000, 100_000);
         guard.enable_live_status(source.clone());
@@ -5537,6 +5546,223 @@ mod tests {
                 text.escape_debug().to_string()
             );
         }
+        drop(guard);
+    }
+
+    // ---------------------------------------------------------------------
+    // Card **T4-S6-status**, requirement A5 / design §4.5: the
+    // `attached · agent N` segment, measured in the bytes the painter writes.
+    //
+    // **FAILING-FIRST.** `StatusFields::attached` and `StatusCounts::attached`
+    // exist (this card's authorised production edits) and nothing composes or
+    // forwards them, so both tests below are red.
+    //
+    // The surface is `repaint_status_row` -> `InlineSurface::paint` -> stderr:
+    // the same path the 50 ms cadence paints the pinned row on, so what these
+    // tests read is what reaches the terminal. Finding **F71**: reading the
+    // attachment back off `StatusSource::fields` would pass against a row
+    // that never mentions it.
+    // ---------------------------------------------------------------------
+
+    /// The fixture of [`live_status_fixture`] plus the **session binding** the
+    /// composer loop owns, behind the handle the counts closure reads.
+    ///
+    /// The closure is a *pull*: the attachment is read at paint time from the
+    /// one cell, never copied into the source, which is why a detach needs no
+    /// second notification and the row cannot drift from the prompt label
+    /// (**F75**).
+    #[allow(clippy::type_complexity)]
+    fn live_status_fixture_attached() -> (
+        BridgeGuard,
+        SharedSink,
+        Arc<StatusSource>,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Option<u64>>>,
+    ) {
+        let (guard, _out, err) = install_inline(T3_S12_ROWS, T3_S12_VIEWPORT_ROWS, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let queued = Arc::new(AtomicUsize::new(0));
+        let attached: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
+        let (queue_cell, attach_cell) = (queued.clone(), attached.clone());
+        let source = StatusSource::new(Box::new(move || StatusCounts {
+            queued: queue_cell.load(Ordering::Relaxed),
+            attached: *attach_cell.lock().expect("the session binding"),
+            ..Default::default()
+        }));
+        source.set_usage("example-model-v1", 1_000, 100_000);
+        guard.enable_live_status(source.clone());
+        source.begin_turn();
+        (guard, err, source, queued, attached)
+    }
+
+    /// Past the painter's frame budget (N3), so the next `repaint_status_row`
+    /// is not swallowed by it.
+    fn past_the_frame_budget() {
+        std::thread::sleep(STATUS_FRAME_INTERVAL * 3);
+    }
+
+    /// The segment is **painted**, it **names the agent**, and it **tracks
+    /// the binding in both directions** — attach paints it, detach takes it
+    /// away. Nothing between the binding and the bytes but production.
+    ///
+    /// The detach half is deliberately driven by clearing the binding and
+    /// nothing else, because that is the whole of what the composer loop's
+    /// detach arm does (`main.rs`, `InlineRead::Detached`: `*attached = None`)
+    /// — so if the row needed telling separately, it would be a second copy
+    /// and this test would stay red.
+    #[test]
+    #[serial]
+    fn the_status_row_paints_the_attachment_and_stops_when_the_binding_is_cleared() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, _source, _queued, attached) = live_status_fixture_attached();
+
+        // Detached: the row is painted, and it is the whole row.
+        repaint_status_row();
+        let visible = kitsu_render::sanitize_terminal_text(&err.text());
+        assert!(
+            visible.contains("example-model-v1"),
+            "control: the detached row must be painted, got {visible:?}"
+        );
+        assert!(
+            !visible.contains("attached"),
+            "nothing is attached, so the row must not say so, got {visible:?}"
+        );
+
+        // Attach: the binding moves and nothing else is told.
+        *attached.lock().expect("the session binding") = Some(3);
+        let before = err.text().len();
+        past_the_frame_budget();
+        repaint_status_row();
+        let window = err.text()[before..].to_string();
+        let visible = kitsu_render::sanitize_terminal_text(&window);
+        assert_eq!(
+            row_paints(&window),
+            1,
+            "attaching is state, not animation, and must paint once, got {:?}",
+            window.escape_debug().to_string()
+        );
+        assert!(
+            visible.contains("attached \u{b7} agent 3"),
+            "design §4.5: the status row shows `attached \u{b7} agent 3`, got \
+             {visible:?}"
+        );
+        assert!(
+            visible.contains("example-model-v1"),
+            "and it is still the status row, got {visible:?}"
+        );
+
+        // A second agent: the row names *which*, so the segment cannot be a
+        // fixed "attached" with the id painted from somewhere else.
+        *attached.lock().expect("the session binding") = Some(11);
+        let before = err.text().len();
+        past_the_frame_budget();
+        repaint_status_row();
+        let visible = kitsu_render::sanitize_terminal_text(&err.text()[before..]);
+        assert!(
+            visible.contains("attached \u{b7} agent 11") && !visible.contains("agent 3"),
+            "the segment names the agent the binding holds, got {visible:?}"
+        );
+
+        // Detach: clearing the binding is the whole of the composer loop's
+        // detach arm, and the segment must go with it.
+        *attached.lock().expect("the session binding") = None;
+        let before = err.text().len();
+        past_the_frame_budget();
+        repaint_status_row();
+        let window = err.text()[before..].to_string();
+        let visible = kitsu_render::sanitize_terminal_text(&window);
+        assert_eq!(
+            row_paints(&window),
+            1,
+            "detaching must repaint the row, got {:?}",
+            window.escape_debug().to_string()
+        );
+        assert!(
+            !visible.contains("attached"),
+            "A5: after a detach the row must not claim an attachment, got \
+             {visible:?}"
+        );
+        assert!(
+            visible.contains("example-model-v1"),
+            "and the row that comes back is the whole row, not an empty one, \
+             got {visible:?}"
+        );
+        drop(guard);
+    }
+
+    /// **Decided here, because §4.5 does not say: the segment survives a
+    /// repaint, and survives the attached agent finishing.**
+    ///
+    /// *Repaint.* The row is recomposed from the source on every paint
+    /// (`repaint_status_row`, `clear_approval_modal`), never remembered, so a
+    /// repaint triggered by something else entirely — here a queue-depth
+    /// change — must still carry the attachment. A segment that was painted
+    /// once and lost on the next frame would make §4.5's legibility argument
+    /// for `←` hold only until the next keystroke.
+    ///
+    /// *The agent finishing.* The attachment is the **user's**, not the
+    /// agent's: it is derived from the composer's session binding and the
+    /// registry is not consulted, so an agent reaching a terminal state while
+    /// attached does **not** silently detach. The precedent is T4-S6a's own
+    /// ruling that leaving the agent view is not detaching — only `←`,
+    /// `Ctrl+X d` and `/detach` are — and the alternative is worse: the
+    /// prompt label is derived from the same binding, so a row that dropped
+    /// the segment on its own would disagree with the caret in front of the
+    /// user. This test pins it at the only place that can be pinned here: the
+    /// row's content depends on the binding and on nothing about the agent,
+    /// so no registry state can take the segment away. The registry's side of
+    /// it belongs to T4-S6b/c, which own the stream and the recap.
+    #[test]
+    #[serial]
+    fn the_attachment_segment_survives_a_repaint_caused_by_anything_else() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, source, queued, attached) = live_status_fixture_attached();
+
+        *attached.lock().expect("the session binding") = Some(4);
+        repaint_status_row();
+        let visible = kitsu_render::sanitize_terminal_text(&err.text());
+        assert!(
+            visible.contains("attached \u{b7} agent 4"),
+            "control: the attachment must reach the first paint, got {visible:?}"
+        );
+
+        // A repaint caused by an unrelated state change, with the binding
+        // untouched.
+        queued.store(2, Ordering::Relaxed);
+        let before = err.text().len();
+        past_the_frame_budget();
+        repaint_status_row();
+        let window = err.text()[before..].to_string();
+        let visible = kitsu_render::sanitize_terminal_text(&window);
+        assert_eq!(
+            row_paints(&window),
+            1,
+            "control: the queue depth moved, so the row must repaint, got {:?}",
+            window.escape_debug().to_string()
+        );
+        assert!(
+            visible.contains("[2 queued]"),
+            "control: carrying the new depth, got {visible:?}"
+        );
+        assert!(
+            visible.contains("attached \u{b7} agent 4"),
+            "and the attachment survives a repaint it did not cause, got \
+             {visible:?}"
+        );
+
+        // And the composed row is a function of the binding alone: the same
+        // binding composes the same segment however many times it is asked,
+        // which is what "recomposed, never remembered" means.
+        let cols = live::terminal_columns();
+        let once = kitsu_render::sanitize_terminal_text(&source.compose(cols));
+        let twice = kitsu_render::sanitize_terminal_text(&source.compose(cols));
+        assert_eq!(once, twice, "the row is composed, not consumed");
+        assert!(
+            once.contains("attached \u{b7} agent 4"),
+            "and composing it again still names the agent, got {once:?}"
+        );
         drop(guard);
     }
 

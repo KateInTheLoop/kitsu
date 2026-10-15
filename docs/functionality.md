@@ -304,7 +304,10 @@ the composer prompt names the agent (`agent 3>`), so the line you are typing has
 a visible destination. `←` on an empty composer detaches on the first press --
 it does not wait for the two-press agent-view chord, and it is not affected by
 `[tui] left_arrow_opens_agents`; with text typed, `←` is still cursor movement.
-`Ctrl+X d` and `/detach` also detach. Detaching stops nothing: stopping is `x`
+`Ctrl+X d` also detaches. `/detach` is registered but **not yet wired**: it
+always answers `not attached to a background agent`, because the slash dispatcher
+has no access to the composer's attachment -- wiring it means threading that
+binding through the dispatch sites. Detaching stops nothing: stopping is `x`
 in the view or `/jobs stop <id>`. Attaching a finished agent collects its result
 just as `Space` does, and closing the view with `q` or `Esc` does not detach.
 

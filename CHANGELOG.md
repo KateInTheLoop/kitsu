@@ -95,7 +95,9 @@ shapes may change in any minor release.
 - **Attach to a background agent from the agent view.** `Enter` or `→` on the
   selected row attaches and closes the view; the composer prompt then names the
   agent, so you can see what your next line is aimed at. `←` on an empty
-  composer, `Ctrl+X d`, or the new **`/detach`** return you to the session.
+  composer or `Ctrl+X d` returns you to the session. (`/detach` is registered but
+  **not yet wired** — it always reports that nothing is attached, because the
+  slash dispatcher cannot yet see the composer's attachment.)
   Attaching a finished agent counts as collecting its result, exactly as `Space`
   does. Detaching stops nothing. Leaving the view with `q` or `Esc` does not
   detach.

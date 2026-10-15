@@ -19728,6 +19728,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 queued: queue.lock().expect("prompt queue").status().queued,
                 blocked: agents.blocked,
                 running: agents.running,
+                ..Default::default()
             }
         }));
         refresh_status_usage(Some(&source), &model, &messages, &session, &session_state);
@@ -33356,6 +33357,163 @@ mod tests {
         // A view that was never shown is the same answer.
         apply_agent_view_exit(&AgentViewExit::declined(), &mut attached);
         assert_eq!(attached, Some(ids[0]));
+    }
+
+    /// Card **T4-S6-status**, requirement A5 / design §4.5: **the row and the
+    /// prompt label are the same attachment**, carried by production.
+    ///
+    /// **FAILING-FIRST**, and this is the test that fails if the row is given
+    /// a copy of the attachment instead of a read of it. Every transition is
+    /// driven through the production carriers T4-S6a shipped — the view's
+    /// `Enter`, [`AgentViewExit::leaving`], [`apply_agent_view_exit`], and the
+    /// reader's `Detached` outcome — and after each one **two** derived
+    /// surfaces are asserted against each other: the status row
+    /// (`StatusSource::compose`, the string `repaint_status_row` paints) and
+    /// the composer prompt (`tui_bridge::composer_prompt`, the label in front
+    /// of the caret). Nothing in this test tells the row anything; the row's
+    /// counts closure reads the **same cell** `apply_agent_view_exit` writes,
+    /// which is the shape production must have because the painter composes
+    /// the row from a cadence tick the composer loop is not on.
+    ///
+    /// Why both surfaces and not just the row: §4.5's amendment rests the
+    /// `←`-detaches-on-the-first-press rule on the attachment being legible
+    /// at the moment of the press, and the label carried that argument alone
+    /// (**F74**). Two labels derived from one binding keep it; a label and a
+    /// *copy* would be the fifth occurrence of **F75**'s family, so the
+    /// agreement is asserted after every transition rather than once.
+    ///
+    /// The terminal is the one thing not traversed, exactly as in
+    /// `the_views_attach_reaches_the_composer_and_makes_the_detach_keys_live`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_status_row_and_the_prompt_label_read_the_one_attachment_binding() {
+        /// One read of the inline composer with a configured keymap, as the
+        /// F75 test drives it.
+        fn one_read(attached: Option<u64>, bytes: &[u8]) -> tui_bridge::InlineRead {
+            let keys = tui_bridge::InlineKeys {
+                prefix: tui_bridge::chord_prefix_byte("ctrl+x"),
+                left_arrow_opens_agents: true,
+            };
+            let mut input = std::io::Cursor::new(bytes.to_vec());
+            let mut paint = |_: &str, _: usize, _: &str, _: bool| {};
+            tui_bridge::read_line_inline_with_keys(
+                &mut input,
+                &mut paint,
+                &[],
+                &mut || {},
+                keys,
+                attached,
+            )
+            .expect("a cursor cannot fail to read")
+        }
+
+        const BASE: &str = "kitsu> ";
+        const COLS: usize = 120;
+        const LEFT: &[u8] = b"\x1b[D";
+
+        let (registry, ids) = registry_with_three_agents();
+        // The session binding, behind the handle the status row's counts
+        // closure reads at paint time. One cell, two readers.
+        let binding: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
+        let cell = binding.clone();
+        let source = tui_bridge::StatusSource::new(Box::new(move || tui_bridge::StatusCounts {
+            attached: *cell.lock().expect("the session binding"),
+            ..Default::default()
+        }));
+        source.set_usage("example-model-v1", 1_000, 100_000);
+        let row = || kitsu_render::sanitize_terminal_text(&source.compose(COLS));
+        let label = || tui_bridge::composer_prompt(BASE, *binding.lock().expect("the binding"));
+
+        // Detached: neither surface claims an attachment, and the row is a
+        // row (the control that makes the absence non-vacuous).
+        assert!(
+            row().contains("example-model-v1"),
+            "control: the detached row is painted: {:?}",
+            row()
+        );
+        assert!(!row().contains("attached"), "{:?}", row());
+        assert_eq!(label(), BASE);
+
+        // Attach, through the two carriers production uses, in its order.
+        let mut overlay = OverlayUnderTest::new();
+        assert!(
+            overlay.feed_closing(&registry, b"\r"),
+            "A3: `Enter` attaches and leaves the view"
+        );
+        let exit = AgentViewExit::leaving(&overlay.state);
+        apply_agent_view_exit(&exit, &mut binding.lock().expect("the binding"));
+        assert_eq!(
+            *binding.lock().expect("the binding"),
+            Some(ids[0]),
+            "F75: the view's attachment reaches the session binding"
+        );
+        assert_eq!(
+            label(),
+            format!("agent {}> ", ids[0]),
+            "the prompt label names it (T4-S6a, already shipped)"
+        );
+        assert!(
+            row().contains(&format!("attached \u{b7} agent {}", ids[0])),
+            "design §4.5: and so does the status row, off the same binding: \
+             {:?}",
+            row()
+        );
+
+        // An agent finishing while attached does **not** detach: the segment
+        // is derived from the binding, and the registry is not consulted.
+        // Decided here, because §4.5 does not say; T4-S6a's "leaving the view
+        // is not detaching" is the precedent, and a row that detached itself
+        // would disagree with the label in front of the caret.
+        registry.finish(ids[0], Ok("alpha: done".to_string()));
+        assert!(
+            registry.snapshot().terminal >= 1,
+            "control: the attached agent really reached a terminal state"
+        );
+        assert!(
+            row().contains(&format!("attached \u{b7} agent {}", ids[0])),
+            "an agent finishing while attached must not silently detach: \
+             {:?}",
+            row()
+        );
+        assert_eq!(
+            label(),
+            format!("agent {}> ", ids[0]),
+            "and the two surfaces still agree"
+        );
+
+        // Detach, through the reader's own outcome and the composer loop's
+        // arm, which is `*attached = None` and nothing else: no second
+        // notification exists, so a row holding a copy stays red here.
+        assert_eq!(
+            one_read(*binding.lock().expect("the binding"), LEFT),
+            tui_bridge::InlineRead::Detached,
+            "A5: `\u{2190}` on an empty composer detaches while attached"
+        );
+        *binding.lock().expect("the binding") = None;
+        assert_eq!(label(), BASE, "the label goes back to the session's own");
+        assert!(
+            !row().contains("attached"),
+            "A5: and the row stops claiming an attachment: {:?}",
+            row()
+        );
+        assert!(
+            row().contains("example-model-v1"),
+            "while still being the whole row: {:?}",
+            row()
+        );
+
+        // `Ctrl+X d` is the same binding and the same arm: re-attach through
+        // production and detach with the chord.
+        apply_agent_view_exit(&exit, &mut binding.lock().expect("the binding"));
+        assert!(row().contains("attached \u{b7} agent"), "{:?}", row());
+        assert_eq!(
+            one_read(*binding.lock().expect("the binding"), b"\x18d"),
+            tui_bridge::InlineRead::Detached,
+            "A5: `Ctrl+X d` detaches too"
+        );
+        *binding.lock().expect("the binding") = None;
+        assert!(!row().contains("attached"), "{:?}", row());
+        assert_eq!(label(), BASE);
     }
 
     // ------------------------------------------------------------------
