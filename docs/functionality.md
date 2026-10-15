@@ -299,6 +299,15 @@ clamps at the ends instead of wrapping, moving it never collects a result, and
 if the selected agent is pruned the selection falls to the row that took its
 place.
 
+`Enter` or `→` attaches the selected agent and closes the view. While attached
+the composer prompt names the agent (`agent 3>`), so the line you are typing has
+a visible destination. `←` on an empty composer detaches on the first press --
+it does not wait for the two-press agent-view chord, and it is not affected by
+`[tui] left_arrow_opens_agents`; with text typed, `←` is still cursor movement.
+`Ctrl+X d` and `/detach` also detach. Detaching stops nothing: stopping is `x`
+in the view or `/jobs stop <id>`. Attaching a finished agent collects its result
+just as `Space` does, and closing the view with `q` or `Esc` does not detach.
+
 `n` opens a rename line that accepts any name the registry does -- including
 non-ASCII, which it previously dropped without saying so. A refused name (empty,
 longer than the limit, or carrying control characters) is reported on the rename

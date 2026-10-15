@@ -5376,6 +5376,14 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         alias_of: None,
     },
     SlashCommandSpec {
+        name: "detach",
+        args: "",
+        description: "return the composer from an attached background agent",
+        details: "Leaves the attachment an agent view `Enter` (or the chord `Ctrl+X d`, or left-arrow on an empty composer) created, so the next line you type goes to the model again. It stops nothing: the agent keeps running, and stopping one is `x` in the agent view or `/jobs stop <id>`.",
+        group: CommandGroup::AgentsJobs,
+        alias_of: None,
+    },
+    SlashCommandSpec {
         name: "diff",
         args: "[scope] [path]",
         description: "show a verified working/staged/unstaged/base/commit/checkpoint diff",
@@ -6196,13 +6204,14 @@ fn read_idle_chat_line(
     prompt: &str,
     assistive: bool,
     initial: &str,
+    attached: &mut Option<u64>,
 ) -> ChatReadline {
     if let Some(bridge) = bridge {
         // Assistive and non-TTY carriers keep their existing readers: neither
         // can be painted into a viewport row.
         if !assistive && kitsu_render::stdin_is_tty() && kitsu_render::stderr_styled() {
             let history: Vec<String> = editor.history().iter().cloned().collect();
-            return read_chat_line_inline(bridge, registry, prompt, &history, initial);
+            return read_chat_line_inline(bridge, registry, prompt, &history, initial, attached);
         }
     }
     read_chat_line(editor, prompt, assistive, initial)
@@ -6254,9 +6263,10 @@ fn read_idle_chat_line(
 fn read_chat_line_inline(
     bridge: &tui_bridge::BridgeGuard,
     registry: &subagent::AgentRegistry,
-    prompt: &str,
+    base_prompt: &str,
     history: &[String],
     initial: &str,
+    attached: &mut Option<u64>,
 ) -> ChatReadline {
     use std::io::Read as _;
 
@@ -6287,6 +6297,23 @@ fn read_chat_line_inline(
     // return with raw mode still engaged.
     let mut raw: Option<RawStdinGuard> = None;
     loop {
+        // Card **T4-S6a**: the agent this composer is routed to, and the
+        // label that is the standing evidence of it (design \u{00a7}4.5).
+        //
+        // It is derived **per read** rather than once per call, because the
+        // two things that change it both resume this loop: an attach made in
+        // the agent view (the `OpenAgentView` arm below) and a detach (the
+        // `Detached` arm). Both the prompt label and the key route the reader
+        // takes come off this one binding, so the row and the reader read the
+        // same single source rather than two.
+        //
+        // The binding itself is the **session's**, owned by the composer loop
+        // in `run_interactive` and borrowed here: `OverlayState` is
+        // per-invocation and this function returns after every submitted
+        // line, so neither can hold an attachment that must outlive them
+        // (finding **F75**).
+        let labelled = tui_bridge::composer_prompt(base_prompt, *attached);
+        let prompt = labelled.as_str();
         if raw.is_none() {
             match RawStdinGuard::engage() {
                 Some(guard) => raw = Some(guard),
@@ -6322,6 +6349,10 @@ fn read_chat_line_inline(
                 history,
                 &mut on_resize,
                 tui_bridge::inline_keys(),
+                // Card **T4-S6a** threads the attached agent here, from the
+                // same binding the prompt label above was derived from: a
+                // second carrier for it would be a second source of truth.
+                *attached,
             )
         };
         // Whatever happened, the row must not keep showing a draft that is
@@ -6343,9 +6374,28 @@ fn read_chat_line_inline(
             // overlay must not engage a second one: `RawStdinGuard::engage`
             // snapshots the modes it displaces, and nesting would publish the
             // *raw* modes as the canonical ones for the dying-signal restore.
-            run_agent_view_overlay(registry, false);
+            let exit = run_agent_view_overlay(registry, false);
+            // Card **T4-S6a**, requirement A3: the view's `Enter`/`\u{2192}`
+            // attaches, and this is the one place that attachment becomes the
+            // composer's. The view is gone by now (attach closes it), so the
+            // id has to be carried out of it rather than read off it.
+            apply_agent_view_exit(&exit, attached);
             bridge.reinstall_after_resume();
             carried = draft;
+            continue;
+        }
+        // Card **T4-S6a**, requirement A5: `\u{2190}` on an empty composer
+        // and `Ctrl+X d` both report `Detached`, and detaching is this loop's
+        // to perform: the reader is pure, exactly as it is for a suspend and
+        // for the agent view. Clearing the session binding is the whole of
+        // it — the next iteration re-derives the prompt label off it, so the
+        // composer visibly goes back to the session's own prompt and the
+        // `\u{2190}` route goes back to the agent view's two-press arm. The
+        // `\u{26E9}` milestone and the recap are **not** this card's (design
+        // \u{00a7}4.5: they land with T4-S6b and T4-S6c).
+        if let Ok(tui_bridge::InlineRead::Detached) = outcome {
+            *attached = None;
+            carried = String::new();
             continue;
         }
         // Finding F21: Ctrl+Z. The reader is pure, so the whole suspend is
@@ -6380,6 +6430,10 @@ fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead
         // Both handled by the caller's loop before this is reached.
         Ok(tui_bridge::InlineRead::Suspended(_)) => ChatReadline::Eof,
         Ok(tui_bridge::InlineRead::OpenAgentView(_)) => ChatReadline::Eof,
+        // Card T4-S6a: handled by the caller's loop too -- detaching clears
+        // the session's attachment, which re-labels the composer, and reads
+        // again. Unreachable from there, like the two outcomes above it.
+        Ok(tui_bridge::InlineRead::Detached) => ChatReadline::Eof,
         Ok(tui_bridge::InlineRead::Interrupted) => {
             // Deliberately NOT re-raising SIGINT here, unlike the during-turn
             // collector. The collector raises because a turn is in flight and
@@ -6779,6 +6833,16 @@ fn agent_view_no_selection(key: char) -> AgentViewReport {
     }
 }
 
+/// What `Enter`/`\u{2192}` say when there is **no selection at all** (card
+/// **T4-S6a**, requirement A3's *attach*).
+///
+/// Its own wording rather than [`agent_view_no_selection`]'s, for two reasons:
+/// that helper interpolates the keystroke as a character, which neither of
+/// these two keys is, and a row carrying a raw `\r` would corrupt the frame it
+/// is painted on.
+#[cfg(unix)]
+const ATTACH_WITHOUT_SELECTION: &str = "nothing is selected, so there is no agent to attach to";
+
 /// What one chunk of bytes did to the steer line (card T4-S4b).
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))] // Bound by T4-S4b's loop.
@@ -7020,6 +7084,10 @@ enum OverlayPending {
 enum OverlayKey {
     Up,
     Down,
+    /// `\u{2192}`: attach to the selected agent, the synonym requirement A3
+    /// gives `Enter` (card T4-S6a). Decoded from `ESC [ C` and `ESC O C`, the
+    /// two spellings `arrow` already reads `Up` and `Down` from.
+    Right,
     /// A resolved `Esc`: step back out of the frame on screen.
     StepBack,
     /// `Enter`: submit whatever prompt is open. Inert over the row list.
@@ -7050,6 +7118,10 @@ fn decode_overlay_keys(bytes: &[u8], pending: &mut OverlayPending) -> Vec<Overla
         match final_byte {
             b'A' => Some(OverlayKey::Up),
             b'B' => Some(OverlayKey::Down),
+            // Card **T4-S6a**: `\u{2192}`, the synonym requirement A3 gives
+            // `Enter`. Both spellings reach here, so one arm covers
+            // `ESC [ C` and the application-cursor-mode `ESC O C` alike.
+            b'C' => Some(OverlayKey::Right),
             _ => None,
         }
     }
@@ -7464,6 +7536,15 @@ struct OverlayState {
     /// same reasons `s`'s is — a term may be non-ASCII, a paste is content,
     /// and a character may arrive split across two reads (card T4-S5).
     filtering: Option<OverlayLine>,
+    /// The agent the view was told to attach to, for the loop to pick up as
+    /// it leaves (card **T4-S6a**, requirement A3's `Enter`/`\u{2192}`).
+    ///
+    /// Attach is state rather than a step for the reason the filter is: the
+    /// key's whole effect is recorded here, and the terminal half of the loop
+    /// — which leaves the alternate screen, prints the `\u{26E9}` milestone and
+    /// routes the composer — reads it afterwards. A step carrying the id would
+    /// put the id in two places.
+    attaching: Option<u64>,
     /// The filter in force, which is what [`overlay_visible_rows`] applies.
     ///
     /// It lives here and nowhere else, so it survives every repaint and every
@@ -7486,6 +7567,7 @@ impl OverlayState {
             steering: None,
             renaming: None,
             filtering: None,
+            attaching: None,
             filter: kitsu_tui::agents_view::AgentFilter::default(),
         }
     }
@@ -7842,9 +7924,11 @@ fn handle_overlay_input(
             // An arrow or an Enter inside the read is neither an
             // answer nor a cancel, so the read stays open rather than
             // resolving to a guess.
-            OverlayKey::Up | OverlayKey::Down | OverlayKey::Enter | OverlayKey::Backspace => {
-                state.prompt = Some(OverlayPrompt::Decision(id))
-            }
+            OverlayKey::Up
+            | OverlayKey::Down
+            | OverlayKey::Right
+            | OverlayKey::Enter
+            | OverlayKey::Backspace => state.prompt = Some(OverlayPrompt::Decision(id)),
         },
         None => match key {
             // Esc, resolved as a real key press rather than as the
@@ -7877,10 +7961,38 @@ fn handle_overlay_input(
                     state.selection.move_down(view_rows);
                 }
             }
-            // Enter and Backspace belong to the prompts; over the row
-            // list there is nothing for them to do, and they must not
-            // reach the composer underneath either.
-            OverlayKey::Enter | OverlayKey::Backspace => {}
+            // Card **T4-S6a**, requirement A3: `Enter` and its synonym
+            // `\u{2192}` **attach** to the selected agent and leave the view.
+            // Leaving is part of the key and not an extra step: A5 streams the
+            // attached agent into the **main viewport**, which a full-screen
+            // overlay would cover. Inert while the help or a peek panel is up,
+            // like every other key that acts on the selection, because the
+            // selected row is not on screen there.
+            //
+            // Requirement **A7**: attaching a terminal agent takes custody of
+            // its result, because attach is how the user reads it. The
+            // acknowledgement goes through `agent_view_peek` -- the one
+            // acknowledging path T4-S3 left -- rather than a second
+            // `acknowledge_result` call site, which is the shape F45 was
+            // closed by retiring. Its panel is discarded here: the view is
+            // closing, and the stream the user attached to is the viewport's.
+            OverlayKey::Enter | OverlayKey::Right => {
+                if !state.helping && state.peeking.is_none() {
+                    state.selection.disarm();
+                    match state.selection.selected() {
+                        None => state.report = Some(ATTACH_WITHOUT_SELECTION.to_string()),
+                        Some(id) => {
+                            let _ = agent_view_peek(registry, id);
+                            state.attaching = Some(id);
+                            return OverlayStep::Closing;
+                        }
+                    }
+                }
+            }
+            // Backspace belongs to the prompts; over the row list there is
+            // nothing for it to do, and it must not reach the composer
+            // underneath either.
+            OverlayKey::Backspace => {}
             OverlayKey::Char('?') => state.helping = true,
             OverlayKey::Char('q') => return OverlayStep::Closing,
             // Space: peek the selected agent. The byte is the view's
@@ -7995,6 +8107,66 @@ fn handle_overlay_input(
     OverlayStep::Continue
 }
 
+/// What one run of the agent view leaves behind for the composer underneath
+/// (card **T4-S6a**, finding **F75**).
+///
+/// Two things, because the overlay has two callers with two different
+/// questions: `/jobs view` only asks **whether** the view was shown, so it can
+/// print the text deck when it was not; the idle composer asks **what the view
+/// attached to**, because requirement A3's `Enter`/`\u{2192}` is an action
+/// whose entire effect lands outside the view.
+///
+/// It is a return value rather than something the caller reads off
+/// [`OverlayState`] because the state does not survive the run: it is built
+/// inside [`run_agent_view_overlay`] and dropped when the view closes — and
+/// attach *closes the view*, so by the time the composer could look, there is
+/// nothing left to look at. **F75** is what happens without this: the attach
+/// arm wrote `OverlayState::attaching` and no production code ever read it.
+#[cfg(unix)]
+#[derive(Debug, Default, Eq, PartialEq)]
+struct AgentViewExit {
+    /// Whether the overlay was actually shown. `false` when the mode or the
+    /// terminal declined it, which is the answer `/jobs view` falls back on.
+    shown: bool,
+    /// The agent `Enter`/`\u{2192}` attached to, if either was pressed.
+    attached: Option<u64>,
+}
+
+#[cfg(unix)]
+impl AgentViewExit {
+    /// The view was not shown, so it attached to nothing.
+    fn declined() -> Self {
+        Self::default()
+    }
+
+    /// The view ran and has closed: whatever the attach arm recorded is now
+    /// the composer's to act on.
+    fn leaving(state: &OverlayState) -> Self {
+        Self {
+            shown: true,
+            attached: state.attaching,
+        }
+    }
+}
+
+/// Carry one agent view's attachment into the composer's session binding
+/// (card **T4-S6a**, requirement A3).
+///
+/// The session binding is the attachment's **only** home: it has to outlive
+/// both the overlay (per-invocation) and one inline read (one submitted line),
+/// and it is the single source the prompt label and the `\u{2190}`/`Ctrl+X d`
+/// routes are both derived from.
+///
+/// A view that was closed with `q` or `Esc` attached to nothing and leaves the
+/// existing attachment alone: leaving the view is not detaching, and `\u{2190}`
+/// and `/detach` are the keys that are.
+#[cfg(unix)]
+fn apply_agent_view_exit(exit: &AgentViewExit, attached: &mut Option<u64>) {
+    if let Some(id) = exit.attached {
+        *attached = Some(id);
+    }
+}
+
 /// Open the agent view overlay and run it until it is closed, returning
 /// whether it was opened at all (card T4-S2, requirement A1).
 ///
@@ -8019,14 +8191,14 @@ fn handle_overlay_input(
 /// would snapshot the *raw* modes as the canonical ones for the dying-signal
 /// restore.
 #[cfg(unix)]
-fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) -> bool {
+fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) -> AgentViewExit {
     use std::io::{Read as _, Write as _};
 
     if tui_bridge::live_mode() != tui_bridge::TuiMode::Inline {
-        return false;
+        return AgentViewExit::declined();
     }
     if !kitsu_render::stdin_is_tty() || !kitsu_render::stderr_styled() {
-        return false;
+        return AgentViewExit::declined();
     }
     // Held for the whole loop when it is this function's to hold, dropped on
     // every return path by being bound here.
@@ -8035,7 +8207,7 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
             Some(guard) => Some(guard),
             // No raw mode means no keystrokes, which means no way back out of
             // a full-screen overlay. Declining is the only safe answer.
-            None => return false,
+            None => return AgentViewExit::declined(),
         }
     } else {
         None
@@ -8140,7 +8312,7 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
     // screen back: control bytes and the bottom row only, so the restored
     // transcript is not disturbed.
     tui_bridge::reinstall_pinned_region();
-    true
+    AgentViewExit::leaving(&state)
 }
 
 /// The real [`tui_bridge::SuspendEffects`]: the viewport guard for the screen
@@ -13771,7 +13943,7 @@ async fn handle_jobs_command(
             // user never sees it and it still scrolls their history. Classic
             // mode opens no overlay, so it keeps the deck unchanged.
             #[cfg(unix)]
-            let shown = run_agent_view_overlay(registry, true);
+            let shown = run_agent_view_overlay(registry, true).shown;
             #[cfg(not(unix))]
             let shown = false;
             if !shown {
@@ -19576,6 +19748,17 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // Type-ahead the user was still composing when a turn ended; pre-filled
     // into the next live editor or idle prompt so typing is never dropped.
     let mut pending_draft = String::new();
+    // Card **T4-S6a**, requirement A3/A5: the background agent this
+    // composer is routed to, and the session's only home for it. The agent
+    // view's `Enter`/`\u{2192}` sets it (through `apply_agent_view_exit`),
+    // `\u{2190}` on an empty composer and `Ctrl+X d` clear it, and the
+    // composer's prompt label is derived from it on every read. It lives here
+    // because it must outlive both the overlay, which is per-invocation, and
+    // one inline read, which returns on every submitted line (**F75**).
+    // (`cfg(unix)`: the inline reader is the only thing that can attach,
+    // and the classic reader on other platforms has no agent view at all.)
+    #[cfg(unix)]
+    let mut attached_agent: Option<u64> = None;
     let no_tools = Registry::new();
     let mut run_aggregate = InteractiveRunAggregate::default();
 
@@ -19658,6 +19841,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     &visible_prompt,
                     assistive_input,
                     &initial,
+                    &mut attached_agent,
                 );
                 #[cfg(not(unix))]
                 let read = read_chat_line(&mut rl, &visible_prompt, assistive_input, &initial);
@@ -22000,6 +22184,17 @@ async fn handle_slash(
                 "changed": !arg.is_empty(),
                 "effort": reasoning_effort_label(selected),
             })));
+        }
+        // Card **T4-S6a**: `/detach`, the command requirement A5 names beside
+        // `\u{2190}`. A submitted line is an intention with somewhere to put
+        // the answer (T2-S5b), so unlike the `Ctrl+X d` chord it is answered
+        // rather than silently inert. Nothing in this card can attach, so
+        // there is one answer to give; **F57** is why the arm exists at all:
+        // a registered command with no arm falls through to `unknown command`
+        // and, mid-turn, is enqueued as a model prompt.
+        "detach" => {
+            eprintln!("not attached to a background agent");
+            return SlashResult::Error;
         }
         "steer" => {
             eprintln!(
@@ -31303,21 +31498,32 @@ mod tests {
         /// collect it; [`OverlayUnderTest::feed_and_frame`] leaves it in,
         /// because the frame is painted from it. Both go through this one
         /// body, so there is one byte path here and not two (**F69**).
-        fn apply(&mut self, registry: &subagent::AgentRegistry, chunk: &[u8]) {
+        ///
+        /// Returns what the loop's `overlay_feed_chunk` returned -- whether
+        /// the view is closing -- which card T4-S6a's attach needs and the
+        /// earlier cards' callers ignore.
+        fn apply(&mut self, registry: &subagent::AgentRegistry, chunk: &[u8]) -> bool {
             let rows = overlay_visible_rows(registry, &self.state);
             self.state.selection.sync(&rows);
             // The loop's own byte path, whole: the open line's bypass and the
             // decoder's keys through the one dispatch (**F69**). The report
             // row is collected instead of painted; the loop paints it and
             // keeps the last one, and nothing in the dispatch reads it back.
-            let _ = overlay_feed_chunk(
+            overlay_feed_chunk(
                 registry,
                 &mut self.state,
                 &mut self.decoder,
                 &rows,
                 OVERLAY_TEST_COLS,
                 chunk,
-            );
+            )
+        }
+
+        /// One `read`, returning whether the view is closing (card T4-S6a).
+        /// The same single body as every other helper here: `apply` is the
+        /// loop's byte path and this adds nothing to it (**F69**).
+        fn feed_closing(&mut self, registry: &subagent::AgentRegistry, chunk: &[u8]) -> bool {
+            self.apply(registry, chunk)
         }
 
         /// One `read`, then **the rows the loop would paint afterwards** —
@@ -32768,5 +32974,467 @@ mod tests {
             "NON-VACUOUS: the following quiet tick did not cancel the line \
              either, because the arrow consumed the `ESC`"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Card T4-S6a: **attach** -- the agent view's half of requirement A3's
+    // `Enter`/`→`, and requirement A7's custody question.
+    //
+    // Every test under this banner FAILS today: `Enter` is inert over the
+    // row list, `→` is not decoded at all, and `OverlayState::attaching`
+    // is written by nobody.
+    //
+    // **Why attach is `OverlayState::attaching` and a close**, rather than
+    // a step of its own: the key's whole effect is to name the agent the
+    // composer underneath is now routed to. The stream it shows goes to the
+    // **main viewport** (A5), so a full-screen overlay left up over it
+    // would hide the thing the user attached to see.
+    // ------------------------------------------------------------------
+
+    /// The one line `Enter` and `→` leave when there is nothing to attach to.
+    ///
+    /// Deliberately **not** `agent_view_no_selection`'s wording: that helper
+    /// interpolates the keystroke as a character (`` `x` has nothing to act
+    /// on``), which works for the printable action keys and for neither of
+    /// these two. A row carrying a raw `\r` would also corrupt the frame it
+    /// is painted on.
+    #[cfg(unix)]
+    const ATTACH_WITHOUT_SELECTION: &str = "nothing is selected, so there is no agent to attach to";
+
+    /// Requirement A3, *`Enter`/`→` attach*: **the key names the agent and
+    /// leaves the view.**
+    ///
+    /// The help frame is the non-vacuous control, and it is the rule every
+    /// other key over the row list already follows (`↑/↓`, `Space`, the
+    /// action keys): the selected row is not on screen there, so a key that
+    /// acted on it would act on something invisible.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn enter_attaches_the_selected_agent_and_leaves_the_view() {
+        let (registry, ids) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        assert_eq!(
+            overlay.selected(&registry),
+            Some(ids[0]),
+            "NON-VACUOUS: the first row is selected before any key"
+        );
+        assert_eq!(
+            overlay.state.attaching, None,
+            "NON-VACUOUS: nothing is attached before the key"
+        );
+
+        // Inert while the help is up.
+        overlay.feed(&registry, b"?");
+        let closing = overlay.feed_closing(&registry, b"\r");
+        assert_eq!(
+            overlay.state.attaching, None,
+            "`Enter` must not attach while the help frame covers the row list"
+        );
+        assert!(!closing, "and must not close the view from the help either");
+
+        // Out of the help, and attach.
+        overlay.feed(&registry, b"\x1b");
+        assert!(!overlay.quiet_tick(), "`Esc` leaves the help, not the view");
+        let closing = overlay.feed_closing(&registry, b"\r");
+        assert_eq!(
+            overlay.state.attaching,
+            Some(ids[0]),
+            "A3: `Enter` attaches the selected agent"
+        );
+        assert!(
+            closing,
+            "and leaves the view: A5 streams the agent into the main viewport, \
+             which a full-screen overlay would cover"
+        );
+    }
+
+    /// `→` is the same key as `Enter` here, and it has to be **decoded**
+    /// first: `arrow` reads `Up` and `Down` out of a sequence's final byte
+    /// and drops `C` today, so the decoder half is asserted in its own right
+    /// before the dispatch half.
+    ///
+    /// Both spellings, because a terminal in application-cursor mode sends
+    /// the SS3 one and `arrow` is already reached from both.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_right_arrow_decodes_and_attaches_exactly_as_enter_does() {
+        assert_eq!(
+            OverlayDecoder::new().feed(b"\x1b[C"),
+            vec![OverlayInput::Key(OverlayKey::Right)],
+            "CSI C is `\u{2192}`"
+        );
+        assert_eq!(
+            OverlayDecoder::new().feed(b"\x1bOC"),
+            vec![OverlayInput::Key(OverlayKey::Right)],
+            "and so is SS3 C, which an application-cursor-mode terminal sends"
+        );
+        // NON-VACUOUS: the neighbouring final byte still decodes to the key it
+        // always did, so this is a new arm and not a widened one.
+        assert_eq!(
+            OverlayDecoder::new().feed(b"\x1b[B"),
+            vec![OverlayInput::Key(OverlayKey::Down)],
+            "CSI B is still `\u{2193}`"
+        );
+
+        let (registry, ids) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        let closing = overlay.feed_closing(&registry, b"\x1b[C");
+        assert_eq!(
+            overlay.state.attaching,
+            Some(ids[0]),
+            "A3: `\u{2192}` attaches the selected agent, as `Enter` does"
+        );
+        assert!(closing, "and leaves the view, as `Enter` does");
+    }
+
+    /// Requirement **A7**: **attaching a terminal agent takes custody of its
+    /// result**, exactly as peek does.
+    ///
+    /// A7 names attach *beside* peek — "viewing a done agent (peek or
+    /// attach)" — and the reason is the same one T4-S3 pinned for peek:
+    /// attach is how the user reads that result, and a result the user has
+    /// read must not be reprinted by the exit surfacing. The acknowledgement
+    /// must go through the **one** acknowledging path T4-S3 left behind
+    /// (`peek_result` then `acknowledge_result`); a second `acknowledge_result`
+    /// call site is the shape F45 was closed by retiring.
+    ///
+    /// Two non-vacuous halves, in both directions, as T4-S4a pinned the
+    /// selection's: a **running** agent has no handoff to take, and the agent
+    /// that was not attached to keeps its result unobserved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attaching_a_done_agent_takes_custody_of_its_result() {
+        let (registry, ids) = registry_with_three_agents();
+        registry.finish(ids[0], Ok("the attached answer".to_string()));
+        registry.finish(ids[2], Ok("the untouched answer".to_string()));
+        assert_eq!(
+            registry.snapshot().unacknowledged,
+            2,
+            "NON-VACUOUS: both results start out unobserved"
+        );
+
+        // A2's order puts the one still-running agent first and the two done
+        // rows after it, so the keystrokes below address a known agent. Taken
+        // through `group_rows`, the view's own grouping, because
+        // `overlay_visible_rows` yields the **registry's** order and the
+        // selection walks the **displayed** one.
+        let displayed: Vec<u64> = kitsu_tui::agents_view::group_rows(overlay_visible_rows(
+            &registry,
+            &OverlayState::new(),
+        ))
+        .into_iter()
+        .flat_map(|group| group.rows.into_iter().map(|row| row.id))
+        .collect();
+        assert_eq!(
+            displayed,
+            vec![ids[1], ids[0], ids[2]],
+            "A2: `working` outranks `done (unviewed)`, and the done rows keep \
+             their start order"
+        );
+
+        // The running agent first: attaching it acknowledges nothing, because
+        // there is nothing to take custody of.
+        let mut running = OverlayUnderTest::new();
+        running.feed(&registry, b"\r");
+        assert_eq!(
+            running.state.attaching,
+            Some(ids[1]),
+            "the running agent is the one attached here"
+        );
+        assert_eq!(
+            registry.handoff_state(ids[1]),
+            Some(subagent::thread::AgentHandoffState::Unavailable),
+            "A7: a running agent has no handoff, so attaching takes nothing"
+        );
+        assert_eq!(
+            registry.snapshot().unacknowledged,
+            2,
+            "NON-VACUOUS: and the two results are still unobserved"
+        );
+
+        // Now the done row under it.
+        let mut done = OverlayUnderTest::new();
+        done.feed(&registry, b"\x1b[B");
+        assert_eq!(
+            done.selected(&registry),
+            Some(ids[0]),
+            "one `\u{2193}` selects the first done row"
+        );
+        done.feed(&registry, b"\r");
+        assert_eq!(
+            registry.handoff_state(ids[0]),
+            Some(subagent::thread::AgentHandoffState::Acknowledged),
+            "A7: attaching a done agent acknowledges its handoff, exactly as \
+             peeking it does"
+        );
+        assert_eq!(
+            registry.handoff_state(ids[2]),
+            Some(subagent::thread::AgentHandoffState::Ready),
+            "attaching one row must not acknowledge another"
+        );
+    }
+
+    /// **Attach with nothing selected says so, on the frame.**
+    ///
+    /// Asserted through [`overlay_frame_rows`] rather than from
+    /// `state.report`, because the claim is that a user can *see* it
+    /// (**F71**), and a key that acts silently is indistinguishable from one
+    /// that failed (requirement T2-S5b).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attaching_with_nothing_selected_says_so_on_the_frame() {
+        let registry = subagent::AgentRegistry::new();
+        let mut overlay = OverlayUnderTest::new();
+        assert_eq!(
+            overlay.selected(&registry),
+            None,
+            "NON-VACUOUS: an empty registry selects nothing"
+        );
+
+        let frame = overlay.feed_and_frame(&registry, b"\r");
+        assert!(
+            frame
+                .iter()
+                .any(|row| row.trim() == ATTACH_WITHOUT_SELECTION),
+            "`Enter` with nothing selected must say so on the frame, but the \
+             frame reads:\n{}",
+            frame.join("\n")
+        );
+        assert_eq!(overlay.state.attaching, None, "and nothing is attached");
+
+        // NON-VACUOUS, the other direction: with an agent on screen the same
+        // key attaches and the row is gone.
+        let (registry, ids) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        let frame = overlay.feed_and_frame(&registry, b"\r");
+        assert_eq!(
+            overlay.state.attaching,
+            Some(ids[0]),
+            "with a row selected the same key attaches"
+        );
+        assert!(
+            !frame
+                .iter()
+                .any(|row| row.trim() == ATTACH_WITHOUT_SELECTION),
+            "and the refusal is not painted: {}",
+            frame.join("\n")
+        );
+    }
+
+    /// Finding **F75**: the two halves of A3/A5 **connected**. The agent the
+    /// view attached to reaches the composer's session binding, the prompt
+    /// label says so, and the `\u{2190}`/`Ctrl+X d` detach routes are live
+    /// because of it.
+    ///
+    /// Every other test on this card drives one half: the overlay's own state,
+    /// or the reader with an attachment handed to it. Both halves passed while
+    /// production carried nothing between them — the attach arm wrote
+    /// `OverlayState::attaching` and `read_chat_line_inline` hardcoded `None`,
+    /// so `Enter` closed the view and attached nothing and neither detach key
+    /// could ever fire. This test is the one that fails when they are
+    /// disconnected: it goes **through** the production carriers
+    /// ([`AgentViewExit::leaving`], which is what `run_agent_view_overlay`
+    /// returns, and [`apply_agent_view_exit`], which is what the inline
+    /// reader's `OpenAgentView` arm calls) rather than asserting either side
+    /// of the gap.
+    ///
+    /// The terminal is the one thing not traversed: the overlay's byte loop
+    /// and the composer's painter both need a tty, so the bytes go through the
+    /// loop's own dispatch (`overlay_feed_chunk`, **F69**) and the reader's own
+    /// key routes, with nothing between them but the two carriers production
+    /// uses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_views_attach_reaches_the_composer_and_makes_the_detach_keys_live() {
+        /// One read of the inline composer, with `[tui]` resolved the way a
+        /// configured session resolves it: the chord prefix bound and the
+        /// two-press `\u{2190}` route on, so the detach routes are asserted
+        /// against the keymap a user actually has.
+        fn one_read(attached: Option<u64>, bytes: &[u8]) -> tui_bridge::InlineRead {
+            let keys = tui_bridge::InlineKeys {
+                prefix: tui_bridge::chord_prefix_byte("ctrl+x"),
+                left_arrow_opens_agents: true,
+            };
+            assert!(keys.prefix.is_some(), "the chord prefix must be bound");
+            let mut input = std::io::Cursor::new(bytes.to_vec());
+            let mut paint = |_: &str, _: usize, _: &str, _: bool| {};
+            tui_bridge::read_line_inline_with_keys(
+                &mut input,
+                &mut paint,
+                &[],
+                &mut || {},
+                keys,
+                attached,
+            )
+            .expect("a cursor cannot fail to read")
+        }
+
+        const BASE: &str = "kitsu> ";
+        const LEFT: &[u8] = b"\x1b[D";
+        const CHORD_D: &[u8] = b"\x18d";
+
+        let (registry, ids) = registry_with_three_agents();
+        // The session binding, exactly as the composer loop starts it.
+        let mut attached: Option<u64> = None;
+
+        // NON-VACUOUS, and the shape of the bug: with nothing carried across
+        // -- which is what production did -- the composer wears its own
+        // prompt and neither detach key can fire.
+        assert_eq!(
+            tui_bridge::composer_prompt(BASE, attached),
+            BASE,
+            "detached, the composer wears the session's own prompt"
+        );
+        assert_ne!(
+            one_read(attached, LEFT),
+            tui_bridge::InlineRead::Detached,
+            "and `\u{2190}` cannot detach with nothing attached"
+        );
+        assert_ne!(
+            one_read(attached, CHORD_D),
+            tui_bridge::InlineRead::Detached,
+            "nor can `Ctrl+X d`, which is inert and silent there"
+        );
+
+        // The view attaches, and closes doing it.
+        let mut overlay = OverlayUnderTest::new();
+        assert!(
+            overlay.feed_closing(&registry, b"\r"),
+            "A3: `Enter` leaves the view"
+        );
+        // The two carriers production uses, in production's order: the exit
+        // `run_agent_view_overlay` returns, and the composer's application of
+        // it. Nothing reads `OverlayState` after this point, because by then
+        // the view that owned it is gone.
+        let exit = AgentViewExit::leaving(&overlay.state);
+        assert!(exit.shown, "the view ran");
+        apply_agent_view_exit(&exit, &mut attached);
+        assert_eq!(
+            attached,
+            Some(ids[0]),
+            "F75: the agent the view attached to must reach the composer's \
+             binding, which is the only home that outlives the overlay"
+        );
+
+        // What the user sees, and what the keys now do.
+        assert_eq!(
+            tui_bridge::composer_prompt(BASE, attached),
+            format!("agent {}> ", ids[0]),
+            "the prompt label names the attached agent (design \u{00a7}4.5)"
+        );
+        assert_eq!(
+            one_read(attached, LEFT),
+            tui_bridge::InlineRead::Detached,
+            "A5: `\u{2190}` on an empty composer detaches -- on the FIRST \
+             press, before the two-press agent-view route is consulted"
+        );
+        assert_eq!(
+            one_read(attached, CHORD_D),
+            tui_bridge::InlineRead::Detached,
+            "and so does `Ctrl+X d`"
+        );
+        // A non-empty draft keeps `\u{2190}` as cursor movement, attached or
+        // not: the overload is safe only while there is nothing to move over.
+        assert_eq!(
+            one_read(attached, b"ab\x1b[D\r"),
+            tui_bridge::InlineRead::Submitted("ab".to_string()),
+            "a non-empty draft keeps `\u{2190}` as cursor movement while attached"
+        );
+
+        // Leaving the view by any other door attaches nothing and does not
+        // disturb the attachment in force: `q` is not a detach key.
+        let mut quit = OverlayUnderTest::new();
+        assert!(quit.feed_closing(&registry, b"q"), "`q` closes the view");
+        let exit = AgentViewExit::leaving(&quit.state);
+        assert_eq!(exit.attached, None, "and attaches nothing");
+        apply_agent_view_exit(&exit, &mut attached);
+        assert_eq!(
+            attached,
+            Some(ids[0]),
+            "leaving the view is not detaching; `\u{2190}` and `/detach` are"
+        );
+        // A view that was never shown is the same answer.
+        apply_agent_view_exit(&AgentViewExit::declined(), &mut attached);
+        assert_eq!(attached, Some(ids[0]));
+    }
+
+    // ------------------------------------------------------------------
+    // Card T4-S6a: `/detach`, the command requirement A5 names beside `←`.
+    //
+    // `/detach` is NOT a command yet — `SLASH_COMMANDS` has no `detach`
+    // entry and the dispatcher has no arm — so both tests below fail, and
+    // the PTY session in `tests/tui.rs` measures what a user gets instead
+    // (`unknown command: /detach`). The registry is the one source `/help`,
+    // `/help <command>`, the palette and both completion hosts read, so a
+    // command with no entry is a command nothing can discover (**F38**).
+    // ------------------------------------------------------------------
+
+    /// The registry entry, and what it must say.
+    ///
+    /// The one clause worth pinning beyond the syntax is in the details:
+    /// detaching **stops nothing** (design §4.5 — stopping is `x` in the
+    /// view or `/jobs stop`). A user who reads this row as "cancel the
+    /// agent" would use it for the opposite of what it does, and that
+    /// sentence is the only place the command surface can say so.
+    #[test]
+    fn the_command_registry_advertises_the_detach_command() {
+        let detach = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "detach")
+            .expect("/detach is registered");
+        assert_eq!(
+            detach.args, "",
+            "/detach takes no argument: there is one attachment"
+        );
+        assert_eq!(detach.syntax(), "/detach");
+        assert_eq!(
+            detach.alias_of, None,
+            "/detach is a command in its own right, not an alias"
+        );
+        assert_eq!(
+            detach.group,
+            CommandGroup::AgentsJobs,
+            "attachment is about a background agent, which is where /steer lives too"
+        );
+        assert!(
+            detach.details.contains("stop"),
+            "the details must say that detaching stops nothing, because a user \
+             who reads this command as `cancel` uses it for the opposite of \
+             what it does: {}",
+            detach.details
+        );
+
+        // The registry-fed surfaces, which are traversals of the entry above
+        // and so cannot drift from it.
+        let help = slash_help("test-model", false);
+        assert!(help.contains("/detach"), "/help lists it: {help}");
+        assert!(
+            help.contains(detach.description),
+            "with its description: {help}"
+        );
+        let detail = slash_command_help("detach");
+        assert!(
+            detail.starts_with("/detach"),
+            "/help detach leads with the syntax: {detail}"
+        );
+        let palette = slash_palette("deta", false, 80);
+        assert!(
+            palette.contains("/detach"),
+            "the palette offers it for the prefix `deta`: {palette}"
+        );
+    }
+
+    /// `/detach` is its own nearest suggestion, so a user who types it is not
+    /// sent to a neighbour — and the neighbours keep theirs, so the new entry
+    /// does not capture them.
+    ///
+    /// Also the non-vacuity of the PTY session's `unknown command: /detach`
+    /// observation: today `closest_slash_command("detach")` answers with some
+    /// *other* command, which is exactly the failure mode that test bans.
+    #[test]
+    fn detach_is_its_own_nearest_suggestion() {
+        assert_eq!(closest_slash_command("detach"), Some("detach"));
+        assert_eq!(closest_slash_command("delete"), Some("delete"));
+        assert_eq!(closest_slash_command("diff"), Some("diff"));
     }
 }

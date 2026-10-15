@@ -705,6 +705,43 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   `/detach` return with a recap of events that happened while attached.
   Attaching never pauses the foreground turn; the foreground turn's output is
   buffered and replayed on detach.
+
+  **T4-S6 was split into three, and A5 therefore lands in three pieces.**
+  **T4-S6a** (shipped) is attachment itself and the keys that enter and leave
+  it; **T4-S6b** is the routed composer, which needs a live thread with an open
+  correction channel — the fixture problem that split T4-S4b; **T4-S6c** is the
+  64 KiB buffer and the recap replay, a disjoint surface (the output sink, not
+  key routing). The `⛩` milestones were deliberately **not** given a card of
+  their own: over an existing `milestone_line` helper that would pin two format
+  strings and prove nothing, and **F71** requires a visibility claim to go
+  through the surface that paints it — so the attach milestone belongs with (b),
+  where something can attach, and the recap milestone is (c)'s header.
+
+  **`←` detaches on the first press, on an empty composer, and is not gated by
+  `[tui] left_arrow_opens_agents`.** T4-S2 refused a durable armed state because
+  it makes a keystroke's meaning depend on something the user did minutes ago
+  **and can no longer see**; attachment is the opposite — it is on screen in
+  front of the caret for as long as it lasts, so **the context is legible at the
+  moment of the press.** The costs are asymmetric too: opening a full-screen
+  overlay by accident interrupts you, while detaching by accident costs one
+  keystroke and **stops nothing**. A non-empty draft keeps `←` as cursor
+  movement. The config key is not consulted because A1 scopes it to "that route
+  alone" — the agent view's — while this clause names `←` as the return path
+  unconditionally. **`←←` in a single read is one detach and no view**: an
+  implementation that counts presses before asking about attachment gets that
+  wrong, and a test is named for it.
+
+  **With nothing attached, `Ctrl+X d` is inert and silent while `/detach` is
+  answered.** A chord is a slip; a submitted line is an intention with somewhere
+  to put the answer (T2-S5b).
+
+  **`Ctrl+X 1..9` is not shipped, and the reason is a constraint, not a
+  schedule.** §4.7 says "attach agent N", but the digit **cannot be an id**:
+  ids pass 9 after nine spawns, so a digit-keyed id binding would be dead for
+  `#10` and — worse — **wrong** rather than dead once `#1` is pruned and `#11`
+  exists. It must therefore be a **1-based ordinal over A2's display order**,
+  which means resolving it against the registry at the composer's byte filter, a
+  point that has no registry. That coupling is its own card.
 - **A6** Dispatch from the agent view composer: plain text spawns a background
   agent with the default profile; `@<profile> <task>` selects a profile.
   Dispatch is admitted by the registry limits (`AgentRegistryLimits`,
@@ -1249,6 +1286,19 @@ Attach does not move the agent to the foreground or take its stdin; it is a
   empty draft it **detaches** (it never stops the agent — stopping is explicit
   via `x` in the view or `/jobs stop`). `Ctrl+Z` keeps its existing meaning
   (suspend kitsu) and is not a detach key.
+
+  **The detach half of this clause is deliberately NOT shipped, pending F54.**
+  The clear-draft half already exists in `kitsu-editor` (`0x03` clears a
+  non-empty buffer and emits `Interrupt` on an empty one) and is untouched. But
+  **F54** records that "`Ctrl+C` is swallowed at an approval prompt" is
+  **measured and unexplained** — most likely a harness artefact, since the child
+  is probably not in the pty's foreground process group, and an echoed `^C` with
+  no signal delivered is exactly that signature, while the code comment at the
+  approval handoff says `ISIG` is restored. **Binding the detach half would mean
+  writing product behaviour on top of an unresolved measurement of the one byte
+  whose signal path is in doubt.** One minute in a real terminal settles it;
+  until someone has that minute, this clause describes an intention and not the
+  product. Two cards in a row were told not to map `\x03`, and did not.
 - the prompt label changes to `agent 3>` and the status row shows
   `attached · agent 3`.
 
