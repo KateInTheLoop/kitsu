@@ -1169,8 +1169,37 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   screen and nothing has to restore them. A test asserting their restore would
   pass by construction, which is why none was written.
 
-  **Status as of T5-S2: the title clause is MET, the alt-screen clause is MET for
-  a normal switch, and the signal/panic clause is OPEN for fullscreen (F94).**
+  **Status as of F94+F96's card: every clause is met on every exit path, for both
+  surfaces that take the alternate screen.** The dying-signal handler now chooses
+  between two compile-time-composed constants on one `AtomicBool` load, so it
+  gives the alternate screen back **only when it is held** — writing
+  `ESC[?1049l` unconditionally was tried and **refused by measurement**, because
+  it is not a no-op on the primary screen (it restores the cursor to its saved
+  slot, so a `SIGTERM` in an ordinary session would drop the shell's next prompt
+  on top of the user's transcript). The panic hook covers both surfaces,
+  including a panic off the main thread, and clears the flag after writing so a
+  take still yields exactly one leave.
+
+  **Two holes were closed, and the second was worse than the first.** A dying
+  signal left the **agent view's** alternate screen taken **since T4-S2** — five
+  cards before fullscreen, which inherited the hole rather than introducing it.
+  And a session **started** in fullscreen installed **no handler at all**
+  (**F96**), because the handler was installed only where the pinned region was
+  and `install` is deliberately inert in fullscreen: `Ctrl+C` there restored
+  nothing, leaving the terminal in **raw mode** as well as the alternate screen.
+  **That intersection of two individually correct decisions is what neither a
+  per-card test nor a per-requirement review looks at.**
+
+  **And "the handler is missing" turned out to be two defects with one symptom.**
+  Installing it was not enough: `CANONICAL_TERMIOS` is published only by
+  `RawStdinGuard::engage`, and a fullscreen-start session's raw mode is
+  **rustyline's**, so the handler had nothing to restore. It now falls back to
+  `tcgetattr` + re-enabling `ICANON|ECHO|ISIG` + `tcsetattr` — not the shell's
+  full termios, which nothing in this process knows, but the difference between a
+  usable shell and `reset` typed blind. Only a test asserting the **terminal's
+  observable state** separated the two; the bytes were already right.
+
+  **Superseded status note (T5-S2), kept for the record:**
   `install_exit_restore` gives back the **inline region only**, so a dying signal
   or a panic while fullscreen is active **leaves the alternate screen taken** and
   the user's terminal in it. This requirement demands restore on *every* exit

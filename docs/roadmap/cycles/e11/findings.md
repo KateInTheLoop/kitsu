@@ -4399,3 +4399,75 @@ Repaired, and the commit amended (local and unpushed).
 **The fix for next time is not more care, it is a different tool:** compute the timestamp into the file afterwards, or use a quoted delimiter and substitute the one variable with `sed`/Python. **A hand-escaping discipline applied to dozens of occurrences per file will fail on one of them** — which is the same argument as **F82**'s (*a rule applied per-change is not a rule enforced*), in my own toolchain rather than the product's.
 
 Nothing else was affected: the cycle record's remaining backticks were escaped correctly, the findings file uses a **quoted** delimiter throughout, and no source file is written this way.
+
+### F94 corrected — the hole is not fullscreen's, it is the overlay's, and it is five cards old
+
+I recorded F94 as *"a dying signal or panic in **fullscreen** leaves the alternate screen taken"*. **The scope was wrong, and understating it made it look like a new mode's teething problem.**
+
+Verified: `ESC[?1049l` appears in exactly **three** places — the fullscreen `LEAVE_ALT_SCREEN` const, one doc comment, and the **agent-view overlay's normal-path restore** (`main.rs:8870`). The dying-signal handler writes `SIGNAL_RESTORE`:
+
+```
+b"\x1b[r\x1b[?25h\x1b[?2004l\x1b[23;2t"
+```
+
+— reset scroll region, show cursor, bracketed paste off, **pop title**. It gives back the title and **not the alternate screen.**
+
+**So a `SIGINT` or `SIGTERM` while the agent view is open has left users in the alternate screen since T4-S2** — five cards before fullscreen existed. Fullscreen did not introduce this hole; **it inherited it, and made it longer-lived**, because a fullscreen segment lasts until the user switches away while an overlay is usually seconds.
+
+**And my N5 amendment is therefore wrong too**: I wrote that the signal clause is *"met for inline, open for fullscreen"*. Correct reading: **met for inline** (inline never takes the alternate screen, so there is nothing to give back), **open for the overlay since T4-S2**, and **open for fullscreen since T5-S2**.
+
+### Why it went unnoticed, which is the useful part
+
+`SIGNAL_RESTORE` already pops the title — so the handler *looks* like it handles screen-level state, and it was written before anything in this binary took the alternate screen. **The overlay added a new terminal mode and did not revisit the one place that undoes terminal modes on the way out.** Nothing failed, because no test kills the process mid-overlay.
+
+**That is F79's rule in reverse.** F79: *when a function starts returning something new, every caller is a suspect.* Here: **when a surface starts taking new terminal state, every exit path is a suspect — and exit paths are enumerable too** (normal return, `/quit`, a dying signal, a panic). The overlay covered one of four.
+
+### The constraint any fix must respect
+
+The handler's body is **deliberately async-signal-safe**, and says so: an atomic load, one `write(2)` of a `const` buffer, a `tcsetattr`, no allocation and no locking — explicitly *not* reusing the panic helper because that one writes through a locked `Stderr`. **A fix may add bytes to a `const` and may read an `AtomicBool`** — the handler already loads two atomics — **and may not allocate, lock, or format.**
+
+## F96 — a session started in fullscreen installs no dying-signal handler at all
+
+Found by the F94 test author while deciding how to enter fullscreen in a script, and **it is strictly worse than F94.** Verified by me:
+
+- `install_exit_restore()` is called **only** inside `if installed.is_some()` (`main.rs:19478`).
+- `install` returns `None` for `TuiMode::Classic | TuiMode::Fullscreen` (`tui_bridge.rs:155`) — fullscreen pins no region, which is deliberate.
+- So **`--tui fullscreen` / `[tui] mode = "fullscreen"` never installs the handler.**
+
+A `SIGINT` or `SIGTERM` in that session therefore gets the **default disposition and no restore of any kind**: no scroll-region reset, **no `tcsetattr` back to canonical termios**, no title pop, no alternate-screen release.
+
+**The termios half is the serious part.** F94 leaves a user on the alternate screen — recoverable with `reset`, confusing until then. **This leaves the terminal in raw mode as well**: no echo, no line editing, `Ctrl+C` inert. The user's shell is effectively unusable until they type `reset` blind.
+
+**And it shipped in T5-S2, one card ago** — mine, accepted by me.
+
+### Why neither the card nor its review caught it
+
+T5-S2's four transition tests all **switch into** fullscreen from another mode, so the inline segment had already installed the handler. The two scripts that start in fullscreen (`--tui fullscreen`) assert the alternate screen is taken **before any input** — they exercise startup and then exit normally, which is the one exit path that does not need the handler.
+
+**The gap is the intersection of two correct decisions:** fullscreen pins no region (so `install` is inert, which is right), and the handler is installed where the region is (which was right when the region was the only thing needing restoring). **Nothing is wrong with either; the conjunction is wrong**, and conjunctions are what neither a per-card test nor a per-requirement review looks at.
+
+That is the same shape as **F94** — a surface took new terminal state without revisiting the exit paths — one level up: here a surface took new terminal state while **declining the mechanism that owns the exit paths.**
+
+### Scope decision
+
+**Folded into F94's card**, for the reasons that folded F79 into F77's: same mechanism (what the dying handler owes and when it exists), same files, and shipping a known "your terminal is left unusable" defect while fixing the lesser one beside it would be indefensible. The implementer is authorised one additional test for it.
+
+**Note the asymmetry it creates for the fix:** F94 needs the handler to *write more*; F96 needs the handler to *exist at all*. A gated flag solves the first and does nothing for the second.
+
+### F96's termios half had a second cause, found by the new test's first run
+
+My record said the terminal is left raw because the handler is never installed. **True, and insufficient.** Installing it was not enough, and the implementer's first run of the new test proved it: the handler ran and wrote the full restore — so F94's gating worked — while the pty still read `ICANON=false ECHO=false ISIG=false`.
+
+**Why:** `CANONICAL_TERMIOS` is published only by `RawStdinGuard::engage`, and a session started in fullscreen installs no inline viewport. **Its raw mode is rustyline's own**, so nothing in this process holds the modes rustyline displaced, and the handler's `valid` load is false. The handler had a snapshot to restore in every case anyone had tested, and **none** in the case F96 describes.
+
+The fix gained an `else` branch: `tcgetattr`, OR `ICANON|ECHO|ISIG` back on, `tcsetattr` — both on POSIX's async-signal-safe list, the struct a stack local, and a failing `tcgetattr` leaving the terminal exactly as the signal found it. **It is not the shell's full termios — nobody in this process knows that — but it is the difference between a usable shell and `reset` typed blind.**
+
+**The lesson: "the handler is missing" and "the handler has nothing to restore" are different defects with the same symptom**, and fixing the first leaves the second looking fixed. The only thing that separated them was a test that asserted the **terminal's observable state** rather than the bytes the handler wrote — the bytes were right and the terminal was still broken.
+
+### And two things the implementation got right that I had not specified
+
+**The flag's asymmetry is deliberate:** set **before** the take, cleared **after** the give, so no window can read "free" while the screen is held. The reverse window costs at most one stray leave on the primary screen; **the window it excludes is the defect itself.**
+
+**`SIGNAL_RESTORE_WITH_SCREEN` is composed at compile time** from the two existing constants rather than written out — so there is no third copy of either sequence and no new drift surface, and `SIGNAL_RESTORE` stays a **prefix**, which is what keeps an existing `contains` assertion and a byte-parity test green without being touched.
+
+**The double-restore case was handled too:** a main-thread panic in fullscreen would have had both `Drop` and the panic hook writing a leave, so `write_restore_sequences` **clears the flag after writing** — one take still yields one leave. The implementer also verified the overlay **cannot nest inside** fullscreen, so a single boolean has no nesting case to get wrong today.

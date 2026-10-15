@@ -8788,6 +8788,13 @@ fn run_agent_view_overlay(
     // It is deliberately **not** disabled on the way out: the composer
     // underneath needs it on, and whichever `RawStdinGuard` owns the terminal
     // turns it off in its `Drop` when stdin goes back to rustyline.
+    // Card **F94**, and before the bytes: this is the overlay's half of the
+    // flag every dying exit path reads (`kitsu_tui::alternate_screen_taken`).
+    // The leave below is straight-line code after the read loop, so a panic
+    // or a signal in the overlay never reaches it -- the handler and the
+    // panic hook give the screen back instead, and this store is what tells
+    // them they owe it.
+    kitsu_tui::note_alternate_screen(true);
     let _ = err.write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h");
     let _ = err.flush();
 
@@ -8869,6 +8876,11 @@ fn run_agent_view_overlay(
 
     let _ = err.write_all(b"\x1b[?25h\x1b[?1049l");
     let _ = err.flush();
+    // Card **F94**: after the bytes, so a signal in this window writes a
+    // second leave onto a primary screen rather than none onto an alternate
+    // one. The normal path has now given the screen back, so a dying signal
+    // arriving afterwards owes nothing.
+    kitsu_tui::note_alternate_screen(false);
     // The region and the pinned row, after the terminal has given the primary
     // screen back: control bytes and the bottom row only, so the restored
     // transcript is not disturbed.
@@ -19468,13 +19480,26 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             Box::new(std::io::stdout()),
             Box::new(std::io::stderr()),
         );
-        if installed.is_some() {
-            // Requirement N5, and only here: the restore exists to give back
-            // what the *inline* viewport took (a pinned DECSTBM region, raw
-            // termios, bracketed paste). Classic mode pins no region and
-            // holds raw mode only inside rustyline's own readline, so it
-            // keeps the signal dispositions it was started with and its byte
-            // stream is unchanged, signal or no signal.
+        if installed.is_some() || mode == tui_bridge::TuiMode::Fullscreen {
+            // Requirement N5. The restore exists to give back what a surface
+            // took, and there are two takers at startup, not one.
+            //
+            // The *inline* viewport takes a pinned DECSTBM region, raw
+            // termios and bracketed paste, and `installed.is_some()` is how
+            // that is recognised. Classic mode pins no region and holds raw
+            // mode only inside rustyline's own readline, so it keeps the
+            // signal dispositions it was started with and its byte stream is
+            // unchanged, signal or no signal.
+            //
+            // Card **F96**: fullscreen is the third case and it was missing.
+            // `install` is inert in fullscreen -- it pins no region, which is
+            // right -- so gating the handler on the *region* left a session
+            // started with `--tui fullscreen` with the default disposition
+            // and no restore of any kind: no title pop, no alternate-screen
+            // release, and no `tcsetattr` back to canonical termios, which is
+            // a shell with no echo and no line editing until the user types
+            // `reset` blind. The handler is owed wherever terminal state is
+            // taken, so the condition names the mode as well as the region.
             tui_bridge::install_exit_restore();
         }
         // `install` is inert in fullscreen -- it pins no region and installs

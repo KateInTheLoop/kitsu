@@ -281,6 +281,11 @@ impl FullscreenSegment {
         let _ = self.err.write_all(LEAVE_ALT_SCREEN);
         let _ = self.err.write_all(POP_TITLE);
         let _ = self.err.flush();
+        // Card F94, and the mirror of `enter_fullscreen`'s store: after the
+        // bytes, so no exit path can read "free" while the screen is still
+        // held. A signal in this window writes a second leave onto a primary
+        // screen; a signal in the opposite window would write none at all.
+        kitsu_tui::note_alternate_screen(false);
     }
 }
 
@@ -329,6 +334,15 @@ pub(crate) fn enter_fullscreen(
         kitsu_tui::fullscreen::FullscreenView::new().frame(&ring, rows.saturating_sub(1), cols);
 
     let mut err = err;
+    // Card F94: **before** the bytes, and the opposite order to
+    // `FULLSCREEN_ACTIVE` below on purpose. This flag is read by the exit
+    // paths `Drop` does not run on -- the dying-signal handler and the panic
+    // hook -- so a signal landing between the store and the write must find
+    // the screen claimed rather than free: a restore of a screen not yet
+    // taken costs one `ESC[?1049l` on the primary screen, while the reverse
+    // window leaves the user on the alternate screen, which is the defect
+    // itself.
+    kitsu_tui::note_alternate_screen(true);
     let _ = err.write_all(PUSH_TITLE);
     let _ = err.write_all(ENTER_ALT_SCREEN);
     for row in &frame {
@@ -1256,6 +1270,36 @@ pub(crate) fn install_sigwinch_handler() {
 /// on `Stderr` takes a lock.
 const SIGNAL_RESTORE: &[u8] = b"\x1b[r\x1b[?25h\x1b[?2004l\x1b[23;2t";
 
+/// The same stream with the alternate screen's leave **appended**, for a
+/// signal taken while a surface is holding it (card **F94**).
+///
+/// Two `const`s and a choice between them, rather than one `const` plus a
+/// second `write(2)`: the handler's one write is what keeps the restore
+/// atomic against a terminal that may be read by the shell the instant the
+/// process dies. Composed from the two existing `const`s at compile time, so
+/// this is not a third copy of either sequence -- `LEAVE_ALT_SCREEN` is the
+/// one `FullscreenSegment::leave` writes.
+///
+/// **Appended, never interleaved.** The four sequences in `SIGNAL_RESTORE`
+/// are global to the terminal rather than per-screen-buffer, so the order
+/// relative to the screen switch does not change what the user is left with,
+/// and keeping `SIGNAL_RESTORE` a prefix is what lets every existing
+/// assertion about the handler's bytes go on holding.
+const SIGNAL_RESTORE_WITH_SCREEN: [u8; SIGNAL_RESTORE.len() + LEAVE_ALT_SCREEN.len()] = {
+    let mut out = [0u8; SIGNAL_RESTORE.len() + LEAVE_ALT_SCREEN.len()];
+    let mut i = 0;
+    while i < SIGNAL_RESTORE.len() {
+        out[i] = SIGNAL_RESTORE[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < LEAVE_ALT_SCREEN.len() {
+        out[SIGNAL_RESTORE.len() + j] = LEAVE_ALT_SCREEN[j];
+        j += 1;
+    }
+    out
+};
+
 /// The signal kitsu is raising **on itself** right now, or `0`.
 ///
 /// Set by [`raise_in_process`] around its `raise(2)` and read by the dying
@@ -1378,14 +1422,22 @@ pub(crate) fn install_exit_restore() {
         if SELF_RAISED.load(std::sync::atomic::Ordering::SeqCst) == signal {
             return;
         }
+        // Card **F94**: which of the two precomposed streams this terminal
+        // is owed. One more atomic load and a choice between two `const`s --
+        // no allocation, no locking, no formatting, and still one `write(2)`.
+        let restore: &[u8] = if kitsu_tui::alternate_screen_taken() {
+            &SIGNAL_RESTORE_WITH_SCREEN
+        } else {
+            SIGNAL_RESTORE
+        };
         // SAFETY: a single `write` of a `'static` buffer to a descriptor this
         // process owns; a short write or an error is not worth handling while
         // the process is dying.
         unsafe {
             libc::write(
                 libc::STDERR_FILENO,
-                SIGNAL_RESTORE.as_ptr().cast::<libc::c_void>(),
-                SIGNAL_RESTORE.len(),
+                restore.as_ptr().cast::<libc::c_void>(),
+                restore.len(),
             );
         }
         if CANONICAL_TERMIOS
@@ -1400,6 +1452,36 @@ pub(crate) fn install_exit_restore() {
                     libc::TCSANOW,
                     (*CANONICAL_TERMIOS.modes.get()).as_ptr(),
                 );
+            }
+        } else {
+            // Card **F96**: there is no snapshot, and the terminal may still
+            // be raw -- which is exactly the state a session started in
+            // fullscreen dies in. `RawStdinGuard` is the only publisher, and
+            // fullscreen installs no inline viewport, so its raw mode is
+            // **rustyline's own** and nothing in this process holds the modes
+            // it displaced.
+            //
+            // So the three line flags a user needs are turned back on in
+            // place rather than restored from a copy: canonical reads, kernel
+            // echo, and job-control signals. It is not the full termios the
+            // shell had -- nobody in this process knows that -- but it is the
+            // difference between a shell the user can type into and one they
+            // have to run `reset` on blind.
+            //
+            // Still async-signal-safe: `tcgetattr` and `tcsetattr` are both
+            // on POSIX's list, the struct is a stack local, and there is no
+            // allocation, no lock and no formatting. A failing `tcgetattr`
+            // leaves the terminal as the signal found it, which is the state
+            // this branch is trying to improve on and never worse.
+            //
+            // SAFETY: both calls write through a valid pointer to one
+            // `termios` on a descriptor this process owns.
+            unsafe {
+                let mut modes: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(libc::STDIN_FILENO, &mut modes) == 0 {
+                    modes.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG;
+                    libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &modes);
+                }
             }
         }
         // And now die as the signal says. Putting the default disposition

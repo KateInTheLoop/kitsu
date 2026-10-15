@@ -204,6 +204,32 @@ pub fn sanitize_title(raw: &str) -> String {
     out
 }
 
+/// Whether a surface is currently holding the terminal's alternate screen.
+///
+/// Read by every exit path that owes a restore -- the panic hook through
+/// [`write_restore_sequences`], and kitsu's own dying-signal handler, which
+/// may do nothing but load an atomic and write a `const`. An `AtomicBool`
+/// is therefore the whole of the mechanism; it carries no writer identity,
+/// because the question an exit path asks is only "is the screen taken".
+static ALTERNATE_SCREEN_TAKEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record that a surface has taken (`true`) or given back (`false`) the
+/// terminal's alternate screen.
+///
+/// Every taker must call this on both sides. There are two in kitsu today --
+/// the agent-view overlay and the fullscreen segment -- and this doc comment
+/// is where that enumeration lives.
+pub fn note_alternate_screen(taken: bool) {
+    ALTERNATE_SCREEN_TAKEN.store(taken, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the alternate screen is held right now. Async-signal-safe: one
+/// atomic load and nothing else.
+pub fn alternate_screen_taken() -> bool {
+    ALTERNATE_SCREEN_TAKEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Chain a terminal restore onto the current panic hook.
 ///
 /// The previously installed hook still runs — this wraps it rather than
@@ -223,17 +249,45 @@ pub fn install_panic_restore() {
     }));
 }
 
+/// The alternate screen's leave, written **only** when a surface is holding
+/// it ([`alternate_screen_taken`]).
+///
+/// Gated, and not for tidiness: `ESC[?1049l` is not inert on the primary
+/// screen. xterm's `rmcup` is *"restore cursor as in DECRC, then use the
+/// normal screen"*, so a process that never took the alternate screen and
+/// wrote this anyway would yank the cursor to whatever the DECSC slot holds
+/// (1;1 unless something saved it) and the shell's next prompt would land on
+/// top of the user's transcript.
+const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
+
 /// Write the escape sequences that give the terminal back, in restore order.
 ///
 /// Split out of [`install_panic_restore`] so the exact byte stream an exit
 /// path owes can be asserted against a buffer: the hook itself writes to the
 /// process's real stderr, which a unit test cannot inspect without
 /// redirecting a descriptor.
+///
+/// The alternate screen's leave comes **last**, and appending rather than
+/// interleaving is deliberate: the four sequences above it are global to the
+/// terminal rather than per-screen-buffer (scroll margins, cursor visibility,
+/// bracketed paste, the title stack), so their order relative to the screen
+/// switch does not change what the user is left with — while a stream that
+/// put the leave anywhere but the end would no longer be a prefix of itself,
+/// and this stream is asserted byte-for-byte by callers in two crates.
+///
+/// Writing the leave also **clears** the flag, for the one path that has two
+/// restorers: a panic on the main thread inside a fullscreen segment runs
+/// this hook *and* then `FullscreenSegment::drop` during unwind. Clearing
+/// here is what keeps that one take to one leave.
 pub fn write_restore_sequences<W: Write>(out: &mut W) -> std::io::Result<()> {
     out.write_all(REGION_RESET)?;
     out.write_all(SHOW_CURSOR)?;
     out.write_all(PASTE_OFF)?;
     out.write_all(POP_TITLE)?;
+    if alternate_screen_taken() {
+        out.write_all(LEAVE_ALT_SCREEN)?;
+        note_alternate_screen(false);
+    }
     out.flush()
 }
 
@@ -504,5 +558,62 @@ mod tests {
             "install_panic_restore must chain, not replace, the previous hook"
         );
         std::panic::set_hook(original);
+    }
+
+    /// The alternate screen's leave, which the restore stream owes when a
+    /// surface is holding it.
+    const ALT_SCREEN_OFF: &[u8] = b"\x1b[?1049l";
+
+    /// **Card F94, the panic half of N5.** The panic hook writes
+    /// [`write_restore_sequences`] and nothing else, so that stream is the
+    /// whole of what a panicking kitsu gives the terminal back -- and it
+    /// carries no `ESC[?1049l`. A panic inside the agent-view overlay
+    /// therefore leaves the user on kitsu's alternate screen with the panic
+    /// message painted over a screen they are about to lose: the overlay
+    /// writes its own leave straight-line, after the read loop, so unwinding
+    /// past it writes nothing.
+    ///
+    /// The restore is asserted **gated**, not unconditional, and both halves
+    /// run here so each is the other's control. `?1049l` is not inert on the
+    /// primary screen -- xterm's `rmcup` restores the cursor from the DECSC
+    /// slot -- so a process that panics having never taken the alternate
+    /// screen must not write it, and the second half of this test is the only
+    /// reader of that.
+    ///
+    /// The flag is process-global, so it is put back before returning for the
+    /// same reason the panic hook above is.
+    #[test]
+    fn the_restore_stream_gives_the_alternate_screen_back_only_when_it_is_taken() {
+        let was = alternate_screen_taken();
+
+        note_alternate_screen(true);
+        let mut held = Vec::new();
+        write_restore_sequences(&mut held).expect("writing to a Vec cannot fail");
+        // NON-VACUOUS: the stream is the real one, so the absence below is
+        // about the alternate screen and not about an empty buffer.
+        assert_eq!(
+            count(&held, REGION_RESET),
+            1,
+            "NON-VACUOUS: the restore stream must be the real one; wrote {:?}",
+            String::from_utf8_lossy(&held).escape_debug().to_string()
+        );
+        assert_eq!(
+            count(&held, ALT_SCREEN_OFF),
+            1,
+            "a surface is holding the alternate screen, so every exit path owes              `ESC[?1049l` -- including the panic hook, which writes this stream              and nothing else (N5); wrote {:?}",
+            String::from_utf8_lossy(&held).escape_debug().to_string()
+        );
+
+        note_alternate_screen(false);
+        let mut free = Vec::new();
+        write_restore_sequences(&mut free).expect("writing to a Vec cannot fail");
+        assert_eq!(
+            count(&free, ALT_SCREEN_OFF),
+            0,
+            "and must not give back an alternate screen nobody took: on the              primary screen `ESC[?1049l` restores the cursor from the DECSC              slot rather than doing nothing; wrote {:?}",
+            String::from_utf8_lossy(&free).escape_debug().to_string()
+        );
+
+        note_alternate_screen(was);
     }
 }
