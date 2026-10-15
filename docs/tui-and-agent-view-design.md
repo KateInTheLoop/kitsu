@@ -1287,7 +1287,18 @@ Attach does not move the agent to the foreground or take its stdin; it is a
   via `x` in the view or `/jobs stop`). `Ctrl+Z` keeps its existing meaning
   (suspend kitsu) and is not a detach key.
 
-  **The detach half of this clause is deliberately NOT shipped, pending F54.**
+  **`/detach` is registered and dispatched but NOT wired (F77).** Its arm is
+  unconditional — it always answers `not attached to a background agent` —
+  because the slash dispatcher has no access to the composer's session binding.
+  The arm's own comment says *"nothing in this card can attach"*, which was
+  **true when written**, before the rework that made attachment work; it was
+  never revisited. Wiring it means threading that binding through
+  `handle_slash_command`'s call sites, which is a signature change and its own
+  card. `←` on an empty composer and `Ctrl+X d` both work today. **The lesson,
+  recorded in F77: when a rework makes something possible that was previously
+  impossible, every arm written while it was impossible is suspect.**
+
+  **The detach half of the `Ctrl+C` clause is deliberately NOT shipped, pending F54.**
   The clear-draft half already exists in `kitsu-editor` (`0x03` clears a
   non-empty buffer and emits `Interrupt` on an empty one) and is untouched. But
   **F54** records that "`Ctrl+C` is swallowed at an approval prompt" is
@@ -1299,6 +1310,38 @@ Attach does not move the agent to the foreground or take its stdin; it is a
   whose signal path is in doubt.** One minute in a real terminal settles it;
   until someone has that minute, this clause describes an intention and not the
   product. Two cards in a row were told not to map `\x03`, and did not.
+- **T4-S6-status settled four things §4.5 did not state.**
+  - **Position:** the attachment is the **leftmost content segment** —
+    `attached · agent N · <model> · <meter> · <elapsed> [queued] [tag]`.
+  - **Claim priority: second**, right after the ambient tag and above the queue
+    tag, the model, elapsed and the meter. The full drop order is now
+    `meter, elapsed, model, [N queued], attached · agent N, ambient tag`.
+  - **A repaint keeps it.** The row is recomposed from the source on every paint
+    and never remembered, so a segment lost on the next frame would make this
+    section's legibility argument for `←` hold only until the next keystroke.
+    Pinned both ways: a repaint caused by *something else* (the queue depth
+    moving) must still carry the attachment, and composing twice from the same
+    binding yields the same row — **composed, not consumed**.
+  - **An agent finishing while attached does NOT detach.** The segment is
+    derived from the user's binding and the registry is never consulted, which
+    follows A5's ruling that leaving the view is not detaching. The alternative
+    is worse: the prompt label comes off the **same** binding, so a
+    self-detaching row would disagree with the caret in front of the user.
+
+  **The segment is derived at paint time, never cached** (**F75**'s lesson):
+  `StatusSource::fields()` pulls it through the same closure as the queue and
+  blocked counts, so a detach needs no notification — clearing the composer's
+  binding *is* the whole of it, and the next composition reads nothing. A
+  snapshot stored anywhere would need telling on detach, and the detach path
+  offers **no publication point** to tell it from.
+
+  **F78: the row's drop order is not monotonic in width.** A clipped model
+  segment **reappears at 44–42 columns** once the row is busier, because each
+  segment is offered what the higher-ranked ones left and dropping the
+  thirteen-column queue tag frees room. No special case was added to "fix" this,
+  and **no future card should assert a prefix or no-revive property on this
+  row.**
+
 - the prompt label changes to `agent 3>` and the status row shows
   `attached · agent 3`.
 

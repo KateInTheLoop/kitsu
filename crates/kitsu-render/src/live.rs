@@ -265,6 +265,15 @@ pub struct StatusFields {
     /// Detached agents needing input, and running, behind the ambient tag.
     pub blocked: usize,
     pub running: usize,
+    /// The background agent this composer is attached to, behind
+    /// `attached \u{b7} agent N`, or `None` when the composer is the
+    /// session's own (card **T4-S6-status**, design \u{a7}4.5).
+    ///
+    /// Derived from the composer loop's one session binding on every read --
+    /// the same binding `composer_prompt` takes its label from (**F75**) --
+    /// so the row and the prompt label cannot disagree about what the user is
+    /// attached to.
+    pub attached: Option<u64>,
 }
 
 /// Cells in the status row's meter. `/context` renders sixteen in a block it
@@ -328,9 +337,9 @@ fn clip_to(text: &str, budget: usize) -> String {
 ///
 /// # Drop order
 ///
-/// First dropped to last kept: **meter, elapsed, model, `[N queued]`, ambient
-/// tag**. Decoration yields to content, exactly as the classic row's spinner
-/// yields to the draft: the meter goes first because `/context` renders it on
+/// First dropped to last kept: **meter, elapsed, model, `[N queued]`,
+/// `attached · agent N`, ambient tag**. Decoration yields to content,
+/// exactly as the classic row's spinner yields to the draft: the meter goes first because `/context` renders it on
 /// demand, elapsed next because the spinner already carries elapsed past five
 /// seconds, the model is truncated before it is dropped (long and static),
 /// and the ambient tag is last standing because a blocked agent is the thing
@@ -361,11 +370,26 @@ pub fn compose_status_row(fields: &StatusFields, cols: usize) -> String {
     let agents = agents_tag(fields.blocked, fields.running)
         .map(|tag| tag.trim_end().to_string())
         .filter(|tag| fits(display_width(tag), &mut used));
-    // 2. The queue tag.
+    // 2. The attachment label (card **T4-S6-status**, design §4.5). It claims
+    //    room right after the ambient tag: §4.5's amendment rests the
+    //    `←`-detaches-on-the-first-press rule on the attachment being legible
+    //    at the moment of the press, so it outranks `[N queued]`, the model,
+    //    elapsed and the meter; it still yields to the ambient tag, because a
+    //    blocked agent is the thing the user must act on while losing this
+    //    label costs one keystroke.
+    //
+    //    Derived from `fields.attached` on every call and never remembered,
+    //    so a repaint composes it again from the one session binding the
+    //    composer prompt label reads (**F75**).
+    let attached = fields
+        .attached
+        .map(|id| format!("attached · agent {id}"))
+        .filter(|label| fits(display_width(label), &mut used));
+    // 3. The queue tag.
     let queue = queued_tag(fields.queued)
         .map(|tag| tag.trim_end().to_string())
         .filter(|tag| fits(display_width(tag), &mut used));
-    // 3. The model: truncated before it is dropped.
+    // 4. The model: truncated before it is dropped.
     let model_width = display_width(&fields.model);
     let (model, model_whole) = if fields.model.is_empty() {
         (None, true)
@@ -383,14 +407,14 @@ pub fn compose_status_row(fields: &StatusFields, cols: usize) -> String {
             (None, false)
         }
     };
-    // 4. Elapsed, only once the model is whole: the model outranks it, so a
+    // 5. Elapsed, only once the model is whole: the model outranks it, so a
     //    truncated model means elapsed is already gone.
     let elapsed = fields
         .elapsed
         .filter(|_| model_whole)
         .map(crate::format_wait_elapsed)
         .filter(|text| fits(display_width(text), &mut used));
-    // 5. The meter, first to go, so last to be offered room. It needs the
+    // 6. The meter, first to go, so last to be offered room. It needs the
     //    model whole and elapsed either absent from the data or still kept.
     let elapsed_intact = fields.elapsed.is_none() || elapsed.is_some();
     let meter = status_meter(fields.used, fields.effective)
@@ -398,6 +422,9 @@ pub fn compose_status_row(fields: &StatusFields, cols: usize) -> String {
         .filter(|text| fits(display_width(text), &mut used));
 
     let mut content: Vec<String> = Vec::new();
+    if let Some(attached) = attached {
+        content.push(attached);
+    }
     if let Some(model) = model {
         content.push(model);
     }

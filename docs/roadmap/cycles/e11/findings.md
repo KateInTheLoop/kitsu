@@ -3853,3 +3853,58 @@ Flagged by the implementer for my attention rather than silently shipped or sile
 **Not fixed in T4-S6a**, because carrying the draft means changing the `Detached` variant, which changes the twelve tests written for this card — an authorised test edit, which belongs in a card with a failing test of its own rather than in a rework whose contract was one added test.
 
 The shape is familiar: **a variant documented by the narrowest route that reaches it.** `←`'s empty-composer precondition got written into the type's comment, and then a second route was given the same variant without the precondition. The comment was accurate when written and became wrong when the second caller arrived — which is the same mechanism as **F69**'s mirror and **F70**'s unreachable rule, one level down in the type system rather than in a test or a validator.
+
+## F77 — `/detach` never detaches, and I documented that it does
+
+**The worst failure of this epic's review process so far, and it is mine.**
+
+T4-S6a's `/detach` arm (`main.rs:22195`) is **unconditional**:
+
+```rust
+"detach" => {
+    eprintln!("not attached to a background agent");
+    return SlashResult::Error;
+}
+```
+
+Its own comment explains why: *"Nothing in this card can attach, so there is one answer to give."* That was **true when written** — the first attempt had no working attachment. Then I rejected that attempt for **F75**, the rework wired attachment end to end, and **this arm was never revisited.** The slash dispatcher has no access to the composer's session binding, so wiring it means threading that binding through `handle_slash_command`'s call sites — a signature change, not a one-line fix.
+
+### What makes this worse than F75
+
+**I shipped documentation claiming it works.** `README.md`'s command table said `/detach` would "Leave an agent you attached … and return the composer to the session", `CHANGELOG.md` listed it among the three ways to return, and `docs/functionality.md` said "`Ctrl+X d` and `/detach` also detach". **All three were false when I committed them.** Corrected in this card's commit.
+
+So the standing requirement that documentation ships with the feature was satisfied *procedurally* — three files updated in the same commit — and **violated in substance**, because what they said was not true. **A doc update is only worth what its claims are worth**, and a reviewer writing docs from a brief rather than from the code is how a false claim gets the authority of a committed file.
+
+### And it is F75 repeating inside the card that fixed F75
+
+F75 was *a state nobody reads*. I rejected it, demanded the wiring, verified the chain overlay → `AgentViewExit` → `apply_agent_view_exit` → session binding → composer — and **never checked the third consumer of that binding.** I verified the route I had been thinking about and treated the card as whole.
+
+**Sixth occurrence in this epic** of *the thing we checked was not the thing that matters*: a registered command nobody dispatched (**F57**), a mirror that stopped reflecting (**F69**), a legality rule no keystroke could satisfy (**F70**), a message only the test could see (**F71**), a state nobody read (**F75**), and now **a command whose arm predates the feature it names.**
+
+The specific lesson, which is narrower and more useful than "check more": **when a rework makes something possible that was previously impossible, every arm that was written while it was impossible is now suspect.** That comment — "nothing in this card can attach" — was a precise, dated statement of an assumption, and it is exactly the thing a rework invalidates. It should have been a grep.
+
+### Carded, not fixed here
+
+Wiring it is a signature change across the dispatch sites, and this card is the status segment. The test author correctly pinned detach tracking for `←` and `Ctrl+X d` only and wrote **no** test asserting `/detach` clears the segment, rather than writing one that would have to fail.
+
+## F74 — corrected: nine constructions, three exhaustive, and `Default` was already derived
+
+**My count was wrong, and the way it was wrong matters.** I wrote that `StatusFields` has "12 construction sites, none using `..Default::default()`" and authorised adding a `Default` impl.
+
+Verified by the agent and confirmed by me: the struct **already derives `Default`** (`live.rs:254`, `#[derive(Clone, Debug, Default)]`), there are **nine literal constructions**, and **six already use functional-update syntax** (`..busy()` / `..fields`), so adding a field broke **exactly two** places — quoted as two `E0063` errors — not nine test modules. `kitsu-render/src/live.rs` has **zero** constructions.
+
+**I produced that number with a grep and trusted its shape.** `grep -c` over a type name counts *mentions in text*, not constructions in code, and summing per-file counts compounded it. The resulting finding overstated a real but much smaller tax, and the authorisation I wrote on top of it asked for work already done.
+
+**A count is evidence about text until someone reads the code.** This is the same class as F43 and F64 — a mechanism (here, a number) taken from a cheap signal and promoted to a finding without the read that would have corrected it.
+
+The underlying tax is real and now paid: three exhaustive sites converted, with one case left partly explicit because the values it spells out are what it documents. Note `clippy::needless_update` forbids a fully exhaustive literal plus `..Default::default()`, so a converted site must omit at least one field.
+
+## F78 — the status row's drop order is not monotonic in width
+
+Measured, not reasoned, while proving an assertion reachable: **a clipped model segment reappears at 44, 43 and 42 columns** once the row is busier, because `compose_status_row` offers each segment what the higher-ranked ones left, and dropping a thirteen-column queue tag frees enough room for a segment that was previously truncated.
+
+So the intuitive property — *narrower never shows more* — is **false**, and a test asserting a prefix or no-revive relationship across widths cannot hold. The test author had written exactly that assertion first and discovered it was unsatisfiable (the **sixth** unsatisfiable assertion in this epic, after F58, F61 and the two in F70's card).
+
+Related measurement from the same sweep: "if the queue tag survives, so does the attachment" is **false below 32 columns**, where the ten-column tag fits and the eighteen-column label does not. The surviving test therefore pins the **claim order exactly** — `painted == (cols >= tag + sep + label)` across 20..=200, derived from the tag's own text — and says nothing about the model's revival in either direction.
+
+**No future card should assert a prefix or no-revive property on this row.**
