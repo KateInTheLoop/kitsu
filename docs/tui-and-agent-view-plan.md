@@ -386,7 +386,10 @@ profiles.
 
 | Story | Deliverable | First card | Files | Acceptance / req |
 |---|---|---|---|---|
-| T5-S1 | Fullscreen renderer over the cell ring (alt screen, auto-follow, `PgUp/PgDn`, `Ctrl+Home/End`) | Failing 5 000-line RSS test | `kitsu-tui/src/fullscreen.rs` | (N4) |
+| T5-S1a | The fullscreen **view** over the cell ring — auto-follow and the paging keys as **one** state machine, pure (no terminal) | done, this commit | `kitsu-tui/src/fullscreen.rs` | (N4) |
+| T5-S1b | The ring **goes live** in production: thread `cell_ring_lines` into `install` and call `with_cell_ring`; `main.rs`'s `_resolved_tui` already resolves and discards it | **not started — lands AFTER T5-S1a**, because N4 forbids feeding a ring nothing reads (**F86**) | `kitsu/src/tui_bridge.rs`, `main.rs` | (N4) |
+| ~~T5-S1c~~ | The alternate screen — **no code at all**: `TuiRuntime::enter`/`leave` already do the alt-screen, title and raw-mode lifecycle, and panic/signal restore already cover N5. What is missing is a **caller**, which belongs to T5-S2's switch | folded into T5-S2 | — | (N5) |
+| ~~T5-S1~~ | *Superseded by T5-S1a/b/c. Its acceptance said "failing 5 000-line **RSS** test"; an RSS bound would assert a property **F52** leaves open, and the 5 000-push bound test **already existed** in `cells.rs` since T3-S6 (**F85**)* | — | — | — |
 | T5-S2 | `/tui fullscreen` runtime switch (completes R2) | Failing PTY switch test | `main.rs`, `surface.rs` | (R2) |
 | T5-S3 | `[` dump ring to native scrollback; `v` to `$EDITOR` | Failing equality test | `overlay/transcript.rs` | (R6) |
 | T5-S4 | Windows Terminal fallback (inline → fullscreen when regions misbehave); `--no-alt-screen` forces inline; Windows liveness in `kitsu agents --json` | Failing decision-function test | `viewport.rs`, `agent_state_file.rs` | (N6, H1) |

@@ -1043,6 +1043,23 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   structural-marker substitution is **not** applied at storage — it is an output
   transform, not a storage one.
 
+  **The reader lands before the feed (T5-S1, F86).** This clause says the ring is
+  not fed until something reads it — so the **order of work follows from the
+  requirement**: the fullscreen view (T5-S1a) ships first and is the reader;
+  making the ring live (T5-S1b) comes second. Shipping the feed first would spend
+  up to ten thousand styled lines during the window before a reader existed —
+  **the exact expenditure this clause forbids.**
+
+  **One byte-level claim *is* testable, and one is not.** "Retained bytes ≤ K for
+  a fixed K" needs the per-line clamp F52 declines, and an **RSS** assertion is
+  worse than untestable — it is *false*, since one pathological line defeats it by
+  design, and it is environment-dependent besides. But **the sum of the retained
+  lines' own byte lengths is identical after 10 000 pushes and after 5 000** —
+  computed from the ring's contents rather than the allocator, so deterministic
+  and parallelism-independent. That pins what RSS was reaching for: **the evicted
+  lines' bytes are not retained anywhere.** Recorded because "no byte-level claim
+  is testable" was an overcorrection of mine (**F85**).
+
   **The ring is an opt-in field on the TUI backend, not a process global**, and
   `classic` cannot construct one: the renderer crate has no dependency path to
   the viewport crate, which makes "classic pays nothing for this" a
@@ -1113,8 +1130,17 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   and window-title clauses describe a runtime (`kitsu_tui::TuiRuntime`) that has
   **no caller in the binary**, so nothing pushes a title or enters the alt
   screen and nothing has to restore them. A test asserting their restore would
-  pass by construction, which is why none was written. They become real when
-  T5's fullscreen renderer uses that runtime.
+  pass by construction, which is why none was written.
+
+  **Narrowed in T5-S1a:** this previously said the clauses become real "when T5's
+  fullscreen renderer uses that runtime". **It is not the renderer.** The
+  fullscreen view is **pure by design** — it holds no terminal, writes nothing,
+  and never enters an alternate screen; that purity is what lets auto-follow and
+  the paging keys be asserted through painted rows instead of a pty (**F71**).
+  The caller is **the mode switch** (T5-S2), which is the only thing that can
+  select fullscreen and therefore the only thing that can call `enter`. Recorded
+  because the renderer shipped without touching a terminal, and a reader of the
+  old sentence would have gone looking for the alt screen in the wrong file.
 
   The restore is installed **only in the viewport**, so classic keeps the signal
   dispositions it started with.
