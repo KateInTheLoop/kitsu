@@ -1997,6 +1997,96 @@ fn deck_header_with_mode(summary: &str, styled: bool, plain: bool) -> String {
     }
 }
 
+/// The agent view's state taxonomy (requirement **A2**), and the **one** place
+/// its order is defined.
+///
+/// `DeckState` above is a *glyph* vocabulary: four fill levels. A2 needs six
+/// groups, because it splits a finished agent by whether its result has been
+/// observed and it separates a failure from a cancellation. The two are
+/// deliberately different types — a glyph is not a group — but they live in
+/// the same module so the refinement is visible in one file.
+///
+/// **Why `kitsu-render` and not `kitsu-tui`.** The order has two consumers:
+/// `kitsu-tui`'s agent-view overlay and the binary's `/jobs view` text deck.
+/// `kitsu-tui` cannot depend on `kitsu` (`kitsu` is a binary-only crate, F5),
+/// and `kitsu-render` is the only crate both already depend on. Forking the
+/// order into a second array is the F2/F38/F45/F57 failure family; the
+/// `jobs_view_group` anti-fork test in `tui_bridge.rs` pins that it has not.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AgentViewState {
+    /// Parked on a user answer: `AgentThreadPhase::Blocked`.
+    NeedsInput,
+    /// Working right now: `AgentThreadPhase::Running`.
+    Working,
+    /// Finished, and its handoff is still `Ready` — nobody has looked.
+    DoneUnviewed,
+    /// Finished, and its handoff is `Acknowledged` (or `Unavailable`, so there
+    /// is nothing left to observe).
+    DoneViewed,
+    Failed,
+    Cancelled,
+}
+
+impl AgentViewState {
+    /// A2's six groups in A2's order. The single source; nothing else may
+    /// hard-code a second ordering.
+    pub fn order() -> [AgentViewState; 6] {
+        [
+            Self::NeedsInput,
+            Self::Working,
+            Self::DoneUnviewed,
+            Self::DoneViewed,
+            Self::Failed,
+            Self::Cancelled,
+        ]
+    }
+
+    /// This state's index in [`AgentViewState::order`].
+    ///
+    /// Read *out of* [`AgentViewState::order`] rather than written out a
+    /// second time: a rank that restated the sequence could drift from it,
+    /// which is the whole failure this type exists to prevent.
+    pub fn rank(self) -> usize {
+        Self::order()
+            .into_iter()
+            .position(|state| state == self)
+            .expect("`order` lists every AgentViewState")
+    }
+
+    /// The group heading the agent view prints, in A2's own words.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NeedsInput => "needs input",
+            Self::Working => "working",
+            Self::DoneUnviewed => "done (unviewed)",
+            Self::DoneViewed => "done (viewed)",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// The machine spelling the `s:` filter term accepts (A3).
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::NeedsInput => "needs-input",
+            Self::Working => "working",
+            Self::DoneUnviewed => "done-unviewed",
+            Self::DoneViewed => "done-viewed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parse an `s:` filter value. `None` for a word that is not one of the
+    /// six [`AgentViewState::wire`] spellings.
+    ///
+    /// The accepted vocabulary is read back off [`AgentViewState::wire`], so a
+    /// renamed spelling cannot be accepted here under its old name.
+    pub fn from_wire(word: &str) -> Option<AgentViewState> {
+        Self::order().into_iter().find(|state| state.wire() == word)
+    }
+}
+
 /// One deck row's state marker, already colored for the destination. Callers
 /// append their own (already sanitized) row text after it.
 pub fn deck_marker(state: DeckState) -> String {
