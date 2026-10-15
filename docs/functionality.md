@@ -292,6 +292,13 @@ with `?` for the key list and `Esc` to close; `Ctrl+X a` (following
 first press only hinting so it cannot open by accident. Left on a non-empty
 draft still moves the cursor, and up-arrow history recall is untouched.
 `[tui] left_arrow_opens_agents = false` disables the left-arrow route alone.
+`Up`/`Down` move the selection, which follows the agent rather than the row
+position -- an agent finishing re-groups the rows, and a position-keyed cursor
+would silently move your next keystroke onto a different agent. The selection
+clamps at the ends instead of wrapping, moving it never collects a result, and
+if the selected agent is pruned the selection falls to the row that took its
+place.
+
 `Space` peeks the selected agent -- the same bounded redacted timeline
 `/jobs show` prints, the permission kind it waits on if blocked, and its result
 or failure if finished. Peeking takes custody of the result exactly as

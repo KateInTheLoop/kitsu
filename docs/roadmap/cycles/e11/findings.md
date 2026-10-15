@@ -3485,3 +3485,23 @@ That is a better explanation than carelessness, and it generalises: **a well-nam
 Practically: when a brief asserts how something behaves, it should either cite the line that shows it or mark the claim as needing verification. This epic's briefs now routinely say "verified by me" against specific line numbers; the two failures are both places where I did not.
 
 **The plan row's acceptance needs amending** from "an unviewed failed agent still refuses" to "an unviewed failed result is still surfaced at exit, and a peeked one is not" — or the quit path changes, which would be a different card with its own requirement.
+
+## F65 — an arrow key is not one byte, and the overlay's close key ate the first one
+
+**Found by a test, not asserted from a brief**, which is the part worth keeping.
+
+T4-S4's PTY test pressed `↓` in the agent view and failed with *"`↓` is move, not an exit"*, dumping the pre-open banner. Cause: the overlay's byte loop matched `0x1b` as **close**, and an arrow key is **`ESC [ B`** — three bytes. So the first arrow **closed the view and fed `[B` into the composer underneath.** The view had been shipped (T4-S2) and peeked in (T4-S3) without this surfacing, because every key either card used is a single byte.
+
+**This is the mirror image of T4-S2's trap.** There, at the idle composer, a lone `ESC` stays *pending* in the editor's escape state machine until the next byte, which is then consumed as part of the sequence — so `Esc` then `/quit\r` submits `quit` as a prompt. Same ambiguity, opposite failure: the editor waits where the overlay acted.
+
+**The fix has to carry state across reads**, because a read can split a sequence: a pending-state decoder (`None`/`Escape`/`Csi`/`Ss3`), with `ESC` alone never acting, `[`/`O` opening a sequence consumed to its final byte, and a **50 ms grace** resolving a lone `ESC` as the `Esc` key when no byte follows — matching the editor collector's own poll tick. The `poll` retries on `EINTR`, so **a SIGWINCH arriving during an arrow is not read as a close**. Non-key bytes are dropped rather than forwarded, so no `[B` can reach the composer.
+
+**The lesson for the remaining key cards (T4-S4b, T4-S5…):** every multi-byte key is a latent version of this, and single-byte keys will not reveal it. A card that adds a key should ask what else starts with the same byte.
+
+## F66 — the agent-name limit is a renderer constant, and that is deliberate
+
+`AgentRegistry::NAME_MAX_CHARS` is defined as `kitsu_tui::agents_view::AgentRow::TASK_HEAD_CHARS` (48), with the rationale stated where it is defined: *a name stands in for the task head on A2's row, so the budget is the head's.* The dependency direction is legal (`kitsu` → `kitsu-tui`), and the reasoning is sound — a name that fits the row and a task head that fits it are the same width.
+
+**Recorded because it has a consequence a later reader should see coming:** a **validation** bound is now a **display** constant, so changing the row's head width silently changes **what names are legal**, and the `TooLong { max }` message reports a number that came from a renderer. Names stored before a narrowing stay stored and render truncated by the normal width fitting — they do not break — but they can no longer be re-entered as typed.
+
+Not changed, because the coupling is intentional and documented, and splitting it would need a reason this card does not have. The note is here so that a future row-width change is recognised as a **product change to name validation**, not a layout tweak.

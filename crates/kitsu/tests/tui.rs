@@ -5993,3 +5993,96 @@ fn inline_mode_agent_view_answers_the_help_key_and_still_closes() {
     );
     assert_opened_and_restored(&session, 0, 1, 7);
 }
+
+/// Test T4-S4a. **`↑/↓` belong to the agent view.**
+///
+/// What the arrows *select* is pinned at unit level in `kitsu-tui`
+/// (`AgentSelection`) and in `main.rs` (the walk over a real registry's rows):
+/// a fixture session has zero agents, so there is no row to move over here.
+/// What only a PTY can answer is the routing, and the routing is the half an
+/// implementer is most likely to get wrong, because an arrow key is **not one
+/// byte**. `↑` arrives as `ESC [ A`, and the overlay's byte loop reads `ESC`
+/// as close today — so a naive binding closes the view on the first arrow and
+/// then feeds `[A` to whatever is underneath.
+///
+/// Three things are asserted, and the third is what makes the first two a
+/// claim rather than an observation about a dead loop:
+///
+/// 1. the view is still on screen after each arrow — the arrow is not an exit;
+/// 2. the pinned composer row is unchanged — no byte of the sequence reached
+///    the editor underneath;
+/// 3. the POSITIVE CONTROL: a `?` pressed *after* both arrows still brings up
+///    the help, so the overlay was reading keys the whole time. A loop that
+///    had exited, or that had desynchronised on the escape sequence, cannot
+///    answer `?`.
+///
+/// `Esc` must still close afterwards, which is what distinguishes "the overlay
+/// consumed the arrow" from "the overlay now swallows `Esc` too".
+#[test]
+#[serial]
+fn inline_mode_agent_view_answers_the_arrow_keys_without_typing_into_the_composer() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let script = vec![
+        send(RAW_MODE_MARKER, CTRL_X_A),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b[B"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b[A"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "?"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+    ];
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &script);
+
+    let (opened, downed, upped, helped) = (
+        session.screen_at(1),
+        session.screen_at(3),
+        session.screen_at(5),
+        session.screen_at(7),
+    );
+    let region = |screen: &[String]| screen[..(ROWS - 1) as usize].to_vec();
+    assert!(
+        agent_view_open(&opened),
+        "the view must be open before the arrows are pressed; whole screen:\n{}",
+        Session::dump(&opened)
+    );
+    for (name, screen) in [("\u{2193}", &downed), ("\u{2191}", &upped)] {
+        assert!(
+            agent_view_open(screen),
+            "`{name}` is move, not an exit: the agent view must still be the \
+             surface on screen; whole screen:\n{}",
+            Session::dump(screen)
+        );
+        assert_eq!(
+            pinned_row(screen),
+            pinned_row(&opened),
+            "`{name}` belongs to the view: no byte of its escape sequence may \
+             reach the composer underneath it; screen with the view up:\n{}\n\
+             screen after `{name}`:\n{}",
+            Session::dump(&opened),
+            Session::dump(screen)
+        );
+    }
+    assert_ne!(
+        region(&helped),
+        region(&opened),
+        "POSITIVE CONTROL: `?` pressed after both arrows still brings up the \
+         key help, so the overlay was reading keys throughout and the two \
+         assertions above are not about a loop that had already exited; \
+         screen with the view up:\n{}\nscreen after `?`:\n{}",
+        Session::dump(&opened),
+        Session::dump(&helped)
+    );
+    assert!(
+        agent_view_open(&helped),
+        "whole screen:\n{}",
+        Session::dump(&helped)
+    );
+    assert_opened_and_restored(&session, 0, 1, 11);
+}

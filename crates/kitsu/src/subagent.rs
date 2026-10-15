@@ -465,6 +465,35 @@ pub enum AgentHandoffAckOutcome {
     NotFound,
 }
 
+/// Outcome of naming one agent (the agent view's `n` key).
+///
+/// Every refusal names *why*, because the name is what A2's row head shows: a
+/// name accepted and then not shown, or coerced into something the user did
+/// not type, is the silent rejection this project refuses. In particular this
+/// deliberately does not borrow `safe_inline_label`, which coerces an empty
+/// label to `unknown` and truncates with an ellipsis — right for a label the
+/// model produced, wrong for a name a human just typed.
+#[cfg_attr(not(test), allow(dead_code))] // Read by `n`'s report in T4-S4b.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentRenameOutcome {
+    /// Named, reporting the name this one replaced so the user can tell the
+    /// key reached the row they meant.
+    Renamed {
+        previous: Option<String>,
+    },
+    /// The name was empty, or whitespace only.
+    Empty,
+    /// Longer than `max` characters. Refused rather than truncated.
+    TooLong {
+        max: usize,
+    },
+    /// The name carries a control character — a newline or an `ESC` in a name
+    /// would corrupt every row it is drawn on. Non-ASCII is legal: the rule is
+    /// control characters, not ASCII.
+    Unprintable,
+    NotFound,
+}
+
 /// Outcome of closing one agent's correction channel without stopping it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentSteeringCloseOutcome {
@@ -1399,6 +1428,55 @@ impl AgentRegistry {
             .expect("agent registry")
             .get(&id)
             .map(|record| record.thread.handoff())
+    }
+
+    /// The longest display name an agent may be given, in characters.
+    ///
+    /// A name stands in for the task head on A2's row, so the budget is the
+    /// head's: a name that fitted the row and a task head that fitted it are
+    /// the same width.
+    // `allow(dead_code)` until T4-S4b binds `n` to it: the signature is
+    // settled by this card so the key has something to call.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const NAME_MAX_CHARS: usize = kitsu_tui::agents_view::AgentRow::TASK_HEAD_CHARS;
+
+    /// Name one agent, for the agent view's `n` key.
+    ///
+    /// The name is the trimmed input; it must be non-empty, at most
+    /// [`AgentRegistry::NAME_MAX_CHARS`] characters and free of control
+    /// characters. Any phase may be renamed, terminal included — the agent
+    /// whose result you are about to read is exactly the one worth labelling —
+    /// and naming a row takes **no** custody of its result: the handoff is
+    /// untouched here, so the exit guard still holds an unread result back.
+    ///
+    /// A refused name leaves the previous name exactly as it was.
+    #[cfg_attr(not(test), allow(dead_code))] // Bound to `n` by T4-S4b.
+    pub fn rename(&self, id: u64, name: &str) -> AgentRenameOutcome {
+        let name = name.trim();
+        if name.is_empty() {
+            return AgentRenameOutcome::Empty;
+        }
+        if name.chars().count() > Self::NAME_MAX_CHARS {
+            return AgentRenameOutcome::TooLong {
+                max: Self::NAME_MAX_CHARS,
+            };
+        }
+        if name.chars().any(char::is_control) {
+            return AgentRenameOutcome::Unprintable;
+        }
+        let (previous, update) = {
+            let mut agents = self.agents.lock().expect("agent registry");
+            let Some(record) = agents.get_mut(&id) else {
+                return AgentRenameOutcome::NotFound;
+            };
+            let previous = record.thread.set_name(name);
+            // The counts are unchanged, but the generation is not: a watcher
+            // repaints so the new name is on screen without waiting for the
+            // next unrelated change.
+            (previous, self.changed_snapshot(&agents))
+        };
+        self.publish(update);
+        AgentRenameOutcome::Renamed { previous }
     }
 
     /// Acknowledge a result handoff without copying its content.
