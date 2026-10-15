@@ -4079,3 +4079,31 @@ Naming the gaps is part of the guard being trustworthy: a sweep described as tot
 ### The vacuity guard carried forward unprompted
 
 Last card's result — an acceptance test passing an implementation that painted nothing — shaped this card's main assertion without being asked for. The help-equals-table test adds `!painted.is_empty()`, because **the one way an equality holds vacuously is both sides empty.** The table's rows are also asserted to *have consequences*: a `BindingKind` that is only a struct field fails, since `x`'s text must say "twice", `r`'s must name `y`/`a`/`n`, and the line-openers must carry their grammars.
+
+## F83 — the fixture that blocked two cards was already in the tree, and a comment went stale the moment this card shipped
+
+**Two things from T4-S6b, both about inherited beliefs rather than code.**
+
+### The blocker had dissolved and nobody checked
+
+T4-S4b and T4-S6a both deferred work on the grounds that *a steerable agent needs a live thread with an open correction channel, built from helpers that live in `subagent`'s own test module and are unreachable from `main.rs`'s.* That was true and it was recorded twice.
+
+**But the helpers were reachable all along — from `subagent.rs`.** `EchoProvider`, `ProviderBinder::fixed` and `empty_profile_runtime` are there, and **a passing test already drove a steerable agent end to end** (`background_steering_restarts_only_that_thread_and_handoff_is_explicit`). T4-S7 had already proved the pattern by writing its registry-level tests in that module and splitting three ways.
+
+So the blocker was never "a steerable agent is unreachable"; it was **"a steerable agent is unreachable *from where I was standing*"** — and the fix was to stand somewhere else. **A deferral records where someone was when they hit the wall, and gets re-read later as a property of the wall.** Worth checking any inherited "cannot be done" against the tree before building around it.
+
+### A comment went stale the instant the card landed — F77 again, caught this time
+
+The composer loop carried a comment from T4-S6a: *"the `⛩` milestone and the recap are **not** this card's (design §4.5: they land with T4-S6b and T4-S6c)."* **T4-S6b is this card, and it shipped the milestone** — so the comment became wrong at the moment of the commit that made it wrong, three lines above the arm that did it.
+
+That is **F77** exactly: `/detach`'s arm said *"nothing in this card can attach"*, true when written and false after the rework, and it cost three false documentation claims. **Found here only because I had promised to read the arm by eye** — no test touches a comment.
+
+**The pattern, now twice: a comment that names a future card dates itself.** "Not this card's — it lands with X" is true until X lands, and nothing fails when it stops being true. Corrected in place, with the reason recorded in the comment itself.
+
+### The route's enumeration question, answered better than I asked it
+
+**F82** established that *a rule applied per-change is not a rule enforced*, and I asked what enumerates a new user-visible route. The answer: **this route adds no key — it changes what `Enter` means — so the only thing that can enumerate it is the moment it begins.** Hence the milestone names the *route*, not just the agent. A key table cannot advertise a route that has no key, and bolting it on would have been the wrong fix for the right rule.
+
+### And the race was dissolved rather than decided
+
+A5 did not say whether routing reads the agent's state when the line is opened or when it is submitted. Both readings can be wrong — open-time can send a steer the registry must refuse, submit-time can hand a typed correction to a parser expecting `y`/`a`/`n`. The resolution was not to pick the less-bad one but to **make being wrong cheap**: submit-time routing, the registry as final adjudicator, and **every refusal sends nothing and hands the line back**, so the worst case is one extra keystroke with the user's words intact. In the implementation "refused" and "keeps the line" are the **same boolean**, so they cannot drift apart.
