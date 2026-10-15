@@ -40,6 +40,7 @@ pub mod composer;
 pub mod fullscreen;
 pub mod keys;
 pub mod status;
+pub mod transcript;
 pub mod viewport;
 
 use std::io::{IsTerminal, Write};

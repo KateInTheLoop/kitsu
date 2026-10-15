@@ -362,17 +362,31 @@ view: new output stops dragging it to the bottom until you page back down or
 press `Ctrl+End`. A paged sequence arriving inside a paste is content, not a
 keypress.
 
+`Ctrl+O` opens a **transcript overlay** over the transcript the ring retains,
+from the inline composer and from fullscreen alike. The same four keys scroll it,
+and `q` or `Esc` closes it and leaves the frame behind it exactly where it was --
+paging the overlay never moves the view underneath. Its keys are listed on its
+own footer rather than in a global table, because they are live only while it
+holds the screen; `Ctrl+O` itself is listed by `/help tui`, with the composer's
+other chords. Searching it, jumping between prompts, dumping it to scrollback
+and opening it in `$EDITOR` are **not** wired yet.
+
 `Ctrl+Z` suspends from fullscreen through the same path the other renderers use,
 though the alternate screen's contents are the terminal's across the stop. `--tui
 fullscreen` and `[tui] mode = "fullscreen"` start there instead; a session that
-starts in fullscreen has nothing behind it to paint yet. Paging is not wired, so
-the view shows the newest lines that fit.
+starts in fullscreen has nothing behind it to paint yet.
 
 The scrollback it paints holds the **streamed** conversation. It does not hold
 kitsu's own diagnostics and receipts, and it does not hold an answer that was
 buffered rather than streamed -- which happens whenever tools are advertised for
 that round, i.e. by default. With `--no-tools` the answer streams and the
 scrollback has it. `[tui] cell_ring_lines` bounds it in lines (default 10000).
+
+**It also does not hold your own prompts.** The line you submit is painted by the
+composer and then erased, so it never becomes a transcript line: the scrollback,
+and the `Ctrl+O` overlay built on it, show the assistant's side and the tool
+output, with your side missing. `/export` remains the route to the full
+conversation.
 
 `?` lists every key the view binds, and `/help keys` prints the same list
 without opening the view -- both render one table, so neither can drift from the

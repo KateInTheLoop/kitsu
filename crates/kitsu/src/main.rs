@@ -5635,7 +5635,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "tui",
         args: "[classic|inline|fullscreen]",
         description: "report or switch the live renderer",
-        details: "Switches the renderer in place: `classic` is the line renderer kitsu has always had, `inline` is the pinned bottom viewport, `fullscreen` takes the terminal's alternate screen and repaints the tail of the transcript the inline viewport retained. The conversation is unchanged by a switch — the transcript already on screen stays exactly where it is, and nothing is replayed, except into fullscreen, where the alternate screen starts blank and the retained tail is painted onto it. In fullscreen, `PgUp` and `PgDn` move the frame back and forward by a window, `Ctrl+Home` moves it to the oldest line the transcript ring still retains and `Ctrl+End` brings it back to the newest and resumes following the output; all four move the frame rather than the caret, and only while fullscreen holds the screen. Leaving fullscreen gives the screen back untouched. Bare /tui reports the renderer in use. Accepted only between turns; a /tui typed during a turn is refused rather than queued. Persist a choice with `mode = \"inline\"` under `[tui]` in the config or --tui.",
+        details: "Switches the renderer in place: `classic` is the line renderer kitsu has always had, `inline` is the pinned bottom viewport, `fullscreen` takes the terminal's alternate screen and repaints the tail of the transcript the inline viewport retained. The conversation is unchanged by a switch — the transcript already on screen stays exactly where it is, and nothing is replayed, except into fullscreen, where the alternate screen starts blank and the retained tail is painted onto it. In fullscreen, `PgUp` and `PgDn` move the frame back and forward by a window, `Ctrl+Home` moves it to the oldest line the transcript ring still retains and `Ctrl+End` brings it back to the newest and resumes following the output; all four move the frame rather than the caret, and only while fullscreen holds the screen. `Ctrl+O` opens the transcript overlay over the transcript the ring retains, from the inline composer and from fullscreen alike: the same four keys scroll it, and `q` or `Esc` closes it and leaves the frame behind it where it was. Leaving fullscreen gives the screen back untouched. Bare /tui reports the renderer in use. Accepted only between turns; a /tui typed during a turn is refused rather than queued. Persist a choice with `mode = \"inline\"` under `[tui]` in the config or --tui.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -6419,6 +6419,20 @@ fn read_chat_line_inline(
             carried = draft;
             continue;
         }
+        // Requirement **R6**: `Ctrl+O`. Sequenced here for the agent view's
+        // reason -- the reader is pure and the overlay owns the screen, the
+        // alternate screen and its own key loop -- and the draft comes back
+        // through the same replay (**F76**), so the key cannot cost the user a
+        // character. The lines are the installed viewport's ring, read before
+        // the overlay paints anything: that ring is the streamed conversation
+        // and the only copy of it (**N4**).
+        if let Ok(tui_bridge::InlineRead::OpenTranscript(draft)) = outcome {
+            let lines = bridge.cell_lines().unwrap_or_default();
+            run_transcript_overlay(&lines, true);
+            bridge.reinstall_after_resume();
+            carried = draft;
+            continue;
+        }
         // Card **T4-S6a**, requirement A5: `\u{2190}` on an empty composer
         // and `Ctrl+X d` both report `Detached`, and detaching is this loop's
         // to perform: the reader is pure, exactly as it is for a suspend and
@@ -6483,6 +6497,9 @@ fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead
         // the session's attachment, which re-labels the composer, and reads
         // again. Unreachable from there, like the two outcomes above it.
         Ok(tui_bridge::InlineRead::Detached(_)) => ChatReadline::Eof,
+        // Requirement **R6**: handled by the caller's loop, like the two
+        // outcomes above it. Unreachable from here.
+        Ok(tui_bridge::InlineRead::OpenTranscript(_)) => ChatReadline::Eof,
         Ok(tui_bridge::InlineRead::Interrupted) => {
             // Deliberately NOT re-raising SIGINT here, unlike the during-turn
             // collector. The collector raises because a turn is in flight and
@@ -6498,6 +6515,239 @@ fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead
             ChatReadline::Interrupted
         }
         Err(error) => ChatReadline::Error(error.to_string()),
+    }
+}
+
+/// Open the transcript overlay over the cell ring and run it until `q` or
+/// `Esc` closes it (requirement **R6**, first piece).
+///
+/// # Reachable from both surfaces, which is what `take_alternate_screen` says
+///
+/// `Ctrl+O` is read by the one inline reader both surfaces use, so the overlay
+/// has two call sites: the inline idle prompt, which is on the primary screen
+/// and must therefore **take** the alternate screen for the overlay, and the
+/// fullscreen idle prompt, which is already holding one and must not take a
+/// second (a second `ESC[?1049h` would have no counterpart in the leave).
+/// Finding **F89**: a capability that compiles is not one that is reachable,
+/// and one route is not two.
+///
+/// # The anchor is the overlay's own
+///
+/// [`kitsu_tui::transcript::TranscriptOverlay`] holds its own
+/// `FullscreenView`, so paging here moves nothing the fullscreen segment
+/// owns; on close the fullscreen caller repaints from the segment's anchor and
+/// the user is back on the frame they left.
+///
+/// # The dying-signal restore
+///
+/// On the inline route this is the one thing on screen when a signal arrives,
+/// so [`kitsu_tui::note_alternate_screen`] is stored **before** the enter
+/// bytes and cleared **after** the leave, exactly as the agent view's overlay
+/// orders the same pair (**F94**): the straight-line leave below never runs
+/// for a panic or a dying signal, and the handler installed by
+/// `tui_bridge::install_exit_restore` -- which the inline surface's own
+/// install site registers before any idle prompt can be reached -- gives the
+/// screen back instead. Raw mode is the caller's: both call sites already hold
+/// a `RawStdinGuard`, and nesting a second one would publish the *raw* modes
+/// as the canonical ones for that handler.
+#[cfg(unix)]
+fn run_transcript_overlay(lines: &[kitsu_tui::cells::CellLine], take_alternate_screen: bool) {
+    use std::io::Write as _;
+
+    // Nothing is drawn into a carrier that cannot be drawn into, and nothing
+    // is written before the decision, exactly as the agent view's overlay
+    // declines.
+    if !kitsu_render::stdin_is_tty() || !kitsu_render::stderr_styled() {
+        return;
+    }
+
+    let mut err = std::io::stderr();
+    if take_alternate_screen {
+        kitsu_tui::note_alternate_screen(true);
+        let _ = err.write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h");
+    } else {
+        // The screen is the fullscreen segment's and stays its; only the
+        // caret is the overlay's business, since the overlay has none.
+        let _ = err.write_all(b"\x1b[?25l");
+    }
+    let _ = err.flush();
+
+    // The key loop is its own function, and not for tidiness: it is the
+    // thing the byte-level tests drive (finding **F69**). A test that mirrored
+    // this loop instead of running it would be a second decoder agreeing with
+    // itself -- which is exactly how the `Esc` defect this seam was extracted
+    // for went unseen: the key-space sweep in `kitsu_tui::transcript` proves
+    // the *predicate* answers `Esc`, and proves nothing about whether anything
+    // ever hands it one.
+    let ring = tui_bridge::frame_ring(lines);
+    let mut overlay = kitsu_tui::transcript::TranscriptOverlay::new();
+    let mut stdin = std::io::stdin();
+    let _exit = run_transcript_key_loop(
+        &mut stdin,
+        &mut overlay,
+        &ring,
+        // Probed per frame, so a `SIGWINCH` that wakes the read is answered at
+        // the new geometry.
+        &mut || {
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            (rows, cols as usize)
+        },
+        // The agent view's own grace and its own `poll`, not a second copy:
+        // the only honest way to tell a lone `ESC` from the first byte of an
+        // arrow is time, and a second implementation of that is how two
+        // surfaces come to disagree about what `Esc` means.
+        &mut || stdin_waiting(ESC_SEQUENCE_GRACE),
+        &mut |frame: &[String]| {
+            // Absolute addressing and a cleared row each, for the agent
+            // view's reason: the overlay owns the whole screen while it is
+            // up, and a painted row that scrolled would cost a frame row.
+            let mut painted = String::from("\x1b[2J");
+            for (index, row) in frame.iter().enumerate() {
+                painted.push_str(&format!("\x1b[{};1H\x1b[2K{row}", index + 1));
+            }
+            let _ = err.write_all(painted.as_bytes());
+            let _ = err.flush();
+        },
+    );
+
+    let _ = err.write_all(b"\x1b[?25h");
+    if take_alternate_screen {
+        let _ = err.write_all(b"\x1b[?1049l");
+        let _ = err.flush();
+        // After the bytes (**F94**): a signal in this window writes a second
+        // leave onto a primary screen rather than none onto an alternate one.
+        kitsu_tui::note_alternate_screen(false);
+        // The region and the pinned status row, for the agent view overlay's
+        // reason: a terminal that keeps per-screen margins hands back an
+        // unpinned one.
+        tui_bridge::reinstall_pinned_region();
+    } else {
+        let _ = err.flush();
+    }
+}
+
+/// How the transcript overlay's key loop ended.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TranscriptExit {
+    /// A close key was pressed: `q`, or `Esc`.
+    Closed,
+    /// The descriptor was drained or errored. A descriptor that cannot deliver
+    /// the key which closes the overlay closes it rather than spinning.
+    Drained,
+}
+
+/// The transcript overlay's key loop: paint, read, decode, repeat until a
+/// close key or a drained descriptor.
+///
+/// Extracted from [`run_transcript_overlay`] so the **real** decoder is what
+/// the tests drive (finding **F69**): `input` is any reader, the geometry and
+/// the paint are closures, and `more_input_waiting` is the lone-`ESC` grace --
+/// production passes the agent view's own `stdin_waiting(ESC_SEQUENCE_GRACE)`.
+/// Nothing in here touches a terminal, which is what makes a byte-level
+/// assertion possible at all.
+///
+/// # Why a lone `ESC` needs the grace rather than a chunk boundary
+///
+/// `ESC` is the first byte of every sequence this loop drops and of the two
+/// `PgUp`/`PgDn` presses it answers, so a chunk that ends on one is ambiguous
+/// (**F65**: a multi-byte key is not one byte). Resolving it by "nothing
+/// followed it in this chunk" is **wrong**, and measurably so: a lone `Esc`
+/// keypress delivers exactly `[0x1b]`, which is a strict prefix of all four
+/// paging sequences, so the partial-hold took it and the loop went back to a
+/// blocking read -- `Esc` did nothing until the user pressed something else,
+/// while the footer advertised it (**F75**: a key that appears to work is a
+/// defect, not a missing feature). The grace is the agent view's answer to the
+/// same ambiguity and this is the same mechanism, not a second one.
+#[cfg(unix)]
+fn run_transcript_key_loop<R: std::io::Read>(
+    input: &mut R,
+    overlay: &mut kitsu_tui::transcript::TranscriptOverlay,
+    ring: &kitsu_tui::cells::CellRing,
+    geometry: &mut dyn FnMut() -> (u16, usize),
+    more_input_waiting: &mut dyn FnMut() -> bool,
+    paint: &mut dyn FnMut(&[String]),
+) -> TranscriptExit {
+    let mut buffer = [0u8; 256];
+    // A sequence split across reads is still one keystroke (**F65**), so the
+    // tail of a chunk that ran out mid-sequence waits for the rest of itself.
+    let mut held: Vec<u8> = Vec::new();
+    loop {
+        let (rows, cols) = geometry();
+        paint(&overlay.frame(ring, rows, cols));
+
+        // The grace, before the next read can block on a key the user has
+        // already pressed.
+        if !held.is_empty() && !more_input_waiting() {
+            let lone_escape = held == [0x1b];
+            held.clear();
+            if lone_escape {
+                return TranscriptExit::Closed;
+            }
+            // An incomplete sequence whose rest never came: dropped, never
+            // read as the keys its bytes spell.
+            continue;
+        }
+
+        let count = match input.read(&mut buffer) {
+            Ok(0) => return TranscriptExit::Drained,
+            Ok(count) => count,
+            // A signal woke the read (a `SIGWINCH`, typically): repaint and
+            // carry on, which also re-probes the geometry.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return TranscriptExit::Drained,
+        };
+        let mut data = std::mem::take(&mut held);
+        data.extend_from_slice(&buffer[..count]);
+        let mut index = 0usize;
+        while index < data.len() {
+            let rest = &data[index..];
+            // The four paging sequences first, and through the bridge's own
+            // table: a second copy is how two surfaces come to disagree about
+            // which bytes `Ctrl+End` is.
+            if let Some((press, length)) = tui_bridge::page_key(rest) {
+                overlay.page(press, ring, rows);
+                index += length;
+                continue;
+            }
+            if tui_bridge::partial_page_key(rest) {
+                held = rest.to_vec();
+                break;
+            }
+            let byte = data[index];
+            index += 1;
+            if byte == 0x1b {
+                // An `ESC` with bytes behind it that start some *other*
+                // sequence is that sequence and not a close: its bytes are
+                // dropped rather than read as keys.
+                if data.get(index) == Some(&b'[') || data.get(index) == Some(&b'O') {
+                    index += 1;
+                    while let Some(byte) = data.get(index) {
+                        index += 1;
+                        if (0x40..=0x7e).contains(byte) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                // An `ESC` that ends the chunk is still ambiguous: hold it for
+                // the grace above rather than guessing from the boundary.
+                if index == data.len() {
+                    held = vec![0x1b];
+                    break;
+                }
+            }
+            let press = match byte {
+                0x1b => kitsu_tui::keys::Press::Esc,
+                byte if (0x20..=0x7e).contains(&byte) => kitsu_tui::keys::Press::Char(byte as char),
+                // Every other control byte is inert here, which is what keeps
+                // the footer honest: it advertises the keys this loop answers.
+                _ => continue,
+            };
+            if kitsu_tui::transcript::closes(press) {
+                return TranscriptExit::Closed;
+            }
+        }
     }
 }
 
@@ -6649,6 +6899,22 @@ fn read_chat_line_fullscreen(
                         "failed to switch stdin back to raw mode after a suspend".to_string(),
                     );
                 }
+                carried = draft;
+                continue;
+            }
+            // Requirement **R6**: `Ctrl+O` is a literal control byte and not
+            // one of the two chord routes, so it *is* reachable here with
+            // `InlineKeys::disabled()` -- which is the point: the overlay is
+            // reachable from both surfaces (**F89**). The alternate screen is
+            // already this segment's, so the overlay does not take a second
+            // one, and the close repaints the frame from the **segment's**
+            // anchor: the overlay paged its own, so this is what puts back the
+            // frame the user left.
+            Ok(tui_bridge::InlineRead::OpenTranscript(draft)) => {
+                let lines = segment.transcript_lines();
+                run_transcript_overlay(&lines, false);
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                segment.repaint_frame(rows, cols as usize);
                 carried = draft;
                 continue;
             }
@@ -24635,6 +24901,170 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    // ---- R6-a: the transcript overlay's byte loop ----
+    //
+    // These drive `run_transcript_key_loop` itself, which is the point
+    // (**F69**): `kitsu_tui::transcript`'s key-space sweep proves the
+    // *predicate* `closes(Esc)` is true and proves nothing about whether any
+    // byte ever becomes a `Press::Esc`. It did not, and the footer advertised
+    // `Esc` anyway (**F75**).
+
+    /// A reader that hands over one scripted chunk per `read`, as a terminal
+    /// in `VMIN=1` raw mode does: a keystroke is a read and an escape
+    /// sequence can be split across two of them (**F65**).
+    ///
+    /// The remaining-chunk count is shared so the loop's grace closure can be
+    /// the honest question "is there another chunk already waiting?", which is
+    /// what `stdin_waiting` asks `poll` in production.
+    #[cfg(unix)]
+    struct ChunkReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        remaining: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    #[cfg(unix)]
+    impl ChunkReader {
+        fn new(chunks: &[&[u8]]) -> Self {
+            let chunks: std::collections::VecDeque<Vec<u8>> =
+                chunks.iter().map(|chunk| chunk.to_vec()).collect();
+            let remaining = std::rc::Rc::new(std::cell::Cell::new(chunks.len()));
+            Self { chunks, remaining }
+        }
+    }
+
+    #[cfg(unix)]
+    impl std::io::Read for ChunkReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            match self.chunks.pop_front() {
+                Some(chunk) => {
+                    self.remaining.set(self.chunks.len());
+                    out[..chunk.len()].copy_from_slice(&chunk);
+                    Ok(chunk.len())
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    /// Run the real key loop over `chunks` on an 8-line ring and a 6-row
+    /// window, returning how it ended, the overlay's follow state and every
+    /// painted frame.
+    #[cfg(unix)]
+    fn drive_transcript(chunks: &[&[u8]]) -> (TranscriptExit, bool, Vec<Vec<String>>) {
+        let mut ring = kitsu_tui::cells::CellRing::new(16);
+        for n in 0..16 {
+            ring.push(kitsu_render::surface::Fd::Stdout, &format!("line {n}"));
+        }
+        let mut overlay = kitsu_tui::transcript::TranscriptOverlay::new();
+        let mut input = ChunkReader::new(chunks);
+        let remaining = std::rc::Rc::clone(&input.remaining);
+        let mut frames: Vec<Vec<String>> = Vec::new();
+        let exit = {
+            let mut geometry = || (6u16, 40usize);
+            // The grace, answered honestly rather than always-false: a chunk
+            // already queued is exactly what `poll` reports as waiting, so a
+            // sequence split across two reads is resolved as a sequence and a
+            // lone `ESC` with nothing behind it is resolved as the press.
+            let mut waiting = || remaining.get() > 0;
+            let mut paint = |frame: &[String]| frames.push(frame.to_vec());
+            run_transcript_key_loop(
+                &mut input,
+                &mut overlay,
+                &ring,
+                &mut geometry,
+                &mut waiting,
+                &mut paint,
+            )
+        };
+        (exit, overlay.is_following(), frames)
+    }
+
+    /// **Test: a lone `Esc` closes the overlay.**
+    ///
+    /// Measured before it was asserted (**F99**), and it was red for a reason
+    /// no mirror-test could have found: `[0x1b]` is a strict prefix of all
+    /// four paging sequences, so the partial-hold took it and the loop went
+    /// back to a blocking read. The overlay stayed up until the user pressed
+    /// something else, and the footer said `q/Esc close`.
+    ///
+    /// Not vacuous: the exit **reason** is asserted, not merely that the loop
+    /// returned. A drained descriptor also ends the loop, and that is the
+    /// value the defect produced here.
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_esc_closes_the_transcript_overlay() {
+        let (exit, following, frames) = drive_transcript(&[b"\x1b"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Closed,
+            "a lone Esc is the close press the footer advertises, not the \
+             first byte of a sequence that never came"
+        );
+        assert!(following, "and nothing paged");
+        assert!(!frames.is_empty(), "the overlay painted before it read");
+    }
+
+    /// **Test: a lone `Esc` after another key, alone in its own chunk, closes
+    /// the overlay.**
+    ///
+    /// The chunk-boundary case: `PgUp` arrives and is answered, and the `Esc`
+    /// that follows is a read of its own with nothing behind it.
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_esc_at_a_chunk_boundary_closes_the_overlay() {
+        let (exit, following, _) = drive_transcript(&[b"\x1b[5~", b"\x1b"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Closed,
+            "the Esc in its own read is the press"
+        );
+        assert!(
+            !following,
+            "and the PgUp before it was answered, so this is not a loop that \
+             dropped both bytes"
+        );
+    }
+
+    /// **Test: `ESC [ B` split across two reads is one keystroke, is dropped,
+    /// and does not close the overlay (F65).**
+    ///
+    /// The regression the grace must not buy at the expense of: an arrow key
+    /// whose first byte lands at the end of a chunk must not be read as a
+    /// close.
+    #[cfg(unix)]
+    #[test]
+    fn a_split_arrow_sequence_is_dropped_and_does_not_close_the_overlay() {
+        let (exit, following, _) = drive_transcript(&[b"\x1b", b"[B"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "the down arrow is not a close key, so the loop ran out of input \
+             instead of closing"
+        );
+        assert!(
+            following,
+            "and the arrow moved nothing: this overlay has no \
+             selection for it"
+        );
+    }
+
+    /// **Test: `q` closes the overlay, and the paging keys do not.**
+    #[cfg(unix)]
+    #[test]
+    fn q_closes_the_transcript_overlay_and_a_paging_key_does_not() {
+        let (exit, following, _) = drive_transcript(&[b"q"]);
+        assert_eq!(exit, TranscriptExit::Closed, "q closes");
+        assert!(following);
+
+        let (exit, following, _) = drive_transcript(&[b"\x1b[5~\x1b[1;5H"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "PgUp and Ctrl+Home scroll; neither closes"
+        );
+        assert!(!following, "and both were answered");
+    }
+
     #[test]
     fn failure_count_phrase_pluralizes_naturally() {
         assert_eq!(failure_count_phrase(1), "1 failure");
@@ -31193,6 +31623,59 @@ mod tests {
              advertises an ambiguity rather than a capability: {}",
             tui.details
         );
+    }
+
+    /// **R6-a.** `Ctrl+O`'s only advertisement.
+    ///
+    /// The transcript overlay's own footer advertises the keys that are live
+    /// **inside** it; nothing in it can tell a user that the overlay exists
+    /// or how to open it. And `Ctrl+O` cannot go in `keys::BINDINGS` for the
+    /// four paging keys' reason above: that table is the agent view's,
+    /// guarded by a sweep over *that* decoder's key space (**F82**), and this
+    /// key is read by the inline reader on the composer's surfaces. So its
+    /// home is the same one T5-S1c-iii gave the paging keys, and this test is
+    /// that test's shape deliberately rather than a second one.
+    ///
+    /// **F82** is also why this test exists at all: its sweep found `q`,
+    /// `Enter` and `\u{2192}` dispatched and advertised nowhere, and the
+    /// lesson recorded was that a rule applied per-change is not a rule
+    /// enforced. An unadvertised key is that finding verbatim.
+    ///
+    /// The second half is the footer's guard restated on this string: the
+    /// details must not promise the R6 clauses that are **not** built, for
+    /// exactly the reason the footer may not name them (**F75**: a key that
+    /// appears to work is worse than one that is missing).
+    #[test]
+    fn the_tui_details_advertise_the_transcript_overlay_key() {
+        let tui = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "tui")
+            .expect("/tui is registered");
+
+        assert!(
+            tui.details.contains("Ctrl+O"),
+            "the details are where `Ctrl+O` is advertised: there is no \
+             `keys::BINDINGS` row for it and the overlay's own footer is only \
+             visible once it is already open, so a user who is not told here \
+             is not told at all. The details read: {}",
+            tui.details
+        );
+        assert!(
+            tui.details.contains("overlay"),
+            "...and the sentence must say what the key opens, not merely \
+             that the key exists: {}",
+            tui.details
+        );
+        let lowered = tui.details.to_ascii_lowercase();
+        for unbuilt in ["search", "dump", "editor", "scrollback", "jump"] {
+            assert!(
+                !lowered.contains(unbuilt),
+                "the details must not promise {unbuilt:?}: it is a later \
+                 piece of R6 and nothing dispatches it, which is the same \
+                 rule the overlay's footer is guarded by: {}",
+                tui.details
+            );
+        }
     }
 
     /// **T5-S2.** The two literals `/tui`'s own messages are built from, and

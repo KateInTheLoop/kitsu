@@ -437,6 +437,36 @@ impl FullscreenSegment {
         let _ = self.err.flush();
     }
 
+    /// The lines the frame is painted from, oldest first: the seed plus
+    /// everything the tap has recorded.
+    ///
+    /// Requirement **R6**: the transcript overlay opens over the same lines
+    /// this segment's frame is painted from, and reads them through this
+    /// rather than through a ring of its own.
+    pub(crate) fn transcript_lines(&self) -> Vec<kitsu_tui::cells::CellLine> {
+        self.lines_now()
+    }
+
+    /// Paint the frame again from this segment's **own** anchor, whatever the
+    /// ring has done.
+    ///
+    /// Requirement **R6**'s close: the transcript overlay painted over this
+    /// screen and scrolled its own anchor, so `q` must put back the frame the
+    /// user left -- which is this segment's anchor, untouched by the overlay's
+    /// separate instance. Unlike [`Self::repaint_if_the_ring_grew`] this is
+    /// unconditional, because nothing about the ring changed and the screen is
+    /// nevertheless not the one the segment painted.
+    pub(crate) fn repaint_frame(&mut self, rows: u16, cols: usize) {
+        if self.left {
+            return;
+        }
+        let frame = {
+            let ring = frame_ring(&self.lines_now());
+            self.view.frame(&ring, window_rows(rows), cols)
+        };
+        self.paint_frame(&frame);
+    }
+
     /// Whether this segment's frame is still following the newest line.
     ///
     /// The anchor's own transitions are [`kitsu_tui::fullscreen`]'s and are
@@ -700,7 +730,7 @@ fn fullscreen_frame(lines: &[kitsu_tui::cells::CellLine], rows: u16, cols: usize
 ///
 /// The limit is the line count, so nothing is evicted and a paging anchor is
 /// an ordinal into exactly the lines the segment holds.
-fn frame_ring(lines: &[kitsu_tui::cells::CellLine]) -> kitsu_tui::cells::CellRing {
+pub(crate) fn frame_ring(lines: &[kitsu_tui::cells::CellLine]) -> kitsu_tui::cells::CellRing {
     let mut ring = kitsu_tui::cells::CellRing::new(lines.len().max(1));
     for line in lines {
         ring.push(line.fd(), line.styled());
@@ -2004,6 +2034,12 @@ const PAGE_KEYS: [(&[u8], kitsu_tui::fullscreen::Page); 4] = [
     (b"\x1b[1;5F", kitsu_tui::fullscreen::Page::Newest),
 ];
 
+/// `Ctrl+O`: the transcript overlay's key (requirement **R6**).
+///
+/// One literal control byte, so unlike the four paging sequences it has no
+/// partial-sequence case and is not behind the configurable `[tui] prefix`.
+const TRANSCRIPT_KEY: u8 = 0x0f;
+
 /// The bracketed-paste opening delimiter.
 const PASTE_START: &[u8] = b"\x1b[200~";
 /// The bracketed-paste closing delimiter.
@@ -2030,6 +2066,15 @@ enum KeyItem {
     /// move the caret. Only produced when the reader was given a paging sink
     /// ([`KeyFilter::pages`]).
     Page(kitsu_tui::fullscreen::Page),
+    /// `Ctrl+O`: open the transcript overlay (requirement **R6**).
+    ///
+    /// Lifted out for [`KeyItem::Open`]'s reason, and a **literal** control
+    /// byte rather than a chord letter: R6 spells the key, so it is not
+    /// behind the configurable `[tui] prefix`. Measured before it was a key
+    /// here: `0x0f` reached the editor, whose `0x00..=0x1f` arm dropped it,
+    /// so the draft and the caret were untouched and nothing repainted.
+    ///
+    OpenTranscript,
 }
 
 /// Splits a read chunk into [`KeyItem`]s: the chord prefix and its letter are
@@ -2138,6 +2183,19 @@ impl KeyFilter {
                 index += 1;
                 continue;
             }
+            // Requirement **R6**. After the prefix check, so a session that
+            // configured this byte as its chord prefix keeps the chord, and
+            // inside the non-paste branch only: in a paste the payload is
+            // *text*, and a control byte in pasted content is never a key
+            // (the editor's in-paste arm drops it rather than drafting it).
+            if data[index] == TRANSCRIPT_KEY {
+                if !bytes.is_empty() {
+                    items.push(KeyItem::Bytes(std::mem::take(&mut bytes)));
+                }
+                items.push(KeyItem::OpenTranscript);
+                index += 1;
+                continue;
+            }
             if data[index] == 0x1b {
                 if rest.starts_with(PASTE_START) {
                     self.in_paste = true;
@@ -2185,6 +2243,26 @@ impl KeyFilter {
         }
         items
     }
+}
+
+/// The paging press `data` starts with, and its length in bytes.
+///
+/// Requirement **R6**: the transcript overlay runs its own key loop over the
+/// raw bytes, exactly as the agent view's overlay does, and it reads the same
+/// four sequences this module already decodes for the inline reader. Exposed
+/// rather than re-tabulated: a second copy of [`PAGE_KEYS`] is how the two
+/// surfaces come to disagree about which byte string `Ctrl+End` is.
+pub(crate) fn page_key(data: &[u8]) -> Option<(kitsu_tui::fullscreen::Page, usize)> {
+    KeyFilter::page_press(data)
+}
+
+/// Whether `data` ends part-way through one of the four paging sequences, so
+/// the overlay's key loop holds it for the next read rather than resolving the
+/// `ESC` as a close (finding **F65**: a multi-byte key is not one byte).
+pub(crate) fn partial_page_key(data: &[u8]) -> bool {
+    PAGE_KEYS
+        .iter()
+        .any(|(sequence, _)| KeyFilter::is_partial(data, sequence))
 }
 
 /// Re-pin the DECSTBM region and repaint the status row, for a full-screen
@@ -2255,6 +2333,16 @@ pub(crate) enum InlineRead {
     /// -- "only ever reached on an empty one" -- was true of `\u{2190}`
     /// alone and became wrong when the chord was given the same variant.
     Detached(String),
+
+    /// `Ctrl+O`: open the transcript overlay over the cell ring (requirement
+    /// **R6**).
+    ///
+    /// Carries the draft for [`InlineRead::OpenAgentView`]'s reason: the
+    /// overlay takes the screen this reader is painting on, so the whole
+    /// sequencing is the caller's, and the draft comes back through the same
+    /// replay a suspend uses so the key cannot cost the user a character.
+    ///
+    OpenTranscript(String),
 }
 
 /// Read one line from `input` through the shared editor, repainting through
@@ -2507,6 +2595,20 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
                     left_presses = 0;
                     open_agent_view = true;
                     break;
+                }
+                // Requirement **R6**: the transcript overlay's route. The
+                // reader stays pure for `KeyItem::Open`'s reason -- the
+                // overlay takes the screen this reader paints on -- so the
+                // keystroke is reported and the draft handed back, returning
+                // *at* this item so bytes typed after it belong to the next
+                // read. The draft is carried rather than dropped, which is
+                // **F76**'s replay: the key must not cost the user a
+                // character.
+                KeyItem::OpenTranscript => {
+                    // No disarm of the `\u{2190}\u{2190}` count, unlike every
+                    // other arm: this one returns, so the whole reader state
+                    // dies with it.
+                    return Ok(InlineRead::OpenTranscript(editor.buffer_string()));
                 }
                 // Card **T4-S6a**: `<prefix> d`. With an agent attached this
                 // is the detach route (`InlineRead::Detached`); with nothing
@@ -3599,6 +3701,96 @@ mod tests {
     /// script several sequences in a row.
     fn script(parts: &[&[u8]]) -> Vec<u8> {
         parts.iter().flat_map(|part| part.iter().copied()).collect()
+    }
+
+    // ---- R6: Ctrl+O, the transcript overlay's route ----
+
+    /// `Ctrl+O`, as a terminal sends it: one literal control byte, which is
+    /// why it has no partial-sequence case the way the paging keys do.
+    const CTRL_O: &[u8] = b"\x0f";
+
+    /// **Test: `Ctrl+O` ends the read as `OpenTranscript` and carries the
+    /// draft.**
+    ///
+    /// Measured first (**F99**), because the obvious assertion is green
+    /// today and proves nothing: fed `abc` then `0x0f`, the reader reports
+    /// `Eof` with frames `[("",0),("a",1),("ab",2),("abc",3)]` -- the byte
+    /// reaches the editor, whose `0x00..=0x1f` arm drops it, so there is **no
+    /// fourth frame** and the draft and caret are already untouched. "Ctrl+O
+    /// leaves the draft alone" is therefore satisfied by the key not
+    /// existing.
+    ///
+    /// What is red is the pair: the outcome, and the draft *carried on it*.
+    /// Asserting them together is also what pins the replay -- an
+    /// `OpenTranscript(String::new())` would lose the user's three
+    /// characters, which is the **F76** shape the agent-view chord already
+    /// pays for.
+    ///
+    /// The route runs under `InlineKeys::disabled()`, which is the design
+    /// claim: R6 spells `Ctrl+O`, so unlike the agent view's `<prefix> a`
+    /// this key is **not** behind the configurable chord prefix and is not
+    /// switchable off with it.
+    #[test]
+    fn ctrl_o_ends_the_read_as_open_transcript_and_carries_the_draft() {
+        let typed = script(&[b"abc", CTRL_O]);
+        let (outcome, frames) = read_bytes(&typed);
+        assert_eq!(
+            outcome,
+            InlineRead::OpenTranscript("abc".to_string()),
+            "Ctrl+O opens the transcript overlay and hands the draft back for \
+             the caller to replay"
+        );
+        assert_eq!(
+            frames.last(),
+            Some(&("abc".to_string(), 3)),
+            "and the key put nothing in the draft and moved no caret: the \
+             last frame is still the three typed characters"
+        );
+    }
+
+    /// **Test: `Ctrl+O` inside a bracketed paste does not open the overlay.**
+    ///
+    /// The hazard the paging keys have a test for: inside a paste the payload
+    /// is *text*, and a control byte in pasted content must not be read as a
+    /// key.
+    ///
+    /// Measured, and it corrected this test: the editor does **not** take a
+    /// pasted `0x0f` as content either -- fed `ESC[200~ a 0x0f b ESC[201~`
+    /// it reports frames `[("",0),("a",1),("ab",2)]`, because its in-paste
+    /// arm drops `0x00..=0x1f` to keep C1 controls out of the draft. So the
+    /// claim is not "a pasted Ctrl+O is content"; that is a thing this system
+    /// never does, and asserting it would be a specification of a fixture
+    /// (**F61**). The claim is that it is **not a key**: the paste is still a
+    /// paste, and `ab` is still the draft.
+    ///
+    /// Not vacuous, and specifically not green today: the paste half alone is
+    /// satisfied by `Ctrl+O` not existing, so the same byte is fed again
+    /// **outside** the paste in the same read, where it must open the
+    /// overlay. A filter that recognised `Ctrl+O` everywhere fails the first
+    /// assertion; one that recognised it nowhere fails the second.
+    #[test]
+    fn ctrl_o_is_not_a_key_inside_a_bracketed_paste() {
+        let pasted = script(&[b"\x1b[200~", b"a", CTRL_O, b"b", b"\x1b[201~"]);
+        let (outcome, frames) = read_bytes(&pasted);
+        assert_ne!(
+            outcome,
+            InlineRead::OpenTranscript("ab".to_string()),
+            "a pasted Ctrl+O must not open the overlay"
+        );
+        assert_eq!(
+            frames.last(),
+            Some(&("ab".to_string(), 2)),
+            "and the paste is still the paste it was"
+        );
+
+        let then_typed = script(&[b"\x1b[200~", b"a", CTRL_O, b"b", b"\x1b[201~", CTRL_O]);
+        let (outcome, _) = read_bytes(&then_typed);
+        assert_eq!(
+            outcome,
+            InlineRead::OpenTranscript("ab".to_string()),
+            "the same byte after the paste ends is the key again, carrying \
+             the pasted draft"
+        );
     }
 
     /// **Test: the four presses reach the sink, and none of them touches the

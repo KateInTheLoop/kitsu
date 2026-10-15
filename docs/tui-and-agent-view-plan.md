@@ -356,8 +356,8 @@ fixtures byte-identical in classic/plain/JSONL; both profiles; `cargo test
 | Story | Deliverable | First card | Files | Acceptance / req |
 |---|---|---|---|---|
 | T4-S1 | Pure model in `kitsu-tui`: `AgentRow`/`AgentGroup` plain structs, grouping, ordering, filter grammar; `tui_bridge.rs` maps `AgentThreadSnapshotDto` → `AgentRow` | Failing table-driven grouping test | `kitsu-tui/src/agents_view.rs`, `tui_bridge.rs` | (A2, A3 filter) |
-| T4-S2 | Overlay: list, `↑/↓`, `?`, `Esc`; opened by `Ctrl+X a`, `/jobs view` (TUI mode), `←`-twice on empty composer (config); `←` never consumes a draft; `↑` recall untouched | Failing PTY open/close test | `overlay/agents.rs`, `tui_bridge.rs` | (A1) |
-| T4-S3 | Peek (`Space`): redacted timeline, pending request, result; viewing acknowledges via `peek_result` + `acknowledge_result` | Failing test: **a peeked result is not surfaced at exit, an unviewed one still is** — *amended in T4-S3: the original read "unviewed failed agent still refuses", but nothing refuses `/quit` for a finished agent; only `Running`/`Blocked` block it, and unviewed results are **surfaced** at exit, not refused (**F64**)* | `overlay/agents.rs` | (A4, A7) |
+| T4-S2 | Overlay: list, `↑/↓`, `?`, `Esc`; opened by `Ctrl+X a`, `/jobs view` (TUI mode), `←`-twice on empty composer (config); `←` never consumes a draft; `↑` recall untouched | Failing PTY open/close test | `agents_view.rs`, `tui_bridge.rs` | (A1) |
+| T4-S3 | Peek (`Space`): redacted timeline, pending request, result; viewing acknowledges via `peek_result` + `acknowledge_result` | Failing test: **a peeked result is not surfaced at exit, an unviewed one still is** — *amended in T4-S3: the original read "unviewed failed agent still refuses", but nothing refuses `/quit` for a finished agent; only `Running`/`Blocked` block it, and unviewed results are **surfaced** at exit, not refused (**F64**)* | `agents_view.rs` | (A4, A7) |
 | T4-S4 | Keys → registry calls: `r` reply, `s` steer, `x` stop/prune, `n` rename (new `AgentRegistry::rename`), `p` acknowledge | Failing outcome tests | `subagent.rs`, overlay | (A3) |
 | T4-S5 | `tail_timeline(id) -> broadcast::Receiver` (cap 256; lag → "n skipped") | Failing lag test | `subagent.rs`, `thread.rs` | Timeline bounds unchanged |
 | T4-S6a | Attachment and the keys that enter and leave it: `Enter`/`→`, `←`, `Ctrl+X d`, `/detach`; **rejected once for F75** (the attachment had no reader) and reworked with a carrier out of the overlay | done | this commit |
@@ -371,7 +371,11 @@ fixtures byte-identical in classic/plain/JSONL; both profiles; `cargo test
 | T4-S7 | Dispatch from the agent view with `+` (`task` or `@profile task`), admitted by `AgentRegistryLimits`, **not** `SpawnBudget` — the view's **fourth** edited line | done, this commit | `main.rs`, `kitsu-tui/src/agents_view.rs`, `subagent.rs` — *corrected in T4-S7: the row named `tui_bridge.rs`, which is the **inline** composer and is untouched here; T4-S6b is the card that lands there* | (A6) |
 | T4-S8 | Ambient counter ≤ 250 ms in TUI — **A8 was violated at the idle composer**, now driven by `registry.subscribe()`; **F81** | done, this commit | `main.rs`, `tui_bridge.rs` — *corrected: `status.rs` holds no timing, and no "paused clock" exists to pause* | (A8) |
 | **F81 residual** | Mid-turn the approval arm `continue`s before the counts are re-pulled, so the counter freezes while an approval modal is up | **not started** — adjacent to **F54** | — |
-| T4-S9 | Transcript overlay (`Ctrl+O`): scroll, `/`, `n/N`, `{ }`, `v`, `q` over the cell ring | Failing search/jump unit test | `overlay/transcript.rs` | (R6) |
+| ~~T4-S9~~ | **Split four ways at R6-a's review** into the rows below: eight bindings over one surface was one card only on paper, and measuring the ring found a third of it unbuildable. `T5-S3` is folded into **R6-d** | superseded | — | (R6) |
+| R6-a | **The overlay exists, scrolls the ring and closes.** `Ctrl+O` from inline *and* fullscreen, `FullscreenView` reused **by composition** (one anchor implementation, two instances — the overlay's position and the frame behind it are different facts), footer row taken **out of** the window, `q`/`Esc` close replaying the draft. Keys advertised **in situ by the footer**, no third table | done, this commit (**rejected twice**: F105, F106) | `transcript.rs` (new, flat; no `overlay/` dir exists), `tui_bridge.rs`, `main.rs` | (R6, §4.7) |
+| R6-b | `/` search, `n`/`N` over `CellLine::plain()`. Needs **one additive method on `FullscreenView`** — `Anchor::Pinned { top }` is private and `page()` takes only the four presses, so "jump to the match" has no way in; a `reveal(ordinal)` is a **twelfth transition** on that module's eleven-row table and the table must grow with it | Failing search unit test | `transcript.rs`, `fullscreen.rs` | (R6) |
+| R6-c | `{`/`}` prompt jumps — **BLOCKED, and not on overlay work (F102).** `CellLine` carries only `fd` + `styled`, and the user's submitted line is painted by the composer then **erased**, so **the ring holds no prompts at all**. N4 makes the ring the sole source, so this needs the *feed* to mark prompt boundaries. Inferring prompts from `Fd` is refused: `Stderr` is tools, not the user | — (none writable without a fixture that lies) | the feed (T5-S1b's surface) | (R6, amended) |
+| R6-d | The two hand-offs, `[` and `v` — together because both are **terminal-state hand-offs**, a different gate in kind from a/b/c. `[`'s "fullscreen only" is a **description, nearly a contradiction (F103)**: bytes written under `ESC[?1049h` are discarded on `ESC[?1049l`, so the dump must leave the alternate screen first. `v` spawns a child over a terminal held in raw mode — F94/F96/F98's family, with *more than one* path out of "editor running" (non-zero exit, exec failure, `SIGTSTP` from inside it, a signal to kitsu while the child owns the screen). `$EDITOR` is read nowhere in the tree today | Failing equality + ordering tests | `transcript.rs`, `main.rs` | (R6) |
 | T4-S10 | One bindings table in `kitsu-tui/src/keys.rs`, rendered by both the overlay help and `/help keys`; the guard is a **total keyboard sweep**, which found `q`, `Enter` and `→` dispatched and advertised nowhere | done, this commit | `kitsu-tui/src/keys.rs`, `agents_view.rs`, `main.rs`, `docs/` | (§4.7) |
 
 **Exit gate:** fake-provider integration (two agents, one blocks, view shows
@@ -394,7 +398,7 @@ profiles.
 | **F94 + F96 fixed** | The dying handler gives the alternate screen back **when held** (gated, not unconditional — the unconditional form was refused by measurement), for **both** the agent view (open since T4-S2) and fullscreen; the panic hook covers both; and a **fullscreen-start session now installs a handler at all**, with a termios fallback for the case where nothing in the process holds a snapshot | done, this commit | `tui_bridge.rs`, `main.rs`, `kitsu-tui/src/lib.rs` | (N5) |
 | ~~T5-S1c~~ | The alternate screen — *this row claimed `TuiRuntime::enter`/`leave` "already do the alt-screen, title and raw-mode lifecycle". **That was false** (**F91**): `enter` writes the title push, the OSC title and raw mode, and **never** `ESC[?1049h`. The switch writes the screen itself (**F93**: routing through `TuiRuntime` would also enable crossterm's raw mode, clearing `OPOST` and staircasing several hundred direct writers). Folded into T5-S2's card* | superseded | — | (N5) |
 | ~~T5-S1~~ | *Superseded by T5-S1a/b/c. Its acceptance said "failing 5 000-line **RSS** test"; an RSS bound would assert a property **F52** leaves open, and the 5 000-push bound test **already existed** in `cells.rs` since T3-S6 (**F85**)* | — | — | — |
-| T5-S3 | `[` dump ring to native scrollback; `v` to `$EDITOR` | Failing equality test | `overlay/transcript.rs` | (R6) |
+| ~~T5-S3~~ | Folded into **R6-d** above — it was always half of one requirement, which is why `v` appeared in this row *and* T4-S9's | superseded | — | (R6) |
 | T5-S4 | Windows Terminal fallback (inline → fullscreen when regions misbehave); `--no-alt-screen` forces inline; Windows liveness in `kitsu agents --json` | Failing decision-function test | `viewport.rs`, `agent_state_file.rs` | (N6, H1) |
 | T5-S5 | Mouse wheel in fullscreen (optional) | — | `fullscreen.rs` | Manual |
 | T5-S6 | `agent_wait(id, until, timeout)` tool; no `SpawnBudget` use | Failing until/timeout tests | `subagent.rs` | (H5) |
@@ -457,11 +461,11 @@ profiles.
 | Req | Stories |
 |---|---|
 | R1 | T3-S2, T5-S8 |
-| R2 | T3-S9, T5-S2 |
+| R2 | T3-S9, T5-S1b + T5-S2 (merged) |
 | R3 | T0-S4, T0-S5, T3 exit |
 | R4 | T3-S3, T3-S4, T3-S5, T3-S7 |
 | R5 | T3-S5 |
-| R6 | T4-S9, T5-S3 |
+| R6 | R6-a, R6-b, R6-c (blocked, F102), R6-d (~~T4-S9~~, ~~T5-S3~~ superseded) |
 | R7 | T3-S7 |
 | R8 | T3-S8 |
 | A1 | T1-S3 (alias widening), T4-S2 |
