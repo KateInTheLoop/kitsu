@@ -230,6 +230,10 @@ pub(crate) struct StatusSource {
     /// `live_agents_state` applies, and what keeps a 50 ms tick from emitting
     /// twenty identical paints a second into the transcript's stream.
     painted: std::sync::Mutex<Option<String>>,
+    /// When the cadence painter last actually wrote the row, for note
+    /// **N3**'s frame budget. `None` until the first paint, so the first
+    /// frame of a session is never made to wait.
+    last_paint: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 /// The model and meter numbers, pushed at turn boundaries.
@@ -256,6 +260,7 @@ impl StatusSource {
             turn_start: std::sync::Mutex::new(None),
             counts,
             painted: std::sync::Mutex::new(None),
+            last_paint: std::sync::Mutex::new(None),
         })
     }
 
@@ -423,16 +428,48 @@ pub(crate) fn repaint_status_row() {
         return;
     };
     let cols = live::terminal_columns();
-    let row = source.compose(cols);
+    let fields = source.fields();
+    let row = live::compose_status_row(&fields, cols);
+    // The dedupe key. Normally it is the row itself: an unchanged row costs
+    // no bytes (T3-S5b). Under `--reduced-motion` it is the row recomposed
+    // with `elapsed: None`, so a row whose *only* moved segment is the clock
+    // compares equal to the one on screen and no paint follows -- note
+    // **N9**'s "periodic age refresh", suppressed. The queue tag and the
+    // ambient agent tag stay in the key, because they are state and not
+    // animation: freezing them would hide a blocked agent.
+    let key = if kitsu_render::reduced_motion_mode() {
+        let still = live::StatusFields {
+            elapsed: None,
+            ..fields
+        };
+        live::compose_status_row(&still, cols)
+    } else {
+        row.clone()
+    };
     {
         let mut painted = lock(&source.painted);
-        if painted.as_deref() == Some(row.as_str()) {
+        if painted.as_deref() == Some(key.as_str()) {
             return;
         }
-        *painted = Some(row.clone());
+        // Note **N3**'s frame budget, enforced here rather than in a
+        // caller's `sleep`: the row has more than one author now (the
+        // approval modal's teardown paints it too), and the dedupe above
+        // only ever catches a byte-identical row, so field churn alone would
+        // otherwise paint as fast as it is called. Inside the window the
+        // call returns *without* recording the key, so the next call past it
+        // paints whatever the fields say then -- intermediate frames
+        // collapse, the latest one is never lost.
+        if lock(&source.last_paint).is_some_and(|last| last.elapsed() < STATUS_FRAME_INTERVAL) {
+            return;
+        }
+        *painted = Some(key);
     }
+    *lock(&source.last_paint) = Some(std::time::Instant::now());
     viewport.paint(std::slice::from_ref(&row), cols);
 }
+
+/// Note **N3**'s coalescing window: one row paint per 1/60 s.
+const STATUS_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
 
 impl BridgeGuard {
     /// Hand the guard requirement **R5**'s live fields, replacing the fixed
@@ -4686,5 +4723,340 @@ mod tests {
                  nothing is not a restore"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Card **T3-S12**: the status row's frame budget and `--reduced-motion`
+    // (notes **N3** and **N9**).
+    //
+    // **FAILING-FIRST.** Both measurements below were taken on this tree
+    // before a line of them was written, with a throwaway probe in this very
+    // module, and both are reported here as numbers rather than as beliefs
+    // (F43/F47):
+    //
+    // * **Reduced motion is ignored by the painter.** With
+    //   `configure_terminal_modes(false, true, false)` in force, a turn
+    //   running and *nothing changed but the clock*, `repaint_status_row`
+    //   emitted a full row paint one second later:
+    //   `ESC[24;1H ESC[2K example-model-v1 · ■□□□□□□□ 1% · 2s ESC[23;1H`.
+    //   That is N9's "periodic age refresh", still refreshing. The code path
+    //   is `repaint_status_row` -> `StatusSource::compose` ->
+    //   `StatusSource::fields`, whose `elapsed` is
+    //   `turn_start.map(Instant::elapsed)`; nothing between the flag and the
+    //   row consults `reduced_motion`, and the dedupe in `repaint_status_row`
+    //   compares *composed rows*, so a row whose only changed segment is
+    //   elapsed is a changed row.
+    //
+    // * **The 60 fps budget is a property of the caller, not of the
+    //   painter.** `run_live_typeahead` calls the painter on a 50 ms
+    //   `libc::poll` tick (20 fps), and T3-S5b's dedupe suppresses an
+    //   unchanged row, so in production the budget holds. It does **not**
+    //   hold of `repaint_status_row` itself: a loop that changed one
+    //   non-elapsed field (the queue depth) on every call produced **54003
+    //   paints in 209 ms**, about 258 000 fps, because the dedupe only ever
+    //   catches a byte-identical row. N3 asks for coalescing, and coalescing
+    //   that lives in the caller's sleep is coalescing only for as long as
+    //   nobody adds a second caller -- which this epic has already done once
+    //   (the approval modal, T3-S7a, paints the same row through
+    //   `clear_approval_modal`).
+    //
+    // What these tests deliberately do **not** pin:
+    //
+    // * **Synchronized output (`CSI ?2026 h/l`) is deferred**, and
+    //   [`synchronized_output_is_not_emitted_until_a_capability_probe_exists`]
+    //   pins the deferral rather than the feature. Reason: the only in-band
+    //   way to learn whether a terminal implements mode 2026 is DECRQM
+    //   (`CSI ?2026$p`) and then *reading a reply* on stdin -- and stdin here
+    //   is owned by `run_live_typeahead`'s raw-mode poll loop, which is also
+    //   serving approval reads (T3-S7b). A probe that waits for a report it
+    //   may never get is a hang; a probe with a timeout is a sleep on the
+    //   first frame; and emitting the mode unconditionally leaves `?2026h` as
+    //   visible garbage on a terminal that does not know it. Until the
+    //   reader can be asked for a DECRPM reply, the honest state is: do not
+    //   emit it. The row is one line, so tearing is not a live defect.
+    // * The agent and queue tags under reduced motion. They are **state**,
+    //   not animation: `[2 blocked]` appearing is an event the user must act
+    //   on, and N9 names only the spinner, counter flashes and the periodic
+    //   age refresh. Suppressing them would hide a blocked agent, so the
+    //   reduced-motion test's positive control is precisely that a queue-depth
+    //   change still repaints.
+    // ---------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{repaint_status_row, StatusCounts, StatusSource};
+
+    /// Process-wide reduced-motion override, restored on the way out.
+    ///
+    /// `kitsu_render` exposes a setter and no getter, and this binary's only
+    /// other caller of `configure_terminal_modes` is `main` (which never runs
+    /// under `cargo test`), so the value to restore is the documented default:
+    /// every flag off. Tests that use this are `#[serial]` for the same reason
+    /// the surface slot's tests are.
+    struct ReducedMotion;
+
+    impl ReducedMotion {
+        fn on() -> Self {
+            kitsu_render::configure_terminal_modes(false, true, false);
+            Self
+        }
+
+        fn off() {
+            kitsu_render::configure_terminal_modes(false, false, false);
+        }
+    }
+
+    impl Drop for ReducedMotion {
+        fn drop(&mut self) {
+            Self::off();
+        }
+    }
+
+    /// The viewport geometry these tests install over: a 24-row terminal with
+    /// one pinned row, so the row is 24 and the park row is 23.
+    const T3_S12_ROWS: u16 = 24;
+    const T3_S12_VIEWPORT_ROWS: u16 = 1;
+
+    /// The prefix `InlineSurface::paint` writes once per painted row --
+    /// absolute position then erase-line -- derived from
+    /// [`expected_status_paint`] rather than retyped, so counting these counts
+    /// frames.
+    fn paint_marker() -> String {
+        let painted = expected_status_paint(T3_S12_ROWS, T3_S12_VIEWPORT_ROWS, "");
+        let park = format!("\x1b[{};1H", T3_S12_ROWS - T3_S12_VIEWPORT_ROWS);
+        painted
+            .strip_suffix(&park)
+            .expect("a one-row paint ends by parking the cursor")
+            .to_string()
+    }
+
+    /// How many row paints `text` contains.
+    fn row_paints(text: &str) -> usize {
+        text.matches(&paint_marker()).count()
+    }
+
+    /// A live status row installed over a 24x1 inline viewport, with a
+    /// turn running and a queue depth the test can move.
+    ///
+    /// Returns the guard, the stderr sink, the source and the queue-depth
+    /// cell. The usage numbers are the PTY suite's own fixture model and a
+    /// realistic window, so the composed row is a real sample.
+    fn live_status_fixture() -> (BridgeGuard, SharedSink, Arc<StatusSource>, Arc<AtomicUsize>) {
+        let (guard, _out, err) = install_inline(T3_S12_ROWS, T3_S12_VIEWPORT_ROWS, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let queued = Arc::new(AtomicUsize::new(0));
+        let cell = queued.clone();
+        let source = StatusSource::new(Box::new(move || StatusCounts {
+            queued: cell.load(Ordering::Relaxed),
+            blocked: 0,
+            running: 0,
+        }));
+        source.set_usage("example-model-v1", 1_000, 100_000);
+        guard.enable_live_status(source.clone());
+        source.begin_turn();
+        (guard, err, source, queued)
+    }
+
+    /// Note **N9**, both halves, in one test because the second is what keeps
+    /// the first from being satisfied by an over-broad fix.
+    ///
+    /// 1. **Under `--reduced-motion` the row does not repaint merely because
+    ///    time passed.** A second and a bit elapses with every field but the
+    ///    clock untouched, and the painter writes **nothing**.
+    /// 2. **It still repaints on a real state change.** The queue depth moves
+    ///    from 0 to 3 and the row is painted, carrying `[3 queued]`. A fix
+    ///    that froze the row outright would hide a blocked agent, which is the
+    ///    opposite of what N9 asks for.
+    ///
+    /// Half 1 is a negative assertion, so the test carries its own control
+    /// (the eight-finding family): with reduced motion **off**, the same
+    /// sleep and the same pair of calls *do* produce a paint, which proves the
+    /// sleep really crosses a one-second boundary and the row really would
+    /// have changed. Without that control, "nothing was emitted" could mean
+    /// nothing was ever wired.
+    #[test]
+    #[serial]
+    fn reduced_motion_suppresses_the_elapsed_tick_but_not_a_state_change() {
+        let _state = GlobalState::capture();
+        let _motion = ReducedMotion::on();
+        let (guard, err, _source, queued) = live_status_fixture();
+
+        // Establish a painted row, then let only the clock move.
+        repaint_status_row();
+        let before = err.text().len();
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        repaint_status_row();
+        let window = err.text()[before..].to_string();
+        assert_eq!(
+            window,
+            "",
+            "under --reduced-motion the row must not repaint because a second \
+             passed (N9's periodic age refresh), got {:?}",
+            window.escape_debug().to_string()
+        );
+
+        // Half 2: a real state change still reaches the screen.
+        let before = err.text().len();
+        queued.store(3, Ordering::Relaxed);
+        repaint_status_row();
+        let window = err.text()[before..].to_string();
+        assert_eq!(
+            row_paints(&window),
+            1,
+            "a queue-depth change is state, not animation, and must still \
+             paint exactly once, got {:?}",
+            window.escape_debug().to_string()
+        );
+        let visible = kitsu_render::sanitize_terminal_text(&window);
+        assert!(
+            visible.contains("[3 queued]"),
+            "and the painted row must carry the new depth, got {visible:?}"
+        );
+        assert!(
+            visible.contains("example-model-v1"),
+            "and still be the status row, got {visible:?}"
+        );
+
+        // The control: the same wait, the same two calls, reduced motion off.
+        ReducedMotion::off();
+        repaint_status_row();
+        let before = err.text().len();
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        repaint_status_row();
+        let window = err.text()[before..].to_string();
+        assert_eq!(
+            row_paints(&window),
+            1,
+            "control: with motion allowed the elapsed tick must paint, so the \
+             assertion above is about the flag and not about dead wiring, got \
+             {:?}",
+            window.escape_debug().to_string()
+        );
+        drop(guard);
+    }
+
+    /// Note **N3**'s frame budget, measured at the painter rather than at its
+    /// caller: **no more than 60 row paints per second**, however often
+    /// `repaint_status_row` is called and however often the fields move.
+    ///
+    /// The budget is computed from the window this loop actually occupied, not
+    /// from a magic number: 60 fps allows `ceil(seconds * 60)` frames, plus
+    /// one for the frame at the window's start, which is owed immediately
+    /// (a rate limiter that made the *first* frame wait would show a stale row
+    /// for 16 ms on every keystroke).
+    ///
+    /// Three positive controls, so neither half can pass vacuously:
+    ///
+    /// * the loop really churned (thousands of calls, every one of them with
+    ///   a different queue depth than the last);
+    /// * at least one frame got through, so the budget is not satisfied by
+    ///   painting nothing;
+    /// * **the last value is not lost.** Coalescing may drop intermediate
+    ///   frames; it may not leave the final state unpainted. After the churn
+    ///   the depth is set once more and the painter is given a tick's worth of
+    ///   wall clock and a further call, after which the screen must carry it.
+    #[test]
+    #[serial]
+    fn status_row_paints_stay_inside_the_sixty_frame_budget() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, _source, queued) = live_status_fixture();
+
+        let before = err.text().len();
+        let start = std::time::Instant::now();
+        let mut calls = 0usize;
+        while start.elapsed() < std::time::Duration::from_millis(250) {
+            // Alternate between two depths: each call composes a row that
+            // differs from the one before, so T3-S5b's byte-identity dedupe
+            // can never be what holds the rate down.
+            queued.store(calls % 2, Ordering::Relaxed);
+            repaint_status_row();
+            calls += 1;
+        }
+        let window_secs = start.elapsed().as_secs_f64();
+        let window = err.text()[before..].to_string();
+        let painted = row_paints(&window);
+        let allowed = (window_secs * 60.0).ceil() as usize + 1;
+
+        assert!(
+            calls > 1_000,
+            "control: the loop must really churn, got {calls} calls in \
+             {window_secs:.3}s"
+        );
+        assert!(
+            painted >= 1,
+            "control: the budget must be met by coalescing, not by painting \
+             nothing -- {calls} calls produced no frame at all"
+        );
+        assert!(
+            painted <= allowed,
+            "N3: {painted} row paints in {window_secs:.3}s exceeds 60 fps \
+             ({allowed} allowed); {calls} calls"
+        );
+
+        // And the last state is not lost to the coalescing.
+        queued.store(7, Ordering::Relaxed);
+        repaint_status_row();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        repaint_status_row();
+        let visible = kitsu_render::sanitize_terminal_text(&err.text());
+        assert!(
+            visible.contains("[7 queued]"),
+            "coalescing may drop intermediate frames but must not leave the \
+             final state unpainted; screen bytes: {:?}",
+            err.text().escape_debug().to_string()
+        );
+        drop(guard);
+    }
+
+    /// Note **N3**'s synchronized-output clause, **deferred on purpose**: no
+    /// paint may emit `CSI ?2026 h` or `l` until something can establish that
+    /// the terminal implements the mode.
+    ///
+    /// This is not a style ban (F41) -- it is the byte-level contract of the
+    /// deferral argued at the top of this block: mode 2026 can only be
+    /// detected by a DECRQM report read from stdin, stdin belongs to the
+    /// type-ahead loop, and a terminal that does not implement the mode shows
+    /// the sequence instead of obeying it. Emitting it blind is the one
+    /// outcome worse than not having it. When a probe exists, the test to
+    /// write is "the mode is emitted *after* a positive DECRPM report and
+    /// never without one", and this test is what that one replaces.
+    ///
+    /// Positive controls: the same stream must contain the viewport's region
+    /// and at least two row paints, so the absence is an absence in a stream
+    /// that was really written.
+    #[test]
+    #[serial]
+    fn synchronized_output_is_not_emitted_until_a_capability_probe_exists() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, _source, queued) = live_status_fixture();
+
+        repaint_status_row();
+        queued.store(2, Ordering::Relaxed);
+        repaint_status_row();
+        let text = err.text();
+
+        assert!(
+            row_paints(&text) >= 2,
+            "control: the session must really have painted rows, got {:?}",
+            text.escape_debug().to_string()
+        );
+        assert!(
+            text.contains(&expected_show(T3_S12_ROWS, T3_S12_VIEWPORT_ROWS)),
+            "control: and really have pinned the viewport, got {:?}",
+            text.escape_debug().to_string()
+        );
+        for mode in ["\x1b[?2026h", "\x1b[?2026l"] {
+            assert_eq!(
+                text.matches(mode).count(),
+                0,
+                "synchronized output is deferred until a capability probe \
+                 exists: {:?} must not be emitted; stream {:?}",
+                mode.escape_debug().to_string(),
+                text.escape_debug().to_string()
+            );
+        }
+        drop(guard);
     }
 }

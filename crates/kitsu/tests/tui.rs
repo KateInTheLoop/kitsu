@@ -5075,3 +5075,169 @@ fn classic_session_that_never_switches_emits_no_viewport_bytes() {
         text.escape_debug()
     );
 }
+
+// -------------------------------------------------------------------------
+// Card **T3-S12**, the risk gate: a PTY session under `--reduced-motion`
+// (notes **N3** and **N9**).
+//
+// What a PTY can and cannot measure here, said plainly (F43/F47): the status
+// row's elapsed segment is `None` between turns, so an **idle** session has
+// no age to refresh and the two tests below cannot measure N9's periodic age
+// refresh at all. That half is pinned where it can be driven --
+// `tui_bridge::tests::reduced_motion_suppresses_the_elapsed_tick_but_not_a_state_change`
+// -- because driving it from a PTY would need a model turn, and this harness's
+// gateway is `https://gateway.invalid` by design.
+//
+// What these two do measure is the rest of the gate: reduced motion still
+// **enters** the viewport (N9: it keeps styled output by definition), the
+// transcript is **never redrawn** (N3's third clause), an idle second costs
+// **zero bytes**, and no synchronized-output mode is emitted.
+// -------------------------------------------------------------------------
+
+/// A styled session with `--reduced-motion` on the command line. The flag is
+/// `global = true` in the CLI, so it rides along after `chat`'s own flags
+/// exactly as `--allow-path` does for the streaming harness.
+fn run_reduced_motion_chat_pty(home: &Path, tui: Option<&str>, script: &[Step]) -> Session {
+    run_styled_chat_pty_core(
+        home,
+        tui,
+        script,
+        Options::default(),
+        &["--reduced-motion".to_string()],
+    )
+}
+
+/// `/help`, then two pauses, then `/quit`.
+///
+/// Two pauses rather than one, and that is the measurement rather than a
+/// nicety: a mark is written after each step, so the bytes between the first
+/// pause's mark and the second's are **exactly** what the child wrote during
+/// the second pause, with no step's input or output mixed in. One pause would
+/// only bound a window that still contained all of `/help`.
+fn help_then_idle_then_quit() -> Vec<Step> {
+    vec![
+        send("/help for commands", "/help\n"),
+        pause("/help <command> explains one command in detail", 300),
+        pause("/help <command> explains one command in detail", 1_200),
+        send("/help <command> explains one command in detail", "/quit\n"),
+    ]
+}
+
+/// Notes **N3** and **N9** on a real terminal: inline mode under
+/// `--reduced-motion` pins its viewport, prints its transcript once, writes
+/// nothing at all while idle, and emits no synchronized-update mode.
+///
+/// Every assertion is derived from a measurement taken on this tree before the
+/// test was written (a throwaway probe in this file): region `ESC[1;23r` once,
+/// the `/help` footer once, **0 bytes** across a 1 200 ms idle pause, 8
+/// occurrences of the status row's model, and zero `?2026`.
+///
+/// The idle-pause assertion is a negative one, so it carries its controls in
+/// the same test: the session must have pinned a region, must have printed its
+/// transcript, and must have painted the status row at least once -- otherwise
+/// "wrote nothing" would be satisfied by a session that did nothing.
+#[test]
+#[serial]
+fn inline_mode_under_reduced_motion_is_static_and_never_redraws_history() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session =
+        run_reduced_motion_chat_pty(home.path(), Some("inline"), &help_then_idle_then_quit());
+
+    assert!(
+        session.status.success(),
+        "a reduced-motion inline session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+    // N9: reduced motion keeps styled output, so the viewport is entered.
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        1,
+        "--reduced-motion may enter inline mode and must pin the region once; \
+         raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    // N3, third clause: history is written once and never redrawn.
+    assert_eq!(
+        session.raw_count("/help <command> explains one command in detail"),
+        1,
+        "the transcript must be emitted exactly once -- a redraw of history \
+         would repeat it; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    // Control: the pinned row was really painted.
+    assert!(
+        session.raw_count(STATUS_ROW_MODEL) >= 1,
+        "control: the status row must have been painted; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    // N3/N9: an idle second costs nothing. `marks[1]..marks[2]` is the second
+    // pause's window; see `help_then_idle_then_quit`.
+    let during_idle = &session.raw[session.marks[1]..session.marks[2]];
+    assert_eq!(
+        during_idle.len(),
+        0,
+        "1 200 ms of idle must emit no bytes at all, got {:?}",
+        String::from_utf8_lossy(during_idle)
+            .escape_debug()
+            .to_string()
+    );
+    // The synchronized-output deferral, on the wire.
+    for mode in ["\x1b[?2026h", "\x1b[?2026l"] {
+        assert_eq!(
+            session.raw_count(mode),
+            0,
+            "synchronized output is deferred until a capability probe exists, \
+             so {:?} must not reach the terminal; raw:\n{}",
+            mode.escape_debug().to_string(),
+            session.raw_text().escape_debug()
+        );
+    }
+}
+
+/// And classic mode is unaffected by the card: `--reduced-motion` with no
+/// `--tui` flag pins no region, releases none, emits no synchronized-update
+/// mode, and still prints its transcript exactly once.
+///
+/// This is a guard rather than a measurement -- it passes before the feature
+/// exists and can only ever fail afterwards, exactly like
+/// `classic_session_that_never_switches_emits_no_viewport_bytes`, whose shape
+/// it borrows.
+#[test]
+#[serial]
+fn classic_mode_under_reduced_motion_emits_no_viewport_bytes() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_reduced_motion_chat_pty(home.path(), None, &help_then_quit());
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        0,
+        "classic mode pins no region under --reduced-motion; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count("\x1b[r"),
+        0,
+        "and releases none, because there was nothing to release; raw:\n{}",
+        text.escape_debug()
+    );
+    for mode in ["\x1b[?2026h", "\x1b[?2026l"] {
+        assert_eq!(
+            session.raw_count(mode),
+            0,
+            "and emits no synchronized-update mode {:?}; raw:\n{}",
+            mode.escape_debug().to_string(),
+            text.escape_debug()
+        );
+    }
+    // Non-vacuous: this session really did run a transcript.
+    assert_eq!(
+        session.raw_count("/help <command> explains one command in detail"),
+        1,
+        "the session must have printed its transcript once; raw:\n{}",
+        text.escape_debug()
+    );
+}

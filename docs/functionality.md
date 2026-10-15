@@ -309,6 +309,12 @@ that thread, and any other argument is forwarded verbatim to `/jobs`, so every
 subcommand is reachable through either name.
 
 Background agents run in-process, so nothing outside kitsu can observe them.
+Under `--reduced-motion` the viewport's status row no longer repaints because
+time passed -- the elapsed segment stops ticking -- while the queue and
+background-agent tags keep updating, since those are state changes rather than
+animation. The row is also coalesced to at most 60 repaints per second in the
+painter, so a burst of field changes collapses to the newest value instead of
+one paint each; the newest value is never dropped.
 `/tui [classic|inline]` switches the renderer between turns and keeps the
 conversation: what was printed before the switch stays on screen exactly once,
 and the viewport's live status row returns with it. Bare `/tui` reports the

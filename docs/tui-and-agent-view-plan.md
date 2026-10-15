@@ -148,7 +148,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T3-S8 `Ctrl+L` + restore on SIGINT/SIGTERM/panic; N5 amended (two clauses vacuous); resize pinned, not rebuilt | done | e2654f4 |
 | T3-S9 `/tui classic\|inline` runtime switch; R2 completed; F57 reachability, F58 unsatisfiable test | done | d4d213b |
 | T3-S10 census answered (421, triaged); **`write_block` ring gap fixed**; F17 corrected, N4 limitation list | done | 4d567bf |
-| T3-S11 Windows half measured (renderer crates clean; F59 corrects the premise); **matrix still needs a human** | partial | this commit |
+| T3-S11 Windows half measured (renderer crates clean; F59 corrects the premise); **matrix still needs a human** | partial | 6d22d79 |
+| T3-S12 reduced motion reaches the viewport; 60 fps enforced **in the painter** (was ~109k-400k fps); sync output deferred with reason | done | this commit |
 
 > **`KITSU_TUI` is retired as of T3-S2.** Mentions of it in the T0-T2 rows and
 > requirement text below are **historical** — they record how the preview was

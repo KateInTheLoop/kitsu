@@ -3230,3 +3230,31 @@ fails".
 It is a type-check *plus* every dependency build script, and a build script is
 arbitrary code with arbitrary toolchain needs. A cross-target check is only as
 portable as the least portable build script in the tree.
+
+## F39 fourth occurrence — the shape is now confirmed, with the exact extra lines
+
+T3-S10 recorded the third occurrence and proposed a shape: a byte-identity
+comparison running before a background agent had joined. T3-S12 hit the **same
+test** again under full-workspace load and produced the detail that confirms it.
+
+`test_scripted_and_jsonl_runs_are_byte_identical_under_the_default` failed once
+with the scripted run carrying **`joining them`** and **`joined 1 background
+agent`** lines the JSONL run did not. Under load the detached agent had not
+finished by input end, so one side joined and narrated it while the other had
+already finished.
+
+**So this is no longer a mystery and no longer a product concern.** It is a test
+that compares two runs whose **background-agent lifetimes are not
+synchronised**, and under load their join points diverge. The two unidentified
+earlier occurrences are plausibly the same thing; both were in suites driving
+real child processes.
+
+**It passed alone and the clean full-workspace re-run was 2178/0**, and the
+implementer did not re-run to make it pass — it diagnosed first, which is how
+the detail exists.
+
+**The fix is in the test, and it is now specific:** either join the background
+agent deterministically before comparing, or exclude the join narration from the
+comparison. Worth a small card, and worth checking the other byte-identity tests
+for the same pattern — four occurrences across three cards is frequent enough to
+cost someone an afternoon eventually.

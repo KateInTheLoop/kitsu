@@ -334,7 +334,15 @@ pub fn configure_terminal_modes(plain: bool, reduced_motion: bool, screen_reader
     FORCE_SCREEN_READER.store(screen_reader, Ordering::Relaxed);
 }
 
-fn reduced_motion_mode() -> bool {
+/// Whether animation must be suppressed: the `--reduced-motion` flag or
+/// `KITSU_REDUCED_MOTION`.
+///
+/// Public because the flag has consumers outside this crate: the inline
+/// viewport's status row must not repaint merely because its elapsed segment
+/// ticked (note **N9**'s "periodic age refresh"), and the only process-wide
+/// home of the flag is here. Callers read it; only
+/// [`configure_terminal_modes`] sets it.
+pub fn reduced_motion_mode() -> bool {
     FORCE_REDUCED_MOTION.load(Ordering::Relaxed)
         || std::env::var_os("KITSU_REDUCED_MOTION").is_some()
 }
