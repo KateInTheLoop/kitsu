@@ -1398,6 +1398,51 @@ Attach does not move the agent to the foreground or take its stdin; it is a
   offers the option keys first (`y/a/n`) and free text as a steering message.
 - foreground orchestrator output is buffered (bounded, 64 KiB; overflow noted)
   and replayed with a `⛩ detached from agent N — recap:` milestone on return.
+
+  **T4-S6c settled three things this clause left open, and completes A5.**
+
+  - **The milestone is the recap's *header*, and is suppressed when nothing was
+    buffered.** A detach with an empty buffer paints **nothing at all** — not a
+    bare header. Three reasons: the clause itself makes the milestone the thing
+    the recap is *"replayed with"*; §4.5 separately settles that **the two keys
+    are silent and the command answers**, so a bare milestone on `←`/`Ctrl+X d`
+    would break that silence rule; and a header ending in a colon with nothing
+    under it reads as a bug. The code returns before painting the header, so the
+    naive "header, then lines" shape does not exist.
+  - **The bound is bytes, and deliberately NOT the line-bounded cell ring.**
+    **F52** is the finding that *"N4 said memory and specified lines; a single
+    huge line is still unbounded"*, and the ring has no byte accounting anywhere.
+    A **structural** reason settles it independently: the buffer decorates
+    `Surface`, which lives in `kitsu-render`, while `CellRing` lives in
+    `kitsu-tui` — and **`kitsu-render` does not depend on `kitsu-tui`**, so the
+    ring is unreachable from it however it is bounded. **`cell_ring_lines` still
+    has no reader and F52 stays open** for the overlay and the `[` dump; it is
+    decided only for this buffer.
+  - **Overflow is *marked*, not merely bounded.** The note is the recap's
+    **first** entry and **counts the lines the bound cost**; eviction is
+    oldest-first, so the gap is at the top where the note sits and F52's
+    "silently eats the middle" cannot happen. Pinned at **two** levels, and the
+    painted one is the point (**F71**): *a recap that computed the note and
+    replayed only the survivors would pass every unit test and still show the
+    user an unmarked hole.*
+  - **A clamped styled line is cut on a `char` boundary and ends with a reset** —
+    F52's *second* caution, which a **byte** bound makes real for the first time
+    in this epic. It is `fit_row`'s existing rule. The test caught a prototype
+    that cut on a boundary without resetting, which would have coloured the rest
+    of the session.
+
+  **A fourth way an attachment ends, which no key triggers (F84).** The clause
+  names `←` and `/detach`, and `Ctrl+X d` arrived in T4-S6a — but **re-binding to
+  a different agent through the view ends an attachment with no detach key at
+  all.** The previous agent's recap is replayed **under that agent's own header,
+  before the new agent's attach milestone**, and **order is the assertion**: the
+  other order **attributes one agent's turn to another**. All four transitions
+  call one replay.
+
+  **Attaching never pauses the foreground turn**, and the buffer cannot make it:
+  the bound is held by **evicting**, never by refusing a write; there is no
+  channel to signal "wait" through (`transcript_line` returns `()`); and the
+  displaced surface is never called from any `Surface` method.
 - `Ctrl+C` keeps the existing editor rule: a non-empty draft is cleared; on an
   empty draft it **detaches** (it never stops the agent — stopping is explicit
   via `x` in the view or `/jobs stop`). `Ctrl+Z` keeps its existing meaning
