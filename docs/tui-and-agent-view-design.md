@@ -298,6 +298,30 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
 - **R6** Transcript overlay (`Ctrl+O`): scroll, `/` search, `n`/`N`, `{`/`}`
   prompt jumps, `[` dump the cell ring to native scrollback (fullscreen only),
   `v` open in `$EDITOR`, `q`/`Esc` close.
+
+  **Amended at R6-a's review, twice, after measuring the ring.** Split into four
+  cards (R6-a overlay+scroll+close, R6-b search, R6-c prompt jumps, R6-d the two
+  hand-offs), and **two clauses above are not buildable as written**:
+
+  **`{`/`}` prompt jumps have nothing to jump between (F102).** `CellLine` carries
+  only `fd: Fd` and `styled: String` -- **no role marker** -- and production feeds
+  the ring from exactly two `transcript_line` paths. The user's submitted line is
+  painted by the composer and then **erased**, so it never becomes a transcript
+  line: **the ring holds no prompts at all.** Since **N4** makes the ring the sole
+  source for this overlay, `{`/`}` is unsatisfiable until the *feed* marks prompt
+  boundaries. **R6-c is blocked on that feed change, not on overlay work**, and the
+  honest consequence is wider than the key: **the overlay shows one speaker.**
+  Inferring prompts from `Fd` is refused -- `Stderr` is tools and diagnostics, not
+  the user.
+
+  **`[`'s "fullscreen only" is a description, not a restriction, and nearly a
+  contradiction (F103).** Native scrollback is the one thing the alternate screen
+  does not have: bytes written while `ESC[?1049h` is in effect are discarded by the
+  terminal on `ESC[?1049l`. So a dump performed *while fullscreen holds the screen
+  goes nowhere.* The clause can only mean the key is **offered** only in fullscreen
+  and the dump **leaves the alternate screen first**, or defers to the leave -- which
+  makes `[` a terminal-state hand-off like `v`, not a write, and is why both land in
+  one card.
 - **R7** Approval prompts in TUI modes MUST render as a bottom-pane modal
   with the same `[y] allow once · [a] always (<dir>) · [n] deny` option line
   (command approvals keep their provenance rows) and the same `◉ permission —`

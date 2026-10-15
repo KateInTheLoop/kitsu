@@ -4621,3 +4621,112 @@ then restored it. **So the assertion demonstrably covers the one-line change it 
 It also added an assertion nobody asked for: `!segment.is_following()` after the growth, pinning that **append-while-following is suppressed while pinned** — transition 10's negative, which the view's own table describes and nothing had checked from the production side.
 
 **Three design choices recorded as right:** the **sink** rather than a reader outcome (an outcome ends the read, and re-entry replays the draft as bytes, so paging-by-outcome would jerk the caret to the end on every press and hand each one a fresh editor and a lost reverse-search); **the gate being the sink's presence** rather than a flag — *a surface with nowhere to send a press has no business lifting one out of the stream*; and **matching the full byte string including parameters**, which is the only thing keeping `Ctrl+Home` separable from `Home` given that the editor cannot tell them apart.
+
+## F101 — the plan's "files" column named a directory that never existed, in four rows across three stories, and the one catch never propagated
+
+Nothing checks the plan's file column against the tree, so it drifted into fiction unnoticed:
+
+| Row | Named | Reality |
+|---|---|---|
+| T3-S7 | `kitsu-tui/src/overlay/approval.rs` | **caught at review**, recorded as *"impossible"* — `kitsu-tui` sees only `kitsu-render` and cannot name `PermissionRequest` |
+| T4-S4/S4b | `overlay/agents.rs` | **shipped as `agents_view.rs`** — flat, and never corrected |
+| T4-S9, T5-S3 | `overlay/transcript.rs` | unbuilt; **no `overlay/` directory has ever existed** |
+
+`crates/kitsu-tui/src/` is and always was flat: `agents_view.rs`, `cells.rs`, `composer.rs`, `fullscreen.rs`, `keys.rs`, `lib.rs`, `status.rs`, `viewport.rs`.
+
+### The finding is not the wrong path, it is that finding it once fixed one row
+
+T3-S7's review **did** catch this, in the strongest terms — *"the original row's `kitsu-tui/src/overlay/approval.rs` was **impossible**"* — and wrote the reason into the plan. **Then I shipped the agent view into a differently-named file and left its row saying `overlay/agents.rs`,** and briefed two later cards off rows naming the same fictional directory.
+
+**This is F91's shape from the other direction.** F91 was *a false entry travelling four hops*; this is **a true correction failing to travel at all**. The same cause: a document is corrected where the eye is, and its siblings keep the old claim. Two instances in two cards — the surviving `TuiRuntime::enter` claim in a struck-through row, and this.
+
+**Cheap guard, applied now:** every `` `dir/file.rs` `` in the plan, resolved against `find crates -path`. Two misses, both `overlay/`. It is one command and it had never been run.
+
+**And note which way the error cuts.** A plan that names a file which does not exist invites an implementer to *create* it — so a wrong path does not fail loudly, it **grows a directory the crate's convention does not use.** The agent view escaped only because whoever wrote it ignored the row.
+
+## F102 — the ring holds no prompts, so the transcript overlay would show one speaker
+
+Verified independently. `CellLine` carries **only** `fd: Fd` and `styled: String` — no role or kind marker — and production pushes into a `CellRing` from exactly two `transcript_line` paths (`viewport.rs` for inline, `FullscreenTap` for fullscreen); the remaining `push` sites are test fixtures or `frame_ring` rebuilding a ring from lines it already holds.
+
+**The user's submitted line never becomes a transcript line.** The composer paints it and then `clear_composer` erases it. So the ring contains assistant stream on `Stdout` and tools/diagnostics on `Stderr`, **and nothing the user typed.**
+
+### Why this is a requirement finding and not a card detail
+
+**N4** makes the ring *"the sole source for the transcript overlay and the `[` dump"*. So:
+
+- **`{`/`}` prompt jumps are unsatisfiable** — there are no prompt boundaries to find. R6-c is **blocked on a feed change**, on the surface T5-S1b owns, not on overlay work.
+- **The whole overlay shows half a conversation with one speaker missing.** That is a user-visible surprise, not a docs footnote, and it is **wider than F92 said**: F92 recorded that diagnostics and tool-deferred answers are absent; prompts are absent too, and they are the user's own words.
+- **Inferring prompts from `Fd` is refused.** `Stderr` is tools and diagnostics, not the user. A heuristic here would be a rule whose narrowest input path defeats it (**F70**'s shape).
+
+**The test author declined to write a `{`/`}` test**, on the grounds that the only way to make one pass today is to push a fake `"> prompt"` line in the fixture — *the "true only for its fixture, so it looks like a specification" failure*, which is now the second card running where that rule did work.
+
+## F103 — `[` dumps to the one thing the alternate screen does not have
+
+R6 says `[` dumps the ring *to native scrollback*, **fullscreen only**. Those two clauses are nearly contradictory: **bytes written while `ESC[?1049h` is in effect are discarded by the terminal on `ESC[?1049l`.** A dump performed while fullscreen holds the screen therefore goes **nowhere**.
+
+So "fullscreen only" cannot mean *performed while fullscreen holds the screen*. It can only mean the key is **offered** only there, and the dump **leaves the alternate screen first** or defers to the leave. **That makes `[` a terminal-state hand-off, not a write** — the same kind of thing as `v` spawning `$EDITOR`, which is why grouping them in one card is right rather than merely convenient.
+
+**And `[` is where the ring's gaps stop being a display matter.** A dump into native scrollback *looks* like a transcript the user can scroll back through and trust. With prompts absent (**F102**) and diagnostics absent (**F92**), its output should say what it is.
+
+## F104 — a tenth flake, named: the attach-recap test
+
+`tests::the_recap_holds_only_what_the_foreground_produced_while_attached` (`crates/kitsu/src/main.rs`, `--bins`) failed **once** in a full run and then passed **13 consecutive times**; it passes in isolation, so it is order/parallelism-sensitive — consistent with the **process-global active-surface slot** the recap/attach path reads.
+
+Proved not to belong to the card running at the time: **6 consecutive full `--bins` runs skipping that card's tests were 937/0**, and 8 runs with them were exactly 937 + the card's 2.
+
+This is **F88**'s test under a second, independent sighting, so it is now listed under its own name rather than folded into the earlier count. **Ten open flakes.** T4-S6c introduced the process-global slot this one touches, and two of the ten now point at it — the strongest signal yet that the slot, not the tests, is the defect.
+
+### F101 confirmed by its own guard, twice in one sitting
+
+Having recorded that *a true correction fails to travel*, I restructured R6 into four rows and then deliberately looked for the siblings. Both existed, in the requirement-to-story map at the foot of the plan:
+
+- `| R6 | T4-S9, T5-S3 |` — pointing at **both rows I had just retired**.
+- `| R2 | T3-S9, T5-S2 |` — pointing at a row I **deleted earlier the same session** as a stale duplicate.
+
+So the plan had a dangling reference for hours, created by my own correction, and a second one created minutes after writing the finding that predicts it. **The sweep is now a command and not an intention:** resolve every story reference in the map against the rows that actually exist. Its first run found one more thing — a reference I had just written myself, spelled `T5-S1b+T5-S2` where the row says `T5-S1b + T5-S2`.
+
+**The lesson sharpens.** F101 said a correction does not propagate. The sharper version: **a correction *creates* dangling references, so the act of fixing a document is itself the thing most likely to break its siblings.** Editing is not a safe operation on a cross-referenced document, and the only guard that holds is a reference check that runs after the edit.
+
+## F105 (REJECTION) — `Esc` did not close the overlay, and the sweep that should have caught it tested the wrong thing
+
+R6-a was rejected on a defect the implementer had flagged as a judgement call but described more mildly than it was: *"ESC resolves as close only when nothing follows it in the chunk."* The partial-hold runs **before** the ESC arm, and `KeyFilter::is_partial` is `data.len() < pattern.len() && pattern.starts_with(data)` — so a bare `ESC` is a strict prefix of all four paging sequences:
+
+1. `page_key(b"\x1b")` → `None`
+2. `partial_page_key(b"\x1b")` → **`true`** → `held = [0x1b]`, `break`
+3. the loop returns to `stdin.read(...)` and **blocks**
+
+**`Esc` closed nothing until a second keypress arrived**, and the footer advertised `q/Esc close`. **F75**'s second kind: *a key that appears to work is a defect* — and advertised by the very in-situ footer chosen over a global table.
+
+### Why the test that looked like it covered this did not
+
+`q_and_esc_close_the_overlay_and_no_other_press_does` sweeps the **entire** key space — and it tests `kitsu_tui::transcript::closes(press)`, the predicate in the view crate. **The byte loop that must hand it an `Esc` was never exercised.** A total enumeration of the keyboard, proving the predicate answers `Esc`, while the thing that produces an `Esc` never ran.
+
+**That is F69 verbatim**, and the strongest instance yet: F69's mirror diverged three times; here the test was not a mirror but a different *layer*, which looks even more like coverage. **A sweep over a key space is only as good as the layer it sweeps.**
+
+### The fix, and the proof shape worth copying
+
+The loop was extracted as `run_transcript_key_loop` returning `TranscriptExit { Closed, Drained }` (**F69**'s remedy: the test drives the real decoder), and the lone `ESC` is resolved by **the agent view's own `stdin_waiting(ESC_SEQUENCE_GRACE)`** — the existing function and the existing 50 ms constant, verified defined **once** in the tree. The honest signal for *"lone `ESC` or the first byte of a sequence?"* is time, not a chunk boundary; the chunk boundary is not a signal at all, as the trace shows.
+
+**Bidirectional non-vacuity, which is the thing to copy:**
+- pre-fix decoder restored → the two lone-`ESC` tests fail `left: Drained, right: Closed`
+- `ESC [` skip disabled → the split-arrow test fails `left: Closed, right: Drained`
+
+So one test fails if `Esc` does not close, another fails if an arrow *does*. **Asserting on the exit reason means the defect's own value cannot satisfy either** — the two failure modes are opposite and both are pinned, which a single-direction proof cannot do.
+
+## F106 (second rejection, same card) — the key that opens the overlay was advertised nowhere
+
+Every `Ctrl+O` in the tree was a comment or a test string. **F82** verbatim — its sweep found `q`, `Enter` and `→` dispatched and advertised nowhere, and its lesson was *a rule applied per-change is not a rule enforced*.
+
+**The footer does not cover this**, and the distinction is the finding: the footer advertises the keys live *inside* the overlay, so it is **only visible once the overlay is already open.** An in-situ advertisement cannot advertise its own entrance.
+
+The location needed no new decision, only reading: `agent_view_keys_help` prints *"the agent view's keys (/jobs view, or ctrl+x a):"* and closes with *"the composer's own chords are listed by /help tui."* **So composer chords already had an established home**, and `Ctrl+O` is a composer chord — read by the one inline reader both surfaces use, exactly like the four paging keys T5-S1c-iii put in `/tui`'s `details`. Not `keys::BINDINGS`, which is the agent view's table.
+
+The test restates the footer's own guard on the new string: the details must not contain `search`, `dump`, `editor`, `scrollback` or `jump`, so **the advertisement cannot promise R6-b/c/d either** — the failure mode of the three documents once committed saying `/detach` worked (**F77**).
+
+## F101, third instance — and this one was mine, in the file I had just edited
+
+`docs/functionality.md` still read **"Paging is not wired, so the view shows the newest lines that fit"** — ten lines below the paragraph I added last card describing paging working, in the same file, in the same edit session.
+
+So the count is: a false claim surviving in a struck-through plan row; a fictional directory in four rows with one catch that never travelled; two dangling map references created *by* my corrections; and now **a sentence contradicting its own neighbour because I added the new text instead of searching for what it falsified.**
+
+**The sharpened rule, now applied:** after changing a document, grep it for the claim the change makes false — not just the place the new text goes. Adding is not the same operation as correcting, and I keep performing the first while believing I have done the second.

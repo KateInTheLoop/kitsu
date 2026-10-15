@@ -39,6 +39,20 @@ shapes may change in any minor release.
   reason.
 
 ### Added
+- **A transcript overlay on `Ctrl+O`**, from the inline composer and from
+  fullscreen alike. It opens over the transcript the cell ring retains;
+  `PgUp`/`PgDn` scroll it, `Ctrl+Home`/`Ctrl+End` jump to the oldest retained
+  line and back to the newest, and `q` or `Esc` closes it and leaves the frame
+  behind it exactly where it was. The overlay's keys are listed on its own
+  footer rather than in a global table, since they are live only while it holds
+  the screen; `Ctrl+O` itself is listed by `/help tui`, with the composer's
+  other chords.
+
+  **It shows what the ring holds, which is not everything you saw.** The ring
+  records the streamed conversation, so kitsu's own diagnostics, an answer
+  buffered because tools were offered that round, and -- as of this release --
+  **your own prompts** are absent from it. `/export` remains the route to the
+  full conversation.
 #### Background agents that can ask
 
 - `[agents] blocking = "ask"` lets a background agent **park** when one of its
