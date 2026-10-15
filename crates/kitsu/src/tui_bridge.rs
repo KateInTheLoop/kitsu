@@ -409,6 +409,86 @@ impl FullscreenSegment {
         let _ = self.err.flush();
     }
 
+    /// Paint the composer onto the **bottom row** of the alternate screen,
+    /// at an absolute address and without a line feed.
+    ///
+    /// This is fullscreen's own composer row, and it is the counterpart of
+    /// `BridgeGuard::paint_composer` rather than a second renderer: the row
+    /// itself is composed by `kitsu_render::live::compose_input_row`, the
+    /// same function the inline composer and the classic live row compose
+    /// theirs with, so the three cannot drift in what a draft looks like.
+    ///
+    /// # Why an absolute address and no newline
+    ///
+    /// A fullscreen segment pins no DECSTBM region -- the frame fills the
+    /// screen and the cursor is parked on the one row the frame held back
+    /// (see [`enter_fullscreen`]). So the one thing this paint must never do
+    /// is **scroll**: every row it scrolls off the top is a frame row the
+    /// user loses for good, which is finding **F97**'s second half as
+    /// measured on a pty (a cooked-mode editor's palette cost eleven of
+    /// them, and backspacing did not bring them back). Addressing the bottom
+    /// row, erasing it and writing the row with no trailing `\n` leaves
+    /// every other cell of the screen exactly as the frame left it, so the
+    /// frame survives being typed at by construction rather than by being
+    /// repainted afterwards.
+    ///
+    /// `rows` and `cols` are the caller's geometry probe, taken per paint, so
+    /// a `SIGWINCH` that wakes the reader lands the next row on the new
+    /// bottom row without this type latching a geometry of its own.
+    ///
+    /// The caret is left in the draft, which is what makes the row a composer
+    /// and not a status line: `compose_input_row` returns the column it
+    /// belongs in, windowed with the draft.
+    ///
+    /// The draft arrives as the `LiveDraft` the renderer's own composition
+    /// takes, rather than as its five fields: this method's business is
+    /// *where* the row goes, and the row's content is the shared value type
+    /// the inline composer and the classic live row are already built from.
+    ///
+    /// There is no slash palette on this surface. A palette is several rows
+    /// tall and the only space for it is the frame's, and the frame is what
+    /// this card exists to stop losing; the one-row composer is what the
+    /// alternate screen has room for.
+    pub(crate) fn paint_composer(&mut self, draft: &live::LiveDraft, rows: u16, cols: usize) {
+        if self.left {
+            return;
+        }
+        let (row, caret) = live::compose_input_row(draft, cols);
+        let bottom = rows.max(1);
+        let _ = self
+            .err
+            .write_all(format!("\x1b[{bottom};1H\x1b[2K").as_bytes());
+        let _ = self.err.write_all(row.as_bytes());
+        // Columns are 1-based on the wire; `caret` is a 0-based display
+        // column within the row, and a row with no caret parks at the start.
+        let column = caret.unwrap_or(0).saturating_add(1);
+        let _ = self
+            .err
+            .write_all(format!("\x1b[{bottom};{column}H").as_bytes());
+        let _ = self.err.flush();
+    }
+
+    /// Take the composer row back once the read is over, leaving the cursor at
+    /// the start of it.
+    ///
+    /// The mirror of [`paint_composer`](Self::paint_composer), and the reason
+    /// it exists is the cursor rather than the row: a submitted line is
+    /// followed by the turn's own output, written at wherever the cursor was
+    /// left, and a caret parked in the middle of a drafted row would start
+    /// the transcript there. Erasing the row and homing the column puts the
+    /// screen back exactly as the frame's last `\r\n` left it, which is where
+    /// every writer in this process expects to continue.
+    pub(crate) fn clear_composer(&mut self, rows: u16) {
+        if self.left {
+            return;
+        }
+        let bottom = rows.max(1);
+        let _ = self
+            .err
+            .write_all(format!("\x1b[{bottom};1H\x1b[2K").as_bytes());
+        let _ = self.err.flush();
+    }
+
     /// Give the terminal back: the alternate screen first, then the title.
     ///
     /// Idempotent, and every I/O result is dropped: this is the body of

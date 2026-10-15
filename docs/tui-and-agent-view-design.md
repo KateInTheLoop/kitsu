@@ -1169,6 +1169,21 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   screen and nothing has to restore them. A test asserting their restore would
   pass by construction, which is why none was written.
 
+  **A third registration gap closed in T5-S1c-ii (F98).** The `/tui` switch
+  **into** fullscreen called `enter_fullscreen` and an `eprintln!` **and nothing
+  else** — so the **classic → fullscreen** route left the session holding the
+  alternate screen on the **default signal disposition**. Every existing signal
+  test entered fullscreen by a route that happened to have a handler already
+  (from inline, or by starting in fullscreen per F96), so **the one route nobody
+  had taken was the one with the gap.** There are now **three** registration
+  sites — startup, the inline re-install, and the fullscreen switch — all
+  `Once`-gated, so the later ones are no-ops.
+
+  **The lesson, after three cards each finding one of these:** F94 taught that
+  **exit paths are enumerable**. F98 is the other half — **the paths *into* a
+  state are enumerable too, and a restore installed on entry is only as good as
+  the entries that install it.**
+
   **Status as of F94+F96's card: every clause is met on every exit path, for both
   surfaces that take the alternate screen.** The dying-signal handler now chooses
   between two compile-time-composed constants on one `AtomicBool` load, so it

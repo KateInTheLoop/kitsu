@@ -5844,6 +5844,414 @@ fn tui_two_streamed_turns_paint_each_line_once_without_fullscreen() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Card T5-S1c-ii: fullscreen gets a composer with a key decoder.
+//
+// Finding **F97**, sharpened. T5-S1c-i made the frame follow the ring; the
+// next rough edge is that fullscreen's idle prompt is **rustyline**.
+// `read_idle_chat_line` reaches the inline composer only inside
+// `if let Some(bridge) = bridge` and `install` returns `None` for
+// `TuiMode::Fullscreen` (`tui_bridge.rs`'s `TuiMode::Classic |
+// TuiMode::Fullscreen => return None`), so this surface has no `KeyFilter`,
+// no `RawStdinGuard` and no composer of its own -- and rustyline's
+// `ChatHelper` paints its prompt, its `\u{2570} model ... cwd ... \u{256f}`
+// row and the whole `\u{256d} slash commands \u{256e}` palette straight onto
+// the frame the repaint just wrote.
+//
+// **Measured on this pty before a line of it was written**, so the two tests
+// below assert against the real failure rather than against a reading of it:
+// with the ring 24 lines deep and the frame filling the screen, the switch
+// leaves `FS_ROW_05 ..= FS_ROW_24` on screen and rustyline's deck row already
+// on the bottom row; one `/c` keystroke then scrolls **eleven** of the
+// frame's rows off the top for good (`FS_ROW_16 ..= FS_ROW_24` is all that is
+// left), and taking the draft back out does not bring them back, because
+// nothing on this surface owns the screen.
+//
+// So the pins are:
+//
+// * the deck row rustyline alone can write never reaches the alternate screen
+//   (**F71**: the painted bytes, never a state field), and the frame is
+//   **whole again** once a palette-opening draft has been taken back out --
+//   which is the user-visible point of the card and is deliberately silent
+//   about whether the composer repaints the frame or never scrolls it;
+// * and a draft **grows by keystroke** on that surface, through two separate
+//   reads, so the decoder is something production reaches twice rather than a
+//   capability that merely compiles (**F89**, and **F97**'s own lesson: one
+//   occurrence proves it happened, a second that it keeps happening).
+//
+// `\u{2570} model` is the discriminator between the two composers, and it is
+// one by construction rather than by taste: `composer_status` (`main.rs`) has
+// exactly one caller, `impl Hinter for ChatHelper::hint`, which appends it to
+// **every** hint that helper returns, palette or no palette. The inline
+// composer's `paint_composer` never writes it. So that row on the alternate
+// screen is rustyline reading this surface's keystrokes, and its absence
+// while a draft is nevertheless painted and edited is something else reading
+// them.
+//
+// Not in scope here, deliberately: paging and **F54**. Nothing
+// below sends `0x03` or asserts anything about `ISIG`.
+// ---------------------------------------------------------------------------
+
+/// Rustyline's own composer deck, which only its `ChatHelper` can write.
+///
+/// `composer_status` builds `\u{2570}{ model <model> | cwd <dir> }\u{256f}`
+/// and has one caller, that helper's `hint`, which appends it unconditionally.
+const RUSTYLINE_DECK_ROW: &str = "\u{2570} model";
+
+/// The streamed rows that fill the ring, so the frame fills the screen and
+/// the rows rustyline scrolls away are countable.
+///
+/// Twenty-four lines on a 24-row pty: the entry frame is `rows - 1` of them,
+/// so the frame is screen-sized by construction rather than by arithmetic a
+/// later geometry change could falsify. The prefix is what the tests count,
+/// and it is streamed rather than `eprintln!`ed because only a writer that
+/// goes through the surface seam reaches a ring at all.
+const FS_ROW_PREFIX: &str = "FS_ROW_";
+
+/// One streamed turn that fills the ring with [`FS_ROW_PREFIX`] rows.
+fn one_screenful_turn() -> Vec<Turn> {
+    let mut body = String::new();
+    for row in 1..=24 {
+        body.push_str(&format!("{FS_ROW_PREFIX}{row:02}\n"));
+    }
+    vec![Turn {
+        events: vec![delta(&body), finish("stop")],
+        gap: Duration::from_millis(60),
+    }]
+}
+
+/// How many of the frame's rows are on `screen`.
+fn frame_rows_on(screen: &[String]) -> usize {
+    screen
+        .iter()
+        .filter(|row| row.contains(FS_ROW_PREFIX))
+        .count()
+}
+
+/// Inline -> fullscreen with a screenful in the ring, then **three separate
+/// keystroke steps** at fullscreen's own idle prompt, then out.
+///
+/// The keystrokes are separate steps with a pause after each so they cannot
+/// be coalesced into one `read`: the point of the second one is that the
+/// surface decoded the first and is still decoding, and the point of the
+/// third is that the draft can be taken back *out* again. Every trigger is
+/// already satisfied, which is this file's discipline for a keystroke whose
+/// response is not a unique string -- a composer that paints nothing fails on
+/// an assertion rather than on the driver's deadline.
+///
+/// `/c` is a slash prefix on purpose: it is what makes a palette open, and
+/// the palette is what rustyline scrolls the frame away for. The three
+/// backspaces take the draft back to empty, which closes the palette and is
+/// where the frame must be whole again.
+fn fullscreen_then_a_drafted_and_undrafted_slash_prefix() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "say hello\r"),
+        pause(TURN_DONE_MARKER, 500),
+        send(TURN_DONE_MARKER, "/tui fullscreen\r"),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 500),
+        send(TUI_SWITCHED_TO_FULLSCREEN, "/c"),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 400),
+        send(TUI_SWITCHED_TO_FULLSCREEN, "o"),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 400),
+        send(TUI_SWITCHED_TO_FULLSCREEN, "\x7f\x7f\x7f"),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 400),
+        send(TUI_SWITCHED_TO_FULLSCREEN, "/quit\r"),
+    ]
+}
+
+/// **The frame is not painted over, and rustyline is not what reads this
+/// surface.**
+///
+/// Two assertions on the painted bytes, and neither is the other's
+/// restatement: the deck row says *who* is reading the keystrokes, and the
+/// frame-row count says what the reading *costs the user*. A composer that
+/// painted nothing at all would satisfy the first and fail the second's
+/// companion test below.
+#[test]
+#[serial]
+fn tui_fullscreen_idle_prompt_keeps_rustylines_deck_off_the_frame() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &fullscreen_then_a_drafted_and_undrafted_slash_prefix(),
+        one_screenful_turn(),
+        &["--no-tools".to_string()],
+    );
+    let text = session.raw_text();
+
+    // NON-VACUOUS: one real streamed turn, one switch, and a frame that
+    // really does fill the screen before a key is pressed.
+    assert_eq!(
+        session.bodies.len(),
+        1,
+        "the screenful must have come from the mock and been streamed into \
+         the ring; bodies: {:?}",
+        session.bodies
+    );
+    let entered_at = text.find(ALT_SCREEN_ON).unwrap_or_else(|| {
+        panic!(
+            "the switch must enter the alternate screen; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "exactly once: one switch and no overlay; raw:\n{}",
+        text.escape_debug()
+    );
+    let at_switch = session.screen_at(3);
+    let framed = frame_rows_on(&at_switch);
+    assert!(
+        framed >= 15,
+        "NON-VACUOUS: the frame must fill the screen before anything is \
+         typed, or there is nothing for a keystroke to cost; {framed} frame \
+         row(s) at the switch:\n{}",
+        Session::dump(&at_switch)
+    );
+
+    // F71. The deck row is rustyline's and only rustyline's, so a single
+    // occurrence of it inside the alternate screen is this surface's prompt
+    // being read by a cooked-mode line editor painting over the frame.
+    let on_the_alternate_screen = &text[entered_at..];
+    assert_eq!(
+        on_the_alternate_screen.matches(RUSTYLINE_DECK_ROW).count(),
+        0,
+        "rustyline's `{RUSTYLINE_DECK_ROW} ... cwd ...` row is written by its \
+         `ChatHelper` hint and by nothing else in this binary, so it must \
+         never reach the alternate screen: while fullscreen holds the screen \
+         the keystrokes belong to fullscreen's own composer. Everything from \
+         the alternate screen onwards:\n{}",
+        on_the_alternate_screen.escape_debug()
+    );
+
+    // ...and the frame survives being typed at. Asserted after the draft has
+    // been taken back out, because a palette that is *open* may legitimately
+    // cover frame rows -- what it may not do is cost them permanently.
+    let dismissed = session.screen_at(9);
+    assert!(
+        frame_rows_on(&dismissed) >= framed,
+        "the frame's rows must survive the idle prompt: {framed} were on \
+         screen at the switch and {} after a palette-opening draft was typed \
+         and taken back out. Rustyline scrolls them off the top of the \
+         alternate screen and nothing puts them back (F97). Screen after the \
+         draft was dismissed:\n{}",
+        frame_rows_on(&dismissed),
+        Session::dump(&dismissed)
+    );
+
+    // The ordinary exit path, with raw mode now new state on this surface:
+    // every bracketed-paste enable is matched by a disable, and the pty is
+    // canonical again once the session is gone.
+    assert_eq!(
+        session.raw_count("\x1b[?2004h"),
+        session.raw_count("\x1b[?2004l"),
+        "whatever engaged raw mode on this surface must have let it go: \
+         bracketed paste is enabled by `RawStdinGuard::engage` and disabled \
+         by its `Drop`, so an unbalanced count is a guard that outlived its \
+         read; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "`/quit` must still work from fullscreen's own composer, but the \
+         session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+    assert!(
+        session.raw_mode_off(),
+        "and the pty must be canonical again after a fullscreen session that \
+         held raw mode: {}",
+        session.termios_dump()
+    );
+}
+
+/// **The decoder is reachable, and it keeps being reached.**
+///
+/// The companion to the test above, and the one that refuses the cheap fix to
+/// it: suppressing rustyline's helper in fullscreen would leave the deck row
+/// off the screen and the frame intact while leaving the user unable to type.
+/// So this asserts the draft itself -- painted, grown by a second keystroke
+/// in a second read, and erased again -- and asserts it **below** the frame,
+/// which is what "the composer draws where it belongs" means on a surface
+/// whose rows are all frame.
+///
+/// Three reads rather than one is **F97**'s shape applied to the decoder: one
+/// draft proves a keystroke was decoded, the second proves the surface is
+/// still decoding, and the third proves the decoding is editing rather than
+/// echoing -- a cooked-mode byte stream cannot shrink.
+#[test]
+#[serial]
+fn tui_fullscreen_decodes_each_keystroke_at_its_own_idle_prompt() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &fullscreen_then_a_drafted_and_undrafted_slash_prefix(),
+        one_screenful_turn(),
+        &["--no-tools".to_string()],
+    );
+    let text = session.raw_text();
+    assert_eq!(
+        session.bodies.len(),
+        1,
+        "one streamed turn fills the ring; bodies: {:?}",
+        session.bodies
+    );
+
+    // NON-VACUOUS: the keystrokes were written after the alternate screen was
+    // taken, so what answers them is fullscreen's prompt and not inline's.
+    let entered_at = text
+        .find(ALT_SCREEN_ON)
+        .expect("the switch takes the screen");
+    assert!(
+        entered_at < session.marks[4],
+        "the keystrokes must be typed while fullscreen holds the screen; \
+         raw:\n{}",
+        text.escape_debug()
+    );
+
+    // One keystroke, one decoded draft, painted under the frame.
+    for (step, draft) in [(5usize, "/c"), (7, "/co")] {
+        let screen = session.screen_at(step);
+        let row = screen
+            .iter()
+            .position(|row| row.contains(draft))
+            .unwrap_or_else(|| {
+                panic!(
+                    "fullscreen's own composer must paint the draft {draft:?} \
+                     it decoded: this surface has no `KeyFilter` and no raw \
+                     mode today, so the keystroke reaches a cooked-mode line \
+                     editor instead (F97). Screen:\n{}",
+                    Session::dump(&screen)
+                )
+            });
+        let last_frame_row = screen
+            .iter()
+            .rposition(|row| row.contains(FS_ROW_PREFIX))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the frame must still be on screen while the draft is \
+                     being typed; screen:\n{}",
+                    Session::dump(&screen)
+                )
+            });
+        assert!(
+            row > last_frame_row,
+            "and it must paint it *under* the frame rather than into it: the \
+             draft {draft:?} is on row {} and the frame's last row is {}; \
+             screen:\n{}",
+            row + 1,
+            last_frame_row + 1,
+            Session::dump(&screen)
+        );
+    }
+
+    // And the paint that answered each keystroke is **this surface's**, not a
+    // cooked-mode line editor's: the window a keystroke opens carries the new
+    // draft and none of rustyline's deck. Per keystroke rather than per
+    // session, because what is being pinned here is the decode -- the draft
+    // appearing in the window the keystroke opened is the composer having
+    // read that byte (F89: reached, not merely present).
+    for (from, to, draft) in [(4usize, 5usize, "/c"), (6, 7, "/co")] {
+        let window = session.raw_between(from, to);
+        assert!(
+            window.contains(draft),
+            "the keystroke must be answered by a paint of the draft {draft:?} \
+             in the window it opened; the child wrote:\n{}",
+            window.escape_debug()
+        );
+        assert!(
+            !window.contains(RUSTYLINE_DECK_ROW),
+            "...and that paint must not be rustyline's: `{RUSTYLINE_DECK_ROW} \
+             ... cwd ...` in this window is its `ChatHelper` answering the \
+             keystroke, which is a cooked-mode line editor reading a surface \
+             that has no decoder of its own (F97). The child wrote:\n{}",
+            window.escape_debug()
+        );
+    }
+
+    // ...and the editing is the decoder's, not the terminal's: the draft is
+    // gone from the composer once it has been backspaced out.
+    let dismissed = session.screen_at(9);
+    let composer = dismissed
+        .iter()
+        .rposition(|row| row.contains("kitsu>"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the composer's prompt must still be on screen with the draft \
+                 taken back out; screen:\n{}",
+                Session::dump(&dismissed)
+            )
+        });
+    assert!(
+        !dismissed[composer].contains("/co"),
+        "the backspaces must have been decoded as edits: the composer row \
+         still reads {:?}; screen:\n{}",
+        dismissed[composer],
+        Session::dump(&dismissed)
+    );
+}
+
+/// Classic -> fullscreen, then a `SIGTERM` inside the segment.
+///
+/// The third way into fullscreen, and the one no test had taken: the two
+/// signal scripts in the exit-path section below enter from **inline**
+/// (whose `install` registers the dying handler) or start with
+/// `--tui fullscreen` (whose startup registers it for the mode, card F96).
+/// The `/tui` arm's `TuiRendererRequest::Fullscreen` branch calls
+/// `enter_fullscreen` and `eprintln!` and nothing else -- no
+/// `install_exit_restore` -- so a session that reaches fullscreen this way
+/// holds the alternate screen on the **default** signal disposition.
+///
+/// That is an F94-family hole in its own right, and this card is where it
+/// has to be pinned: raw termios is new state on this surface, so a dying
+/// signal on this path now leaves the user's shell with no echo and no line
+/// editing on top of leaving them on the alternate screen, which is exactly
+/// what F96 recorded for the startup path.
+fn classic_into_fullscreen_then_sigterm() -> Vec<Step> {
+    vec![
+        send("/help for commands", "/tui fullscreen\r"),
+        pause(ALT_SCREEN_ON, SETTLE_MS),
+        signal(ALT_SCREEN_ON, libc::SIGTERM),
+        pause(ALT_SCREEN_ON, SETTLE_MS),
+    ]
+}
+
+/// **The exit path this surface's new terminal state adds a suspect to.**
+///
+/// *When a surface takes new terminal state, every exit path is a suspect,
+/// and exit paths are enumerable.* The enumeration for fullscreen's composer
+/// is: a normal switch away, `/quit`, a dying signal, and a panic. The first
+/// two are asserted on the scripts above and in T5-S2's transition tests; the
+/// panic path runs the chained hook and then unwinds through
+/// `RawStdinGuard::drop` and `FullscreenSegment::drop` (neither profile sets
+/// `panic = "abort"`), and there is no in-process way to provoke one from a
+/// script. **This is the third**, on the one route into fullscreen that
+/// registers no handler at all.
+#[test]
+#[serial]
+fn fullscreen_entered_from_classic_sigterm_restores_termios_and_the_screen() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), None, &classic_into_fullscreen_then_sigterm());
+    assert_alt_screen_released_after_signal(&session, 2, "SIGTERM in fullscreen out of classic");
+    assert!(
+        session.raw_mode_off(),
+        "and the pty must be canonical again: a fullscreen composer holds raw \
+         termios, so a session signalled on this path owes the terminal its \
+         line discipline back as well as its screen, but it reads {}",
+        session.termios_dump()
+    );
+    assert!(
+        !session.status.success(),
+        "a signalled session does not exit successfully; it exited {:?}",
+        session.status
+    );
+}
+
 /// Switch into inline, then **switch again**, then take a `SIGTERM`.
 fn switch_twice_then_sigterm() -> Vec<Step> {
     vec![

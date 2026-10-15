@@ -6201,6 +6201,12 @@ fn read_chat_line(
 fn read_idle_chat_line(
     editor: &mut rustyline::Editor<ChatHelper, rustyline::history::DefaultHistory>,
     bridge: Option<&tui_bridge::BridgeGuard>,
+    // Finding **F97**: the live fullscreen segment, when this session holds
+    // the alternate screen. It is the third reader, and it is `Some` exactly
+    // when `bridge` is `None` for the fullscreen reason -- the two are
+    // mutually exclusive by construction, because every route into one
+    // renderer tears the other down first.
+    fullscreen: Option<&mut tui_bridge::FullscreenSegment>,
     registry: &subagent::AgentRegistry,
     prompt: &str,
     assistive: bool,
@@ -6210,10 +6216,20 @@ fn read_idle_chat_line(
     // the inline reader can open.
     view_dispatcher: Option<&subagent::ViewDispatcher>,
 ) -> ChatReadline {
+    // Assistive and non-TTY carriers keep their existing readers: neither can
+    // be painted into a viewport row or onto a frame's bottom row.
+    let interactive = !assistive && kitsu_render::stdin_is_tty() && kitsu_render::stderr_styled();
+    // Fullscreen first, because a session that holds the alternate screen has
+    // no `BridgeGuard` at all: `install` is inert for the mode, which is what
+    // left this surface on rustyline (finding **F97**).
+    if let Some(segment) = fullscreen {
+        if interactive {
+            let history: Vec<String> = editor.history().iter().cloned().collect();
+            return read_chat_line_fullscreen(segment, prompt, &history, initial);
+        }
+    }
     if let Some(bridge) = bridge {
-        // Assistive and non-TTY carriers keep their existing readers: neither
-        // can be painted into a viewport row.
-        if !assistive && kitsu_render::stdin_is_tty() && kitsu_render::stderr_styled() {
+        if interactive {
             let history: Vec<String> = editor.history().iter().cloned().collect();
             return read_chat_line_inline(
                 bridge,
@@ -6478,6 +6494,203 @@ fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead
             ChatReadline::Interrupted
         }
         Err(error) => ChatReadline::Error(error.to_string()),
+    }
+}
+
+/// The fullscreen renderer's own idle prompt: one line read through
+/// [`tui_bridge::read_line_inline_with_keys`] with the draft painted onto the
+/// bottom row of the alternate screen.
+///
+/// # Why this surface needs a reader at all (finding **F97**)
+///
+/// `tui_bridge::install` is inert in fullscreen -- the mode pins no DECSTBM
+/// region and installs no surface -- so there is no `BridgeGuard` here and
+/// [`read_idle_chat_line`] used to fall through to rustyline. Rustyline runs
+/// in **cooked** mode and its `ChatHelper` paints a prompt, a hint deck and
+/// the whole slash palette as ordinary lines at the cursor, which on a screen
+/// the frame fills means scrolling frame rows off the top: measured on a pty,
+/// a single `/c` cost eleven of them, and backspacing brought none of them
+/// back. So the keystrokes on this surface are read here, by the same editor
+/// and the same key decoder the inline composer uses, and painted by
+/// [`tui_bridge::FullscreenSegment::paint_composer`], which addresses the
+/// bottom row absolutely and never feeds a line.
+///
+/// # What is shared with the inline reader, and what differs
+///
+/// Shared: the whole keystroke-to-draft path. `read_line_inline_with_keys` is
+/// generic over the reader and takes its painter as a closure, it touches no
+/// guard, pane or surface, and raw mode is the caller's -- so the only thing
+/// this function supplies that the inline caller does not is a different
+/// `paint`. History is rustyline's, exactly as it is for inline: the caller
+/// hands over the same list and `add_history_entry` still runs on the
+/// submitted line.
+///
+/// Differs, and deliberately:
+///
+/// * **The key routes are off** ([`tui_bridge::InlineKeys::disabled`]). Both
+///   of them lead to the agent view, which takes the alternate screen this
+///   segment is already holding, and `/jobs` is where that view has an answer
+///   that does not need the screen. With the routes off, the reader's
+///   `OpenAgentView` and `Detached` outcomes cannot arrive on this surface.
+/// * **There is no palette row**, for the reason
+///   `FullscreenSegment::paint_composer` gives: the only rows it could use
+///   are the frame's.
+/// * **`on_resize` paints nothing.** The geometry is probed inside `paint`,
+///   per paint, so the frame that answers a `SIGWINCH` wake is already at the
+///   new size and there is nothing for a resize hook to re-latch -- unlike
+///   the inline reader, whose viewport owns a latched region.
+///
+/// # Raw mode is new terminal state on this surface
+///
+/// `RawStdinGuard::engage` clears `ICANON`, `ECHO` and `ISIG`, publishes the
+/// displaced termios for the dying-signal handler and enables bracketed
+/// paste; its `Drop` puts all three back. The guard lives in an `Option`
+/// owned by this frame for the reason the inline reader's does: every
+/// `return` below drops it, and the suspend path takes it out before the
+/// process stops. A dying signal is the exit path no `Drop` runs on, and it
+/// is covered by `tui_bridge::install_exit_restore`, which every route into
+/// fullscreen now registers.
+#[cfg(unix)]
+fn read_chat_line_fullscreen(
+    segment: &mut tui_bridge::FullscreenSegment,
+    prompt: &str,
+    history: &[String],
+    initial: &str,
+) -> ChatReadline {
+    use std::io::Read as _;
+
+    // Finding F16, exactly as the inline reader installs it: the handler is
+    // process-wide and `Once`-gated, and a `SIGWINCH` is delivered by
+    // interrupting the blocking `read` the reader below sits in.
+    static SIGWINCH: std::sync::Once = std::sync::Once::new();
+    SIGWINCH.call_once(tui_bridge::install_sigwinch_handler);
+
+    let mut carried = initial.to_string();
+    let mut raw: Option<RawStdinGuard> = None;
+    let outcome = loop {
+        if raw.is_none() {
+            match RawStdinGuard::engage() {
+                Some(guard) => raw = Some(guard),
+                None => {
+                    return ChatReadline::Error("failed to switch stdin to raw mode".to_string())
+                }
+            }
+        }
+        let mut input = std::io::Cursor::new(carried.clone().into_bytes()).chain(std::io::stdin());
+        let read = {
+            let mut paint = |draft: &str, cursor: usize, hint: &str, hint_reserved: bool| {
+                // Probed per paint rather than captured: see the resize note
+                // above. The fallback is the conventional 80x24 every other
+                // geometry probe in this binary falls back to.
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                // The renderer's own composition value, so this row and the
+                // inline composer's are told the same things about a draft
+                // (the ordering `read_line_inline_with_keys` documents).
+                let composed = kitsu_render::live::LiveDraft {
+                    prompt: prompt.to_string(),
+                    buffer: draft.to_string(),
+                    cursor,
+                    hint: hint.to_string(),
+                    hint_reserved,
+                };
+                segment.paint_composer(&composed, rows, cols as usize);
+            };
+            let mut on_resize = || {};
+            tui_bridge::read_line_inline_with_keys(
+                &mut input,
+                &mut paint,
+                history,
+                &mut on_resize,
+                tui_bridge::InlineKeys::disabled(),
+                None,
+            )
+        };
+        match read {
+            // Finding F21: the reader is pure, so the suspend is sequenced
+            // here, through the same seam the inline reader uses -- which is
+            // what keeps "termios is canonical before the process stops" one
+            // property with one implementation rather than two.
+            Ok(tui_bridge::InlineRead::Suspended(draft)) => {
+                let (_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                let mut effects = FullscreenSuspendEffects {
+                    segment,
+                    raw: &mut raw,
+                    rows,
+                };
+                if !tui_bridge::suspend_and_resume(&mut effects) {
+                    return ChatReadline::Error(
+                        "failed to switch stdin back to raw mode after a suspend".to_string(),
+                    );
+                }
+                carried = draft;
+                continue;
+            }
+            // Unreachable with both key routes off, and the draft is replayed
+            // rather than dropped because that is what a key which did
+            // nothing owes the user (finding F76's replay, same mechanism).
+            Ok(tui_bridge::InlineRead::OpenAgentView(draft))
+            | Ok(tui_bridge::InlineRead::Detached(draft)) => {
+                carried = draft;
+                continue;
+            }
+            other => break other,
+        }
+    };
+    // The composer row is taken back *before* this returns, and the cursor
+    // homed on it: whatever the submitted line starts -- a turn's streamed
+    // output, a slash command's report -- is written at the cursor, and a
+    // caret left in the middle of a drafted row would start the transcript
+    // there.
+    let (_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    segment.clear_composer(rows);
+    read_chat_line_inline_outcome(outcome)
+}
+
+/// The fullscreen segment's [`tui_bridge::SuspendEffects`]: the composer row
+/// for the screen and this frame's `RawStdinGuard` slot for termios.
+///
+/// The screen halves are small because a fullscreen segment pins no region:
+/// there is nothing latched to release, only a composer row that must not be
+/// left on the screen the shell is about to write on, and the alternate
+/// screen's contents are the terminal's to keep across the stop. The termios
+/// halves are the inline effects' verbatim, because the obligation is: the
+/// shell must not inherit a raw terminal.
+#[cfg(unix)]
+struct FullscreenSuspendEffects<'a> {
+    segment: &'a mut tui_bridge::FullscreenSegment,
+    raw: &'a mut Option<RawStdinGuard>,
+    /// The terminal height as it was probed when the Ctrl+Z arrived.
+    rows: u16,
+}
+
+#[cfg(unix)]
+impl tui_bridge::SuspendEffects for FullscreenSuspendEffects<'_> {
+    fn release_viewport(&mut self) {
+        self.segment.clear_composer(self.rows);
+    }
+
+    fn restore_terminal_modes(&mut self) {
+        // Dropping the guard is the restore, and it must precede the stop.
+        self.raw.take();
+    }
+
+    fn stop_process(&mut self) {
+        // SAFETY: raising a default-disposition job-control signal
+        // in-process, exactly as the inline effects do. Blocks here until the
+        // job is foregrounded again.
+        unsafe {
+            libc::raise(libc::SIGTSTP);
+        }
+    }
+
+    fn reengage_terminal_modes(&mut self) -> bool {
+        *self.raw = RawStdinGuard::engage();
+        self.raw.is_some()
+    }
+
+    fn reinstall_viewport(&mut self) {
+        // Nothing to re-latch, and nothing to paint: the next read repaints
+        // the composer row as its first frame.
     }
 }
 
@@ -20562,6 +20775,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 let read = read_idle_chat_line(
                     &mut rl,
                     tui_bridge_guard.as_ref(),
+                    fullscreen_segment.as_mut(),
                     &agent_registry,
                     &visible_prompt,
                     assistive_input,
@@ -20825,6 +21039,22 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                         cols as usize,
                                         setup.tui.cell_ring_lines,
                                     ));
+                                    // Finding **F94**'s third variant, found
+                                    // by this card: *this* route into
+                                    // fullscreen registered no dying-signal
+                                    // restore at all. The two that did are
+                                    // the inline segment's `install` (a
+                                    // switch out of inline) and the startup
+                                    // block's mode check (`--tui fullscreen`,
+                                    // card **F96**) -- so a session that
+                                    // reached fullscreen out of **classic**
+                                    // held the alternate screen on the
+                                    // default disposition, and now holds raw
+                                    // termios on it too, because this
+                                    // renderer has a composer of its own.
+                                    // `Once`-gated, so this is a no-op in the
+                                    // sessions that already registered it.
+                                    tui_bridge::install_exit_restore();
                                     eprintln!(
                                         "~ switched to the {} renderer; the conversation is unchanged",
                                         request.label()
