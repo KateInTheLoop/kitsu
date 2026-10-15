@@ -3114,10 +3114,150 @@ pub fn command_exec_tool(policy: Arc<CommandPolicy>) -> (ToolDescriptor, Handler
     (descriptor, handler)
 }
 
+/// Git-specific entry point backed by the same exact command approvals and
+/// containment as command_exec. It is registered only with command capability.
+pub fn git_tool(policy: Arc<CommandPolicy>) -> (ToolDescriptor, HandlerFn) {
+    let (mut descriptor, _) = command_exec_tool(policy.clone());
+    descriptor.name = "git".to_string();
+    descriptor.description = "Run a local Git operation through the guarded command runner. \
+        Supply literal arguments after git, for example [\"status\",\"--short\"] or \
+        [\"switch\",\"-c\",\"my-branch\"], and an explicit cwd. Exact argv/cwd approval \
+        and mandatory OS containment apply, including to writes and hooks. No shell \
+        string is parsed and network access is unavailable inside containment."
+        .to_string();
+    let properties = descriptor.parameters["properties"].as_object_mut().unwrap();
+    let mut arguments = properties.remove("argv").unwrap();
+    arguments["description"] =
+        serde_json::json!("Literal Git arguments, excluding the git executable");
+    properties.insert("args".to_string(), arguments);
+    descriptor.parameters["required"] = serde_json::json!(["args", "cwd"]);
+    let handler: HandlerFn = Box::new(move |raw_args: String| {
+        let policy = policy.clone();
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct GitArgs {
+                args: Vec<String>,
+                cwd: String,
+                timeout_ms: Option<u64>,
+            }
+            let args: GitArgs = serde_json::from_str(&raw_args)
+                .map_err(|error| ToolError::InvalidArgs(error.to_string()))?;
+            if args.args.is_empty() {
+                return Err(ToolError::InvalidArgs(
+                    "Git arguments must not be empty".to_string(),
+                ));
+            }
+            let argv = std::iter::once("git".to_string())
+                .chain(args.args)
+                .collect();
+            let output = execute_command(
+                &policy,
+                CommandExecArgs {
+                    argv,
+                    cwd: args.cwd,
+                    timeout_ms: args.timeout_ms,
+                },
+            )
+            .await?;
+            serde_json::to_string(&output)
+                .map_err(|error| ToolError::ExecError(format!("serialize Git result: {error}")))
+        })
+    });
+    (descriptor, handler)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn git_tool_requires_the_same_exact_approval_as_command_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Arc::new(CommandPolicy::new(&[root(&dir)], CommandMode::Deny).unwrap());
+        let (descriptor, handler) = git_tool(policy);
+        assert_eq!(descriptor.name, "git");
+        assert!(descriptor.parameters["properties"].get("args").is_some());
+        assert!(descriptor.parameters["properties"].get("argv").is_none());
+        let error = handler(
+            serde_json::json!({
+                "args": ["switch", "-c", "must-not-exist"],
+                "cwd": dir.path(),
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::PolicyDenied(_)), "{error}");
+        assert!(!dir.path().join(".git").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn git_tool_creates_a_branch_only_after_exact_argv_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Arc::new(CommandPolicy::new(&[root(&dir)], CommandMode::Deny).unwrap());
+        if !matches!(
+            policy.containment_status(),
+            CommandContainmentStatus::Ready(_)
+        ) {
+            eprintln!(
+                "skipping live Git containment: {:?}",
+                policy.containment_status()
+            );
+            return;
+        }
+        let (_, handler) = git_tool(policy.clone());
+        for git_args in [
+            vec!["init", "--quiet"],
+            vec!["switch", "-c", "review-branch"],
+        ] {
+            let argv: Vec<String> = std::iter::once("git")
+                .chain(git_args.iter().copied())
+                .map(str::to_string)
+                .collect();
+            policy.grant_command(&argv, dir.path()).unwrap();
+            let output: CommandOutput = serde_json::from_str(
+                &handler(
+                    serde_json::json!({
+                        "args": git_args, "cwd": dir.path(),
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(output.exit_code, Some(0), "{}", output.stderr);
+        }
+        let head = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        assert_eq!(
+            String::from_utf8(head.stdout).unwrap().trim(),
+            "review-branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_tool_rejects_empty_arguments_and_unknown_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Arc::new(CommandPolicy::new(&[root(&dir)], CommandMode::Deny).unwrap());
+        let (_, handler) = git_tool(policy);
+        for input in [
+            serde_json::json!({"args": [], "cwd": dir.path()}),
+            serde_json::json!({"args": ["status"], "cwd": dir.path(), "shell": "sh"}),
+        ] {
+            assert!(matches!(
+                handler(input.to_string()).await,
+                Err(ToolError::InvalidArgs(_))
+            ));
+        }
+    }
 
     fn root(dir: &tempfile::TempDir) -> String {
         dir.path().to_string_lossy().into_owned()

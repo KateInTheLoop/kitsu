@@ -446,8 +446,8 @@ pub enum Command {
         #[arg(long = "require-write-sha256", value_name = "PATH=SHA256")]
         require_write_sha256: Vec<String>,
 
-        /// Explicitly enable the guarded developer-command tool. Commands have
-        /// an independent approval policy and are never authorized by --yes or
+        /// Explicitly enable the guarded developer-command and Git tools.
+        /// Commands have an independent approval policy, never authorized by --yes or
         /// filesystem grants.
         #[arg(long)]
         enable_commands: bool,

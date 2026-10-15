@@ -18946,3 +18946,46 @@ fn test_agents_rejects_the_global_jsonl_flag_and_names_its_replacement() {
     let facts = jsonl_fixture::inspect_jsonl(&events, 1).expect("inspect the rejection JSONL");
     assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::UserFault);
 }
+
+#[tokio::test]
+#[serial]
+async fn test_streaming_output_cap_prints_the_truncation_marker() {
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+    let server = MockServer::start().await;
+    let delta = serde_json::json!({"choices":[{"index":0,"delta":{"content":"partial streamed answer"},"finish_reason":null}]});
+    let done = serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"length"}]});
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!("data: {delta}\n\ndata: {done}\n\ndata: [DONE]\n\n"),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--max-output-tokens", "12", "-p", "give a long answer"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("partial streamed answer"), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("[truncated: model output length limit reached]")
+            .count(),
+        1,
+        "{stdout}"
+    );
+}
