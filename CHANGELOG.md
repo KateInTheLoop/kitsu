@@ -95,7 +95,10 @@ shapes may change in any minor release.
 - **Attach to a background agent from the agent view.** `Enter` or `→` on the
   selected row attaches and closes the view; the composer prompt then names the
   agent, so you can see what your next line is aimed at. `←` on an empty
-  composer, `Ctrl+X d`, or **`/detach`** returns you to the session. The keys are
+  composer, `Ctrl+X d`, or **`/detach`** returns you to the session. The two keys
+  are not interchangeable: `←` needs an empty composer, while **`Ctrl+X d` works
+  with a line in progress and keeps what you had typed** -- which is the case it
+  exists for, since with text typed `←` is cursor movement. The keys are
   silent, because the prompt label changing back is the answer; `/detach` says
   `detached from agent N; it keeps running`, since a typed command deserves a
   reply and that is the last moment to say that detaching is not stopping.

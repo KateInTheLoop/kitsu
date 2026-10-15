@@ -1438,9 +1438,19 @@ pub(crate) enum InlineRead {
     /// The reader stays pure for [`InlineRead::Suspended`]'s reason: leaving
     /// attachment prints a milestone, replays a recap and re-labels the
     /// composer, none of which belong in a function whose value is being
-    /// testable without a terminal. The draft is **not** carried back, because
-    /// this outcome is only ever reached on an empty one.
-    Detached,
+    /// testable without a terminal.
+    ///
+    /// The draft **is** carried back, exactly as [`InlineRead::Suspended`]
+    /// and [`InlineRead::OpenAgentView`] carry it, and the caller replays it
+    /// into the next read. Finding **F76**: this variant has two routes, and
+    /// only one of them has an empty-composer precondition. `\u{2190}` is
+    /// reached only on an empty draft, so its payload is empty; `Ctrl+X d`
+    /// has no such precondition and exists *because* `\u{2190}` is cursor
+    /// movement once there is text to move over, so detaching with the chord
+    /// must not cost the user the line they typed. The earlier comment here
+    /// -- "only ever reached on an empty one" -- was true of `\u{2190}`
+    /// alone and became wrong when the chord was given the same variant.
+    Detached(String),
 }
 
 /// Read one line from `input` through the shared editor, repainting through
@@ -1632,10 +1642,11 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
                     // a view. The rule is deliberately not gated by
                     // `left_arrow_opens_agents`: A1 scopes that key to the
                     // agent view's route alone, and A5 names this one with no
-                    // condition. The draft is not carried back because this
-                    // arm is only reached on an empty one.
+                    // condition. The carried draft is empty because this arm
+                    // is only reached on an empty one -- which is true here
+                    // and is *not* true of the chord below (finding F76).
                     if attached.is_some() && editor.buffer_string().is_empty() {
-                        return Ok(InlineRead::Detached);
+                        return Ok(InlineRead::Detached(String::new()));
                     }
                     // The composer's emptiness is asked *here*, after every
                     // earlier item in the chunk has been applied, so a
@@ -1674,7 +1685,12 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
                 KeyItem::Detach => {
                     left_presses = 0;
                     if attached.is_some() {
-                        return Ok(InlineRead::Detached);
+                        // Finding **F76**: the chord has no empty-composer
+                        // precondition, so whatever is typed is carried back
+                        // for the loop to replay -- `buffer_string` is the
+                        // draft the next read starts from, exactly as the
+                        // agent-view route below carries it.
+                        return Ok(InlineRead::Detached(editor.buffer_string()));
                     }
                 }
             }
@@ -6108,7 +6124,7 @@ mod tests {
     fn left_arrow_detaches_on_the_first_press_while_attached() {
         assert_eq!(
             read_attached(Chunks::bytewise(LEFT_ARROW), attach_keys(), Some(3)),
-            InlineRead::Detached,
+            InlineRead::Detached(String::new()),
             "A5: `\u{2190}` on an empty composer returns from an attached agent, \
              on the first press"
         );
@@ -6147,7 +6163,7 @@ mod tests {
     fn two_left_arrows_in_one_read_detach_rather_than_opening_the_agent_view() {
         assert_eq!(
             read_attached(Chunks::new([b"\x1b[D\x1b[D"]), attach_keys(), Some(5),),
-            InlineRead::Detached,
+            InlineRead::Detached(String::new()),
             "attached, `\u{2190}\u{2190}` is one detach and no view"
         );
         // NON-VACUOUS: the same two bytes with nothing attached still open the
@@ -6170,7 +6186,7 @@ mod tests {
         };
         assert_eq!(
             read_attached(Chunks::bytewise(LEFT_ARROW), route_off, Some(7)),
-            InlineRead::Detached,
+            InlineRead::Detached(String::new()),
             "A5's return path is not the agent view's route and is not gated \
              by its switch"
         );
@@ -6184,6 +6200,77 @@ mod tests {
             )),
             "acb",
             "with the route off the arrow reaches the editor as before"
+        );
+    }
+
+    /// Finding **F76**: **`Ctrl+X d` with text typed detaches and keeps the
+    /// line.**
+    ///
+    /// `InlineRead::Detached` was a unit variant documented as "only ever
+    /// reached on an empty" composer, which is `\u{2190}`'s precondition and
+    /// not the chord's. The chord exists *because* `\u{2190}` is cursor
+    /// movement once there is something to move over -- so it is the only
+    /// detach route a non-empty draft has, and discarding the draft is the
+    /// one thing it must not do.
+    #[test]
+    fn the_detach_chord_carries_a_non_empty_draft_back() {
+        assert_eq!(
+            read_attached(Chunks::bytewise(b"keep me\x18d"), attach_keys(), Some(3)),
+            InlineRead::Detached("keep me".to_string()),
+            "F76: `Ctrl+X d` with a draft typed detaches and carries the draft"
+        );
+        // The cursor need not be at the end: the chord carries the *draft*,
+        // not the tail after the caret.
+        assert_eq!(
+            read_attached(Chunks::bytewise(b"ab\x1b[D\x18d"), attach_keys(), Some(3)),
+            InlineRead::Detached("ab".to_string()),
+            "the whole draft survives, wherever the caret was left"
+        );
+        // NON-VACUOUS: the payload is the draft and not a constant -- an
+        // empty composer still detaches with an empty one.
+        assert_eq!(
+            read_attached(Chunks::bytewise(b"\x18d"), attach_keys(), Some(3)),
+            InlineRead::Detached(String::new()),
+            "NON-VACUOUS: on an empty composer the chord carries nothing back"
+        );
+        // NON-VACUOUS, the other way: with nothing attached the same bytes
+        // are inert, so this measures the chord and not the typing -- the
+        // draft stays a draft and the drained reader reports EOF.
+        assert_eq!(
+            read_attached(Chunks::bytewise(b"keep me\x18d"), attach_keys(), None),
+            InlineRead::Eof,
+            "NON-VACUOUS: unattached, `Ctrl+X d` detaches nothing"
+        );
+    }
+
+    /// Finding **F76** with **F72**'s caution: a **pasted, multi-byte** draft
+    /// survives the chord too.
+    ///
+    /// The composer is not one of the editor lines that bypass the decoder,
+    /// so a bracketed paste reaches the draft as text (the filter's own test
+    /// above pins that), and the payload must be the same bytes back -- a
+    /// `char`-indexed truncation or a lossy re-encode would show here and
+    /// nowhere else.
+    #[test]
+    fn the_detach_chord_carries_a_pasted_multi_byte_draft_back() {
+        const PASTE: &[u8] = "\x1b[200~caf\u{e9} \u{2014} \u{3088}\x1b[201~".as_bytes();
+        const DRAFT: &str = "caf\u{e9} \u{2014} \u{3088}";
+        assert_eq!(
+            read_attached(Chunks::new([PASTE, b"\x18d"]), attach_keys(), Some(4)),
+            InlineRead::Detached(DRAFT.to_string()),
+            "F76/F72: a pasted multi-byte draft comes back byte for byte"
+        );
+        // NON-VACUOUS: the same paste submitted is the same string, so the
+        // claim above is about the detach payload and not about the paste
+        // having arrived intact.
+        assert_eq!(
+            submitted(&read_attached(
+                Chunks::new([PASTE, b"\r"]),
+                attach_keys(),
+                Some(4),
+            )),
+            DRAFT,
+            "NON-VACUOUS: the paste itself reaches the draft intact"
         );
     }
 

@@ -6393,9 +6393,8 @@ fn read_chat_line_inline(
         // `\u{2190}` route goes back to the agent view's two-press arm. The
         // `\u{26E9}` milestone and the recap are **not** this card's (design
         // \u{00a7}4.5: they land with T4-S6b and T4-S6c).
-        if let Ok(tui_bridge::InlineRead::Detached) = outcome {
-            *attached = None;
-            carried = String::new();
+        if let Ok(tui_bridge::InlineRead::Detached(draft)) = outcome {
+            carried = apply_inline_detach(attached, draft);
             continue;
         }
         // Finding F21: Ctrl+Z. The reader is pure, so the whole suspend is
@@ -6433,7 +6432,7 @@ fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead
         // Card T4-S6a: handled by the caller's loop too -- detaching clears
         // the session's attachment, which re-labels the composer, and reads
         // again. Unreachable from there, like the two outcomes above it.
-        Ok(tui_bridge::InlineRead::Detached) => ChatReadline::Eof,
+        Ok(tui_bridge::InlineRead::Detached(_)) => ChatReadline::Eof,
         Ok(tui_bridge::InlineRead::Interrupted) => {
             // Deliberately NOT re-raising SIGINT here, unlike the during-turn
             // collector. The collector raises because a turn is in flight and
@@ -8165,6 +8164,24 @@ fn apply_agent_view_exit(exit: &AgentViewExit, attached: &mut Option<u64>) {
     if let Some(id) = exit.attached {
         *attached = Some(id);
     }
+}
+
+/// Perform one detach for the composer loop, and hand back the draft the
+/// next read must replay (finding **F76**).
+///
+/// Clearing the session binding is the whole of the detach -- the next
+/// iteration re-derives the prompt label and the `\u{2190}` route off it --
+/// and the draft is carried because `Ctrl+X d` has no empty-composer
+/// precondition: the chord exists precisely for the case where `\u{2190}` is
+/// cursor movement, so it is the route that can arrive with text typed.
+///
+/// A function rather than two lines in the arm for `apply_agent_view_exit`'s
+/// reason: the loop around it needs a real tty, so this is the only seam a
+/// test can drive, and there is exactly one of it (**F69**).
+#[cfg(unix)]
+fn apply_inline_detach(attached: &mut Option<u64>, draft: String) -> String {
+    *attached = None;
+    draft
 }
 
 /// The `/jobs view` arm's whole half of one agent view run (**F79**).
@@ -33415,14 +33432,18 @@ mod tests {
             BASE,
             "detached, the composer wears the session's own prompt"
         );
-        assert_ne!(
-            one_read(attached, LEFT),
-            tui_bridge::InlineRead::Detached,
+        assert!(
+            !matches!(
+                one_read(attached, LEFT),
+                tui_bridge::InlineRead::Detached(_)
+            ),
             "and `\u{2190}` cannot detach with nothing attached"
         );
-        assert_ne!(
-            one_read(attached, CHORD_D),
-            tui_bridge::InlineRead::Detached,
+        assert!(
+            !matches!(
+                one_read(attached, CHORD_D),
+                tui_bridge::InlineRead::Detached(_)
+            ),
             "nor can `Ctrl+X d`, which is inert and silent there"
         );
 
@@ -33454,13 +33475,13 @@ mod tests {
         );
         assert_eq!(
             one_read(attached, LEFT),
-            tui_bridge::InlineRead::Detached,
+            tui_bridge::InlineRead::Detached(String::new()),
             "A5: `\u{2190}` on an empty composer detaches -- on the FIRST \
              press, before the two-press agent-view route is consulted"
         );
         assert_eq!(
             one_read(attached, CHORD_D),
-            tui_bridge::InlineRead::Detached,
+            tui_bridge::InlineRead::Detached(String::new()),
             "and so does `Ctrl+X d`"
         );
         // A non-empty draft keeps `\u{2190}` as cursor movement, attached or
@@ -33486,6 +33507,109 @@ mod tests {
         // A view that was never shown is the same answer.
         apply_agent_view_exit(&AgentViewExit::declined(), &mut attached);
         assert_eq!(attached, Some(ids[0]));
+    }
+
+    /// Finding **F76**, end to end: **`Ctrl+X d` with a line typed detaches
+    /// and the line reaches the user's next read.**
+    ///
+    /// **FAILING-FIRST.** Both halves are driven through production and in
+    /// production's order -- `read_line_inline_with_keys` for the keystroke,
+    /// then [`apply_inline_detach`], which is the composer loop's detach arm
+    /// -- because **F75** and **F79** were both "the halves each worked".
+    /// The replay is the loop's own: the carried draft re-enters the reader
+    /// ahead of the terminal's bytes, exactly as a suspend's draft does, so
+    /// the next read is where the user sees it.
+    ///
+    /// The loop itself needs a real tty, which is why the arm is a function.
+    #[cfg(unix)]
+    #[test]
+    fn the_detach_chord_detaches_and_its_draft_reaches_the_next_read() {
+        /// One read of the inline composer with the configured keymap, as the
+        /// two tests above drive it.
+        fn one_read(attached: Option<u64>, bytes: &[u8]) -> tui_bridge::InlineRead {
+            let keys = tui_bridge::InlineKeys {
+                prefix: tui_bridge::chord_prefix_byte("ctrl+x"),
+                left_arrow_opens_agents: true,
+            };
+            assert!(keys.prefix.is_some(), "the chord prefix must be bound");
+            let mut input = std::io::Cursor::new(bytes.to_vec());
+            let mut paint = |_: &str, _: usize, _: &str, _: bool| {};
+            tui_bridge::read_line_inline_with_keys(
+                &mut input,
+                &mut paint,
+                &[],
+                &mut || {},
+                keys,
+                attached,
+            )
+            .expect("a cursor cannot fail to read")
+        }
+
+        const BASE: &str = "kitsu> ";
+        let (registry, ids) = registry_with_three_agents();
+        let running_before = registry.snapshot().running;
+        // The session binding, as the composer loop holds it while attached.
+        let mut attached: Option<u64> = Some(ids[0]);
+
+        let outcome = one_read(attached, b"half a line\x18d");
+        let tui_bridge::InlineRead::Detached(draft) = outcome else {
+            panic!("F76: `Ctrl+X d` while attached must detach: {outcome:?}");
+        };
+        // The loop's arm, verbatim: it clears the binding and hands back what
+        // the next read must replay.
+        let carried = apply_inline_detach(&mut attached, draft);
+        assert_eq!(attached, None, "the chord detaches");
+        assert_eq!(
+            tui_bridge::composer_prompt(BASE, attached),
+            BASE,
+            "and the composer goes back to the session's own prompt"
+        );
+        assert_eq!(
+            carried, "half a line",
+            "F76: the draft the user typed is what the loop carries"
+        );
+        // The replay, through the loop's own cursor chain: the carried draft
+        // is fed ahead of the terminal's next bytes, so the user finds the
+        // line still there and submits it.
+        let replayed = one_read(attached, format!("{carried}\r").as_bytes());
+        assert_eq!(
+            replayed,
+            tui_bridge::InlineRead::Submitted("half a line".to_string()),
+            "and the next read starts from it"
+        );
+        // Detaching stops nothing: the agent is still running.
+        assert_eq!(
+            registry.snapshot().running,
+            running_before,
+            "a detach is a routing change and not a cancellation"
+        );
+
+        // NON-VACUOUS: the `\u{2190}` route is unchanged, and its payload is
+        // genuinely empty -- so the assertion above is about the chord's
+        // draft and not about every detach carrying a constant.
+        let mut attached = Some(ids[1]);
+        let outcome = one_read(attached, b"\x1b[D");
+        let tui_bridge::InlineRead::Detached(draft) = outcome else {
+            panic!("A5: `\u{2190}` on an empty composer must detach: {outcome:?}");
+        };
+        let carried = apply_inline_detach(&mut attached, draft);
+        assert_eq!(attached, None, "`\u{2190}` still detaches");
+        assert_eq!(carried, "", "and carries an empty draft, because it is one");
+        // NON-VACUOUS: `\u{2190}` with a draft typed is cursor movement and
+        // not a detach, which is what leaves the chord its reason to exist.
+        let attached = Some(ids[2]);
+        let outcome = one_read(attached, b"ab\x1b[D\r");
+        assert_eq!(
+            outcome,
+            tui_bridge::InlineRead::Submitted("ab".to_string()),
+            "a non-empty draft keeps `\u{2190}` as cursor movement"
+        );
+        assert_eq!(
+            attached,
+            Some(ids[2]),
+            "so the attachment is untouched and the chord is the only route \
+             left for a non-empty draft"
+        );
     }
 
     /// Card **T4-S6-status**, requirement A5 / design §4.5: **the row and the
@@ -33615,7 +33739,7 @@ mod tests {
         // notification exists, so a row holding a copy stays red here.
         assert_eq!(
             one_read(*binding.lock().expect("the binding"), LEFT),
-            tui_bridge::InlineRead::Detached,
+            tui_bridge::InlineRead::Detached(String::new()),
             "A5: `\u{2190}` on an empty composer detaches while attached"
         );
         *binding.lock().expect("the binding") = None;
@@ -33637,7 +33761,7 @@ mod tests {
         assert!(row().contains("attached \u{b7} agent"), "{:?}", row());
         assert_eq!(
             one_read(*binding.lock().expect("the binding"), b"\x18d"),
-            tui_bridge::InlineRead::Detached,
+            tui_bridge::InlineRead::Detached(String::new()),
             "A5: `Ctrl+X d` detaches too"
         );
         *binding.lock().expect("the binding") = None;

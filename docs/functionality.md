@@ -304,7 +304,10 @@ the composer prompt names the agent (`agent 3>`), so the line you are typing has
 a visible destination. `←` on an empty composer detaches on the first press --
 it does not wait for the two-press agent-view chord, and it is not affected by
 `[tui] left_arrow_opens_agents`; with text typed, `←` is still cursor movement.
-`Ctrl+X d` and `/detach` also detach. The two keys are silent, because the
+`Ctrl+X d` and `/detach` also detach. **`Ctrl+X d` works with a line in
+progress and keeps what you typed** -- that is the case it exists for, because
+with text typed `←` is cursor movement rather than a detach, so the chord is the
+only route a half-written line has. The two keys are silent, because the
 prompt label changing back under your caret is the feedback; `/detach` answers
 `detached from agent N; it keeps running` and records
 `{"kind":"detach","agent":N}` for automation, because a submitted line has

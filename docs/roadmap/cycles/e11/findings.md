@@ -3949,3 +3949,21 @@ The implementer found my brief wrong again (the tenth mechanism correction in th
 **Both traps were re-proved by prototype**, a method now used on four cards: a body applying the exit to a *local copy* leaves `shown == true` and still fails on the painted row, and `apply_detach_command` clearing a copy returns `Detached(1)` and still fails. Both prototypes reverted from byte copies.
 
 **No fourth consumer.** `run_agent_view_overlay` has exactly two call sites and `apply_agent_view_exit` exactly two production callers — checked, because F79's lesson is that the list is enumerable.
+
+## F80 — a fourth flake: the approval modal paints nothing in release, once
+
+Seen once by the F76 test author and **captured to its own file** rather than lost:
+`scratchpad/flake-kitsu-render-lib-release-approval_modal.txt`.
+
+`cargo test --release -p kitsu-render --lib` failed three tests together —
+`approval_modal_paints_header_then_details_then_the_option_line`,
+`approval_modal_keeps_every_provenance_row_in_order`,
+`approval_modal_option_line_is_the_shared_composer_byte_for_byte` — all with `left: []` or `left: None`, i.e. **the modal painted nothing at all.**
+
+Three things make the diagnosis likely without chasing it: the three tests fail *together*; the third names **"the shared composer"**; and the failure is *empty output* rather than wrong output. That reads as a **shared global not yet installed** when those tests run — cross-test ordering, not a defect in the modal.
+
+**It appeared during a run concurrent with another `cargo test`**, and seven later release runs plus the debug run were 130/130.
+
+**The concurrency is partly my doing**, and worth recording as a cause rather than a coincidence: earlier in this session I ran suites myself while an agent was running its own, which is the condition under which this appeared. Later briefs now say **do not run suites concurrently**, and the following card's agent ran them one at a time and saw nothing.
+
+So the standing flake list is now four: the two characterised ones, the **unidentified `--test tui`** (twelve runs clean, name never captured), and this. **F39 took eight occurrences to pin because its first two destroyed their own evidence** — this one has its evidence on disk from occurrence one, which is the whole point of the one-file-per-suite rule.
