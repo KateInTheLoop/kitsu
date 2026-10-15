@@ -3616,3 +3616,32 @@ But the model is now a **mirror that no longer reflects**, and the next person t
 ### Also recorded: my sixth brief error (F64's tally)
 
 My brief said an empty correction is the registry's own `Empty` refusal **and not** a key-level guard. `agent_view_steer` **does** have a `correction.trim().is_empty()` guard — it just constructs the registry's own error so the wording is identical. Pre-existing, pinned by a passing test, left alone. The agent checked rather than believing me, which is now the sixth time across five cards.
+
+### F69, sharpened by the refactor — the arm was never even run, and there were three of them
+
+My write-up said the model's *paste-into-the-steer-draft test* now described the model rather than the product. **There is no such test.** The refactoring agent grepped every call site: the paste test drives `n`, the **rename** line, and **no test has ever fed `s`** to the model at all.
+
+So `OverlayTextPrompt::Steer` was not kept alive by an assertion. It was kept alive by **one unexercised arm of a model that looked authoritative and was never executed.** That makes the diagnosis stronger, not weaker: a mirror that cannot fail is bad, and a mirror with arms nobody runs is worse, because reading it is the only way it ever gets used — and reading it is exactly what misleads.
+
+**And there were two further divergences nobody had noticed**, both erased by the extraction and neither asserted:
+
+- inside a text prompt the model **ignored `Backspace`**, where the real loop does `draft.pop()`;
+- inside `r`'s decision read the model **kept the read open on `Esc`**, where the real loop closes it and clears the report.
+
+Three divergences, zero assertions touching any of them. The count is the point: **duplicated behaviour does not drift once and get noticed, it drifts repeatedly and silently**, because nothing in the design is watching.
+
+### The structural fix, and the gap it exposed
+
+The loop's input dispatch is now one function, `handle_overlay_input`, that both the loop and the tests call; `run_agent_view_overlay` keeps only what needs a terminal (alternate screen, size, painting, `stdin.read`, the two 50 ms graces, and the steer line's raw-byte read with its decoder bypass). Faithfulness was established by **token-comparing the new body against `git show HEAD:…` of the old one** — identical apart from the deleted arm.
+
+**The break-it experiment is the part worth keeping as a method.** Two deliberate one-line breaks in the real dispatch — truncating a paste to its first line, and dropping `n` from the action keys — both produced failures that *would have been invisible before*. A third attempted break did **not** fail anything: making a paste close `r`'s decision read is genuinely unasserted, because the paste test pastes while the frame is the row list and never after an `r`. That gap is **pre-existing**, not a regression, and closing it means adding an assertion — so it is recorded here as a candidate rather than smuggled into a refactor whose contract was that no assertion changes.
+
+**A refactor that claims to remove duplication should be made to prove it**, and breaking the surviving copy is the cheapest proof there is.
+
+## F39 — eighth occurrence, and it is now costing a gate every card
+
+`test_scripted_and_jsonl_runs_are_byte_identical_under_the_default` failed again, in **release** `--test cli` (244 passed, 1 failed), while debug was 245/245 twice. Same signature as the seven before: the two runs' background-agent join points diverge, one narrating `joining them` / `joined 1 background agent` where the other does not. **A test synchronisation defect, not a product one**, and unrelated to the overlay work it interrupted.
+
+Recorded because the pattern has changed character: it is no longer an occasional nuisance but **a red gate on most cards**, which trains the reviewer to wave a failing suite through — exactly the habit F43 and F64 are about. The test-side fix has been "open" for many cards and should be scheduled rather than deferred again.
+
+One process note from this occurrence, reported by the agent rather than hidden: its per-suite output file was **overwritten by the next suite in the same loop**, so it could not name the failing test. F39's own rule is *write full output to a file first and read the file* — the rule needs the second half said out loud: **one file per suite**, or the evidence destroys itself just as surely as a re-run does.
