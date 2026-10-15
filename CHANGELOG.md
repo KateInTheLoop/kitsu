@@ -92,6 +92,12 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- In the agent view, **`Space` peeks** the selected agent: its bounded redacted
+  timeline, the permission it is waiting on if blocked, and its result or failure
+  if finished. Peeking counts as collecting the result, exactly as `/jobs show`
+  does, so a peeked result is not reprinted when you exit — while one you never
+  looked at still is. Peeking a blocked agent collects nothing, and merely
+  opening the view collects nothing.
 - **The agent view opens.** In the inline viewport, `Ctrl+X a`, `/jobs view` (or
   `/agents view`), or pressing **←** twice on an empty composer opens an overlay
   listing your background agents grouped by state — agents needing input first —
