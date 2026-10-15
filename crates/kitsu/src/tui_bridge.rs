@@ -39,6 +39,7 @@
 
 use std::sync::Arc;
 
+use crate::subagent::thread;
 use kitsu_render::live;
 use kitsu_render::surface::{set_surface, Surface};
 use kitsu_tui::viewport::{
@@ -1488,11 +1489,74 @@ impl kitsu_tui::composer::ComposerDecoration for InlineComposerHost {
     }
 }
 
+/// Classify one agent thread into the agent view's A2 group.
+///
+/// This is the **only** mapping from the thread lifecycle onto
+/// [`AgentViewState`]: `Blocked` is the group that needs you, `Done` splits on
+/// whether its handoff is still `Ready` (nobody has looked) and the two
+/// terminal failures stay distinct. The order comes from
+/// [`AgentViewState::order`] and is never restated here.
+// Exercised by this module's tests; T4-S2's overlay is its first
+// non-test caller. Same deliberate `allow` the T2-S3 lifecycle used.
+#[allow(dead_code)]
+pub(crate) fn agent_view_state_of(
+    phase: thread::AgentThreadPhase,
+    handoff: thread::AgentHandoffState,
+) -> kitsu_render::AgentViewState {
+    use kitsu_render::AgentViewState;
+    match phase {
+        thread::AgentThreadPhase::Blocked => AgentViewState::NeedsInput,
+        thread::AgentThreadPhase::Running => AgentViewState::Working,
+        thread::AgentThreadPhase::Done => match handoff {
+            // `Ready` is the one case where a result is still waiting to be
+            // read. `Unavailable` is not an unviewed result: there is nothing
+            // left to observe, so it joins the viewed group.
+            thread::AgentHandoffState::Ready => AgentViewState::DoneUnviewed,
+            thread::AgentHandoffState::Acknowledged | thread::AgentHandoffState::Unavailable => {
+                AgentViewState::DoneViewed
+            }
+        },
+        thread::AgentThreadPhase::Failed => AgentViewState::Failed,
+        thread::AgentThreadPhase::Cancelled => AgentViewState::Cancelled,
+    }
+}
+
+/// Map a validated agent-thread DTO onto one agent-view row (T4-S1).
+///
+/// **What the DTO cannot supply.** `AgentThreadSnapshot` carries no token
+/// counts and no activity label — those live on `AgentTelemetry`, reached
+/// through `AgentProgress`, which the DTO deliberately does not embed. So this
+/// mapping leaves `tokens`, `last_activity` and `last_activity_age` as `None`
+/// rather than inventing a zero, and a caller that has the telemetry fills
+/// them in afterwards.
+// Exercised by this module's tests; T4-S2's overlay is its first
+// non-test caller. Same deliberate `allow` the T2-S3 lifecycle used.
+#[allow(dead_code)]
+pub(crate) fn agent_row_from_thread_dto(
+    dto: &thread::AgentThreadSnapshotDto,
+) -> kitsu_tui::agents_view::AgentRow {
+    let thread = &dto.thread;
+    kitsu_tui::agents_view::AgentRow {
+        state: agent_view_state_of(thread.phase, thread.handoff),
+        id: thread.id,
+        name: thread.name.clone(),
+        task: thread.task.clone(),
+        model: thread.model.clone(),
+        profile: thread.profile.clone(),
+        // Absent, not zero: a zero here would read as "no tokens used" and
+        // "no activity", which is a different claim from "not known here".
+        last_activity: None,
+        last_activity_age: None,
+        tokens: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
+    use crate::subagent::thread;
     use kitsu_render::live;
     use kitsu_render::surface::{active_surface, set_surface, Surface};
     use serial_test::serial;
@@ -5058,5 +5122,272 @@ mod tests {
             );
         }
         drop(guard);
+    }
+
+    // ---- T4-S1: the agent view's pure model, across the crate boundary ----
+
+    /// A valid thread DTO, built from `thread.rs`'s own `blocked_snapshot`
+    /// fixture so its `retained_bytes` accounting is real rather than guessed;
+    /// `validate_default` is asserted below, which proves it.
+    fn thread_dto(
+        phase: thread::AgentThreadPhase,
+        handoff: thread::AgentHandoffState,
+    ) -> thread::AgentThreadSnapshotDto {
+        let terminal = !matches!(
+            phase,
+            thread::AgentThreadPhase::Running | thread::AgentThreadPhase::Blocked
+        );
+        thread::AgentThreadSnapshotDto::from_snapshot(&thread::AgentThreadSnapshot {
+            id: 7,
+            task: "summarize the crate".to_string(),
+            model: "qwen2.5-coder".to_string(),
+            profile: Some("reviewer".to_string()),
+            name: None,
+            phase,
+            waiting_for: None,
+            handoff,
+            elapsed_ms: 12_500,
+            result_bytes: None,
+            // Derived from the phase, not fixed: `validate` requires
+            // `terminal == timeline.closed` and forbids open steering once
+            // terminal, so a fixture with these hard-coded is only a valid DTO
+            // for non-terminal phases. Corrected at review in T4-S1.
+            steering_open: !terminal,
+            pending_steering: 0,
+            timeline: thread::AgentTimelineSnapshot {
+                entries: vec![thread::AgentTimelineEntry {
+                    sequence: 1,
+                    elapsed_ms: 10,
+                    kind: thread::AgentTimelineKind::UserTask,
+                    round: None,
+                    text: "summarize the crate".to_string(),
+                    truncated: false,
+                }],
+                dropped_entries: 0,
+                retained_bytes: 19,
+                closed: terminal,
+            },
+        })
+    }
+
+    /// Every `(phase, handoff)` pair maps onto exactly one A2 group, and the
+    /// viewed/unviewed split is driven by the handoff and nothing else.
+    #[test]
+    fn the_thread_dto_maps_every_phase_and_handoff_pair_to_one_agent_view_state() {
+        use kitsu_render::AgentViewState;
+        use thread::AgentHandoffState::{Acknowledged, Ready, Unavailable};
+        use thread::AgentThreadPhase::{Blocked, Cancelled, Done, Failed, Running};
+
+        let expected: [(
+            thread::AgentThreadPhase,
+            thread::AgentHandoffState,
+            AgentViewState,
+        ); 15] = [
+            (Blocked, Unavailable, AgentViewState::NeedsInput),
+            (Blocked, Ready, AgentViewState::NeedsInput),
+            (Blocked, Acknowledged, AgentViewState::NeedsInput),
+            (Running, Unavailable, AgentViewState::Working),
+            (Running, Ready, AgentViewState::Working),
+            (Running, Acknowledged, AgentViewState::Working),
+            // The split A2 asks for: `Ready` means nobody has looked yet.
+            (Done, Ready, AgentViewState::DoneUnviewed),
+            (Done, Acknowledged, AgentViewState::DoneViewed),
+            // Nothing to observe at all is not an unviewed result.
+            (Done, Unavailable, AgentViewState::DoneViewed),
+            (Failed, Unavailable, AgentViewState::Failed),
+            (Failed, Ready, AgentViewState::Failed),
+            (Failed, Acknowledged, AgentViewState::Failed),
+            (Cancelled, Unavailable, AgentViewState::Cancelled),
+            (Cancelled, Ready, AgentViewState::Cancelled),
+            (Cancelled, Acknowledged, AgentViewState::Cancelled),
+        ];
+
+        let mut checked_dtos = 0_usize;
+        for (phase, handoff, state) in expected {
+            assert_eq!(
+                super::agent_view_state_of(phase, handoff),
+                state,
+                "phase {} + handoff {}",
+                phase.label(),
+                handoff.label()
+            );
+            // The classifier is asserted over all fifteen pairs above, because
+            // it is a total function over two enums and defensive totality is
+            // correct there. The DTO, however, *forbids* seven of them:
+            // `validate` requires `terminal == timeline.closed`, a handoff iff
+            // terminal, and no open steering once terminal. So a non-terminal
+            // phase with a handoff, and a terminal phase with none, are states
+            // the DTO declares unrepresentable -- and an existing test,
+            // `thread::tests::validate_treats_blocked_as_non_terminal`, pins
+            // exactly that ("a blocked thread has no handoff").
+            //
+            // Asserting a fixture is valid for those seven would require
+            // loosening an invariant another test holds. The row mapping is
+            // therefore exercised only over the eight representable pairs,
+            // and the count is asserted below so this guard cannot silently
+            // skip everything. Corrected at review in T4-S1; the implementer
+            // stopped here rather than edit a test or an invariant.
+            let terminal = !matches!(phase, Blocked | Running);
+            let representable = terminal != (handoff == Unavailable);
+            if !representable {
+                continue;
+            }
+            checked_dtos += 1;
+            let dto = thread_dto(phase, handoff);
+            dto.validate_default()
+                .expect("the fixture must be a valid DTO");
+            assert_eq!(
+                super::agent_row_from_thread_dto(&dto).state,
+                state,
+                "the row's state must agree with the classifier"
+            );
+        }
+
+        assert_eq!(
+            checked_dtos, 8,
+            "exactly eight of the fifteen pairs are representable DTOs; a guard \
+             that skipped more would stop exercising the row mapping"
+        );
+
+        // Non-vacuous: all six A2 groups are actually produced by the table.
+        let produced = expected
+            .iter()
+            .map(|(_, _, state)| *state)
+            .collect::<std::collections::HashSet<AgentViewState>>();
+        assert_eq!(produced.len(), 6, "every A2 group must be reachable");
+
+        // And reachable through a *valid* DTO, not merely through the
+        // classifier: the eight representable pairs must still cover all six.
+        let through_dtos = expected
+            .iter()
+            .filter(|(phase, handoff, _)| {
+                let terminal = !matches!(phase, Blocked | Running);
+                terminal != (*handoff == Unavailable)
+            })
+            .map(|(_, _, state)| *state)
+            .collect::<std::collections::HashSet<AgentViewState>>();
+        assert_eq!(
+            through_dtos.len(),
+            6,
+            "every A2 group must be reachable through a DTO the validator accepts"
+        );
+    }
+
+    /// The DTO → row mapping: what the DTO has travels, and what it cannot
+    /// supply stays absent.
+    #[test]
+    fn an_agent_row_from_a_thread_dto_carries_its_fields_and_leaves_telemetry_absent() {
+        let dto = thread_dto(
+            thread::AgentThreadPhase::Running,
+            thread::AgentHandoffState::Unavailable,
+        );
+        dto.validate_default().expect("valid fixture");
+        let row = super::agent_row_from_thread_dto(&dto);
+        assert_eq!(row.id, 7);
+        assert_eq!(row.task, "summarize the crate");
+        assert_eq!(row.model, "qwen2.5-coder");
+        assert_eq!(row.profile.as_deref(), Some("reviewer"));
+        assert_eq!(row.name, None);
+        assert_eq!(
+            row.head(),
+            "summarize the crate",
+            "with no name the head is the task"
+        );
+        // `AgentThreadSnapshot` has no token counts and no activity label, so
+        // the mapping must leave them absent rather than report a zero.
+        assert_eq!(row.tokens, None, "the DTO cannot supply token counts");
+        assert_eq!(row.last_activity, None, "the DTO cannot supply an activity");
+        assert_eq!(row.last_activity_age, None);
+
+        // A named agent's name reaches the row and wins the head.
+        let mut named = dto.thread.clone();
+        named.name = Some("crate-reviewer".to_string());
+        let row = super::agent_row_from_thread_dto(&thread::AgentThreadSnapshotDto::from_snapshot(
+            &named,
+        ));
+        assert_eq!(row.name.as_deref(), Some("crate-reviewer"));
+        assert_eq!(row.head(), "crate-reviewer");
+    }
+
+    /// **Anti-fork (F2/F38/F45/F57).** `/jobs view` and the agent view print
+    /// different words — A2 says "done (unviewed)", the text deck says
+    /// "done, result ready" — but they must not disagree about *which* groups
+    /// exist or *what order* they come in. The headings below are the literal
+    /// `GROUPS` array in `format_jobs_view`; this asserts each one's position
+    /// equals the shared `AgentViewState::rank`.
+    #[test]
+    fn the_jobs_view_group_order_cannot_fork_from_the_shared_agent_view_order() {
+        use crate::subagent::{AgentProgress, AgentProgressStatus, AgentTelemetry};
+        use kitsu_render::AgentViewState;
+
+        // Read from `format_jobs_view`, not invented.
+        const JOBS_VIEW_GROUPS: [&str; 6] = [
+            "needs input",
+            "working",
+            "done, result ready",
+            "done, collected",
+            "failed",
+            "cancelled",
+        ];
+        assert_eq!(
+            JOBS_VIEW_GROUPS.len(),
+            AgentViewState::order().len(),
+            "the two surfaces must have the same number of groups"
+        );
+
+        let progress = |status: AgentProgressStatus| AgentProgress {
+            id: 1,
+            task: "summarize the crate".to_string(),
+            profile: None,
+            status,
+            waiting_for: None,
+            elapsed_ms: 0,
+            result_bytes: None,
+            last_activity_ms_ago: None,
+            telemetry: AgentTelemetry::default(),
+        };
+
+        // Every case `jobs_view_group` can produce, and the A2 group it is.
+        let cases: [(AgentProgressStatus, bool, AgentViewState); 6] = [
+            (
+                AgentProgressStatus::Blocked,
+                true,
+                AgentViewState::NeedsInput,
+            ),
+            (AgentProgressStatus::Running, true, AgentViewState::Working),
+            (
+                AgentProgressStatus::Done,
+                false,
+                AgentViewState::DoneUnviewed,
+            ),
+            (AgentProgressStatus::Done, true, AgentViewState::DoneViewed),
+            (AgentProgressStatus::Failed, true, AgentViewState::Failed),
+            (
+                AgentProgressStatus::Cancelled,
+                true,
+                AgentViewState::Cancelled,
+            ),
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for (status, collected, state) in cases {
+            let heading = crate::jobs_view_group(&progress(status), collected);
+            let position = JOBS_VIEW_GROUPS
+                .iter()
+                .position(|group| *group == heading)
+                .unwrap_or_else(|| panic!("`{heading}` is not one of the known /jobs view groups"));
+            assert_eq!(
+                state.rank(),
+                position,
+                "`{heading}` sits at {position} in /jobs view but ranks {} in the agent view",
+                state.rank()
+            );
+            assert!(seen.insert(heading), "`{heading}` was produced twice");
+        }
+        assert_eq!(
+            seen.len(),
+            JOBS_VIEW_GROUPS.len(),
+            "the table must cover every /jobs view group, or a reorder could hide here"
+        );
     }
 }

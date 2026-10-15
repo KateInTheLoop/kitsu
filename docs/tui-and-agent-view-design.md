@@ -344,10 +344,56 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
 - **A2** Rows MUST be grouped by state in this order: *Needs input*, *Working*,
   *Done (unviewed)*, *Done (viewed)*, *Failed*, *Cancelled*. Each row: state
   label, id, name or task head, model/profile, last activity + age, tokens.
+
+  **Amended in T4-S1 on two points, both found by implementing it.**
+
+  **(a) A row cannot be built from the thread snapshot alone.** Verified: the
+  snapshot carries **neither tokens nor last activity** — those live on the
+  telemetry, reached through `AgentProgress`, which the thread DTO deliberately
+  does not embed. So a row is assembled from the snapshot **plus**
+  `AgentProgress`, and the three fields the snapshot cannot supply are
+  **`Option`, returning `None` rather than a zero**. A zero would be a lie: it
+  reads as "no tokens used" rather than "not known here", and in a view whose
+  job is telling you which agent needs attention, a confident wrong number is
+  worse than an absent one.
+
+  **(b) The order is a single source, and the labels deliberately differ from
+  `/jobs view`'s.** `AgentViewState` in `kitsu-render` owns the order —
+  `rank()` is read *out of* `order()` rather than restated — and it lives in
+  that crate rather than the viewport crate because the existing `DeckState` is
+  there and the new enum is a **refinement** of it (four glyph levels to six
+  groups). `/jobs view` keeps its own wording (`done, result ready` versus this
+  view's `done (unviewed)`); what a test enforces is that both surfaces agree on
+  **which** groups exist and **in what order**, by looking up each of
+  `/jobs view`'s own headings and comparing its index with `rank()`. Empty
+  groups are omitted, matching `/jobs view` — one behaviour, not two.
+
+  "Viewed" versus "unviewed" is the existing `AgentHandoffState`: `Ready` means
+  nobody has looked, `Acknowledged` means somebody has. `Unavailable` on a done
+  thread means there is nothing left to observe and is treated as viewed —
+  though note it is **not a representable DTO** (see **F61**), so that arm is
+  defensive rather than reachable.
 - **A3** Keys: `↑/↓` move, `Enter`/`→` attach, `Space` peek, `s` steer
   (prompt for text), `r` reply (only when blocked), `x` stop (twice to prune),
   `n` rename, `p` mark result acknowledged, `/` filter, `?` help, `Esc`
   close. Filter grammar: `s:<state> n:<text> o:<text> p:<profile>`.
+
+  **The filter grammar was under-specified; T4-S1 decided these four points and
+  pinned each to an exact message.**
+  - **`o:` was never defined here.** It matches the **task/objective**
+    substring, while `n:` matches the **name** — each confined to its own field,
+    asserted in both directions, so a name filter cannot match a task.
+  - **`s:` had no vocabulary.** It is `needs-input`, `working`, `done-unviewed`,
+    `done-viewed`, `failed`, `cancelled`, read back off the states' own wire
+    spellings. `s:done` is an **error listing all six** rather than an alias for
+    both done groups — strict plus discoverable, chosen to minimise invention; a
+    friendlier alias is a defensible amendment.
+  - **A malformed filter is an error, never ignored.** Unknown key, unkeyed bare
+    text, a key with no value, an unknown state, and a repeated key are all
+    rejected by name. The reasoning is specific to this view: a silently dropped
+    term shows the **wrong agents**, and here that means failing to show the one
+    waiting on an answer. Empty input matches everything.
+  - **A repeated key is an error**, not last-wins.
 - **A4** Peek panel MUST show the bounded redacted timeline that `/jobs show`
   shows today, the pending approval request if blocked, and the result if
   done. It MUST never show tool arguments or raw tool output (existing

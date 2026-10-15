@@ -3297,3 +3297,60 @@ one would have been read as passing because adjacent tests with similar names
 do. The lesson is the same one F57 produced from the other direction: **a gate
 is only as real as the test that implements it, and "there is a test about
 this area" is not that test.**
+
+## F61 — F58's second instance: a test unsatisfiable because it contradicted an invariant pinned elsewhere
+
+**F58** recorded an assertion that could never pass, satisfied by changing the
+product. T4-S1 produced the same family in a sharper form, and this time the
+implementer **stopped** instead of resolving it.
+
+The test tabulated all **fifteen** `(phase, handoff)` pairs and, for each,
+asserted both the classifier's answer *and* that a fixture DTO for that pair
+**validates**. But `AgentThreadSnapshotDto::validate` requires
+`terminal == timeline.closed`, a handoff **iff** terminal, and no open steering
+once terminal — so only **eight** of the fifteen are representable at all. And
+an existing, green test, `validate_treats_blocked_as_non_terminal`, pins exactly
+that: *"a blocked thread has no handoff"*.
+
+**So the new test and an existing test made contradictory demands of the same
+function**, and the existing one was in the must-stay-green set. No
+implementation could satisfy both. The implementer diagnosed it precisely,
+named the conflicting test, said the fix belonged in the test rather than the
+invariant, and **stopped** — which is the behaviour the brief asks for and the
+reason this cost one review instead of a loosened invariant.
+
+### The fix, and why it is narrower than shrinking the table
+
+Two different properties were tangled in one loop:
+
+- **the classifier is a total function over two enums**, and asserting all
+  fifteen is *correct* — defensive totality is cheap and right;
+- **the DTO forbids seven of them**, so a fixture cannot be valid for those.
+
+So the classifier assertions stayed at fifteen and only the **fixture validity
+and row mapping** were confined to the eight representable pairs, with the count
+asserted (`checked_dtos == 8`) so the guard cannot silently skip everything, and
+a second assertion that those eight still reach **all six** A2 groups — through
+a DTO the validator accepts, not merely through the classifier.
+
+**The fixture was also wrong independently**: it hard-coded `steering_open: true`
+and `closed: false`, so it was only a valid DTO for non-terminal phases. It now
+derives both from the phase. That is the deeper bug — a fixture that cannot
+represent the states its own test enumerates.
+
+### The lesson, beyond this instance
+
+**An unsatisfiable test has two sources, and the second is worse.** F58's was a
+mental model of the output. This one is a **conflict between two
+specifications**: a new test asserting what an older test forbids. The first is
+caught by deriving expectations from real samples. The second is only caught by
+noticing that the invariant is *already pinned somewhere* — which is why
+"stop and report" must stay available to an implementer, and why forbidding test
+edits is what made the conflict visible instead of silently resolved in the
+product.
+
+The arithmetic also deserves a note: the first estimate of representable pairs
+was **eleven**, by counting only the non-terminal-with-handoff cases and missing
+terminal-without-handoff. The real count is **eight**. A guard built on the wrong
+number would have skipped nothing and still failed; the count assertion is what
+makes the number checkable rather than assumed.

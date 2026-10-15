@@ -34,6 +34,7 @@
 //! activity labels derived from model-driven work, so this is the boundary at
 //! which an escape sequence could otherwise reach the user's terminal.
 
+pub mod agents_view;
 pub mod cells;
 pub mod composer;
 pub mod status;
