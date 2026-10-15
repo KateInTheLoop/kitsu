@@ -397,9 +397,20 @@ fn hex_dump_preview(bytes: &[u8], total_bytes: u64) -> String {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
         let ascii: String = chunk
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
-        out.push_str(&format!("{:08x}  {:<47}  |{}|\n", row * 16, hex.join(" "), ascii));
+        out.push_str(&format!(
+            "{:08x}  {:<47}  |{}|\n",
+            row * 16,
+            hex.join(" "),
+            ascii
+        ));
     }
     if (total_bytes as usize) > shown {
         out.push_str("...[binary preview capped; use commands (if enabled) for deeper analysis]\n");
@@ -6625,9 +6636,7 @@ fn unix_renameat_with_flags(
         RenameMode::Exchange => crate::rename_flags::RENAME_EXCHANGE,
         RenameMode::NoReplace => crate::rename_flags::RENAME_NOREPLACE,
     };
-    unsafe {
-        crate::rename_flags::renameat2(old_dir, old.as_ptr(), new_dir, new.as_ptr(), flags)
-    }
+    unsafe { crate::rename_flags::renameat2(old_dir, old.as_ptr(), new_dir, new.as_ptr(), flags) }
 }
 
 #[cfg(target_vendor = "apple")]

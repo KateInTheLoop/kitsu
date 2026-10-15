@@ -249,6 +249,11 @@ fn run_styled_chat_pty_with(
         .env("HOME", home)
         .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
         .env("KITSU_NO_PROJECT_CONTEXT", "1")
+        // These tests explicitly measure the styled terminal carrier.
+        .env("TERM", "xterm-256color")
+        .env_remove("NO_COLOR")
+        .env_remove("KITSU_PLAIN")
+        .env_remove("KITSU_SCREEN_READER")
         .env_remove("ANTHROPIC_TOKEN_EXPIRES")
         .env_remove("KITSU_GATEWAY")
         .env_remove("KITSU_MODEL")

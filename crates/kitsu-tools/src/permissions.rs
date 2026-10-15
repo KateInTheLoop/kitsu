@@ -1809,9 +1809,15 @@ mod tests {
     #[test]
     fn host_home_prefers_home_then_userprofile_and_skips_empties() {
         let os = |s: &str| Some(std::ffi::OsString::from(s));
-        assert_eq!(host_home_from(os("/home/k"), os("C:\\Users\\k")), os("/home/k"));
+        assert_eq!(
+            host_home_from(os("/home/k"), os("C:\\Users\\k")),
+            os("/home/k")
+        );
         assert_eq!(host_home_from(None, os("C:\\Users\\k")), os("C:\\Users\\k"));
-        assert_eq!(host_home_from(os(""), os("C:\\Users\\k")), os("C:\\Users\\k"));
+        assert_eq!(
+            host_home_from(os(""), os("C:\\Users\\k")),
+            os("C:\\Users\\k")
+        );
         assert_eq!(host_home_from(os(""), os("")), None);
         assert_eq!(host_home_from(None, None), None);
     }
@@ -1862,10 +1868,7 @@ mod tests {
             panic!("a write under a nonexistent parent must be denied");
         };
         assert!(
-            message.contains(&format!(
-                "{}/kitsu-test-no-such-dir-9c1e",
-                home.display()
-            )),
+            message.contains(&format!("{}/kitsu-test-no-such-dir-9c1e", home.display())),
             "denial must show the HOME-expanded path: {message}"
         );
         assert!(
