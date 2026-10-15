@@ -813,6 +813,47 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   per input poll tick while a turn runs, and the idle prompt keeps reporting
   at the next prompt cycle, which is the pre-existing notice behavior.
 
+  **This clause was violated at the TUI idle composer until T4-S8, and the
+  carve-out in its second sentence is why nobody noticed.** That latitude is
+  granted to **`classic`** by its own wording; the TUI idle composer never had
+  it. Yet `sync_agent_counts` and `repaint_status_row` were called from **one
+  loop only** — the *during-a-turn* typeahead — while the idle read blocks with
+  **no timeout**, waking only on a resize and then explicitly retrying *without
+  a frame*. The idle row **does** carry the ambient tag, so **a background agent
+  that blocked while the user sat at the prompt changed nothing on screen until
+  a keystroke.** That is what R5 and the whole T2 blocked-agent surfacing exist
+  to prevent.
+
+  **The argument against it was already in the tree**, which is the part worth
+  remembering. The recorded rationale for having no idle cadence says the idle
+  prompt *"has nothing to tick"* — **true of the elapsed clock, false of the
+  ambient tag** — while the reduced-motion logic states the opposite case
+  exactly: these tags stay visible *"because they are state and not animation:
+  freezing them would hide a blocked agent."* Same reasoning, same segment,
+  applied to reduced motion and not to idle. **A justification true of one
+  segment is not true of the row.**
+
+  **The fix is a subscriber, not a poll.** `registry.subscribe()` wakes a task
+  that repaints the row; the counts are already a pull, so nothing is pushed and
+  the composer stays blocked in `read()`. A read timeout was rejected because
+  `read_line_inline_with_keys` is generic over `R: Read` and driven by in-memory
+  cursors in tests, so giving it an fd would mean changing the signature of the
+  one function that owns the decoder and the editor lines' byte bypass (**F68**,
+  **F72**). **A bare wake paints no frame**: the step compares the projected
+  counts against what it last showed and returns without painting when they
+  match, so reduced motion and N3's 1/60 s budget are untouched.
+
+  **`AMBIENT_TICK_POLL_MS` and `AMBIENT_LATENCY_BUDGET` now put A8's numbers in
+  the suite**, so raising the during-turn tick past 250 ms **fails by name** —
+  **F50**'s loud guard, which that finding proposed against a constant that did
+  not yet exist.
+
+  **Still open (not A8's fault, but adjacent):** mid-turn, the approval arm
+  `continue`s **before** the counts are re-pulled, so while an approval modal is
+  up the counter freezes and that modal's own row shows a stale count. Carded,
+  and deliberately untested: the new cadence may refresh it **incidentally**, and
+  an accidental fix is not a tested one.
+
 ### 3.3 Functional — blocked agents (B)
 
 - **B1** A detached agent whose action needs a **permission** (path or

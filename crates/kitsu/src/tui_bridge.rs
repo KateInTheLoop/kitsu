@@ -482,6 +482,146 @@ pub(crate) fn repaint_status_row() {
 /// Note **N3**'s coalescing window: one row paint per 1/60 s.
 const STATUS_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
 
+/// Requirement **A8**'s budget: the ambient background-agent counter must
+/// update within 250 ms of a registry change in TUI modes.
+///
+/// Named, and asserted against, so that raising a cadence past it fails
+/// loudly rather than silently breaking a numbered requirement — finding
+/// **F50**: "a requirement whose number appears nowhere in the test suite is
+/// a requirement nobody is holding."
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const AMBIENT_LATENCY_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// Card **T4-S8**, requirement **A8**: the **idle** composer's ambient
+/// staleness bound -- the longest a registry change can go unpainted between
+/// turns -- or `None` if it has no cadence at all.
+///
+/// # Why this seam exists
+///
+/// The during-turn half of A8 was already met: `run_live_typeahead` syncs the counts
+/// and calls [`repaint_status_row`] once per `AMBIENT_TICK_POLL_MS`
+/// (`main.rs`) tick, for the whole of every foreground turn. The **idle**
+/// half was not, until this cadence. `read_line_inline_with_keys` blocks in `read()` with no
+/// timeout and nothing else repaints between turns, so a background agent
+/// that blocks while the user is sitting at the composer changes the registry
+/// and changes **nothing on screen** until the user presses a key, resizes
+/// the terminal or submits a line. A8 grants the "next prompt cycle"
+/// carve-out to `classic` only.
+///
+/// The counts are already a **pull** ([`StatusCounts`], read through
+/// `StatusSource`'s closure at paint time), so nothing has to be pushed
+/// anywhere: the whole gap is that at idle **nobody calls paint**. Closing it
+/// needs a cadence, and this is the interval that cadence runs at.
+///
+/// # What drives it
+///
+/// [`spawn_idle_ambient_cadence`] (one production call site, `main.rs`, right
+/// where the session's [`StatusSource`] is built) subscribes to
+/// `AgentRegistry::subscribe` and runs [`idle_ambient_cadence_step`] for the
+/// life of the session. A registry change wakes the step, which calls
+/// [`repaint_status_row`] — the counts are a pull, so a subscriber only has
+/// to trigger a paint — and then, one
+/// [`IDLE_AMBIENT_REFRESH_INTERVAL`] later, calls it again, because note
+/// **N3**'s coalescing window drops a paint inside 1/60 s of the previous one
+/// *without recording it*. That retry is the only thing that can defer the
+/// cadence's paint, so it is the interval reported here.
+///
+/// A wake whose counts are unchanged is a **bare wake**: the step returns
+/// having painted nothing, so reduced motion and N3's budget are untouched.
+///
+/// **The value is only honest because the cadence uses this same constant and
+/// `the_idle_ambient_cadence_paints_a_registry_change_with_no_byte_read`
+/// drives the real step through the painting surface.** A constant returned
+/// by a function nothing drives would be exactly the vacuous pass F50 is
+/// about.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn idle_ambient_refresh_interval() -> Option<std::time::Duration> {
+    Some(IDLE_AMBIENT_REFRESH_INTERVAL)
+}
+
+/// How long a registry change can sit unseen once the idle cadence has been
+/// woken by it: note **N3**'s coalescing window, the one and only thing that
+/// can defer [`idle_ambient_cadence_step`]'s paint, and twelve times finer
+/// than requirement **A8**'s 250 ms budget.
+///
+/// Deliberately *not* a polling period: the cadence is woken by the
+/// registry's `watch` channel, so an idle session with no background agents
+/// does no work at all.
+const IDLE_AMBIENT_REFRESH_INTERVAL: std::time::Duration = STATUS_FRAME_INTERVAL;
+
+/// One wake of the idle ambient cadence: wait for the next registry change
+/// and, if it changed anything the row shows, repaint. Returns `false` once
+/// the registry is gone and the cadence should stop.
+///
+/// Generic over the watched value and the counts projection so the step can be
+/// driven by a plain `watch` channel in a test — the production projection is
+/// `|snapshot| (snapshot.blocked, snapshot.running)`, the two numbers
+/// requirement **A8**'s ambient tag is composed from.
+///
+/// `seen` is the pair the cadence last painted. When a wake carries the same
+/// pair it is a **bare wake** (the registry's generation moved, the tag did
+/// not) and **no frame is painted** — the rule
+/// `read_line_inline_with_keys` applies to a resize-less `SIGWINCH` wake,
+/// applied here.
+///
+/// Nothing in here touches stdin, the decoder or the editor's byte bypass
+/// (findings **F72**/**F68**): the composer stays blocked in `read()`, and
+/// the row is repainted around it from the pull the painter already does.
+pub(crate) async fn idle_ambient_cadence_step<T, F>(
+    changes: &mut tokio::sync::watch::Receiver<T>,
+    counts: &F,
+    seen: &mut (usize, usize),
+) -> bool
+where
+    F: Fn(&T) -> (usize, usize),
+{
+    if changes.changed().await.is_err() {
+        return false;
+    }
+    let current = counts(&changes.borrow_and_update());
+    if *seen == current {
+        // A bare wake: nothing the row shows moved, so no frame.
+        return true;
+    }
+    *seen = current;
+    repaint_status_row();
+    // Note **N3**: a paint inside the 1/60 s window returns *without*
+    // recording the key, so the change would otherwise wait for the next
+    // registry event -- which may never come while an agent sits blocked.
+    // One retry past the window closes that, and the dedupe makes it free
+    // when the first call landed.
+    tokio::time::sleep(IDLE_AMBIENT_REFRESH_INTERVAL).await;
+    repaint_status_row();
+    true
+}
+
+/// Install the idle composer's ambient cadence for the session: card
+/// **T4-S8**, requirement **A8**.
+///
+/// The **one** production caller is `main.rs`, beside the session's
+/// [`StatusSource`]. Deliberately ungated — unlike the classic-mode
+/// external-printer notifier, which is behind `KITSU_LIVE_NOTICES` and an
+/// assistive-input check and therefore leaves a default TUI session with no
+/// subscriber at all. Inert in classic mode and in any session that never
+/// enabled a live status row, because [`repaint_status_row`] is: that is what
+/// keeps the classic byte stream identical.
+///
+/// The task ends on its own when the registry's sender drops.
+pub(crate) fn spawn_idle_ambient_cadence<T, F>(
+    mut changes: tokio::sync::watch::Receiver<T>,
+    counts: F,
+) -> tokio::task::JoinHandle<()>
+where
+    T: Send + Sync + 'static,
+    F: Fn(&T) -> (usize, usize) + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        let mut seen = counts(&changes.borrow_and_update());
+        while idle_ambient_cadence_step(&mut changes, &counts, &mut seen).await {}
+    })
+}
+
 impl BridgeGuard {
     /// Hand the guard requirement **R5**'s live fields, replacing the fixed
     /// `status` text for every idle paint, and publish the during-turn
@@ -6349,5 +6489,276 @@ mod tests {
             "kitsu> ",
             "detached, the composer is the session's own prompt"
         );
+    }
+
+    // =====================================================================
+    // Card **T4-S8**, requirement **A8**: the ambient counter's latency.
+    //
+    // **FAILING-FIRST.** A8 gives the ambient background-agent counter 250 ms
+    // from a registry change "in TUI modes". During a turn that is met:
+    // `run_live_typeahead` re-pulls the counts and repaints once per
+    // `AMBIENT_TICK_POLL_MS` tick. At the **idle composer** it is not met at
+    // all: `read_line_inline_with_keys` blocks in `read()` with no timeout,
+    // and nothing else repaints between turns, so a registry change while the
+    // user sits at the prompt reaches the screen only when the user types,
+    // resizes or submits. A8's "next prompt cycle" carve-out is granted to
+    // `classic` and not to the TUI.
+    //
+    // **No clock is paused and nothing sleeps**, deliberately: there are four
+    // open flakes in this tree and a timing test that measures elapsed time is
+    // the fifth. Both halves below are structural. The latency is governed by
+    // *when a paint happens*, not by any clock inside the composer — the
+    // counts are a pull, read through `StatusSource`'s closure at paint time
+    // — so the cadence's interval, named, is the whole of what A8 constrains.
+    // =====================================================================
+
+    /// An **idle** live-status fixture: the same wiring as
+    /// [`live_status_fixture`] with no `begin_turn`, so `elapsed` is `None`
+    /// and the row is the between-turns row A8's TUI half is about. The cell
+    /// stands in for the registry's `blocked` count, exactly as
+    /// `live_status_fixture`'s cell stands in for the queue depth.
+    fn idle_ambient_fixture() -> (BridgeGuard, SharedSink, Arc<StatusSource>, Arc<AtomicUsize>) {
+        let (guard, _out, err) = install_inline(T3_S12_ROWS, T3_S12_VIEWPORT_ROWS, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let blocked = Arc::new(AtomicUsize::new(0));
+        let cell = blocked.clone();
+        let source = StatusSource::new(Box::new(move || StatusCounts {
+            blocked: cell.load(Ordering::Relaxed),
+            ..Default::default()
+        }));
+        source.set_usage("example-model-v1", 1_000, 100_000);
+        guard.enable_live_status(source.clone());
+        (guard, err, source, blocked)
+    }
+
+    /// **The acceptance test, and it is red.** The idle composer must have an
+    /// ambient cadence, and that cadence must fit A8's 250 ms.
+    ///
+    /// Half 1 is the **non-vacuity control** and passes today: with a cadence
+    /// tick simulated by hand, a change to the counts does reach the pinned
+    /// row, as the row the painter actually wrote. So the pull path, the
+    /// composition and the surface are all already right, and the one thing
+    /// A8 is missing at idle is a caller — which is what makes half 2's
+    /// assertion reachable by wiring alone (`registry.subscribe()`, or a
+    /// bounded timeout on the idle read) rather than by a rewrite.
+    ///
+    /// Half 2 is the failing half: [`idle_ambient_refresh_interval`] reports
+    /// `None`, because there is no cadence between turns at all.
+    ///
+    /// The row is asserted at **120 columns** as well as at the terminal's
+    /// own, finding **F78**: the status row's drop order is not monotonic in
+    /// width, so the segment is checked at a width where it demonstrably
+    /// fits rather than assumed to survive every width.
+    #[test]
+    #[serial]
+    fn the_idle_composer_must_have_an_ambient_cadence() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, source, blocked) = idle_ambient_fixture();
+
+        // Precondition: an idle row, and no tag on it, because nothing is
+        // blocked. Pinned on the composed row rather than on an absence of
+        // bytes, finding **F71**/**F41**.
+        let cols = live::terminal_columns();
+        let idle_row = source.compose(cols);
+        let tag = live::agents_tag(1, 0).expect("1 blocked agent has a tag at all");
+        assert!(
+            !idle_row.contains(tag.trim_end()),
+            "precondition: nothing is blocked, so the idle row carries no \
+             ambient tag: {idle_row:?}"
+        );
+
+        // Half 1, the control. A registry change, then one cadence tick by
+        // hand: the tag reaches the pinned row.
+        blocked.store(1, Ordering::Relaxed);
+        past_the_frame_budget();
+        let before = err.text().len();
+        repaint_status_row();
+        let tail = err.text()[before..].to_string();
+        assert_eq!(
+            tail,
+            expected_status_paint(
+                T3_S12_ROWS,
+                T3_S12_VIEWPORT_ROWS,
+                &live::compose_status_row(
+                    &live::StatusFields {
+                        model: "example-model-v1".to_string(),
+                        used: 1_000,
+                        effective: 100_000,
+                        elapsed: None,
+                        blocked: 1,
+                        ..Default::default()
+                    },
+                    cols,
+                ),
+            ),
+            "one cadence tick must paint the idle row the counts describe"
+        );
+        assert!(
+            tail.contains(tag.trim_end()),
+            "and that row carries the ambient tag: {tail:?}"
+        );
+        // F78: and at 120 columns, a width where the segment fits.
+        let wide = live::compose_status_row(
+            &live::StatusFields {
+                model: "example-model-v1".to_string(),
+                used: 1_000,
+                effective: 100_000,
+                elapsed: None,
+                blocked: 1,
+                ..Default::default()
+            },
+            120,
+        );
+        assert!(
+            wide.contains(tag.trim_end()),
+            "the ambient tag fits at 120 columns: {wide:?}"
+        );
+
+        // Half 2, **the failing half**: nothing calls that tick at idle.
+        let interval = super::idle_ambient_refresh_interval().expect(
+            "A8: the ambient counter MUST update within 250 ms of a registry change in TUI \
+             modes, so the idle composer needs a cadence -- today it blocks in `read()` with \
+             no timeout and a blocked background agent changes nothing on screen until the \
+             user types",
+        );
+        assert!(
+            interval <= super::AMBIENT_LATENCY_BUDGET,
+            "A8 gives the ambient counter {:?}; the idle cadence runs at {interval:?}",
+            super::AMBIENT_LATENCY_BUDGET,
+        );
+        assert!(
+            interval > std::time::Duration::ZERO,
+            "a zero interval is a busy loop, not a cadence"
+        );
+        drop(guard);
+    }
+
+    /// Card **T4-S8**, requirement **A8**, and the **behavioural** half the
+    /// seam's doc comment asks for: an idle registry change reaches the
+    /// painted surface **with no byte read**.
+    ///
+    /// Why this test and not just the interval: making
+    /// [`idle_ambient_refresh_interval`] return `Some(..)` costs one line and
+    /// holds nothing, which is finding **F50**'s failure exactly -- a
+    /// requirement passing a test while nothing implements it. So this drives
+    /// the real cadence, [`idle_ambient_cadence_step`], the same function the
+    /// session's one `spawn_idle_ambient_cadence` call runs for the life of
+    /// the session, and asserts the **bytes the painter wrote** (finding
+    /// **F71**: a visibility claim goes through the surface that paints it,
+    /// never through state).
+    ///
+    /// The registry is stood in for by a plain `watch` channel, which is what
+    /// `AgentRegistry::subscribe` hands out: the wake carries the counts and
+    /// the fixture's cell carries the pull the painter reads, which is how
+    /// production is wired (`main.rs` projects `(blocked, running)` off the
+    /// snapshot, and the `StatusSource` closure re-reads the registry at
+    /// paint time). One registry change moves both.
+    ///
+    /// **Nothing reads a byte**, and that is the point: the composer stays
+    /// blocked in `read()` throughout -- no input is fed to any reader here,
+    /// no decoder and no editor line is touched (**F72**/**F68**).
+    ///
+    /// **No latency is measured.** Both wakes are already-ready `changed()`
+    /// awaits, so `block_on` returns as soon as the step has painted; the only
+    /// sleep is the in-tree frame-budget helper that clears note **N3**'s
+    /// coalescing window, plus the step's own one-frame retry.
+    #[test]
+    #[serial]
+    fn the_idle_ambient_cadence_paints_a_registry_change_with_no_byte_read() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, _source, blocked) = idle_ambient_fixture();
+        let cols = live::terminal_columns();
+        let tag = live::agents_tag(1, 0).expect("1 blocked agent has a tag at all");
+
+        // The interval the cadence actually defers by, inside A8's budget.
+        let interval =
+            super::idle_ambient_refresh_interval().expect("the idle composer has a cadence");
+        assert!(
+            interval <= super::AMBIENT_LATENCY_BUDGET,
+            "A8 gives the ambient counter {:?}; the idle cadence defers by {interval:?}",
+            super::AMBIENT_LATENCY_BUDGET,
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a current-thread runtime for the cadence step");
+        let (sender, mut changes) = tokio::sync::watch::channel((0usize, 0usize));
+        let counts = |pair: &(usize, usize)| *pair;
+        let mut seen = *changes.borrow_and_update();
+        past_the_frame_budget();
+
+        // A **bare wake** first: the registry published, but nothing the row
+        // shows moved. No frame -- the same rule the composer applies to a
+        // resize-less signal wake, and what reduced motion and N3's budget
+        // both depend on.
+        let before = err.text().len();
+        sender
+            .send((0, 0))
+            .expect("the cadence is still subscribed");
+        assert!(
+            runtime.block_on(super::idle_ambient_cadence_step(
+                &mut changes,
+                &counts,
+                &mut seen
+            )),
+            "the cadence keeps running while the registry is alive"
+        );
+        assert_eq!(
+            err.text().len(),
+            before,
+            "a bare wake must paint no frame: {:?}",
+            err.text()[before..].escape_debug().to_string()
+        );
+
+        // Now a real one: an agent blocks while the user sits at the prompt.
+        blocked.store(1, Ordering::Relaxed);
+        sender
+            .send((1, 0))
+            .expect("the cadence is still subscribed");
+        let before = err.text().len();
+        assert!(runtime.block_on(super::idle_ambient_cadence_step(
+            &mut changes,
+            &counts,
+            &mut seen
+        )));
+        let tail = err.text()[before..].to_string();
+        assert_eq!(
+            tail,
+            expected_status_paint(
+                T3_S12_ROWS,
+                T3_S12_VIEWPORT_ROWS,
+                &live::compose_status_row(
+                    &live::StatusFields {
+                        model: "example-model-v1".to_string(),
+                        used: 1_000,
+                        effective: 100_000,
+                        elapsed: None,
+                        blocked: 1,
+                        ..Default::default()
+                    },
+                    cols,
+                ),
+            ),
+            "the cadence alone -- no keystroke, no resize, no submitted line --              must put the idle row the registry describes on screen"
+        );
+        assert!(
+            tail.contains(tag.trim_end()),
+            "and that painted row carries A8's ambient tag: {tail:?}"
+        );
+
+        // And it stops when the registry is gone rather than spinning.
+        drop(sender);
+        assert!(
+            !runtime.block_on(super::idle_ambient_cadence_step(
+                &mut changes,
+                &counts,
+                &mut seen
+            )),
+            "a closed registry ends the cadence"
+        );
+        drop(guard);
     }
 }

@@ -113,6 +113,12 @@ shapes may change in any minor release.
   including one whose characters arrive split across reads, and a refused name
   stays on screen with the message so the one wrong character can be corrected
   rather than the whole name retyped.
+- **Fixed:** the background-agent counter on the status row went stale while you
+  sat at the prompt. It only refreshed while a turn was running, so an agent that
+  blocked waiting for your permission could sit there invisibly until you typed
+  something, resized the window, or submitted a line -- which is the one moment
+  you most need to be told. The row now follows the registry as it changes, and a
+  change with nothing new to show still paints nothing.
 - **Start a background agent from the agent view with `+`.** Type a task for the
   default profile, or `@<profile> <task>` to pick one; `Enter` starts it, `Esc`
   cancels. A refusal -- an unreadable line, an unknown profile, or the registry at
