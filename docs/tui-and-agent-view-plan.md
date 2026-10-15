@@ -154,7 +154,9 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | **T3 complete.** T4-S1 agent-view model: `AgentViewState` single source, filter grammar, DTO mapping; A2/A3 amended; F61 | done | 76bfc7c |
 | marker story (between T4-S1 and T4-S2): `DeckState::Blocked`, one vocabulary via `deck_state()`; **F34 and F3 closed**, §4.4 amended | done | bd9d845 |
 | T4-S2 agent view overlay opens/closes; `[tui] prefix` + `left_arrow_opens_agents` get their first consumer; A1's two stale clauses corrected | done | e791fa2 |
-| T4-S3 peek (`Space`) reusing `/jobs show`'s renderers; A4 shown satisfied by construction, A7 clarified; **F64** (my second unverified premise) | done | this commit |
+| T4-S3 peek (`Space`) reusing `/jobs show`'s renderers; A4 shown satisfied by construction, A7 clarified; **F64** (my second unverified premise) | done | 7da0ce8 |
+| T4-S4a selection keyed on the agent, `↑/↓` clamping, `x` arming, `AgentRegistry::rename`, `p`'s taxonomy; A3 amended; **F65**, **F66** | done | this commit |
+| T4-S4b action keys `r`/`s`/`x` wired to the registry paths they already have; `s`'s text sub-mode | **split out of T4-S4, not started** | — |
 
 > **`KITSU_TUI` is retired as of T3-S2.** Mentions of it in the T0-T2 rows and
 > requirement text below are **historical** — they record how the preview was

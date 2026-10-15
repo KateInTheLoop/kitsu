@@ -92,6 +92,12 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- In the agent view, **`↑`/`↓` move the selection**, which now actually works:
+  the arrow keys used to close the view and leak their escape sequence into the
+  prompt underneath. The selection follows **the agent**, not the row position,
+  so an agent finishing and re-grouping can never silently move your next
+  keystroke onto a different one; it clamps at both ends rather than wrapping,
+  and moving it never collects a result.
 - In the agent view, **`Space` peeks** the selected agent: its bounded redacted
   timeline, the permission it is waiting on if blocked, and its result or failure
   if finished. Peeking counts as collecting the result, exactly as `/jobs show`

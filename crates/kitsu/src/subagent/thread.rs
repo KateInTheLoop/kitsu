@@ -500,6 +500,11 @@ impl AgentThreadRuntime {
 pub(crate) struct AgentThreadState {
     task: String,
     model: String,
+    /// The display name, once the user has given the agent one. Stored here,
+    /// on the thread the snapshot is built from, so one mapping carries it to
+    /// every surface: `/jobs show`, the DTO and the agent view's row. A name
+    /// held anywhere else would be a second source of truth for A2's head.
+    name: Option<String>,
     profile: Option<String>,
     phase: AgentThreadPhase,
     /// The argument-free kind this thread is parked on, set by
@@ -536,6 +541,7 @@ impl AgentThreadState {
                 )
                 .0,
                 profile: profile.map(|name| safe_inline_label(name, 64)),
+                name: None,
                 phase: AgentThreadPhase::Running,
                 waiting_for: None,
                 handoff: AgentHandoffState::Unavailable,
@@ -849,6 +855,16 @@ impl AgentThreadState {
         self.profile.as_deref()
     }
 
+    /// Give the thread a display name, returning the name it replaced.
+    ///
+    /// The caller has already decided the name is legal
+    /// (`AgentRegistry::rename`): a name a human typed is accepted as typed or
+    /// refused with a reason, never coerced here.
+    #[cfg_attr(not(test), allow(dead_code))] // Reached through `rename`, bound by T4-S4b.
+    pub(crate) fn set_name(&mut self, name: &str) -> Option<String> {
+        self.name.replace(name.to_string())
+    }
+
     pub(crate) fn snapshot(&self, id: u64, elapsed_ms: u64) -> AgentThreadSnapshot {
         let pending_steering = self.steering_sender.as_ref().map_or(0, |sender| {
             self.steering_capacity.saturating_sub(sender.capacity())
@@ -858,7 +874,7 @@ impl AgentThreadState {
             task: self.task.clone(),
             model: self.model.clone(),
             profile: self.profile.clone(),
-            name: None,
+            name: self.name.clone(),
             phase: self.phase,
             waiting_for: (self.phase == AgentThreadPhase::Blocked)
                 .then_some(self.waiting_for)

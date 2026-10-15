@@ -416,6 +416,53 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   `n` rename, `p` mark result acknowledged, `/` filter, `?` help, `Esc`
   close. Filter grammar: `s:<state> n:<text> o:<text> p:<profile>`.
 
+  **`↑/↓ move` was under-specified; T4-S4a decided these points and pinned each.
+  The first is a safety property, not a preference.**
+
+  - **The selection is an agent, not a row index.** Rows re-group constantly: an
+    agent finishing moves from `working` to `done (unviewed)`, which in A2's
+    order is a *later* group, so an index-keyed selection would silently
+    retarget the user's next `x` or `p` onto a **different agent**. Keying on the
+    agent id makes that impossible, and a test pins a regroup that really
+    reorders so an index-keyed model lands on the wrong agent and fails.
+  - **The selection clamps; it does not wrap.** `↑` on the first row stays.
+    Wrapping would carry the cursor from `needs input` — the group that needs
+    you — to `cancelled` in one keystroke, possibly while a stop is armed on the
+    row left behind. With no rows nothing is selected, and neither key invents a
+    selection.
+  - **When the selected agent vanishes** (pruned), the selection falls to
+    whatever row now holds its old display index, clamped to the new last row,
+    and is `None` only when the list empties. That is where the user's eye
+    already is; `None` would make the next keystroke a silent no-op.
+  - **`x` is two presses per row, and moving the selection disarms it.** This
+    extends T4-S2's rule for the two-press `←` to the case T4-S2 did not have:
+    an `x` armed on one agent and firing on another after a `↓` is the one way
+    this affordance stops an agent nobody asked to stop. A **repaint keeps** the
+    arming — a repaint is not a keystroke, and an agent finishing under the
+    cursor must not cancel a half-typed stop — but a repaint that **loses** the
+    armed agent disarms.
+  - **Moving the selection acknowledges nothing.** T4-S3 made peek the single
+    call site that takes custody of a result; selection must not become a
+    second one, or the guard on unviewed results stops meaning anything. Pinned
+    in both directions, with `p` on a row just moved over as the positive
+    control.
+  - **`r` is not a text prompt, and `s` is.** `AgentRegistry::answer` takes a
+    `Decision`, so `r` reads a decision through the **one** shared
+    `parse_permission_answer` (the parser **F45** was closed by consolidating);
+    only `s` needs a line of text. The row's `s` *(prompt for text)* applies to
+    `s` alone.
+  - **`n` rename legality**, which this requirement did not state: the name is
+    trimmed, must be non-empty, at most `AgentRegistry::NAME_MAX_CHARS`, and may
+    contain **no control characters**; **non-ASCII is legal** — the rule is
+    control characters, not ASCII-only. **Any phase is renameable**, terminal
+    included, since the agent whose result you are about to read is the one worth
+    labelling. Each refusal is **distinct** (`Empty`, `TooLong`, `Unprintable`,
+    `NotFound`), and a refused rename leaves the previous name intact.
+    Deliberately **not** `safe_inline_label`: that helper coerces empty to
+    `"unknown"` and truncates with an ellipsis, which is right for a
+    model-produced label and is exactly the silent rejection this project
+    refuses for a name a human just typed.
+
   **The filter grammar was under-specified; T4-S1 decided these four points and
   pinned each to an exact message.**
   - **`o:` was never defined here.** It matches the **task/objective**

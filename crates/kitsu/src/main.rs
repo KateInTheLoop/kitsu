@@ -6500,6 +6500,148 @@ fn agent_view_peek_frame(
     )
 }
 
+/// How long the overlay waits for the rest of an escape sequence before it
+/// treats a trailing `ESC` byte as the `Esc` key.
+///
+/// A terminal writes `ESC [ B` in one go, so anything still absent after this
+/// was never coming. The value matches the editor collector's own ~50ms poll
+/// tick, so the two surfaces resolve a lone `Esc` on the same timescale.
+#[cfg(unix)]
+const ESC_SEQUENCE_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Where the overlay's byte decoder is in an escape sequence. The overlay
+/// reads bytes, not keys, so this is the whole difference between `Esc` and
+/// the first byte of `\u{2191}`.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverlayPending {
+    None,
+    /// An `ESC` has arrived and nothing after it yet. Still ambiguous.
+    Escape,
+    /// `ESC [` -- a CSI sequence, consumed up to and including its final byte.
+    Csi,
+    /// `ESC O` -- the application-keypad spelling of the same arrows.
+    Ss3,
+}
+
+/// One key the agent view understands, decoded from the byte stream.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverlayKey {
+    Help,
+    Peek,
+    Up,
+    Down,
+    /// A resolved `Esc`: step back out of the frame on screen.
+    StepBack,
+    /// `q`, the conventional synonym for closing outright.
+    Close,
+}
+
+/// Decode a chunk of raw bytes into the keys the overlay acts on, carrying
+/// `pending` across chunks because a read can split a sequence.
+///
+/// The one thing this exists to get right: an arrow key is **not one byte**.
+/// `ESC` alone is only *possibly* `Esc`, so it is held pending and resolved
+/// either by the next byte (part of a sequence, or a key in its own right
+/// after the `Esc`) or by the caller's quiet grace period. Bytes that are not
+/// keys here are dropped rather than forwarded: the overlay owns the keyboard
+/// while it is up, and a stray byte reaching the composer underneath is the
+/// defect this decoder replaces.
+#[cfg(unix)]
+fn decode_overlay_keys(bytes: &[u8], pending: &mut OverlayPending) -> Vec<OverlayKey> {
+    /// The arrows, in both the CSI and the SS3 spelling, from the final byte.
+    fn arrow(final_byte: u8) -> Option<OverlayKey> {
+        match final_byte {
+            b'A' => Some(OverlayKey::Up),
+            b'B' => Some(OverlayKey::Down),
+            _ => None,
+        }
+    }
+    fn plain(byte: u8) -> Option<OverlayKey> {
+        match byte {
+            b'?' => Some(OverlayKey::Help),
+            b' ' => Some(OverlayKey::Peek),
+            b'q' => Some(OverlayKey::Close),
+            _ => None,
+        }
+    }
+    let mut keys = Vec::new();
+    for &byte in bytes {
+        match *pending {
+            OverlayPending::Escape => {
+                *pending = OverlayPending::None;
+                match byte {
+                    b'[' => *pending = OverlayPending::Csi,
+                    b'O' => *pending = OverlayPending::Ss3,
+                    // `ESC ESC`: the first was a real `Esc`, the second is the
+                    // next one's ambiguity.
+                    0x1b => {
+                        keys.push(OverlayKey::StepBack);
+                        *pending = OverlayPending::Escape;
+                    }
+                    // A key that arrived too late to be part of a sequence:
+                    // the `Esc` happened, and then the key did.
+                    other => {
+                        keys.push(OverlayKey::StepBack);
+                        keys.extend(plain(other));
+                    }
+                }
+            }
+            // Parameter and intermediate bytes carry no key; the final byte
+            // (0x40..=0x7e) ends the sequence.
+            OverlayPending::Csi => {
+                if (0x40..=0x7e).contains(&byte) {
+                    *pending = OverlayPending::None;
+                    keys.extend(arrow(byte));
+                }
+            }
+            OverlayPending::Ss3 => {
+                *pending = OverlayPending::None;
+                keys.extend(arrow(byte));
+            }
+            OverlayPending::None => match byte {
+                0x1b => *pending = OverlayPending::Escape,
+                other => keys.extend(plain(other)),
+            },
+        }
+    }
+    keys
+}
+
+/// Whether stdin has a byte waiting within `timeout`.
+///
+/// Used for one thing only: deciding that the rest of an escape sequence is
+/// not coming, so a trailing `ESC` was the `Esc` key.
+#[cfg(unix)]
+fn stdin_waiting(timeout: std::time::Duration) -> bool {
+    let mut remaining = timeout;
+    loop {
+        let mut fds = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let started = std::time::Instant::now();
+        // SAFETY: one `pollfd` for a descriptor this process owns, with the
+        // count matching the slice length.
+        let ready = unsafe { libc::poll(&mut fds, 1, remaining.as_millis() as libc::c_int) };
+        if ready >= 0 {
+            return ready > 0;
+        }
+        // A signal woke the poll (a `SIGWINCH`, typically). Waiting out the
+        // rest of the grace is the safe answer: resolving the `ESC` here would
+        // close the view on an arrow key that a resize interrupted.
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+        remaining = remaining.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return false;
+        }
+    }
+}
+
 /// Open the agent view overlay and run it until it is closed, returning
 /// whether it was opened at all (card T4-S2, requirement A1).
 ///
@@ -6559,15 +6701,27 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
     // The peek panel for one agent (card T4-S3), while `Space` is holding it
     // up. `Esc` steps back out of it the way it steps out of the help.
     let mut peeking: Option<Vec<String>> = None;
+    // Which agent the keys act on (card T4-S4a). Re-synced against freshly
+    // built rows on every repaint, which is what keeps it on its *agent* while
+    // rows regroup under it; the sync acknowledges nothing, and neither does
+    // painting the mark.
+    let mut selection = kitsu_tui::agents_view::AgentSelection::new();
     let mut stdin = std::io::stdin();
     let mut buffer = [0u8; 256];
+    let mut pending = OverlayPending::None;
     loop {
+        let view_rows = agent_view_rows(registry);
+        selection.sync(&view_rows);
         let content = if helping {
             kitsu_tui::agents_view::overlay_help_rows(cols as usize)
         } else if let Some(panel) = peeking.as_ref() {
             panel.clone()
         } else {
-            kitsu_tui::agents_view::overlay_rows(agent_view_rows(registry), cols as usize)
+            kitsu_tui::agents_view::overlay_rows_selected(
+                view_rows.clone(),
+                cols as usize,
+                selection.selected(),
+            )
         };
         // Repainted whole, with absolute addressing, and never into the last
         // row: the pinned composer row belongs to the viewport underneath, and
@@ -6581,6 +6735,26 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
         let _ = err.write_all(frame.as_bytes());
         let _ = err.flush();
 
+        // An `ESC` byte is ambiguous until the next byte arrives *or does
+        // not*: `Esc` is one byte, `\u{2193}` is `ESC [ B`. A terminal emits
+        // the rest of a sequence in the same breath, so a quiet grace period
+        // is what tells the two apart — the same answer T4-S2 gave at the
+        // idle composer, where a lone `ESC` stays pending until the next byte
+        // and is resolved on a quiet tick.
+        if pending == OverlayPending::Escape && !stdin_waiting(ESC_SEQUENCE_GRACE) {
+            pending = OverlayPending::None;
+            // A real `Esc`: step back out of the help, out of a peek, or out
+            // of the view.
+            if helping {
+                helping = false;
+            } else if peeking.is_some() {
+                peeking = None;
+            } else {
+                break;
+            }
+            continue;
+        }
+
         let count = match stdin.read(&mut buffer) {
             // A drained descriptor cannot deliver the key that would close the
             // view, so the view closes itself rather than spinning.
@@ -6592,26 +6766,42 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
             Err(_) => break,
         };
         let mut closing = false;
-        for byte in &buffer[..count] {
-            match byte {
-                b'?' => helping = true,
-                // Space: peek. The byte is the view's and goes no further —
-                // nothing is forwarded to the composer underneath, and it is
-                // not an exit either (test T4-S3a). With no rows there is
-                // nothing to peek and the frame is unchanged. Peeking is the
-                // only read here that acknowledges a handoff; painting rows
-                // does not.
-                b' ' => {
+        for key in decode_overlay_keys(&buffer[..count], &mut pending) {
+            match key {
+                OverlayKey::Help => helping = true,
+                // Space: peek the selected agent. The byte is the view's and
+                // goes no further — nothing is forwarded to the composer
+                // underneath, and it is not an exit either (test T4-S3a).
+                // With no rows there is nothing to peek and the frame is
+                // unchanged. Peeking is the only read here that acknowledges a
+                // handoff; painting rows and moving the selection do not.
+                OverlayKey::Peek => {
                     if !helping && peeking.is_none() {
-                        if let Some(first) = agent_view_rows(registry).first().map(|row| row.id) {
-                            peeking = agent_view_peek_frame(registry, first, cols as usize);
+                        if let Some(id) = selection.selected() {
+                            peeking = agent_view_peek_frame(registry, id, cols as usize);
                         }
                     }
                 }
-                // Esc: out of the help if it is showing, out of a peek panel
-                // if one is up, out of the view otherwise. `q` is the
-                // conventional synonym for the latter.
-                0x1b => {
+                // The arrows move the selection and nothing else: they are
+                // not an exit, and no byte of their escape sequence reaches
+                // the composer underneath. They clamp rather than wrap, and
+                // they are inert while the help or a peek panel is up, where
+                // there is no row list on screen to move over.
+                OverlayKey::Up => {
+                    if !helping && peeking.is_none() {
+                        selection.move_up(&view_rows);
+                    }
+                }
+                OverlayKey::Down => {
+                    if !helping && peeking.is_none() {
+                        selection.move_down(&view_rows);
+                    }
+                }
+                // Esc, resolved as a real key press rather than as the start
+                // of a sequence: out of the help if it is showing, out of a
+                // peek panel if one is up, out of the view otherwise. `q` is
+                // the conventional synonym for the latter.
+                OverlayKey::StepBack => {
                     if helping {
                         helping = false;
                     } else if peeking.is_some() {
@@ -6620,8 +6810,7 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
                         closing = true;
                     }
                 }
-                b'q' => closing = true,
-                _ => {}
+                OverlayKey::Close => closing = true,
             }
         }
         if closing {
@@ -28678,6 +28867,369 @@ mod tests {
             registry.handoff_state(blocked),
             Some(subagent::thread::AgentHandoffState::Unavailable),
             "a blocked agent has no handoff, so peeking it acknowledges nothing"
+        );
+    }
+
+    // --- card T4-S4: selection, and the keys that act on the selected agent ---
+    //
+    // Pinned at unit level against a real `AgentRegistry` for the reason
+    // T4-S3 gave above and for one more: a fixture PTY session has zero
+    // agents, so a key bound to "the selected agent" has nothing to act on
+    // there and every outcome would be the no-selection one. The PTY answers
+    // only routing.
+
+    /// Card T4-S4, the regression T4-S3 left a note about: **moving the
+    /// selection acknowledges nothing.** The earlier test asserted that over a
+    /// stand-in for selection (a loop counter) because no selection existed;
+    /// this one asserts it over the real [`kitsu_tui::agents_view::AgentSelection`]
+    /// walking every row of a registry that really does have unacknowledged
+    /// results, which is the thing an implementer can break.
+    ///
+    /// The POSITIVE CONTROL is in this test, on the very rows just walked: the
+    /// walk ends with `p`'s own call on one of them, which does acknowledge.
+    /// So the negative assertions are about moving rather than about a
+    /// registry that never acknowledges anything.
+    #[cfg(unix)]
+    #[test]
+    fn moving_the_agent_views_selection_over_every_row_acknowledges_nothing() {
+        let registry = subagent::AgentRegistry::new();
+        let done = registry.start("done work".to_string()).unwrap();
+        let failed = registry.start("failed work".to_string()).unwrap();
+        let running = registry.start("still running".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+        registry.finish(failed, Err("boom".to_string()));
+        assert_eq!(
+            registry.snapshot().unacknowledged,
+            2,
+            "non-vacuous: there really are two results waiting to be collected"
+        );
+
+        let rows = agent_view_rows(&registry);
+        assert_eq!(rows.len(), 3, "all three agents are rows in the view");
+        let mut selection = kitsu_tui::agents_view::AgentSelection::new();
+        selection.sync(&rows);
+
+        // Every row, down and back up, repainting each time exactly as the
+        // overlay loop does — and `overlay_rows_selected` is the paint, so a
+        // renderer that acknowledged while drawing the mark fails here.
+        let mut visited = vec![selection.selected().expect("a row is selected")];
+        for _ in 0..rows.len() * 2 {
+            selection.move_down(&rows);
+            let _ = kitsu_tui::agents_view::overlay_rows_selected(
+                agent_view_rows(&registry),
+                80,
+                selection.selected(),
+            );
+            visited.push(selection.selected().expect("the selection clamps"));
+        }
+        for _ in 0..rows.len() * 2 {
+            selection.move_up(&rows);
+            let _ = kitsu_tui::agents_view::overlay_rows_selected(
+                agent_view_rows(&registry),
+                80,
+                selection.selected(),
+            );
+            visited.push(selection.selected().expect("the selection clamps"));
+        }
+        for id in [done, failed, running] {
+            assert!(
+                visited.contains(&id),
+                "non-vacuous: the walk really did select agent #{id}, so the \
+                 assertions below are about a row that was moved over; \
+                 visited: {visited:?}"
+            );
+        }
+
+        for id in [done, failed] {
+            assert_eq!(
+                registry.handoff_state(id),
+                Some(subagent::thread::AgentHandoffState::Ready),
+                "moving the selection over agent #{id} must not take custody \
+                 of its result"
+            );
+        }
+        assert_eq!(
+            registry.snapshot().unacknowledged,
+            2,
+            "the exit guard still holds both results after the selection \
+             walked every row twice"
+        );
+
+        // POSITIVE CONTROL: `p`'s own registry call, on one of the rows just
+        // walked over.
+        assert_eq!(
+            registry.acknowledge_result(failed),
+            subagent::AgentHandoffAckOutcome::Acknowledged,
+            "POSITIVE CONTROL: `p` on a row the selection just moved over does \
+             acknowledge"
+        );
+        assert_eq!(
+            registry.handoff_state(done),
+            Some(subagent::thread::AgentHandoffState::Ready),
+            "and only that row"
+        );
+        let unobserved = registry
+            .take_unobserved_terminal_results()
+            .iter()
+            .map(|result| result.id)
+            .collect::<Vec<_>>();
+        assert_eq!(unobserved, vec![done]);
+    }
+
+    /// Card T4-S4, the `p` key: every outcome of acknowledging the selected
+    /// agent is **distinguishable**, per T2-S5b. A human typing `p` into a
+    /// racy world must be able to tell "it worked" from "there was nothing
+    /// here" from "someone already collected this".
+    ///
+    /// `p` is `AgentRegistry::acknowledge_result`, which T4-S3's peek already
+    /// calls; this pins its four answers on real samples rather than adding a
+    /// second path.
+    #[cfg(unix)]
+    #[test]
+    fn acknowledging_the_selected_agent_distinguishes_every_outcome() {
+        use subagent::AgentHandoffAckOutcome;
+
+        let registry = subagent::AgentRegistry::new();
+        let done = registry.start("has a result".to_string()).unwrap();
+        let running = registry.start("still running".to_string()).unwrap();
+        registry.finish(done, Ok("collect me".to_string()));
+
+        assert_eq!(
+            registry.acknowledge_result(done),
+            AgentHandoffAckOutcome::Acknowledged,
+            "`p` on a done agent with an uncollected result collects it"
+        );
+        assert_eq!(
+            registry.acknowledge_result(done),
+            AgentHandoffAckOutcome::AlreadyAcknowledged,
+            "`p` again says so rather than reporting a second success"
+        );
+        assert_eq!(
+            registry.acknowledge_result(running),
+            AgentHandoffAckOutcome::NotReady,
+            "`p` on a running agent has nothing to acknowledge, and says that \
+             rather than nothing"
+        );
+        assert_eq!(
+            registry.acknowledge_result(9_999),
+            AgentHandoffAckOutcome::NotFound,
+            "`p` on an id the registry does not hold is its own answer"
+        );
+
+        // The four answers are four, not one with four spellings: a `p` whose
+        // caller could not tell them apart would print the same line for all
+        // of them.
+        let answers = [
+            AgentHandoffAckOutcome::Acknowledged,
+            AgentHandoffAckOutcome::AlreadyAcknowledged,
+            AgentHandoffAckOutcome::NotReady,
+            AgentHandoffAckOutcome::NotFound,
+        ];
+        for (index, left) in answers.iter().enumerate() {
+            for right in &answers[index + 1..] {
+                assert_ne!(left, right);
+            }
+        }
+    }
+
+    /// Card T4-S4, the one **new** registry method: `n` rename.
+    ///
+    /// The name is what A2's row head shows in place of the task head, so a
+    /// rename that was accepted and then not shown, or coerced to something
+    /// the user did not type, is the silent-rejection failure this project
+    /// keeps refusing. `AgentRegistry::rename` therefore answers with an
+    /// outcome that names *why* a name was refused, and does not borrow
+    /// `safe_inline_label` — that helper coerces an empty label to `unknown`
+    /// and truncates with an ellipsis, which is right for a label the model
+    /// produced and wrong for a name a human just typed.
+    ///
+    /// Legality, decided here because A3 does not say: a name is the trimmed
+    /// input; it must be non-empty, at most
+    /// `AgentRegistry::NAME_MAX_CHARS` characters, and free of control
+    /// characters (a newline or an `ESC` in a name would corrupt every row it
+    /// is drawn on). Any phase may be renamed, including a terminal one: an
+    /// agent whose result you are about to read is exactly the one worth
+    /// labelling.
+    #[cfg(unix)]
+    #[test]
+    fn renaming_the_selected_agent_shows_the_new_name_and_names_its_refusals() {
+        use subagent::AgentRenameOutcome;
+
+        // A name must be able to hold a short human phrase. Const-asserted so
+        // narrowing the budget is a compile error.
+        const _: () = assert!(subagent::AgentRegistry::NAME_MAX_CHARS >= 16);
+
+        let registry = subagent::AgentRegistry::new();
+        let id = registry.start("summarize the crate".to_string()).unwrap();
+        let other = registry.start("run the build".to_string()).unwrap();
+
+        // Before: the row head is the task head, and no name is carried.
+        let head_of = |id: u64| {
+            agent_view_rows(&registry)
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap_or_else(|| panic!("agent #{id} has a row"))
+        };
+        let before = head_of(id);
+        assert_eq!(before.name, None, "an agent starts out unnamed");
+        assert_eq!(
+            before.head(),
+            "summarize the crate",
+            "non-vacuous: unnamed, the head is the task head"
+        );
+
+        assert_eq!(
+            registry.rename(id, "reviewer-1"),
+            AgentRenameOutcome::Renamed { previous: None },
+            "a legal name is accepted, and the answer says what it replaced"
+        );
+        let after = head_of(id);
+        assert_eq!(
+            after.name.as_deref(),
+            Some("reviewer-1"),
+            "the name reaches the view's row through the thread snapshot, \
+             which is the only mapping (`agent_row_from_thread_dto`)"
+        );
+        assert_eq!(
+            after.head(),
+            "reviewer-1",
+            "A2's head is the name once there is one"
+        );
+        assert_eq!(
+            registry
+                .thread_snapshot(id)
+                .expect("a snapshot")
+                .name
+                .as_deref(),
+            Some("reviewer-1"),
+            "and it is on the snapshot itself, so `/jobs show` and the DTO \
+             carry it too rather than the overlay keeping a private name"
+        );
+        assert_eq!(
+            head_of(other).name,
+            None,
+            "renaming one agent names one agent"
+        );
+
+        // Renaming again reports the name it replaced, so the user is never
+        // left guessing whether the key reached the row they meant.
+        assert_eq!(
+            registry.rename(id, "  reviewer-2  "),
+            AgentRenameOutcome::Renamed {
+                previous: Some("reviewer-1".to_string()),
+            },
+            "surrounding whitespace is trimmed, which is not a coercion of \
+             what the user meant"
+        );
+        assert_eq!(head_of(id).name.as_deref(), Some("reviewer-2"));
+
+        // Every refusal is its own answer, and none of them changes the name.
+        let too_long = "n".repeat(subagent::AgentRegistry::NAME_MAX_CHARS + 1);
+        let refusals: Vec<(String, AgentRenameOutcome)> = vec![
+            ("".to_string(), AgentRenameOutcome::Empty),
+            ("   \t ".to_string(), AgentRenameOutcome::Empty),
+            (
+                too_long,
+                AgentRenameOutcome::TooLong {
+                    max: subagent::AgentRegistry::NAME_MAX_CHARS,
+                },
+            ),
+            ("two\nlines".to_string(), AgentRenameOutcome::Unprintable),
+            (
+                "esc\x1b[2Jhere".to_string(),
+                AgentRenameOutcome::Unprintable,
+            ),
+        ];
+        for (input, expected) in refusals {
+            assert_eq!(
+                registry.rename(id, &input),
+                expected,
+                "rename({input:?}) must be refused with a reason, not \
+                 silently coerced"
+            );
+            assert_eq!(
+                head_of(id).name.as_deref(),
+                Some("reviewer-2"),
+                "a refused rename leaves the name it had: {input:?}"
+            );
+        }
+
+        // A name exactly at the budget is legal: the refusal above is about
+        // one character too many and not about the budget being unusable.
+        let at_budget = "m".repeat(subagent::AgentRegistry::NAME_MAX_CHARS);
+        assert_eq!(
+            registry.rename(id, &at_budget),
+            AgentRenameOutcome::Renamed {
+                previous: Some("reviewer-2".to_string()),
+            },
+            "the budget is inclusive"
+        );
+        assert_eq!(head_of(id).name.as_deref(), Some(at_budget.as_str()));
+
+        // A non-ASCII name is a name: the rule is control characters, not
+        // ASCII-only. A user naming an agent in their own language is not
+        // typing an illegal name.
+        assert!(matches!(
+            registry.rename(id, "r\u{e9}viseur"),
+            AgentRenameOutcome::Renamed { .. }
+        ));
+        assert_eq!(head_of(id).name.as_deref(), Some("r\u{e9}viseur"));
+
+        assert_eq!(
+            registry.rename(9_999, "ghost"),
+            AgentRenameOutcome::NotFound,
+            "renaming an id the registry does not hold is its own answer"
+        );
+    }
+
+    /// Card T4-S4: renaming a terminal agent is allowed and **acknowledges
+    /// nothing**. Naming a row is a note to yourself about it, not a claim to
+    /// have read its result, so the exit guard must still hold it back.
+    ///
+    /// The POSITIVE CONTROL is the second half: `p` on the same agent does
+    /// release it.
+    #[cfg(unix)]
+    #[test]
+    fn renaming_a_done_agent_is_allowed_and_does_not_collect_its_result() {
+        let registry = subagent::AgentRegistry::new();
+        let id = registry.start("will finish".to_string()).unwrap();
+        registry.finish(id, Ok("the answer".to_string()));
+
+        assert!(
+            matches!(
+                registry.rename(id, "the-one-that-failed"),
+                subagent::AgentRenameOutcome::Renamed { .. }
+            ),
+            "a terminal agent can be named: it is the one worth labelling"
+        );
+        assert_eq!(
+            registry.handoff_state(id),
+            Some(subagent::thread::AgentHandoffState::Ready),
+            "naming a row is not collecting its result"
+        );
+        assert_eq!(
+            registry
+                .take_unobserved_terminal_results()
+                .iter()
+                .map(|result| result.id)
+                .collect::<Vec<_>>(),
+            vec![id],
+            "so the exit guard still holds it"
+        );
+
+        // POSITIVE CONTROL, on the same agent: `p` does release it.
+        let registry = subagent::AgentRegistry::new();
+        let id = registry.start("will finish".to_string()).unwrap();
+        registry.finish(id, Ok("the answer".to_string()));
+        let _ = registry.rename(id, "named-then-collected");
+        assert_eq!(
+            registry.acknowledge_result(id),
+            subagent::AgentHandoffAckOutcome::Acknowledged
+        );
+        assert!(
+            registry.take_unobserved_terminal_results().is_empty(),
+            "POSITIVE CONTROL: the guard does let a collected result go, so \
+             the assertion above is about the rename"
         );
     }
 }

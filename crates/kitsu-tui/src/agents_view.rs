@@ -95,6 +95,168 @@ pub fn group_rows(rows: Vec<AgentRow>) -> Vec<AgentGroup> {
     buckets
 }
 
+/// The ids of `rows` in the order the view **displays** them: A2's groups in
+/// A2's order, rows in input order within a group. The selection walks this
+/// and never the input order, so moving down goes to the row below the one on
+/// screen.
+fn display_order(rows: &[AgentRow]) -> Vec<u64> {
+    group_rows(rows.to_vec())
+        .into_iter()
+        .flat_map(|group| group.rows.into_iter().map(|row| row.id))
+        .collect()
+}
+
+/// What a press of the two-press stop key answered.
+///
+/// `Confirmed` carries the id it is confirming, so the caller fires at the
+/// agent the second press was typed on rather than re-reading the selection at
+/// fire time — between the two there may have been a repaint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopPress {
+    /// The first press: nothing has been stopped, and the key is now armed.
+    Armed,
+    /// The second press on the same agent: stop this one.
+    Confirmed(u64),
+    /// There is no selected agent, so there is nothing to arm. Its own answer
+    /// rather than a silent `Armed` that would fire on the next row to appear.
+    NoSelection,
+}
+
+/// The agent view's selection: **which agent** the keys act on.
+///
+/// # Why an id and not a row index
+///
+/// Rows re-group under the cursor while the view is open: an agent that
+/// finishes moves from `working` to `done (unviewed)`, which is a *later*
+/// group in A2's order, so a row index would quietly come to mean a different
+/// agent. The user's next keystroke may be destructive, so the selection is
+/// the agent, and only a repaint that cannot find that agent any more moves
+/// the selection at all.
+///
+/// # Clamping, not wrapping
+///
+/// `↑` on the first row stays on the first row. Wrapping would carry the
+/// cursor from `needs input` — the group that needs you — to `cancelled` in
+/// one keystroke, possibly while the stop key is armed on the row left behind.
+///
+/// # Custody
+///
+/// Nothing here reads a result or touches a handoff: the type holds an id, a
+/// display index and an arming, and A7's acknowledgement stays the peek's
+/// alone.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentSelection {
+    /// The selected agent, absent only while the view has no rows.
+    selected: Option<u64>,
+    /// The selected row's display index at the last sync or move. Consulted
+    /// only when the selected agent has vanished: the selection then falls to
+    /// whatever row holds this index, clamped to the new last row, because
+    /// that is where the user's eye already is.
+    index: usize,
+    /// The agent the stop key is armed on, if any. Keyed by agent for the same
+    /// reason the selection is: an arming must never migrate to another row.
+    armed: Option<u64>,
+}
+
+impl AgentSelection {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The selected agent, or `None` when the view has no rows.
+    pub fn selected(&self) -> Option<u64> {
+        self.selected
+    }
+
+    /// Reconcile the selection with a freshly built row list — every repaint.
+    ///
+    /// A repaint is not a keystroke: it keeps the selection on its agent and
+    /// keeps the stop key's arming. It disarms only when the armed agent is no
+    /// longer the selected one, which is exactly when firing would hit someone
+    /// else.
+    pub fn sync(&mut self, rows: &[AgentRow]) {
+        let order = display_order(rows);
+        if order.is_empty() {
+            self.selected = None;
+            // Back to the first row when rows come back, rather than staying
+            // absent for the rest of the session.
+            self.index = 0;
+        } else if let Some(position) = self
+            .selected
+            .and_then(|id| order.iter().position(|row| *row == id))
+        {
+            self.index = position;
+        } else {
+            self.index = self.index.min(order.len() - 1);
+            self.selected = Some(order[self.index]);
+        }
+        if self.armed != self.selected {
+            self.armed = None;
+        }
+    }
+
+    /// `↓`: the next displayed row, clamping on the last one.
+    pub fn move_down(&mut self, rows: &[AgentRow]) {
+        self.move_by(rows, 1);
+    }
+
+    /// `↑`: the previous displayed row, clamping on the first one.
+    pub fn move_up(&mut self, rows: &[AgentRow]) {
+        self.move_by(rows, -1);
+    }
+
+    fn move_by(&mut self, rows: &[AgentRow], delta: isize) {
+        // Moving is a keystroke, so it disarms whatever the stop key was armed
+        // on — an `x` armed on one agent must not fire on another because a
+        // `↓` happened in between.
+        self.armed = None;
+        let order = display_order(rows);
+        if order.is_empty() {
+            // Neither key invents a selection for an empty view.
+            self.selected = None;
+            self.index = 0;
+            return;
+        }
+        let current = self
+            .selected
+            .and_then(|id| order.iter().position(|row| *row == id))
+            .unwrap_or_else(|| self.index.min(order.len() - 1));
+        let next = if delta < 0 {
+            current.saturating_sub(1)
+        } else {
+            (current + 1).min(order.len() - 1)
+        };
+        self.index = next;
+        self.selected = Some(order[next]);
+    }
+
+    /// Whether the stop key is armed, so the surface can say so.
+    pub fn stop_armed(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    /// Any other keystroke: the arming goes away, as it does for T4-S2's
+    /// two-press `←`.
+    pub fn disarm(&mut self) {
+        self.armed = None;
+    }
+
+    /// A press of the stop key: the first arms, the second on the same agent
+    /// confirms, and confirming disarms so a third press arms again rather
+    /// than firing again.
+    pub fn press_stop(&mut self) -> StopPress {
+        let Some(id) = self.selected else {
+            return StopPress::NoSelection;
+        };
+        if self.armed == Some(id) {
+            self.armed = None;
+            return StopPress::Confirmed(id);
+        }
+        self.armed = Some(id);
+        StopPress::Armed
+    }
+}
+
 /// A parsed A3 filter: `s:<state> n:<text> o:<text> p:<profile>`. Absent keys
 /// do not constrain; present keys are combined with AND.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -257,9 +419,16 @@ fn group_heading(group: &AgentGroup) -> String {
 /// reason this function exists rather than a `format!` at the call site: a
 /// second marker table here is the F2/F38/F45/F57 drift family, and it is also
 /// what keeps a *blocked* agent from rendering identically to a busy one.
-fn agent_line(row: &AgentRow) -> String {
+fn agent_line(row: &AgentRow, selected: bool) -> String {
+    // The selected row is marked in the row's own indent, and the mark is the
+    // `*` `kitsu_render`'s profile list already uses for "the active row of a
+    // list" — no new glyph enters the project's vocabulary, and in particular
+    // no second *state* marker table appears next to `deck_marker`'s. It
+    // replaces an indent space rather than being inserted, so a marked row is
+    // exactly as wide as the row it marks and cannot wrap into the row below.
+    let indent = if selected { "  * " } else { "    " };
     let mut line = format!(
-        "    {} #{} {}",
+        "{indent}{} #{} {}",
         kitsu_render::deck_marker(row.state.deck_state()),
         row.id,
         row.head()
@@ -286,6 +455,27 @@ fn agent_line(row: &AgentRow) -> String {
 /// [`kitsu_render::fit_row_to_width`], and the caller positions them
 /// absolutely — this function knows nothing about the terminal.
 pub fn overlay_rows(rows: Vec<AgentRow>, cols: usize) -> Vec<String> {
+    overlay_rows_selected(rows, cols, None)
+}
+
+/// The overlay's list frame with the selected agent's row marked.
+///
+/// `selected` is an **agent id**, never a row index, for the reason
+/// [`AgentSelection`] gives: rows re-group under the cursor, so an index would
+/// retarget the mark — and the user's next key — onto a different agent. An id
+/// with no row on screen (filtered away, or pruned between the selection and
+/// the paint) marks nothing rather than marking some other row.
+///
+/// With `None` this is byte-identical to [`overlay_rows`], which is the one
+/// renderer: there is no second frame layout here, only the row indent.
+///
+/// Painting a frame — marked or not — reads rows and nothing else. It takes no
+/// custody of any result (A7: the peek is the only acknowledging call site).
+pub fn overlay_rows_selected(
+    rows: Vec<AgentRow>,
+    cols: usize,
+    selected: Option<u64>,
+) -> Vec<String> {
     let count = rows.len();
     let mut out = vec![
         title_row(
@@ -304,7 +494,7 @@ pub fn overlay_rows(rows: Vec<AgentRow>, cols: usize) -> Vec<String> {
     for group in group_rows(rows) {
         out.push(group_heading(&group));
         for row in &group.rows {
-            out.push(agent_line(row));
+            out.push(agent_line(row, selected == Some(row.id)));
         }
         out.push(String::new());
     }
@@ -320,6 +510,10 @@ pub fn overlay_help_rows(cols: usize) -> Vec<String> {
         String::new(),
     ];
     for (key, what) in [
+        (
+            "up/dn",
+            "move the selection; moving disarms a half-pressed stop",
+        ),
         // `space` is listed because T4-S3 wired it and a key that works while
         // being unadvertised is half-shipped (F38's lesson, applied to keys).
         // This literal list is itself the thing T4-S10 replaces with the one
@@ -752,5 +946,424 @@ mod tests {
                 .unwrap_or_else(|error| panic!("s:{} rejected: {error}", state.wire()));
             assert_eq!(filter.state, Some(state));
         }
+    }
+
+    // --- card T4-S4: selection, and the keystroke that arms a destructive key ---
+    //
+    // A3 names `↑/↓ move` and five keys that act on "the selected agent", and
+    // selection state does not exist yet: T4-S3's `Space` peeks the *first*
+    // row because there is nothing to consult. These tests pin the selection
+    // model, which is pure — rows in, a selected id out — so the whole of it
+    // is answerable here and the PTY is left to answer only key routing (the
+    // split T4-S3 made, for the reason it gave: a fixture session has zero
+    // agents).
+    //
+    // # The two decisions A3 does not make, made here
+    //
+    // **Clamping, not wrapping.** `↑` on the first row stays on the first row.
+    // Wrapping would carry the cursor from `needs input` — the group that
+    // needs you — to `cancelled`, the group that needs nobody, in one
+    // keystroke, and it would do so while `x` may be armed on the row left
+    // behind. T4-S2's two-press `←` already set this project's taste for
+    // keystrokes with no surprising long-range effect.
+    //
+    // **Selection is an agent, not a row index.** Rows re-group under the
+    // selection constantly: an agent finishing moves from `working` to `done
+    // (unviewed)`, which in A2's order is a *later* group, so an index-based
+    // selection would quietly retarget the user's next `x` or `p` onto a
+    // different agent. Keying on the id makes that impossible. When the
+    // selected agent is gone entirely (pruned) the selection falls to whatever
+    // row now holds its old display index, clamped to the last row, because
+    // that is the row the user's eye is already on.
+
+    /// The display order the selection walks: `group_rows` flattened. Written
+    /// out in the test rather than read off the model, so a model that walked
+    /// its *input* order instead of A2's grouped order fails here.
+    fn display_ids(rows: &[AgentRow]) -> Vec<u64> {
+        group_rows(rows.to_vec())
+            .into_iter()
+            .flat_map(|group| group.rows.into_iter().map(|row| row.id))
+            .collect()
+    }
+
+    /// `↑/↓` move the selection through the view's **displayed** order, and
+    /// clamp at both ends rather than wrapping.
+    ///
+    /// The clamp is asserted from both ends and with a press to spare, so a
+    /// model that wrapped, or that ran off the end into `None`, fails. The
+    /// non-vacuity is the middle of the test: the same calls really do move
+    /// the selection when there is somewhere to move to.
+    #[test]
+    fn the_selection_moves_with_the_arrow_keys_and_clamps_at_both_ends() {
+        // Deliberately not in A2's order, so walking the input order is wrong.
+        let rows = vec![
+            row(11, AgentViewState::Cancelled),
+            row(22, AgentViewState::NeedsInput),
+            row(33, AgentViewState::Working),
+            row(44, AgentViewState::NeedsInput),
+        ];
+        let order = display_ids(&rows);
+        assert_eq!(
+            order,
+            vec![22, 44, 33, 11],
+            "non-vacuous: the displayed order really differs from the input \
+             order, so the walk below is a claim about grouping"
+        );
+
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&rows);
+        assert_eq!(
+            selection.selected(),
+            Some(order[0]),
+            "a fresh selection sits on the first displayed row, which is what \
+             T4-S3's `Space` already peeks"
+        );
+
+        // Down through every row.
+        for expected in &order[1..] {
+            selection.move_down(&rows);
+            assert_eq!(selection.selected(), Some(*expected));
+        }
+        // Two presses past the end: it stays, it does not wrap and it does not
+        // become absent.
+        for _ in 0..2 {
+            selection.move_down(&rows);
+            assert_eq!(
+                selection.selected(),
+                Some(*order.last().expect("four rows")),
+                "`\u{2193}` on the last row clamps: it must not wrap to the \
+                 first and must not clear the selection"
+            );
+        }
+        // Back up through every row.
+        for expected in order.iter().rev().skip(1) {
+            selection.move_up(&rows);
+            assert_eq!(selection.selected(), Some(*expected));
+        }
+        for _ in 0..2 {
+            selection.move_up(&rows);
+            assert_eq!(
+                selection.selected(),
+                Some(order[0]),
+                "`\u{2191}` on the first row clamps"
+            );
+        }
+
+        // One row: both keys are no-ops that keep the selection, rather than
+        // either key clearing it.
+        let single = vec![row(7, AgentViewState::Working)];
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&single);
+        for _ in 0..2 {
+            selection.move_down(&single);
+            selection.move_up(&single);
+        }
+        assert_eq!(selection.selected(), Some(7));
+
+        // No rows: nothing is selected, and neither key invents a selection.
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&[]);
+        assert_eq!(selection.selected(), None, "an empty view selects nothing");
+        selection.move_down(&[]);
+        selection.move_up(&[]);
+        assert_eq!(selection.selected(), None);
+    }
+
+    /// What the selection means when the list changes under it: it is the
+    /// **agent**, not the row.
+    ///
+    /// Three cases, each a thing that really happens while the view is open:
+    /// the selected agent finishes and changes group; another agent finishes
+    /// and shifts the selected one's display index; the selected agent is
+    /// pruned away. The third is the only one in which the selection moves to
+    /// a different agent, and it moves to a named one rather than to `None`.
+    #[test]
+    fn the_selection_follows_its_agent_when_the_list_regroups_and_falls_down_when_it_vanishes() {
+        let working = vec![
+            row(1, AgentViewState::NeedsInput),
+            row(2, AgentViewState::Working),
+            row(3, AgentViewState::Working),
+        ];
+        assert_eq!(
+            display_ids(&working),
+            vec![1, 2, 3],
+            "non-vacuous: the starting display order is this"
+        );
+
+        // Case 1: the selected agent changes group. `#2` is selected at
+        // display index 1; it finishes, which in A2's order moves it *after*
+        // `#3`. Index-keyed selection would now be pointing at `#3`.
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&working);
+        selection.move_down(&working);
+        assert_eq!(selection.selected(), Some(2));
+        let regrouped = vec![
+            row(1, AgentViewState::NeedsInput),
+            row(2, AgentViewState::DoneUnviewed),
+            row(3, AgentViewState::Working),
+        ];
+        assert_eq!(
+            display_ids(&regrouped),
+            vec![1, 3, 2],
+            "non-vacuous: finishing really did move #2 past #3 in the display \
+             order, so an index-keyed selection would land on #3"
+        );
+        selection.sync(&regrouped);
+        assert_eq!(
+            selection.selected(),
+            Some(2),
+            "the selection is the agent it was put on, wherever its row went: \
+             a `x` or `p` typed now must reach #2 and not #3"
+        );
+
+        // Case 2: a *different* agent moves, shifting the selected one's
+        // display index without the selection changing agent.
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&working);
+        selection.move_down(&working);
+        selection.move_down(&working);
+        assert_eq!(selection.selected(), Some(3));
+        let other_finished = vec![
+            row(1, AgentViewState::NeedsInput),
+            row(2, AgentViewState::DoneUnviewed),
+            row(3, AgentViewState::Working),
+        ];
+        selection.sync(&other_finished);
+        assert_eq!(
+            selection.selected(),
+            Some(3),
+            "#3 is still the selected agent although its display index changed \
+             from 2 to 1"
+        );
+
+        // Case 3: the selected agent is gone. The selection falls to whatever
+        // row now holds its old display index — the next one down — rather
+        // than to nothing and rather than silently to the top.
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&working);
+        selection.move_down(&working);
+        assert_eq!(selection.selected(), Some(2));
+        let pruned = vec![
+            row(1, AgentViewState::NeedsInput),
+            row(3, AgentViewState::Working),
+        ];
+        assert_eq!(display_ids(&pruned), vec![1, 3]);
+        selection.sync(&pruned);
+        assert_eq!(
+            selection.selected(),
+            Some(3),
+            "a pruned selection falls to the row that took its display index"
+        );
+
+        // Case 3b: the *last* row is pruned, so there is no row at its old
+        // index. The selection clamps to the new last row.
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&working);
+        selection.move_down(&working);
+        selection.move_down(&working);
+        assert_eq!(selection.selected(), Some(3));
+        let tail_pruned = vec![
+            row(1, AgentViewState::NeedsInput),
+            row(2, AgentViewState::Working),
+        ];
+        selection.sync(&tail_pruned);
+        assert_eq!(
+            selection.selected(),
+            Some(2),
+            "pruning the last row clamps the selection to the new last row"
+        );
+
+        // Case 3c: everything is gone.
+        selection.sync(&[]);
+        assert_eq!(selection.selected(), None);
+        // And it comes back on the first row when rows come back, rather than
+        // staying absent for the rest of the session.
+        selection.sync(&working);
+        assert_eq!(selection.selected(), Some(1));
+    }
+
+    /// A selection the user cannot see is not a selection. Exactly one
+    /// rendered row is marked, the marked row still carries everything the
+    /// unmarked one did, and the frame for *no* selection is byte-identical to
+    /// the frame [`super::overlay_rows`] already produces — so the two existing
+    /// callers of that function are unaffected and no second renderer appears.
+    #[test]
+    fn exactly_one_rendered_row_is_marked_and_an_unselected_frame_is_the_old_frame() {
+        let rows = vec![
+            row(1, AgentViewState::NeedsInput),
+            row(2, AgentViewState::Working),
+            row(3, AgentViewState::Working),
+        ];
+        const COLS: usize = 100;
+
+        let plain = super::overlay_rows(rows.clone(), COLS);
+        assert_eq!(
+            super::overlay_rows_selected(rows.clone(), COLS, None),
+            plain,
+            "with nothing selected the frame is exactly the frame \
+             `overlay_rows` already prints, so T4-S2's and T4-S3's \
+             measurements of it are untouched"
+        );
+
+        for selected in [1u64, 2, 3] {
+            let marked = super::overlay_rows_selected(rows.clone(), COLS, Some(selected));
+            assert_eq!(
+                marked.len(),
+                plain.len(),
+                "marking a row adds no rows and drops none"
+            );
+            let differing = plain
+                .iter()
+                .zip(marked.iter())
+                .enumerate()
+                .filter(|(_, (before, after))| before != after)
+                .map(|(index, _)| index)
+                .collect::<Vec<usize>>();
+            assert_eq!(
+                differing.len(),
+                1,
+                "exactly one row of the frame may change when agent \
+                 #{selected} is selected; frame:\n{}",
+                marked.join("\n")
+            );
+            let changed = &marked[differing[0]];
+            assert!(
+                plain[differing[0]].contains(&format!("#{selected}")),
+                "the row that changed must be agent #{selected}'s own row, \
+                 but it was {:?}",
+                plain[differing[0]]
+            );
+            // The mark is decoration, not replacement: the row still says
+            // everything it said, in the same spelling.
+            for token in [format!("#{selected}"), "summarize the crate".to_string()] {
+                assert!(
+                    changed.contains(&token),
+                    "the selected row still carries {token:?}: {changed:?}"
+                );
+            }
+            assert_eq!(
+                changed.chars().count(),
+                plain[differing[0]].chars().count(),
+                "the selected row is still fitted to the terminal's width, so \
+                 it cannot wrap into the row below it"
+            );
+        }
+
+        // An id that is not on screen marks nothing — a filtered-away or
+        // just-pruned selection must not paint a mark on some other row.
+        assert_eq!(
+            super::overlay_rows_selected(rows, COLS, Some(9_999)),
+            plain,
+            "an id with no row on screen marks no row at all"
+        );
+    }
+
+    /// `x` is two presses per row, and **any other keystroke disarms** — the
+    /// answer T4-S2 gave for the two-press `←`, followed here rather than a
+    /// second answer being invented.
+    ///
+    /// Moving the selection disarms too, which is the case T4-S2 did not have:
+    /// an `x` armed on one agent must not fire on another because the user
+    /// pressed `↓` in between. That is the one way this affordance could stop
+    /// an agent nobody asked to stop.
+    #[test]
+    fn two_stop_presses_on_one_row_confirm_and_anything_else_disarms() {
+        let rows = vec![
+            row(1, AgentViewState::NeedsInput),
+            row(2, AgentViewState::Working),
+        ];
+
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&rows);
+        assert!(
+            !selection.stop_armed(),
+            "nothing is armed when the view opens"
+        );
+        assert_eq!(
+            selection.press_stop(),
+            super::StopPress::Armed,
+            "the first `x` arms and stops nothing"
+        );
+        assert!(
+            selection.stop_armed(),
+            "and it says so, so the user can tell"
+        );
+        assert_eq!(
+            selection.press_stop(),
+            super::StopPress::Confirmed(1),
+            "the second `x` on the same row confirms, naming the agent it acts \
+             on rather than `the selection` at the time of firing"
+        );
+        assert!(
+            !selection.stop_armed(),
+            "confirming disarms, so a third `x` arms again rather than firing \
+             again"
+        );
+        assert_eq!(selection.press_stop(), super::StopPress::Armed);
+
+        // Any other keystroke disarms.
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&rows);
+        assert_eq!(selection.press_stop(), super::StopPress::Armed);
+        selection.disarm();
+        assert!(!selection.stop_armed());
+        assert_eq!(
+            selection.press_stop(),
+            super::StopPress::Armed,
+            "after a disarm the next `x` arms: it does not fire"
+        );
+
+        // Moving the selection disarms, and the row moved to is not armed.
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&rows);
+        assert_eq!(selection.press_stop(), super::StopPress::Armed);
+        selection.move_down(&rows);
+        assert_eq!(selection.selected(), Some(2));
+        assert!(
+            !selection.stop_armed(),
+            "`\u{2193}` disarms: an `x` armed on #1 must not fire on #2"
+        );
+        assert_eq!(selection.press_stop(), super::StopPress::Armed);
+        assert_eq!(
+            selection.press_stop(),
+            super::StopPress::Confirmed(2),
+            "and the two presses on the new row confirm it, so the disarm \
+             above is a disarm and not a jam"
+        );
+
+        // A re-sync that keeps the selected agent keeps the arming: a repaint
+        // is not a keystroke, and an agent finishing under the cursor must not
+        // silently cancel a stop the user has half-typed.
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&rows);
+        assert_eq!(selection.press_stop(), super::StopPress::Armed);
+        selection.sync(&[
+            row(1, AgentViewState::NeedsInput),
+            row(2, AgentViewState::DoneUnviewed),
+        ]);
+        assert_eq!(
+            selection.press_stop(),
+            super::StopPress::Confirmed(1),
+            "a repaint that kept the selected agent kept its arming"
+        );
+
+        // But a re-sync that *loses* the selected agent disarms, because the
+        // selection now points at a different agent.
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&rows);
+        assert_eq!(selection.press_stop(), super::StopPress::Armed);
+        selection.sync(&[row(2, AgentViewState::Working)]);
+        assert_eq!(selection.selected(), Some(2));
+        assert!(
+            !selection.stop_armed(),
+            "the armed agent is gone, so the arming is gone with it"
+        );
+
+        // With nothing selected there is nothing to arm, and that is its own
+        // answer rather than a silent `Armed`.
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&[]);
+        assert_eq!(selection.press_stop(), super::StopPress::NoSelection);
+        assert!(!selection.stop_armed());
     }
 }
