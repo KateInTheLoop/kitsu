@@ -411,7 +411,7 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   thread means there is nothing left to observe and is treated as viewed —
   though note it is **not a representable DTO** (see **F61**), so that arm is
   defensive rather than reachable.
-- **A3** Keys: `↑/↓` move, `Enter`/`→` attach, `Space` peek, `s` steer
+- **A3** Keys: `↑/↓` move, `Enter`/`→` attach, `Space` peek, `+` dispatch (**added in T4-S7**; A6 named no key and this list was full — see A6 for why `+`), `s` steer
   (prompt for text), `r` reply (only when blocked), `x` stop (twice to prune),
   `n` rename, `p` mark result acknowledged, `/` filter, `?` help, `Esc`
   close. Filter grammar: `s:<state> n:<text> o:<text> p:<profile>`.
@@ -747,6 +747,42 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   Dispatch is admitted by the registry limits (`AgentRegistryLimits`,
   default 8 running / 128 records), **not** by the model's per-turn
   `SpawnBudget`, which exists to stop storming models.
+
+  **Two things this clause got wrong, corrected in T4-S7.** It says *composer*,
+  and the view has no composer — it has **modal edited lines**, so the dispatch
+  is the view's **fourth** (beside `s`'s correction, `n`'s name and `/`'s
+  filter). And it names **no key**, while A3's list was full, so one was chosen
+  here: **`+`**.
+
+  **`+` was picked for a property, not for taste.** It is `0x2b`, **outside the
+  CSI final-byte range `0x40..=0x7e`** — the same property `/` was chosen for,
+  and one that `r`, `s`, `n`, `p` and `x` do not have. That is **F65** (*an arrow
+  key is not one byte*) applied to a new binding instead of rediscovered by it.
+  The key is exported as `DISPATCH_KEY` so the help row, the overlay arm and the
+  tests read one letter and no test spells the character.
+
+  **The dispatch line inherits F72** with the other three: these lines take raw
+  bytes on the byte bypass, so the decoder's unbracketed-burst fallback does not
+  protect them, and on a terminal that does not bracket pastes a pasted task
+  submits at its first newline. Recorded, not fixed here.
+
+  **A dispatch does not move the selection**, on T4-S4a's safety argument: a
+  silent move would repoint the next `x` or `p` at an agent the user never chose.
+
+  **How "not the `SpawnBudget`" is actually satisfied:** by **not plumbing it**.
+  All twelve of its references were enumerated, and **every consumer is a
+  model-facing tool family calling `admit` as its first act** — nothing else in
+  the tree consults it. So `view_dispatcher`'s signature is
+  `spawn_agent_bg_tool_with_binder`'s **minus the budget**, and the claim is
+  pinned in the **positive** form rather than by omission: one budget and one
+  registry, where the model's spawn spends the turn's only credit, **the same
+  handler is then refused**, and the view's dispatch still succeeds with the
+  budget untouched.
+
+  **The over-capacity refusal is painted on the dispatch frame** and the line
+  stays open carrying the task, exactly as `n`'s and `/`'s refusals are
+  (**F71**) — a refusal painted under the row list would be off-screen while a
+  line is open.
 - **A7** Viewing a done agent (peek or attach) MUST transition its handoff to
   `Acknowledged`, exactly as `/jobs show` does (`peek_result` +
   `acknowledge_result`), so the exit guard and strict-automation rules are

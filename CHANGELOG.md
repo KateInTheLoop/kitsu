@@ -113,6 +113,15 @@ shapes may change in any minor release.
   including one whose characters arrive split across reads, and a refused name
   stays on screen with the message so the one wrong character can be corrected
   rather than the whole name retyped.
+- **Start a background agent from the agent view with `+`.** Type a task for the
+  default profile, or `@<profile> <task>` to pick one; `Enter` starts it, `Esc`
+  cancels. A refusal -- an unreadable line, an unknown profile, or the registry at
+  its ceiling -- is reported on the dispatch line itself and **leaves your task
+  there to be corrected** rather than making you retype it. A dispatch you start
+  this way is admitted by kitsu's own limits (8 running / 128 records by default),
+  **not** by the per-turn cap that stops a model spawning agents in a loop -- that
+  cap exists for models, and you are not one. Starting an agent does not move the
+  selection, so your next keystroke still acts on the row you chose.
 - In the agent view, **`/` filters the rows** — `s:<state>`, `n:<text>`,
   `o:<text>` and `p:<profile>`, each confined to its own field. A term it cannot
   read is refused on the spot, naming the key it did not recognise and leaving
