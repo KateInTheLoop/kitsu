@@ -1497,6 +1497,24 @@ Everything else keeps today's editor keymap (`Ctrl+Z` suspend, `Ctrl+\` quit,
 `Ctrl+C` draft-aware, `↑` recall). Bindings are declared in one table consumed
 by the help overlay and `/help keys` so docs cannot drift.
 
+**Three bindings this section promises do not exist (recorded in T4-S10).** There
+is no `Ctrl+X o`, no `Ctrl+X ?` and no `Ctrl+X 1..9`: the composer's chord
+decoder binds exactly **two** letters, `a` (open the agent view) and `d`
+(detach). `Ctrl+X 1..9` is carded separately and cannot be an id — ids pass 9,
+and go *wrong* rather than dead once early agents are pruned — so it must be an
+ordinal over the display order. **`Ctrl+L` does exist**, in both halves, citing
+R8.
+
+So this section's sentence about one table consumed by the help overlay and
+`/help keys` is satisfied today by **exactly those two readers**, and should not
+be read as promising a third surface. **The chords are deliberately not in that
+table yet**: they never reach the overlay's dispatch — a different decoder on a
+different surface — so T4-S10's keyboard sweep, which is the only thing making
+the table more than a literal, cannot reach them. Their labels are also not
+static, since the prefix is configurable, so a chord row's key column is
+computed rather than written. Folding them in would buy one table and lose the
+guard on half of it.
+
 ### 4.8 Configuration
 
 `Config` is `#[serde(deny_unknown_fields)]` and flat today (`agent_spawn_cap`,

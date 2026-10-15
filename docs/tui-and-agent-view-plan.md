@@ -372,7 +372,7 @@ fixtures byte-identical in classic/plain/JSONL; both profiles; `cargo test
 | T4-S8 | Ambient counter ≤ 250 ms in TUI — **A8 was violated at the idle composer**, now driven by `registry.subscribe()`; **F81** | done, this commit | `main.rs`, `tui_bridge.rs` — *corrected: `status.rs` holds no timing, and no "paused clock" exists to pause* | (A8) |
 | **F81 residual** | Mid-turn the approval arm `continue`s before the counts are re-pulled, so the counter freezes while an approval modal is up | **not started** — adjacent to **F54** | — |
 | T4-S9 | Transcript overlay (`Ctrl+O`): scroll, `/`, `n/N`, `{ }`, `v`, `q` over the cell ring | Failing search/jump unit test | `overlay/transcript.rs` | (R6) |
-| T4-S10 | Single bindings table → help overlay + `/help keys` — **note:** the help literal now has **six** rows to absorb (`up/dn`, `space`, `/`, `+`, `?`, `esc`), one added by each of T4-S3, T4-S4a, T4-S5 and T4-S7; docs (`ux-design.md` glyph `◉` row rule, `functionality.md`) | Failing bindings-table test | `kitsu-tui/src/keys.rs`, `docs/` | (§4.7) |
+| T4-S10 | One bindings table in `kitsu-tui/src/keys.rs`, rendered by both the overlay help and `/help keys`; the guard is a **total keyboard sweep**, which found `q`, `Enter` and `→` dispatched and advertised nowhere | done, this commit | `kitsu-tui/src/keys.rs`, `agents_view.rs`, `main.rs`, `docs/` | (§4.7) |
 
 **Exit gate:** fake-provider integration (two agents, one blocks, view shows
 it first, reply, attach, detach, acknowledged); exit guard unchanged; both

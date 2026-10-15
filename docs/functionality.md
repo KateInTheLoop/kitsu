@@ -323,6 +323,12 @@ longer than the limit, or carrying control characters) is reported on the rename
 line itself and leaves what you typed in place to be corrected; `Esc` cancels
 without renaming.
 
+`?` lists every key the view binds, and `/help keys` prints the same list
+without opening the view -- both render one table, so neither can drift from the
+other or from what the keys actually do. `Enter` or `→` attaches to the selected
+agent, `q` closes the view, and `Esc` leaves whatever line or panel is open
+before closing it.
+
 The status row's background-agent counter follows the registry while you are at
 the prompt, not only while a turn is running -- so an agent that parks on a
 permission shows up without you having to touch the keyboard. A registry change

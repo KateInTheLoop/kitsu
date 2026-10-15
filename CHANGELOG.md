@@ -113,6 +113,14 @@ shapes may change in any minor release.
   including one whose characters arrive split across reads, and a refused name
   stays on screen with the message so the one wrong character can be corrected
   rather than the whole name retyped.
+- **`/help keys`** prints the agent view's key bindings without opening the view,
+  and the view's own `?` help now prints the same rows from the same table — so
+  the two can no longer disagree about what a key does.
+- **Fixed:** three keys the agent view has always accepted were advertised
+  nowhere: **`q`** closes the view, and **`Enter`** or **`→`** attaches to the
+  selected agent. All three are now in the help, and a test presses **every** key
+  the view can receive and fails if any of them does something while being
+  undocumented — or is documented while doing nothing.
 - **Fixed:** the background-agent counter on the status row went stale while you
   sat at the prompt. It only refreshed while a turn was running, so an agent that
   blocked waiting for your permission could sit there invisibly until you typed

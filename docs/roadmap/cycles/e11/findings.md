@@ -4041,3 +4041,41 @@ The implementer prototyped the broken shape I asked for — interval returning `
 ### The mid-turn gap stays open
 
 `run_live_typeahead`'s approval arm still `continue`s **before** `sync_agent_counts`, so while an approval modal is up the counter is frozen and the modal's own row shows a stale count. Out of scope here (adjacent to **F54**, whose signal path is still unexplained). The implementer notes the new cadence may now refresh that row **incidentally**, since a registry change wakes the task during a turn too — but **asserted nothing about it and changed nothing in that arm**, which is the right call: an accidental fix is not a tested one.
+
+## F82 — three keys the view always accepted and never advertised, found by sweeping the keyboard
+
+T4-S10's job was to collapse three independent enumerations of the agent view's keys: the help's literal, the dispatch's `match` arms, and **a test's own list** (which meant adding a key to the product and the help but not to that list silently narrowed the test).
+
+**The design question was whether the table could be the dispatch source. It cannot:** `OverlayKey` is private to the binary, and `match` arms are not data, so `kitsu-tui` can neither be the match nor enumerate it. **An exhaustiveness test would have fallen into F57's trap** — a guard that reads the dispatch's own source cannot fail when the dispatch disagrees with it, which is precisely why F57's own guard was unwritable.
+
+### The guard that worked: enumerate the keyboard, not the code
+
+The test presses **every key the decoder can produce** — all of `0x20..=0x7e`, plus `↑ ↓ → Enter Backspace` and a quiet-tick-resolved `Esc` — on a fresh registry and view per key, and asks **the painted frame** whether anything happened (**F71**: never a state field). Then both directions: everything that changes the frame or closes the view must be a table row, and every row must change it.
+
+**It reads neither source, so it cannot agree with the dispatch by construction.** That is F57's trap actually solved rather than worked around.
+
+### What it found
+
+**Fifteen presses are dispatched; the help advertised twelve.** Missing: **`q`** (closes the view), and **`Enter`/`→`** (T4-S6a's attach).
+
+So the shipped view had three keys a user could press and could not discover — **the exact defect T4-S3, T4-S4b, T4-S5 and T4-S7 each closed once, open in triplicate.** Every one of those cards applied the rule *a key that works while unadvertised is half-shipped*, and every one applied it **only to the key it was adding.** Four correct applications of a rule left three violations standing, because nobody enumerated.
+
+**The lesson: a rule applied per-change is not a rule enforced.** The fix was never more diligence per card; it was one test that asks the question for all keys at once.
+
+### What the sweep deliberately does not cover, stated by its author
+
+- **A row wired to the wrong action.** It asks *did something happen*, not *did the right thing happen*; the per-key behaviour tests from the earlier cards remain the only guard on **what** each key does, and they were left untouched.
+- **Keys that act only from a non-fresh state** — inside `r`'s decision read, inside an open line, on `x`'s second press, under the help or a peek panel.
+- **Anything that never reaches the overlay's dispatch**, i.e. the whole composer chord surface.
+
+Naming the gaps is part of the guard being trustworthy: a sweep described as total would invite exactly the false confidence F57, F69 and F75 are about.
+
+### Two corrections to my brief, and one of the agent's own
+
+- **`/help keys` is not a new command.** `/help` is registered and its arm already forwards any argument, so F57's unregistered-arm hazard could not arise. The half that did matter was **registration**: the entry's `args` was `""`, so nothing offered `keys` in `/help`'s listing, the palette or either completion host. Now `"[command|keys]"`.
+- The brief's "three enumerations" undercounted the problem: the collapse **closes three live defects**, not just tidies duplication.
+- **The agent reported that `Ctrl+L` does not exist. It does**, in both halves, citing R8 — I verified before passing the brief on. Three of the four bindings it flagged as phantom are genuinely missing (`Ctrl+X o`, `Ctrl+X ?`, `Ctrl+X 1..9`); that one is not.
+
+### The vacuity guard carried forward unprompted
+
+Last card's result — an acceptance test passing an implementation that painted nothing — shaped this card's main assertion without being asked for. The help-equals-table test adds `!painted.is_empty()`, because **the one way an equality holds vacuously is both sides empty.** The table's rows are also asserted to *have consequences*: a `BindingKind` that is only a struct field fails, since `x`'s text must say "twice", `r`'s must name `y`/`a`/`n`, and the line-openers must carry their grammars.
