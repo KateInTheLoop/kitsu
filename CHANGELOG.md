@@ -92,6 +92,11 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- A background agent that is **waiting for your answer now has its own marker**
+  in `/jobs list`, `/jobs view`, `/jobs show` and `/jobs explain` — `◉`, or
+  `[blk]` under `--plain`. It previously shared the busy agent's marker, so the
+  one agent needing you looked exactly like the ones that did not. No other
+  state's marker changed.
 - `--reduced-motion` (and `KITSU_REDUCED_MOTION=1`) now affects the inline
   viewport, not just the wait indicator: the status row stops repainting just
   because the clock moved. It still updates the moment something actually

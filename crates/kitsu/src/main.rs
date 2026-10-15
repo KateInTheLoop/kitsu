@@ -11376,12 +11376,11 @@ fn agent_deck_state(
     result_collected: bool,
 ) -> kitsu_render::DeckState {
     match status {
-        // A blocked agent is non-terminal, and `kitsu-render` has no
-        // `Blocked` state: the live marker is the honest reuse. `ResultReady`
-        // would imply there is something to collect.
-        subagent::AgentProgressStatus::Running | subagent::AgentProgressStatus::Blocked => {
-            kitsu_render::DeckState::Running
-        }
+        subagent::AgentProgressStatus::Running => kitsu_render::DeckState::Running,
+        // A blocked agent is non-terminal but it needs the user, so it gets
+        // its own marker rather than the busy one (F34). Collection state
+        // cannot move a non-terminal agent, so `result_collected` is ignored.
+        subagent::AgentProgressStatus::Blocked => kitsu_render::DeckState::Blocked,
         subagent::AgentProgressStatus::Done if !result_collected => {
             kitsu_render::DeckState::ResultReady
         }
@@ -11710,8 +11709,10 @@ fn format_steering_receipt(receipt: &subagent::thread::AgentSteeringReceipt) -> 
 /// terminal and the JSONL `thread` payload read identically.
 fn format_agent_thread(snapshot: &subagent::thread::AgentThreadSnapshot) -> String {
     let state = match snapshot.phase {
-        subagent::thread::AgentThreadPhase::Running
-        | subagent::thread::AgentThreadPhase::Blocked => kitsu_render::DeckState::Running,
+        subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+        // F34: the same marker the `/jobs` deck gives a blocked agent, so the
+        // glyph does not depend on which subcommand was typed.
+        subagent::thread::AgentThreadPhase::Blocked => kitsu_render::DeckState::Blocked,
         subagent::thread::AgentThreadPhase::Done
             if snapshot.handoff == subagent::thread::AgentHandoffState::Ready =>
         {
@@ -11802,8 +11803,10 @@ fn format_agent_explain(
     thread: &subagent::thread::AgentThreadSnapshot,
 ) -> String {
     let state = match thread.phase {
-        subagent::thread::AgentThreadPhase::Running
-        | subagent::thread::AgentThreadPhase::Blocked => kitsu_render::DeckState::Running,
+        subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+        // F34: the same marker the `/jobs` deck gives a blocked agent, so the
+        // glyph does not depend on which subcommand was typed.
+        subagent::thread::AgentThreadPhase::Blocked => kitsu_render::DeckState::Blocked,
         subagent::thread::AgentThreadPhase::Done
             if thread.handoff == subagent::thread::AgentHandoffState::Ready =>
         {
@@ -23256,21 +23259,148 @@ mod tests {
         );
     }
 
-    /// The deck row for a blocked agent: a live, non-terminal marker (there is
-    /// no `Blocked` `DeckState`, and B5 does not extend `kitsu-render`), and
-    /// the row's own status word is `blocked`.
+    /// The deck row for a blocked agent: its own `Blocked` marker — **not** the
+    /// busy one — and the row's own status word is `blocked`.
+    ///
+    /// **F34 closes here.** T2-S3 deferred the `kitsu-render` variant and this
+    /// test recorded the deferral by asserting `DeckState::Running`. The
+    /// product legitimately changed: `DeckState::Blocked` now exists, so the
+    /// honest reuse this test documented is no longer the honest answer, and
+    /// the deck row the user has to act on no longer renders identically to one
+    /// that is merely working.
+    ///
+    /// Collection state cannot move a non-terminal agent, so both
+    /// `result_collected` values map the same way.
     #[test]
-    fn the_blocked_deck_row_is_marked_live_and_reads_blocked() {
+    fn the_blocked_deck_row_is_marked_blocked_and_reads_blocked() {
         assert_eq!(
             agent_deck_state(subagent::AgentProgressStatus::Blocked, false),
-            kitsu_render::DeckState::Running
+            kitsu_render::DeckState::Blocked
         );
         assert_eq!(
             agent_deck_state(subagent::AgentProgressStatus::Blocked, true),
-            kitsu_render::DeckState::Running
+            kitsu_render::DeckState::Blocked
         );
         let row = agent_deck_row_block(&blocked_progress(3), false, 2, 6);
         assert!(row.contains("blocked"), "{row}");
+    }
+
+    /// **F34, the visible half.** The whole point is the rendered row, not the
+    /// enum: a blocked row and a running row must not begin with the same
+    /// bytes. Derived from real samples of `agent_deck_row_block`, and compared
+    /// exactly rather than by substring (F41).
+    #[test]
+    fn a_blocked_deck_row_does_not_begin_like_a_running_row() {
+        let blocked = agent_deck_row_block(&blocked_progress(3), false, 2, 6);
+        let mut running_progress = blocked_progress(3);
+        running_progress.status = subagent::AgentProgressStatus::Running;
+        let running = agent_deck_row_block(&running_progress, false, 2, 6);
+
+        let blocked_marker = kitsu_render::deck_marker(kitsu_render::DeckState::Blocked);
+        let running_marker = kitsu_render::deck_marker(kitsu_render::DeckState::Running);
+        assert_ne!(blocked_marker, running_marker);
+
+        // The row's exact first line, not a substring of it. Everything after
+        // the marker is identical between the two fixtures, which is what makes
+        // the marker the only thing distinguishing them.
+        assert_eq!(
+            blocked
+                .lines()
+                .nth(1)
+                .unwrap_or_else(|| panic!("{blocked}")),
+            format!("  {blocked_marker} #3 blocked | reviewer | summarize the crate")
+        );
+        assert_eq!(
+            running
+                .lines()
+                .nth(1)
+                .unwrap_or_else(|| panic!("{running}")),
+            format!("  {running_marker} #3 running | reviewer | summarize the crate")
+        );
+    }
+
+    /// The rest of `agent_deck_state` is unchanged: adding `Blocked` must not
+    /// disturb the four mappings that shipped. Exhaustive over the status
+    /// vocabulary crossed with both collection states, so a fifth status or a
+    /// re-pointed arm cannot slip past.
+    #[test]
+    fn adding_blocked_leaves_every_other_deck_state_mapping_alone() {
+        use kitsu_render::DeckState;
+        use subagent::AgentProgressStatus as Status;
+        let cases = [
+            (Status::Running, false, DeckState::Running),
+            (Status::Running, true, DeckState::Running),
+            (Status::Blocked, false, DeckState::Blocked),
+            (Status::Blocked, true, DeckState::Blocked),
+            (Status::Done, false, DeckState::ResultReady),
+            (Status::Done, true, DeckState::Stopped),
+            (Status::Failed, false, DeckState::Failed),
+            (Status::Failed, true, DeckState::Failed),
+            (Status::Cancelled, false, DeckState::Stopped),
+            (Status::Cancelled, true, DeckState::Stopped),
+        ];
+        for (status, collected, expected) in cases {
+            assert_eq!(
+                agent_deck_state(status, collected),
+                expected,
+                "{status:?} collected={collected}"
+            );
+        }
+    }
+
+    /// The `/jobs` deck still marks every state it renders, with `blocked`
+    /// now a fifth marker in the output rather than a second `◆`, and the
+    /// header counts still sum to `total` with the blocked agent included.
+    ///
+    /// The marker set is compared against `kitsu_render::deck_marker` rather
+    /// than against literal glyphs, so this test cannot drift from the
+    /// vocabulary it is checking.
+    #[test]
+    fn the_jobs_deck_distinguishes_a_blocked_row_from_the_running_rows() {
+        let snapshot = subagent::AgentProgressSnapshot {
+            generation: 1,
+            total: 3,
+            running: 1,
+            done: 0,
+            failed: 0,
+            cancelled: 0,
+            blocked: 2,
+            max_running: 4,
+            max_records: 32,
+            available_running_slots: 3,
+            available_record_slots: 29,
+            agents: Vec::new(),
+        };
+        let counts = jobs_deck_counts(&snapshot);
+        assert!(
+            counts.contains("3 total \u{b7} 1 running \u{b7} 0 done \u{b7} 0 failed \u{b7} 0 cancelled \u{b7} 2 blocked"),
+            "{counts}"
+        );
+        assert_eq!(
+            snapshot.running
+                + snapshot.done
+                + snapshot.failed
+                + snapshot.cancelled
+                + snapshot.blocked,
+            snapshot.total,
+            "the per-state counts must still sum to total: {counts}"
+        );
+
+        let mut running_progress = blocked_progress(4);
+        running_progress.status = subagent::AgentProgressStatus::Running;
+        let blocked_row = agent_deck_row_block(&blocked_progress(3), false, 4, 8);
+        let running_row = agent_deck_row_block(&running_progress, false, 4, 8);
+        let blocked_marker = kitsu_render::deck_marker(kitsu_render::DeckState::Blocked);
+        let running_marker = kitsu_render::deck_marker(kitsu_render::DeckState::Running);
+
+        assert_eq!(
+            blocked_row.lines().nth(1).unwrap(),
+            format!("    {blocked_marker} #3 blocked | reviewer | summarize the crate")
+        );
+        assert_eq!(
+            running_row.lines().nth(1).unwrap(),
+            format!("    {running_marker} #4 running | reviewer | summarize the crate")
+        );
     }
 
     /// The deck header counts gain a `blocked` term after `cancelled`, so the
@@ -23347,7 +23477,7 @@ mod tests {
             "a non-terminal agent has no handoff line: {explain}"
         );
         let body = explain
-            .strip_prefix(&kitsu_render::deck_marker(kitsu_render::DeckState::Running))
+            .strip_prefix(&kitsu_render::deck_marker(kitsu_render::DeckState::Blocked))
             .unwrap_or_else(|| panic!("no deck marker: {explain}"));
         assert!(body.is_ascii(), "{explain}");
     }
@@ -23991,8 +24121,8 @@ mod tests {
             // every byte it adds to the state marker must already be ASCII and
             // every separator must be `|`.
             let marker = kitsu_render::deck_marker(match phase {
-                subagent::thread::AgentThreadPhase::Running
-                | subagent::thread::AgentThreadPhase::Blocked => kitsu_render::DeckState::Running,
+                subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+                subagent::thread::AgentThreadPhase::Blocked => kitsu_render::DeckState::Blocked,
                 subagent::thread::AgentThreadPhase::Done
                     if handoff == subagent::thread::AgentHandoffState::Ready =>
                 {
@@ -27611,7 +27741,7 @@ mod tests {
             "explain names the permission, not the last tool: {explain}"
         );
         let body = explain
-            .strip_prefix(&kitsu_render::deck_marker(kitsu_render::DeckState::Running))
+            .strip_prefix(&kitsu_render::deck_marker(kitsu_render::DeckState::Blocked))
             .unwrap_or_else(|| panic!("no deck marker: {explain}"));
         assert!(body.is_ascii(), "{explain}");
     }

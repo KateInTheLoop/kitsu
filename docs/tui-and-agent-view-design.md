@@ -879,12 +879,40 @@ Backed mostly by existing data: `AgentRegistry::snapshot()`,
   functions over DTOs so they are unit-testable without a terminal.
 - **Row indicators.** Rows use the state **word** (`blocked`, `working`,
   `done`, `viewed`, `failed`, `cancelled`) as the primary indicator, exactly as
-  the `/jobs` deck does, tinted per theme. The only row glyph is `◉` for
-  *blocked* (it is the approval glyph; plain maps it to `o`). `◆`/`◇` keep
-  their `/profiles` capability meaning and `◈` stays the deck/section header;
-  none of them is reused as a row-state glyph, so plain mode never renders a
-  row as `tool>` or `result>`. Any new glyph must be added to
-  `docs/ux-design.md` and `ascii_structural_markers` in the same change.
+  the `/jobs` deck does, tinted per theme. `◉` is the glyph for *blocked* (it is
+  the approval glyph, and a blocked agent **is** a pending approval; plain maps
+  it to `o`).
+
+  **Amended in the marker story, which closes F34 and F3.** This paragraph used
+  to forbid reusing `◆`/`◇`/`◈` as row-state glyphs, "so plain mode never
+  renders a row as `tool>` or `result>`" — a real hazard, since
+  `ascii_structural_markers` maps `◆→*`, `◇→>`, `◈→#`, and `#` is exactly what
+  a plain section header prints.
+
+  **But the ban was the wrong instrument, and the shipped deck had already
+  broken it**: `/jobs` has used `◈` for result-ready rows since D1. The hazard
+  **cannot occur through `deck_marker`**, because it checks `plain` **first**
+  and returns a bracketed ASCII token (`[blk]`, `[run]`, `[rdy]`, `[err]`,
+  `[stp]`) — so a row glyph never reaches the mapper at all. The rule is
+  enforced **structurally** rather than by prohibition.
+
+  So the agent view and the `/jobs` deck share **one** marker vocabulary,
+  `kitsu_render::deck_marker`, which the view reaches through
+  `AgentViewState::deck_state()` — **one function, not two tables that agree
+  today**, because two vocabularies for the same data is the drift this epic has
+  five findings about. `◈` is consequently shared between a section header and a
+  *done (unviewed)* row in the glyph tiers, deliberately, and disambiguated
+  structurally: a header is unindented and word-only, a row is indented and
+  starts `#<id>`.
+
+  `DeckState::Blocked` exists as of that story — this paragraph previously
+  asserted `kitsu-render` had no blocked state, which is no longer true — so a
+  blocked agent is no longer rendered identically to a busy one. All four
+  surfaces agree: `/jobs list`, `/jobs view`, `/jobs show` and `/jobs explain`
+  print `◉` or `[blk]`.
+
+  Any new glyph must still be added to `docs/ux-design.md` and
+  `ascii_structural_markers` in the same change.
 
 ### 4.5 Attach semantics
 
