@@ -16827,12 +16827,33 @@ async fn test_scripted_and_jsonl_runs_are_byte_identical_under_the_default() {
     Mock::given(method("POST"))
         .and(path(CHAT_PATH))
         .and(body_string_contains("\"content\":\"BYTE_IDENTICAL_TASK\""))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "choices": [{
-                "message": {"role": "assistant", "content": "DETACHED_DONE"},
-                "finish_reason": "stop"
-            }]
-        })))
+        // THE DETERMINISM OF THIS TEST LIVES HERE (F39, eight occurrences).
+        // Without this delay the detached agent and the foreground turn race:
+        // the agent needs one round trip to this very mock, the foreground
+        // needs one more, and whichever lands first decides whether
+        // `registry.running()` is still non-zero when input ends. On the
+        // running side the run narrates `input ended with 1 background
+        // agent(s) running; joining them` and `joined 1 background agent(s)
+        // before exit`; on the finished side it narrates neither -- and the
+        // byte comparison below then fails on two lines of correct product
+        // output. The delay does not replace the wait: it only puts the
+        // detached completion behind end-of-input, so the exit join is always
+        // entered and then WAITS on the agent registry's watch channel until
+        // the agent is terminal (`join_background_agents_at_exit`). That is
+        // the synchronisation; one second against an end-of-input that
+        // arrives in single-digit milliseconds is the ordering, and it is far
+        // under the 15s first join heartbeat, which would otherwise add a
+        // `still waiting` line of its own.
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(1))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "DETACHED_DONE"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
         .with_priority(1)
         .mount(&server)
         .await;
@@ -16956,6 +16977,18 @@ async fn test_scripted_and_jsonl_runs_are_byte_identical_under_the_default() {
     .await
     .expect("byte-identical fixture joins");
 
+    // The determinate state the delay above buys: in BOTH scripted runs the
+    // agent is still live when input ends, so the exit join is entered and its
+    // two narration lines are compared rather than coin-flipped. If this ever
+    // trips, the ordering has inverted and the byte comparison below has
+    // quietly stopped covering the join path.
+    for (index, (_, stderr)) in transcripts.iter().take(2).enumerate() {
+        assert!(
+            stderr.contains("input ended with N background agent(s) running; joining them")
+                && stderr.contains("joined N background agent(s) before exit"),
+            "scripted run {index} must reach end-of-input with the agent still joining: {stderr}"
+        );
+    }
     assert_eq!(
         transcripts[0], transcripts[1],
         "an explicit fail_closed must not change one byte of a scripted run"

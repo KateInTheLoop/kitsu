@@ -3645,3 +3645,40 @@ The loop's input dispatch is now one function, `handle_overlay_input`, that both
 Recorded because the pattern has changed character: it is no longer an occasional nuisance but **a red gate on most cards**, which trains the reviewer to wave a failing suite through — exactly the habit F43 and F64 are about. The test-side fix has been "open" for many cards and should be scheduled rather than deferred again.
 
 One process note from this occurrence, reported by the agent rather than hidden: its per-suite output file was **overwritten by the next suite in the same loop**, so it could not name the failing test. F39's own rule is *write full output to a file first and read the file* — the rule needs the second half said out loud: **one file per suite**, or the evidence destroys itself just as surely as a re-run does.
+
+## F39 — RESOLVED, and it was failing far more often than eight times
+
+Scheduled after the eighth occurrence, on the grounds that its cost was no longer the minute it wasted but the review discipline it eroded.
+
+### The diagnosis was right, and verified two ways
+
+**In the code:** `join_background_agents_at_exit` (`main.rs:14066`) takes **one snapshot** — `let running = registry.running(); if running == 0 { return }` — and both narrations (`~ input ended with N background agent(s) running; joining them` and `~ joined N background agent(s) before exit`) hang off it. **In a captured failure:** the transcript diff is *exactly* those two lines and nothing else, with N1's `background_result` present and identical on both sides.
+
+The race is structural: the detached agent needs one round trip to the mock, the foreground needs one more after `spawn_agent_bg` returns, and whichever lands first decides. Both narrations are correct for their timing — **a test synchronisation defect, not a product one.**
+
+### It was 11 failures in 20 standalone runs
+
+Run alone in release, the test failed **11 times out of 20**. The suite had been hiding the frequency behind serial ordering and load, so "eight occurrences" understated it by a wide margin. **A flake's observed rate is a property of how you run it, not of the flake** — which is worth remembering before calling anything rare.
+
+### What was actually impossible, which is the interesting part
+
+The obvious fix — drive the script through `/quit wait` so the agent drains deterministically — **does not work, and was measured failing 7 times in 20.** `await_background_agents` (`main.rs:14018`) has the *same* `if running == 0 { return }` early exit on the *same* snapshot, so the race simply moves to its own narration line.
+
+**Every wait primitive the product exposes narrates conditionally on that one snapshot**, and `agent_result` does not block. So **no script-only sequence can make entry into a wait deterministic.** That left two options: rewrite the test's whole I/O shape (piped stderr, a watcher thread, a gated mock response, and a multi-thread runtime flavour because the detached request precedes the foreground's), or push the detached completion behind end-of-input with a margin.
+
+### Why the margin was accepted, having forbidden sleep-based fixes
+
+My brief said no sleep-based fix, and that a bounded wait must be bounded on an observable condition rather than on time. The accepted fix satisfies that, because the two roles are separate:
+
+- **The synchronisation is condition-based and pre-existing product code** — the join already does `let mut changes = registry.subscribe(); while changes.borrow().running > 0 { … changes.changed() … }`. Verified by reading.
+- **The 1 s mock delay only decides which of two valid orderings occurs**, so the code path that waits on the condition is always entered. It is not `sleep(); assert`.
+
+Three things make it safe rather than merely convenient: the margin is ~200× (1 s against an end-of-input arriving in single-digit milliseconds); it sits well under the 15 s first join heartbeat, which would otherwise inject a variable `still waiting` line; and the test next door already uses the same device for the same purpose (`set_delay(30s)` to guarantee an agent is still running).
+
+**The decisive mitigation is a new assertion, not the delay.** The fix *adds* a guard that both scripted runs must contain both join lines — so if the ordering ever inverts, the test **says so** instead of silently comparing two transcripts that no longer cover the join path. That guard would have failed about half the runs before the fix, which is independent confirmation of the diagnosis. **A time margin that is policed by an assertion is a different thing from a time margin that is trusted.**
+
+Neither compared assertion changed by a byte; nothing was normalised out of the comparison.
+
+### Tally
+
+Baseline release 9/20 pass. `/quit wait` experiment 13/20. **Fix: 40 release and 10 debug runs, 0 failures**, each to its own numbered file, plus three full release suites at 245. My own independent check: 6 release runs green, full release `--test cli` **245**.
