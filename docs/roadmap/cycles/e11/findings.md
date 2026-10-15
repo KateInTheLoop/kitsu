@@ -3175,3 +3175,58 @@ earlier two may well be the same thing wearing different names.
 comparison should wait on a completion signal from the background agent rather
 than on the foreground's own done-marker. Worth a small card, and worth checking
 whether the other byte-identity tests share the pattern.
+
+## F59 — `cargo check` runs build scripts, so "no linker needed" was wrong
+
+The T3-S11 plan row asserts the Windows check needs no toolchain beyond the
+target:
+
+> `rustup target add x86_64-pc-windows-gnu && cargo check --target x86_64-pc-windows-gnu -p kitsu` (**no linker needed**)
+
+**Measured in T3-S11: the target installs fine, and the check fails.** Not at
+link time — `cargo check` indeed does not link — but at **build-script** time:
+
+```
+error: failed to run custom build command for `ring v0.17.14`
+  CC_x86_64-pc-windows-gnu = None
+```
+
+`ring` compiles C, so its build script needs a MinGW cross-compiler
+(`x86_64-w64-mingw32-gcc`), which is not installed here. `cargo check` skips
+**linking**, not **building dependencies' build scripts** — those still run, and
+a build script that invokes a C compiler needs that compiler for the target.
+`ring` arrives via `kitsu-providers`, i.e. through TLS, not through anything the
+TUI touches.
+
+### But the part N6 actually cares about is green, and that was worth measuring
+
+The renderer and viewport crates do not depend on `ring`, and all three
+**compile cleanly for `x86_64-pc-windows-gnu`, zero errors**:
+
+| crate | `cargo check --target x86_64-pc-windows-gnu` |
+|---|---|
+| `kitsu-tui` (holds `viewport.rs`) | **clean** |
+| `kitsu-render` | **clean** |
+| `kitsu-editor` | **clean** |
+
+So **the viewport code is already Windows-portable**, and what blocks the
+whole-binary check is a TLS dependency's C build script — nothing in the
+terminal work. That is a much more useful statement than "the Windows check
+fails".
+
+### Consequences
+
+- The plan row's parenthetical should read **"needs a MinGW cross-compiler for
+  `ring`'s build script"**, not "no linker needed".
+- The `cfg(unix)` narrowing the row also asks for (4 gates in `tui_bridge.rs`,
+  85 in `main.rs`) **cannot be verified here**, because `tui_bridge.rs` lives in
+  the crate that cannot be checked. Narrowing a platform gate without a
+  compiler to prove it is guessing, so it was **not attempted** — it belongs
+  with whoever has the cross-compiler, or with CI.
+- `viewport.rs` has **zero** `cfg(unix)` gates already, which is consistent with
+  it checking clean.
+
+**The reusable lesson:** `cargo check` is not a pure type-check across targets.
+It is a type-check *plus* every dependency build script, and a build script is
+arbitrary code with arbitrary toolchain needs. A cross-target check is only as
+portable as the least portable build script in the tree.
