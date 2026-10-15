@@ -1287,6 +1287,24 @@ Attach does not move the agent to the foreground or take its stdin; it is a
   via `x` in the view or `/jobs stop`). `Ctrl+Z` keeps its existing meaning
   (suspend kitsu) and is not a detach key.
 
+  **`Ctrl+X d` carries the draft; `←` does not need to (F76).** The two routes
+  are **not interchangeable**, and the asymmetry is the point: `←` detaches only
+  on an **empty** composer, so with text typed it is cursor movement and the
+  chord is the **only** route a half-written line has. `InlineRead::Detached`
+  therefore carries the composer's contents, and the loop replays them into the
+  next read.
+
+  The variant's doc comment used to say the draft was not carried back *"because
+  this outcome is only ever reached on an empty one"* — **true of `←`, false of
+  the chord.** A variant documented by the narrowest route that reaches it: the
+  comment was accurate when written and became wrong when a second caller
+  arrived, which is **F69**'s and **F70**'s mechanism one level down, in the type
+  system. The cheap alternative — giving the chord an empty-composer precondition
+  so the comment became true — was **rejected**, because with an empty composer
+  the chord is **already** redundant (`←` detaches on the first press and is not
+  gated by `[tui] left_arrow_opens_agents`), so narrowing it would have left the
+  chord with no case of its own and the non-empty case with no route at all.
+
   **`/detach` is wired (F77, F79).** It answers `detached from agent N; it keeps
   running` and records `{"kind":"detach","agent":N}`; with nothing attached it
   answers `not attached to a background agent` as an error. **The division is

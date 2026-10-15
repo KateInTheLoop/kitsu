@@ -363,10 +363,9 @@ fixtures byte-identical in classic/plain/JSONL; both profiles; `cargo test
 | T4-S6a | Attachment and the keys that enter and leave it: `Enter`/`→`, `←`, `Ctrl+X d`, `/detach`; **rejected once for F75** (the attachment had no reader) and reworked with a carrier out of the overlay | done | this commit |
 | T4-S6b | The routed composer: `steer` when working, `y`/`a`/`n` through the one `parse_permission_answer` when blocked; the `⛩ attach` milestone | **not started** — needs a live correction channel, the fixture problem that split T4-S4b | — |
 | T4-S6c | The bounded 64 KiB foreground buffer and the recap replay on detach | **not started** — disjoint surface (the output sink); may need R6's cell ring | — |
-| **F76** | `Ctrl+X d` discards a non-empty draft — `InlineRead::Detached` carries none, documented by `←`'s empty-composer precondition | **not started** | — |
+| **F76 fixed** | `InlineRead::Detached` carries the draft and `Ctrl+X d` keeps a line in progress; the cheap narrowing was rejected because the chord's only non-redundant case is exactly that one | done | this commit |
 | T4-S6-status | The `attached · agent N` status segment, derived at paint time; **F74** corrected (nine constructions, three exhaustive, `Default` already derived), **F78** measured | done | this commit |
 | **F77 + F79 fixed** | `/detach` wired through a 17th `&mut Option<u64>` on `handle_slash`; `/jobs view` no longer discards the attachment (**F79**, the third consumer of the same exit value); a `#[cfg(test)]` shim removed on review | done | this commit |
-| **F76** | `Ctrl+X d` discards a non-empty draft — `InlineRead::Detached` carries none, documented by `←`'s empty-composer precondition | **not started** | — |
 | T4-S6-ordinal | `Ctrl+X 1..9` as a **1-based ordinal over A2's display order**, never an id | **not started** | — |
 | ~~T4-S6~~ | Attach/detach: `⛩` milestones, routed composer (`steer`, `y/a/n` when blocked), 64 KiB foreground buffer replayed with recap; `Ctrl+X d`, `←`, `/detach`; `Ctrl+C` = clear draft / detach | Failing fake-provider integration test | `tui_bridge.rs`, overlay, `status.rs` | (A5) |
 | T4-S7 | Dispatch from the view composer (`@profile task`) admitted by `AgentRegistryLimits`, not `SpawnBudget` | Failing over-capacity test | `tui_bridge.rs`, `subagent.rs` | (A6) |
