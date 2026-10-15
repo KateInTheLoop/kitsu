@@ -14,7 +14,7 @@
 //! output stays byte-identical.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use owo_colors::OwoColorize;
@@ -47,6 +47,14 @@ struct LiveRowState {
     /// dimmed `[N queued]` tag so the pending stack stays visible after its
     /// receipt scrolls away.
     queued: usize,
+    /// Detached background agents waiting on the user; rendered as a dimmed
+    /// `[N blocked] ` tag leftmost on the status row so an agent that needs
+    /// an answer stays visible after its one-off notice scrolls away.
+    blocked: usize,
+    /// Detached background agents still running; rendered as a dimmed
+    /// `[N agent(s)] ` tag only when nothing is blocked — progress matters
+    /// less than a question the user must answer.
+    running: usize,
     /// Up to the first three queued prompts, rendered as dimmed stack rows
     /// above the status row (the live region's upper rows).
     previews: Vec<String>,
@@ -75,8 +83,27 @@ fn state() -> &'static Mutex<LiveRowState> {
 /// outermost suspension owns the terminal row.
 static SUSPEND_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
+/// Finding F15's off switch: whether a live status row may be painted at all.
+///
+/// Default `true`, so a session without the inline viewport is byte-identical
+/// to the pre-gate renderer. The inline viewport pins its rows outside the
+/// DECSTBM scroll region and suspends nothing, so a live row painted at the
+/// same time lands *inside* the region and either scrolls away with the
+/// transcript or fights the viewport's parked cursor. The viewport wins,
+/// because its bottom rows are exactly where the spinner, draft, queue tag and
+/// ambient agent tag belong, so running both would be duplication before it is
+/// a conflict.
+static LIVE_ROWS_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Turn the live status row on or off process-wide, returning the **previous**
+/// setting so a caller can restore exactly what it displaced rather than a
+/// hardcoded default.
+pub fn set_live_rows_enabled(enabled: bool) -> bool {
+    LIVE_ROWS_ENABLED.swap(enabled, Ordering::AcqRel)
+}
+
 fn live_rows_supported() -> bool {
-    crate::stderr_styled() && !crate::plain_mode()
+    LIVE_ROWS_ENABLED.load(Ordering::Acquire) && crate::stderr_styled() && !crate::plain_mode()
 }
 
 #[cfg(unix)]
@@ -167,9 +194,26 @@ fn fit_draft_window(buffer: &str, cursor: usize, avail: usize) -> (String, usize
 
 /// Compose the styled row and the 1-based cursor column (when a draft is
 /// present). Pure so the layout is unit-testable without a terminal.
+/// The ambient background-agent tag (trailing space included), or `None`
+/// when no detached agent is blocked or running. Blocked outranks running:
+/// an agent waiting on the user is the thing the user must act on. Pure.
+fn agents_tag(blocked: usize, running: usize) -> Option<String> {
+    if blocked > 0 {
+        Some(format!("[{blocked} blocked] "))
+    } else if running == 1 {
+        Some("[1 agent] ".to_string())
+    } else if running > 0 {
+        Some(format!("[{running} agents] "))
+    } else {
+        None
+    }
+}
+
 fn compose_row(
     spinner: Option<&str>,
     draft: Option<&LiveDraft>,
+    blocked: usize,
+    running: usize,
     queued: usize,
     cols: usize,
 ) -> (String, Option<usize>) {
@@ -181,7 +225,12 @@ fn compose_row(
     // trailing space is part of its width.
     let queue_tag = (queued > 0).then(|| format!("[{queued} queued] "));
     let queue_tag_width = queue_tag.as_deref().map(display_width).unwrap_or(0);
-    let prompt_width = display_width(&sanitize_terminal_text(&draft.prompt)) + queue_tag_width;
+    // The background-agent tag sits leftmost of the tags, before the queue
+    // tag; its trailing space is part of its width too.
+    let agents_tag = agents_tag(blocked, running);
+    let agents_tag_width = agents_tag.as_deref().map(display_width).unwrap_or(0);
+    let prompt_width =
+        display_width(&sanitize_terminal_text(&draft.prompt)) + agents_tag_width + queue_tag_width;
     // The spinner yields the row to the draft when both cannot fit.
     let spinner = match (spinner, spinner_width) {
         (Some(segment), Some(width)) if width + 2 + prompt_width + 8 <= cols => {
@@ -229,6 +278,9 @@ fn compose_row(
     if let Some((segment, _)) = spinner {
         row.push_str(segment);
         row.push_str("  ");
+    }
+    if let Some(tag) = agents_tag {
+        row.push_str(&format!("{}", tag.dimmed()));
     }
     if let Some(tag) = queue_tag {
         row.push_str(&format!("{}", tag.dimmed()));
@@ -286,12 +338,14 @@ fn compose_row(
 }
 
 /// The columns available to the draft text on the status row, given the
-/// spinner segment, queue tag, and prompt — the SAME math compose_row uses,
-/// shared so soft-wrap segmentation agrees between the bottom row and the
-/// wrap context rows. Pure.
+/// spinner segment, background-agent tag, queue tag, and prompt — the SAME
+/// math compose_row uses, shared so soft-wrap segmentation agrees between the
+/// bottom row and the wrap context rows. Pure.
 fn draft_segment_width(
     spinner: Option<&str>,
     draft: &LiveDraft,
+    blocked: usize,
+    running: usize,
     queued: usize,
     cols: usize,
 ) -> usize {
@@ -301,7 +355,12 @@ fn draft_segment_width(
     } else {
         0
     };
-    let prompt_width = display_width(&sanitize_terminal_text(&draft.prompt)) + queue_tag_width;
+    let agents_tag_width = agents_tag(blocked, running)
+        .as_deref()
+        .map(display_width)
+        .unwrap_or(0);
+    let prompt_width =
+        display_width(&sanitize_terminal_text(&draft.prompt)) + agents_tag_width + queue_tag_width;
     let lead = match spinner_width {
         Some(width) if width + 2 + prompt_width + 8 <= cols => width + 2,
         _ => 0,
@@ -620,7 +679,14 @@ fn render_region(err: &mut impl Write, row_state: &mut LiveRowState, cols: usize
         let segment_width = if draft.hint_reserved {
             0
         } else {
-            draft_segment_width(row_state.spinner.as_deref(), draft, row_state.queued, cols)
+            draft_segment_width(
+                row_state.spinner.as_deref(),
+                draft,
+                row_state.blocked,
+                row_state.running,
+                row_state.queued,
+                cols,
+            )
         };
         upper.extend(compose_draft_context_rows(
             &draft.buffer,
@@ -632,6 +698,8 @@ fn render_region(err: &mut impl Write, row_state: &mut LiveRowState, cols: usize
     let (status, cursor_col) = compose_row(
         row_state.spinner.as_deref(),
         row_state.draft.as_ref(),
+        row_state.blocked,
+        row_state.running,
         row_state.queued,
         cols,
     );
@@ -710,6 +778,14 @@ pub fn with_live_row_suspended<T>(write: impl FnOnce() -> T) -> T {
     write()
 }
 
+/// The current live-row suspension depth, for tests that must prove a routed
+/// writer balances its own suspension (a leaked one would lift the row for the
+/// rest of the process without failing any other assertion).
+#[cfg(test)]
+pub(crate) fn suspend_depth() -> usize {
+    SUSPEND_DEPTH.load(Ordering::Acquire)
+}
+
 /// Show the input draft on the live row. `prompt` may carry styling; it is
 /// measured through the sanitizer.
 pub fn live_input_begin(prompt: String) {
@@ -760,6 +836,26 @@ pub fn live_queue_state(queued: usize, previews: Vec<String>) {
     redraw();
 }
 
+/// Update the background-agent counts behind the status row's ambient tag:
+/// `blocked` detached agents waiting on the user, `running` ones still
+/// working (0/0 hides the tag). No-op when nothing changed. Unlike
+/// [`live_queue_state`] this touches only the bottom status row, so it leaves
+/// `region_dirty` alone — the collector calls it on every poll tick and a
+/// full-region repaint per count change would be wasted work.
+pub fn live_agents_state(blocked: usize, running: usize) {
+    {
+        let mut row_state = state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if row_state.blocked == blocked && row_state.running == running {
+            return;
+        }
+        row_state.blocked = blocked;
+        row_state.running = running;
+    }
+    redraw();
+}
+
 /// Remove the input draft from the live row (spinner, if any, remains).
 pub fn live_input_end() {
     {
@@ -781,6 +877,28 @@ pub(crate) fn set_spinner_segment(segment: Option<String>) {
         row_state.spinner = segment;
     }
     redraw();
+}
+
+/// Compose the inline viewport's pinned input row: *exactly* the classic
+/// during-turn row for the same draft, minus the spinner and the queue and
+/// agent tags the inline surface does not have.
+///
+/// Additive by design. The inline renderer needs the same hint handling this
+/// module already implements -- a reserved reverse-search status that claims
+/// its columns before the draft is windowed, an unreserved completion suffix
+/// dropped when the row is tight -- and reimplementing that math in `kitsu`
+/// is how the two renderers drift. So the inline path delegates here instead
+/// of concatenating its own row, and `compose_row` stays untouched.
+pub fn compose_input_row(draft: &LiveDraft, cols: usize) -> (String, Option<usize>) {
+    compose_row(None, Some(draft), 0, 0, 0, cols)
+}
+
+/// The width of the terminal the live row draws on, shared so the inline
+/// guard -- which is handed only a row count -- does not re-probe the
+/// terminal itself. A second probe is a second source of truth, which is the
+/// drift this seam exists to prevent. Never 0: the probe falls back to 80.
+pub fn terminal_columns() -> usize {
+    terminal_cols()
 }
 
 #[cfg(test)]
@@ -824,7 +942,7 @@ mod tests {
             cursor: 2,
             ..LiveDraft::default()
         };
-        let (row, col) = compose_row(None, Some(&draft), 0, 80);
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 0, 80);
         assert_eq!(row, "kitsu> abc");
         // 7 prompt columns + 2 chars, 1-based.
         assert_eq!(col, Some(10));
@@ -832,7 +950,7 @@ mod tests {
 
     #[test]
     fn compose_row_spinner_only_has_no_cursor_column() {
-        let (row, col) = compose_row(Some("* thinking"), None, 0, 80);
+        let (row, col) = compose_row(Some("* thinking"), None, 0, 0, 0, 80);
         assert_eq!(row, "* thinking");
         assert_eq!(col, None);
     }
@@ -845,7 +963,7 @@ mod tests {
             cursor: 5,
             ..LiveDraft::default()
         };
-        let (row, col) = compose_row(Some("( .a. ) kitsu is thinking"), Some(&draft), 0, 20);
+        let (row, col) = compose_row(Some("( .a. ) kitsu is thinking"), Some(&draft), 0, 0, 0, 20);
         assert!(!row.contains("thinking"));
         assert!(row.starts_with("kitsu> "));
         assert_eq!(col, Some(13));
@@ -868,7 +986,7 @@ mod tests {
             hint: "ue".to_string(),
             hint_reserved: false,
         };
-        let (row, col) = compose_row(None, Some(&draft), 0, 80);
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 0, 80);
         assert!(row.contains("\u{1b}[2m"), "hint must be dimmed: {row:?}");
         assert!(sanitize_terminal_text(&row).contains("/queue"));
         // Cursor sits right after the typed text, before the hint.
@@ -884,7 +1002,7 @@ mod tests {
             hint: "ue".to_string(),
             hint_reserved: false,
         };
-        let (row, _) = compose_row(None, Some(&mid_cursor), 0, 80);
+        let (row, _) = compose_row(None, Some(&mid_cursor), 0, 0, 0, 80);
         assert!(!row.contains("\u{1b}[2m"), "no hint mid-buffer: {row:?}");
 
         let no_room = LiveDraft {
@@ -895,7 +1013,7 @@ mod tests {
             hint_reserved: false,
         };
         // avail = 10 - 2 - 1 = 7: the buffer exactly fills it.
-        let (row, _) = compose_row(None, Some(&no_room), 0, 10);
+        let (row, _) = compose_row(None, Some(&no_room), 0, 0, 0, 10);
         assert!(
             !row.contains("extra"),
             "hint must never displace text: {row:?}"
@@ -916,7 +1034,7 @@ mod tests {
             hint: "ue".to_string(),
             hint_reserved: false,
         };
-        let (row, _) = compose_row(None, Some(&trimmed), 0, 16);
+        let (row, _) = compose_row(None, Some(&trimmed), 0, 0, 0, 16);
         assert!(
             !row.contains("\u{1b}[2m"),
             "no hint on a windowed draft: {row:?}"
@@ -927,7 +1045,7 @@ mod tests {
             cursor: 34,
             ..trimmed.clone()
         };
-        let (row, _) = compose_row(None, Some(&wrapped), 0, 16);
+        let (row, _) = compose_row(None, Some(&wrapped), 0, 0, 0, 16);
         assert!(row.contains("\u{1b}[2m"), "hint on wrapped tail: {row:?}");
 
         // Unwindowed + literal `…`: the hint still renders.
@@ -938,7 +1056,7 @@ mod tests {
             hint: "ue".to_string(),
             hint_reserved: false,
         };
-        let (row, _) = compose_row(None, Some(&fits), 0, 80);
+        let (row, _) = compose_row(None, Some(&fits), 0, 0, 0, 80);
         assert!(row.contains("\u{1b}[2m"));
     }
 
@@ -950,13 +1068,13 @@ mod tests {
             cursor: 2,
             ..LiveDraft::default()
         };
-        let (row, col) = compose_row(None, Some(&draft), 2, 80);
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 2, 80);
         assert!(sanitize_terminal_text(&row).starts_with("[2 queued] kitsu> abc"));
         assert!(row.contains("\u{1b}[2m"), "tag must be dimmed: {row:?}");
         // "[2 queued] " is 11 columns; 7 prompt + 2 chars + 1 (1-based).
         assert_eq!(col, Some(21));
         // Zero queued: no tag, original column.
-        let (row, col) = compose_row(None, Some(&draft), 0, 80);
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 0, 80);
         assert!(!sanitize_terminal_text(&row).contains("queued"));
         assert_eq!(col, Some(10));
     }
@@ -972,7 +1090,7 @@ mod tests {
             hint: "  ⌕ reverse-search 'match'".to_string(),
             hint_reserved: true,
         };
-        let (row, _) = compose_row(None, Some(&draft), 0, 48);
+        let (row, _) = compose_row(None, Some(&draft), 0, 0, 0, 48);
         let plain = sanitize_terminal_text(&row);
         assert!(
             plain.contains("reverse-search 'match'"),
@@ -984,7 +1102,7 @@ mod tests {
             hint_reserved: false,
             ..draft
         };
-        let (row, _) = compose_row(None, Some(&unreserved), 0, 48);
+        let (row, _) = compose_row(None, Some(&unreserved), 0, 0, 0, 48);
         assert!(!sanitize_terminal_text(&row).contains("reverse-search"));
     }
 
@@ -1038,7 +1156,7 @@ mod tests {
             cursor: 26,
             ..LiveDraft::default()
         };
-        let (row, col) = compose_row(None, Some(&draft), 0, 18);
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 0, 18);
         let plain = sanitize_terminal_text(&row);
         assert!(
             plain.ends_with("uvwxyz"),
@@ -1076,7 +1194,7 @@ mod tests {
             cursor: 12,
             ..LiveDraft::default()
         };
-        let (row, _) = compose_row(None, Some(&draft), 0, 18);
+        let (row, _) = compose_row(None, Some(&draft), 0, 0, 0, 18);
         assert!(
             sanitize_terminal_text(&row).contains('…'),
             "window still used"
@@ -1108,7 +1226,7 @@ mod tests {
             cursor: 28, // end of "third"
             ..LiveDraft::default()
         };
-        let (row, col) = compose_row(None, Some(&draft), 0, 80);
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 0, 80);
         let plain = sanitize_terminal_text(&row);
         assert!(
             plain.contains("third"),
@@ -1284,7 +1402,7 @@ mod tests {
 
     #[test]
     fn queue_tag_only_renders_alongside_a_draft() {
-        let (row, _) = compose_row(Some("* thinking"), None, 3, 80);
+        let (row, _) = compose_row(Some("* thinking"), None, 0, 0, 3, 80);
         assert!(!row.contains("queued"), "spinner-only row carries no tag");
     }
 
@@ -1296,7 +1414,393 @@ mod tests {
             cursor: 0,
             ..LiveDraft::default()
         };
-        let (_, col) = compose_row(None, Some(&draft), 0, 80);
+        let (_, col) = compose_row(None, Some(&draft), 0, 0, 0, 80);
         assert_eq!(col, Some(8));
+    }
+
+    #[test]
+    fn agents_tag_truth_table_ranks_blocked_over_running() {
+        // (blocked, running) -> rendered tag (trailing space included).
+        let cases: &[(usize, usize, Option<&str>)] = &[
+            (0, 0, None),
+            (0, 1, Some("[1 agent] ")),
+            (0, 2, Some("[2 agents] ")),
+            (0, 7, Some("[7 agents] ")),
+            (1, 0, Some("[1 blocked] ")),
+            (3, 0, Some("[3 blocked] ")),
+            // Blocked outranks running: an agent waiting on the user is the
+            // thing the user must act on.
+            (2, 5, Some("[2 blocked] ")),
+            (1, 1, Some("[1 blocked] ")),
+        ];
+        for &(blocked, running, expected) in cases {
+            assert_eq!(
+                agents_tag(blocked, running).as_deref(),
+                expected,
+                "agents_tag({blocked}, {running})"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_tag_renders_dimmed_and_shifts_the_cursor_column() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "abc".to_string(),
+            cursor: 2,
+            ..LiveDraft::default()
+        };
+        let (row, col) = compose_row(None, Some(&draft), 1, 0, 0, 80);
+        assert!(sanitize_terminal_text(&row).starts_with("[1 blocked] kitsu> abc"));
+        assert!(row.contains("\u{1b}[2m"), "tag must be dimmed: {row:?}");
+        // "[1 blocked] " is 12 columns; + 7 prompt + 2 chars + 1 (1-based).
+        assert_eq!(col, Some(12 + 7 + 2 + 1));
+        // Running-only tag is narrower by its wording.
+        let (row, col) = compose_row(None, Some(&draft), 0, 2, 0, 80);
+        assert!(sanitize_terminal_text(&row).starts_with("[2 agents] kitsu> abc"));
+        assert!(row.contains("\u{1b}[2m"), "tag must be dimmed: {row:?}");
+        // "[2 agents] " is 11 columns; + 7 prompt + 2 chars + 1 (1-based).
+        assert_eq!(col, Some(11 + 7 + 2 + 1));
+        // No agents: no tag, original column.
+        let (row, col) = compose_row(None, Some(&draft), 0, 0, 0, 80);
+        assert!(!sanitize_terminal_text(&row).contains("agent"));
+        assert!(!sanitize_terminal_text(&row).contains("blocked"));
+        assert_eq!(col, Some(10));
+    }
+
+    #[test]
+    fn agents_tag_precedes_the_queue_tag_and_both_shift_the_cursor() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "abc".to_string(),
+            cursor: 2,
+            ..LiveDraft::default()
+        };
+        let (row, col) = compose_row(None, Some(&draft), 1, 0, 2, 80);
+        let plain = sanitize_terminal_text(&row);
+        assert_eq!(plain, "[1 blocked] [2 queued] kitsu> abc");
+        assert!(row.contains("\u{1b}[2m"), "tags must be dimmed: {row:?}");
+        // "[1 blocked] " 12 + "[2 queued] " 11 + 7 prompt + 2 chars + 1.
+        assert_eq!(col, Some(12 + 11 + 7 + 2 + 1));
+        // Running-only variant keeps the same ordering.
+        let (row, col) = compose_row(None, Some(&draft), 0, 1, 3, 80);
+        assert_eq!(
+            sanitize_terminal_text(&row),
+            "[1 agent] [3 queued] kitsu> abc"
+        );
+        // "[1 agent] " 10 + "[3 queued] " 11 + 7 + 2 + 1.
+        assert_eq!(col, Some(10 + 11 + 7 + 2 + 1));
+    }
+
+    #[test]
+    fn agents_tag_only_renders_alongside_a_draft() {
+        let (row, col) = compose_row(Some("* thinking"), None, 2, 3, 0, 80);
+        assert_eq!(row, "* thinking");
+        assert_eq!(col, None);
+        assert!(!row.contains("blocked"), "spinner-only row carries no tag");
+        assert!(!row.contains("agent"), "spinner-only row carries no tag");
+    }
+
+    #[test]
+    fn agents_tag_row_never_wraps_across_a_width_sweep() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "the quick brown fox jumps over the lazy dog".to_string(),
+            cursor: 20,
+            ..LiveDraft::default()
+        };
+        for cols in 40usize..=200 {
+            for &(blocked, running, queued) in
+                &[(1usize, 0usize, 2usize), (0, 4, 1), (3, 7, 0), (0, 1, 9)]
+            {
+                let (row, col) = compose_row(
+                    Some("( .a. ) kitsu is thinking"),
+                    Some(&draft),
+                    blocked,
+                    running,
+                    queued,
+                    cols,
+                );
+                let width = display_width(&sanitize_terminal_text(&row));
+                assert!(
+                    width <= cols,
+                    "row wider than {cols} cols ({width}) at ({blocked},{running},{queued}): {row:?}"
+                );
+                let col = col.expect("a draft row always reports a cursor column");
+                assert!(
+                    col >= 1 && col <= cols,
+                    "cursor column {col} outside {cols} cols at ({blocked},{running},{queued})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agents_tag_width_agrees_between_compose_row_and_draft_segment_width() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "abc".to_string(),
+            cursor: 3,
+            ..LiveDraft::default()
+        };
+        let prompt_width = display_width(&draft.prompt);
+        for cols in [40usize, 60, 80, 120] {
+            for &(blocked, running, queued) in &[
+                (0usize, 0usize, 0usize),
+                (1, 0, 0),
+                (0, 1, 0),
+                (0, 2, 0),
+                (2, 5, 3),
+                (0, 0, 2),
+            ] {
+                let tag_width = agents_tag(blocked, running)
+                    .as_deref()
+                    .map(display_width)
+                    .unwrap_or(0);
+                let queue_width = if queued > 0 {
+                    display_width(&format!("[{queued} queued] "))
+                } else {
+                    0
+                };
+                // No spinner, so the lead is 0 and the draft keeps every
+                // column the tags and prompt do not claim, less the one
+                // reserved so an end-of-buffer cursor cannot wrap.
+                let expected = cols.saturating_sub(tag_width + queue_width + prompt_width + 1);
+                assert_eq!(
+                    draft_segment_width(None, &draft, blocked, running, queued, cols),
+                    expected,
+                    "segment width at {cols} cols with ({blocked},{running},{queued})"
+                );
+                // And the row's own arithmetic: the cursor sits one past the
+                // tags, the prompt and the whole (fitting) buffer.
+                let (_, col) = compose_row(None, Some(&draft), blocked, running, queued, cols);
+                assert_eq!(
+                    col,
+                    Some(tag_width + queue_width + prompt_width + display_width(&draft.buffer) + 1),
+                    "cursor column at {cols} cols with ({blocked},{running},{queued})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agents_tag_survives_the_sanitize_round_trip() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "abc".to_string(),
+            cursor: 3,
+            ..LiveDraft::default()
+        };
+        let (row, _) = compose_row(None, Some(&draft), 2, 1, 1, 80);
+        assert!(row.contains("\u{1b}[2m"), "styled row should dim: {row:?}");
+        let plain = sanitize_terminal_text(&row);
+        assert!(plain.contains("[2 blocked] "), "plain tag text: {plain:?}");
+        assert!(
+            !plain.contains('\u{1b}'),
+            "no escape bytes may survive: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_terminal_drops_spinner_but_keeps_draft_and_agents_tag() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "hello".to_string(),
+            cursor: 5,
+            ..LiveDraft::default()
+        };
+        let (row, col) = compose_row(Some("( .a. ) kitsu is thinking"), Some(&draft), 1, 0, 0, 30);
+        let plain = sanitize_terminal_text(&row);
+        assert!(
+            !plain.contains("thinking"),
+            "spinner drops first: {plain:?}"
+        );
+        assert!(plain.starts_with("[1 blocked] kitsu> "), "{plain:?}");
+        assert!(plain.contains("hello"), "draft must survive: {plain:?}");
+        assert!(display_width(&plain) <= 30, "row must not wrap: {plain:?}");
+        // 12 tag + 7 prompt + 5 chars + 1 (1-based).
+        assert_eq!(col, Some(12 + 7 + 5 + 1));
+    }
+
+    /// Finding F15, pinned in the crate that owns the mechanism.
+    ///
+    /// The inline viewport pins its rows outside the DECSTBM scroll region and
+    /// suspends nothing, so a live status row painted at the same time lands
+    /// *inside* the region and either scrolls away with the transcript or
+    /// fights the viewport's parked cursor. The resolution is that the
+    /// viewport replaces the live row, which needs a process-wide off switch
+    /// here: `set_live_rows_enabled` returns the previous setting and
+    /// `live_rows_supported` consults it, so with it off every draw path
+    /// degrades to the same pure bookkeeping a non-TTY session already gets.
+    ///
+    /// CAVEAT on the two global pieces this touches. The setting is
+    /// process-wide and so is the live-row state, so the test restores both,
+    /// and the setting is restored through `RestoreLiveRows` so an assertion
+    /// that panics cannot leave the row disabled for the rest of this test
+    /// binary. No serialisation lock is needed: the other tests in this module
+    /// are pure composers that never consult the gate, and the gate's default
+    /// is enabled, so the only observable window is this test's own body.
+    struct RestoreLiveRows(bool);
+
+    impl Drop for RestoreLiveRows {
+        fn drop(&mut self) {
+            set_live_rows_enabled(self.0);
+        }
+    }
+
+    #[test]
+    fn disabling_the_live_rows_stands_the_row_down_and_re_enabling_restores_it() {
+        let _restore = RestoreLiveRows(set_live_rows_enabled(true));
+
+        // Default enabled: with no viewport the gate is transparent and the
+        // predicate is exactly the pre-F15 expression, so nothing changes byte
+        // for byte for a classic session.
+        assert_eq!(
+            live_rows_supported(),
+            crate::stderr_styled() && !crate::plain_mode(),
+            "enabled, the gate must not alter the supported predicate"
+        );
+
+        // Disabled, the predicate is false unconditionally -- styled TTY or
+        // not -- which is what makes the draw paths inert.
+        let previous = set_live_rows_enabled(false);
+        assert!(
+            previous,
+            "set_live_rows_enabled returns the previous setting"
+        );
+        assert!(
+            !live_rows_supported(),
+            "the live row must not be supported while the viewport owns the rows"
+        );
+
+        // A draft update writes nothing: with the row unsupported, `redraw`
+        // returns before touching the terminal, so no region is ever painted
+        // and `drawn_rows` stays at zero. That counter is the only
+        // process-independent witness of "wrote bytes" available here, since
+        // `redraw` takes the real stderr.
+        live_input_begin("kitsu> ".to_string());
+        live_input_update("hello".to_string(), 5, String::new(), false);
+        assert_eq!(
+            state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .drawn_rows,
+            0,
+            "a draft update must paint no rows while the live row is disabled"
+        );
+        live_input_end();
+
+        // Re-enabling restores the previous behaviour: the predicate is the
+        // bare pre-F15 expression again.
+        let previous = set_live_rows_enabled(true);
+        assert!(!previous, "the disabled setting is reported back");
+        assert_eq!(
+            live_rows_supported(),
+            crate::stderr_styled() && !crate::plain_mode(),
+            "re-enabling restores the original predicate exactly"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The inline viewport's shared composition surface.
+    //
+    // The inline renderer (`KITSU_TUI=inline`) paints its own pinned row and
+    // has no spinner, queue tag or agent tag to place, but it needs exactly
+    // the hint handling this module already implements: a reserved
+    // reverse-search status that claims its columns before the draft is
+    // windowed, and an unreserved slash-completion suffix that is dropped
+    // when the row is tight. Reimplementing that math in `kitsu` is how the
+    // two renderers drift, so the inline path composes through here.
+    //
+    // `compose_input_row` is therefore required to be a thin, *additive*
+    // wrapper over `compose_row` -- test 1 below pins equality with the
+    // classic row rather than re-deriving the expected string, so the two
+    // renderers cannot disagree about a draft they were told the same thing
+    // about.
+    // ------------------------------------------------------------------
+
+    /// The inline row is byte-identical to the classic row for the same
+    /// draft, with no spinner and no tags. Equality against `compose_row`,
+    /// not against a literal: the point is shared composition, so anything
+    /// that makes the inline row differ -- including a future change to
+    /// windowing or hint placement -- must break this.
+    #[test]
+    fn compose_input_row_is_the_classic_row_without_spinner_or_tags() {
+        for (buffer, cursor, hint, reserved, cols) in [
+            ("/s", 2usize, "teer", false, 80usize),
+            ("hello", 5, "", false, 80),
+            (
+                "a long matched history entry, long enough that it must window",
+                61,
+                "  ⌕ reverse-search 'match'",
+                true,
+                64,
+            ),
+            ("abcdefghij", 4, "klm", false, 14),
+        ] {
+            let draft = LiveDraft {
+                prompt: "kitsu> ".to_string(),
+                buffer: buffer.to_string(),
+                cursor,
+                hint: hint.to_string(),
+                hint_reserved: reserved,
+            };
+            assert_eq!(
+                compose_input_row(&draft, cols),
+                compose_row(None, Some(&draft), 0, 0, 0, cols),
+                "the inline row must BE the classic row for {buffer:?} at {cols} cols"
+            );
+        }
+    }
+
+    /// The unreserved slash hint renders dimmed immediately after the draft,
+    /// and the cursor column stays *before* it so typing continues over it.
+    #[test]
+    fn compose_input_row_renders_an_unreserved_hint_dimmed_after_the_draft() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "/s".to_string(),
+            cursor: 2,
+            hint: "teer".to_string(),
+            hint_reserved: false,
+        };
+        let (row, col) = compose_input_row(&draft, 80);
+        assert_eq!(sanitize_terminal_text(&row), "kitsu> /steer");
+        assert!(
+            row.contains("\u{1b}[2mteer"),
+            "hint must be dimmed: {row:?}"
+        );
+        // 7 prompt columns + 2 typed chars, 1-based: before the hint.
+        assert_eq!(col, Some(10));
+    }
+
+    /// The whole point of the reserved flag: a reverse-search status survives
+    /// a draft long enough to compete for every column on the row.
+    #[test]
+    fn compose_input_row_keeps_a_reserved_hint_against_a_competing_draft() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "a very long matched history entry indeed, long enough to window".to_string(),
+            cursor: 63,
+            hint: "  ⌕ reverse-search 'match'".to_string(),
+            hint_reserved: true,
+        };
+        let (row, _) = compose_input_row(&draft, 64);
+        let plain = sanitize_terminal_text(&row);
+        assert!(
+            plain.contains("⌕ reverse-search 'match'"),
+            "the reserved status must survive a windowed draft: {plain:?}"
+        );
+        assert!(plain.contains('…'), "the draft yields columns: {plain:?}");
+        assert!(display_width(&plain) <= 64, "row overflows: {plain:?}");
+    }
+
+    /// The inline guard has no column count of its own (it is handed only a
+    /// row count), so the width probe is shared from here too rather than
+    /// re-ioctl'd in `kitsu`. It must never be 0, or every draft would
+    /// compose to an empty row.
+    #[test]
+    fn terminal_columns_is_never_zero() {
+        assert!(terminal_columns() > 0);
     }
 }

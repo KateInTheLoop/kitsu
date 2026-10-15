@@ -1,6 +1,8 @@
 //! kitsu — CLI entry. MVP target: `kitsu ask --gateway example "hello"` runs the
 //! agent loop against the gateway (Mistral). See docs/architecture.md §6.
 
+mod agent_hook;
+mod agent_state_file;
 mod artifacts;
 mod attachments;
 mod cli;
@@ -15,7 +17,7 @@ mod session_telemetry_render;
 mod skills;
 mod structured_output;
 mod subagent;
-mod typeahead_editor;
+mod tui_bridge;
 mod workspace;
 
 use std::cell::{Cell, RefCell};
@@ -1940,6 +1942,7 @@ fn run() -> Result<(), CliError> {
             runtime.block_on(run_sessions(&cli, *json, command.as_ref()))
         }
         Some(Command::Artifacts { json, command }) => run_artifacts(&cli, *json, command.as_ref()),
+        Some(Command::Agents { json, all }) => run_agents(&cli, *json, *all),
         Some(Command::Chat {
             prompt,
             no_tools,
@@ -2886,6 +2889,26 @@ fn skip_reason(generation: &artifacts::Generation) -> String {
             "no lock file and younger than the {}s liveness grace period",
             artifacts::UNLOCKED_GRACE_SECS
         ),
+    }
+}
+
+/// `kitsu agents`: the background agents every kitsu on this machine is
+/// publishing. Host-only and read-only — it opens no provider, makes no
+/// inference request, needs no config, and reclaims no state file.
+fn run_agents(cli: &Cli, json: bool, all: bool) -> Result<(), CliError> {
+    reject_jsonl_for_management(cli, "kitsu agents --json")?;
+    let entries = agent_state_file::list_entries(
+        &agent_state_file::state_dir(),
+        all,
+        &agent_state_file::process_is_alive,
+    );
+    if json {
+        // A listing like `kitsu sessions --json`: the bare array, with no
+        // action envelope.
+        print_json(&entries)
+    } else {
+        println!("{}", agent_state_file::format_agents_listing(&entries));
+        Ok(())
     }
 }
 
@@ -4499,6 +4522,13 @@ struct ChatSetup {
     /// falls back to the mode default (interactive 8, scripted/piped 2);
     /// `--agent-spawn-cap` overrides.
     agent_spawn_cap: Option<u32>,
+    /// Config-level `[agents] state_file` mode deciding whether this process
+    /// publishes the per-process agent state hint file.
+    agent_state_file: crate::config::StateFileMode,
+    /// Config-level `[hooks] on_agent_state` command, already split into argv
+    /// (requirement H3). `None` when absent, empty, or unsplittable, so an
+    /// unusable command is a no-op rather than a per-boundary parse attempt.
+    agent_state_hook: Option<Vec<String>>,
     /// Effective run-level policy for Kitsu-created automatic output
     /// artifacts. This never changes explicit session, credential, `-o`, or
     /// model filesystem destinations.
@@ -5223,7 +5253,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "agents",
-        args: "[id]",
+        args: "[view|<id>|any /jobs subcommand]",
         description: "backward-compatible alias for /jobs",
         details: "",
         group: CommandGroup::AgentsJobs,
@@ -5375,7 +5405,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "jobs",
-        args: "[list|show <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>]",
+        args: "[list|view|show <id>|explain <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>]",
         description: "inspect, steer, stop, prune, and close background agent threads",
         details: "The agent deck: every background agent thread with state glyphs (filled = running, hollow = spent, half = result awaiting pickup), token/tool telemetry, and ids for /agent.",
         group: CommandGroup::AgentsJobs,
@@ -5945,6 +5975,208 @@ fn read_chat_line(
         Err(rustyline::error::ReadlineError::Eof) => ChatReadline::Eof,
         Err(rustyline::error::ReadlineError::Interrupted) => ChatReadline::Interrupted,
         Err(error) => ChatReadline::Error(error.to_string()),
+    }
+}
+
+/// The idle prompt's reader: the inline one when the viewport is installed on
+/// an interactive terminal, rustyline otherwise.
+///
+/// History comes from rustyline either way — `add_history_entry` still runs on
+/// every submitted line — so Up/Down at the inline prompt walks the same list,
+/// even though rustyline's own composer never runs.
+#[cfg(unix)]
+fn read_idle_chat_line(
+    editor: &mut rustyline::Editor<ChatHelper, rustyline::history::DefaultHistory>,
+    bridge: Option<&tui_bridge::BridgeGuard>,
+    prompt: &str,
+    assistive: bool,
+    initial: &str,
+) -> ChatReadline {
+    if let Some(bridge) = bridge {
+        // Assistive and non-TTY carriers keep their existing readers: neither
+        // can be painted into a viewport row.
+        if !assistive && kitsu_render::stdin_is_tty() && kitsu_render::stderr_styled() {
+            let history: Vec<String> = editor.history().iter().cloned().collect();
+            return read_chat_line_inline(bridge, prompt, &history, initial);
+        }
+    }
+    read_chat_line(editor, prompt, assistive, initial)
+}
+
+/// The inline mode's idle prompt (story T0-S5d): one line read through
+/// [`tui_bridge::read_line_inline`] instead of rustyline, with the draft
+/// painted onto the pinned viewport row.
+///
+/// # Raw mode is `RawStdinGuard`'s, and only `RawStdinGuard`'s
+///
+/// The guard clears `ICANON`, `ECHO` and `ISIG` in `c_lflag` and leaves
+/// `c_oflag` alone, so `OPOST`/`ONLCR` stay on and the binary's several
+/// hundred direct `println!`/`eprintln!` writers keep getting a carriage
+/// return with every line feed. Enabling a second, fuller raw mode here
+/// (crossterm's, which clears `OPOST`) would staircase all of them down the
+/// screen, so this path engages the existing guard and nothing else.
+///
+/// Because `ISIG` is masked, Ctrl+C arrives as a byte rather than a signal.
+/// On an empty draft the reader reports `Interrupted` and this caller raises
+/// the `SIGINT` the kernel would have sent — the same division of labour the
+/// during-turn collector uses. Termios is restored first: unlike the
+/// collector, this function returns rather than continuing to read, so it must
+/// not hand back a terminal that is still raw.
+///
+/// Known preview gaps, carded rather than fixed here: no Tab completion and no
+/// slash-command palette at the idle prompt. **History persistence is not one
+/// of them** — an earlier version of this comment said it was, wrongly. Inline
+/// mode borrows rustyline's persistence wholesale without running its
+/// composer: `load_history` seeds the editor at startup, `read_idle_chat_line`
+/// hands the inline reader that same list, and `add_history_entry` sits on the
+/// common path after the read, so a line submitted here is saved like any
+/// other. Reverse search works too, **including** its status indicator, which
+/// the hint slot now carries.
+///
+/// Still missing here, and they are **not** one cause — an earlier version of
+/// this comment claimed they were, wrongly. The hint slot carries one line
+/// beside the draft, so widening it restored the reverse-search status and the
+/// inline slash-completion suffix, and nothing else. What remains:
+///
+/// * **Tab completion.** `EditorAction::CompleteRequest` is still dropped here.
+///   Reaching parity with the during-turn row is small — see
+///   `update_live_row`'s neighbourhood, where the whole of Tab is seven lines
+///   that append the showing hint to the buffer.
+/// * **The `@file` and slash-palette completion lists.** Rustyline helper
+///   surfaces that draw over several rows, so they need a viewport taller than
+///   one row and belong with the multi-row composer.
+#[cfg(unix)]
+fn read_chat_line_inline(
+    bridge: &tui_bridge::BridgeGuard,
+    prompt: &str,
+    history: &[String],
+    initial: &str,
+) -> ChatReadline {
+    use std::io::Read as _;
+
+    // A draft carried over from the during-turn live editor is replayed into
+    // the editor as if it had just been typed, which keeps the "typing is
+    // never dropped" contract the rustyline path has. Finding F21 reuses the
+    // same replay for a draft that survived a suspend, which is why this is a
+    // `mut` binding and the read below sits in a loop.
+    let mut carried = initial.to_string();
+    // Raw mode spans the read, but not the *whole* function any more: a
+    // suspend must hand a canonical terminal back to the shell before the
+    // process stops and re-engage after it is foregrounded. So the guard
+    // lives in an `Option` owned by this frame rather than being bound once:
+    // every `return` below drops it (restoring termios), the suspend path
+    // takes it out before the stop and puts a fresh one back after, and a
+    // re-engage that fails leaves it `None` and returns. No path can therefore
+    // return with raw mode still engaged.
+    let mut raw: Option<RawStdinGuard> = None;
+    loop {
+        if raw.is_none() {
+            match RawStdinGuard::engage() {
+                Some(guard) => raw = Some(guard),
+                None => {
+                    return ChatReadline::Error("failed to switch stdin to raw mode".to_string())
+                }
+            }
+        }
+        let mut input = std::io::Cursor::new(carried.clone().into_bytes()).chain(std::io::stdin());
+        let outcome = {
+            let mut paint = |draft: &str, cursor: usize, hint: &str, hint_reserved: bool| {
+                bridge.paint_draft(prompt, draft, cursor, hint, hint_reserved)
+            };
+            tui_bridge::read_line_inline(&mut input, &mut paint, history)
+        };
+        // Whatever happened, the row must not keep showing a draft that is
+        // gone. On the suspend path the release below clears the row anyway,
+        // but doing it here keeps the invariant on every outcome.
+        bridge.paint_draft(prompt, "", 0, "", false);
+        // Finding F21: Ctrl+Z. The reader is pure, so the whole suspend is
+        // sequenced here, through the seam that makes the ordering testable.
+        if let Ok(tui_bridge::InlineRead::Suspended(draft)) = outcome {
+            let mut effects = InlineSuspendEffects {
+                bridge,
+                raw: &mut raw,
+            };
+            if !tui_bridge::suspend_and_resume(&mut effects) {
+                return ChatReadline::Error(
+                    "failed to switch stdin back to raw mode after a suspend".to_string(),
+                );
+            }
+            // Resume reading with the draft preserved: it replays through the
+            // same cursor-chain as a carried-over draft, so typing survives a
+            // suspend/resume cycle.
+            carried = draft;
+            continue;
+        }
+        return read_chat_line_inline_outcome(outcome);
+    }
+}
+
+/// The non-suspend outcomes of one inline read, split out so the loop above
+/// reads as the sequencing it is.
+#[cfg(unix)]
+fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead>) -> ChatReadline {
+    match outcome {
+        Ok(tui_bridge::InlineRead::Submitted(line)) => ChatReadline::Line(line),
+        Ok(tui_bridge::InlineRead::Eof) => ChatReadline::Eof,
+        // Handled by the caller's loop before this is reached.
+        Ok(tui_bridge::InlineRead::Suspended(_)) => ChatReadline::Eof,
+        Ok(tui_bridge::InlineRead::Interrupted) => {
+            // Deliberately NOT re-raising SIGINT here, unlike the during-turn
+            // collector. The collector raises because a turn is in flight and
+            // the signal is what cancels it; at an idle prompt there is
+            // nothing to cancel, and every `ctrl_c()` in this binary sits
+            // inside a `select!` scoped to one operation rather than being a
+            // process-lifetime handler -- so at the *first* idle prompt no
+            // handler is installed and the raise would take the default
+            // disposition and kill kitsu. Classic mode prints `^C` and keeps
+            // the session, so raising here would make Ctrl+C mean "exit" in
+            // inline mode and "clear the line" in classic. `Interrupted` is
+            // handled by the caller, which prints exactly that notice.
+            ChatReadline::Interrupted
+        }
+        Err(error) => ChatReadline::Error(error.to_string()),
+    }
+}
+
+/// The real [`tui_bridge::SuspendEffects`]: the viewport guard for the screen
+/// and the frame's `RawStdinGuard` slot for termios (finding F21).
+#[cfg(unix)]
+struct InlineSuspendEffects<'a> {
+    bridge: &'a tui_bridge::BridgeGuard,
+    raw: &'a mut Option<RawStdinGuard>,
+}
+
+#[cfg(unix)]
+impl tui_bridge::SuspendEffects for InlineSuspendEffects<'_> {
+    fn release_viewport(&mut self) {
+        self.bridge.release_for_suspend();
+    }
+
+    fn restore_terminal_modes(&mut self) {
+        // Dropping the guard is the restore: canonical mode, `ISIG` back on
+        // and bracketed paste off. It must happen before the stop, so the
+        // shell does not inherit a raw terminal.
+        self.raw.take();
+    }
+
+    fn stop_process(&mut self) {
+        // SAFETY: raising a default-disposition job-control signal
+        // in-process, exactly as the during-turn collector does. The region
+        // is already released and termios already canonical, so the shell
+        // takes over a normal full-screen terminal. This blocks here until
+        // the job is foregrounded again (SIGCONT).
+        unsafe {
+            libc::raise(libc::SIGTSTP);
+        }
+    }
+
+    fn reengage_terminal_modes(&mut self) -> bool {
+        *self.raw = RawStdinGuard::engage();
+        self.raw.is_some()
+    }
+
+    fn reinstall_viewport(&mut self) {
+        self.bridge.reinstall_after_resume();
     }
 }
 
@@ -9394,6 +9626,13 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         auth_status,
         workspace_evidence: config.workspace_evidence.unwrap_or(true),
         agent_spawn_cap: config.agent_spawn_cap,
+        agent_state_file: config.agents.unwrap_or_default().state_file,
+        agent_state_hook: config
+            .hooks
+            .unwrap_or_default()
+            .on_agent_state
+            .as_deref()
+            .and_then(agent_hook::split_command),
         artifact_policy,
         artifact_policy_source,
         context_window,
@@ -10970,19 +11209,11 @@ fn agent_activity_child_row(activity: Option<&str>, ms_ago: Option<u64>, plain: 
     }
 }
 
-/// Human `/jobs list`. Rendered from the same progress snapshot the JSONL
-/// `command_result` payload is built from, using the DTO's own status spellings
-/// — no `{:?}` reaches the terminal.
-fn format_jobs(registry: &subagent::AgentRegistry) -> String {
-    let snapshot = registry.progress_snapshot();
-    let ready = registry
-        .thread_snapshots()
-        .into_iter()
-        .filter(|thread| thread.handoff == subagent::thread::AgentHandoffState::Ready)
-        .map(|thread| thread.id)
-        .collect::<std::collections::HashSet<_>>();
-    let mut output = kitsu_render::deck_header(&format!(
-        "agent deck — {} total · {} running · {} done · {} failed · {} cancelled · {} running slot(s) free · {} record slot(s) free",
+/// The deck's shared count line: one expression so the flat deck and the
+/// grouped view can never disagree on the numbers they report.
+fn jobs_deck_counts(snapshot: &subagent::AgentProgressSnapshot) -> String {
+    format!(
+        "{} total \u{b7} {} running \u{b7} {} done \u{b7} {} failed \u{b7} {} cancelled \u{b7} {} running slot(s) free \u{b7} {} record slot(s) free",
         snapshot.total,
         snapshot.running,
         snapshot.done,
@@ -10990,94 +11221,200 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
         snapshot.cancelled,
         snapshot.available_running_slots,
         snapshot.available_record_slots,
+    )
+}
+
+/// One agent's deck row and its continuation lines, shared by `/jobs list`
+/// (indents 2/6) and `/jobs view` (indents 4/8) so the two renderings can
+/// never drift in content.
+fn agent_deck_row_block(
+    agent: &subagent::AgentProgress,
+    result_collected: bool,
+    row_indent: usize,
+    continuation_indent: usize,
+) -> String {
+    let row = " ".repeat(row_indent);
+    let cont = " ".repeat(continuation_indent);
+    let model = if agent.telemetry.model.is_empty() {
+        "unknown".to_string()
+    } else {
+        terminal_inline(&agent.telemetry.model)
+    };
+    let activity = agent
+        .telemetry
+        .last_activity
+        .as_deref()
+        .map(terminal_inline)
+        .unwrap_or_else(|| "none".to_string());
+    let failure = agent
+        .telemetry
+        .failure_class
+        .map(|class| format!(" | failure {class}"))
+        .unwrap_or_default();
+    let route = match (
+        agent.telemetry.route_generation,
+        agent.telemetry.route_generation_mismatch,
+    ) {
+        (Some(generation), false) => format!(" | route gen {generation}"),
+        (Some(generation), true) => format!(" | route gen {generation} (mismatch observed)"),
+        (None, true) => " | route generation mismatch observed".to_string(),
+        (None, false) => String::new(),
+    };
+    let bytes = agent
+        .result_bytes
+        .map(|bytes| format!(" | result {bytes} B"))
+        .unwrap_or_default();
+    let state = agent_deck_state(agent.status, result_collected);
+    let profile = agent
+        .profile
+        .as_deref()
+        .map(terminal_inline)
+        .unwrap_or_else(|| "default profile".to_string());
+    let mut output = format!(
+        "\n{row}{} #{} {} | {} | {}\n{cont}{:.1}s | model {}{} | tokens {}/{}/{} | tools {} | writes {} | last {}{}{}",
+        kitsu_render::deck_marker(state),
+        agent.id,
+        agent_progress_status_label(agent.status),
+        profile,
+        terminal_inline(&agent.task),
+        agent.elapsed_ms as f64 / 1000.0,
+        model,
+        route,
+        agent.telemetry.prompt_tokens,
+        agent.telemetry.completion_tokens,
+        agent.telemetry.total_tokens,
+        agent.telemetry.tool_count,
+        agent.telemetry.write_count,
+        activity,
+        failure,
+        bytes,
+    );
+    if agent.telemetry.recent_activity.len() > 1 {
+        let recent = agent
+            .telemetry
+            .recent_activity
+            .iter()
+            .map(|activity| terminal_inline(activity))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        output.push_str(&format!("\n{cont}recent {recent}"));
+    }
+    if state == kitsu_render::DeckState::ResultReady {
+        output.push_str(&format!(
+            "\n{cont}result ready and not yet collected - /jobs show {}",
+            agent.id
+        ));
+    }
+    if matches!(agent.status, subagent::AgentProgressStatus::Running) {
+        output.push_str(&format!(
+            "\n{cont}{}",
+            agent_activity_child_row(
+                agent.telemetry.last_activity.as_deref(),
+                agent.last_activity_ms_ago,
+                kitsu_render::plain_mode(),
+            )
+        ));
+        output.push_str(&format!(
+            "\n{cont}partial response text withheld until the job is terminal"
+        ));
+    }
+    output
+}
+
+/// Agents whose Done result is still awaiting pickup, so a row can tell
+/// "result ready" from "collected".
+fn jobs_ready_handoff_ids(registry: &subagent::AgentRegistry) -> std::collections::HashSet<u64> {
+    registry
+        .thread_snapshots()
+        .into_iter()
+        .filter(|thread| thread.handoff == subagent::thread::AgentHandoffState::Ready)
+        .map(|thread| thread.id)
+        .collect()
+}
+
+const JOBS_EMPTY_DECK_LINE: &str =
+    "\n  no background agents \u{2014} ask the model to delegate work, or see /profiles";
+
+/// Human `/jobs list`. Rendered from the same progress snapshot the JSONL
+/// `command_result` payload is built from, using the DTO's own status spellings
+/// — no `{:?}` reaches the terminal.
+fn format_jobs(registry: &subagent::AgentRegistry) -> String {
+    let snapshot = registry.progress_snapshot();
+    let ready = jobs_ready_handoff_ids(registry);
+    let mut output = kitsu_render::deck_header(&format!(
+        "agent deck \u{2014} {}",
+        jobs_deck_counts(&snapshot)
     ));
     if snapshot.agents.is_empty() {
-        output.push_str(
-            "\n  no background agents — ask the model to delegate work, or see /profiles",
-        );
+        output.push_str(JOBS_EMPTY_DECK_LINE);
         return output;
     }
-    for agent in snapshot.agents {
-        let model = if agent.telemetry.model.is_empty() {
-            "unknown".to_string()
-        } else {
-            terminal_inline(&agent.telemetry.model)
-        };
-        let activity = agent
-            .telemetry
-            .last_activity
-            .as_deref()
-            .map(terminal_inline)
-            .unwrap_or_else(|| "none".to_string());
-        let failure = agent
-            .telemetry
-            .failure_class
-            .map(|class| format!(" | failure {class}"))
-            .unwrap_or_default();
-        let route = match (
-            agent.telemetry.route_generation,
-            agent.telemetry.route_generation_mismatch,
-        ) {
-            (Some(generation), false) => format!(" | route gen {generation}"),
-            (Some(generation), true) => format!(" | route gen {generation} (mismatch observed)"),
-            (None, true) => " | route generation mismatch observed".to_string(),
-            (None, false) => String::new(),
-        };
-        let bytes = agent
-            .result_bytes
-            .map(|bytes| format!(" | result {bytes} B"))
-            .unwrap_or_default();
-        let state = agent_deck_state(agent.status, !ready.contains(&agent.id));
-        let profile = agent
-            .profile
-            .as_deref()
-            .map(terminal_inline)
-            .unwrap_or_else(|| "default profile".to_string());
-        output.push_str(&format!(
-            "\n  {} #{} {} | {} | {}\n      {:.1}s | model {}{} | tokens {}/{}/{} | tools {} | writes {} | last {}{}{}",
-            kitsu_render::deck_marker(state),
-            agent.id,
-            agent_progress_status_label(agent.status),
-            profile,
-            terminal_inline(&agent.task),
-            agent.elapsed_ms as f64 / 1000.0,
-            model,
-            route,
-            agent.telemetry.prompt_tokens,
-            agent.telemetry.completion_tokens,
-            agent.telemetry.total_tokens,
-            agent.telemetry.tool_count,
-            agent.telemetry.write_count,
-            activity,
-            failure,
-            bytes,
+    for agent in &snapshot.agents {
+        output.push_str(&agent_deck_row_block(
+            agent,
+            !ready.contains(&agent.id),
+            2,
+            6,
         ));
-        if agent.telemetry.recent_activity.len() > 1 {
-            let recent = agent
-                .telemetry
-                .recent_activity
-                .iter()
-                .map(|activity| terminal_inline(activity))
-                .collect::<Vec<_>>()
-                .join(" -> ");
-            output.push_str(&format!("\n      recent {recent}"));
+    }
+    output
+}
+
+/// Which `/jobs view` group one agent belongs to. `needs input` is
+/// unreachable today — no agent state parks on a user answer yet — so the
+/// group is never produced, and a later story only has to add its arm.
+fn jobs_view_group(agent: &subagent::AgentProgress, result_collected: bool) -> &'static str {
+    match agent.status {
+        subagent::AgentProgressStatus::Running => "working",
+        subagent::AgentProgressStatus::Done if !result_collected => "done, result ready",
+        subagent::AgentProgressStatus::Done => "done, collected",
+        subagent::AgentProgressStatus::Failed => "failed",
+        subagent::AgentProgressStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Human `/jobs view`: the same rows the flat deck prints, grouped by state in
+/// a fixed order with empty groups omitted. Headings bypass `deck_header`, so
+/// they are pure ASCII in every output tier.
+fn format_jobs_view(registry: &subagent::AgentRegistry) -> String {
+    let snapshot = registry.progress_snapshot();
+    let ready = jobs_ready_handoff_ids(registry);
+    let mut output = kitsu_render::deck_header(&format!(
+        "agent deck by state \u{2014} {}",
+        jobs_deck_counts(&snapshot)
+    ));
+    if snapshot.agents.is_empty() {
+        output.push_str(JOBS_EMPTY_DECK_LINE);
+        return output;
+    }
+    // `needs input` is unreachable today: no agent state parks on a user
+    // answer yet. The group stays so a later story only supplies the state.
+    const GROUPS: [&str; 6] = [
+        "needs input",
+        "working",
+        "done, result ready",
+        "done, collected",
+        "failed",
+        "cancelled",
+    ];
+    for heading in GROUPS {
+        let members = snapshot
+            .agents
+            .iter()
+            .filter(|agent| jobs_view_group(agent, !ready.contains(&agent.id)) == heading)
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            continue;
         }
-        if state == kitsu_render::DeckState::ResultReady {
-            output.push_str(&format!(
-                "\n      result ready and not yet collected - /jobs show {}",
-                agent.id
+        debug_assert!(heading.is_ascii(), "deck group headings stay ASCII");
+        output.push_str(&format!("\n  {heading} ({})", members.len()));
+        for agent in members {
+            output.push_str(&agent_deck_row_block(
+                agent,
+                !ready.contains(&agent.id),
+                4,
+                8,
             ));
-        }
-        if matches!(agent.status, subagent::AgentProgressStatus::Running) {
-            output.push_str(&format!(
-                "\n      {}",
-                agent_activity_child_row(
-                    agent.telemetry.last_activity.as_deref(),
-                    agent.last_activity_ms_ago,
-                    kitsu_render::plain_mode(),
-                )
-            ));
-            output.push_str("\n      partial response text withheld until the job is terminal");
         }
     }
     output
@@ -11212,6 +11549,123 @@ fn format_agent_thread(snapshot: &subagent::thread::AgentThreadSnapshot) -> Stri
     output
 }
 
+/// Human `/jobs explain <id>`, borrowed from herdr's `agent explain`: why is
+/// this agent in this state, since when, and what is it waiting on.
+///
+/// Deliberately *not* `/jobs show`: no timeline, no task text, no result, and
+/// no acknowledgement. Two ages appear in two formats on purpose. `since` is a
+/// run duration and keeps the one decimal this file uses throughout; an
+/// activity age goes through `kitsu_render::format_wait_elapsed`, which
+/// truncates to whole seconds, because that is what the deck's own activity
+/// line shows. They are not unified.
+///
+/// The output does not pass through `sanitize_plain_inline`, so every static
+/// byte here is ASCII and every separator is `|`; user-supplied text is routed
+/// through `terminal_inline`.
+fn format_agent_explain(
+    progress: &subagent::AgentProgress,
+    thread: &subagent::thread::AgentThreadSnapshot,
+) -> String {
+    let state = match thread.phase {
+        subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+        subagent::thread::AgentThreadPhase::Done
+            if thread.handoff == subagent::thread::AgentHandoffState::Ready =>
+        {
+            kitsu_render::DeckState::ResultReady
+        }
+        subagent::thread::AgentThreadPhase::Done => kitsu_render::DeckState::Stopped,
+        subagent::thread::AgentThreadPhase::Failed => kitsu_render::DeckState::Failed,
+        subagent::thread::AgentThreadPhase::Cancelled => kitsu_render::DeckState::Stopped,
+    };
+    let running = matches!(thread.phase, subagent::thread::AgentThreadPhase::Running);
+    let elapsed = thread.elapsed_ms as f64 / 1000.0;
+    let mut output = format!(
+        "{} agent #{} explained | {}",
+        kitsu_render::deck_marker(state),
+        thread.id,
+        thread.phase.label(),
+    );
+
+    if running {
+        output.push_str(&format!("\n  since: started {elapsed:.1}s ago"));
+    } else {
+        output.push_str(&format!("\n  since: ran {elapsed:.1}s"));
+    }
+
+    let activity = progress.telemetry.last_activity.as_deref().map(|label| {
+        let label = terminal_inline(label);
+        match progress.last_activity_ms_ago {
+            Some(ms) => format!(
+                "{label} ({} ago)",
+                kitsu_render::format_wait_elapsed(std::time::Duration::from_millis(ms))
+            ),
+            None => label,
+        }
+    });
+
+    if running {
+        match activity.as_deref() {
+            Some(activity) => output.push_str(&format!("\n  waiting on: {activity}")),
+            None => output.push_str("\n  waiting on: no activity recorded yet"),
+        }
+    } else {
+        if matches!(thread.phase, subagent::thread::AgentThreadPhase::Failed) {
+            if let Some(class) = progress.telemetry.failure_class {
+                output.push_str(&format!("\n  because: {class}"));
+            }
+        }
+        // `AgentProgress::last_activity_ms_ago` is doc-commented "(running
+        // rows)" but is in fact populated for terminal agents too, which this
+        // line's age depends on. Narrowing it to match that comment would
+        // silently drop the age here.
+        if let Some(activity) = activity.as_deref() {
+            output.push_str(&format!("\n  last activity: {activity}"));
+        }
+    }
+
+    if running {
+        if thread.steering_open {
+            output.push_str(&format!(
+                "\n  steering: open | {} queued",
+                thread.pending_steering
+            ));
+        } else {
+            output.push_str("\n  steering: closed");
+        }
+    } else {
+        let handoff = match thread.handoff {
+            subagent::thread::AgentHandoffState::Ready => {
+                format!("ready | result not collected, see /jobs show {}", thread.id)
+            }
+            subagent::thread::AgentHandoffState::Acknowledged => {
+                "acknowledged | result already collected".to_string()
+            }
+            subagent::thread::AgentHandoffState::Unavailable => "unavailable".to_string(),
+        };
+        output.push_str(&format!("\n  handoff: {handoff}"));
+    }
+
+    output
+}
+
+/// `/jobs explain <id>` for both dispatchers: `None` for an unknown id.
+///
+/// Read-only by construction. It never calls `acknowledge_result` and never
+/// calls `result`, which acknowledges too, so diagnosing an agent cannot take
+/// custody of its result and defeat the exit guard on unviewed results.
+///
+/// There is no per-id progress accessor, so the matching progress record is
+/// found by scan; the registry caps records at 128, so this is bounded.
+fn agent_explain_view(registry: &subagent::AgentRegistry, id: u64) -> Option<String> {
+    let thread = registry.thread_snapshot(id)?;
+    let progress = registry
+        .progress_snapshot()
+        .agents
+        .into_iter()
+        .find(|agent| agent.id == id)?;
+    Some(format_agent_explain(&progress, &thread))
+}
+
 async fn handle_jobs_command(
     registry: &Arc<subagent::AgentRegistry>,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
@@ -11225,6 +11679,15 @@ async fn handle_jobs_command(
             Ok(serde_json::json!({
                 "kind": "jobs",
                 "action": "list",
+                "changed": false,
+                "snapshot": jobs_snapshot_payload(registry),
+            }))
+        }
+        "view" if parts.next().is_none() => {
+            eprintln!("{}", format_jobs_view(registry));
+            Ok(serde_json::json!({
+                "kind": "jobs",
+                "action": "view",
                 "changed": false,
                 "snapshot": jobs_snapshot_payload(registry),
             }))
@@ -11260,6 +11723,33 @@ async fn handle_jobs_command(
                 "id": id,
                 "thread": subagent::thread::AgentThreadSnapshotDto::from_snapshot(&thread),
                 "result": result,
+                "handoff": registry.handoff_state(id),
+                "snapshot": jobs_snapshot_payload(registry),
+            }))
+        }
+        "explain" => {
+            let Some(id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+                eprintln!("usage: /jobs explain <id>");
+                return Err(());
+            };
+            if parts.next().is_some() {
+                eprintln!("usage: /jobs explain <id>");
+                return Err(());
+            }
+            let Some(explanation) = agent_explain_view(registry, id) else {
+                eprintln!("no background job #{id}");
+                return Err(());
+            };
+            eprintln!("{explanation}");
+            Ok(serde_json::json!({
+                "kind": "jobs",
+                "action": "explain",
+                "changed": false,
+                "id": id,
+                "thread": registry
+                    .thread_snapshot(id)
+                    .as_ref()
+                    .map(subagent::thread::AgentThreadSnapshotDto::from_snapshot),
                 "handoff": registry.handoff_state(id),
                 "snapshot": jobs_snapshot_payload(registry),
             }))
@@ -11422,7 +11912,7 @@ async fn handle_jobs_command(
             if let Some(suggestion) = closest_jobs_subcommand(action) {
                 eprintln!("unknown action '{action}' - did you mean '{suggestion}'?");
             }
-            eprintln!("usage: /jobs [list|show <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>]");
+            eprintln!("usage: /jobs [list|view|show <id>|explain <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>]");
             Err(())
         }
     }
@@ -13628,6 +14118,7 @@ fn handle_active_jobs_command(
     let mut parts = argument.split_whitespace();
     match parts.next().unwrap_or("list") {
         "list" if parts.next().is_none() => Ok(format_jobs(registry)),
+        "view" if parts.next().is_none() => Ok(format_jobs_view(registry)),
         "show" => {
             let id = parts
                 .next()
@@ -13648,6 +14139,16 @@ fn handle_active_jobs_command(
                 let _ = registry.acknowledge_result(id);
             }
             Ok(output)
+        }
+        "explain" => {
+            let id = parts
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| "usage: /jobs explain <id>".to_string())?;
+            if parts.next().is_some() {
+                return Err("usage: /jobs explain <id>".to_string());
+            }
+            agent_explain_view(registry, id).ok_or_else(|| format!("no background job #{id}"))
         }
         "steer" => {
             let id = parts
@@ -13691,7 +14192,7 @@ fn handle_active_jobs_command(
             ))
         }
         _ => Err(
-            "active-turn controls: /jobs [list|show <id>|steer <id> <text>|stop <id>|stop-all]"
+            "active-turn controls: /jobs [list|view|show <id>|explain <id>|steer <id> <text>|stop <id>|stop-all]"
                 .to_string(),
         ),
     }
@@ -14067,8 +14568,8 @@ struct ActionEffects {
 /// the newest queued prompt plus the remaining count, if any.
 #[cfg(unix)]
 fn resolve_editor_actions(
-    editor: &mut typeahead_editor::TypeaheadEditor,
-    outcome: typeahead_editor::FeedOutcome,
+    editor: &mut kitsu_editor::TypeaheadEditor,
+    outcome: kitsu_editor::FeedOutcome,
     result: &mut TypeaheadCaptureResult,
     mut dispatch: impl FnMut(&str, &mut TypeaheadCaptureResult),
     mut recall_pop: impl FnMut() -> Option<(String, usize)>,
@@ -14079,7 +14580,7 @@ fn resolve_editor_actions(
     };
     for action in outcome.actions {
         match action {
-            typeahead_editor::EditorAction::Submit(line) => {
+            kitsu_editor::EditorAction::Submit(line) => {
                 let line = line.trim().to_string();
                 if line.is_empty() {
                     continue;
@@ -14088,19 +14589,19 @@ fn resolve_editor_actions(
                 // Enqueues and /queue edits both move the pending count.
                 effects.queue_touched = true;
             }
-            typeahead_editor::EditorAction::Eof => {
+            kitsu_editor::EditorAction::Eof => {
                 result.eof = true;
             }
-            typeahead_editor::EditorAction::Interrupt => {
+            kitsu_editor::EditorAction::Interrupt => {
                 effects.raise_signal = Some(libc::SIGINT);
             }
-            typeahead_editor::EditorAction::Suspend => {
+            kitsu_editor::EditorAction::Suspend => {
                 effects.raise_signal = Some(libc::SIGTSTP);
             }
-            typeahead_editor::EditorAction::Quit => {
+            kitsu_editor::EditorAction::Quit => {
                 effects.raise_signal = Some(libc::SIGQUIT);
             }
-            typeahead_editor::EditorAction::CompleteRequest => {
+            kitsu_editor::EditorAction::CompleteRequest => {
                 // Tab accepts the inline slash hint, if one is showing.
                 let buffer = editor.buffer_string();
                 let hint = typeahead_slash_hint(&buffer);
@@ -14109,7 +14610,7 @@ fn resolve_editor_actions(
                     effects.needs_redraw = true;
                 }
             }
-            typeahead_editor::EditorAction::RecallRequest => {
+            kitsu_editor::EditorAction::RecallRequest => {
                 // ↑ on an empty draft: pull the newest queued prompt back
                 // into the editor (it leaves the queue — the draft is now
                 // its only copy; submitting re-enqueues it at the back,
@@ -14129,7 +14630,7 @@ fn resolve_editor_actions(
                     }
                     None => {
                         // Queue empty: plain history walk, as before.
-                        let mut forced = typeahead_editor::FeedOutcome::default();
+                        let mut forced = kitsu_editor::FeedOutcome::default();
                         editor.history_prev_forced(&mut forced);
                     }
                 }
@@ -14144,7 +14645,7 @@ fn resolve_editor_actions(
 /// reverse-search status while Ctrl+R is active, the inline slash hint
 /// otherwise.
 #[cfg(unix)]
-fn update_live_row(editor: &typeahead_editor::TypeaheadEditor) {
+fn update_live_row(editor: &kitsu_editor::TypeaheadEditor) {
     let buffer = editor.buffer_string();
     let search_status = editor.search_status();
     let hint_reserved = search_status.is_some();
@@ -14184,7 +14685,7 @@ fn typeahead_slash_hint(buffer: &str) -> String {
 }
 
 /// The live during-turn editor: raw stdin bytes feed the pure
-/// [`typeahead_editor::TypeaheadEditor`], and the draft renders on the shared
+/// [`kitsu_editor::TypeaheadEditor`], and the draft renders on the shared
 /// status row with a real cursor, ↑/↓ history, and editable text — while
 /// streamed output and tool receipts keep flowing above it. Approval prompts
 /// take stdin back by claiming `APPROVAL_INPUT_ACTIVE`: raw mode is released
@@ -14204,7 +14705,7 @@ fn run_live_typeahead(
         live: true,
         ..TypeaheadCaptureResult::default()
     };
-    let mut editor = typeahead_editor::TypeaheadEditor::with_draft(history, initial_draft);
+    let mut editor = kitsu_editor::TypeaheadEditor::with_draft(history, initial_draft);
     let mut raw = Some(raw);
     // Consecutive no-data poll timeouts; the lone-Esc resolver requires two.
     let mut quiet_ticks = 0u32;
@@ -14215,10 +14716,19 @@ fn run_live_typeahead(
         drop(queue);
         live::live_queue_state(queued, previews);
     };
+    // The ambient background-agent tag: a cheap `watch` borrow of a `Copy`
+    // snapshot, so polling it per tick costs nothing and the tag tracks
+    // reality within one poll interval.
+    let sync_agent_counts = |dispatcher: &TypeaheadDispatcher| {
+        let agents = dispatcher.registry.snapshot();
+        live::live_agents_state(agents.blocked, agents.running);
+    };
     // Depth first, paint second: the row's first frame must reflect the
     // real queue, not the previous turn's persisted count (the main loop
-    // dequeues between turns, so the stored value can be stale here).
+    // dequeues between turns, so the stored value can be stale here). The
+    // agent counts are synced ahead of the first paint for the same reason.
     sync_queue_depth(dispatcher);
+    sync_agent_counts(dispatcher);
     live::live_input_begin(prompt.clone());
     update_live_row(&editor);
     while !stop.load(Ordering::Acquire) {
@@ -14253,6 +14763,11 @@ fn run_live_typeahead(
         if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
             continue;
         }
+        // We own stdin and the row is painted: refresh the ambient agent tag
+        // once per poll tick. Deliberately after the approval checks, so no
+        // work happens while the approval reader owns the terminal and the
+        // row is torn down.
+        sync_agent_counts(dispatcher);
 
         let mut descriptor = libc::pollfd {
             fd: libc::STDIN_FILENO,
@@ -15709,6 +16224,89 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         None
     };
 
+    // The per-process agent state file (`[agents] state_file`). The carrier
+    // rule lives entirely in `should_write`, so this is the only gate: a
+    // second check here would make an explicit `on` unobservable in the
+    // scripted and piped carriers that reach this point. The guard removes the
+    // file however this function returns, and writing is best effort — every
+    // error is dropped, because a hint must never cost a turn.
+    let agent_state_pid = std::process::id();
+    let agent_state_dir = agent_state_file::state_dir();
+    let agent_state_enabled = agent_state_file::should_write(
+        setup.agent_state_file,
+        PROCESS_INFERENCE_CARRIER.get().copied(),
+    );
+    let _agent_state_guard = agent_state_enabled
+        .then(|| agent_state_file::StateFileGuard::new(agent_state_dir.clone(), agent_state_pid));
+
+    // The inline viewport preview (`KITSU_TUI=inline`, T0-S5a). Held for the
+    // whole session so the scroll region is released on every exit path. With
+    // the variable unset the mode is classic, `install` writes nothing and
+    // touches no global state, so the session is byte-identical.
+    #[cfg(unix)]
+    let tui_bridge_guard = {
+        let mode = tui_bridge::mode_from_value(std::env::var_os("KITSU_TUI").as_deref());
+        // A failed geometry probe (not a terminal, or an ioctl refusal) falls
+        // back to the conventional 80x24, the same fallback the renderer's own
+        // width probe uses.
+        let (_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        tui_bridge::install(
+            mode,
+            rows,
+            1,
+            "kitsu",
+            Box::new(std::io::stdout()),
+            Box::new(std::io::stderr()),
+        )
+    };
+    let publish_agent_state = |turn_active: bool| {
+        if !agent_state_enabled {
+            return;
+        }
+        let payload = agent_state_file::build(
+            &agent_registry,
+            agent_state_pid,
+            session.directory.display().to_string(),
+            session.session_id.borrow().clone(),
+            turn_active,
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
+        let _ = agent_state_file::write(&agent_state_dir, agent_state_pid, &payload);
+    };
+    // The agent state hook (`[hooks] on_agent_state`, requirement H3). It is
+    // independent of the state file above: a user may want the notification
+    // without the file, so this is gated only on a usable command. The
+    // previous observations live beside the closure, because firing is driven
+    // by the change between two boundaries, never by an agent's presence.
+    let agent_hook_argv = setup.agent_state_hook.clone();
+    let previous_agent_observations: std::cell::RefCell<Vec<agent_hook::AgentObservation>> =
+        std::cell::RefCell::new(Vec::new());
+    let fire_agent_state_hooks = || {
+        let Some(argv) = agent_hook_argv.as_ref() else {
+            return;
+        };
+        let current = agent_registry
+            .progress_snapshot()
+            .agents
+            .into_iter()
+            .map(|progress| agent_hook::AgentObservation {
+                id: progress.id,
+                state: agent_hook::agent_state_label(progress.status),
+                waiting_for: progress.telemetry.last_activity,
+            })
+            .collect::<Vec<_>>();
+        let mut previous = previous_agent_observations.borrow_mut();
+        for event in agent_hook::transitions(&previous, &current) {
+            agent_hook::fire(argv, &event);
+        }
+        *previous = current;
+    };
+    // The session's own boundary: idle, before any carrier-specific driver
+    // runs. Scripted, piped and one-shot carriers never reach the interactive
+    // turn boundaries below, so this is the one hint they publish.
+    publish_agent_state(false);
+    fire_agent_state_hooks();
+
     // Scripted mode: run turns from a file non-interactively, then exit. Works
     // regardless of TTY, so it's the deterministic multi-turn driver.
     if let Some(path) = script {
@@ -16561,6 +17159,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let mut run_aggregate = InteractiveRunAggregate::default();
 
     loop {
+        // Turn boundary: the previous turn has ended and nothing is running, so
+        // the hint is refreshed as idle before the next prompt is collected.
+        publish_agent_state(false);
+        fire_agent_state_hooks();
         let agent_snapshot = agent_registry.snapshot();
         if !agent_notifications_live {
             if let Some(message) = background_agent_notice(last_agent_snapshot, agent_snapshot) {
@@ -16611,34 +17213,46 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 run_aggregate.observe_cleanup(cleanup);
                 break;
             }
-            (None, None) => match read_chat_line(
-                &mut rl,
-                &visible_prompt,
-                assistive_input,
-                &std::mem::take(&mut pending_draft),
-            ) {
-                ChatReadline::Line(line) => line,
-                ChatReadline::Eof => {
-                    let running = agent_registry.running();
-                    if running > 0 {
-                        eprintln!(
+            (None, None) => {
+                let initial = std::mem::take(&mut pending_draft);
+                // Inline mode replaces rustyline on this path rather than
+                // adding to it: two composers drawing a draft at once would
+                // put one copy inside the scroll region and one on the pinned
+                // row.
+                #[cfg(unix)]
+                let read = read_idle_chat_line(
+                    &mut rl,
+                    tui_bridge_guard.as_ref(),
+                    &visible_prompt,
+                    assistive_input,
+                    &initial,
+                );
+                #[cfg(not(unix))]
+                let read = read_chat_line(&mut rl, &visible_prompt, assistive_input, &initial);
+                match read {
+                    ChatReadline::Line(line) => line,
+                    ChatReadline::Eof => {
+                        let running = agent_registry.running();
+                        if running > 0 {
+                            eprintln!(
                             "exit waiting for {running} background agent(s); detached work will not be discarded"
                         );
-                        exit_after_queue = true;
+                            exit_after_queue = true;
+                            continue;
+                        }
+                        break;
+                    }
+                    ChatReadline::Interrupted => {
+                        eprintln!("^C (input cleared; Ctrl+D or /quit exits)");
                         continue;
                     }
-                    break;
+                    ChatReadline::Error(error) => {
+                        run_aggregate.record_non_success(kitsu_core::RunOutcomeClass::UserFault);
+                        eprintln!("input error: {error}");
+                        break;
+                    }
                 }
-                ChatReadline::Interrupted => {
-                    eprintln!("^C (input cleared; Ctrl+D or /quit exits)");
-                    continue;
-                }
-                ChatReadline::Error(error) => {
-                    run_aggregate.record_non_success(kitsu_core::RunOutcomeClass::UserFault);
-                    eprintln!("input error: {error}");
-                    break;
-                }
-            },
+            }
         };
         let line = line.trim().to_string();
         if line.is_empty() {
@@ -17166,6 +17780,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let (steering_turn, steering_receiver) = steering
             .begin_turn()
             .expect("interactive turns open steering sequentially");
+        // Turn boundary: a turn is now active, so the hint flips to working
+        // before any inference begins.
+        publish_agent_state(true);
+        fire_agent_state_hooks();
         foreground_typeahead_active.store(true, Ordering::Release);
         // A styled interactive session gets the live raw-mode editor (visible
         // draft + history on the status row); scripted/plain/assistive
@@ -17807,7 +18425,9 @@ fn closest_slash_command(name: &str) -> Option<&'static str> {
 fn closest_jobs_subcommand(name: &str) -> Option<&'static str> {
     const SUBCOMMANDS: &[&str] = &[
         "list",
+        "view",
         "show",
+        "explain",
         "steer",
         "close-steering",
         "stop",
@@ -18796,13 +19416,14 @@ async fn handle_slash(
             return SlashResult::Continue(Some(agent_profiles_payload(&session.agent_profiles)));
         }
         "agents" => {
+            // Any other argument is forwarded verbatim: /jobs owns the
+            // did-you-mean suggester and the usage line.
             let command = if arg.is_empty() {
                 "list".to_string()
             } else if arg.parse::<u64>().is_ok() {
                 format!("show {arg}")
             } else {
-                eprintln!("usage: /agents [id] (or use /jobs for controls)");
-                return SlashResult::Error;
+                arg.to_string()
             };
             return match handle_jobs_command(registry, journal, &command).await {
                 Ok(mut payload) => {
@@ -20482,7 +21103,7 @@ mod tests {
 
     #[cfg(unix)]
     fn resolve(
-        editor: &mut typeahead_editor::TypeaheadEditor,
+        editor: &mut kitsu_editor::TypeaheadEditor,
         bytes: &[u8],
         queue: &mut prompt_queue::PromptQueue,
         dispatched: &mut Vec<String>,
@@ -20508,7 +21129,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn action_resolution_dispatches_trimmed_submissions_and_touches_the_queue() {
-        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut editor = kitsu_editor::TypeaheadEditor::new(Vec::new());
         let mut queue = prompt_queue::PromptQueue::new(4);
         let mut dispatched = Vec::new();
         let (effects, result) = resolve(&mut editor, b"  hello  \r\r", &mut queue, &mut dispatched);
@@ -20523,7 +21144,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn action_resolution_recall_pops_newest_and_falls_back_to_history() {
-        let mut editor = typeahead_editor::TypeaheadEditor::new(vec!["from history".to_string()]);
+        let mut editor = kitsu_editor::TypeaheadEditor::new(vec!["from history".to_string()]);
         let mut queue = prompt_queue::PromptQueue::new(4);
         queue.enqueue("older").unwrap();
         queue.enqueue("newest").unwrap();
@@ -20534,7 +21155,7 @@ mod tests {
         assert!(effects.queue_touched && effects.needs_redraw);
         assert_eq!(queue.status().queued, 1);
         // Empty queue: the same ↑ falls back to the plain history walk.
-        let mut editor = typeahead_editor::TypeaheadEditor::new(vec!["from history".to_string()]);
+        let mut editor = kitsu_editor::TypeaheadEditor::new(vec!["from history".to_string()]);
         let mut queue = prompt_queue::PromptQueue::new(4);
         let (effects, _) = resolve(&mut editor, b"\x1b[A", &mut queue, &mut dispatched);
         assert_eq!(editor.buffer_string(), "from history");
@@ -20545,7 +21166,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn action_resolution_maps_control_actions_to_signals_and_eof() {
-        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut editor = kitsu_editor::TypeaheadEditor::new(Vec::new());
         let mut queue = prompt_queue::PromptQueue::new(4);
         let mut dispatched = Vec::new();
         // Ctrl+C on empty draft → SIGINT effect (raise happens in the caller).
@@ -20566,14 +21187,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn action_resolution_tab_accepts_the_slash_hint() {
-        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut editor = kitsu_editor::TypeaheadEditor::new(Vec::new());
         let mut queue = prompt_queue::PromptQueue::new(4);
         let mut dispatched = Vec::new();
         let (effects, _) = resolve(&mut editor, b"/ste\t", &mut queue, &mut dispatched);
         assert_eq!(editor.buffer_string(), "/steer");
         assert!(effects.needs_redraw);
         // Tab with no matching hint leaves the draft alone.
-        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut editor = kitsu_editor::TypeaheadEditor::new(Vec::new());
         let (_, _) = resolve(&mut editor, b"/zzz\t", &mut queue, &mut dispatched);
         assert_eq!(editor.buffer_string(), "/zzz");
     }
@@ -20806,6 +21427,837 @@ mod tests {
         assert_eq!(
             agent_activity_child_row(None, Some(10), false),
             "↳ no activity yet"
+        );
+    }
+
+    /// Byte offset of one `/jobs view` group heading, matched as a whole line
+    /// at the documented two-space indent with its count parenthesis, so a
+    /// heading nested inside a row or missing its count never satisfies it.
+    fn jobs_view_heading_offset(rendered: &str, heading: &str) -> Option<usize> {
+        rendered.find(&format!("\n  {heading} ("))
+    }
+
+    fn jobs_view_heading_count(rendered: &str, heading: &str) -> Option<usize> {
+        let start = jobs_view_heading_offset(rendered, heading)? + 3 + heading.len() + 2;
+        let rest = &rendered[start..];
+        let end = rest.find(')')?;
+        rest[..end].parse::<usize>().ok()
+    }
+
+    /// The detail continuation line for one agent row, trimmed of its indent so
+    /// the flat deck and the grouped view can be compared on content alone.
+    fn jobs_detail_line(rendered: &str) -> &str {
+        rendered
+            .lines()
+            .find(|line| line.contains("| tokens "))
+            .unwrap_or_else(|| panic!("no agent detail line in: {rendered}"))
+            .trim()
+    }
+
+    #[test]
+    fn the_jobs_view_groups_agents_by_state_in_the_documented_order() {
+        let registry = subagent::AgentRegistry::default();
+        let _running = registry.start("still working".to_string()).unwrap();
+        let ready = registry.start("finished cleanly".to_string()).unwrap();
+        let collected = registry.start("already picked up".to_string()).unwrap();
+        let failed = registry.start("broke".to_string()).unwrap();
+        registry.finish(ready, Ok("result awaiting pickup".to_string()));
+        registry.finish(collected, Ok("result already read".to_string()));
+        registry.finish(failed, Err("provider request failed".to_string()));
+        // Observing the result is what moves a row from "result ready" to
+        // "collected"; peeking must not.
+        assert!(registry.result(collected).is_some());
+
+        let view = format_jobs_view(&registry);
+        assert_no_debug_leak(&view);
+        assert!(!view.contains('\u{1b}'), "{view}");
+
+        let working =
+            jobs_view_heading_offset(&view, "working").unwrap_or_else(|| panic!("{view}"));
+        let result_ready = jobs_view_heading_offset(&view, "done, result ready")
+            .unwrap_or_else(|| panic!("{view}"));
+        let done_collected =
+            jobs_view_heading_offset(&view, "done, collected").unwrap_or_else(|| panic!("{view}"));
+        let failed_heading =
+            jobs_view_heading_offset(&view, "failed").unwrap_or_else(|| panic!("{view}"));
+        assert!(
+            working < result_ready && result_ready < done_collected,
+            "{view}"
+        );
+        assert!(done_collected < failed_heading, "{view}");
+
+        assert_eq!(jobs_view_heading_count(&view, "working"), Some(1), "{view}");
+        assert_eq!(
+            jobs_view_heading_count(&view, "done, result ready"),
+            Some(1),
+            "{view}"
+        );
+        assert_eq!(
+            jobs_view_heading_count(&view, "done, collected"),
+            Some(1),
+            "{view}"
+        );
+        assert_eq!(jobs_view_heading_count(&view, "failed"), Some(1), "{view}");
+    }
+
+    #[test]
+    fn jobs_view_omits_empty_groups_and_never_shows_needs_input_today() {
+        let registry = subagent::AgentRegistry::default();
+        let running = registry.start("still working".to_string()).unwrap();
+        let _ = running;
+
+        let view = format_jobs_view(&registry);
+        assert!(
+            jobs_view_heading_offset(&view, "working").is_some(),
+            "{view}"
+        );
+        // Nothing is cancelled, done or failed, so those headings are absent
+        // entirely rather than printed with a zero count.
+        assert!(!view.contains("cancelled ("), "{view}");
+        assert!(!view.contains("failed ("), "{view}");
+        assert!(!view.contains("done, "), "{view}");
+        // No state can reach "needs input" yet, so the group is unreachable.
+        assert!(!view.contains("needs input"), "{view}");
+    }
+
+    #[test]
+    fn jobs_view_moves_a_done_agent_from_result_ready_to_collected_on_handoff() {
+        let registry = subagent::AgentRegistry::default();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+
+        let before = format_jobs_view(&registry);
+        assert!(
+            jobs_view_heading_offset(&before, "done, result ready").is_some(),
+            "{before}"
+        );
+        assert!(!before.contains("done, collected"), "{before}");
+
+        // Peeking is not a handoff.
+        assert!(registry.peek_result(done).is_some());
+        let peeked = format_jobs_view(&registry);
+        assert!(
+            jobs_view_heading_offset(&peeked, "done, result ready").is_some(),
+            "{peeked}"
+        );
+
+        assert!(matches!(
+            registry.acknowledge_result(done),
+            subagent::AgentHandoffAckOutcome::Acknowledged
+        ));
+        let after = format_jobs_view(&registry);
+        assert!(
+            jobs_view_heading_offset(&after, "done, collected").is_some(),
+            "{after}"
+        );
+        assert!(!after.contains("done, result ready"), "{after}");
+    }
+
+    #[test]
+    fn jobs_view_group_order_is_independent_of_agent_creation_order() {
+        let registry = subagent::AgentRegistry::default();
+        // Ids ascend while states descend: the lowest id is the group printed
+        // last, so any id-ordered implementation prints the groups backwards.
+        let failed = registry.start("broke".to_string()).unwrap();
+        let collected = registry.start("already picked up".to_string()).unwrap();
+        let ready = registry.start("finished cleanly".to_string()).unwrap();
+        let _running = registry.start("still working".to_string()).unwrap();
+        registry.finish(failed, Err("provider request failed".to_string()));
+        registry.finish(collected, Ok("result already read".to_string()));
+        registry.finish(ready, Ok("result awaiting pickup".to_string()));
+        assert!(registry.result(collected).is_some());
+
+        let view = format_jobs_view(&registry);
+        let offsets = [
+            jobs_view_heading_offset(&view, "working"),
+            jobs_view_heading_offset(&view, "done, result ready"),
+            jobs_view_heading_offset(&view, "done, collected"),
+            jobs_view_heading_offset(&view, "failed"),
+        ]
+        .map(|offset| offset.unwrap_or_else(|| panic!("{view}")));
+        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]), "{view}");
+    }
+
+    #[test]
+    fn an_empty_jobs_view_says_the_same_thing_the_flat_deck_says() {
+        let registry = subagent::AgentRegistry::default();
+        let view = format_jobs_view(&registry);
+        assert_no_debug_leak(&view);
+        assert!(!view.contains('\u{1b}'), "{view}");
+        assert!(
+            view.contains(
+                "no background agents — ask the model to delegate work, or see /profiles"
+            ),
+            "{view}"
+        );
+        assert!(view.contains("agent deck by state"), "{view}");
+        if kitsu_render::plain_mode() {
+            assert!(view.starts_with("# agent deck by state"), "{view}");
+        } else {
+            assert!(view.starts_with("◈ agent deck by state"), "{view}");
+        }
+        // No group heading can appear when there is nothing to group.
+        for heading in [
+            "needs input",
+            "working",
+            "done, result ready",
+            "done, collected",
+            "failed",
+            "cancelled",
+        ] {
+            assert!(jobs_view_heading_offset(&view, heading).is_none(), "{view}");
+        }
+    }
+
+    #[test]
+    fn the_jobs_view_header_reports_the_same_counts_as_the_flat_deck() {
+        let registry = subagent::AgentRegistry::default();
+        let _running = registry.start("still working".to_string()).unwrap();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        let failed = registry.start("broke".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+        registry.finish(failed, Err("provider request failed".to_string()));
+
+        let flat = format_jobs(&registry);
+        let view = format_jobs_view(&registry);
+        let counts = if kitsu_render::plain_mode() {
+            "3 total | 1 running | 1 done | 1 failed | 0 cancelled"
+        } else {
+            "3 total · 1 running · 1 done · 1 failed · 0 cancelled"
+        };
+        assert!(flat.contains(counts), "{flat}");
+        assert!(view.contains(counts), "{view}");
+        // The header summary is the flat deck's summary with the grouped lead.
+        let flat_header = flat.lines().next().unwrap();
+        let view_header = view.lines().next().unwrap();
+        assert_eq!(
+            view_header.replace("agent deck by state", "agent deck"),
+            flat_header,
+            "{view_header} vs {flat_header}"
+        );
+    }
+
+    #[test]
+    fn jobs_view_rows_carry_the_same_content_as_the_flat_deck_rows() {
+        let registry = subagent::AgentRegistry::default();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+
+        let flat = format_jobs(&registry);
+        let view = format_jobs_view(&registry);
+        // The detail continuation line (model, tokens, tools, writes, last
+        // activity) must be identical once indentation is stripped: the two
+        // views render the same row through one shared helper.
+        assert_eq!(jobs_detail_line(&flat), jobs_detail_line(&view));
+
+        // The row line itself is identical too, marker and label included.
+        let row_of = |rendered: &str| -> String {
+            rendered
+                .lines()
+                .find(|line| line.contains(&format!("#{done} ")))
+                .unwrap_or_else(|| panic!("no agent row in: {rendered}"))
+                .trim()
+                .to_string()
+        };
+        assert_eq!(row_of(&flat), row_of(&view));
+
+        // Grouped rows sit one level deeper than their heading.
+        let row_line = view
+            .lines()
+            .find(|line| line.contains(&format!("#{done} ")))
+            .unwrap_or_else(|| panic!("{view}"));
+        assert!(row_line.starts_with("    "), "{row_line:?}");
+        assert!(!row_line.starts_with("     "), "{row_line:?}");
+
+        // Continuation lines keep the deck's +4 relationship to their row:
+        // the flat deck is 2/6, the grouped view is 4/8.
+        let detail_indent = |rendered: &str| -> usize {
+            let line = rendered
+                .lines()
+                .find(|line| line.contains("| tokens "))
+                .unwrap_or_else(|| panic!("{rendered}"));
+            line.len() - line.trim_start().len()
+        };
+        assert_eq!(detail_indent(&flat), 6, "{flat}");
+        assert_eq!(detail_indent(&view), 8, "{view}");
+    }
+
+    #[test]
+    fn jobs_view_running_rows_keep_the_activity_child_line() {
+        let registry = subagent::AgentRegistry::default();
+        let _running = registry.start("still working".to_string()).unwrap();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+
+        let view = format_jobs_view(&registry);
+        let activity = if kitsu_render::plain_mode() {
+            "-> started | 0s ago"
+        } else {
+            "↳ started · 0s ago"
+        };
+        // Exactly the running row carries exactly one child, as in the deck.
+        assert_eq!(view.matches(activity).count(), 1, "{view}");
+        assert_eq!(
+            format_jobs(&registry).matches(activity).count(),
+            view.matches(activity).count(),
+            "{view}"
+        );
+    }
+
+    #[test]
+    fn jobs_view_group_headings_are_unglyphed_two_space_indented_text() {
+        let registry = subagent::AgentRegistry::default();
+        let _running = registry.start("still working".to_string()).unwrap();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+
+        let view = format_jobs_view(&registry);
+        for heading in ["working", "done, result ready"] {
+            let line = view
+                .lines()
+                .find(|line| line.trim_start().starts_with(heading))
+                .unwrap_or_else(|| panic!("{view}"));
+            assert_eq!(line, format!("  {heading} (1)"), "{view}");
+            // No deck glyph or ASCII marker leaks into a heading.
+            for glyph in ["◆", "◈", "◇", "[run]", "[rdy]", "[err]", "#"] {
+                assert!(!line.contains(glyph), "{line:?}");
+            }
+            // Headings bypass deck_header/sanitize_plain_inline, so they must
+            // already be pure ASCII: --plain and NO_COLOR emit zero non-ASCII
+            // bytes, and mode-dependent heading text would break this test.
+            assert!(line.is_ascii(), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn the_flat_jobs_deck_keeps_its_shape_after_the_row_helper_is_shared() {
+        let registry = subagent::AgentRegistry::default();
+        let _running = registry.start("still working".to_string()).unwrap();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        let failed = registry.start("broke".to_string()).unwrap();
+        registry.finish(done, Ok("collected later".to_string()));
+        registry.finish(failed, Err("provider request failed".to_string()));
+
+        let flat = format_jobs(&registry);
+        assert_no_debug_leak(&flat);
+        assert!(!flat.contains('\u{1b}'), "{flat}");
+        if kitsu_render::plain_mode() {
+            assert!(flat.starts_with("# agent deck -"), "{flat}");
+            assert!(flat.contains("[run] #"), "{flat}");
+            assert!(flat.contains("[rdy] #"), "{flat}");
+            assert!(flat.contains("[err] #"), "{flat}");
+        } else {
+            assert!(flat.starts_with("◈ agent deck —"), "{flat}");
+            assert!(flat.contains("◆ #"), "{flat}");
+            assert!(flat.contains("◈ #"), "{flat}");
+            assert!(flat.contains("◇ #"), "{flat}");
+        }
+        assert!(flat.contains(&format!("/jobs show {done}")), "{flat}");
+        // The flat deck stays flat: no group heading ever appears in it.
+        assert!(!flat.contains("agent deck by state"), "{flat}");
+        for heading in ["needs input", "working", "done, result ready"] {
+            assert!(jobs_view_heading_offset(&flat, heading).is_none(), "{flat}");
+        }
+        // Rows stay at the flat deck's two-space indent.
+        let row = flat
+            .lines()
+            .find(|line| line.contains(&format!("#{done} ")))
+            .unwrap_or_else(|| panic!("{flat}"));
+        assert!(row.starts_with("  ") && !row.starts_with("   "), "{row:?}");
+    }
+
+    #[test]
+    fn a_near_miss_for_view_is_suggested_as_a_jobs_subcommand() {
+        assert_eq!(closest_jobs_subcommand("viw"), Some("view"));
+        assert_eq!(closest_jobs_subcommand("vieww"), Some("view"));
+        assert_eq!(closest_jobs_subcommand("view"), Some("view"));
+    }
+
+    #[test]
+    fn the_command_registry_advertises_jobs_view_on_jobs_and_its_agents_alias() {
+        let jobs = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "jobs")
+            .expect("/jobs is registered");
+        assert!(jobs.args.contains("view"), "{}", jobs.args);
+
+        let agents = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "agents")
+            .expect("/agents is registered");
+        assert_eq!(agents.alias_of, Some("jobs"));
+        assert!(agents.args.contains("view"), "{}", agents.args);
+        assert!(agents.args.contains("id"), "{}", agents.args);
+    }
+
+    /// Build the `(progress, thread)` pair `/jobs explain` renders from. The
+    /// two snapshots the command passes always describe the same agent, so the
+    /// helper keeps them consistent.
+    fn explain_fixture(
+        id: u64,
+        status: subagent::AgentProgressStatus,
+        phase: subagent::thread::AgentThreadPhase,
+        handoff: subagent::thread::AgentHandoffState,
+    ) -> (
+        subagent::AgentProgress,
+        subagent::thread::AgentThreadSnapshot,
+    ) {
+        let progress = subagent::AgentProgress {
+            id,
+            task: "summarize the crate".to_string(),
+            profile: Some("reviewer".to_string()),
+            status,
+            elapsed_ms: 12_500,
+            result_bytes: Some(42),
+            last_activity_ms_ago: Some(3_200),
+            telemetry: subagent::AgentTelemetry {
+                model: "qwen2.5-coder".to_string(),
+                last_activity: Some("tool read".to_string()),
+                ..Default::default()
+            },
+        };
+        let thread = subagent::thread::AgentThreadSnapshot {
+            id,
+            task: "summarize the crate".to_string(),
+            model: "qwen2.5-coder".to_string(),
+            profile: Some("reviewer".to_string()),
+            phase,
+            handoff,
+            elapsed_ms: 12_500,
+            result_bytes: Some(42),
+            steering_open: true,
+            pending_steering: 2,
+            timeline: subagent::thread::AgentTimelineSnapshot {
+                entries: vec![subagent::thread::AgentTimelineEntry {
+                    sequence: 1,
+                    elapsed_ms: 10,
+                    kind: subagent::thread::AgentTimelineKind::UserTask,
+                    round: None,
+                    text: "summarize the crate".to_string(),
+                    truncated: false,
+                }],
+                dropped_entries: 0,
+                retained_bytes: 19,
+                closed: false,
+            },
+        };
+        (progress, thread)
+    }
+
+    /// The labelled lines of an explanation, in order, as `(label, value)`.
+    /// The header line is excluded, and every other line must be a labelled
+    /// one at the documented two-space indent.
+    fn explain_labels(rendered: &str) -> Vec<(String, String)> {
+        rendered
+            .lines()
+            .skip(1)
+            .map(|line| {
+                assert!(
+                    line.starts_with("  ") && !line.starts_with("   "),
+                    "explain lines sit at a two-space indent: {line:?}"
+                );
+                let (label, value) = line
+                    .trim_start()
+                    .split_once(": ")
+                    .unwrap_or_else(|| panic!("unlabelled explain line: {line:?}"));
+                (label.to_string(), value.to_string())
+            })
+            .collect()
+    }
+
+    fn explain_label_value<'a>(labels: &'a [(String, String)], label: &str) -> Option<&'a str> {
+        labels
+            .iter()
+            .find(|(name, _)| name == label)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn explaining_a_running_agent_says_since_when_and_what_it_waits_on() {
+        let (progress, thread) = explain_fixture(
+            3,
+            subagent::AgentProgressStatus::Running,
+            subagent::thread::AgentThreadPhase::Running,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        let explain = format_agent_explain(&progress, &thread);
+        assert_no_debug_leak(&explain);
+        assert!(!explain.contains('\u{1b}'), "{explain}");
+
+        let header = explain
+            .lines()
+            .next()
+            .unwrap_or_else(|| panic!("{explain}"));
+        assert!(header.contains("agent #3 explained"), "{header}");
+        assert!(header.contains("running"), "{header}");
+        if kitsu_render::plain_mode() {
+            assert!(header.starts_with("[run] "), "{header}");
+        } else {
+            assert!(header.starts_with("◆ "), "{header}");
+        }
+
+        let labels = explain_labels(&explain);
+        // Two ages, two deliberately different formats, each matching its own
+        // established precedent. `since` is a run duration, which this file
+        // renders at one decimal throughout (`format_agent_thread`). An
+        // activity age is whole seconds, because `agent_activity_child_row`
+        // routes the deck's own activity age through
+        // `kitsu_render::format_wait_elapsed`, which truncates. Do not
+        // "unify" these: that breaks one precedent whichever way it goes.
+        let since = explain_label_value(&labels, "since").unwrap_or_else(|| panic!("{explain}"));
+        assert_eq!(since, "started 12.5s ago", "{explain}");
+        let waiting =
+            explain_label_value(&labels, "waiting on").unwrap_or_else(|| panic!("{explain}"));
+        assert!(waiting.contains("tool read"), "{explain}");
+        assert!(
+            waiting.contains(&format!(
+                "{} ago",
+                kitsu_render::format_wait_elapsed(std::time::Duration::from_millis(3_200))
+            )),
+            "{explain}"
+        );
+        assert!(!waiting.contains("3.2s"), "{explain}");
+        // `show` says "queued" for this field; `explain` must not invent a
+        // second word for one fact.
+        assert_eq!(
+            explain_label_value(&labels, "steering"),
+            Some("open | 2 queued"),
+            "{explain}"
+        );
+        // A running agent has not failed, has no collected-or-not result, and
+        // its activity is the thing it is waiting on, not a past event.
+        for absent in ["because", "last activity", "handoff"] {
+            assert!(
+                explain_label_value(&labels, absent).is_none(),
+                "a running explanation must omit {absent}: {explain}"
+            );
+        }
+    }
+
+    #[test]
+    fn explaining_a_done_agent_with_an_uncollected_result_points_at_jobs_show() {
+        let (progress, thread) = explain_fixture(
+            4,
+            subagent::AgentProgressStatus::Done,
+            subagent::thread::AgentThreadPhase::Done,
+            subagent::thread::AgentHandoffState::Ready,
+        );
+        let explain = format_agent_explain(&progress, &thread);
+        assert_no_debug_leak(&explain);
+        assert!(!explain.contains('\u{1b}'), "{explain}");
+
+        let labels = explain_labels(&explain);
+        assert_eq!(
+            explain_label_value(&labels, "since"),
+            Some("ran 12.5s"),
+            "{explain}"
+        );
+        let handoff =
+            explain_label_value(&labels, "handoff").unwrap_or_else(|| panic!("{explain}"));
+        assert!(handoff.starts_with("ready |"), "{explain}");
+        assert!(handoff.contains("/jobs show 4"), "{explain}");
+        // Nothing is being waited on and nothing can be steered any more.
+        for absent in ["waiting on", "steering"] {
+            assert!(
+                explain_label_value(&labels, absent).is_none(),
+                "a terminal explanation must omit {absent}: {explain}"
+            );
+        }
+    }
+
+    #[test]
+    fn explaining_a_done_agent_whose_result_was_collected_says_acknowledged() {
+        let (progress, thread) = explain_fixture(
+            5,
+            subagent::AgentProgressStatus::Done,
+            subagent::thread::AgentThreadPhase::Done,
+            subagent::thread::AgentHandoffState::Acknowledged,
+        );
+        let explain = format_agent_explain(&progress, &thread);
+        let labels = explain_labels(&explain);
+        let handoff =
+            explain_label_value(&labels, "handoff").unwrap_or_else(|| panic!("{explain}"));
+        assert!(handoff.starts_with("acknowledged |"), "{explain}");
+        assert!(!handoff.contains("/jobs show"), "{explain}");
+    }
+
+    #[test]
+    fn explaining_a_failed_agent_names_the_failure_class_before_the_last_activity() {
+        let (mut progress, thread) = explain_fixture(
+            6,
+            subagent::AgentProgressStatus::Failed,
+            subagent::thread::AgentThreadPhase::Failed,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        progress.telemetry.failure_class = Some(subagent::AgentFailureClass::ProviderRateLimited);
+        let explain = format_agent_explain(&progress, &thread);
+        assert_no_debug_leak(&explain);
+
+        let labels = explain_labels(&explain);
+        assert_eq!(
+            explain_label_value(&labels, "because"),
+            Some(
+                subagent::AgentFailureClass::ProviderRateLimited
+                    .to_string()
+                    .as_str()
+            ),
+            "{explain}"
+        );
+        let activity =
+            explain_label_value(&labels, "last activity").unwrap_or_else(|| panic!("{explain}"));
+        assert!(activity.contains("tool read"), "{explain}");
+        // Same shared formatter as the deck's activity age, not `since`'s
+        // one-decimal run duration.
+        assert!(
+            activity.contains(&format!(
+                "{} ago",
+                kitsu_render::format_wait_elapsed(std::time::Duration::from_millis(3_200))
+            )),
+            "{explain}"
+        );
+        assert!(!activity.contains("3.2s"), "{explain}");
+
+        // The cause is stated before the evidence, so the line order reads as
+        // an explanation rather than a log.
+        let because = explain
+            .find("\n  because: ")
+            .unwrap_or_else(|| panic!("{explain}"));
+        let last = explain
+            .find("\n  last activity: ")
+            .unwrap_or_else(|| panic!("{explain}"));
+        assert!(because < last, "{explain}");
+    }
+
+    #[test]
+    fn explaining_a_failed_agent_without_a_failure_class_omits_because() {
+        let (progress, thread) = explain_fixture(
+            7,
+            subagent::AgentProgressStatus::Failed,
+            subagent::thread::AgentThreadPhase::Failed,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        assert_eq!(progress.telemetry.failure_class, None);
+        let explain = format_agent_explain(&progress, &thread);
+        let labels = explain_labels(&explain);
+        assert!(
+            explain_label_value(&labels, "because").is_none(),
+            "{explain}"
+        );
+        // The rest of the explanation still renders.
+        assert_eq!(
+            explain_label_value(&labels, "since"),
+            Some("ran 12.5s"),
+            "{explain}"
+        );
+        assert!(
+            explain_label_value(&labels, "last activity").is_some(),
+            "{explain}"
+        );
+    }
+
+    #[test]
+    fn explaining_a_running_agent_with_no_activity_says_so_in_words() {
+        let (mut progress, thread) = explain_fixture(
+            8,
+            subagent::AgentProgressStatus::Running,
+            subagent::thread::AgentThreadPhase::Running,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        progress.telemetry.last_activity = None;
+        progress.last_activity_ms_ago = None;
+        let explain = format_agent_explain(&progress, &thread);
+        assert!(
+            explain.contains("\n  waiting on: no activity recorded yet"),
+            "{explain}"
+        );
+        // No empty parenthetical age leaks out when there is no timestamp.
+        assert!(!explain.contains("( ago)"), "{explain}");
+        assert!(!explain.contains("(0s ago)"), "{explain}");
+        assert!(!explain.contains("(0.0s ago)"), "{explain}");
+    }
+
+    #[test]
+    fn explain_labels_keep_their_documented_order_shape_and_ascii_tier() {
+        const ORDER: [&str; 6] = [
+            "since",
+            "waiting on",
+            "because",
+            "last activity",
+            "steering",
+            "handoff",
+        ];
+        let cases = [
+            (
+                subagent::AgentProgressStatus::Running,
+                subagent::thread::AgentThreadPhase::Running,
+                subagent::thread::AgentHandoffState::Unavailable,
+                Some(subagent::AgentFailureClass::ProviderTimeout),
+            ),
+            (
+                subagent::AgentProgressStatus::Failed,
+                subagent::thread::AgentThreadPhase::Failed,
+                subagent::thread::AgentHandoffState::Unavailable,
+                Some(subagent::AgentFailureClass::ProviderTimeout),
+            ),
+            (
+                subagent::AgentProgressStatus::Done,
+                subagent::thread::AgentThreadPhase::Done,
+                subagent::thread::AgentHandoffState::Ready,
+                None,
+            ),
+            (
+                subagent::AgentProgressStatus::Cancelled,
+                subagent::thread::AgentThreadPhase::Cancelled,
+                subagent::thread::AgentHandoffState::Unavailable,
+                None,
+            ),
+        ];
+        for (index, (status, phase, handoff, class)) in cases.into_iter().enumerate() {
+            let (mut progress, thread) = explain_fixture(9, status, phase, handoff);
+            progress.telemetry.failure_class = class;
+            let explain = format_agent_explain(&progress, &thread);
+            assert_no_debug_leak(&explain);
+            assert!(!explain.contains('\u{1b}'), "case {index}: {explain}");
+
+            // `explain_labels` itself pins the `"  <label>: <value>"` shape.
+            let labels = explain_labels(&explain);
+            assert!(!labels.is_empty(), "case {index}: {explain}");
+            let positions = labels
+                .iter()
+                .map(|(label, _)| {
+                    ORDER
+                        .iter()
+                        .position(|known| known == label)
+                        .unwrap_or_else(|| panic!("case {index}: unknown label {label:?}"))
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "case {index}: labels out of order: {explain}"
+            );
+            // `since` is unconditional.
+            assert_eq!(labels[0].0, "since", "case {index}: {explain}");
+
+            // The explanation does not pass through `sanitize_plain_inline`, so
+            // every byte it adds to the state marker must already be ASCII and
+            // every separator must be `|`.
+            let marker = kitsu_render::deck_marker(match phase {
+                subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+                subagent::thread::AgentThreadPhase::Done
+                    if handoff == subagent::thread::AgentHandoffState::Ready =>
+                {
+                    kitsu_render::DeckState::ResultReady
+                }
+                subagent::thread::AgentThreadPhase::Done => kitsu_render::DeckState::Stopped,
+                subagent::thread::AgentThreadPhase::Failed => kitsu_render::DeckState::Failed,
+                subagent::thread::AgentThreadPhase::Cancelled => kitsu_render::DeckState::Stopped,
+            });
+            let body = explain
+                .strip_prefix(&marker)
+                .unwrap_or_else(|| panic!("case {index}: no deck marker: {explain}"));
+            assert!(body.is_ascii(), "case {index}: {explain}");
+            for forbidden in ["·", "—", "↳", "\u{2502}"] {
+                assert!(!explain.contains(forbidden), "case {index}: {explain}");
+            }
+        }
+    }
+
+    #[test]
+    fn explain_answers_a_different_question_than_show() {
+        let (progress, thread) = explain_fixture(
+            10,
+            subagent::AgentProgressStatus::Done,
+            subagent::thread::AgentThreadPhase::Done,
+            subagent::thread::AgentHandoffState::Ready,
+        );
+        let explain = format_agent_explain(&progress, &thread);
+        let show = format_agent_thread(&thread);
+
+        // `show` dumps the whole bounded timeline and the task text; `explain`
+        // answers why/since-when/waiting-on and dumps nothing.
+        assert!(show.contains("bounded redacted timeline:"), "{show}");
+        assert!(!explain.contains("bounded redacted timeline"), "{explain}");
+        assert!(!explain.contains("timeline:"), "{explain}");
+        assert!(show.contains("\n  task: "), "{show}");
+        assert!(!explain.contains("\n  task: "), "{explain}");
+        assert!(!explain.contains("summarize the crate"), "{explain}");
+
+        // And it says, in the header, that it is an explanation.
+        assert!(explain.contains("explained"), "{explain}");
+        assert!(!show.contains("explained"), "{show}");
+    }
+
+    #[test]
+    fn explaining_an_agent_never_collects_its_result() {
+        let registry = subagent::AgentRegistry::default();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+        assert_eq!(
+            registry.handoff_state(done),
+            Some(subagent::thread::AgentHandoffState::Ready)
+        );
+        let before = registry.snapshot().unacknowledged;
+        assert_eq!(before, 1);
+
+        let explain =
+            agent_explain_view(&registry, done).unwrap_or_else(|| panic!("agent #{done} exists"));
+        assert!(
+            explain.contains(&format!("agent #{done} explained")),
+            "{explain}"
+        );
+
+        // Diagnosing an agent must never be the act that takes custody of its
+        // result: `/jobs show` acknowledges, and if `explain` did too the exit
+        // guard that refuses to quit on unviewed results would be defeated.
+        assert_eq!(
+            registry.handoff_state(done),
+            Some(subagent::thread::AgentHandoffState::Ready),
+            "explain acknowledged the handoff: {explain}"
+        );
+        assert_eq!(registry.snapshot().unacknowledged, before, "{explain}");
+        let view = format_jobs_view(&registry);
+        assert!(
+            jobs_view_heading_offset(&view, "done, result ready").is_some(),
+            "{view}"
+        );
+        assert!(!view.contains("done, collected"), "{view}");
+    }
+
+    #[test]
+    fn explaining_an_unknown_agent_id_has_nothing_to_render() {
+        let registry = subagent::AgentRegistry::default();
+        assert!(agent_explain_view(&registry, 404).is_none());
+        let known = registry.start("still working".to_string()).unwrap();
+        assert!(agent_explain_view(&registry, known).is_some());
+        assert!(agent_explain_view(&registry, known + 1).is_none());
+    }
+
+    #[test]
+    fn a_near_miss_for_explain_is_suggested_as_a_jobs_subcommand() {
+        assert_eq!(closest_jobs_subcommand("explan"), Some("explain"));
+        assert_eq!(closest_jobs_subcommand("explain"), Some("explain"));
+        assert_eq!(closest_jobs_subcommand("xplain"), Some("explain"));
+    }
+
+    #[test]
+    fn the_command_registry_advertises_jobs_explain() {
+        let jobs = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "jobs")
+            .expect("/jobs is registered");
+        assert!(jobs.args.contains("explain"), "{}", jobs.args);
+
+        // The alias needs no row change: it already advertises, and forwards,
+        // every /jobs subcommand.
+        let agents = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "agents")
+            .expect("/agents is registered");
+        assert_eq!(agents.alias_of, Some("jobs"));
+        assert!(
+            agents.args.contains("any /jobs subcommand"),
+            "{}",
+            agents.args
         );
     }
 
@@ -21942,12 +23394,16 @@ mod tests {
             running: 0,
             terminal: 0,
             failed: 0,
+            unacknowledged: 0,
+            blocked: 0,
         };
         let current = subagent::AgentRegistrySnapshot {
             generation: 3,
             running: 0,
             terminal: 1,
             failed: 0,
+            unacknowledged: 0,
+            blocked: 0,
         };
         let notice = background_agent_notice(previous, current).unwrap();
         assert!(notice.contains("1 background agent(s) finished"));
@@ -21964,12 +23420,16 @@ mod tests {
             running: 1,
             terminal: 0,
             failed: 0,
+            unacknowledged: 0,
+            blocked: 0,
         };
         let current = subagent::AgentRegistrySnapshot {
             generation: 2,
             running: 0,
             terminal: 1,
             failed: 1,
+            unacknowledged: 0,
+            blocked: 0,
         };
         let notice = background_agent_notice(previous, current).unwrap();
         assert!(notice.contains("FAILED"), "{notice}");
