@@ -323,6 +323,14 @@ longer than the limit, or carrying control characters) is reported on the rename
 line itself and leaves what you typed in place to be corrected; `Esc` cancels
 without renaming.
 
+While you are attached, the foreground turn keeps running and its output is held
+back rather than interleaved, then replayed when you detach under a
+`⛩ detached from agent N — recap:` header. The buffer holds 64 KiB; if it has
+to drop anything it says how many lines, at the top of the recap, so a gap is
+never silent. A detach with nothing buffered prints nothing at all. Attaching
+straight to another agent replays the first one's recap before announcing the
+new attachment.
+
 While you are attached, a line you submit belongs to that agent: it steers the
 agent, or -- if the agent is blocked waiting on a permission -- answers it with
 `y`, `a` or `n` (the same spellings `/jobs reply` takes). Which one happens is

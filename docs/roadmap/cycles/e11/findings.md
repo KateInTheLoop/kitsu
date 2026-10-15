@@ -4107,3 +4107,35 @@ That is **F77** exactly: `/detach`'s arm said *"nothing in this card can attach"
 ### And the race was dissolved rather than decided
 
 A5 did not say whether routing reads the agent's state when the line is opened or when it is submitted. Both readings can be wrong — open-time can send a steer the registry must refuse, submit-time can hand a typed correction to a parser expecting `y`/`a`/`n`. The resolution was not to pick the less-bad one but to **make being wrong cheap**: submit-time routing, the registry as final adjudicator, and **every refusal sends nothing and hands the line back**, so the worst case is one extra keystroke with the user's words intact. In the implementation "refused" and "keeps the line" are the **same boolean**, so they cannot drift apart.
+
+## F84 — the transition that is not a route: enumerating the keys missed the one without a key
+
+My brief for T4-S6c said *"the three detach routes must all replay"* and cited **F79** (*callers are enumerable*). The test author enumerated them — and then found **a fourth way an attachment ends, which no key triggers**.
+
+`apply_agent_view_exit` **re-binds to a different agent**. No detach key is pressed, no detach arm runs, and whatever the first attachment buffered has nowhere to go. Its first prototype **dropped it silently.**
+
+### How it surfaced, which is the uncomfortable part
+
+It did not fail a test of its own. It announced itself as **cross-test interference**: a *different, existing* test (`the_attach_milestone_is_painted_once_per_change_of_binding`) left a stale buffer in a process-global slot, and the multithreaded run of the new route test failed because of it. **The bug was found by luck through a shared global, which is the kind of luck that does not repeat.**
+
+It is now pinned deliberately: `re_attaching_to_another_agent_replays_the_first_ones_recap_first` requires the previous agent's recap **under that agent's header, before the new agent's attach milestone** — order is the assertion, because the other order **attributes one agent's turn to another**.
+
+### The lesson, which is narrower and more useful than F79's
+
+**F79** says *when a function starts returning something new, every caller is a suspect, and callers are enumerable.* That is about **callers**. This is about **states**: I enumerated the ways a user *asks* to leave an attachment and missed the way an attachment *ends without being left*.
+
+**Enumerating the routes out of a state is not the same as enumerating the transitions out of it.** A route is something a user does; a transition is anything that changes the state, including being replaced. The three keys were the routes. The re-bind was a transition with no route, and a brief organised around user actions cannot see it.
+
+§4.5 does not cover it either, so the decision was the test author's and it is recorded in the requirement now.
+
+## F84b — the byte bound makes an old caution real, and it caught its own prototype
+
+**F52** carried two cautions. The first — *lines are the wrong unit for a memory bound* — is why this card does not reuse the cell ring. The second had never mattered: *truncating styled bytes can cut an SGR sequence in half.*
+
+**A byte bound makes it real for the first time in this epic**, and the test author pinned it unprompted: a clamped styled line must be cut on a `char` boundary **and end `\x1b[0m`**, which is the rule `fit_row` already follows — the renderer's existing rule, not a new one. **That test failed against the author's own first prototype**, which cut on a boundary but did not reset. So it is catching something real rather than restating the cap, and without it a severed escape would have coloured the rest of the session.
+
+### And the reason the ring was wrong is structural, not just unit-mismatch
+
+I argued from F52's units. The stronger argument is the dependency graph, verified: **`Surface` lives in `kitsu-render`; `CellRing` lives in `kitsu-tui`; and `kitsu-render` does not depend on `kitsu-tui`.** A buffer that decorates `Surface` must live beside the trait, so **the ring is unreachable from it regardless of how it is bounded.** The split that created this card feared a deferral past R6 if the implementer "reached for the ring" — it cannot be reached, so there is nothing to defer.
+
+**`cell_ring_lines` still has no reader.** This card does not become one, and **F52 stays open** for the overlay and the `[` dump; it is decided only for this buffer (byte-budgeted, oldest evicted, loss noted, clamped lines reset).

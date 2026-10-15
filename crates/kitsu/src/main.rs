@@ -8345,6 +8345,81 @@ impl AgentViewExit {
     }
 }
 
+/// The foreground recap buffer for the attachment in force, if any (design
+/// \u{a7}4.5), or `None` when nothing is attached.
+type ForegroundRecap = Option<std::sync::Arc<kitsu_render::surface::BufferedSurface>>;
+
+/// The one recap buffer a session can have.
+///
+/// Process-global because the thing it displaces is: the surface slot
+/// ([`kitsu_render::surface::set_surface`]) is the one seam every routed
+/// writer in this binary reaches through, and an attachment is a property of
+/// the session, not of any one call stack. One slot, because the session
+/// binding it shadows holds at most one agent.
+static FOREGROUND_RECAP: std::sync::Mutex<ForegroundRecap> = std::sync::Mutex::new(None);
+
+/// The recap buffer, with a poisoned lock recovered: a panic elsewhere must
+/// not make the next attachment panic too.
+fn foreground_recap_slot() -> std::sync::MutexGuard<'static, ForegroundRecap> {
+    FOREGROUND_RECAP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Start withholding the foreground orchestrator's output, by installing a
+/// buffer over whatever surface is installed now (design \u{a7}4.5).
+///
+/// Called at the one moment the binding begins, so that output produced
+/// *before* the attachment is already painted and is never in a recap.
+#[cfg(unix)]
+fn begin_foreground_buffering() {
+    let mut slot = foreground_recap_slot();
+    let buffer = std::sync::Arc::new(kitsu_render::surface::BufferedSurface::new(
+        kitsu_render::surface::active_surface(),
+    ));
+    kitsu_render::surface::set_surface(std::sync::Arc::clone(&buffer) as _);
+    *slot = Some(buffer);
+}
+
+/// Put the displaced surface back and replay what the attachment to `id`
+/// withheld, under its own `\u{26E9}` header (design \u{a7}4.5).
+///
+/// **Every way an attachment ends calls this**, which is four and not three:
+/// the two detach keystrokes both land in [`apply_inline_detach`], `/detach`
+/// lands in [`apply_detach_command`], and
+/// [`apply_agent_view_exit`] re-binding to a *different* agent ends the first
+/// attachment with no key pressed at all. Enumerating the routes out of the
+/// state is not enumerating the transitions out of it; another transition
+/// that moves the binding needs this call too.
+///
+/// **The milestone is the recap's header, not an announcement of the
+/// detach**, so an empty recap paints nothing: the two keystrokes are silent
+/// by design and the command gives its own answer, and a header ending in a
+/// colon with nothing under it reads as a bug.
+///
+/// The recap is replayed through the *displaced* surface after it is
+/// reinstalled, so the overflow note and the lines go to the terminal the
+/// user is returning to rather than back into a buffer.
+fn replay_foreground_recap(id: u64) {
+    let Some(buffer) = foreground_recap_slot().take() else {
+        return;
+    };
+    let inner = buffer.inner();
+    kitsu_render::surface::set_surface(std::sync::Arc::clone(&inner));
+
+    let recap = buffer.take_recap();
+    if recap.is_empty() {
+        return;
+    }
+    inner.transcript_line(
+        kitsu_render::surface::Fd::Stderr,
+        &kitsu_render::milestone_line(&format!("detached from agent {id} \u{2014} recap:")),
+    );
+    for (fd, text) in recap {
+        inner.transcript_line(fd, &text);
+    }
+}
+
 /// Carry one agent view's attachment into the composer's session binding
 /// (card **T4-S6a**, requirement A3).
 ///
@@ -8369,6 +8444,13 @@ fn apply_agent_view_exit(exit: &AgentViewExit, attached: &mut Option<u64>) {
         // adds no key, it changes what `Enter` means, so the moment the
         // binding begins is the only place that change can be enumerated.
         if *attached != Some(id) {
+            // The fourth transition out of an attachment: re-binding ends the
+            // previous one, and what it buffered is replayed under *its* own
+            // agent's header before the new attachment is announced, or a
+            // reader would attribute one agent's turn to another.
+            if let Some(previous) = attached.take() {
+                replay_foreground_recap(previous);
+            }
             *attached = Some(id);
             kitsu_render::surface::active_surface().transcript_line(
                 kitsu_render::surface::Fd::Stderr,
@@ -8377,6 +8459,7 @@ fn apply_agent_view_exit(exit: &AgentViewExit, attached: &mut Option<u64>) {
                      answers it while it is blocked"
                 )),
             );
+            begin_foreground_buffering();
         }
     }
 }
@@ -8395,7 +8478,9 @@ fn apply_agent_view_exit(exit: &AgentViewExit, attached: &mut Option<u64>) {
 /// test can drive, and there is exactly one of it (**F69**).
 #[cfg(unix)]
 fn apply_inline_detach(attached: &mut Option<u64>, draft: String) -> String {
-    *attached = None;
+    if let Some(id) = attached.take() {
+        replay_foreground_recap(id);
+    }
     draft
 }
 
@@ -8623,7 +8708,10 @@ impl DetachCommandOutcome {
 /// outside inline mode on a tty with styled stderr.
 fn apply_detach_command(attached: &mut Option<u64>) -> DetachCommandOutcome {
     match attached.take() {
-        Some(id) => DetachCommandOutcome::Detached(id),
+        Some(id) => {
+            replay_foreground_recap(id);
+            DetachCommandOutcome::Detached(id)
+        }
         None => DetachCommandOutcome::NothingAttached,
     }
 }
@@ -35917,6 +36005,404 @@ mod tests {
             vec![expected],
             "the registry's own words for the refusal, painted through the \
              surface"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Card T4-S6c -- the foreground buffer and the recap on detach.
+    //
+    // Design \u{a7}4.5's remaining clause: *"foreground orchestrator output is
+    // buffered (bounded, 64 KiB; overflow noted) and replayed with a
+    // `\u{26E9} detached from agent N -- recap:` milestone on return."*
+    //
+    // **Its own buffer, not the cell ring.** The ring
+    // (`kitsu_tui::cells::CellRing`) is bounded by line **count**, and
+    // **F52** is the finding that said so: *"N4 said memory and specified
+    // lines; a single huge line is still unbounded."* \u{a7}4.5 specifies 64
+    // KiB -- bytes -- so reusing the ring would reintroduce the hazard F52
+    // named. The byte-bounded buffer lives in `kitsu-render`, beside the
+    // `Surface` trait it decorates; the ring lives in `kitsu-tui`, which
+    // `kitsu-render` cannot depend on, so there is no shared mechanism to
+    // reach for even if the units agreed.
+    //
+    // **The header is painted only over content.** The two keys are silent
+    // by \u{a7}4.5's own division (*"the two keys are silent and the command
+    // answers"*) and the milestone is the recap's **header** -- \u{a7}4.5
+    // makes it part of the replay, not part of the detach. A header with
+    // nothing under it would both break that silence and claim a recap that
+    // does not exist.
+    // ------------------------------------------------------------------
+
+    /// The recap header's text: the `\u{26E9}` line without the glyph and
+    /// styling [`kitsu_render::milestone_line`] adds.
+    #[cfg(unix)]
+    fn detach_recap_message(id: u64) -> String {
+        format!("detached from agent {id} \u{2014} recap:")
+    }
+
+    /// One meta line the foreground orchestrator produces, written exactly
+    /// the way every routed writer in this binary writes one -- through the
+    /// surface slot, so whatever is installed there is what receives it.
+    #[cfg(unix)]
+    fn foreground_meta(text: &str) {
+        kitsu_render::surface::active_surface()
+            .transcript_line(kitsu_render::surface::Fd::Stderr, text);
+    }
+
+    /// One read of the inline composer with the configured keymap, as the
+    /// `F76` test above drives it.
+    #[cfg(unix)]
+    fn one_composer_read(attached: Option<u64>, bytes: &[u8]) -> tui_bridge::InlineRead {
+        let keys = tui_bridge::InlineKeys {
+            prefix: tui_bridge::chord_prefix_byte("ctrl+x"),
+            left_arrow_opens_agents: true,
+        };
+        assert!(keys.prefix.is_some(), "the chord prefix must be bound");
+        let mut input = std::io::Cursor::new(bytes.to_vec());
+        let mut paint = |_: &str, _: usize, _: &str, _: bool| {};
+        tui_bridge::read_line_inline_with_keys(
+            &mut input,
+            &mut paint,
+            &[],
+            &mut || {},
+            keys,
+            attached,
+        )
+        .expect("a cursor cannot fail to read")
+    }
+
+    /// **All three detach routes replay the recap** (design \u{a7}4.5,
+    /// **F79**).
+    ///
+    /// **FAILING-FIRST**: nothing buffers today, so the foreground lines
+    /// reach the probe immediately and no header is ever painted.
+    ///
+    /// **How the routes were enumerated (F79: callers are enumerable).**
+    /// There are exactly three keystroke/command routes out of an
+    /// attachment and exactly two arms they reach:
+    /// `\u{2190}` and `Ctrl+X d` both become `InlineRead::Detached` and go
+    /// through [`apply_inline_detach`]; `/detach` goes through
+    /// [`apply_detach_command`]. Both arms are driven here, and the two
+    /// keystrokes are driven as **keystrokes** through
+    /// `read_line_inline_with_keys` rather than by constructing the outcome
+    /// -- **F77** was an arm that predated the feature and **F79** was a
+    /// caller that discarded the new return value, and both would have
+    /// survived a test that called the arm directly.
+    ///
+    /// **Each route is asserted on what the recap *contains*** (T4-S8's
+    /// vacuity result), and on the withholding that made a recap necessary:
+    /// a buffer that forwarded output as it arrived would fail the
+    /// mid-attachment assertion while passing every claim about the header.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn every_detach_route_replays_the_foreground_recap_under_one_torii_header() {
+        /// Attach to `id`, produce two foreground meta lines, and return the
+        /// probe's view *while still attached* -- which must be the attach
+        /// milestone and nothing else.
+        fn attach_and_produce(
+            probe: &SurfaceProbe,
+            attached: &mut Option<u64>,
+            id: u64,
+        ) -> Vec<String> {
+            apply_agent_view_exit(&attaching_exit(id), attached);
+            assert_eq!(*attached, Some(id), "control: the binding took");
+            foreground_meta("* read src/main.rs");
+            foreground_meta("* edited src/main.rs");
+            probe.lines()
+        }
+
+        /// What the probe must hold after a detach from `id`: the attach
+        /// milestone, then the recap header, then the two buffered lines in
+        /// the order the foreground produced them.
+        ///
+        /// The attach milestone is in the **prefix** and never in the recap:
+        /// it was painted before the attachment began, and \u{a7}4.5's clause
+        /// is about what the foreground produced *while* attached.
+        fn expected_after_detach(id: u64) -> Vec<String> {
+            vec![
+                kitsu_render::milestone_line(&attach_milestone_message(id)),
+                kitsu_render::milestone_line(&detach_recap_message(id)),
+                "* read src/main.rs".to_string(),
+                "* edited src/main.rs".to_string(),
+            ]
+        }
+
+        // ---- route 1 of 3: `\u{2190}` on an empty composer ----
+        {
+            let probe = SurfaceProbe::install();
+            let mut attached: Option<u64> = None;
+            let during = attach_and_produce(&probe, &mut attached, 7);
+            assert_eq!(
+                during,
+                vec![kitsu_render::milestone_line(&attach_milestone_message(7))],
+                "A5: while attached the foreground's output is buffered, not \
+                 painted over the agent view the user is reading"
+            );
+
+            let outcome = one_composer_read(attached, b"\x1b[D");
+            let tui_bridge::InlineRead::Detached(draft) = outcome else {
+                panic!("A5: `\u{2190}` on an empty composer detaches: {outcome:?}");
+            };
+            let carried = apply_inline_detach(&mut attached, draft);
+            assert_eq!(attached, None, "control: the arm cleared the binding");
+            assert_eq!(carried, "", "control: `\u{2190}` carries no draft");
+            assert_eq!(
+                probe.lines(),
+                expected_after_detach(7),
+                "design \u{a7}4.5: the `\u{2190}` route replays what the \
+                 foreground produced, headed by its `\u{26E9}` milestone"
+            );
+        }
+
+        // ---- route 2 of 3: the chord `Ctrl+X d`, with a draft typed ----
+        {
+            let probe = SurfaceProbe::install();
+            let mut attached: Option<u64> = None;
+            attach_and_produce(&probe, &mut attached, 11);
+
+            let outcome = one_composer_read(attached, b"half a line\x18d");
+            let tui_bridge::InlineRead::Detached(draft) = outcome else {
+                panic!("F76: `Ctrl+X d` while attached detaches: {outcome:?}");
+            };
+            let carried = apply_inline_detach(&mut attached, draft);
+            assert_eq!(
+                carried, "half a line",
+                "control, F76: the chord still carries the draft -- the recap \
+                 is painted *and* the line is kept"
+            );
+            assert_eq!(
+                probe.lines(),
+                expected_after_detach(11),
+                "design \u{a7}4.5: the chord route replays the same recap"
+            );
+        }
+
+        // ---- route 3 of 3: `/detach` ----
+        {
+            let probe = SurfaceProbe::install();
+            let mut attached: Option<u64> = None;
+            attach_and_produce(&probe, &mut attached, 13);
+
+            let outcome = apply_detach_command(&mut attached);
+            assert_eq!(
+                outcome,
+                DetachCommandOutcome::Detached(13),
+                "control: the command detached"
+            );
+            assert_eq!(attached, None);
+            assert_eq!(
+                probe.lines(),
+                expected_after_detach(13),
+                "F79/F77: the command route is a third route and replays too \
+                 -- its own answer is the slash reply, which is not painted \
+                 through this seam"
+            );
+        }
+    }
+
+    /// **A detach with nothing buffered paints nothing at all.**
+    ///
+    /// **FAILING-FIRST** in the sense that matters: it passes today and must
+    /// still pass after the implementation, and the implementation that gets
+    /// it wrong is the obvious one -- paint the header, then the lines.
+    ///
+    /// **The decision, and why.** \u{a7}4.5 makes the milestone the thing the
+    /// recap is *"replayed with"*: it is the recap's **header**, not an
+    /// announcement of the detach. And \u{a7}4.5 settles the announcement
+    /// separately -- *"the two keys are silent and the command answers"* --
+    /// because `\u{2190}` and `Ctrl+X d` give their feedback through the
+    /// prompt label changing under the caret, where the eye already is. A
+    /// bare `\u{26E9} detached from agent N \u{2014} recap:` with nothing
+    /// under it would break that silence rule **and** read as a bug: a
+    /// colon promising content that never came.
+    ///
+    /// Non-vacuous against the test above, which pins that the same three
+    /// routes *do* paint the header when the buffer holds anything.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_detach_with_nothing_buffered_paints_no_recap_header() {
+        for id in [3_u64, 5] {
+            let probe = SurfaceProbe::install();
+            let mut attached: Option<u64> = None;
+            apply_agent_view_exit(&attaching_exit(id), &mut attached);
+            let attach_only = vec![kitsu_render::milestone_line(&attach_milestone_message(id))];
+            assert_eq!(probe.lines(), attach_only, "control: the attach announced");
+
+            // No foreground output at all: the user attached, read the view,
+            // and came back.
+            if id == 3 {
+                let outcome = one_composer_read(attached, b"\x1b[D");
+                let tui_bridge::InlineRead::Detached(draft) = outcome else {
+                    panic!("control: `\u{2190}` detaches: {outcome:?}");
+                };
+                apply_inline_detach(&mut attached, draft);
+            } else {
+                apply_detach_command(&mut attached);
+            }
+            assert_eq!(attached, None, "control: detached");
+            assert_eq!(
+                probe.lines(),
+                attach_only,
+                "an empty recap has no header: the `\u{26E9}` line is the \
+                 recap's header and there is no recap"
+            );
+        }
+    }
+
+    /// **The recap carries nothing from before the attachment** (design
+    /// \u{a7}4.5), including across a re-attachment.
+    ///
+    /// **FAILING-FIRST.**
+    ///
+    /// Two gaps this closes. Output produced *before* attaching belongs to
+    /// the foreground the user was already watching and has already been
+    /// painted -- replaying it would duplicate it. And a second attachment
+    /// must start empty: a buffer kept across a detach would replay the
+    /// previous attachment's output under the new agent's header, attributing
+    /// one agent's turn to another.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn the_recap_holds_only_what_the_foreground_produced_while_attached() {
+        let probe = SurfaceProbe::install();
+        let mut attached: Option<u64> = None;
+
+        // Before any attachment: ordinary foreground output, painted at once.
+        foreground_meta("* before the attach");
+        assert_eq!(
+            probe.lines(),
+            vec!["* before the attach".to_string()],
+            "control: with nothing attached the foreground paints normally"
+        );
+
+        // First attachment, with output, detached by `/detach`.
+        apply_agent_view_exit(&attaching_exit(7), &mut attached);
+        foreground_meta("* during the first attach");
+        apply_detach_command(&mut attached);
+
+        // Second attachment, to a different agent, with its own output.
+        apply_agent_view_exit(&attaching_exit(9), &mut attached);
+        foreground_meta("* during the second attach");
+        apply_detach_command(&mut attached);
+
+        assert_eq!(
+            probe.lines(),
+            vec![
+                "* before the attach".to_string(),
+                kitsu_render::milestone_line(&attach_milestone_message(7)),
+                kitsu_render::milestone_line(&detach_recap_message(7)),
+                "* during the first attach".to_string(),
+                kitsu_render::milestone_line(&attach_milestone_message(9)),
+                kitsu_render::milestone_line(&detach_recap_message(9)),
+                "* during the second attach".to_string(),
+            ],
+            "each recap holds its own attachment's output and no other's"
+        );
+    }
+
+    /// **Re-attaching to a different agent is leaving the first one, and
+    /// replays its recap before announcing the second** (**F79**: a fourth
+    /// route out of an attachment, found by the brief's own enumeration
+    /// coming up one short).
+    ///
+    /// **FAILING-FIRST.**
+    ///
+    /// \u{a7}4.5 names three detach routes and `apply_agent_view_exit` is a
+    /// fourth way an attachment ends: `Enter` in the view on a *different*
+    /// agent re-binds without any detach key being pressed. Whatever the
+    /// first attachment buffered has to go somewhere, and the only two
+    /// options are "replayed" and "silently dropped" -- and a buffer whose
+    /// whole purpose is that the foreground is not lost cannot drop it.
+    ///
+    /// **The order is the assertion.** The recap is painted under the
+    /// *first* agent's header, before the second agent's attach milestone,
+    /// or a reader would attribute agent 7's turn to agent 9.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn re_attaching_to_another_agent_replays_the_first_ones_recap_first() {
+        let probe = SurfaceProbe::install();
+        let mut attached: Option<u64> = None;
+
+        apply_agent_view_exit(&attaching_exit(7), &mut attached);
+        foreground_meta("* agent 7's attachment");
+        apply_agent_view_exit(&attaching_exit(9), &mut attached);
+        assert_eq!(attached, Some(9), "control: the binding moved");
+        foreground_meta("* agent 9's attachment");
+        apply_detach_command(&mut attached);
+
+        assert_eq!(
+            probe.lines(),
+            vec![
+                kitsu_render::milestone_line(&attach_milestone_message(7)),
+                kitsu_render::milestone_line(&detach_recap_message(7)),
+                "* agent 7's attachment".to_string(),
+                kitsu_render::milestone_line(&attach_milestone_message(9)),
+                kitsu_render::milestone_line(&detach_recap_message(9)),
+                "* agent 9's attachment".to_string(),
+            ],
+            "a re-attachment leaves the first agent, and its recap is headed \
+             by the agent it belongs to"
+        );
+    }
+
+    /// **The overflow note reaches the user**, not just the buffer
+    /// (**F52**, **F71**).
+    ///
+    /// **FAILING-FIRST.**
+    ///
+    /// The byte bound and the note are pinned at unit level in
+    /// `kitsu-render`; this is the claim that the note is *painted*, which is
+    /// the half F71 exists for. A recap that computed the note and replayed
+    /// only the surviving lines would pass every unit test and still show
+    /// the user a hole with nothing marking it.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn an_overflowing_recap_paints_its_overflow_note_under_the_header() {
+        let probe = SurfaceProbe::install();
+        let mut attached: Option<u64> = None;
+        apply_agent_view_exit(&attaching_exit(4), &mut attached);
+
+        // 1 KiB a line, two buffers' worth: the bound must cost it lines.
+        const LINE: usize = 1024;
+        let line = |n: usize| format!("{n:04} {}", "q".repeat(LINE - 5));
+        let pushed = 2 * kitsu_render::surface::RECAP_BUFFER_BYTES / LINE;
+        for n in 0..pushed {
+            foreground_meta(&line(n));
+        }
+        apply_detach_command(&mut attached);
+
+        let painted = probe.lines();
+        assert_eq!(
+            painted.first().map(String::as_str),
+            Some(kitsu_render::milestone_line(&attach_milestone_message(4)).as_str()),
+            "control: {painted:?}"
+        );
+        assert_eq!(
+            painted.get(1).map(String::as_str),
+            Some(kitsu_render::milestone_line(&detach_recap_message(4)).as_str()),
+            "the header still heads it"
+        );
+        let kept = painted.len() - 3;
+        assert_eq!(
+            painted.get(2).map(String::as_str),
+            Some(kitsu_render::surface::recap_overflow_note(pushed - kept).as_str()),
+            "F52: the note sits directly under the header, where the dropped \
+             output was, and says how much went"
+        );
+        assert!(
+            kept > 0 && kept < pushed,
+            "non-vacuous: the recap kept some of the output and lost some: \
+             {kept} of {pushed}"
+        );
+        assert_eq!(
+            painted.last().map(String::as_str),
+            Some(line(pushed - 1).as_str()),
+            "and what it kept ends at the newest line, which is what a user \
+             returning to the foreground is looking for"
         );
     }
 }
