@@ -1,10 +1,4 @@
-# `workspace_diff` — a model-callable, host-verified evidence tool
-
-Cycle-10 headline fix for docs/chat-ux-cycle-9.md finding 1: piped (and
-interactive, scripted, JSONL) chat has no evidence path for "explain my
-uncommitted changes". The model cannot see the diff, flails, spawns agents,
-and times out — while `kitsu review` answers the same question in one command.
-This doc is the design contract; the implementation follows it.
+# Workspace diff tool
 
 ## What it is
 
@@ -29,9 +23,8 @@ with the same private-path exclusions.
 
 ## Authority model — a disclosure, not a read
 
-This is the `/review` half of the cycle-7 host-evidence asymmetry, on demand:
-a **disclosure of host-gathered evidence to the provider**, never a filesystem
-read by the model.
+The tool discloses host-gathered evidence to the provider without granting
+filesystem read access.
 
 - It reuses `WorkspaceEvidenceAuthority` (main.rs), gaining a Send-safe
   constructor (`for_workspace_tool`) bound at registration time to the launch
@@ -67,8 +60,7 @@ disclosure is bounded (one diff, capped, private paths excluded) and
   followed by the standing announcement line, identical to `/review`'s:
   `~ disclosing N bytes of host-verified evidence to <model>; no read root
   granted`. No filesystem prompt is raised — prompting would train users to
-  widen *model read authority* to look at their own diff, the exact
-  anti-pattern the cycle-7 work removed.
+  widen *model read authority* to look at their own diff, an unnecessary standing permission.
 - **Non-interactive (piped/scripted):** allowed by default, for the same
   reason `kitsu review` works non-interactively. The disclosure line prints
   to stderr; JSONL runs get a `workspace_evidence_disclosure` event instead.
@@ -106,26 +98,8 @@ consumers audit both disclosure surfaces with one shape. The
 ## System prompt
 
 When (and only when) the tool is registered, one line tells the model it can
-fetch verified workspace diffs itself — directly preventing the cycle-9
-flail (agent-spawning, asking the user to paste diffs):
+fetch verified workspace diffs itself:
 
 > Use workspace_diff to fetch the user's verified git diff (scope working /
 > staged / unstaged / {base: REV} / {commit: REV}) when asked about their
 > changes — do not ask them to paste diffs or spawn agents to run git.
-
-## Test plan
-
-Unit (main.rs): scope-argument parsing (strings, `{base}`/`{commit}`
-objects, defaults, rejection of unknown scopes/extra keys/empty revisions);
-system-prompt line present iff `workspace_diff` is registered.
-
-Integration (tests/cli.rs, existing wiremock + git-fixture patterns): a
-scripted chat where the mock provider calls `workspace_diff` and the
-transcript shows the diff-backed answer plus the disclosure line while
-`/permissions` still reports no read roots and the host-evidence section
-lists the tool; the same flow in `--jsonl` asserting the
-`workspace_evidence_disclosure` event shape between `tool_started` and
-`tool_finished`; `--no-workspace-evidence` (and the config knob) unregister
-the tool; private-path exclusions honored through the tool
-(kitsu-private file changes absent from the returned diff); a non-worktree
-directory registers nothing.

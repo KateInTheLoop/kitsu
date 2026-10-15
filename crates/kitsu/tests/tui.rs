@@ -923,7 +923,7 @@ fn recall_with_up_then_quit() -> Vec<Step> {
 /// Test 39. **Finding F20, corrected: inline mode does _not_ lose history that
 /// persists across sessions.**
 ///
-/// F20 recorded, and `README.md`, `CHANGELOG.md`, `docs/ux-design.md` and the
+/// F20 recorded, and `README.md`, `CHANGELOG.md`, `docs/usage.md` and the
 /// T0 go/no-go record repeated, that the inline idle prompt loses cross-session
 /// history. This runs the real binary twice under one `HOME` and shows the
 /// first session's submitted line coming back on Up at the second session's
