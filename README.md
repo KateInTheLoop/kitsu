@@ -706,7 +706,7 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--allow-read-write <PATH>` | Explicitly allow both reads and writes under `PATH` (repeatable) for read-modify-write workflows. |
 | `--require-write <PATH>` | Fail a scripted or piped automation run unless the exact file receives a verified model filesystem mutation and its final contents differ from process launch (repeatable). This is a completion assertion, not a grant. A new target may use `--allow-write`; an existing target also needs read authority, normally via `--allow-read-write`, so safe replacement is possible. With `--output-schema`, `--max-rounds` must be at least 2: tool rounds omit the response format and one tool-free structured finalization round is reserved. |
 | `--require-write-sha256 <PATH=SHA256>` | Add an exact raw-byte SHA-256 expectation to the same verified-write/net-change contract (repeatable). Input hex is case-insensitive and normalized lowercase; parsing uses the final `=`, so paths may contain `=`. It grants no authority, and a mismatch fails before `-o` is replaced. With structured output, a descriptor-verified mismatch may use remaining bounded tool rounds for correction before finalization. |
-| `--enable-commands` | Enable the guarded `command_exec` and `git` tools. Approval is independent from filesystem access and `--yes`. |
+| `--enable-commands` | Enable general `command_exec` operations and Git in automation; interactive Git is already available. Approval is independent from filesystem access and `--yes`. |
 | `--command-root <PATH>` | Add an existing writable root to mandatory Linux command containment (repeatable; implies `--enable-commands`). Exact argv/cwd approval remains a separate gate. **The approved executable's own directory is a second, independent root requirement** — if a tool lives outside every `--command-root` (e.g. `~/.local/bin/pytest`), containment denies it at run time; the denial names the exact missing directory and the `--command-root` flag to add. |
 | `--allow-command <JSON_ARGV>` | Pre-approve one exact argv (repeatable). `'["cargo","test"]'` binds it to the launch directory; `'{"argv":["cargo","test"],"cwd":"/abs/dir"}'` binds it to an explicit directory inside a `--command-root`. The grant is exact argv **and** exact cwd. Every pregrant is also named verbatim (argv + cwd) in the system prompt, so the model can call it directly instead of guessing. |
 | `--command-env <NAME[=VALUE]>` | Opt-in, explicit environment pass-through into contained commands (repeatable), layered on top of the fixed non-secret base set (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`). Needed for interpreter-based toolchains (`pytest`, `npm test`, ...) whose module search path is env-driven (`PYTHONPATH`, `NODE_PATH`, ...). Bare `NAME` reads the value from kitsu's own environment and is refused for names that look secret-bearing (case-insensitive substring match on `KEY`/`TOKEN`/`SECRET`/`PASSWORD`); use `NAME=value` to pass an explicit literal value regardless of name. Nothing else is inherited from the host — deny-by-default is unchanged. Disclosed in `/permissions` and JSONL (secret-shaped values are redacted there even though the contained process receives the real value). |
@@ -743,9 +743,9 @@ In an interactive `chat` the model has filesystem tools (`fs_read_file`,
 `fs_list_dir`, `repo_grep`, `fs_edit_file`, `fs_write_file`), gated by a **permission model**
 similar to Claude Code — it asks before touching paths you haven't allowed:
 
-For local Git work, launch `kitsu chat --enable-commands`. The `git` tool can
-inspect status/diffs and create branches or commits after exact argv/cwd
-approval. It uses the same Linux containment as developer commands; network
+The `git` tool is available by default in interactive chat. It can inspect
+status/diffs and create branches or commits after exact argv/cwd approval.
+`--no-tools` disables it; `--enable-commands` also exposes the general command runner. It uses the same Linux containment as developer commands; network
 operations remain unavailable. In automation, pre-approve exact invocations
 with `--allow-command`; filesystem grants alone do not authorize Git.
 

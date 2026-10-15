@@ -17,8 +17,9 @@ shapes may change in any minor release.
 
 ### Added
 
-- A `git` tool for local repository operations, enabled with `--enable-commands`
-  and backed by the existing exact command approvals and Linux containment.
+- A `git` tool available by default in interactive chat, backed by exact
+  command approvals and Linux containment. General commands remain opt-in;
+  `--no-tools` disables Git too.
 
 
 #### Terminal UI (preview)
