@@ -340,6 +340,19 @@ nothing is sent, the agent's own refusal is printed, and **your line stays in th
 composer**. Slash commands are still commands while attached, so `/detach` always
 works.
 
+`/tui fullscreen` switches the renderer to a fullscreen view over the viewport's
+scrollback: it takes the terminal's alternate screen, paints the retained lines,
+and gives the screen and the window title back when you leave it. `--tui
+fullscreen` and `[tui] mode = "fullscreen"` start there instead; a session that
+starts in fullscreen has nothing behind it to paint yet. Paging is not wired, so
+the view shows the newest lines that fit.
+
+The scrollback it paints holds the **streamed** conversation. It does not hold
+kitsu's own diagnostics and receipts, and it does not hold an answer that was
+buffered rather than streamed -- which happens whenever tools are advertised for
+that round, i.e. by default. With `--no-tools` the answer streams and the
+scrollback has it. `[tui] cell_ring_lines` bounds it in lines (default 10000).
+
 `?` lists every key the view binds, and `/help keys` prints the same list
 without opening the view -- both render one table, so neither can drift from the
 other or from what the keys actually do. `Enter` or `→` attaches to the selected

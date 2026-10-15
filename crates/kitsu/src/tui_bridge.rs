@@ -54,6 +54,11 @@ pub(crate) enum TuiMode {
     Classic,
     /// The pinned inline viewport from `kitsu-tui`.
     Inline,
+    /// The fullscreen transcript renderer: the terminal's alternate screen,
+    /// painted from the cell ring inline mode retains. It pins no DECSTBM
+    /// region and installs no surface, so [`install`] is inert for it and
+    /// [`enter_fullscreen`] is what takes the terminal.
+    Fullscreen,
 }
 
 impl TuiMode {
@@ -62,6 +67,7 @@ impl TuiMode {
         match self {
             TuiMode::Classic => "classic",
             TuiMode::Inline => "inline",
+            TuiMode::Fullscreen => "fullscreen",
         }
     }
 }
@@ -76,9 +82,22 @@ impl TuiMode {
 /// caller remembering to update it.
 static INLINE_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether a fullscreen segment holds the terminal's alternate screen **right
+/// now**.
+///
+/// The fullscreen counterpart of [`INLINE_INSTALLED`], and global for the same
+/// reason: `/tui`'s dispatch arm reports the live renderer and cannot see the
+/// `run_chat` local that holds the segment. Maintained by exactly two writers
+/// — [`enter_fullscreen`] on the way in and [`FullscreenSegment::leave`] on
+/// the way out — and the two flags are mutually exclusive by construction,
+/// because every route into one renderer tears the other down first.
+static FULLSCREEN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The renderer this process is painting through at this instant.
 pub(crate) fn live_mode() -> TuiMode {
-    if INLINE_INSTALLED.load(std::sync::atomic::Ordering::Acquire) {
+    if FULLSCREEN_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+        TuiMode::Fullscreen
+    } else if INLINE_INSTALLED.load(std::sync::atomic::Ordering::Acquire) {
         TuiMode::Inline
     } else {
         TuiMode::Classic
@@ -122,13 +141,18 @@ pub(crate) fn install(
     mode: TuiMode,
     rows: u16,
     viewport_rows: u16,
+    cell_ring_lines: usize,
     status: &str,
     out: Box<dyn std::io::Write + Send>,
     err: Box<dyn std::io::Write + Send>,
 ) -> Option<BridgeGuard> {
     match mode {
-        // Inert: no bytes, no surface swap, and the live-row setting untouched.
-        TuiMode::Classic => return None,
+        // Inert: no bytes, no surface swap, and the live-row setting
+        // untouched. Fullscreen shares the arm because it pins no region and
+        // installs no surface of its own -- it takes the alternate screen
+        // through `enter_fullscreen` and lets the displaced surface keep
+        // printing the transcript onto it.
+        TuiMode::Classic | TuiMode::Fullscreen => return None,
         TuiMode::Inline => {}
     }
 
@@ -147,7 +171,10 @@ pub(crate) fn install(
         return None;
     }
 
-    let viewport = Arc::new(InlineSurface::new(out, err));
+    // Requirement N4: inline mode always carries a ring, bounded by the
+    // configured line count. There is no off switch -- the bound's minimum is
+    // one line -- so the newest line is always retained.
+    let viewport = Arc::new(InlineSurface::with_cell_ring(out, err, cell_ring_lines));
     viewport.show(rows, viewport_rows);
     viewport.paint(&[status.to_string()], live::terminal_columns());
 
@@ -174,6 +201,145 @@ pub(crate) fn install(
         previous_live_rows,
         live_status: std::cell::RefCell::new(None),
     })
+}
+
+impl BridgeGuard {
+    /// The lines the installed viewport's cell ring retains, oldest first, or
+    /// `None` when the viewport was built without a ring.
+    ///
+    /// The one window onto requirement **N4**'s ring from outside
+    /// `kitsu-tui`: the surface itself stays private to the pane, so this is
+    /// how the fullscreen renderer — and these tests — read what the surface
+    /// wrote.
+    ///
+    /// The production reader is the `/tui fullscreen` switch, which calls
+    /// this **before** dropping the guard (the ring belongs to the surface the
+    /// teardown puts back) and hands the lines to [`enter_fullscreen`].
+    pub(crate) fn cell_lines(&self) -> Option<Vec<kitsu_tui::cells::CellLine>> {
+        self.pane.viewport.cells()
+    }
+}
+
+/// Take the terminal's alternate screen, and push the window title onto the
+/// terminal's title stack. Requirement **N5**'s two clauses, as bytes.
+///
+/// The clear and the home cursor ride along with the enable, exactly as the
+/// agent view's own enter does: the alternate screen a terminal hands back is
+/// not guaranteed to be blank.
+const ENTER_ALT_SCREEN: &[u8] = b"\x1b[?1049h\x1b[2J\x1b[H";
+/// Give the alternate screen back. The restore is then the *terminal's* own:
+/// the transcript the user had is still on the primary screen, untouched.
+const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
+/// Push the window title (`CSI 22;2t`), and pop it (`CSI 23;2t`).
+///
+/// These are the same two sequences `kitsu_tui::TuiRuntime` writes, and they
+/// are written here rather than by borrowing that runtime for one reason,
+/// which is the same one `run_agent_view_overlay` states for the alternate
+/// screen: `TuiRuntime::enter` also enables **crossterm's** raw mode, which
+/// clears `OPOST`, and this binary's several hundred direct
+/// `println!`/`eprintln!` writers would staircase down the screen. Raw mode
+/// in this process belongs to `RawStdinGuard` and to nothing else, so a
+/// fullscreen segment states the screen and the title and leaves termios
+/// alone. Under tmux and GNU screen both sequences are silently ignored and a
+/// title kitsu set would stay; an ignored sequence is inert rather than
+/// broken.
+const PUSH_TITLE: &[u8] = b"\x1b[22;2t";
+/// See [`PUSH_TITLE`].
+const POP_TITLE: &[u8] = b"\x1b[23;2t";
+
+/// A live fullscreen segment: the alternate screen and the pushed title, given
+/// back when this is dropped.
+///
+/// A guard rather than an enter/leave pair of calls, for the reason
+/// [`BridgeGuard`] is one: `/tui` swaps renderers by dropping the outgoing
+/// one, every exit path out of `run_chat` drops it too, and a second teardown
+/// path is how one of them comes to differ from the other.
+pub(crate) struct FullscreenSegment {
+    /// The sink the enter bytes went to, kept so the leave bytes go to the
+    /// same one.
+    err: Box<dyn std::io::Write + Send>,
+    /// Whether the terminal has already been given back, so the restore bytes
+    /// are written at most once per segment.
+    left: bool,
+}
+
+impl FullscreenSegment {
+    /// Give the terminal back: the alternate screen first, then the title.
+    ///
+    /// Idempotent, and every I/O result is dropped: this is the body of
+    /// [`Drop`], there is nothing useful to do about a terminal that will not
+    /// take its own escape sequences, and the only place left to report it to
+    /// is that terminal.
+    fn leave(&mut self) {
+        if self.left {
+            return;
+        }
+        self.left = true;
+        // Before the bytes, so `/tui`'s report cannot observe a renderer the
+        // terminal has already been taken back from.
+        FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        let _ = self.err.write_all(LEAVE_ALT_SCREEN);
+        let _ = self.err.write_all(POP_TITLE);
+        let _ = self.err.flush();
+    }
+}
+
+impl Drop for FullscreenSegment {
+    fn drop(&mut self) {
+        self.leave();
+    }
+}
+
+/// Enter fullscreen: take the alternate screen and paint the **tail** of
+/// `lines` into it through `kitsu_tui::fullscreen::FullscreenView`.
+///
+/// `lines` is the inline viewport's cell ring as [`BridgeGuard::cell_lines`]
+/// returned it, oldest first, and empty when the outgoing renderer was
+/// classic — classic feeds no ring, so a switch out of it has nothing to
+/// repaint and paints nothing. That is the honest frame for an empty ring
+/// rather than a reason to conjure one.
+///
+/// The ring is rebuilt here over the copy `cell_lines` already handed out,
+/// because the ring itself belongs to the surface the teardown has just put
+/// back. Its limit is the line count, so nothing is evicted and the view's
+/// follow anchor resolves to the newest `rows - 1` lines.
+///
+/// One row is held back from the window on purpose: the switch receipt and
+/// the prompt are written to the same screen straight afterwards, so a frame
+/// that filled every row would scroll its own oldest line off before the user
+/// saw it. Paging back through the rest of the ring needs a key decoder and a
+/// view that outlives the paint; this segment shows the tail, which is
+/// strictly more than the classic renderer shows of a transcript that has
+/// scrolled away.
+///
+/// The rows are written as lines rather than at absolute addresses, with this
+/// backend's own CRLF: the cursor is then left under the frame, where the
+/// receipt and everything the session prints next belong.
+pub(crate) fn enter_fullscreen(
+    err: Box<dyn std::io::Write + Send>,
+    lines: &[kitsu_tui::cells::CellLine],
+    rows: u16,
+    cols: usize,
+) -> FullscreenSegment {
+    let mut ring = kitsu_tui::cells::CellRing::new(lines.len().max(1));
+    for line in lines {
+        ring.push(line.fd(), line.styled());
+    }
+    let frame =
+        kitsu_tui::fullscreen::FullscreenView::new().frame(&ring, rows.saturating_sub(1), cols);
+
+    let mut err = err;
+    let _ = err.write_all(PUSH_TITLE);
+    let _ = err.write_all(ENTER_ALT_SCREEN);
+    for row in &frame {
+        let _ = err.write_all(row.as_bytes());
+        let _ = err.write_all(b"\r\n");
+    }
+    let _ = err.flush();
+    // After the bytes: the terminal is held by the time anything can report
+    // that it is.
+    FULLSCREEN_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+    FullscreenSegment { err, left: false }
 }
 
 /// The pinned pane: the inline viewport plus the geometry currently latched
@@ -2250,12 +2416,28 @@ mod tests {
         viewport_rows: u16,
         status: &str,
     ) -> (Option<BridgeGuard>, SharedSink, SharedSink) {
+        install_inline_with_ring(rows, viewport_rows, DEFAULT_TEST_RING, status)
+    }
+
+    /// The cell-ring bound the helper above installs with: a bound every
+    /// existing test is indifferent to, so only the tests that name a bound
+    /// of their own depend on one.
+    const DEFAULT_TEST_RING: usize = 64;
+
+    /// As [`install_inline`], with the cell-ring bound spelled out.
+    fn install_inline_with_ring(
+        rows: u16,
+        viewport_rows: u16,
+        cell_ring_lines: usize,
+        status: &str,
+    ) -> (Option<BridgeGuard>, SharedSink, SharedSink) {
         let out = SharedSink::new();
         let err = SharedSink::new();
         let guard = install(
             TuiMode::Inline,
             rows,
             viewport_rows,
+            cell_ring_lines,
             status,
             Box::new(out.clone()),
             Box::new(err.clone()),
@@ -2400,6 +2582,8 @@ mod tests {
             TuiMode::Classic,
             24,
             3,
+            // A bound classic must not spend: it constructs no surface at all.
+            DEFAULT_TEST_RING,
             "status: idle",
             Box::new(out.clone()),
             Box::new(err.clone()),
@@ -2418,6 +2602,240 @@ mod tests {
         assert!(
             out.is_empty() && err.is_empty(),
             "and write no bytes at all"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // T5-S1b: the cell ring goes live.
+    //
+    // Requirement **N4**. The ring is an opt-in field on the inline surface,
+    // so making it live is one decision in one place: `install` builds the
+    // viewport, and it is the only production constructor of one. These tests
+    // therefore read the ring back through the guard that `install` returned,
+    // which is the same window the overlay will use -- never from the
+    // configuration, and never from the surface's bytes (finding **F71**).
+    //
+    // Classic is not re-pinned here: `install_classic_is_inert` above already
+    // asserts that classic mode constructs no surface at all, and it now does
+    // so while being handed a bound. That classic *cannot* construct a ring is
+    // stronger than any of this and is not a test: `kitsu-render` has no
+    // dependency on `kitsu-tui`, so the ring is unnameable from the classic
+    // renderer at compile time.
+    // ---------------------------------------------------------------------
+
+    use kitsu_render::surface::Fd;
+    use kitsu_tui::cells::CellRing;
+    use kitsu_tui::fullscreen::FullscreenView;
+
+    /// Write `lines` through whatever surface is installed right now, which is
+    /// the seam the whole transcript takes: `kitsu-render`'s writers reach the
+    /// surface slot, never the viewport directly.
+    fn through_the_seam(lines: &[(Fd, &str)]) {
+        let surface = active_surface();
+        for (fd, text) in lines {
+            surface.transcript_line(*fd, text);
+        }
+    }
+
+    /// The ring's retained lines as `(fd, styled bytes)`, which is what every
+    /// assertion below compares.
+    fn retained(guard: &BridgeGuard) -> Vec<(Fd, String)> {
+        guard
+            .cell_lines()
+            .expect("installing the inline viewport in production feeds a cell ring")
+            .iter()
+            .map(|line| (line.fd(), line.styled().to_string()))
+            .collect()
+    }
+
+    /// **The ring is fed in production.** Installing the inline viewport --
+    /// the one production construction of a surface -- builds a ring, and the
+    /// lines that cross the seam afterwards are in it.
+    ///
+    /// Not vacuous twice over: the injected sink is asserted to have received
+    /// both lines, so the writes really happened and the ring is being read
+    /// after a transcript it could have missed; and the retained list is
+    /// compared by value, so a ring that exists and retains nothing fails.
+    #[test]
+    #[serial]
+    fn installing_the_inline_viewport_feeds_a_cell_ring() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let err_before = err.bytes().len();
+
+        through_the_seam(&[(Fd::Stdout, "assistant"), (Fd::Stderr, "tool")]);
+
+        // Each line on its own descriptor, which is also why the ring is
+        // fd-tagged: the two sinks are what the surface actually split.
+        let err_tail = err.text()[err_before..].to_string();
+        assert!(
+            out.text().contains("assistant"),
+            "precondition: the stdout line crossed the seam: {:?}",
+            out.text()
+        );
+        assert!(
+            err_tail.contains("tool"),
+            "precondition: the stderr line crossed the seam: {err_tail:?}"
+        );
+        assert_eq!(
+            retained(&guard),
+            vec![
+                (Fd::Stdout, "assistant".to_string()),
+                (Fd::Stderr, "tool".to_string()),
+            ],
+            "the installed viewport's ring is N4's sole record of the transcript"
+        );
+    }
+
+    /// **The configured bound reaches the ring.** A non-default
+    /// `cell_ring_lines` produces a ring that evicts at exactly that bound, so
+    /// the configuration key has a reader in fact and not only in name.
+    ///
+    /// Two different bounds in one test on purpose: a single bound is
+    /// satisfied by any constant the install might hardcode, including
+    /// `TuiConfig::DEFAULT_CELL_RING_LINES`, whereas two are satisfied only by
+    /// a value that travelled from the caller.
+    #[test]
+    #[serial]
+    fn the_configured_bound_is_the_bound_the_installed_ring_evicts_at() {
+        let _state = GlobalState::capture();
+        for bound in [2_usize, 3] {
+            let (guard, _out, _err) = install_inline_with_ring(24, 1, bound, "status: idle");
+            let guard = guard.expect("inline mode installs a guard");
+            through_the_seam(&[
+                (Fd::Stdout, "one"),
+                (Fd::Stdout, "two"),
+                (Fd::Stdout, "three"),
+                (Fd::Stdout, "four"),
+            ]);
+            let kept = retained(&guard)
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>();
+            let expected = ["one", "two", "three", "four"][4 - bound..]
+                .iter()
+                .map(|text| (*text).to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kept, expected,
+                "a ring installed with a bound of {bound} retains the newest {bound} lines"
+            );
+            drop(guard);
+        }
+    }
+
+    /// **The evicted lines' bytes are retained nowhere.** The achievable
+    /// byte-level claim of **F52**/**F84b**, computed from the ring's contents
+    /// and never from the allocator: the retained bytes are the retained
+    /// lines' and no others, so the sum is the same however many lines were
+    /// pushed past the bound.
+    #[test]
+    #[serial]
+    fn the_live_rings_retained_bytes_are_the_retained_lines_and_no_others() {
+        let _state = GlobalState::capture();
+        let mut sums = Vec::new();
+        for pushes in [8_usize, 40] {
+            let (guard, _out, _err) = install_inline_with_ring(24, 1, 4, "status: idle");
+            let guard = guard.expect("inline mode installs a guard");
+            let lines = (0..pushes)
+                .map(|n| format!("line {n:04}"))
+                .collect::<Vec<_>>();
+            through_the_seam(
+                &lines
+                    .iter()
+                    .map(|text| (Fd::Stdout, text.as_str()))
+                    .collect::<Vec<_>>(),
+            );
+            let kept = retained(&guard);
+            assert_eq!(kept.len(), 4, "the bound holds at {pushes} pushes");
+            sums.push(kept.iter().map(|(_, text)| text.len()).sum::<usize>());
+            drop(guard);
+        }
+        assert_eq!(
+            sums[0], sums[1],
+            "five times the traffic retains the same bytes: the evicted lines' \
+             bytes are held nowhere"
+        );
+    }
+
+    /// **A stored line is the surface's bytes verbatim, styling included**
+    /// (N4, explicitly) -- on the *live* path, not only on the unit one. The
+    /// overlay repaints these rows and the ring is the only copy, so a feed
+    /// that stored the stripped form would decolour the transcript
+    /// irreversibly.
+    #[test]
+    #[serial]
+    fn the_live_cell_ring_stores_the_surfaces_styled_bytes_verbatim() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        through_the_seam(&[(Fd::Stderr, "\x1b[1mtool\x1b[0m")]);
+
+        let lines = guard
+            .cell_lines()
+            .expect("installing the inline viewport in production feeds a cell ring");
+        let line = lines.last().expect("the styled line was retained");
+        assert_eq!(
+            line.styled(),
+            "\x1b[1mtool\x1b[0m",
+            "the SGR bytes are stored as written: they can be stripped later \
+             and never reconstructed"
+        );
+        assert_eq!(
+            line.plain(),
+            "tool",
+            "and the stripped form is derived on demand, not stored"
+        );
+    }
+
+    /// **The reader and the feed, together.** Each half can work while the
+    /// pair does not, so this pins the composition: what the fullscreen view
+    /// paints is the bytes the *installed* surface wrote, styling intact, in
+    /// order.
+    ///
+    /// The view takes a `CellRing`, and the guard hands out the retained
+    /// lines, so the ring the view reads is rebuilt here through
+    /// `CellRing::push` -- the same call the surface's own feed makes, with the
+    /// same `(fd, styled bytes)` the surface produced. Nothing in the
+    /// round-trip can invent styling that the feed did not store, which is the
+    /// property under test.
+    #[test]
+    #[serial]
+    fn the_fullscreen_frame_paints_what_the_installed_surface_wrote() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        let written = [
+            (Fd::Stdout, "plain row"),
+            (Fd::Stderr, "\x1b[31mred row\x1b[0m"),
+            (Fd::Stdout, "last row"),
+        ];
+        through_the_seam(&written);
+
+        let lines = guard
+            .cell_lines()
+            .expect("installing the inline viewport in production feeds a cell ring");
+        let mut ring = CellRing::new(16);
+        for line in &lines {
+            ring.push(line.fd(), line.styled());
+        }
+        let frame = FullscreenView::new().frame(&ring, 3, 80);
+        assert_eq!(
+            frame,
+            written
+                .iter()
+                .map(|(_, text)| kitsu_render::fit_row_to_width(text, 80))
+                .collect::<Vec<_>>(),
+            "the view over the live ring shows the surface's own rows, styling \
+             included, oldest first"
+        );
+        assert!(
+            frame.iter().any(|row| row.contains("\x1b[31m")),
+            "precondition: the frame really carries SGR bytes, so the equality \
+             above is not between two stripped forms: {frame:?}"
         );
     }
 

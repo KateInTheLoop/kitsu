@@ -220,15 +220,9 @@ impl InlineSurface {
     /// Wrap the two descriptors **and** feed a bounded cell ring of
     /// `cell_ring_lines` lines (requirement **N4**, plan row T3-S6).
     ///
-    /// Opt-in on purpose: only a backend with a transcript overlay and a `[`
-    /// dump has a reader for the ring, so a surface built with
-    /// [`new`](Self::new) retains nothing and pays nothing.
-    // Constructed by tests only for now: nothing reads the ring until the
-    // transcript overlay (`Ctrl+O`, requirement R6) and the `[` dump land in
-    // T5, and feeding an unread ring would spend up to `DEFAULT_CELL_RING_LINES`
-    // styled lines of memory for no benefit. The production constructor arrives
-    // with R6's overlay, which is also what `InlineComposerHost` is waiting on.
-    #[allow(dead_code)]
+    /// Opt-in on purpose: a surface built with [`new`](Self::new) retains
+    /// nothing and pays nothing, which is what every non-inline caller wants.
+    /// The inline install uses this constructor, so inline mode always retains.
     pub fn with_cell_ring(
         out: Box<dyn Write + Send>,
         err: Box<dyn Write + Send>,
