@@ -18989,3 +18989,50 @@ async fn test_streaming_output_cap_prints_the_truncation_marker() {
         "{stdout}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_interactive_git_is_default_without_enabling_general_commands() {
+    use std::io::Write;
+    for (flags, want_git, want_commands) in [
+        (vec![], true, false),
+        (vec!["--no-tools"], false, false),
+        (vec!["--enable-commands"], true, true),
+    ] {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write_config(home.path(), "http://127.0.0.1:1");
+        let mut sent = false;
+        let mut quit = false;
+        let (status, transcript) = run_plain_interactive_chat_pty(
+            home.path(),
+            project.path(),
+            &flags,
+            |output, terminal| {
+                let text = String::from_utf8_lossy(output);
+                if !sent && text.contains("kitsu>") {
+                    terminal.write_all(b"/tools\n").unwrap();
+                    terminal.flush().unwrap();
+                    sent = true;
+                }
+                if sent
+                    && !quit
+                    && text.contains("enabled; permissions")
+                    && text.matches("kitsu>").count() >= 2
+                {
+                    terminal.write_all(b"/quit\n").unwrap();
+                    terminal.flush().unwrap();
+                    quit = true;
+                }
+            },
+        );
+        assert!(status.success(), "{transcript}");
+        let listed_git = transcript.lines().any(|line| line.trim() == "- git");
+        let listed_commands = transcript
+            .lines()
+            .any(|line| line.trim() == "- command_exec");
+        assert_eq!(listed_git, want_git, "{flags:?}: {transcript}");
+        assert_eq!(listed_commands, want_commands, "{flags:?}: {transcript}");
+    }
+}

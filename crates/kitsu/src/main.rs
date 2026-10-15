@@ -7833,7 +7833,7 @@ fn collect_current_session_snapshot(
     let commands_enabled = session
         .tool_names
         .iter()
-        .any(|tool_name| tool_name == "command_exec");
+        .any(|tool_name| matches!(tool_name.as_str(), "command_exec" | "git"));
     let authority = current_session_authority_input(
         mode,
         read_roots,
@@ -15130,6 +15130,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         || !command_runtime_roots.is_empty()
         || !allow_commands.is_empty()
         || !command_env.is_empty();
+    // Interactive developer chat offers Git without exposing a general command
+    // runner. Every Git invocation still uses the independent approval policy.
+    let default_git = interactive
+        && !no_tools
+        && std::env::current_dir().is_ok_and(|cwd| {
+            reject_credential_command_root(&cwd, &setup.state_dir, "default Git root").is_ok()
+        });
     let automatic_artifacts = setup.artifact_policy == ArtifactStoragePolicy::Automatic;
     if cli.jsonl && interactive {
         return Err(CliError::user(
@@ -15367,21 +15374,22 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             required_write_structured_repair(&contracts, &journal)
         })
     });
-    let command_artifact_sink = (command_requested && automatic_artifacts).then(|| {
-        let quota = command_artifact::CommandArtifactQuota::new(
-            command_artifact::DEFAULT_COMMAND_ARTIFACT_COUNT,
-            command_artifact::DEFAULT_COMMAND_ARTIFACT_TOTAL_BYTES,
-            command_artifact::CommandArtifactOverflowPolicy::PruneOldest,
-        )
-        .expect("non-zero built-in command artifact quota");
-        command_artifact::CommandArtifactSink::with_quota(quota)
-    });
+    let command_artifact_sink =
+        ((command_requested || default_git) && automatic_artifacts).then(|| {
+            let quota = command_artifact::CommandArtifactQuota::new(
+                command_artifact::DEFAULT_COMMAND_ARTIFACT_COUNT,
+                command_artifact::DEFAULT_COMMAND_ARTIFACT_TOTAL_BYTES,
+                command_artifact::CommandArtifactOverflowPolicy::PruneOldest,
+            )
+            .expect("non-zero built-in command artifact quota");
+            command_artifact::CommandArtifactSink::with_quota(quota)
+        });
     let command_pregrant_specs: Vec<PregrantedCommandSpec> = allow_commands
         .iter()
         .map(|encoded| PregrantedCommandSpec::parse(encoded))
         .collect::<Result<_, _>>()?;
     let mut explicit_command_grants: Vec<PregrantedCommand> = Vec::new();
-    let command_policy = if command_requested {
+    let command_policy = if command_requested || default_git {
         let launch_dir = std::env::current_dir().map_err(|error| {
             CliError::user(format!("cannot resolve command directory: {error}"))
         })?;
@@ -15525,9 +15533,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             can_read,
             can_write,
             &write_journal,
-            command_policy.as_ref(),
+            command_policy.as_ref().filter(|_| command_requested),
             tool_tier,
         )?;
+        if default_git && !command_requested {
+            let (descriptor, handler) = builtins::command::git_tool(
+                command_policy
+                    .as_ref()
+                    .expect("default Git owns a command policy")
+                    .clone(),
+            );
+            t.register_with_descriptor(descriptor, handler)?;
+        }
         Arc::new(t)
     };
 
@@ -15640,9 +15657,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             can_read,
             can_write,
             &write_journal,
-            command_policy.as_ref(),
+            command_policy.as_ref().filter(|_| command_requested),
             tool_tier,
         )?;
+        if default_git && !command_requested {
+            let (descriptor, handler) = builtins::command::git_tool(
+                command_policy
+                    .as_ref()
+                    .expect("default Git owns a command policy")
+                    .clone(),
+            );
+            tools.register_with_descriptor(descriptor, handler)?;
+        }
     }
     let mut sub_cfg = build_agent_config(
         initial_model.clone(),
