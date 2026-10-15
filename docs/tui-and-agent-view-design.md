@@ -1,6 +1,6 @@
 # Kitsu TUI and agent view — design and requirements
 
-- **Status:** Draft v2.1 (revised after reviews `reviews/tui-design-review-1.md`
+- **Status:** **Implemented through milestone T3** (T3-S13). Requirements R1-R5, R7, R8, N2-N5, N8, N9 and B1-B5 are shipped or amended in place with the reason; R6 (transcript overlay), A1-A8 (the agent view) and the `fullscreen` renderer remain for T4 and T5. **Q1's live terminal matrix is still unrun and gates making `inline` a default rather than an opt-in.** Previously: Draft v2.1 (revised after reviews `reviews/tui-design-review-1.md`
   and `reviews/tui-plan-review-1.md`)
 - **Date:** 2026-10-12
 - **Branch:** `features/tui_herdr_improvements`

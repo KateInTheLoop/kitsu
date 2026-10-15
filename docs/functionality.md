@@ -349,10 +349,15 @@ ambient counter current, and deduplicated so an unchanged row writes no bytes.
 The meter reads the same session usage and effective budget `/context` reports,
 so the two cannot disagree. It never wraps between 40 and 200 columns and sheds
 segments in the order R5 documents.
-In the inline viewport the composer offers `@file` path completion and slash
-completion with the **same candidates, in the same order**, as the classic
-prompt: both hosts call one completion source, and a test sweeps every prefix of
-every registered command requiring all three to agree, so the two cannot drift.
+In the inline viewport, slash completion works: Tab accepts the showing hint,
+and typing a slash prefix opens the bordered command palette above the composer.
+**`@file` path completion is not yet wired there** -- the shared completion
+source and its parity test exist, and a sweep over every prefix of every
+registered command requires the classic prompt, the shared source and the inline
+host to agree, so they cannot drift once connected; but nothing in production
+drives the inline host yet. A 10 KiB bracketed paste at the idle inline prompt
+stays a single draft and is accepted in single-digit milliseconds, measured by
+`crates/kitsu/tests/paste_latency.rs` against requirement N2's 100 ms budget.
 `--tui <classic|inline>` and the `[tui]` table select the renderer: `mode`
 (default `classic`), `alternate_screen` (`auto|always|never`, forced to `never`
 by `--no-alt-screen`), `prefix` (default `ctrl+x`), `title`,

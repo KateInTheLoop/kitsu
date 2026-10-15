@@ -3258,3 +3258,42 @@ agent deterministically before comparing, or exclude the join narration from the
 comparison. Worth a small card, and worth checking the other byte-identity tests
 for the same pattern — four occurrences across three cards is frequent enough to
 cost someone an afternoon eventually.
+
+## F60 — T3's exit gate has a clause with no test, and the harness cannot express it
+
+Found while running T3's exit gate clause by clause in T3-S13. The gate reads:
+
+> per-fd sanitize equality on the streamed two-tool PTY run; all fixtures
+> byte-identical in classic/plain/JSONL; both profiles; `cargo test --locked`;
+> Windows `cargo check`.
+
+**The first clause cannot be run, for two independent reasons.**
+
+1. **No two-tool-call streamed PTY run exists.** The nearest test streams
+   **one** tool call, in **classic only**, and asserts screen order and a
+   request body — not cross-renderer equality. `tool_call(` appears at four
+   sites in the terminal suite, none of them two calls in one streamed turn.
+2. **Per-fd separation is structurally impossible in the harness as built.**
+   `run_styled_chat_pty_core` hands the child **three `dup`s of one pty slave**,
+   so stdout and stderr *are the same descriptor* and the harness reads one
+   interleaved stream. There is no "inline's stdout" to compare against
+   "classic's stdout".
+
+**What passes and must not be mistaken for it:**
+`inline_mode_commits_the_same_permission_receipt_as_classic` asserts sanitize
+equality of the `◉ permission —` receipt between renderers. That is **R7's**
+risk gate — one line, on one fd-blind stream. It is good evidence that the two
+renderers agree about *that* receipt, and it is not this clause.
+
+**The card to write**, specified so nobody has to rediscover it: allocate **two**
+ptys, stdout on one and stderr on the other, each `TIOCSWINSZ`'d and both real
+ttys so the inline gate still opens; add a streamed turn with **two** tool calls
+to the streaming harness; then assert sanitized stdout and sanitized stderr
+**separately**, classic against inline.
+
+**Why this was worth finding rather than assuming.** An exit gate is the thing
+that decides a milestone is done. Four of its five clauses ran and passed; this
+one would have been read as passing because adjacent tests with similar names
+do. The lesson is the same one F57 produced from the other direction: **a gate
+is only as real as the test that implements it, and "there is a test about
+this area" is not that test.**
