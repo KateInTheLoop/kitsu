@@ -4561,3 +4561,63 @@ T5-S1c-ii's test author **stopped twice on its own work**, both times because a 
 **The generalisable practice: before writing a failing test, measure what the current code actually does to the thing you are about to assert.** A test derived from a description of the defect can be satisfied by the defect; a test derived from a measurement of it cannot.
 
 The discriminator it chose is the other half of the lesson: the `model … cwd` hint row has **exactly one producer**, whose only caller is rustyline's hinter, and the inline painter never writes it. **That row on the alternate screen *is* rustyline reading the surface** — a by-construction fact rather than a substring guess (**F41**).
+
+## F100 — `Ctrl+Home` is already `Home`, and that makes the inline negative load-bearing
+
+My brief for T5-S1c-iii warned that `Ctrl+Home`/`Ctrl+End` *could* collide with plain `Home`/`End`. **Measured, it is not a risk — they are already the same key.** Verified at `kitsu-editor/src/lib.rs`:
+
+```
+b'C' => match self.csi_params.as_slice() { b"1;5" | b"1;3" => move_word_right, … }
+b'D' => match self.csi_params.as_slice() { b"1;5" | b"1;3" => move_word_left,  … }
+b'H' => self.move_home(outcome),      // no parameter match
+b'F' => self.move_end(outcome),       // no parameter match
+```
+
+`C` and `D` **inspect the parameters** to distinguish a word jump from a plain arrow. `H` and `F` **do not**, so `ESC[1;5H` and `ESC[H` are indistinguishable to the editor: **`Ctrl+Home` moves the caret home today, in every mode.**
+
+And `ESC[5~`/`ESC[6~` are **swallowed** — the `b'~'` arm has no `5` or `6` parameter and falls through — so **`PgUp` currently does nothing at all.**
+
+### The consequence, which is the finding
+
+**An implementer who recognises these four sequences *unconditionally* in the shared reader would pass every positive test on this card and silently break `Ctrl+Home` for every inline user.** The inline negative — *these keys do nothing new in inline and classic, and `Ctrl+Home` still moves the caret* — is therefore **load-bearing rather than decorative**, which is not how a "nothing regresses" guard usually reads.
+
+**And "PgUp does not disturb the draft" is green today**, because the editor already ignores it. **F99**'s trap on this very card: the test author measured first, found that assertion vacuous, and made every red test pin *delivery* or the caret instead. A card that asserted only inertness would have shipped nothing and passed.
+
+### Two corrections to my brief
+
+- **The comments I cited** as the reader's keymap documentation are in the **test** `inline_read_delivers_the_editor_keymap`, not in the reader. Substance right, location wrong.
+- **"The view's anchor is already there" was false.** `FullscreenSegment` held **no** view, and `fullscreen_frame` constructs `FullscreenView::new()` **fresh on every paint**, so no anchor survived a repaint. Paging state is **new** state on the segment, not relocated state. Verified.
+
+**Fourteenth and fifteenth mechanism errors in my briefs.** Both reported rather than worked around, and neither invalidated the card — but the second one matters, because "relocate existing state" and "introduce state with a lifetime" are different jobs and I had described the harder one as the easier.
+
+### One design choice worth keeping
+
+Paging delivers through a **sink closure**, not a new reader outcome, and the reasoning was measured rather than argued: **an outcome ends the read**, and re-entry replays the draft as *bytes* through a cursor, which leaves the caret at the end. So paging-by-outcome would **jerk the caret to the end on every press**, and hand each press a fresh editor, a fresh key filter and a lost reverse-search. A sink keeps one read, one editor and one draft across a whole run — pinned as a **count**: ten keystrokes, ten presses, in order (**F97**'s shape).
+
+### F100's resolution — and the best non-vacuity proof this epic has produced
+
+The anchor test's middle assertion was **arithmetically unsatisfiable**: 60 lines in a 60-limit ring retains all 60, window 23, `follow_top = 37`, `page_step(23) = 22`, so one `Page::Up` lands on ROW_16..ROW_38. Reaching ROW_01 needs a **1.6-window jump** — `Page::Oldest`'s transition, not `Up`'s — and one-window-per-press is pinned **green** in `kitsu-tui`. **Satisfying it would have meant redefining the key and breaking two passing tests.** Reproduced independently by me. The implementer stopped rather than bend the product: the **ninth** unsatisfiable assertion in this epic.
+
+**I rejected both fixes it offered, and the reasons generalise.**
+
+- *Assert the row the step actually reaches* — it would **hard-code `page_step` into a second place** when `kitsu-tui` already pins it. Two homes for one arithmetic fact is this epic's oldest failure mode.
+- *Shrink the ring so one press does reach the oldest* — it makes the claim true **by fixture**, and the test would then read as *"one PgUp reaches the oldest line"*, which is false of the product at any realistic size. **A test that is only true for its fixture is worse than one that is wrong, because it looks like a specification.**
+
+**The authorised fix asserted the intent instead** — the anchor's *lifetime*, not the step's size: the press moved the frame off the newest line, the paged frame **differs from the entry frame by value**, and then the claim the test's own name promises and nothing else covered — **after a repaint, the same frame is painted again.**
+
+### The proof, which is the part worth copying
+
+The implementer made that assertion **non-vacuous by mutation**: it reverted `repaint_if_the_ring_grew` to the `FullscreenView::new()` form it had before the card, re-ran, and got
+
+```
+assertion `left == right` failed: a repaint must come from the segment's anchor
+and not from a fresh view: same anchor, same rows.
+```
+
+then restored it. **So the assertion demonstrably covers the one-line change it exists for** — a change that was previously untested, because the fresh-view construction had passed every earlier test.
+
+**And the seam it needed already existed.** I had said "if pinning this needs a seam you do not have, stop again rather than weakening it". It didn't: `through_the_seam` writes to `active_surface()`, which **while the segment lives *is* its own tap** — so the ring grows and the repaint fires through **production's own gate**, with no test-only hook. That let the assertion pin the **whole frame equal by value** rather than the top row I had asked for, which is stronger and still names no number.
+
+It also added an assertion nobody asked for: `!segment.is_following()` after the growth, pinning that **append-while-following is suppressed while pinned** — transition 10's negative, which the view's own table describes and nothing had checked from the production side.
+
+**Three design choices recorded as right:** the **sink** rather than a reader outcome (an outcome ends the read, and re-entry replays the draft as bytes, so paging-by-outcome would jerk the caret to the end on every press and hand each one a fresh editor and a lost reverse-search); **the gate being the sink's presence** rather than a flag — *a surface with nowhere to send a press has no business lifting one out of the stream*; and **matching the full byte string including parameters**, which is the only thing keeping `Ctrl+Home` separable from `Home` given that the editor cannot tell them apart.

@@ -5888,8 +5888,8 @@ fn tui_two_streamed_turns_paint_each_line_once_without_fullscreen() {
 // while a draft is nevertheless painted and edited is something else reading
 // them.
 //
-// Not in scope here, deliberately: paging and **F54**. Nothing
-// below sends `0x03` or asserts anything about `ISIG`.
+// Not in scope here, deliberately: **F54**. Nothing below sends `0x03` or
+// asserts anything about `ISIG`. Paging has its own section further down.
 // ---------------------------------------------------------------------------
 
 /// Rustyline's own composer deck, which only its `ChatHelper` can write.
@@ -6192,6 +6192,168 @@ fn tui_fullscreen_decodes_each_keystroke_at_its_own_idle_prompt() {
          still reads {:?}; screen:\n{}",
         dismissed[composer],
         Session::dump(&dismissed)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Card **T5-S1c-iii**: the four paging keys, end to end.
+//
+// The decoder's side is pinned in `tui_bridge`'s own tests (the press list,
+// the `Home`/`End` collision, the split sequence, the inline negative) and
+// the anchor's eleven transitions are pinned in `kitsu_tui::fullscreen`.
+// Neither of those is **F89**: a decoder that compiles and a view that pages
+// are not a key the user can press. What this section adds is the one thing
+// only a pty can show -- that a `PgUp` typed at a live fullscreen prompt
+// moves the frame on the screen.
+// ---------------------------------------------------------------------------
+
+/// `PgUp`, `PgDn`, `Ctrl+Home` and `Ctrl+End` as a terminal sends them.
+///
+/// `Ctrl+Home`/`Ctrl+End` are the **modified** forms of plain `Home`/`End`'s
+/// finals, which is the whole of **F65**'s family here: the bytes differ only
+/// in the parameters, and the plain forms must keep moving the caret.
+const PG_UP_KEY: &str = "\x1b[5~";
+const CTRL_END_KEY: &str = "\x1b[1;5F";
+
+/// Inline -> fullscreen with a screenful in the ring, then `PgUp`, then
+/// `Ctrl+End`, then out.
+///
+/// Each press is its own step with a pause after it, for the reason the
+/// keystroke script above gives: the presses must not be coalesced into one
+/// `read`, because a frame that moved once is not a frame the keys keep
+/// moving. Every trigger is already satisfied, so a press that does nothing
+/// fails on an assertion rather than on the driver's deadline.
+fn fullscreen_then_pgup_then_ctrl_end() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "say hello\r"),
+        pause(TURN_DONE_MARKER, 500),
+        send(TURN_DONE_MARKER, "/tui fullscreen\r"),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 500),
+        send(TUI_SWITCHED_TO_FULLSCREEN, PG_UP_KEY),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 500),
+        send(TUI_SWITCHED_TO_FULLSCREEN, CTRL_END_KEY),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 500),
+        send(TUI_SWITCHED_TO_FULLSCREEN, "/quit\r"),
+    ]
+}
+
+/// **The paging keys are reachable, and they move the frame.**
+///
+/// Finding **F89**: a capability that compiles is not one that is reachable.
+/// The reader hands its bytes to `kitsu_editor::TypeaheadEditor`, whose
+/// `dispatch_csi` has no `5`/`6` parameter for `~` at all -- measured: a
+/// `PgUp` fed to it leaves `(buffer, cursor)` untouched and reports
+/// `changed: false` with no action -- so today this surface answers a `PgUp`
+/// with nothing whatsoever. Only the screen can show that.
+///
+/// **F71/F41**: asserted on the parsed screen, by *which* of the ring's lines
+/// are on it. `FS_ROW_24` is the newest and `FS_ROW_01` is above the entry
+/// window (the frame is `rows - 1` of a 24-line ring), so one press has to
+/// swap which of the two is visible, and `Ctrl+End` has to swap it back.
+#[test]
+#[serial]
+fn tui_fullscreen_pages_the_frame_with_pgup_and_re_latches_with_ctrl_end() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &fullscreen_then_pgup_then_ctrl_end(),
+        one_screenful_turn(),
+        &["--no-tools".to_string()],
+    );
+    let text = session.raw_text();
+
+    // NON-VACUOUS: a real streamed turn, one switch, and an entry frame that
+    // fills the screen with the *newest* lines and keeps `FS_ROW_01` above it.
+    assert_eq!(
+        session.bodies.len(),
+        1,
+        "the screenful must have been streamed into the ring; bodies: {:?}",
+        session.bodies
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "exactly once: one switch and no overlay; raw:\n{}",
+        text.escape_debug()
+    );
+    let at_switch = session.screen_at(3);
+    assert!(
+        frame_rows_on(&at_switch) >= 15,
+        "NON-VACUOUS: the frame must fill the screen before a key is \
+         pressed:\n{}",
+        Session::dump(&at_switch)
+    );
+    let on_screen = |screen: &[String], row: &str| screen.iter().any(|r| r.contains(row));
+    assert!(
+        on_screen(&at_switch, "FS_ROW_24"),
+        "NON-VACUOUS: the entry frame follows the newest line:\n{}",
+        Session::dump(&at_switch)
+    );
+    assert!(
+        !on_screen(&at_switch, "FS_ROW_01"),
+        "NON-VACUOUS: and holds the oldest line *above* the window, or a \
+         `PgUp` has nothing to reveal:\n{}",
+        Session::dump(&at_switch)
+    );
+
+    // One `PgUp`: the frame moves back and the oldest retained line arrives.
+    let paged = session.screen_at(6);
+    assert!(
+        on_screen(&paged, "FS_ROW_01"),
+        "a `PgUp` at fullscreen's own idle prompt must page the frame back: \
+         `ESC[5~` reaches `TypeaheadEditor`, which has no `5` parameter for \
+         `~` and drops it, so this surface answers the key with nothing \
+         today. Screen after the press:\n{}",
+        Session::dump(&paged)
+    );
+    assert!(
+        !on_screen(&paged, "FS_ROW_24"),
+        "...and must move it by a window rather than by a line: the newest \
+         line has to leave the screen, or the press scrolled instead of \
+         paging. Screen after the press:\n{}",
+        Session::dump(&paged)
+    );
+    assert!(
+        session.raw_between(4, 6).contains("FS_ROW_01"),
+        "and the repaint must be what *answers the press*, in the window the \
+         press opened: the frame follows the ring only when the ring grows, \
+         so a press that leaves the repaint to the next transcript line \
+         leaves the user's key dead. The child wrote:\n{}",
+        session.raw_between(4, 6).escape_debug()
+    );
+
+    // `Ctrl+End`: the re-latch, and the half of the `Home`/`End` collision
+    // that has to page rather than move a caret. The draft is empty here, so
+    // a leak to the editor's `move_end` would be invisible -- which is why
+    // the caret half of this pair is pinned in `tui_bridge`'s unit tests and
+    // the frame half is pinned here.
+    let relatched = session.screen_at(8);
+    assert!(
+        on_screen(&relatched, "FS_ROW_24"),
+        "`Ctrl+End` (`ESC[1;5F`) must bring the newest line back and resume \
+         following (transition 9); screen:\n{}",
+        Session::dump(&relatched)
+    );
+
+    // The ordinary exit path, unchanged by the new keys.
+    assert_eq!(
+        session.raw_count("\x1b[?2004h"),
+        session.raw_count("\x1b[?2004l"),
+        "every bracketed-paste enable is matched by a disable: raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "`/quit` must still work after a run of page presses, but the \
+         session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+    assert!(
+        session.raw_mode_off(),
+        "and the pty must be canonical again: {}",
+        session.termios_dump()
     );
 }
 

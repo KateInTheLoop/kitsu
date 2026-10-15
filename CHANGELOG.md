@@ -148,8 +148,12 @@ shapes may change in any minor release.
   painted over between turns -- typing cannot scroll it at all. The slash-command
   palette is deliberately absent there (the only rows it could use are the
   frame's), and the agent-view keys are off while fullscreen holds the screen.
-  **Still missing:** paging, so the view follows the newest lines rather than
-  letting you scroll back. Switching keeps the conversation, as the other modes do.
+  **`PgUp`/`PgDn` page the retained transcript and `Ctrl+Home`/`Ctrl+End` jump to
+  the oldest retained line and back to following** -- they move the frame, not the
+  caret, and only while fullscreen holds the screen. Paging pins the view, so new
+  output no longer drags it to the bottom until you page back down or press
+  `Ctrl+End`. The keys are listed in `/help tui` rather than the agent view's key
+  table, since they do nothing in the other renderers. Switching keeps the conversation, as the other modes do.
   Paging keys are not wired yet, so it shows the most recent lines.
   **What the scrollback holds is worth knowing:** the streamed conversation --
   not kitsu's own messages and receipts, and not an answer that was buffered
