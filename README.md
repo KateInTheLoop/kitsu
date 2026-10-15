@@ -918,6 +918,7 @@ Slash commands inside the REPL:
 | `/checkpoints` / `/checkpoint <id>` | List recoverable write checkpoints or preview one verified diff. |
 | `/permissions` | Show effective filesystem authority with invocation/session provenance, revoked invocation roots, protected/internal reads, protected writes, and the command non-sandbox warning. |
 | `/tools` | Show enabled tools and the effective permission behavior. |
+| `/tui [classic\|inline]` | Report or switch the live renderer between turns, keeping the conversation; bare `/tui` reports the renderer actually running. Refused during a turn. |
 | `/allow <path>` | Grant read access to a path for the rest of the session (no more prompts there). |
 | `/allow-write <path>` | Grant write access to a path for the rest of the session. |
 | `/allow-read-write <path>` | Grant both read and write access for the rest of the session. |

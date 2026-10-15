@@ -309,6 +309,14 @@ that thread, and any other argument is forwarded verbatim to `/jobs`, so every
 subcommand is reachable through either name.
 
 Background agents run in-process, so nothing outside kitsu can observe them.
+`/tui [classic|inline]` switches the renderer between turns and keeps the
+conversation: what was printed before the switch stays on screen exactly once,
+and the viewport's live status row returns with it. Bare `/tui` reports the
+renderer actually running. `fullscreen` is refused until that renderer exists,
+naming what is accepted, and `/tui` during a turn is refused rather than queued,
+because the mid-turn fall-through would otherwise send it to the model as a
+prompt. Switching into a terminal shorter than the viewport's minimum stays
+classic and says so.
 `Ctrl+L` repaints the viewport's pinned row. Every exit path from the viewport
 releases the scroll region and restores the terminal: a normal quit, a panic,
 `SIGINT` and `SIGTERM`. The signal path writes one precomposed escape sequence

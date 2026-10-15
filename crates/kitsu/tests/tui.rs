@@ -4585,3 +4585,493 @@ fn inline_mode_resize_does_not_duplicate_transcript_lines() {
         Session::dump(&screen)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Card T3-S9: `/tui classic|inline` as a runtime switch (requirement R2).
+//
+// `/tui` DOES NOT EXIST YET: it is not in `SLASH_COMMANDS` and there is no
+// dispatch arm, so every session below currently answers the command with
+// `unknown command: /tui - did you mean ...?` and never prints the switch
+// receipt the scripts trigger on. Each of these tests therefore fails today,
+// most of them by the harness deadline with the transcript attached (finding
+// F46 names that shape deliberately: the view cannot print what the script
+// waits for, because the feature is absent).
+// ---------------------------------------------------------------------------
+
+/// The transcript marker, and why it is `/theme <nonsense>` rather than
+/// anything purpose-built.
+///
+/// "The transcript continues across a switch" needs content that is
+/// (a) emitted by the binary itself, (b) **unique** in the whole byte stream,
+/// so "exactly once" is countable rather than approximated, (c) exactly one
+/// physical row at `COLS` = 80, because a 24-row screen with no scrollback in
+/// the emulator is the whole budget, and (d) available with no network, no
+/// tool and no turn. `/theme zz1` is all four: `kitsu_render::set_theme`
+/// rejects the name with one line that quotes it back, the quoted token
+/// appears nowhere else, and the line is 76 columns.
+///
+/// Pinned as whole lines rather than as substrings (finding F41): what is
+/// asserted is what the row **is**.
+const TUI_MARK_1: &str =
+    "unknown theme 'zz1' — available: kitsune, sakura, ocean, forest, ember, mono";
+const TUI_MARK_2: &str =
+    "unknown theme 'zz2' — available: kitsune, sakura, ocean, forest, ember, mono";
+const TUI_MARK_3: &str =
+    "unknown theme 'zz3' — available: kitsune, sakura, ocean, forest, ember, mono";
+
+/// The receipt a successful switch prints, per mode. **This is a decision
+/// this card makes, not an observation**: a switch must be narrated, because
+/// R2's gate is that the conversation survives and a silent switch leaves the
+/// user unable to tell a working switch from a lost one.
+const TUI_SWITCHED_TO_CLASSIC: &str =
+    "~ switched to the classic renderer; the conversation is unchanged";
+const TUI_SWITCHED_TO_INLINE: &str =
+    "~ switched to the inline renderer; the conversation is unchanged";
+
+/// Bare `/tui` **reports**, it does not print usage. Decision: the command's
+/// argument is optional in the registry (`/tui [classic|inline]`), the
+/// question "which renderer am I in?" has no other answer in the product, and
+/// `/theme` with no argument already answers the same question for themes.
+/// The accepted vocabulary rides along, so the report is also the usage line.
+const TUI_REPORT_CLASSIC: &str = "tui mode: classic (accepted: classic, inline)";
+const TUI_REPORT_INLINE: &str = "tui mode: inline (accepted: classic, inline)";
+
+/// `fullscreen` is refused, naming what is accepted, and saying why it is not
+/// a typo — consistent with `[tui] mode`'s own error, which lists
+/// ``classic``, ``inline`` and nothing else until T5 ships the renderer.
+const TUI_FULLSCREEN_REFUSED: &str =
+    "/tui fullscreen is not available yet; accepted: classic, inline";
+
+/// The DECSTBM region this geometry pins, and its release.
+fn tui_region() -> String {
+    format!("\x1b[1;{}r", ROWS - 1)
+}
+
+/// Inline → classic → inline in one session, with a marker printed in each of
+/// the three segments.
+fn switch_both_directions() -> Vec<Step> {
+    vec![
+        // Segment 1: inline.
+        send(RAW_MODE_MARKER, "/theme zz1\r"),
+        send(TUI_MARK_1, "/tui classic\r"),
+        // Segment 2: classic.
+        send(TUI_SWITCHED_TO_CLASSIC, "/theme zz2\r"),
+        send(TUI_MARK_2, "/tui inline\r"),
+        // Segment 3: inline again.
+        send(TUI_SWITCHED_TO_INLINE, "/theme zz3\r"),
+        send(TUI_MARK_3, "/quit\r"),
+    ]
+}
+
+/// **The card's acceptance, and requirement R2's gate.**
+///
+/// What makes "the transcript continues" an assertion rather than a slogan:
+/// each marker is counted **in the raw byte stream** (emitted exactly once —
+/// a switch that reprinted the scrollback to rebuild it would count 2) and
+/// **on the screen the user is left looking at** before `/quit` (present
+/// exactly once — a switch that cleared the screen, took the alternate
+/// screen, or scrolled the region away would count 0). Both halves are
+/// needed: counting only the stream passes for a switch that erases the
+/// screen, and counting only the screen passes for a switch that replays
+/// history.
+///
+/// Were the gate violated, this test says which way: a dropped transcript
+/// fails the screen count at 0 with the screen dumped, a replayed one fails
+/// the raw count at 2 or more.
+#[test]
+#[serial]
+fn tui_switch_both_directions_keeps_one_copy_of_the_transcript() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &switch_both_directions());
+
+    let text = session.raw_text();
+    for (label, mark) in [
+        ("zz1", TUI_MARK_1),
+        ("zz2", TUI_MARK_2),
+        ("zz3", TUI_MARK_3),
+    ] {
+        assert_eq!(
+            session.raw_count(mark),
+            1,
+            "the {label} transcript line must be written exactly once in the \
+             whole session — a switch neither drops it nor replays it; raw:\n{}",
+            text.escape_debug()
+        );
+    }
+
+    // The screen with all three segments printed and `/quit` not yet sent.
+    let screen = session.screen_at(5);
+    for (label, mark) in [
+        ("zz1", TUI_MARK_1),
+        ("zz2", TUI_MARK_2),
+        ("zz3", TUI_MARK_3),
+    ] {
+        assert_eq!(
+            screen.iter().filter(|row| row.trim_end() == mark).count(),
+            1,
+            "the {label} line, printed {} the switch, must still be on screen \
+             exactly once after both switches; screen:\n{}",
+            if label == "zz3" { "after" } else { "before" },
+            Session::dump(&screen)
+        );
+    }
+
+    // Not vacuous in the other direction either: the three markers are in
+    // transcript order, so the screen holds a *continuing* conversation and
+    // not three unordered fragments.
+    let positions: Vec<usize> = [TUI_MARK_1, TUI_MARK_2, TUI_MARK_3]
+        .iter()
+        .map(|mark| {
+            screen
+                .iter()
+                .position(|row| row.trim_end() == *mark)
+                .expect("each marker was just asserted to be on screen")
+        })
+        .collect();
+    assert!(
+        positions[0] < positions[1] && positions[1] < positions[2],
+        "the three markers must read down the screen in the order they were \
+         printed, but they are on rows {positions:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+
+    assert!(
+        session.status.success(),
+        "the session must still exit cleanly, but exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+}
+
+/// **Requirement 4 of the card: the region is released on the way out of
+/// inline and re-pinned on the way back in.** T3-S8's lesson is the reason: a
+/// leaked DECSTBM region leaves the user's terminal clamped to 23 rows with
+/// no kitsu left to release it.
+///
+/// Counted, not merely present: this session enters inline twice and leaves
+/// it twice (once by `/tui classic`, once by `/quit`), so the region is set
+/// twice and released twice. A switch that forgot the teardown would set it
+/// twice and release once; one that tore down without re-installing would set
+/// it once.
+#[test]
+#[serial]
+fn tui_switch_releases_the_region_and_re_pins_it() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &switch_both_directions());
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        2,
+        "the region is pinned once per inline segment, and this session has \
+         two; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count("\x1b[r"),
+        2,
+        "and released once per exit from inline: the switch away, and the \
+         session's end; raw:\n{}",
+        text.escape_debug()
+    );
+
+    // The classic segment is genuinely region-free: between the switch away
+    // and the switch back the child pins nothing.
+    let classic_segment = session.raw_between(1, 3);
+    assert!(
+        !classic_segment.contains(&tui_region()),
+        "no region may be pinned while the session is in classic mode; \
+         between the two switches the child wrote:\n{}",
+        classic_segment.escape_debug()
+    );
+    assert!(
+        classic_segment.contains("\x1b[r"),
+        "and the release must happen *in* that window rather than only at \
+         exit; between the two switches the child wrote:\n{}",
+        classic_segment.escape_debug()
+    );
+
+    // ...and the re-install really re-pinned, so the count above is not two
+    // copies of one install: the status row is painted again on the bottom
+    // row of the second inline segment. R5's row, not the `kitsu` fallback —
+    // a re-install that forgot to republish `StatusSource` would leave the
+    // placeholder there, which is a live trap in `run_chat` (the source is
+    // handed to the guard once, outside the loop).
+    let screen = session.screen_at(5);
+    let row = screen[(ROWS - 1) as usize].trim_end();
+    assert!(
+        row.starts_with(STATUS_ROW_MODEL),
+        "after switching back to inline the pinned row must carry R5's \
+         composed status row again, which leads with {STATUS_ROW_MODEL:?}; \
+         row {ROWS} reads {row:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        session.raw_mode_off(),
+        "the pty must be canonical again after the session: {}",
+        session.termios_dump()
+    );
+}
+
+/// Classic → inline, the other start mode, with the transcript gate applied
+/// to the one switch this direction has.
+fn switch_from_classic() -> Vec<Step> {
+    vec![
+        send("/help for commands", "/theme zz1\r"),
+        send(TUI_MARK_1, "/tui inline\r"),
+        send(TUI_SWITCHED_TO_INLINE, "/theme zz2\r"),
+        send(TUI_MARK_2, "/quit\r"),
+    ]
+}
+
+/// A session **started** in classic mode switches into inline and keeps what
+/// it had already printed.
+#[test]
+#[serial]
+fn tui_switch_from_classic_into_inline_keeps_the_transcript_and_pins_the_region() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), None, &switch_from_classic());
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        1,
+        "the switch into inline pins the region exactly once; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count("\x1b[r"),
+        1,
+        "and the session releases it exactly once, at exit; raw:\n{}",
+        text.escape_debug()
+    );
+    // The region is pinned *after* the classic-segment transcript, which is
+    // what says the switch happened mid-session rather than at startup.
+    let pinned_at = text.find(&tui_region()).unwrap_or_else(|| {
+        panic!(
+            "the region must be pinned at all; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    let mark_at = text.find(TUI_MARK_1).unwrap_or_else(|| {
+        panic!(
+            "the classic segment must print its marker; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert!(
+        mark_at < pinned_at,
+        "the classic transcript must precede the region being pinned, \
+         otherwise this session started inline and proves nothing; raw:\n{}",
+        text.escape_debug()
+    );
+
+    let screen = session.screen_at(3);
+    for (label, mark) in [("zz1", TUI_MARK_1), ("zz2", TUI_MARK_2)] {
+        assert_eq!(
+            screen.iter().filter(|row| row.trim_end() == mark).count(),
+            1,
+            "the {label} line must be on screen exactly once after the \
+             switch; screen:\n{}",
+            Session::dump(&screen)
+        );
+        assert_eq!(
+            session.raw_count(mark),
+            1,
+            "...and written exactly once; raw:\n{}",
+            text.escape_debug()
+        );
+    }
+}
+
+/// `/tui fullscreen`, `/tui` bare, and `/tui wat`, in one classic session
+/// that keeps going afterwards.
+fn tui_argument_vocabulary() -> Vec<Step> {
+    vec![
+        send("/help for commands", "/tui\r"),
+        send(TUI_REPORT_CLASSIC, "/tui fullscreen\r"),
+        send(TUI_FULLSCREEN_REFUSED, "/theme zz1\r"),
+        // ...and the report tracks the LIVE mode, not the start mode: a
+        // `/tui` that printed `[tui] mode` or `--tui` back would answer
+        // `classic` here too.
+        send(TUI_MARK_1, "/tui inline\r"),
+        send(TUI_SWITCHED_TO_INLINE, "/tui\r"),
+        send(TUI_REPORT_INLINE, "/quit\r"),
+    ]
+}
+
+/// **Requirements 5 and 6 of the card.** `fullscreen` is refused by name —
+/// not as an unknown command and not as a typo — and bare `/tui` reports the
+/// mode it is in. Both messages name the accepted vocabulary, the same two
+/// spellings `[tui] mode` accepts, so a user who reads either one learns the
+/// whole grammar.
+///
+/// The refusal must also be inert: no region is pinned, and the session
+/// carries on printing its transcript afterwards.
+#[test]
+#[serial]
+fn tui_refuses_fullscreen_and_reports_the_mode_when_bare() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), None, &tui_argument_vocabulary());
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count(TUI_REPORT_CLASSIC),
+        1,
+        "bare /tui reports the current mode and the accepted spellings, \
+         exactly once; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TUI_FULLSCREEN_REFUSED),
+        1,
+        "/tui fullscreen is refused by name, with the accepted spellings; \
+         raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        !text.contains("unknown command: /tui"),
+        "/tui must be a registered command, so neither spelling may fall \
+         through to the unknown-command path; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TUI_REPORT_INLINE),
+        1,
+        "and after a switch the report follows the live renderer rather than \
+         the start mode; raw:\n{}",
+        text.escape_debug()
+    );
+    // The refusal itself pinned nothing: the only region in this session is
+    // the one the later, accepted `/tui inline` pins, and it comes after the
+    // refusal in the stream.
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        1,
+        "exactly one region, from the one accepted switch; raw:\n{}",
+        text.escape_debug()
+    );
+    let refused_at = text
+        .find(TUI_FULLSCREEN_REFUSED)
+        .expect("the refusal was just counted");
+    let pinned_at = text
+        .find(&tui_region())
+        .expect("the accepted switch's region was just counted");
+    assert!(
+        refused_at < pinned_at,
+        "a refused mode pins nothing, so the refusal must precede the only \
+         region in the stream; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TUI_MARK_1),
+        1,
+        "and the session keeps running after the refusal; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "the session exits cleanly after a refusal, but exited {:?}; \
+         screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+}
+
+/// Switch into inline, then **switch again**, then take a `SIGTERM`.
+fn switch_twice_then_sigterm() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/tui classic\r"),
+        send(TUI_SWITCHED_TO_CLASSIC, "/tui inline\r"),
+        send(TUI_SWITCHED_TO_INLINE, "/theme zz1\r"),
+        signal(TUI_MARK_1, libc::SIGTERM),
+        pause(TUI_MARK_1, 300),
+    ]
+}
+
+/// **T3-S8's restore, after a second install.** `install_exit_restore` is
+/// `Once`-gated, so the second install does not register anything: the
+/// question this pins is whether the restore that was registered by the
+/// *first* install still gives back what the *second* one took.
+///
+/// Read, not assumed (findings F43/F47): the handler reads only
+/// `SELF_RAISED`, the `CANONICAL_TERMIOS` snapshot and a `const` byte string
+/// — it holds no viewport handle at all — so `Once` is sound here by
+/// construction and this test is the proof rather than the discovery. What it
+/// *can* still catch is the re-install forgetting to re-publish the termios
+/// snapshot, which would leave the pty raw after the signal.
+#[test]
+#[serial]
+fn tui_switch_back_into_inline_still_restores_on_a_signal() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &switch_twice_then_sigterm());
+    let text = session.raw_text();
+
+    assert!(
+        session.raw_mode_off(),
+        "a SIGTERM taken in the *second* inline segment must still leave the \
+         pty canonical, but it reads {}; raw:\n{}",
+        session.termios_dump(),
+        text.escape_debug()
+    );
+    // The dying handler's own byte string, which only the signal path writes.
+    assert!(
+        text.contains("\x1b[r\x1b[?25h\x1b[?2004l\x1b[23;2t"),
+        "the dying-signal restore must run for the re-installed viewport; \
+         raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        !session.status.success(),
+        "a signalled session does not exit successfully; it exited {:?}",
+        session.status
+    );
+}
+
+/// **Requirement 7 of the card: a classic session that never switches is
+/// unchanged.** The byte-level half of that claim is that nothing the switch
+/// brought with it — a pinned region, a region release, or the dying-signal
+/// restore the inline path installs — appears in a session that never asks
+/// for one.
+///
+/// This is the one test in this block that **passes before the feature
+/// exists**: it is the guard that says the implementation did not reach into
+/// the classic path, and it can only ever fail afterwards.
+#[test]
+#[serial]
+fn classic_session_that_never_switches_emits_no_viewport_bytes() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), None, &help_then_quit());
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        0,
+        "no region; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count("\x1b[r"),
+        0,
+        "and no release, because there was nothing to release; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        !text.contains("\x1b[r\x1b[?25h\x1b[?2004l\x1b[23;2t"),
+        "and no dying-signal restore sequence; raw:\n{}",
+        text.escape_debug()
+    );
+    // Non-vacuous: this session really did run a transcript.
+    assert_eq!(
+        session.raw_count("/help <command> explains one command in detail"),
+        1,
+        "the session must have printed its transcript; raw:\n{}",
+        text.escape_debug()
+    );
+}

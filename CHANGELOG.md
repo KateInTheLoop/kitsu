@@ -92,6 +92,10 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- **`/tui [classic|inline]`** switches the renderer mid-session without losing
+  the conversation, and reports the live renderer when called bare. `fullscreen`
+  is refused until it exists, and `/tui` typed during a turn is refused rather
+  than queued — it is accepted between turns.
 - **Ctrl+L repaints** the inline viewport's pinned row.
 - Fixed: interrupting the inline viewport with **Ctrl+C**, or the process taking
   a `SIGTERM` or panicking, used to leave the terminal with a **pinned scroll

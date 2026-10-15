@@ -55,6 +55,35 @@ pub(crate) enum TuiMode {
     Inline,
 }
 
+impl TuiMode {
+    /// The one spelling `/tui`, `--tui` and `[tui] mode` all use.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TuiMode::Classic => "classic",
+            TuiMode::Inline => "inline",
+        }
+    }
+}
+
+/// Whether an inline viewport is installed **right now**.
+///
+/// Process-global for the same reason `STATUS_PAINTER` is, plus one of its
+/// own: `/tui`'s dispatch arm has to report the live renderer and cannot see
+/// the `run_chat` local that holds the guard. Maintained by exactly two
+/// writers — [`install`] on the way in and [`BridgeGuard::drop`] on the way
+/// out — so a runtime switch keeps it true by construction rather than by a
+/// caller remembering to update it.
+static INLINE_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The renderer this process is painting through at this instant.
+pub(crate) fn live_mode() -> TuiMode {
+    if INLINE_INSTALLED.load(std::sync::atomic::Ordering::Acquire) {
+        TuiMode::Inline
+    } else {
+        TuiMode::Classic
+    }
+}
+
 /// A session-lifetime guard that puts back everything [`install`] displaced.
 ///
 /// Both pieces of state are process-global, so the guard carries the
@@ -136,6 +165,7 @@ pub(crate) fn install(
     // a thread that holds no guard. Taken back by `Drop`, exactly as
     // `STATUS_PAINTER` is.
     *lock(&MODAL_PANE) = Some(pane.clone());
+    INLINE_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
 
     Some(BridgeGuard {
         pane,
@@ -1073,6 +1103,10 @@ impl Drop for BridgeGuard {
         set_surface(self.previous_surface.clone());
         live::set_live_rows_enabled(self.previous_live_rows);
         self.pane.viewport.hide();
+        // Last, because `live_mode` must not answer `classic` while a region
+        // is still pinned: the flag describes the terminal, so it is cleared
+        // only once the terminal has been given back.
+        INLINE_INSTALLED.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
