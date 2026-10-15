@@ -1,4 +1,4 @@
-//! Config model + loading (docs/architecture.md §2). Parses the
+//! Config model + loading (docs/architecture.md). Parses the
 //! `[gateways.<name>]` profiles and `default_gateway`, resolves a profile by
 //! name, and validates flavor/model per the design's rules.
 

@@ -1,51 +1,37 @@
-# kitsu 狐
+# kitsu
 
-> A Rust CLI for OpenAI-compatible hosted gateways and local model servers, with
-> interactive chat, guarded developer tools, durable sessions, automation, and
-> model-aware context management.
+> A Rust terminal coding agent for hosted gateways and local model servers,
+> with guarded tools, resumable sessions, automation, and background agents.
 
-Kitsu is a Cargo workspace of five crates:
+The workspace has seven crates: `kitsu` owns CLI/configuration/session
+integration; `kitsu-core` owns the agent loop and context budgeting;
+`kitsu-providers` owns compatible Chat and native Anthropic Messages adapters;
+`kitsu-tools` owns permission-gated tools and command containment;
+`kitsu-render` owns terminal/JSONL output; `kitsu-editor` owns shared input
+editing; `kitsu-tui` owns terminal lifecycle and inline viewport primitives.
 
-- `kitsu` — `init`, `doctor`, `ask`, verified `review`, `models`, `sessions`,
-  `artifacts`, and `chat`; slash commands; JSONL automation; `@file`; editable
-  queues/steering; project context; bounded background-agent threads/profiles;
-  reasoning control; and aggregate command-artifact lifecycle management.
-- `kitsu-core` — the provider/tool agent loop, checked context preflight,
-  offload/trim/summarize cascade, manual compaction, and compaction telemetry.
-- `kitsu-providers` — provider traits and the shared OpenAI-compatible client,
-  including streaming, physical-attempt telemetry, retry deadlines, and model
-  discovery/cache behavior. Optional reasoning effort is transported only when
-  configured.
-- `kitsu-tools` — protected-path permissions, read/edit/write/search tools,
-  verified diff/checkpoint journals, and opt-in literal-argv developer commands
-  with exact approval plus mandatory fail-closed Linux OS containment.
-- `kitsu-render` — sanitized terminal output, plain/reduced-motion rendering,
-  streaming, diffs, tool activity, and usage/context telemetry.
+Preserve credential redaction, private-state exclusions, filesystem authority,
+and fail-closed command containment. Keep neutral run/session values in core
+and physical I/O in adapters. Use local fixtures for provider tests.
 
-Project context loading consumes this file's text only; markdown links are an
-index for the model and are not followed automatically. Required context is
-capped at one third of the active window. The `## Optional` section is included
-only when the complete rendered file fits within one quarter of that window.
+Update existing documentation with behavior changes. Plans, cycle receipts,
+and audit transcripts belong in issues or pull requests, not the source tree.
 
 ## Docs
 
-- [README](README.md): installation, gateway/auth recipes, CLI reference, chat
-  workflows, automation, tools, sessions, and context behavior.
-- [Functionality](docs/functionality.md): concise source-backed feature contract.
-- [Architecture](docs/architecture.md): crate and component overview.
-- [Context management](docs/context-management-design.md): implemented window,
-  budgeting, cascade, project-context, and telemetry contract.
+- [README](README.md): quick start and documentation index.
+- [Agent instructions](AGENTS.md): repository working rules.
+- [Contributing](CONTRIBUTING.md): development commands and documentation policy.
+- [Architecture](docs/architecture.md): crate responsibilities and boundaries.
+- [User guide](docs/usage.md): configuration, providers, commands, and tools.
 
 ## Optional
 
-- [UX design](docs/ux-design.md): palette, glyphs, and degradation-tier
-  contract for every rendered surface.
-- [JSONL protocol](docs/jsonl-protocol.md): the `kitsu.chat.v1` automation
-  event contract.
-- [Cycle-6 UX audit](docs/chat-ux-cycle-6.md) and
-  [Cycle-7 UX audit](docs/chat-ux-cycle-7.md): most recent dogfood findings
-  and implemented outcomes (agent-deck correctness, artifact GC, host-owned
-  evidence).
-- [UI guidelines](docs/ui_guidelines.md): terminal UX conventions.
-- [Codex comparison](docs/claude-code-comparison.md): historical product
-  comparison and roadmap notes.
+- [Context management](docs/context.md): windows, compaction, and project context.
+- [JSONL protocol](docs/jsonl-protocol.md): automation contract and schema.
+- [Verified review](docs/verified-review.md): Git evidence and checkpoints.
+- [Workspace diff](docs/workspace-diff-tool.md): model-callable Git evidence.
+- [Releases](docs/releasing.md): packaging and publishing.
+
+Kitsu loads this file's text as project context; linked documents are not
+followed automatically.

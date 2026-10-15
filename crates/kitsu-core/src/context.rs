@@ -789,7 +789,7 @@ mod tests {
         assert_eq!(meter.estimate(&msgs), 35);
     }
 
-    /// (b) THE bug from reviews/kimi-cycle-6.md P2: an in-place content edit
+    /// (b) an important regression: an in-place content edit
     /// INSIDE the anchored prefix that preserves the message COUNT (rewritten
     /// tool result, edited queued message) must invalidate the anchor. On the
     /// old length-only code this silently returned `anchor + tail` for content
