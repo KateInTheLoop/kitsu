@@ -6792,7 +6792,14 @@ enum SteerLineStep {
     Cancelled,
 }
 
-/// `s`'s text sub-mode: a line of text collected inside the overlay.
+/// A line of text collected inside the overlay **and bound to one agent**:
+/// `s`'s correction, and `n`'s name (card F70).
+///
+/// The name is `s`'s because `s` had it first; what the type *is*, is an
+/// [`OverlayLine`] plus the id the line was opened on. `n` joined it when the
+/// rename line moved off the decoded key prompt: a name may be non-ASCII and
+/// `OverlayKey::Char` is ASCII-only by construction, so the keyboard could
+/// not express a name the registry accepts (**F70**).
 ///
 /// # Where the input lives, and why
 ///
@@ -6842,14 +6849,21 @@ impl SteerLine {
         self.id
     }
 
-    /// The echo, for `agents_view::steer_prompt_rows`.
-    fn draft(&self) -> String {
+    /// The echo, for `agents_view::steer_prompt_rows` and, for `n`'s line,
+    /// `agents_view::rename_prompt_rows`.
+    fn draft(&self) -> &str {
         self.line.draft()
     }
 
     /// The caret, as a char offset into [`SteerLine::draft`].
     fn cursor(&self) -> usize {
         self.line.cursor()
+    }
+
+    /// Put a refused submission back into the line, because the caller
+    /// refused it and the line stays open: see [`OverlayLine::restore`].
+    fn restore(&mut self, text: &str) {
+        self.line.restore(text);
     }
 
     /// Feed one chunk of raw bytes.
@@ -6878,6 +6892,15 @@ impl SteerLine {
 #[cfg(unix)]
 struct OverlayLine {
     editor: kitsu_editor::TypeaheadEditor,
+    /// The editor's buffer as a string, refreshed by every method that can
+    /// change it.
+    ///
+    /// The editor keeps its buffer as `Vec<char>` and spells it out on
+    /// demand, so there is nothing inside it to borrow; the frames and the
+    /// line's own callers want a `&str`. It is written at the one place the
+    /// buffer is written and read nowhere else, so it is a derived field and
+    /// not a second copy of the draft.
+    echo: String,
 }
 
 #[cfg(unix)]
@@ -6888,12 +6911,18 @@ impl OverlayLine {
     fn new() -> Self {
         Self {
             editor: kitsu_editor::TypeaheadEditor::new(Vec::new()),
+            echo: String::new(),
         }
     }
 
     /// The echo, for the frame that paints it.
-    fn draft(&self) -> String {
-        self.editor.buffer_string()
+    fn draft(&self) -> &str {
+        &self.echo
+    }
+
+    /// Re-read the editor's buffer into [`OverlayLine::echo`].
+    fn sync_echo(&mut self) {
+        self.echo = self.editor.buffer_string();
     }
 
     /// The caret, as a char offset into [`OverlayLine::draft`].
@@ -6906,6 +6935,7 @@ impl OverlayLine {
     /// the user corrects the one wrong character rather than retyping.
     fn restore(&mut self, text: &str) {
         self.editor.replace_buffer(text);
+        self.sync_echo();
     }
 
     /// Feed one chunk of raw bytes.
@@ -6918,6 +6948,7 @@ impl OverlayLine {
         // unbracketed text fed to the editor would submit on that newline,
         // which is F68 again one layer down.
         let outcome = self.editor.feed(bytes);
+        self.sync_echo();
         for action in outcome.actions {
             // Only `Submit` means anything here. The editor's other actions
             // belong to the composer's collector — history recall, EOF,
@@ -6941,6 +6972,7 @@ impl OverlayLine {
             return SteerLineStep::Editing;
         }
         self.editor.resolve_lone_escape();
+        self.sync_echo();
         SteerLineStep::Cancelled
     }
 
@@ -7294,48 +7326,37 @@ impl OverlayDecoder {
 /// The prompt the overlay has open, if any (card T4-S4b). A prompt is the
 /// innermost frame of the view: `Esc` leaves it before it leaves the help, a
 /// peek or the view itself.
+///
+/// **It is a decision read and nothing else.** It once also held a line of
+/// typed text, which is why it is an enum at all; card F70 took the last one
+/// away, because a prompt is fed *decoded keys* and `OverlayKey::Char` is
+/// ASCII-only by construction, so `n`'s name could never be a name the
+/// registry accepts. The lines are fed **bytes**, through `kitsu-editor`, and
+/// live in their own fields beside this one. `r`'s read legitimately stays
+/// decoded: it is a single key, `y`, `a` or `n`, all ASCII.
+///
+/// The enum is kept rather than collapsed to an `Option<u64>` because
+/// [`OverlayPrompt::report_line`] is what paints the decision row, and a bare
+/// id would leave that behaviour with nowhere to live.
 #[cfg(unix)]
 enum OverlayPrompt {
     /// `r`: a **decision read**, not a text prompt. One key, resolved by
     /// [`parse_permission_answer`] -- the one parser (finding F45).
     Decision(u64),
-    /// A line of text: `n`'s name, or `s`'s correction.
-    Text {
-        id: u64,
-        kind: OverlayTextPrompt,
-        draft: String,
-    },
-}
-
-/// Which line of text a [`OverlayPrompt::Text`] is collecting.
-///
-/// `n`'s name is the only one left: card T4-S4b-ii replaced `s`'s naive line
-/// with `SteerLine` over `kitsu-editor`, and the `Steer` variant that outlived
-/// it was constructed only by a test model (finding **F69**), which is gone.
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OverlayTextPrompt {
-    Rename,
 }
 
 #[cfg(unix)]
 impl OverlayPrompt {
-    /// The prompt as the one report row the frame has room for. The draft is
-    /// echoed with no caret because `n`'s name appends at the end: there is
-    /// nowhere else the next character could go. `s`'s line is no longer one
-    /// of these — card T4-S4b-ii gave it `agents_view::steer_prompt_rows` and
-    /// a real caret over `kitsu-editor` — and the `Steer` wording is kept
-    /// here as the line that frame inherited.
+    /// The prompt as the one report row the frame has room for. Neither of
+    /// the typed lines is one of these any more: `s`'s went to
+    /// `agents_view::steer_prompt_rows` in card T4-S4b-ii and `n`'s to
+    /// `agents_view::rename_prompt_rows` in card F70, both with a real caret
+    /// over `kitsu-editor`.
     fn report_line(&self) -> String {
         match self {
             Self::Decision(id) => format!(
                 "reply to background agent #{id}: y allow once, a allow always, n deny (esc cancels)"
             ),
-            Self::Text {
-                id,
-                kind: OverlayTextPrompt::Rename,
-                draft,
-            } => format!("name background agent #{id}: {draft} (enter applies, esc cancels)"),
         }
     }
 }
@@ -7433,6 +7454,12 @@ struct OverlayState {
     /// [`OverlayPrompt`], because the prompts are fed decoded keys and this is
     /// fed bytes.
     steering: Option<SteerLine>,
+    /// `n`'s rename line while the name is being typed, read as raw bytes for
+    /// the reasons `s`'s is and one of its own: a name may be non-ASCII and
+    /// the registry accepts it, while `OverlayKey::Char` is ASCII-only by
+    /// construction, so the decoded prompt this replaces could not express a
+    /// legal name at all (**F70**).
+    renaming: Option<SteerLine>,
     /// `/`'s filter line while it is being typed, read as raw bytes for the
     /// same reasons `s`'s is — a term may be non-ASCII, a paste is content,
     /// and a character may arrive split across two reads (card T4-S5).
@@ -7457,6 +7484,7 @@ impl OverlayState {
             report: None,
             prompt: None,
             steering: None,
+            renaming: None,
             filtering: None,
             filter: kitsu_tui::agents_view::AgentFilter::default(),
         }
@@ -7473,9 +7501,9 @@ enum OverlayStep {
     /// `q`, or an `Esc` with nothing left to step out of: finish the chunk and
     /// leave the view.
     Closing,
-    /// Stop reading this chunk: `s` opened the steer line on this very
-    /// keystroke, and the bytes after it are the line's to read, not the
-    /// decoder's.
+    /// Stop reading this chunk: one of the keys that open a line (`s`, `n`
+    /// or `/`) did so on this very keystroke, and the bytes after it are the
+    /// line's to read, not the decoder's.
     StopChunk,
 }
 
@@ -7496,6 +7524,9 @@ enum OverlayStep {
 fn overlay_escape_held(state: &OverlayState, decoder: &OverlayDecoder) -> bool {
     if state.steering.is_some() {
         return state.steering.as_ref().is_some_and(SteerLine::escape_held);
+    }
+    if state.renaming.is_some() {
+        return state.renaming.as_ref().is_some_and(SteerLine::escape_held);
     }
     if state.filtering.is_some() {
         return state
@@ -7523,6 +7554,18 @@ fn overlay_resolve_held_escape(state: &mut OverlayState, decoder: &mut OverlayDe
         if let Some(line) = state.steering.as_mut() {
             if line.quiet_tick() == SteerLineStep::Cancelled {
                 state.steering = None;
+                state.report = None;
+            }
+        }
+        return false;
+    }
+    // `n`'s line, identically: `Esc` steps out of the rename frame and
+    // renames nothing, which is the one reading under which a half-typed
+    // name cannot be applied by accident.
+    if state.renaming.is_some() {
+        if let Some(line) = state.renaming.as_mut() {
+            if line.quiet_tick() == SteerLineStep::Cancelled {
+                state.renaming = None;
                 state.report = None;
             }
         }
@@ -7593,6 +7636,35 @@ fn overlay_feed_chunk(
         }
         return false;
     }
+    // `n`'s rename line, on the same byte bypass and for the same three
+    // reasons the filter line below gives — and F70 is the finding that a
+    // *legal* non-ASCII name was unreachable from the keyboard until it was.
+    if let Some(line) = state.renaming.as_mut() {
+        match line.feed(bytes) {
+            SteerLineStep::Editing => {}
+            SteerLineStep::Submit(name) => {
+                let report = agent_view_rename(registry, line.id(), &name);
+                if report.changed {
+                    state.renaming = None;
+                } else {
+                    // Refused: the line stays **open** carrying the name, as
+                    // `/`'s refused term does, so the message and the text it
+                    // is about are on screen together and one wrong character
+                    // is corrected rather than a 48-character name retyped.
+                    // The refusal is painted on *this* frame — the rename
+                    // frame is innermost, so a report row under the row list
+                    // would be a message the user cannot see (**F71**).
+                    line.restore(&name);
+                }
+                state.report = Some(report.line);
+            }
+            SteerLineStep::Cancelled => {
+                state.renaming = None;
+                state.report = None;
+            }
+        }
+        return false;
+    }
     // `/`'s filter line, on the same byte bypass and for the same three
     // reasons: a non-ASCII term is legal and `OverlayKey::Char` is ASCII-only
     // by construction, a bracketed paste must not submit, and a multi-byte
@@ -7631,13 +7703,82 @@ fn overlay_feed_chunk(
         match handle_overlay_input(registry, state, view_rows, cols, input) {
             OverlayStep::Continue => {}
             OverlayStep::Closing => closing = true,
-            // `s` opened the steer line: the rest of this chunk is not a
-            // correction anybody typed, and the bytes after it are read by
+            // A line opened (`s`, `n` or `/`): the rest of this chunk is
+            // not text anybody typed, and the bytes after it are read by
             // the line itself from here on.
             OverlayStep::StopChunk => break,
         }
     }
     closing
+}
+
+/// The rows the overlay would paint, for the state it is in: **the frame
+/// chain**, which is what decides whether a message is on screen at all.
+///
+/// Extracted from the loop for [`overlay_feed_chunk`]'s reason (**F69**) and
+/// for **F71**'s: the chain nests, innermost first, and a report row painted
+/// under the row list is *not* on screen while a line is open. A test that
+/// reads `state.report` has asserted the message exists; only this function
+/// says whether a user can see it, so the loop and the tests take the same
+/// one.
+#[cfg(unix)]
+fn overlay_frame_rows(
+    state: &OverlayState,
+    view_rows: &[kitsu_tui::agents_view::AgentRow],
+    cols: usize,
+) -> Vec<String> {
+    if let Some(line) = state.steering.as_ref() {
+        // The innermost frame of all: while a correction is being typed
+        // it owns the screen, caret included, because the overlay hides
+        // the terminal's own cursor.
+        return kitsu_tui::agents_view::steer_prompt_rows(
+            line.id(),
+            line.draft(),
+            line.cursor(),
+            cols,
+        );
+    }
+    if let Some(line) = state.renaming.as_ref() {
+        // `n`'s line is an innermost frame too, and it takes the report with
+        // it: a refused name leaves the line open, and the registry's reason
+        // belongs on the frame the name was typed on and not under a row list
+        // this frame covers (**F71**).
+        return kitsu_tui::agents_view::rename_prompt_rows(
+            line.id(),
+            line.draft(),
+            line.cursor(),
+            cols,
+            state.report.as_deref(),
+        );
+    }
+    if let Some(line) = state.filtering.as_ref() {
+        // The filter line is an innermost frame too, for the same reason:
+        // it owns the caret the view otherwise hides.
+        return kitsu_tui::agents_view::filter_prompt_rows(
+            line.draft(),
+            line.cursor(),
+            cols,
+            state.report.as_deref(),
+        );
+    }
+    if state.helping {
+        return kitsu_tui::agents_view::overlay_help_rows(cols);
+    }
+    if let Some(panel) = state.peeking.as_ref() {
+        return panel.clone();
+    }
+    // An open prompt owns the report row; otherwise the last action's
+    // report has it.
+    let line = match state.prompt.as_ref() {
+        Some(open) => Some(open.report_line()),
+        None => state.report.clone(),
+    };
+    kitsu_tui::agents_view::overlay_rows_with_report(
+        view_rows.to_vec(),
+        cols,
+        state.selection.selected(),
+        line.as_deref(),
+    )
 }
 
 #[cfg(unix)]
@@ -7661,14 +7802,6 @@ fn handle_overlay_input(
         OverlayInput::Key(key) => key,
         OverlayInput::Paste(text) => {
             match state.prompt.take() {
-                Some(OverlayPrompt::Text {
-                    id,
-                    kind,
-                    mut draft,
-                }) => {
-                    draft.push_str(&text);
-                    state.prompt = Some(OverlayPrompt::Text { id, kind, draft });
-                }
                 // The read stays open rather than resolving to a
                 // pasted letter: `r` then a pasted `y` would approve
                 // a filesystem write nobody approved. The open read
@@ -7684,7 +7817,9 @@ fn handle_overlay_input(
                 // typist's two keys in one read), so the one case a
                 // user cannot otherwise explain is exactly this one.
                 // The count is reported and the text is not: it is
-                // the user's clipboard, not the view's to paint.
+                // the user's clipboard, not the view's to paint. A paste
+                // *into* a line never reaches here at all: an open line is
+                // fed the raw bytes and the decoder is not in that path.
                 None => {
                     state.report = Some(format!(
                         "ignored a paste of {} characters: pasted text is not keys here, \
@@ -7709,36 +7844,6 @@ fn handle_overlay_input(
             // resolving to a guess.
             OverlayKey::Up | OverlayKey::Down | OverlayKey::Enter | OverlayKey::Backspace => {
                 state.prompt = Some(OverlayPrompt::Decision(id))
-            }
-        },
-        // A line of text: `n`'s name or `s`'s correction.
-        Some(OverlayPrompt::Text {
-            id,
-            kind,
-            mut draft,
-        }) => match key {
-            OverlayKey::StepBack => state.report = None,
-            OverlayKey::Enter => {
-                state.report = Some(
-                    match kind {
-                        OverlayTextPrompt::Rename => agent_view_rename(registry, id, &draft),
-                    }
-                    .line,
-                );
-            }
-            OverlayKey::Backspace => {
-                draft.pop();
-                state.prompt = Some(OverlayPrompt::Text { id, kind, draft });
-            }
-            OverlayKey::Char(typed) => {
-                draft.push(typed);
-                state.prompt = Some(OverlayPrompt::Text { id, kind, draft });
-            }
-            // The arrows do not edit this line: there is no caret to
-            // move, and moving the selection under an open prompt
-            // would retarget it.
-            OverlayKey::Up | OverlayKey::Down => {
-                state.prompt = Some(OverlayPrompt::Text { id, kind, draft });
             }
         },
         None => match key {
@@ -7812,9 +7917,8 @@ fn handle_overlay_input(
                             's' => {
                                 // Card T4-S4b-ii: the real line over
                                 // `kitsu-editor`, in place of T4-S4b's
-                                // naive one. `n` keeps that line: a
-                                // name is one line and `rename`
-                                // refuses control characters anyway.
+                                // naive one. `n` is on the same line as
+                                // of card F70.
                                 state.steering = Some(SteerLine::new(id));
                                 // The rest of this chunk is not a
                                 // correction anybody typed -- the
@@ -7823,12 +7927,21 @@ fn handle_overlay_input(
                                 // by the line itself from here on.
                                 return OverlayStep::StopChunk;
                             }
+                            // Card F70: the real line over `kitsu-editor`,
+                            // exactly as `s` above, in place of T4-S4b's
+                            // decoded prompt. A name may be non-ASCII and
+                            // the registry accepts it; `OverlayKey::Char`
+                            // cannot carry one byte of it.
                             'n' => {
-                                state.prompt = Some(OverlayPrompt::Text {
-                                    id,
-                                    kind: OverlayTextPrompt::Rename,
-                                    draft: String::new(),
-                                });
+                                state.renaming = Some(SteerLine::new(id));
+                                // The previous key's report is not this
+                                // frame's: the rename frame paints a refusal
+                                // of what is typed *into* it, and a stale
+                                // line there would read as one (**F71**).
+                                state.report = None;
+                                // The bytes after `n` in this very chunk are
+                                // the line's to read, as they are after `s`.
+                                return OverlayStep::StopChunk;
                             }
                             _ => {
                                 state.report = Some(agent_view_acknowledge(registry, id).line);
@@ -7969,43 +8082,7 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
     loop {
         let view_rows = overlay_visible_rows(registry, &state);
         state.selection.sync(&view_rows);
-        let content = if let Some(line) = state.steering.as_ref() {
-            // The innermost frame of all: while a correction is being typed
-            // it owns the screen, caret included, because the overlay hides
-            // the terminal's own cursor.
-            kitsu_tui::agents_view::steer_prompt_rows(
-                line.id(),
-                &line.draft(),
-                line.cursor(),
-                cols as usize,
-            )
-        } else if let Some(line) = state.filtering.as_ref() {
-            // The filter line is an innermost frame too, for the same reason:
-            // it owns the caret the view otherwise hides.
-            kitsu_tui::agents_view::filter_prompt_rows(
-                &line.draft(),
-                line.cursor(),
-                cols as usize,
-                state.report.as_deref(),
-            )
-        } else if state.helping {
-            kitsu_tui::agents_view::overlay_help_rows(cols as usize)
-        } else if let Some(panel) = state.peeking.as_ref() {
-            panel.clone()
-        } else {
-            // An open prompt owns the report row; otherwise the last action's
-            // report has it.
-            let line = match state.prompt.as_ref() {
-                Some(open) => Some(open.report_line()),
-                None => state.report.clone(),
-            };
-            kitsu_tui::agents_view::overlay_rows_with_report(
-                view_rows.clone(),
-                cols as usize,
-                state.selection.selected(),
-                line.as_deref(),
-            )
-        };
+        let content = overlay_frame_rows(&state, &view_rows, cols as usize);
         // Repainted whole, with absolute addressing, and never into the last
         // row: the pinned composer row belongs to the viewport underneath, and
         // an overlay that wrote there would make its own keys indistinguishable
@@ -31213,6 +31290,20 @@ mod tests {
         /// the loop's `for input in decoder.feed(..)`, with the report row
         /// collected instead of painted.
         fn feed(&mut self, registry: &subagent::AgentRegistry, chunk: &[u8]) {
+            self.apply(registry, chunk);
+            if let Some(line) = self.state.report.take() {
+                self.reports.push(line);
+            }
+        }
+
+        /// One `read` of the descriptor, decoded and applied, with the report
+        /// left **in the state** exactly as the loop leaves it there.
+        ///
+        /// [`OverlayUnderTest::feed`] takes the report out afterwards, to
+        /// collect it; [`OverlayUnderTest::feed_and_frame`] leaves it in,
+        /// because the frame is painted from it. Both go through this one
+        /// body, so there is one byte path here and not two (**F69**).
+        fn apply(&mut self, registry: &subagent::AgentRegistry, chunk: &[u8]) {
             let rows = overlay_visible_rows(registry, &self.state);
             self.state.selection.sync(&rows);
             // The loop's own byte path, whole: the open line's bypass and the
@@ -31227,9 +31318,42 @@ mod tests {
                 OVERLAY_TEST_COLS,
                 chunk,
             );
-            if let Some(line) = self.state.report.take() {
-                self.reports.push(line);
-            }
+        }
+
+        /// One `read`, then **the rows the loop would paint afterwards** —
+        /// the loop's own two steps in the loop's own order, through the
+        /// loop's own two functions (**F69**).
+        ///
+        /// This is the only honest way to assert that a message is *on
+        /// screen*: `self.reports` says a message exists, and **F71** is the
+        /// finding that those are different claims.
+        /// Paint at a caller-chosen width. A *visibility* assertion needs a
+        /// frame wide enough to hold the row it is about: every frame row goes
+        /// through `fit_row_to_width`, so at 80 columns an 87-column refusal is
+        /// truncated and `row.trim() == expected` becomes arithmetically
+        /// unsatisfiable (F58). Width-fitting itself is pinned separately by
+        /// `the_steer_line_fits_a_narrow_terminal`, so widening here loses
+        /// nothing.
+        fn feed_and_frame_at(
+            &mut self,
+            registry: &subagent::AgentRegistry,
+            chunk: &[u8],
+            cols: usize,
+        ) -> Vec<String> {
+            self.apply(registry, chunk);
+            let rows = overlay_visible_rows(registry, &self.state);
+            overlay_frame_rows(&self.state, &rows, cols)
+        }
+
+        fn feed_and_frame(
+            &mut self,
+            registry: &subagent::AgentRegistry,
+            chunk: &[u8],
+        ) -> Vec<String> {
+            self.apply(registry, chunk);
+            let rows = overlay_visible_rows(registry, &self.state);
+            self.state.selection.sync(&rows);
+            overlay_frame_rows(&self.state, &rows, OVERLAY_TEST_COLS)
         }
 
         /// The loop's 50 ms grace, resolved: the *waiting* is the terminal's
@@ -31265,10 +31389,7 @@ mod tests {
         }
 
         fn draft(&self) -> Option<&str> {
-            match &self.state.prompt {
-                Some(OverlayPrompt::Text { draft, .. }) => Some(draft.as_str()),
-                _ => None,
-            }
+            self.state.renaming.as_ref().map(SteerLine::draft)
         }
     }
 
@@ -31518,7 +31639,7 @@ mod tests {
     /// and the prompt really was open.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_multi_line_paste_into_an_overlay_text_prompt_is_content_and_its_tail_never_runs() {
+    async fn a_multi_line_paste_into_the_rename_line_is_content_and_its_tail_never_runs() {
         assert!(
             PASTED_CORRECTION.contains('\n')
                 && !PASTED_CORRECTION.ends_with('\n')
@@ -31537,7 +31658,10 @@ mod tests {
             Some(""),
             "NON-VACUOUS: the rename line is open and empty before the paste"
         );
-        overlay.feed(&registry, PASTED_CORRECTION.as_bytes());
+        let mut block = Vec::from(OVERLAY_PASTE_START);
+        block.extend_from_slice(PASTED_CORRECTION.as_bytes());
+        block.extend_from_slice(OVERLAY_PASTE_END);
+        overlay.feed(&registry, &block);
         assert_eq!(
             overlay.draft(),
             Some(PASTED_CORRECTION),
@@ -32159,6 +32283,490 @@ mod tests {
              the paste was content in the line and not nothing at all. \
              Reports: {:?}",
             overlay.reports
+        );
+    }
+
+    // --- card F70: the `n` key must be able to type a name the registry accepts
+    //
+    // The defect, observed live: `OverlayKey::Char` is ASCII-only by
+    // construction (`plain()` maps `0x20..=0x7e` and drops every other byte)
+    // and `n` fills its draft solely from `OverlayKey::Char(typed)`, while
+    // `AgentRegistry::rename` refuses only empty, over-length and
+    // `char::is_control` names. Typing `n` then `café` renamed the agent to
+    // `caf`. **A validation rule is only as wide as the narrowest input path
+    // that feeds it** (F70).
+    //
+    // The fix shape is T4-S5's, one card old: read the line's raw bytes
+    // through `kitsu-editor` on the byte bypass in `overlay_feed_chunk` that
+    // `s` and `/` already take. That brings non-ASCII, a multi-byte character
+    // split across reads and F68's paste rule in one move.
+    //
+    // Two decisions these tests take, so the implementer does not have to
+    // guess:
+    //
+    // * **A refused rename keeps the frame the name was typed on.** This is
+    //   **F71** exactly: once the rename line is an innermost frame like the
+    //   filter's, a refusal left in `state.report` is painted *under the row
+    //   list*, which is not on screen while a line is open — observable to a
+    //   test that reads `state.report`, invisible to the user. So every
+    //   refusal below is asserted against [`overlay_frame_rows`], the real
+    //   frame chain, and the line stays **open carrying the text**, exactly
+    //   as `/`'s refused term does (`OverlayLine::restore` exists for it), so
+    //   the one wrong character is corrected rather than the name retyped.
+    // * **`r`'s decision read is not one of these.** `OverlayPrompt::Decision`
+    //   is a single-key read of `y`/`a`/`n`, all ASCII, and legitimately stays
+    //   decoded. Nothing here touches it.
+
+    /// One line typed into an open overlay line, byte by byte, the way a
+    /// terminal delivers typing: **one `read` per byte**, so a multi-byte
+    /// character really does arrive split across two reads.
+    ///
+    /// `apply` and not `feed`, because these tests read the report off the
+    /// painted frame and `feed` takes it out of the state to collect it.
+    #[cfg(unix)]
+    fn type_line(overlay: &mut OverlayUnderTest, registry: &subagent::AgentRegistry, text: &str) {
+        for byte in text.as_bytes() {
+            overlay.apply(registry, &[*byte]);
+        }
+    }
+
+    /// The name in F70's own report, which the registry accepts and the
+    /// keyboard cannot express (**F58**: the sample is where the expectation
+    /// comes from).
+    #[cfg(unix)]
+    const NON_ASCII_NAME: &str = "café";
+
+    /// **F70: a non-ASCII name typed at the `n` key reaches the registry
+    /// whole**, both typed byte by byte and with the multi-byte character
+    /// split across two reads.
+    ///
+    /// The two NON-VACUOUS halves are the shape of the defect: the key
+    /// decoder cannot carry a single byte of `é`, and the registry accepts
+    /// the name anyway. The failure this replaces renamed the agent to `caf`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_rename_line_takes_a_non_ascii_name_typed_and_split_across_reads() {
+        assert!(
+            NON_ASCII_NAME.len() > NON_ASCII_NAME.chars().count()
+                && NON_ASCII_NAME
+                    .bytes()
+                    .any(|byte| !(0x20..=0x7e).contains(&byte)),
+            "NON-VACUOUS: the name really is multi-byte and really does carry \
+             a byte outside `OverlayKey::Char`'s `0x20..=0x7e`: {:?}",
+            NON_ASCII_NAME.as_bytes()
+        );
+        assert!(
+            decode_overlay_keys(NON_ASCII_NAME.as_bytes(), &mut OverlayPending::None)
+                .iter()
+                .all(|key| !matches!(key, OverlayKey::Char(typed) if !typed.is_ascii())),
+            "NON-VACUOUS: the key decoder drops every non-ASCII byte, so this \
+             name is expressible only by a line that reads the raw bytes: {:?}",
+            decode_overlay_keys(NON_ASCII_NAME.as_bytes(), &mut OverlayPending::None)
+        );
+
+        let registry = subagent::AgentRegistry::new();
+        let typed_id = registry
+            .start("alpha: audit the overlay decoder".to_string())
+            .unwrap();
+        let split_id = registry
+            .start("beta: rewrite the repaint loop".to_string())
+            .unwrap();
+
+        // Typed, one read per byte — which is itself the split case for `é`,
+        // because `é` is two bytes and a typist produces one keystroke.
+        let mut overlay = OverlayUnderTest::new();
+        overlay.feed(&registry, b"n");
+        assert_eq!(
+            overlay.draft(),
+            Some(""),
+            "NON-VACUOUS: `n` opened an empty rename line on the selected agent"
+        );
+        type_line(&mut overlay, &registry, NON_ASCII_NAME);
+        assert_eq!(
+            overlay.draft(),
+            Some(NON_ASCII_NAME),
+            "the line holds every character typed into it, `é` included"
+        );
+        overlay.feed(&registry, b"\r");
+        assert_eq!(
+            registry
+                .thread_snapshot_dtos()
+                .iter()
+                .find(|dto| dto.thread.id == typed_id)
+                .and_then(|dto| dto.thread.name.clone()),
+            Some(NON_ASCII_NAME.to_string()),
+            "the typed Enter renamed the agent to the whole name: {:?}",
+            overlay.reports
+        );
+
+        // The same name with `é` deliberately torn between two reads: the
+        // first chunk ends mid-character. Byte-by-byte typing really produces
+        // this, and a decoder that drops the lead byte loses the character.
+        let mut split = OverlayUnderTest::new();
+        split.feed(&registry, b"\x1b[B");
+        assert_eq!(
+            split.selected(&registry),
+            Some(split_id),
+            "NON-VACUOUS: the second agent is the selected one, so the split \
+             name below lands on an agent the typed one did not"
+        );
+        split.feed(&registry, b"n");
+        split.feed(&registry, b"caf\xc3");
+        split.feed(&registry, b"\xa9");
+        assert_eq!(
+            split.draft(),
+            Some(NON_ASCII_NAME),
+            "a multi-byte character split across two reads is one character \
+             in the line, not two dropped bytes"
+        );
+        split.feed(&registry, b"\r");
+        assert_eq!(
+            registry
+                .thread_snapshot_dtos()
+                .iter()
+                .find(|dto| dto.thread.id == split_id)
+                .and_then(|dto| dto.thread.name.clone()),
+            Some(NON_ASCII_NAME.to_string()),
+            "and the split name reached the registry whole: {:?}",
+            split.reports
+        );
+    }
+
+    /// **The name reaches the row through the snapshot** (card T4-S4a's rule),
+    /// and the rows the frame paints are those rows.
+    ///
+    /// `agent_view_rows` builds from `AgentRegistry::thread_snapshot_dtos`,
+    /// so the assertion is on the path the view really reads and not on a
+    /// private map a renamer might have written instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_typed_name_reaches_the_row_through_the_snapshot() {
+        let registry = subagent::AgentRegistry::new();
+        let id = registry
+            .start("alpha: audit the overlay decoder".to_string())
+            .unwrap();
+        let mut overlay = OverlayUnderTest::new();
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.name.clone()),
+            None,
+            "NON-VACUOUS: the row carries no name before the rename"
+        );
+        overlay.feed(&registry, b"n");
+        type_line(&mut overlay, &registry, NON_ASCII_NAME);
+        overlay.feed(&registry, b"\r");
+        assert_eq!(
+            overlay
+                .visible(&registry)
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.name.clone()),
+            Some(NON_ASCII_NAME.to_string()),
+            "the row the view paints carries the typed name, read back out of \
+             the snapshot: {:?}",
+            overlay.reports
+        );
+    }
+
+    /// A name one character past `AgentRegistry::NAME_MAX_CHARS`, built from
+    /// real task text rather than a run of one letter (**F58**).
+    #[cfg(unix)]
+    fn over_long_name() -> String {
+        let sample = "audit the overlay decoder and the repaint loop too";
+        let name: String = sample
+            .chars()
+            .take(subagent::AgentRegistry::NAME_MAX_CHARS + 1)
+            .collect();
+        assert_eq!(
+            name.chars().count(),
+            subagent::AgentRegistry::NAME_MAX_CHARS + 1,
+            "NON-VACUOUS: the sample is long enough to be over the limit by \
+             exactly one character"
+        );
+        name
+    }
+
+    /// **F71: every registry refusal of a typed name is painted where the
+    /// user is looking**, and a refused rename leaves the previous name
+    /// intact.
+    ///
+    /// The three refusals are the registry's own — `Empty`, `TooLong { max }`
+    /// and `Unprintable` — and each is asserted against
+    /// [`overlay_frame_rows`], the frame chain the loop paints from. That is
+    /// the whole point of the test: `self.reports` would say the message
+    /// exists while the user, looking at an open line, saw nothing. A test
+    /// that asserts a message exists has not asserted the message is on
+    /// screen.
+    ///
+    /// The line stays open carrying the text, as `/`'s refused term does, so
+    /// the message and the text it is about are on screen together.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn each_refused_rename_is_painted_on_the_frame_the_name_was_typed_on() {
+        let registry = subagent::AgentRegistry::new();
+        let id = registry
+            .start("alpha: audit the overlay decoder".to_string())
+            .unwrap();
+        // A name the agent already has, so every refusal below has something
+        // to leave intact.
+        assert!(
+            matches!(
+                registry.rename(id, "alpha"),
+                subagent::AgentRenameOutcome::Renamed { .. }
+            ),
+            "NON-VACUOUS: the agent starts the test named, so a refusal that \
+             silently cleared the name would be visible here"
+        );
+
+        let max = subagent::AgentRegistry::NAME_MAX_CHARS;
+        let long = over_long_name();
+        for (typed, expected) in [
+            (
+                String::new(),
+                format!("a name for background agent #{id} cannot be empty"),
+            ),
+            (
+                long.clone(),
+                format!(
+                    "a name for background agent #{id} is at most {max} characters; it was not shortened for you"
+                ),
+            ),
+            (
+                "two\nlines".to_string(),
+                format!(
+                    "a name for background agent #{id} cannot carry control characters"
+                ),
+            ),
+        ] {
+            let mut overlay = OverlayUnderTest::new();
+            overlay.feed(&registry, b"n");
+            // Delivered as a BRACKETED paste, not as typing. F72: the editor
+            // submits unbracketed text at its first newline, so the control
+            // character this case is about could never reach `rename` by being
+            // typed — the assertion would be unsatisfiable by construction
+            // (F58), for a reason that is the gap F72 records and not this
+            // test's subject. A real paste in this surface *is* bracketed,
+            // since the overlay writes `ESC[?2004h` on entry.
+            let mut block = Vec::from(OVERLAY_PASTE_START);
+            block.extend_from_slice(typed.as_bytes());
+            block.extend_from_slice(OVERLAY_PASTE_END);
+            overlay.feed(&registry, &block);
+            assert_eq!(
+                overlay.draft(),
+                Some(typed.as_str()),
+                "NON-VACUOUS: the line holds {typed:?} before the Enter that \
+                 submits it"
+            );
+            let frame = overlay.feed_and_frame_at(&registry, b"\r", 120);
+            assert!(
+                frame.iter().any(|row| row.trim() == expected),
+                "the refusal is painted on the frame that is on screen, not \
+                 under a row list the open line covers (**F71**). Expected \
+                 {expected:?} among the painted rows: {frame:?}"
+            );
+            assert_eq!(
+                overlay.draft(),
+                Some(typed.as_str()),
+                "and the line is still open carrying {typed:?}, so the one \
+                 wrong character is corrected rather than the name retyped — \
+                 `/`'s refused term does exactly this"
+            );
+            assert_eq!(
+                registry
+                    .thread_snapshot_dtos()
+                    .iter()
+                    .find(|dto| dto.thread.id == id)
+                    .and_then(|dto| dto.thread.name.clone()),
+                Some("alpha".to_string()),
+                "and the refused rename left the previous name intact"
+            );
+        }
+
+        // POSITIVE CONTROL: an accepted name on the same path really does
+        // rename, so every refusal above is the registry's rule and not a
+        // line that had stopped working.
+        let mut accepted = OverlayUnderTest::new();
+        accepted.feed(&registry, b"n");
+        type_line(&mut accepted, &registry, NON_ASCII_NAME);
+        accepted.feed(&registry, b"\r");
+        assert_eq!(
+            registry
+                .thread_snapshot_dtos()
+                .iter()
+                .find(|dto| dto.thread.id == id)
+                .and_then(|dto| dto.thread.name.clone()),
+            Some(NON_ASCII_NAME.to_string()),
+            "POSITIVE CONTROL: {:?}",
+            accepted.reports
+        );
+        assert!(
+            accepted.draft().is_none(),
+            "and an accepted name closes the line"
+        );
+    }
+
+    /// **F68 in the rename line: a paste is content**, consistent with every
+    /// other text field in this view, and a pasted multi-line name is still
+    /// refused on submit — which is `AgentRenameOutcome::Unprintable`'s own
+    /// rule and not this card's.
+    ///
+    /// The paste is **bracketed**, because the overlay enables `ESC[?2004h`
+    /// on entry and a real paste therefore arrives bracketed. The first
+    /// assertion is why that matters: fed unbracketed, the editor submits at
+    /// the newline (`kitsu-editor`'s `unbracketed_newlines_still_submit_each_line`),
+    /// which is F68 one layer down and is a hole the filter line already has.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_paste_into_the_rename_line_is_content_and_a_multi_line_name_is_refused() {
+        assert_eq!(
+            OverlayLine::new().feed(b"two\nlines"),
+            SteerLineStep::Submit("two".to_string()),
+            "NON-VACUOUS: an *unbracketed* newline submits inside the editor, \
+             so the bracketing below is what makes this a paste and not two \
+             lines of typing"
+        );
+
+        let registry = subagent::AgentRegistry::new();
+        let id = registry
+            .start("alpha: audit the overlay decoder".to_string())
+            .unwrap();
+
+        // One pasted line: content, and it does not submit.
+        let mut overlay = OverlayUnderTest::new();
+        overlay.feed(&registry, b"n");
+        let mut pasted = Vec::from(OVERLAY_PASTE_START);
+        pasted.extend_from_slice("fast lane".as_bytes());
+        pasted.extend_from_slice(OVERLAY_PASTE_END);
+        overlay.feed(&registry, &pasted);
+        assert_eq!(
+            overlay.draft(),
+            Some("fast lane"),
+            "the paste is content in the line"
+        );
+        assert_eq!(
+            registry
+                .thread_snapshot_dtos()
+                .iter()
+                .find(|dto| dto.thread.id == id)
+                .and_then(|dto| dto.thread.name.clone()),
+            None,
+            "and it did not submit: a paste never does"
+        );
+        overlay.feed(&registry, b"\r");
+        assert_eq!(
+            registry
+                .thread_snapshot_dtos()
+                .iter()
+                .find(|dto| dto.thread.id == id)
+                .and_then(|dto| dto.thread.name.clone()),
+            Some("fast lane".to_string()),
+            "POSITIVE CONTROL: the Enter the user types applies the pasted \
+             name: {:?}",
+            overlay.reports
+        );
+
+        // A multi-line paste: still content, newline included, and refused by
+        // the registry when the user submits it.
+        let mut multi = OverlayUnderTest::new();
+        multi.feed(&registry, b"n");
+        let mut block = Vec::from(OVERLAY_PASTE_START);
+        block.extend_from_slice(PASTED_CORRECTION.as_bytes());
+        block.extend_from_slice(OVERLAY_PASTE_END);
+        multi.feed(&registry, &block);
+        assert_eq!(
+            multi.draft(),
+            Some(PASTED_CORRECTION),
+            "the whole block is content, newline included, and nothing \
+             submitted at the newline"
+        );
+        let frame = multi.feed_and_frame(&registry, b"\r");
+        assert!(
+            frame.iter().any(|row| row.trim()
+                == format!("a name for background agent #{id} cannot carry control characters")),
+            "and the registry's refusal of a multi-line name is painted where \
+             the user is looking (**F71**): {frame:?}"
+        );
+        assert_eq!(
+            registry
+                .thread_snapshot_dtos()
+                .iter()
+                .find(|dto| dto.thread.id == id)
+                .and_then(|dto| dto.thread.name.clone()),
+            Some("fast lane".to_string()),
+            "and the previous name is intact"
+        );
+    }
+
+    /// **F65 in the rename line: `Esc` cancels under the 50 ms grace, and an
+    /// arrow is not a cancel.**
+    ///
+    /// The same grace the steer and filter lines inherit, through the same two
+    /// functions the loop takes (`overlay_escape_held` and
+    /// `overlay_resolve_held_escape`, **F69**). The NON-VACUOUS halves are
+    /// that the lone `ESC` byte has *not* cancelled before the grace expires,
+    /// and that `ESC [ D` leaves the line open with its text.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn esc_cancels_the_rename_line_under_the_grace_and_an_arrow_does_not() {
+        let registry = subagent::AgentRegistry::new();
+        let id = registry
+            .start("alpha: audit the overlay decoder".to_string())
+            .unwrap();
+
+        let mut overlay = OverlayUnderTest::new();
+        overlay.feed(&registry, b"n");
+        type_line(&mut overlay, &registry, "half typed");
+        overlay.feed(&registry, b"\x1b");
+        assert_eq!(
+            overlay.draft(),
+            Some("half typed"),
+            "NON-VACUOUS: a lone `ESC` byte is ambiguous until the grace \
+             expires, so the line is still open and still holds its text"
+        );
+        assert!(
+            !overlay.quiet_tick(),
+            "the grace expired on the rename line, which cancels the line and \
+             not the view"
+        );
+        assert!(
+            overlay.draft().is_none(),
+            "`Esc` cancelled the line: it steps out of one frame"
+        );
+        assert_eq!(
+            registry
+                .thread_snapshot_dtos()
+                .iter()
+                .find(|dto| dto.thread.id == id)
+                .and_then(|dto| dto.thread.name.clone()),
+            None,
+            "and nothing was renamed: a cancel sends nothing. {:?}",
+            overlay.reports
+        );
+
+        // An arrow is not one byte, and it is not a cancel (**F65**).
+        let mut arrowed = OverlayUnderTest::new();
+        arrowed.feed(&registry, b"n");
+        type_line(&mut arrowed, &registry, "half typed");
+        arrowed.feed(&registry, b"\x1b");
+        arrowed.feed(&registry, b"[D");
+        assert_eq!(
+            arrowed.draft(),
+            Some("half typed"),
+            "the `ESC` was the first byte of a left arrow, so the line is \
+             still open with its text — **F65**"
+        );
+        assert!(
+            !arrowed.quiet_tick(),
+            "and the sequence resolved, so no `ESC` is held any more"
+        );
+        assert_eq!(
+            arrowed.draft(),
+            Some("half typed"),
+            "NON-VACUOUS: the following quiet tick did not cancel the line \
+             either, because the arrow consumed the `ESC`"
         );
     }
 }

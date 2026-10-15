@@ -591,6 +591,40 @@ pub fn steer_prompt_rows(id: u64, draft: &str, cursor: usize, cols: usize) -> Ve
     )
 }
 
+/// The frame for `n`'s rename line (card F70, requirement A3's *`n` name*).
+///
+/// The same drawn echo and caret the other two lines have, because it is the
+/// same kind of line read by the same editor; what differs is the title, the
+/// footer and `id`, which is on the frame because renaming has a real effect
+/// and the surface says which agent it lands on.
+///
+/// `report` is the registry's refusal of the name just submitted, when there
+/// is one. It is painted **on this frame** for `filter_prompt_rows`' reason:
+/// a refused name leaves the line open, so the message and the text it is
+/// about are on screen together, and a refusal painted under the row list
+/// this frame covers is a key that failed silently (requirement T2-S5b,
+/// finding **F71**).
+pub fn rename_prompt_rows(
+    id: u64,
+    draft: &str,
+    cursor: usize,
+    cols: usize,
+    report: Option<&str>,
+) -> Vec<String> {
+    let mut out = vec![
+        title_row(&format!("{OVERLAY_TITLE} \u{2014} name #{id}"), cols),
+        String::new(),
+        line_echo(draft, cursor, cols),
+        String::new(),
+        format!("{LINE_INDENT}enter applies the name to agent #{id}, esc cancels"),
+    ];
+    if let Some(report) = report {
+        out.push(String::new());
+        out.push(format!("{LINE_INDENT}{}", flatten_report(report)));
+    }
+    fit_all(out, cols)
+}
+
 /// The frame for `/`'s filter line (card T4-S5, requirement A3's `/ filter`).
 ///
 /// The same drawn echo and caret `s`'s frame has, because it is the same kind

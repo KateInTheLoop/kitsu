@@ -299,6 +299,12 @@ clamps at the ends instead of wrapping, moving it never collects a result, and
 if the selected agent is pruned the selection falls to the row that took its
 place.
 
+`n` opens a rename line that accepts any name the registry does -- including
+non-ASCII, which it previously dropped without saying so. A refused name (empty,
+longer than the limit, or carrying control characters) is reported on the rename
+line itself and leaves what you typed in place to be corrected; `Esc` cancels
+without renaming.
+
 `/` opens a filter line: `s:<state> n:<text> o:<text> p:<profile>`, each term
 confined to its own field, so a name filter cannot match a task. A term it
 cannot read is refused with the key it did not recognise, and what you typed

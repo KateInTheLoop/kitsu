@@ -463,6 +463,24 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
     model-produced label and is exactly the silent rejection this project
     refuses for a name a human just typed.
 
+    **`n` only became able to honour "non-ASCII is legal" in F70's card.** The
+    rule was stated here, the registry implemented it and its own tests pinned
+    it — but the key read its draft through the **ASCII-only**
+    `OverlayKey::Char`, so typing `café` renamed the agent to `caf`,
+    **silently**. The rule and its enforcement agreed; nothing checked whether
+    the only path a user has could reach it. **A validation rule is only as wide
+    as the narrowest input path that feeds it** (**F70**) — the third time this
+    epic paid for that blind spot, after **F57** and **F69**.
+
+    `n` now reads its line through `kitsu-editor` on the same bypass as `s` and
+    `/`, which makes the rename line an **innermost frame**: `Esc` steps out of
+    it first, and **a refused rename is painted on that frame and leaves the line
+    open carrying the text** — the same contract `/`'s refused term has, so the
+    message and the text it is about are on screen together and one wrong
+    character is corrected rather than a 48-character name retyped. Painting it
+    anywhere else would repeat **F71**, a message the test can read and the user
+    can never see.
+
   **`x` was under-specified, and T4-S4b settled it against a hazard this
   requirement did not anticipate.**
 
@@ -504,12 +522,30 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
     agent** (`allow_once`, 34 keys from one chunk). Pasted text must never
     become a privileged action.
 
-    - **Inside a text prompt** (`n`'s name, `s`'s correction) the whole payload
-      is content, **newlines included**; the prompt stays open and the user
-      presses `Enter` themselves. This keeps **one** answer to "what is a byte
-      inside a paste?" across the binary: `kitsu-editor` already holds that a
-      bracketed paste never submits, and T4-S2 decided a prefix byte inside a
-      paste is content.
+    - **Inside a text prompt** (`n`'s name, `s`'s correction, `/`'s filter) the
+      whole payload is content, **newlines included**; the prompt stays open and
+      the user presses `Enter` themselves. This keeps **one** answer to "what is
+      a byte inside a paste?" across the binary: `kitsu-editor` already holds
+      that a bracketed paste never submits, and T4-S2 decided a prefix byte
+      inside a paste is content.
+
+      **This clause holds only where the terminal brackets pastes — see F72.**
+      All three lines read their bytes through `kitsu-editor` on a bypass that
+      skips the decoder, for three good reasons (a non-ASCII value is legal and
+      `OverlayKey::Char` is ASCII-only, a bracketed paste must not submit, and a
+      multi-byte character really arrives split across reads). But the
+      **unbracketed-burst** fallback F68 added lives in the **decoder**, so these
+      lines do not get it: on a terminal that does not report pastes the editor
+      submits at the paste's first newline and the rest stays in the line. **The
+      fix for one hazard removed the mitigation for another**, which is worth
+      saying rather than leaving the clause looking unconditional.
+
+      **The safety half is unaffected, verified by reading:** an open line's
+      branch in `overlay_feed_chunk` ends with `return false`, so the **whole
+      chunk** is consumed by the line and the decoder is never reached — a
+      mid-chunk submit's tail **cannot** become keys, and F68's `r`+`y` and
+      double-`x` hazards stay closed. The residual gap is early submission, not
+      privileged action.
     - **Over the row list, and inside `r`'s decision read, a paste is dropped
       entirely** — never an action, and the decision read stays open rather than
       resolving to a pasted letter.
