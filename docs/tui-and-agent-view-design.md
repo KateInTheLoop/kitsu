@@ -200,6 +200,35 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
 - **R2** `/tui [classic|inline|fullscreen]` MUST switch at runtime without
   losing the conversation; `--tui <mode>` and `[tui] mode` in `kitsu.toml`
   set the start mode.
+
+  **Completed in T3-S9, which decided three things R2 left open.** All three are
+  user-visible rules, not implementation details, so they belong here:
+  - **`fullscreen` is refused** until T5's renderer exists, naming what is
+    accepted — `/tui fullscreen is not available yet; accepted: classic,
+    inline` — the same vocabulary `[tui] mode`'s error uses. A value that
+    parsed and silently behaved as `inline` is the quiet coercion this epic has
+    refused everywhere else.
+  - **Mid-turn `/tui` is refused**, not queued and not deferred to the turn
+    boundary. The reason is specific: the mid-turn dispatcher's default
+    fall-through **enqueues the line as a future prompt to the model**, so an
+    unhandled `/tui inline` would be *sent to the model as text* — see **F57**.
+    A swap landing silently seconds later is also indistinguishable from the one
+    the user would get by retyping.
+  - **Bare `/tui` reports the live renderer**, doubling as the usage line, and
+    must track the renderer actually running rather than the start mode.
+
+  **A switch is narrated** (`~ switched to the … renderer; the conversation is
+  unchanged`), because R2's guarantee is that the conversation survives and a
+  silent switch leaves the user unable to tell a working switch from a lost one.
+  Switching into a terminal too short for the viewport's minimum height stays
+  classic and says so; geometry is re-probed on every install, since no viewport
+  listens for resize during a classic segment.
+
+  **"Classic is byte-identical" is scoped to sessions that never switched.**
+  Once any inline segment has existed, the signal restore installed with it
+  (N5) stays registered for the life of the process, so a later `SIGINT` writes
+  a region reset even in classic. That is harmless — it is a reset of a region
+  nothing has pinned — but it is not byte-identity.
 - **R3** In `inline` mode every finished transcript cell MUST be written to
   native scrollback exactly once, on the **same fd** `classic` uses (assistant
   text → stdout, receipts/notices → stderr), as the same text, so per fd

@@ -145,7 +145,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T3-S6 bounded fd-tagged cell ring in `kitsu-tui`; **not fed in production until R6 reads it**; N4 amended (F52) | done | 6c91f42 |
 | T3-S7a approval modal in the bottom pane + inline receipt; R7 clarified, `--plain` excluded (F53) | done | 6584101 |
 | T3-S7b in-loop approval read; answer off the transcript; F55 starvation fixed, **F45 closed** | done | b62e3ed |
-| T3-S8 `Ctrl+L` + restore on SIGINT/SIGTERM/panic; N5 amended (two clauses vacuous); resize pinned, not rebuilt | done | this commit |
+| T3-S8 `Ctrl+L` + restore on SIGINT/SIGTERM/panic; N5 amended (two clauses vacuous); resize pinned, not rebuilt | done | e2654f4 |
+| T3-S9 `/tui classic\|inline` runtime switch; R2 completed; F57 reachability, F58 unsatisfiable test | done | this commit |
 
 > **`KITSU_TUI` is retired as of T3-S2.** Mentions of it in the T0-T2 rows and
 > requirement text below are **historical** — they record how the preview was

@@ -3017,3 +3017,102 @@ half-fixed from one path and whole from another.
 genuinely forced — different calling conventions, different safety constraints —
 the duplication is acceptable **only if a test compares the copies.** The copies
 cannot be eliminated; the drift can.
+
+## F57 — a registered-but-undispatched top-level command is silently wrong twice, and the suite says nothing
+
+Measured in T3-S9, not reasoned about. The author added a `SLASH_COMMANDS`
+entry with **no dispatch arm** and ran the suites: the binary prints
+`unknown command: /tui - did you mean /quit?` and **all 824 binary tests and
+245 CLI tests pass.** Nothing asserts that a registered command is reachable.
+
+**The second failure mode is worse than the first.** The mid-turn dispatcher's
+default fall-through is `queue.enqueue(line)`, so a registered-but-undispatched
+command typed **during a turn** does not merely fail — it becomes **a future
+prompt sent to the model.** The user types `/tui inline`, nothing visibly
+happens, and the model is later asked to respond to the literal text
+`/tui inline`.
+
+### Why the F2-style guard cannot be copied here
+
+F38's `/jobs` fix worked because `closest_jobs_subcommand` kept its **own
+hardcoded table**, so "every dispatched subcommand is its own nearest
+suggestion" catches a table that drifted from the dispatcher.
+
+`closest_slash_command` **reads `SLASH_COMMANDS` directly**. So the analogous
+sweep — every registry name is its own nearest suggestion — **passes vacuously**:
+it compares the registry with itself. The registry being the single source,
+which is normally the fix, is exactly what makes this guard impossible.
+
+**The two halves therefore need separate guards**, which T3-S9 adds:
+- a missing *entry* is caught by the registry tests and the suggester test;
+- a missing *arm* is caught by behavioural tests asserting
+  `unknown command: /tui` does **not** appear, and by a unit test asserting the
+  mid-turn queue stays **empty**.
+
+### The general lesson
+
+**A single source of truth guarantees that readers agree with it; it guarantees
+nothing about whether anyone acts on what they read.** Six cards in this epic
+converged on "one source, many readers" as the fix for drift — and this is its
+blind spot: the registry can be perfectly consistent with every surface that
+*displays* it while nothing dispatches it. Reachability is a different property
+from consistency and needs its own test.
+
+Worth a later card: a test that drives **every** registry entry through the
+dispatcher and requires none of them to reach the unknown-command fallback. That
+would make reachability structural for all 54 commands rather than only the one
+this card happened to add.
+
+## F58 — an UNSATISFIABLE test nearly changed the product, which is the mirror of a vacuous one
+
+T3-S9's `every_registry_fed_surface_shows_the_tui_switch` asserted:
+
+```rust
+let palette = slash_palette("tu", false, 80);
+assert!(palette.contains(" /tui [classic|inline]"), …);
+```
+
+At width 80 the palette takes its **wide** branch, which renders
+`" /{name:<22} {description}"` — the bare **name** and the description. The
+asserted substring is the **compact** branch's shape, used only below a
+40-column inner width. So **no registry entry whatsoever could satisfy that
+assertion at width 80.** It was not failing because `/tui` was missing; it was
+unsatisfiable by configuration.
+
+**The implementer could not edit tests, so the only path open to it was to
+change the product** — and it did, making the wide branch show syntax in the
+label slot when it fits. That change was careful and well-reasoned, and it
+**altered the palette for every short-argument command** (`/model <name>`,
+`/theme [name]`, `/usage [session]`, `/undo [id]`) in a card about a renderer
+switch. It flagged the deviation rather than burying it, which is why this is a
+finding and not a regression.
+
+**Reverted at review; the test was corrected instead** to assert the wide
+branch's real shape (the name and the description both present). The intent —
+"the palette offers `/tui` for the prefix `tu`" — is served exactly as well, and
+the palette is byte-for-byte what it was.
+
+### Why this is worth a finding of its own
+
+This project has **seven** findings about **vacuous** assertions — tests that
+can never fail. This is the mirror image: an assertion that can never *pass*.
+The failure modes are opposite but the cause is identical — **an expectation
+written from a mental model of the output rather than from the output** — and
+the consequences differ in an important way:
+
+- a **vacuous** test fails to protect, and is discovered late or never;
+- an **unsatisfiable** test is discovered immediately, but **it exerts pressure
+  on the product**, because the implementer's job is to make it pass and the
+  test is the specification.
+
+So an unsatisfiable test is the more dangerous of the two in a TDD loop. The
+protection is the same one that catches vacuity: **derive the expectation from a
+real sample of the output**, not from what the output ought to look like. T3-S9
+did that correctly for its transcript markers — the author verified the marker's
+exact bytes and its 76-column width against a real run — and then did not do it
+for this one line.
+
+**Rule: when a test demands something the design does not do, the test or the
+requirement is amended deliberately — the product is not changed incidentally
+to satisfy it.** An implementer forbidden from touching tests must flag the
+conflict, as this one did, rather than resolve it in the product.
