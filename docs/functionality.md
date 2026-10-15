@@ -309,6 +309,12 @@ that thread, and any other argument is forwarded verbatim to `/jobs`, so every
 subcommand is reachable through either name.
 
 Background agents run in-process, so nothing outside kitsu can observe them.
+`Ctrl+L` repaints the viewport's pinned row. Every exit path from the viewport
+releases the scroll region and restores the terminal: a normal quit, a panic,
+`SIGINT` and `SIGTERM`. The signal path writes one precomposed escape sequence
+and restores the line settings captured when raw mode was entered, then re-raises
+the signal with its default disposition, so the process still dies by the signal
+and in-turn Ctrl+C cancellation keeps working. `kill -9` cannot be restored from.
 In the viewport the answer is read on the keypress while the input collector
 still holds raw mode, so nothing is echoed and the transcript keeps only the
 receipt; the cue is a row of the modal. Classic reads the answer canonically and

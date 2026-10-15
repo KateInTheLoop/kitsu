@@ -92,6 +92,14 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- **Ctrl+L repaints** the inline viewport's pinned row.
+- Fixed: interrupting the inline viewport with **Ctrl+C**, or the process taking
+  a `SIGTERM` or panicking, used to leave the terminal with a **pinned scroll
+  region** — output stayed trapped in part of the screen until you ran `reset`.
+  Every one of those paths now releases the region, restores line settings,
+  turns bracketed paste off and shows the cursor, and then lets the signal
+  finish the process as it would have. Turn cancellation with Ctrl+C is
+  unaffected. `kill -9` still cannot restore anything, by its nature.
 - In the inline viewport, answering a permission prompt no longer leaves the
   typed letter and a stray `> ` in your transcript: the answer is read on the
   keypress and the cue is drawn in the modal, so the transcript keeps only the

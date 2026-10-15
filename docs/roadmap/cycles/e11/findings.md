@@ -2987,3 +2987,33 @@ answers — and confirmed by the unchanged binary, CLI and command-modal suites.
 **One parser now serves all three answer surfaces**: the filesystem approval, the
 command approval, and `/jobs reply`. The finding that named the rule is finally
 true of the code.
+
+## F56 — a signal handler cannot share the restore writer, so the bytes are duplicated — and now compared
+
+T3-S8's handler needs the restore sequences as a **precomposed `const`**,
+because a signal handler may not write through `io::Write` (it locks and may
+allocate) or call into crossterm. The restore helper that the panic path uses
+writes the same four sequences through a `Write`. So the byte string exists
+**twice**, by necessity rather than carelessness.
+
+The implementer flagged exactly this and declined to add the test itself, being
+restricted to production code. It was right to flag it: **two copies of one byte
+sequence with nothing comparing them is this project's most-repeated defect
+shape** — F2's suggester table, F38's four unchecked string literals, F45's two
+vocabularies, and the `/agent` args string that was stale in three files at
+once.
+
+**Closed at review** with a test asserting the handler's `const` equals the
+helper's output byte-for-byte, and **verified to have teeth**: dropping the
+title-pop sequence from the handler made it fail with both strings printed, and
+restoring the file by checksum made it pass again.
+
+The failure it prevents is specific and nasty: a sequence added to the helper
+and forgotten in the handler would mean **a signal exit restores less than a
+panic does**, which nobody would notice until a user's terminal came back
+half-fixed from one path and whole from another.
+
+**The general rule, now with five instances behind it:** when duplication is
+genuinely forced — different calling conventions, different safety constraints —
+the duplication is acceptable **only if a test compares the copies.** The copies
+cannot be eliminated; the drift can.

@@ -471,7 +471,36 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   would spend up to ten thousand styled lines of memory for no benefit.
 - **N5** Terminal restore MUST happen on every exit path including panics and
   `SIGINT` (raw mode off, alt screen left, bracketed paste off, title reset).
-  Known today: `kill -9` mid-turn leaves raw mode; the TUI must not add paths.
+
+  **Amended in T3-S8, because the "known today" note understated it.** Before
+  this card, `SIGINT`, `SIGTERM` and a panic left the viewport's **DECSTBM
+  scroll region pinned** — worse than leaving raw mode, because the terminal
+  stays visually broken until `reset`. `kill -9` remains the one path that
+  cannot restore, by definition. The restore now runs from a signal handler
+  that performs **one `write(2)` of a precomposed `const`** plus a `tcsetattr`
+  of a snapshot captured when raw mode was entered — both async-signal-safe —
+  and then puts the default disposition back and re-raises, so the process dies
+  **by the signal** rather than by an exit code this module invented.
+
+  **The handler must not terminate, and that is a hard constraint, not a
+  style.** In raw mode Ctrl+C reaches the editor as a byte and the during-turn
+  collector **re-raises `SIGINT` in-process** so the turn is cancelled; tokio's
+  `ctrl_c()` goes through a registry whose handler **chains to the previously
+  installed one**, so a restore-and-exit handler would be invoked on every
+  in-turn cancellation and kill the session mid-cancel. A flag records the
+  signal kitsu raises on itself, and the handler is inert for it — sound with no
+  tolerance window, because `raise(2)` runs the handler synchronously on the
+  raising thread.
+
+  **Two clauses of this requirement are vacuous today, not met.** The alt-screen
+  and window-title clauses describe a runtime (`kitsu_tui::TuiRuntime`) that has
+  **no caller in the binary**, so nothing pushes a title or enters the alt
+  screen and nothing has to restore them. A test asserting their restore would
+  pass by construction, which is why none was written. They become real when
+  T5's fullscreen renderer uses that runtime.
+
+  The restore is installed **only in the viewport**, so classic keeps the signal
+  dispositions it started with.
 - **N6** Works under tmux, zellij, screen, Windows Terminal; `inline` degrades
   to `fullscreen` where DEC scroll regions misbehave (Codex's Windows
   fallback); `--no-alt-screen` forces `inline`.

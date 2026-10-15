@@ -14713,6 +14713,11 @@ impl RawStdinGuard {
             }
             original
         };
+        // Requirement N5: publish the snapshot for the dying-signal handler.
+        // `Drop` below is the normal restore, and a signal is precisely the
+        // exit path `Drop` does not run on, so the handler needs its own
+        // reachable copy of the modes this guard displaced.
+        tui_bridge::publish_canonical_termios(&original);
         // Bracketed paste on: a mid-turn paste arrives as one `ESC[200~`
         // delimited block instead of loose lines, so the editor can keep it
         // as a single draft. Terminals without support ignore the sequence.
@@ -14741,6 +14746,11 @@ impl Drop for RawStdinGuard {
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
         }
+        // Withdrawn after the restore, not before: a signal landing mid-drop
+        // should still find the snapshot. Once the modes are back, whatever
+        // claims the terminal next (rustyline, an approval prompt) owns them,
+        // and a handler must not `tcsetattr` this stale copy over it.
+        tui_bridge::forget_canonical_termios();
     }
 }
 
@@ -14932,6 +14942,12 @@ fn resolve_editor_actions(
             }
             kitsu_editor::EditorAction::Suspend => {
                 effects.raise_signal = Some(libc::SIGTSTP);
+            }
+            // Ctrl+L (requirement R8): the during-turn half. The draft did
+            // not change, so the redraw flag is what repaints the live row --
+            // the same flag a keystroke sets, consulted once per batch.
+            kitsu_editor::EditorAction::Redraw => {
+                effects.needs_redraw = true;
             }
             kitsu_editor::EditorAction::Quit => {
                 effects.raise_signal = Some(libc::SIGQUIT);
@@ -15371,12 +15387,15 @@ fn run_live_typeahead(
                     live::live_input_end();
                 }
             }
-            // SAFETY: raising a handled or default-disposition signal
-            // in-process; for SIGTSTP the loop's re-engage branch restores
-            // raw mode and repaints after fg/SIGCONT.
-            unsafe {
-                libc::raise(signal);
-            }
+            // Raised through the bridge rather than with a bare
+            // `libc::raise`: requirement N5's dying-signal handler must stay
+            // out of the way of a signal kitsu is raising on *itself*. This
+            // SIGINT is how the turn is cancelled (the `ctrl_c()` arm of the
+            // turn's `select!` fires on it), so a restore-and-exit handler
+            // answering it would turn Ctrl+C into a quit. For SIGTSTP the
+            // loop's re-engage branch restores raw mode and repaints after
+            // fg/SIGCONT.
+            tui_bridge::raise_in_process(signal);
         }
         if result.eof {
             break;
@@ -16784,14 +16803,24 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // back to the conventional 80x24, the same fallback the renderer's own
         // width probe uses.
         let (_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        tui_bridge::install(
+        let installed = tui_bridge::install(
             mode,
             rows,
             1,
             "kitsu",
             Box::new(std::io::stdout()),
             Box::new(std::io::stderr()),
-        )
+        );
+        if installed.is_some() {
+            // Requirement N5, and only here: the restore exists to give back
+            // what the *inline* viewport took (a pinned DECSTBM region, raw
+            // termios, bracketed paste). Classic mode pins no region and
+            // holds raw mode only inside rustyline's own readline, so it
+            // keeps the signal dispositions it was started with and its byte
+            // stream is unchanged, signal or no signal.
+            tui_bridge::install_exit_restore();
+        }
+        installed
     };
     let publish_agent_state = |turn_active: bool| {
         if !agent_state_enabled {
