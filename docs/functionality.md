@@ -285,7 +285,15 @@ oldest verified artifact. `/artifacts` lists usage and prunes by ID or all.
 usage, tool/write counts, safe recent activity, failure class, terminal result
 handoff, targeted steering, joined cancellation, and pruning. `/jobs view`
 presents the same deck grouped by state, with agents needing input first and
-empty groups omitted. A blocked agent carries its own marker -- `◉`, or `[blk]`
+empty groups omitted. **In the inline viewport `/jobs view` opens an overlay
+instead of printing that deck** -- the same grouping, on the alternate screen,
+with `?` for the key list and `Esc` to close; `Ctrl+X a` (following
+`[tui] prefix`) and pressing left twice on an empty composer open it too, the
+first press only hinting so it cannot open by accident. Left on a non-empty
+draft still moves the cursor, and up-arrow history recall is untouched.
+`[tui] left_arrow_opens_agents = false` disables the left-arrow route alone. The
+deck is not also printed in inline mode, since it would scroll the transcript
+beneath the overlay unseen. A blocked agent carries its own marker -- `◉`, or `[blk]`
 under `--plain` -- in every agent surface, so the one waiting on an answer is
 distinguishable from the ones merely working; the marker vocabulary is shared
 with the deck rather than duplicated. `/jobs explain <id>` answers why one agent is in its

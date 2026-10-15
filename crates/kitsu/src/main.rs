@@ -6192,6 +6192,7 @@ fn read_chat_line(
 fn read_idle_chat_line(
     editor: &mut rustyline::Editor<ChatHelper, rustyline::history::DefaultHistory>,
     bridge: Option<&tui_bridge::BridgeGuard>,
+    registry: &subagent::AgentRegistry,
     prompt: &str,
     assistive: bool,
     initial: &str,
@@ -6201,7 +6202,7 @@ fn read_idle_chat_line(
         // can be painted into a viewport row.
         if !assistive && kitsu_render::stdin_is_tty() && kitsu_render::stderr_styled() {
             let history: Vec<String> = editor.history().iter().cloned().collect();
-            return read_chat_line_inline(bridge, prompt, &history, initial);
+            return read_chat_line_inline(bridge, registry, prompt, &history, initial);
         }
     }
     read_chat_line(editor, prompt, assistive, initial)
@@ -6252,6 +6253,7 @@ fn read_idle_chat_line(
 #[cfg(unix)]
 fn read_chat_line_inline(
     bridge: &tui_bridge::BridgeGuard,
+    registry: &subagent::AgentRegistry,
     prompt: &str,
     history: &[String],
     initial: &str,
@@ -6314,7 +6316,13 @@ fn read_chat_line_inline(
                     bridge.resize_rows(rows);
                 }
             };
-            tui_bridge::read_line_inline(&mut input, &mut paint, history, &mut on_resize)
+            tui_bridge::read_line_inline_with_keys(
+                &mut input,
+                &mut paint,
+                history,
+                &mut on_resize,
+                tui_bridge::inline_keys(),
+            )
         };
         // Whatever happened, the row must not keep showing a draft that is
         // gone. On the suspend path the release below clears the row anyway,
@@ -6324,6 +6332,22 @@ fn read_chat_line_inline(
         // to one row. `paint_draft` would paint the status row and leave an
         // open palette's frame pinned above it until something else repainted.
         bridge.paint_composer(prompt, "", 0, "", false, rich);
+        // Card T4-S2: the agent view. The reader is pure for the same reason
+        // it is pure for a suspend, so the overlay's terminal, alternate
+        // screen and key loop are sequenced here — and the draft comes back
+        // through the same replay a suspend uses, so `\u{2190}\u{2190}` on a
+        // composer that was *not* empty by the time the chord arrived cannot
+        // cost the user a character.
+        if let Ok(tui_bridge::InlineRead::OpenAgentView(draft)) = outcome {
+            // Raw mode is already engaged by this frame's guard, so the
+            // overlay must not engage a second one: `RawStdinGuard::engage`
+            // snapshots the modes it displaces, and nesting would publish the
+            // *raw* modes as the canonical ones for the dying-signal restore.
+            run_agent_view_overlay(registry, false);
+            bridge.reinstall_after_resume();
+            carried = draft;
+            continue;
+        }
         // Finding F21: Ctrl+Z. The reader is pure, so the whole suspend is
         // sequenced here, through the seam that makes the ordering testable.
         if let Ok(tui_bridge::InlineRead::Suspended(draft)) = outcome {
@@ -6353,8 +6377,9 @@ fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead
     match outcome {
         Ok(tui_bridge::InlineRead::Submitted(line)) => ChatReadline::Line(line),
         Ok(tui_bridge::InlineRead::Eof) => ChatReadline::Eof,
-        // Handled by the caller's loop before this is reached.
+        // Both handled by the caller's loop before this is reached.
         Ok(tui_bridge::InlineRead::Suspended(_)) => ChatReadline::Eof,
+        Ok(tui_bridge::InlineRead::OpenAgentView(_)) => ChatReadline::Eof,
         Ok(tui_bridge::InlineRead::Interrupted) => {
             // Deliberately NOT re-raising SIGINT here, unlike the during-turn
             // collector. The collector raises because a turn is in flight and
@@ -6371,6 +6396,151 @@ fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead
         }
         Err(error) => ChatReadline::Error(error.to_string()),
     }
+}
+
+/// The agent view's rows, built from the registry (card T4-S2).
+///
+/// The thread DTO is the source of the shape — `tui_bridge`'s
+/// [`agent_row_from_thread_dto`](tui_bridge::agent_row_from_thread_dto) is the
+/// only mapping, and this is its first non-test caller — and the progress
+/// snapshot fills in the three fields the DTO cannot carry (the tokens and the
+/// activity with its age, which live on `AgentTelemetry`). Nothing is invented
+/// where neither source has an answer: the fields stay absent.
+#[cfg(unix)]
+fn agent_view_rows(registry: &subagent::AgentRegistry) -> Vec<kitsu_tui::agents_view::AgentRow> {
+    let progress = registry.progress_snapshot();
+    registry
+        .thread_snapshot_dtos()
+        .iter()
+        .map(|dto| {
+            let mut row = tui_bridge::agent_row_from_thread_dto(dto);
+            if let Some(agent) = progress.agents.iter().find(|agent| agent.id == row.id) {
+                row.tokens = Some(agent.telemetry.total_tokens);
+                row.last_activity = agent.telemetry.last_activity.clone();
+                row.last_activity_age = agent
+                    .last_activity_ms_ago
+                    .map(std::time::Duration::from_millis);
+            }
+            row
+        })
+        .collect()
+}
+
+/// Open the agent view overlay and run it until it is closed, returning
+/// whether it was opened at all (card T4-S2, requirement A1).
+///
+/// `false` is the answer in classic mode and on any carrier that cannot be
+/// drawn into — a pipe, an assistive reader — and the caller then falls back to
+/// whatever it printed before. That is what keeps classic's byte stream
+/// identical: nothing here writes a byte before the decision is taken.
+///
+/// # The alternate screen, and why the restore is exact
+///
+/// The overlay takes the terminal's alternate screen (`ESC[?1049h`) and gives
+/// it back on close (`ESC[?1049l`). The restore is then the *terminal's* own —
+/// the transcript the user had is still on the primary screen, untouched,
+/// rather than being repainted from a ring with the documented ring
+/// limitation. The DECSTBM region and the pinned status row are re-established
+/// afterwards through [`tui_bridge::reinstall_pinned_region`], because a
+/// terminal that keeps per-screen margins would otherwise hand back an
+/// unpinned one.
+///
+/// `engage_raw` is the caller's statement about whose raw mode is in force:
+/// the idle reader already holds a `RawStdinGuard`, and nesting a second one
+/// would snapshot the *raw* modes as the canonical ones for the dying-signal
+/// restore.
+#[cfg(unix)]
+fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) -> bool {
+    use std::io::{Read as _, Write as _};
+
+    if tui_bridge::live_mode() != tui_bridge::TuiMode::Inline {
+        return false;
+    }
+    if !kitsu_render::stdin_is_tty() || !kitsu_render::stderr_styled() {
+        return false;
+    }
+    // Held for the whole loop when it is this function's to hold, dropped on
+    // every return path by being bound here.
+    let _raw = if engage_raw {
+        match RawStdinGuard::engage() {
+            Some(guard) => Some(guard),
+            // No raw mode means no keystrokes, which means no way back out of
+            // a full-screen overlay. Declining is the only safe answer.
+            None => return false,
+        }
+    } else {
+        None
+    };
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut err = std::io::stderr();
+    // Enter, clear, and hide the cursor: the view has no caret of its own, and
+    // a cursor parked on a painted row reads as a prompt that is not there.
+    let _ = err.write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l");
+    let _ = err.flush();
+
+    // Which frame is on screen. `?` is help and `Esc` steps back out of it,
+    // so the key never leaves the user somewhere they cannot return from.
+    let mut helping = false;
+    let mut stdin = std::io::stdin();
+    let mut buffer = [0u8; 256];
+    loop {
+        let content = if helping {
+            kitsu_tui::agents_view::overlay_help_rows(cols as usize)
+        } else {
+            kitsu_tui::agents_view::overlay_rows(agent_view_rows(registry), cols as usize)
+        };
+        // Repainted whole, with absolute addressing, and never into the last
+        // row: the pinned composer row belongs to the viewport underneath, and
+        // an overlay that wrote there would make its own keys indistinguishable
+        // from typing.
+        let mut frame = String::from("\x1b[2J");
+        let budget = rows.saturating_sub(1) as usize;
+        for (index, row) in content.iter().take(budget).enumerate() {
+            frame.push_str(&format!("\x1b[{};1H\x1b[2K{row}", index + 1));
+        }
+        let _ = err.write_all(frame.as_bytes());
+        let _ = err.flush();
+
+        let count = match stdin.read(&mut buffer) {
+            // A drained descriptor cannot deliver the key that would close the
+            // view, so the view closes itself rather than spinning.
+            Ok(0) => break,
+            Ok(count) => count,
+            // A signal woke the read (a `SIGWINCH`, typically): repaint and
+            // carry on, which also re-reads the terminal's rows next frame.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let mut closing = false;
+        for byte in &buffer[..count] {
+            match byte {
+                b'?' => helping = true,
+                // Esc: out of the help if it is showing, out of the view
+                // otherwise. `q` is the conventional synonym for the latter.
+                0x1b => {
+                    if helping {
+                        helping = false;
+                    } else {
+                        closing = true;
+                    }
+                }
+                b'q' => closing = true,
+                _ => {}
+            }
+        }
+        if closing {
+            break;
+        }
+    }
+
+    let _ = err.write_all(b"\x1b[?25h\x1b[?1049l");
+    let _ = err.flush();
+    // The region and the pinned row, after the terminal has given the primary
+    // screen back: control bytes and the bottom row only, so the restored
+    // transcript is not disturbed.
+    tui_bridge::reinstall_pinned_region();
+    true
 }
 
 /// The real [`tui_bridge::SuspendEffects`]: the viewport guard for the screen
@@ -11995,7 +12165,18 @@ async fn handle_jobs_command(
             }))
         }
         "view" if parts.next().is_none() => {
-            eprintln!("{}", format_jobs_view(registry));
+            // Card T4-S2, requirement A1: in a TUI mode `/jobs view` *is* the
+            // overlay. The text deck is not also printed — it would land in
+            // the transcript underneath an alternate-screen overlay, where the
+            // user never sees it and it still scrolls their history. Classic
+            // mode opens no overlay, so it keeps the deck unchanged.
+            #[cfg(unix)]
+            let shown = run_agent_view_overlay(registry, true);
+            #[cfg(not(unix))]
+            let shown = false;
+            if !shown {
+                eprintln!("{}", format_jobs_view(registry));
+            }
             Ok(serde_json::json!({
                 "kind": "jobs",
                 "action": "view",
@@ -16834,11 +17015,21 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // force, the chord prefix (T4), the title row, the left-arrow binding
         // and the cell ring (T3-S6) each arrive at their renderer already
         // decided, rather than growing a second resolution point per card.
+        // Card T4-S2 is `prefix`'s and `left_arrow_opens_agents`' first
+        // consumer: both are translated here, at the one resolution point, and
+        // published for the inline reader. The prefix is read as *configured*
+        // and never as a hardcoded chord, so `prefix = "ctrl+t"` makes the
+        // default `Ctrl+X a` inert.
+        tui_bridge::set_inline_keys(tui_bridge::InlineKeys {
+            prefix: tui_bridge::chord_prefix_byte(setup.tui.prefix.as_str()),
+            left_arrow_opens_agents: setup.tui.left_arrow_opens_agents,
+        });
+        // Still resolved here and still without a consumer: the
+        // alternate-screen force (the agent view takes the alternate screen
+        // unconditionally today), the title row and the cell ring.
         let _resolved_tui = (
             setup.tui.effective_alternate_screen(cli.no_alt_screen),
-            setup.tui.prefix.as_str(),
             setup.tui.title,
-            setup.tui.left_arrow_opens_agents,
             setup.tui.cell_ring_lines,
         );
         let mode = match setup.tui.effective_mode(cli.tui_mode()) {
@@ -17863,6 +18054,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 let read = read_idle_chat_line(
                     &mut rl,
                     tui_bridge_guard.as_ref(),
+                    &agent_registry,
                     &visible_prompt,
                     assistive_input,
                     &initial,

@@ -333,14 +333,52 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
 
 ### 3.2 Functional — agent view (A)
 
-- **A1** `Ctrl+X a` or `/jobs view` MUST open the agent view overlay (the
-  `/agents` alias arm, which today forwards only an empty or numeric
-  argument, is widened to forward `view|explain|reply`; mid-turn `/jobs` has
-  its own handler, `handle_active_jobs_command`, which gains the same
-  subcommands); `←` on an empty composer MUST open
-  it too (first press shows a hint, second opens), configurable off. `←` is
-  distinct from the existing `↑`-on-empty queue recall and never consumes a
-  draft.
+- **A1** `Ctrl+X a` or `/jobs view` MUST open the agent view overlay; `←` on an
+  empty composer MUST open it too (first press shows a hint, second opens),
+  configurable off. `←` is distinct from the existing `↑`-on-empty queue recall
+  and never consumes a draft.
+
+  **Corrected in T4-S2: two of this requirement's clauses described work that
+  had already shipped.** It used to say the `/agents` alias "today forwards only
+  an empty or numeric argument" and that `handle_active_jobs_command` "gains the
+  same subcommands". Verified false on both counts — the alias maps empty to
+  `list`, a number to `show <n>`, and **everything else verbatim**, with a
+  comment saying `/jobs` owns the suggester; and the mid-turn handler already had
+  `view`, `explain` and `reply`, with tests. The widening was a **no-op**, and the
+  only missing piece was the overlay at the far end. Dispatch was therefore not
+  restructured.
+
+  **The chord is read from `[tui] prefix`**, not hard-coded: a configured
+  `ctrl+t` leaves the default `Ctrl+X a` inert, and an unrecognisable spelling
+  yields **no chord route** rather than a silent rebinding. `←` is gated by
+  `[tui] left_arrow_opens_agents`, which disables that route alone.
+
+  **The two-press `←` disarms on any other keystroke.** The armed state belongs
+  to an uninterrupted run of `←`s on an untouched empty composer, so typing and
+  deleting back to empty requires two presses again. The alternative — arming
+  until the view opens — would make a keystroke's meaning depend on something the
+  user did minutes ago and can no longer see.
+
+  **How `↑` is protected.** The arming state is a single local in the inline
+  reader, not an editor action and not derived from the editor's empty-buffer
+  predicate; `crates/kitsu-editor` was **not modified at all**, so
+  `RecallRequest` and the deliberate decline that makes `↑` walk history are
+  byte-for-byte unchanged. A byte filter between the read and the editor
+  recognises only the prefix byte, `ESC[D` and the two bracketed-paste
+  delimiters, forwarding everything else — and it tracks the paste delimiters
+  precisely so a `0x18` or an `ESC[D` **inside pasted text arrives as content,
+  not as a chord**. A sequence split across two reads is held and released in
+  front of the next chunk, so the editor sees the same byte stream either way.
+
+  **`/jobs view` now differs by renderer:** the overlay in a TUI mode, the text
+  deck in `classic`. The deck is **not** also printed in inline mode — it would
+  land in the transcript beneath the overlay, unseen but still scrolling the
+  user's history.
+
+  **Known gap:** the overlay takes the **alternate screen unconditionally**, so
+  `[tui] alternate_screen = never` does not yet get the in-viewport overlay this
+  design describes elsewhere. That path is unexercised and `alternate_screen`
+  remains a key without a consumer.
 - **A2** Rows MUST be grouped by state in this order: *Needs input*, *Working*,
   *Done (unviewed)*, *Done (viewed)*, *Failed*, *Cancelled*. Each row: state
   label, id, name or task head, model/profile, last activity + age, tokens.
