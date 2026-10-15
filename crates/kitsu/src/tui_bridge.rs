@@ -861,6 +861,203 @@ pub(crate) fn install_sigwinch_handler() {
     }
 }
 
+/// The byte string a dying signal handler writes, composed at compile time.
+///
+/// Exactly [`kitsu_tui::write_restore_sequences`]'s stream, in the same
+/// order (region reset, show cursor, bracketed paste off, title pop), spelled
+/// as one `const` so the handler performs **one** `write(2)` of a buffer it
+/// does not have to build. Composing it at run time would mean formatting or
+/// allocating inside a signal handler, which is exactly what is not allowed
+/// there -- and calling the helper itself is no better, because `io::Write`
+/// on `Stderr` takes a lock.
+const SIGNAL_RESTORE: &[u8] = b"\x1b[r\x1b[?25h\x1b[?2004l\x1b[23;2t";
+
+/// The signal kitsu is raising **on itself** right now, or `0`.
+///
+/// Set by [`raise_in_process`] around its `raise(2)` and read by the dying
+/// signal handler, which returns without doing anything when the two match.
+/// That is what keeps turn cancellation working: in raw mode `ISIG` is
+/// cleared, so Ctrl+C reaches the editor as a byte, and the during-turn
+/// collector re-raises the real `SIGINT` in-process precisely so the
+/// `tokio::signal::ctrl_c()` arm of the turn's `select!` fires. A handler
+/// that restored the terminal and died on *that* signal would turn every
+/// mid-turn Ctrl+C into an exit.
+///
+/// The flag needs no window of tolerance: `raise(2)` runs the handler
+/// synchronously on the raising thread before it returns, so the store, the
+/// handler's load and the clear are strictly ordered with no interleaving to
+/// reason about.
+static SELF_RAISED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The termios the terminal had before raw mode, if a raw guard is holding
+/// it, published for the dying signal handler.
+///
+/// `Drop` is what normally puts this back, and a signal is exactly the exit
+/// path `Drop` does not run on, so the snapshot has to be reachable from a
+/// handler -- which rules out a `Mutex` (locking is not async-signal-safe).
+/// An `UnsafeCell` behind a flag is the whole of the synchronisation, and it
+/// is sound here because the only writers are the raw guard's `engage` and
+/// `drop`, which run on one thread at a time and never while the handler is
+/// reading: the handler's reader is the same thread, interrupted.
+struct CanonicalTermios {
+    /// `MaybeUninit` because a `termios` has no const-constructible value and
+    /// `valid` already says whether this one has been written.
+    modes: std::cell::UnsafeCell<std::mem::MaybeUninit<libc::termios>>,
+    valid: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: see `CanonicalTermios`. Access is gated on `valid`, the writers are
+// the raw guard's engage/drop on a single thread, and the only other reader
+// is a signal handler running on a thread that is itself inside one of those
+// windows or outside both.
+unsafe impl Sync for CanonicalTermios {}
+
+static CANONICAL_TERMIOS: CanonicalTermios = CanonicalTermios {
+    modes: std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()),
+    valid: std::sync::atomic::AtomicBool::new(false),
+};
+
+/// Publish the pre-raw-mode termios snapshot for the dying signal handler.
+///
+/// Called by `RawStdinGuard::engage` with what `tcgetattr` returned, i.e.
+/// the modes a restore owes the terminal.
+pub(crate) fn publish_canonical_termios(modes: &libc::termios) {
+    // SAFETY: the flag is cleared first, so a handler that interrupts the
+    // copy reads nothing rather than a half-written struct.
+    CANONICAL_TERMIOS
+        .valid
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    unsafe { (*CANONICAL_TERMIOS.modes.get()).write(*modes) };
+    CANONICAL_TERMIOS
+        .valid
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Withdraw the snapshot: the raw guard has already restored it itself, so a
+/// handler must not `tcsetattr` a stale copy over whatever owns the terminal
+/// now (rustyline's readline, or an approval prompt).
+pub(crate) fn forget_canonical_termios() {
+    CANONICAL_TERMIOS
+        .valid
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Raise `signal` on this process with the dying-signal handler suppressed
+/// for the duration.
+///
+/// Every in-process `raise` kitsu performs is a *request* -- cancel the turn,
+/// suspend, quit -- addressed to a `select!` arm or to the signal's own
+/// default behaviour, never a terminal restore. See [`SELF_RAISED`].
+pub(crate) fn raise_in_process(signal: libc::c_int) {
+    SELF_RAISED.store(signal, std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: raising a signal on this process; the handlers reachable from
+    // here are this module's own and the runtime's.
+    unsafe { libc::raise(signal) };
+    SELF_RAISED.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Install the restore that runs on the exit paths `Drop` does not cover
+/// (requirement N5): a panic, `SIGINT` and `SIGTERM`.
+///
+/// # The panic path goes **through** `kitsu_tui::install_panic_restore`
+///
+/// Deliberately, and this is the only thing installed here that is not a
+/// `sigaction`. That helper *chains* the hook it finds rather than replacing
+/// it, and the hook it finds is `main`'s broken-pipe guard -- so after this
+/// call a panic runs the terminal restore, then the broken-pipe guard, then
+/// the default report. A hook installed here instead would have to replace
+/// one of those two, and replacing the guard would silently resurrect exit
+/// 101 on a closed stdout.
+///
+/// # The signal handler does not terminate by itself
+///
+/// It restores the terminal and then re-raises on the default disposition,
+/// which is what ends the session. It is inert for a signal kitsu raised on
+/// itself ([`SELF_RAISED`]), because that raise is how a turn is cancelled.
+///
+/// Installed once per process, and only by the inline path: classic mode
+/// pins no scroll region and holds raw mode only inside rustyline's own
+/// readline, so it has nothing here to give back and keeps the dispositions
+/// it was started with.
+pub(crate) fn install_exit_restore() {
+    /// Restore the terminal, then die the way the signal says.
+    ///
+    /// **Everything in here is async-signal-safe**, which is why it does not
+    /// reuse the panic helper's body: that one calls
+    /// `crossterm::terminal::disable_raw_mode` (a lock and an allocation) and
+    /// writes through `io::Write` on `Stderr` (a lock). What runs here is an
+    /// atomic load, one `write(2)` of a `const` buffer, `tcgetattr`-free
+    /// `tcsetattr` of an already-captured struct, `sigaction` and `raise` --
+    /// all on POSIX's async-signal-safe list, with no allocation, no locking
+    /// and no formatting.
+    extern "C" fn handler(signal: libc::c_int) {
+        if SELF_RAISED.load(std::sync::atomic::Ordering::SeqCst) == signal {
+            return;
+        }
+        // SAFETY: a single `write` of a `'static` buffer to a descriptor this
+        // process owns; a short write or an error is not worth handling while
+        // the process is dying.
+        unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                SIGNAL_RESTORE.as_ptr().cast::<libc::c_void>(),
+                SIGNAL_RESTORE.len(),
+            );
+        }
+        if CANONICAL_TERMIOS
+            .valid
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // SAFETY: `valid` says the cell holds a complete snapshot taken
+            // by `tcgetattr` on this very descriptor.
+            unsafe {
+                libc::tcsetattr(
+                    libc::STDIN_FILENO,
+                    libc::TCSANOW,
+                    (*CANONICAL_TERMIOS.modes.get()).as_ptr(),
+                );
+            }
+        }
+        // And now die as the signal says. Putting the default disposition
+        // back before re-raising is what makes this a restore rather than an
+        // exit: the process's status is the signal's, not an exit code this
+        // module invented, and a second delivery arriving mid-restore cannot
+        // loop through the handler again.
+        //
+        // SAFETY: a zeroed `sigaction` with `SIG_DFL`, an empty mask and no
+        // flags, followed by a raise on this process.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = libc::SIG_DFL;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+            libc::raise(signal);
+        }
+    }
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        kitsu_tui::install_panic_restore();
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            // SAFETY: a zeroed `sigaction` filled in before use, with a
+            // handler that is async-signal-safe (see above). `sa_flags = 0`
+            // for the same reason `install_sigwinch_handler` uses it: no
+            // `SA_RESTART`, so a signal arriving while the inline reader
+            // blocks in `read()` surfaces rather than being swallowed by a
+            // restarted syscall -- though here the handler never returns to
+            // that read anyway.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = handler as *const () as libc::sighandler_t;
+                action.sa_flags = 0;
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(signal, &action, std::ptr::null_mut());
+            }
+        }
+    });
+}
+
 impl Drop for BridgeGuard {
     /// Restore the previous surface **before** releasing the region, so the
     /// last bytes the viewport's descriptor sees are exactly the region reset
@@ -1034,6 +1231,16 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
                         changed = true;
                     }
                 }
+                // Ctrl+L (requirement R8): repaint the pinned row from the
+                // editor's unchanged state. Routed through the loop's own
+                // repaint rather than painting here so the row is composed
+                // exactly once per chunk and from the state the *whole*
+                // chunk left behind -- a paint inlined here would be
+                // overwritten by the one below whenever the same read also
+                // carried draft bytes. The editor reports `changed: false`
+                // (nothing about the draft changed), so this is the only
+                // thing that can answer the keystroke.
+                EditorAction::Redraw => changed = true,
                 // Ctrl+\ stays inert on purpose: its conventional action is to
                 // re-raise SIGQUIT, which terminates *and dumps core*, and this
                 // process holds API tokens and conversation text in memory --
@@ -1221,7 +1428,7 @@ mod tests {
 
     use super::{
         install, palette_rows, suspend_and_resume, BridgeGuard, SuspendEffects, TuiMode,
-        PALETTE_MIN_ROWS,
+        PALETTE_MIN_ROWS, SIGNAL_RESTORE,
     };
 
     /// A sink whose buffer outlives the surface that owns it, so bytes written
@@ -4363,6 +4570,87 @@ mod tests {
                 "a draft with no palette must paint exactly today's one row"
             );
             drop(guard);
+        }
+    }
+
+    /// Requirement N5, the wiring. Nothing in production installs any
+    /// restore for a signal today: the only `sigaction` this binary performs
+    /// is `SIGWINCH`'s, so `SIGINT` and `SIGTERM` are still at `SIG_DFL` and
+    /// the process dies without releasing the viewport.
+    ///
+    /// Asserted by **querying the disposition**, which is what makes this
+    /// non-vacuous without raising anything: `sigaction` with a null `act`
+    /// reports what is installed, and `SIG_DFL` is exactly the state that
+    /// kills the process before any restore can run. The test raises no
+    /// signal (that would terminate the test binary under the default
+    /// disposition it is checking for) and asserts no particular exit code,
+    /// which is the PTY tests' business.
+    ///
+    /// The panic half is **not** re-asserted here: chaining is pinned by
+    /// `kitsu_tui`'s own `install_panic_restore_chains_the_previous_hook`,
+    /// and the panic hook is process-global, so a second test that replaced
+    /// it would race the other 800-odd tests in this binary. What this test
+    /// does owe the reader is the requirement: `install_exit_restore` must
+    /// reach the panic path through that helper, not through a hook of its
+    /// own that drops `main`'s broken-pipe guard.
+    /// `SIGNAL_RESTORE` must be byte-identical to what
+    /// `kitsu_tui::write_restore_sequences` writes.
+    ///
+    /// The duplication is forced, not careless: a signal handler cannot write
+    /// through `io::Write` (it locks and may allocate), so the handler needs a
+    /// precomposed `const`. But two copies of one byte sequence with nothing
+    /// comparing them is this project's most-repeated defect shape -- F2's
+    /// suggester table, F38's four unchecked literals, F45's two vocabularies,
+    /// the `/agent` args string that was stale in three files at once. This
+    /// test is the comparison, so a sequence added to the helper and forgotten
+    /// here fails immediately instead of leaving a signal exit that restores
+    /// less than a panic does.
+    #[test]
+    fn the_handler_byte_string_equals_the_restore_helper_output() {
+        let mut helper = Vec::new();
+        kitsu_tui::write_restore_sequences(&mut helper).expect("writing into a Vec cannot fail");
+        assert_eq!(
+            SIGNAL_RESTORE,
+            helper.as_slice(),
+            "the handler's precomposed bytes and the restore helper have \
+             drifted: the handler writes {:?} but the helper writes {:?}",
+            String::from_utf8_lossy(SIGNAL_RESTORE),
+            String::from_utf8_lossy(&helper),
+        );
+    }
+
+    #[test]
+    fn install_exit_restore_takes_sigint_and_sigterm_off_the_default_disposition() {
+        fn handler_of(signal: libc::c_int) -> libc::sighandler_t {
+            // SAFETY: a query only -- null `act`, valid out-pointer.
+            unsafe {
+                let mut current: libc::sigaction = std::mem::zeroed();
+                assert_eq!(
+                    libc::sigaction(signal, std::ptr::null(), &mut current),
+                    0,
+                    "query the disposition of signal {signal}"
+                );
+                current.sa_sigaction
+            }
+        }
+
+        super::install_exit_restore();
+
+        for (signal, name) in [(libc::SIGINT, "SIGINT"), (libc::SIGTERM, "SIGTERM")] {
+            let installed = handler_of(signal);
+            assert_ne!(
+                installed,
+                libc::SIG_DFL,
+                "{name} must not be left at SIG_DFL: the default disposition \
+                 terminates the process before anything can release the \
+                 viewport's scroll region or restore termios"
+            );
+            assert_ne!(
+                installed,
+                libc::SIG_IGN,
+                "{name} must not be ignored either -- a signal that does \
+                 nothing is not a restore"
+            );
         }
     }
 }

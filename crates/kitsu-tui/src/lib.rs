@@ -41,6 +41,13 @@ pub mod viewport;
 
 use std::io::{IsTerminal, Write};
 
+/// Release a pinned DECSTBM scroll region: the whole screen scrolls again.
+///
+/// First in restore order, and the one sequence a terminal is left visually
+/// broken without -- `viewport::Surface::show` pins `ESC[1;<bottom>r`, and a
+/// process that dies without writing this leaves every later line scrolling
+/// inside a subset of the screen until the user runs `reset`.
+pub const REGION_RESET: &[u8] = b"\x1b[r";
 /// Push the window title onto the terminal's title stack.
 const PUSH_TITLE: &[u8] = b"\x1b[22;2t";
 /// Pop the window title back off the terminal's title stack.
@@ -208,12 +215,23 @@ pub fn install_panic_restore() {
         // and the only place to report to is the terminal being restored.
         let _ = crossterm::terminal::disable_raw_mode();
         let mut err = std::io::stderr();
-        let _ = err.write_all(SHOW_CURSOR);
-        let _ = err.write_all(PASTE_OFF);
-        let _ = err.write_all(POP_TITLE);
-        let _ = err.flush();
+        let _ = write_restore_sequences(&mut err);
         previous(info);
     }));
+}
+
+/// Write the escape sequences that give the terminal back, in restore order.
+///
+/// Split out of [`install_panic_restore`] so the exact byte stream an exit
+/// path owes can be asserted against a buffer: the hook itself writes to the
+/// process's real stderr, which a unit test cannot inspect without
+/// redirecting a descriptor.
+pub fn write_restore_sequences<W: Write>(out: &mut W) -> std::io::Result<()> {
+    out.write_all(REGION_RESET)?;
+    out.write_all(SHOW_CURSOR)?;
+    out.write_all(PASTE_OFF)?;
+    out.write_all(POP_TITLE)?;
+    out.flush()
 }
 
 #[cfg(test)]
@@ -413,6 +431,50 @@ mod tests {
         assert!(
             contents.trim().is_empty(),
             "pure control sequences must print nothing, got {contents:?}"
+        );
+    }
+
+    /// Requirement N5, the missing sequence.
+    ///
+    /// Inline mode pins a DECSTBM scroll region (`viewport::Surface::show`
+    /// writes `ESC[1;<bottom>r`), and `BridgeGuard::drop` releases it with
+    /// `ESC[r` on a normal exit. A panic does not run `Drop`, so the restore
+    /// written here is the only thing left to release it — and a terminal left
+    /// with a pinned region is visually broken until `reset`, which is worse
+    /// than being left in raw mode.
+    ///
+    /// Asserted as a *set in order* rather than an exact stream: the region
+    /// reset must come with the others, in restore order, and the test does
+    /// not care whether a future card adds a fourth sequence after them.
+    #[test]
+    fn the_restore_sequences_release_the_scroll_region() {
+        /// DECSTBM reset: the whole screen scrolls again.
+        const REGION_RESET: &[u8] = b"\x1b[r";
+
+        let mut out: Vec<u8> = Vec::new();
+        write_restore_sequences(&mut out).expect("a Vec never fails to write");
+
+        let found = |needle: &[u8]| {
+            out.windows(needle.len())
+                .position(|window| window == needle)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the restore owes {:?}, but wrote {:?}",
+                        String::from_utf8_lossy(needle).escape_debug().to_string(),
+                        String::from_utf8_lossy(&out).escape_debug().to_string(),
+                    )
+                })
+        };
+        let region = found(REGION_RESET);
+        let cursor = found(SHOW_CURSOR);
+        let paste = found(PASTE_OFF);
+        let title = found(POP);
+        assert!(
+            region < cursor && cursor < paste && paste < title,
+            "the region must be released before the cursor, paste and title \
+             restores (offsets: region {region}, cursor {cursor}, paste \
+             {paste}, title {title}); wrote {:?}",
+            String::from_utf8_lossy(&out).escape_debug().to_string()
         );
     }
 

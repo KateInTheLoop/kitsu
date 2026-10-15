@@ -113,6 +113,30 @@ enum Action {
     /// [`run_styled_chat_pty_with`]'s driver for the re-arm, and the
     /// `inline_mode_resize_*` tests for why.
     Resize { rows: u16, cols: u16 },
+    /// Deliver `signal` to the child with `kill(2)` and **write no bytes**.
+    ///
+    /// Card T3-S8, requirement N5. Delivered with `kill` to the child's pid
+    /// rather than by writing `\x03` to the master, and that is finding
+    /// **F54**, not a stylistic choice: this PTY is nobody's controlling
+    /// terminal (no session leader, no `tcsetpgrp`), so the line discipline
+    /// generates no job-control signals at all -- a `\x03` byte would simply
+    /// be read by the child as a byte, which is also exactly what inline
+    /// mode's raw mode (`ISIG` cleared) makes of it. A test that wanted a
+    /// *signal* and sent a byte would be measuring the editor's Ctrl+C
+    /// keymap instead.
+    Signal(libc::c_int),
+    /// Write nothing and perform no action for `Duration`, then mark the
+    /// stream and move on.
+    ///
+    /// The point is the **mark**: it separates "everything the child wrote in
+    /// response to the previous step alone" from the next step's input, the
+    /// same window the `Action::Resize` tests assert in, for a step whose
+    /// effect emits nothing a later trigger could key on. Without it the only
+    /// way to sequence a step after a keystroke whose output is not unique is
+    /// a trigger that was already satisfied, which fires on the next 5 ms
+    /// poll and can have its bytes coalesced into the same `read` as the
+    /// keystroke.
+    Pause(Duration),
 }
 
 /// One scripted action: wait until `trigger` appears in everything read so far,
@@ -137,6 +161,22 @@ fn resize(trigger: &'static str, rows: u16, cols: u16) -> Step {
     Step {
         trigger,
         action: Action::Resize { rows, cols },
+    }
+}
+
+/// A step that delivers `signal` to the child once `trigger` is seen.
+fn signal(trigger: &'static str, signal: libc::c_int) -> Step {
+    Step {
+        trigger,
+        action: Action::Signal(signal),
+    }
+}
+
+/// A step that waits `millis` once `trigger` is seen, writing nothing.
+fn pause(trigger: &'static str, millis: u64) -> Step {
+    Step {
+        trigger,
+        action: Action::Pause(Duration::from_millis(millis)),
     }
 }
 
@@ -190,6 +230,45 @@ struct Session {
     /// Every window resize the script performed, in stream order. Empty for
     /// every script that never resizes, which is all nine original ones.
     resizes: Vec<Resized>,
+    /// The PTY's line settings read back **after** the session ended, through
+    /// a descriptor on the slave the harness keeps for itself (the same
+    /// `dup`-a-probe discipline `tests/cli.rs`'s
+    /// `test_auth_login_hides_tty_input_and_restores_echo_on_sigint` uses).
+    ///
+    /// Card T3-S8: this is the half of a terminal restore that is *not* a
+    /// byte in the stream. `RawStdinGuard::engage` clears `ICANON`, `ECHO`
+    /// and `ISIG` with `tcsetattr`, and that state belongs to the pty, not to
+    /// the process -- so it **survives the child's death**, which is what
+    /// makes it a non-vacuous observation: a child killed by a signal with no
+    /// restore leaves these three cleared here, exactly as it leaves a real
+    /// user's terminal unusable.
+    termios: libc::termios,
+}
+
+impl Session {
+    /// Whether the pty was canonical again once the session ended: `ICANON`,
+    /// `ECHO` and `ISIG` all back on, which is what `RawStdinGuard`'s restore
+    /// puts back and nothing else in this binary touches.
+    fn raw_mode_off(&self) -> bool {
+        let flags = self.termios.c_lflag;
+        flags & libc::ICANON != 0 && flags & libc::ECHO != 0 && flags & libc::ISIG != 0
+    }
+
+    /// The three line flags, named, for a failure message.
+    fn termios_dump(&self) -> String {
+        let flags = self.termios.c_lflag;
+        format!(
+            "ICANON={} ECHO={} ISIG={}",
+            flags & libc::ICANON != 0,
+            flags & libc::ECHO != 0,
+            flags & libc::ISIG != 0
+        )
+    }
+
+    /// Everything the child wrote from scripted action `step` onwards.
+    fn raw_after(&self, step: usize) -> String {
+        String::from_utf8_lossy(&self.raw[self.marks[step]..]).into_owned()
+    }
 }
 
 impl Session {
@@ -386,7 +465,11 @@ fn run_styled_chat_pty_core(
     // exactly once by the child-spawning machinery.
     let child_stdin = unsafe { libc::dup(slave) };
     let child_stdout = unsafe { libc::dup(slave) };
-    assert!(child_stdin >= 0 && child_stdout >= 0);
+    // The harness's own descriptor on the slave, never handed to the child:
+    // it keeps the pty alive after the child dies so its line settings can be
+    // read back (see `Session::termios`).
+    let probe_slave = unsafe { libc::dup(slave) };
+    assert!(child_stdin >= 0 && child_stdout >= 0 && probe_slave >= 0);
 
     let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
     command
@@ -492,6 +575,9 @@ fn run_styled_chat_pty_core(
     // keystroke would still hang to the deadline, which is exactly the
     // failure the tests want.
     let mut rearm: Option<(usize, Instant)> = None;
+    // An `Action::Pause` in flight: when it is over. The step is not counted
+    // as performed, and the stream is not marked, until then.
+    let mut pausing: Option<Instant> = None;
 
     let status = loop {
         let mut buffer = [0_u8; 8192];
@@ -504,9 +590,29 @@ fn run_styled_chat_pty_core(
             Err(error) => panic!("read styled carrier PTY: {error}"),
         }
 
+        if let Some(until) = pausing {
+            if Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+                if let Some(status) = poll_child(&mut child, options.resume_on_stop, &mut stops) {
+                    break status;
+                }
+                continue;
+            }
+            // The mark goes here, at the end of the pause, so the window that
+            // closes at it holds everything the child wrote in response to
+            // the step before.
+            pausing = None;
+            marks.push(raw.len());
+            step += 1;
+        }
+
         if let Some(next) = script.get(step) {
             let seen = String::from_utf8_lossy(&raw);
             if seen.contains(next.trigger) {
+                if let Action::Pause(span) = next.action {
+                    pausing = Some(Instant::now() + span);
+                    continue;
+                }
                 marks.push(raw.len());
                 match next.action {
                     Action::Send(bytes) => {
@@ -531,6 +637,18 @@ fn run_styled_chat_pty_core(
                         rearm =
                             (step + 1 < script.len()).then(|| (step + 1, Instant::now() + REARM));
                     }
+                    Action::Signal(signal) => {
+                        // SAFETY: signalling a child this harness owns, by
+                        // pid. See `Action::Signal` on why not through the
+                        // terminal.
+                        assert_eq!(
+                            unsafe { libc::kill(pid, signal) },
+                            0,
+                            "deliver signal {signal} to the styled carrier"
+                        );
+                    }
+                    // Handled above: a pause never reaches here.
+                    Action::Pause(_) => unreachable!(),
                 }
                 step += 1;
             }
@@ -572,12 +690,28 @@ fn run_styled_chat_pty_core(
         std::thread::sleep(Duration::from_millis(5));
     };
 
+    // Read the line settings back before the probe descriptor is closed: the
+    // pty outlives the child precisely because this descriptor is still open.
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: `probe_slave` is a live descriptor on the pty slave and the
+    // out-pointer is valid.
+    assert_eq!(
+        unsafe { libc::tcgetattr(probe_slave, termios.as_mut_ptr()) },
+        0,
+        "read the styled carrier's line settings back"
+    );
+    // SAFETY: `tcgetattr` returned 0, so the value is initialised.
+    let termios = unsafe { termios.assume_init() };
+    // SAFETY: the harness owns this descriptor and closes it exactly once.
+    unsafe { libc::close(probe_slave) };
+
     Session {
         raw,
         status,
         stops,
         marks,
         resizes,
+        termios,
     }
 }
 
@@ -4088,5 +4222,366 @@ fn inline_mode_interrupting_the_approval_dismisses_the_modal_without_a_receipt()
          is what proves the modal was torn down; the pane painted {} row(s) \
          after the interrupt: {after:#?}",
         after.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T3-S8: `Ctrl+L`, resize without duplication, and terminal restore on every
+// exit path (requirements R8 and N5)
+// ---------------------------------------------------------------------------
+
+/// The help footer, the one transcript line in this file's scripts that is
+/// long, unique, and printed exactly once. Reused from Test 1 rather than
+/// invented: the duplication tests below need a line whose *count* is already
+/// established, so a change to the help text cannot leave them matching a
+/// stale literal.
+const HELP_FOOTER: &str = "/help <command> explains one command in detail";
+
+/// Bracketed paste off, the sequence `RawStdinGuard::drop` writes.
+const PASTE_OFF: &str = "\x1b[?2004l";
+
+/// DECSTBM reset: the sequence `InlineSurface::hide` writes, and the one a
+/// terminal is left unusable without.
+const REGION_RESET: &str = "\x1b[r";
+
+/// A draft that cannot occur in anything the binary prints by itself, so a
+/// paint carrying it is this test's draft and nothing else.
+const UNIQUE_DRAFT: &str = "xyzzy-draft";
+
+/// Print `/help`, type [`UNIQUE_DRAFT`] without submitting it, then `signal`.
+///
+/// The signal is the last step: the restore under test is the one the child
+/// performs while dying, so nothing may be written to it afterwards.
+fn help_then_draft_then_signal(signal_number: libc::c_int) -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/help\r"),
+        send("commands:", UNIQUE_DRAFT),
+        signal(UNIQUE_DRAFT, signal_number),
+    ]
+}
+
+/// Assert the restore every exit path owes (requirement N5), on a session
+/// whose last step was a signal.
+///
+/// # Why this is not vacuous
+///
+/// Each of the three observations is false today, and would be false again if
+/// the restore were removed:
+///
+/// * **`ESC[r`.** With no restore the child dies on the signal's default
+///   disposition and writes nothing more, so the window after the signal is
+///   empty and carries no region reset. The assertion that the region *was*
+///   pinned first is what makes the release about something real.
+/// * **`ESC[?2004l`.** Same: `RawStdinGuard::drop` writes it and `Drop` does
+///   not run on a signal.
+/// * **The line settings.** This one is not a byte in the stream at all. The
+///   pty's termios is set by the child's `tcsetattr` and **outlives the
+///   child** -- the harness holds its own descriptor on the slave, so the pty
+///   is still there to be asked. A killed child leaves `ICANON`, `ECHO` and
+///   `ISIG` cleared, which is precisely the terminal a user has to run
+///   `reset` on.
+///
+/// The alternate screen and the window title are deliberately **not**
+/// asserted: nothing in this binary enters either (`kitsu_tui::TuiRuntime` is
+/// unused by `kitsu`), so an assertion about leaving them would pass by
+/// construction. N5's other two clauses are vacuous today, not met.
+fn assert_restored_after_signal(session: &Session, step: usize, label: &str) {
+    let before = String::from_utf8_lossy(&session.raw[..session.marks[step]]).into_owned();
+    let region = format!("\x1b[1;{}r", ROWS - 1);
+    assert!(
+        before.contains(&region),
+        "{label}: the region must have been pinned before the signal, or there \
+         is nothing to release; raw before the signal:\n{}",
+        before.escape_debug()
+    );
+
+    let after = session.raw_after(step);
+    assert!(
+        after.contains(REGION_RESET),
+        "{label}: a terminal left with a pinned DECSTBM region stays broken \
+         until `reset`, so every exit path owes `ESC[r`; everything the child \
+         wrote after the signal was:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        after.contains(PASTE_OFF),
+        "{label}: bracketed paste was turned on by `RawStdinGuard::engage` and \
+         must be turned off again; the child wrote:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        session.raw_mode_off(),
+        "{label}: the pty must be canonical again once kitsu is gone, but reads \
+         {}; everything written after the signal was:\n{}",
+        session.termios_dump(),
+        after.escape_debug()
+    );
+}
+
+/// **The row's own risk gate: `kill -INT` restores (N5).**
+///
+/// `BridgeGuard::drop` restores correctly on a normal exit, but `Drop` does
+/// not run on a signal, and the only signal this process handles is
+/// `SIGWINCH`. So today a `SIGINT` at the inline idle prompt leaves the
+/// scroll region pinned and stdin raw.
+///
+/// The signal is delivered with `kill` to the child's pid: see
+/// [`Action::Signal`] and finding F54 for why `\x03` on the master is not a
+/// `SIGINT` here (and, under inline mode's `ISIG`-cleared termios, would not
+/// be one on a real terminal either).
+///
+/// The session must also *end*: the harness only returns once the child is
+/// reaped, so a `SIGINT` that is swallowed entirely fails this test on the
+/// driver's deadline with the whole transcript attached.
+#[test]
+#[serial]
+fn inline_mode_sigint_restores_the_terminal() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &help_then_draft_then_signal(libc::SIGINT),
+    );
+    assert_restored_after_signal(&session, 2, "SIGINT");
+}
+
+/// The same for `SIGTERM`, which N5 names beside `SIGINT`: `kill` with no
+/// arguments is what a supervisor, a `timeout`, or a closing terminal sends,
+/// and it is as unhandled today as `SIGINT` is.
+#[test]
+#[serial]
+fn inline_mode_sigterm_restores_the_terminal() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &help_then_draft_then_signal(libc::SIGTERM),
+    );
+    assert_restored_after_signal(&session, 2, "SIGTERM");
+}
+
+/// **Classic mode is unaffected.** A `SIGINT` to a classic session must not
+/// start emitting viewport geometry, and the transcript it already printed
+/// must not be re-emitted by whatever the restore does.
+///
+/// Classic's own raw-mode restore is *not* asserted here. Classic mode holds
+/// raw mode only inside rustyline's own readline, which this card does not
+/// touch; a claim about it would be this test smuggling in a second card.
+#[test]
+#[serial]
+fn classic_mode_sigint_pins_no_region_and_reprints_nothing() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        None,
+        &help_then_draft_then_signal(libc::SIGINT),
+    );
+
+    assert_eq!(
+        session.raw_count(&format!("\x1b[1;{}r", ROWS - 1)),
+        0,
+        "classic mode emits no viewport geometry, signal or no signal; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(REGION_RESET),
+        0,
+        "and releases a region it never pinned; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(HELP_FOOTER),
+        1,
+        "the transcript is printed once and never re-emitted; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+}
+
+/// Print `/help`, type [`UNIQUE_DRAFT`], press `Ctrl+L`, wait, then clear the
+/// draft and quit.
+///
+/// The [`Action::Pause`] is the load-bearing step. `Ctrl+L`'s repaint emits
+/// nothing a later trigger could key on that is not already in the stream, so
+/// without the pause the `/quit` step's trigger would be satisfied on the next
+/// 5 ms poll and its bytes could reach the child in the *same* `read` as the
+/// `\x0c` -- where the editor would have processed the whole chunk before the
+/// repaint ran, and the row would be repainted from a draft that the same
+/// chunk had already cleared. The pause makes `raw_between(2, 3)` exactly what
+/// the child wrote in answer to `Ctrl+L` and nothing else, the same window the
+/// resize tests assert in.
+///
+/// `\x15` (Ctrl+U) clears the draft before `/quit` so the submitted line is
+/// `/quit` and not `xyzzy-draft/quit`.
+fn help_then_draft_then_ctrl_l() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/help\r"),
+        send("commands:", UNIQUE_DRAFT),
+        send(UNIQUE_DRAFT, "\x0c"),
+        pause(UNIQUE_DRAFT, 400),
+        send(UNIQUE_DRAFT, "\x15/quit\r"),
+    ]
+}
+
+/// **Requirement R8, the `Ctrl+L` half.** What "repaint" means here, stated
+/// observably rather than as "something happened":
+///
+/// * the child answers the `\x0c` byte **alone** -- no other input is written
+///   during the pause -- by painting the pinned row again: the row's own
+///   address-and-clear (`ESC[24;1H ESC[2K`) followed by the draft;
+/// * so the draft survives: it is painted at least twice in the session, once
+///   while it was typed and once by the repaint, and `Ctrl+L` neither enters
+///   the draft as a control character nor clears it;
+/// * and the transcript is **not** re-emitted. A repaint that reprinted the
+///   scrolled-back transcript would duplicate every line of `/help`; the
+///   footer stays at exactly one occurrence in the whole byte stream, and at
+///   one occurrence on the screen.
+///
+/// Today `0x0c` falls into the editor's "other control bytes are ignored"
+/// arm, so the pause window is empty and the first assertion is what fails.
+#[test]
+#[serial]
+fn inline_mode_ctrl_l_repaints_the_pinned_row_without_duplicating_the_transcript() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &help_then_draft_then_ctrl_l());
+
+    let answer = session.raw_between(2, 3);
+    let paint = format!("\x1b[{ROWS};1H\x1b[2K");
+    assert!(
+        answer.contains(&paint),
+        "Ctrl+L alone must repaint the pinned row ({paint:?}); everything the \
+         child wrote between the keystroke and the next input was:\n{}",
+        answer.escape_debug()
+    );
+    assert!(
+        answer.contains(UNIQUE_DRAFT),
+        "and the repaint must carry the draft that was already typed; it \
+         wrote:\n{}",
+        answer.escape_debug()
+    );
+
+    let drafted = pinned_row_paints(&session)
+        .into_iter()
+        .filter(|row| row.contains(UNIQUE_DRAFT))
+        .count();
+    assert!(
+        drafted >= 2,
+        "the draft must be painted once as it was typed and once by the \
+         repaint, but only {drafted} of the pinned-row paints carry it: {:?}",
+        pinned_row_paints(&session)
+    );
+
+    assert_eq!(
+        session.raw_count(HELP_FOOTER),
+        1,
+        "a repaint must not re-emit the transcript; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    let screen = session.screen_at(3);
+    assert_eq!(
+        screen
+            .iter()
+            .filter(|row| row.contains(HELP_FOOTER))
+            .count(),
+        1,
+        "and must leave exactly one copy of it on the screen; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        session.status.success(),
+        "the session must still exit cleanly, but exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+}
+
+/// **Classic mode is unaffected by `Ctrl+L`.** rustyline owns the keystroke
+/// there; what this pins is that nothing in the classic path grew a viewport
+/// and that the transcript is not duplicated.
+#[test]
+#[serial]
+fn classic_mode_ctrl_l_pins_no_region_and_keeps_one_transcript() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), None, &help_then_draft_then_ctrl_l());
+
+    assert_eq!(
+        session.raw_count(&format!("\x1b[1;{}r", ROWS - 1)),
+        0,
+        "classic mode emits no viewport geometry on Ctrl+L; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(HELP_FOOTER),
+        1,
+        "and prints the transcript once; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+}
+
+/// Print `/help`, type a draft, grow the window, submit, then quit.
+///
+/// Built on the existing resize scripts' discipline: the resize writes no
+/// bytes and the submit triggers on the *new* region, so the measurement is
+/// of the signal alone.
+fn help_then_draft_then_grow() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/help\r"),
+        send("commands:", "/context"),
+        resize("/context", TALL_ROWS, COLS),
+        submit_on_tall_region(),
+        send("context window source", "/quit\r"),
+    ]
+}
+
+/// **Requirement R8, the resize half, over a screenful of transcript.**
+///
+/// Tests 10 to 12 already pin that the *pinned row* moves rather than being
+/// duplicated. What they do not have above them is a transcript: their
+/// sessions resize with nothing on the screen but a draft. This one prints
+/// `/help` first, so the region is full of scrolled transcript when the
+/// signal lands, and asserts the duplication R8 actually names -- a history
+/// line appearing twice -- against the same `HELP_FOOTER` sentinel Test 1
+/// counts.
+#[test]
+#[serial]
+fn inline_mode_resize_does_not_duplicate_transcript_lines() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &help_then_draft_then_grow());
+
+    let answer = session.raw_between(2, 3);
+    assert!(
+        answer.contains(&tall_region()),
+        "the signal alone must re-latch at the new geometry; it wrote:\n{}",
+        answer.escape_debug()
+    );
+    assert!(
+        !answer.contains(HELP_FOOTER),
+        "a reflow must not reprint transcript lines; between the resize and \
+         the next input the child wrote:\n{}",
+        answer.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(HELP_FOOTER),
+        1,
+        "the transcript line is emitted exactly once in the whole session; \
+         raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    let screen = session.screen_at(3);
+    assert_eq!(screen.len(), TALL_ROWS as usize);
+    assert_eq!(
+        screen
+            .iter()
+            .filter(|row| row.contains(HELP_FOOTER))
+            .count(),
+        1,
+        "and appears on exactly one row of the reflowed screen; screen:\n{}",
+        Session::dump(&screen)
     );
 }
