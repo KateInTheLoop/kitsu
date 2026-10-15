@@ -365,7 +365,8 @@ fixtures byte-identical in classic/plain/JSONL; both profiles; `cargo test
 | T4-S6c | The bounded 64 KiB foreground buffer and the recap replay on detach | **not started** — disjoint surface (the output sink); may need R6's cell ring | — |
 | **F76** | `Ctrl+X d` discards a non-empty draft — `InlineRead::Detached` carries none, documented by `←`'s empty-composer precondition | **not started** | — |
 | T4-S6-status | The `attached · agent N` status segment, derived at paint time; **F74** corrected (nine constructions, three exhaustive, `Default` already derived), **F78** measured | done | this commit |
-| **F77** | `/detach` is registered and dispatched but its arm is unconditional — thread the composer's attachment binding through `handle_slash_command`'s call sites | **not started** | — |
+| **F77 + F79 fixed** | `/detach` wired through a 17th `&mut Option<u64>` on `handle_slash`; `/jobs view` no longer discards the attachment (**F79**, the third consumer of the same exit value); a `#[cfg(test)]` shim removed on review | done | this commit |
+| **F76** | `Ctrl+X d` discards a non-empty draft — `InlineRead::Detached` carries none, documented by `←`'s empty-composer precondition | **not started** | — |
 | T4-S6-ordinal | `Ctrl+X 1..9` as a **1-based ordinal over A2's display order**, never an id | **not started** | — |
 | ~~T4-S6~~ | Attach/detach: `⛩` milestones, routed composer (`steer`, `y/a/n` when blocked), 64 KiB foreground buffer replayed with recap; `Ctrl+X d`, `←`, `/detach`; `Ctrl+C` = clear draft / detach | Failing fake-provider integration test | `tui_bridge.rs`, overlay, `status.rs` | (A5) |
 | T4-S7 | Dispatch from the view composer (`@profile task`) admitted by `AgentRegistryLimits`, not `SpawnBudget` | Failing over-capacity test | `tui_bridge.rs`, `subagent.rs` | (A6) |

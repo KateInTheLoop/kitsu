@@ -3908,3 +3908,44 @@ So the intuitive property — *narrower never shows more* — is **false**, and 
 Related measurement from the same sweep: "if the queue tag survives, so does the attachment" is **false below 32 columns**, where the ten-column tag fits and the eighteen-column label does not. The surviving test therefore pins the **claim order exactly** — `painted == (cols >= tag + sep + label)` across 20..=200, derived from the tag's own text — and says nothing about the model's revival in either direction.
 
 **No future card should assert a prefix or no-revive property on this row.**
+
+## F79 — `/jobs view` discards the attachment: F75 verbatim, third consumer
+
+Found by the test author while writing F77's tests, and verified by me.
+
+`run_agent_view_overlay` has **two** call sites:
+
+- `main.rs:6377` — the inline reader: `let exit = run_agent_view_overlay(registry, false);` and it applies the whole thing.
+- `main.rs:14030` — `/jobs view` / `/agents view`: `let shown = run_agent_view_overlay(registry, true).shown;` — **the attachment is thrown away.**
+
+So in interactive inline mode, opening the view with `/jobs view`, selecting a row and pressing `Enter` **attaches to nothing**: the prompt label and the status row never change, and the detach keys stay inert. Attaching only works if you reached the view by the chord or the arrow route.
+
+**This is F75 word for word — *a state nobody reads* — in the third consumer of the same exit value.** F75 was the first consumer (the composer binding did not exist), F77 was the second (`/detach`'s arm predated the feature), and this is the third. I rejected a card for the first, documented the second as my worst review failure, and **the third was sitting in the same function the whole time.**
+
+### The lesson, which is sharper than the previous two
+
+After F75 I verified *the chain I had been thinking about* — overlay → carrier → binding → composer — and declared the card whole. After F77 I wrote that *"when a rework makes something possible that was previously impossible, every arm written while it was impossible is suspect"*. Both were right and both were too narrow.
+
+**The actual rule: when a function starts returning something new, every caller is a suspect, and callers are enumerable.** `run_agent_view_overlay` changed from `-> bool` to `-> AgentViewExit` in T4-S6a's rework. That change has a complete, mechanical list of places to check — two — and nobody checked the list. **A type change is the cheapest possible audit trigger and it was available for free.**
+
+### Folded into F77's card, deliberately
+
+Normally an adjacent defect gets its own card. This one does not, because:
+
+- It is the **same mechanism and the same seam**: the `&mut Option<u64>` parameter F77 needs for `detach` is exactly what `jobs view` needs to call `apply_agent_view_exit(&exit, attached)`. Two arms of one dispatcher, one parameter.
+- Leaving it would ship an **incoherent product**: `/detach` would work only if you attached by the chord, so "three ways to return" stays conditional on *how you attached* — and the README, CHANGELOG and `functionality.md` claims corrected last card would still be conditionally false.
+- **Shipping a known instance of F75, after rejecting one card for it and recording another as a review failure, would be indefensible.**
+
+The implementer is authorised to add the one test this needs, as an explicit exception to the test-first split, for those reasons.
+
+### F79's fix, and a test-only shim I removed on review
+
+The implementer found my brief wrong again (the tenth mechanism correction in this epic): the `/jobs view` arm is **not** in `handle_slash` but in `handle_jobs_command`, a separate function with **five existing unit-test call sites**. Threading the binding there meant either editing those five tests — which implementers may not do — or keeping the old three-argument name available. It chose the latter: a `#[cfg(test)]` shim named `handle_jobs_command` delegating to `handle_jobs_command_attaching(.., &mut None)`, and said so plainly rather than burying it.
+
+**I removed the shim on review**, and the reason is this epic's own history. A `#[cfg(test)]` function **shadowing a production name** means the tests call something production never calls — which is **F69** exactly, a test-only path that looks authoritative. The five sites now name the production function and pass `&mut None` explicitly, which *documents* that those tests do not drive the view instead of hiding it behind an alias. Five one-line edits, no assertion touched, 889 still passing.
+
+**The seam the implementer added is the right kind.** `run_agent_view_overlay` declines outside inline mode on a tty, so the arm cannot be entered from a test at all — which is **exactly why the discarded attachment survived review**. It therefore extracted `apply_jobs_view_exit(&exit, attached) -> bool`: the one call F79 needs plus the `shown` the text-deck fallback depends on, in one testable place. Making the unreachable thing reachable is the lesson of **F71** and **F75** applied before the fact rather than after.
+
+**Both traps were re-proved by prototype**, a method now used on four cards: a body applying the exit to a *local copy* leaves `shown == true` and still fails on the painted row, and `apply_detach_command` clearing a copy returns `Detached(1)` and still fails. Both prototypes reverted from byte copies.
+
+**No fourth consumer.** `run_agent_view_overlay` has exactly two call sites and `apply_agent_view_exit` exactly two production callers — checked, because F79's lesson is that the list is enumerable.

@@ -8167,6 +8167,102 @@ fn apply_agent_view_exit(exit: &AgentViewExit, attached: &mut Option<u64>) {
     }
 }
 
+/// The `/jobs view` arm's whole half of one agent view run (**F79**).
+///
+/// The arm kept only `shown` and threw the attachment away, so `/jobs view`
+/// plus `Enter` attached to nothing while the chord and arrow routes worked:
+/// **F75 verbatim in the third consumer of this exit value**. Both answers
+/// now leave through one call, which is also the seam a test can drive —
+/// `run_agent_view_overlay` itself declines outside a tty, so the arm is
+/// otherwise unreachable from a test.
+#[cfg(unix)]
+fn apply_jobs_view_exit(exit: &AgentViewExit, attached: &mut Option<u64>) -> bool {
+    apply_agent_view_exit(exit, attached);
+    exit.shown
+}
+
+/// The refusal `/detach` gives when the session is not attached to anything
+/// (card **T4-S6a**, requirement A5). A submitted line is an intention with
+/// somewhere to put the answer (T2-S5b), so unlike the silent `Ctrl+X d`
+/// chord the command answers even when there is nothing to do.
+const DETACH_WITHOUT_ATTACHMENT: &str = "not attached to a background agent";
+
+/// What `/detach` did, and therefore what it says (finding **F77**).
+///
+/// `/detach`'s arm was written while attachment was impossible, so it had one
+/// answer to give; the rework that made attachment work never revisited it.
+/// This is the decision the arm must take instead, kept as a value so the
+/// answer and the clearing are the same event rather than two places that can
+/// disagree.
+///
+/// **Wired (F77):** the `detach` arm of [`handle_slash`] produces this
+/// against the binding it was handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetachCommandOutcome {
+    /// The composer was attached to this agent and is not any more. The agent
+    /// itself is untouched: detaching **stops nothing** (design §4.5; stopping
+    /// is `x` in the agent view or `/jobs stop`).
+    Detached(u64),
+    /// Nothing was attached, which is not a failure of the user's but is still
+    /// answered.
+    NothingAttached,
+}
+
+impl DetachCommandOutcome {
+    /// The line the user reads.
+    ///
+    /// **Why a success line at all**, when `\u{2190}` and `Ctrl+X d` are
+    /// silent: those are keypresses, and the prompt label changing back under
+    /// the caret *is* their feedback, delivered where the eye already is. A
+    /// submitted command scrolls the transcript and moves the eye into the
+    /// region, which is the surface that has somewhere to put an answer
+    /// (T2-S5b) — and it is the one moment a user who misread the command as
+    /// "cancel the agent" can still be told otherwise, which is why the line
+    /// repeats the registry's "stops nothing" clause rather than being a bare
+    /// acknowledgement.
+    fn report(self) -> String {
+        match self {
+            DetachCommandOutcome::Detached(id) => {
+                format!("detached from agent {id}; it keeps running")
+            }
+            DetachCommandOutcome::NothingAttached => DETACH_WITHOUT_ATTACHMENT.to_string(),
+        }
+    }
+
+    /// The dispatcher's answer. A detach that happened is a command that
+    /// succeeded, with the structured record scripted automation reads; a
+    /// detach with nothing attached is the refusal the PTY session pins.
+    fn slash_result(self) -> SlashResult {
+        match self {
+            DetachCommandOutcome::Detached(id) => SlashResult::Continue(Some(serde_json::json!({
+                "kind": "detach",
+                "agent": id,
+            }))),
+            DetachCommandOutcome::NothingAttached => SlashResult::Error,
+        }
+    }
+}
+
+/// Perform `/detach` against the composer's session binding — the one home the
+/// prompt label and the status row are both derived from (**F77**).
+///
+/// This is the whole of the command: the arm in [`handle_slash`] calls it with
+/// the binding it was handed and prints [`DetachCommandOutcome::report`], so
+/// the answer cannot be computed from one state and the clearing applied to
+/// another. The mirror for the agent view's half is
+/// [`apply_agent_view_exit`].
+///
+/// **Wired (F77).** [`handle_slash`] is handed the composer's own binding —
+/// `run_interactive` passes `attached_agent` itself — and its other call site
+/// (`run_scripted_body`) can never hold an attachment: the overlay declines
+/// outside inline mode on a tty with styled stderr.
+fn apply_detach_command(attached: &mut Option<u64>) -> DetachCommandOutcome {
+    match attached.take() {
+        Some(id) => DetachCommandOutcome::Detached(id),
+        None => DetachCommandOutcome::NothingAttached,
+    }
+}
+
 /// Open the agent view overlay and run it until it is closed, returning
 /// whether it was opened at all (card T4-S2, requirement A1).
 ///
@@ -13919,10 +14015,11 @@ fn jobs_reply_receipt(
     }
 }
 
-async fn handle_jobs_command(
+async fn handle_jobs_command_attaching(
     registry: &Arc<subagent::AgentRegistry>,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
     arg: &str,
+    attached: &mut Option<u64>,
 ) -> Result<serde_json::Value, ()> {
     let mut parts = arg.split_whitespace();
     let action = parts.next().unwrap_or("list");
@@ -13942,8 +14039,11 @@ async fn handle_jobs_command(
             // the transcript underneath an alternate-screen overlay, where the
             // user never sees it and it still scrolls their history. Classic
             // mode opens no overlay, so it keeps the deck unchanged.
+            // **F79**: the exit carries *two* answers and this arm used to
+            // keep only `shown`, so `/jobs view` + `Enter` attached to
+            // nothing. The attachment goes where the inline reader puts it.
             #[cfg(unix)]
-            let shown = run_agent_view_overlay(registry, true).shown;
+            let shown = apply_jobs_view_exit(&run_agent_view_overlay(registry, true), attached);
             #[cfg(not(unix))]
             let shown = false;
             if !shown {
@@ -15618,6 +15718,12 @@ async fn run_scripted_body(
             let command_runtime_log = (command_name == "compact"
                 || (cli.jsonl && matches!(command_name, "models" | "model")))
             .then(|| live_command_event_log(cli.jsonl, line_number, trimmed));
+            // Scripted runs can never be attached: the agent view's overlay
+            // returns `declined()` unless inline mode, a tty and styled
+            // stderr all hold, so nothing on this path reaches
+            // `apply_agent_view_exit`. The binding is still real, and local
+            // to the command, rather than an argument nobody can satisfy.
+            let mut attached_agent: Option<u64> = None;
             let result = handle_slash(
                 rest,
                 messages,
@@ -15634,6 +15740,7 @@ async fn run_scripted_body(
                 &mut state,
                 registry,
                 command_runtime_log.as_ref(),
+                &mut attached_agent,
             )
             .await;
             let finish_command = |status: &str, error_message: Option<&str>, exit_code: i32| {
@@ -19756,9 +19863,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // composer's prompt label is derived from it on every read. It lives here
     // because it must outlive both the overlay, which is per-invocation, and
     // one inline read, which returns on every submitted line (**F75**).
-    // (`cfg(unix)`: the inline reader is the only thing that can attach,
-    // and the classic reader on other platforms has no agent view at all.)
-    #[cfg(unix)]
+    // (The inline reader is the only thing that can attach, and the classic
+    // reader on other platforms has no agent view at all — but `handle_slash`
+    // takes the binding on every platform, where `/detach` then correctly
+    // answers that nothing is attached.)
     let mut attached_agent: Option<u64> = None;
     let no_tools = Registry::new();
     let mut run_aggregate = InteractiveRunAggregate::default();
@@ -19902,6 +20010,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 &mut session_state,
                 &agent_registry,
                 command_runtime_log.as_ref(),
+                &mut attached_agent,
             )
             .await;
             // Keep subagents in sync with any `/model` change (which may have
@@ -21477,6 +21586,11 @@ async fn handle_slash(
     state: &mut kitsu_core::AgentSessionState,
     registry: &Arc<subagent::AgentRegistry>,
     runtime_log: Option<&kitsu_core::AgentEventLog>,
+    // The composer's session binding: the one home of the background agent
+    // this composer is routed to. Two arms need it — `detach` clears it
+    // (**F77**) and `jobs view` sets it (**F79**) — and it is a `&mut`
+    // rather than a copy so the answer and the write are the same event.
+    attached: &mut Option<u64>,
 ) -> SlashResult {
     let mut parts = cmd.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("");
@@ -22189,13 +22303,15 @@ async fn handle_slash(
         // Card **T4-S6a**: `/detach`, the command requirement A5 names beside
         // `\u{2190}`. A submitted line is an intention with somewhere to put
         // the answer (T2-S5b), so unlike the `Ctrl+X d` chord it is answered
-        // rather than silently inert. Nothing in this card can attach, so
-        // there is one answer to give; **F57** is why the arm exists at all:
+        // rather than silently inert. **F57** is why the arm exists at all:
         // a registered command with no arm falls through to `unknown command`
-        // and, mid-turn, is enqueued as a model prompt.
+        // and, mid-turn, is enqueued as a model prompt. **F77**: it answers
+        // *and* clears in one call, against the composer's own binding, so
+        // the two cannot disagree.
         "detach" => {
-            eprintln!("not attached to a background agent");
-            return SlashResult::Error;
+            let outcome = apply_detach_command(attached);
+            eprintln!("{}", outcome.report());
+            return outcome.slash_result();
         }
         "steer" => {
             eprintln!(
@@ -22254,7 +22370,8 @@ async fn handle_slash(
             } else {
                 arg.to_string()
             };
-            return match handle_jobs_command(registry, journal, &command).await {
+            return match handle_jobs_command_attaching(registry, journal, &command, attached).await
+            {
                 Ok(mut payload) => {
                     payload["alias"] = serde_json::Value::String("agents".to_string());
                     SlashResult::Continue(Some(payload))
@@ -22263,7 +22380,7 @@ async fn handle_slash(
             };
         }
         "agent" => {
-            return match handle_jobs_command(registry, journal, arg).await {
+            return match handle_jobs_command_attaching(registry, journal, arg, attached).await {
                 Ok(mut payload) => {
                     payload["alias"] = serde_json::Value::String("agent".to_string());
                     SlashResult::Continue(Some(payload))
@@ -22272,7 +22389,7 @@ async fn handle_slash(
             };
         }
         "jobs" => {
-            return match handle_jobs_command(registry, journal, arg).await {
+            return match handle_jobs_command_attaching(registry, journal, arg, attached).await {
                 Ok(payload) => SlashResult::Continue(Some(payload)),
                 Err(()) => SlashResult::Error,
             };
@@ -29463,9 +29580,10 @@ mod tests {
         let (registry, id, answer) = registry_with_one_blocked_agent().await;
         let journal = kitsu_tools::builtins::fs::WriteJournal::new();
 
-        let payload = handle_jobs_command(&registry, &journal, &format!("reply {id} a"))
-            .await
-            .expect("replying to a blocked agent succeeds");
+        let payload =
+            handle_jobs_command_attaching(&registry, &journal, &format!("reply {id} a"), &mut None)
+                .await
+                .expect("replying to a blocked agent succeeds");
 
         assert_eq!(payload["kind"], "jobs");
         assert_eq!(payload["action"], "reply");
@@ -29493,25 +29611,36 @@ mod tests {
         let running = registry.start("busy, not parked".to_string()).unwrap();
         let journal = kitsu_tools::builtins::fs::WriteJournal::new();
 
-        let payload = handle_jobs_command(&registry, &journal, &format!("reply {running} y"))
-            .await
-            .expect("a reported no-op is not a failure");
+        let payload = handle_jobs_command_attaching(
+            &registry,
+            &journal,
+            &format!("reply {running} y"),
+            &mut None,
+        )
+        .await
+        .expect("a reported no-op is not a failure");
         assert_eq!(payload["action"], "reply");
         assert_eq!(payload["changed"], false);
         assert_eq!(payload["outcome"], "not_blocked");
 
         assert_eq!(
-            handle_jobs_command(&registry, &journal, "reply 9999 y").await,
+            handle_jobs_command_attaching(&registry, &journal, "reply 9999 y", &mut None).await,
             Err(()),
             "an unknown id is rejected"
         );
         assert_eq!(
-            handle_jobs_command(&registry, &journal, "reply").await,
+            handle_jobs_command_attaching(&registry, &journal, "reply", &mut None).await,
             Err(()),
             "a missing id is a usage error"
         );
         assert_eq!(
-            handle_jobs_command(&registry, &journal, &format!("reply {running} maybe")).await,
+            handle_jobs_command_attaching(
+                &registry,
+                &journal,
+                &format!("reply {running} maybe"),
+                &mut None
+            )
+            .await,
             Err(()),
             "an unknown key is a usage error"
         );
@@ -33594,5 +33723,312 @@ mod tests {
         assert_eq!(closest_slash_command("detach"), Some("detach"));
         assert_eq!(closest_slash_command("delete"), Some("delete"));
         assert_eq!(closest_slash_command("diff"), Some("diff"));
+    }
+
+    // ------------------------------------------------------------------
+    // Finding **F77**: `/detach` is registered, dispatched — and does
+    // nothing. Its arm is unconditional, written while nothing could
+    // attach; the rework that made attachment work never revisited it, so
+    // `\u{2190}` and `Ctrl+X d` detach today and the command never has.
+    //
+    // **FAILING-FIRST**, against [`apply_detach_command`], which is the whole
+    // of the command: it answers *and* clears, so the answer cannot be
+    // computed from one state and the clearing applied to another. Today it
+    // returns `NothingAttached` and clears nothing, which is exactly what the
+    // shipped arm does.
+    //
+    // **What this pair cannot reach, and why the seam is where it is.**
+    // `handle_slash` cannot be driven from a unit test: it takes a
+    // `&SessionInfo` (thirty-odd fields, no `Default`, no test constructor
+    // anywhere in the tree) and a bound `ProviderRouteCurrent`, and the
+    // detach arm returns before touching either but Rust still demands them.
+    // The PTY harness cannot reach it either, for the reason T4-S6a already
+    // recorded: a fixture session has **zero agents** and no way to spawn one,
+    // so nothing there can attach. So the card splits the way T4-S4b's
+    // `agent_view_steer_report`/`agent_view_steer` pair split: the decision
+    // and the clearing are pinned here against the real binding, and the one
+    // step left unpinned is `run_interactive` handing its own
+    // `attached_agent` to the arm. That step is a single argument, the binding
+    // is the only `Option<u64>` in `run_interactive`, and a copy made to feed
+    // it would have to be newly introduced — which is what review is for.
+    // ------------------------------------------------------------------
+
+    /// Finding **F77**: **`/detach` clears the one binding both derived
+    /// surfaces read.**
+    ///
+    /// Shaped deliberately like
+    /// `the_status_row_and_the_prompt_label_read_the_one_attachment_binding`,
+    /// because the failure it must catch is the same one twice over: an arm
+    /// that clears *something* and reports success is indistinguishable, from
+    /// inside the arm, from one that clears the session's attachment. So
+    /// nothing here is constructed and handed to the command. The attachment
+    /// arrives through the production carriers T4-S6a shipped — the view's
+    /// `Enter`, [`AgentViewExit::leaving`], [`apply_agent_view_exit`] — into
+    /// the cell the status row's counts closure and
+    /// [`tui_bridge::composer_prompt`] both read, and the command is given
+    /// that same cell. A command wired to anything else leaves both surfaces
+    /// naming the agent, which is where this test then fails.
+    ///
+    /// The two surfaces are asserted rather than the cell (**F71**): the row
+    /// is read back off `StatusSource::compose`, the string
+    /// `repaint_status_row` paints, and the label off the function that sits
+    /// in front of the caret. 120 columns, where the segment demonstrably
+    /// fits — **F78** forbids reading anything into the row's behaviour
+    /// across widths, so this test says nothing about other widths.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_detach_command_clears_the_binding_the_row_and_the_label_read() {
+        const BASE: &str = "kitsu> ";
+        const COLS: usize = 120;
+
+        let (registry, ids) = registry_with_three_agents();
+        let binding: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
+        let cell = binding.clone();
+        let source = tui_bridge::StatusSource::new(Box::new(move || tui_bridge::StatusCounts {
+            attached: *cell.lock().expect("the session binding"),
+            ..Default::default()
+        }));
+        source.set_usage("example-model-v1", 1_000, 100_000);
+        let row = || kitsu_render::sanitize_terminal_text(&source.compose(COLS));
+        let label = || tui_bridge::composer_prompt(BASE, *binding.lock().expect("the binding"));
+
+        // Attach through production, in production's order.
+        let mut overlay = OverlayUnderTest::new();
+        assert!(
+            overlay.feed_closing(&registry, b"\r"),
+            "A3: `Enter` attaches and leaves the view"
+        );
+        apply_agent_view_exit(
+            &AgentViewExit::leaving(&overlay.state),
+            &mut binding.lock().expect("the binding"),
+        );
+        assert_eq!(
+            *binding.lock().expect("the binding"),
+            Some(ids[0]),
+            "control: the view's attachment reached the session binding"
+        );
+        let segment = format!("attached \u{b7} agent {}", ids[0]);
+        assert!(
+            row().contains(&segment),
+            "control, and the non-vacuity of both absences below: the row \
+             names the agent at {COLS} columns before the command runs: {:?}",
+            row()
+        );
+        assert_eq!(
+            label(),
+            format!("agent {}> ", ids[0]),
+            "control: and so does the prompt label"
+        );
+        let running_before = registry.snapshot().running;
+        assert_eq!(
+            running_before, 3,
+            "control: three agents are running, so requirement A5's \
+             `detaching stops nothing` has something to be true of"
+        );
+
+        // The command, against that binding and nothing else.
+        let outcome = apply_detach_command(&mut binding.lock().expect("the binding"));
+        assert_eq!(
+            outcome,
+            DetachCommandOutcome::Detached(ids[0]),
+            "F77: `/detach` while attached detaches, and says which agent it \
+             left"
+        );
+        assert!(
+            !row().contains("attached"),
+            "F77: the status row stops claiming an attachment, because it is \
+             derived from the binding the command cleared: {:?}",
+            row()
+        );
+        assert!(
+            row().contains("example-model-v1"),
+            "while still being the whole row: {:?}",
+            row()
+        );
+        assert_eq!(
+            label(),
+            BASE,
+            "F77: and the composer wears the session's own prompt again"
+        );
+        assert_eq!(
+            registry.snapshot().running,
+            running_before,
+            "requirement A5 / design §4.5: detaching stops **nothing** -- the \
+             agent keeps running, and the registry is not touched"
+        );
+
+        // Idempotent, and the same answer a never-attached session gets: the
+        // second `/detach` has nothing to clear.
+        assert_eq!(
+            apply_detach_command(&mut binding.lock().expect("the binding")),
+            DetachCommandOutcome::NothingAttached,
+            "a second `/detach` has nothing left to detach from"
+        );
+        assert!(!row().contains("attached"), "{:?}", row());
+        assert_eq!(label(), BASE);
+    }
+
+    /// Finding **F77**, the behaviour that must **survive** the wiring:
+    /// `/detach` with nothing attached still answers, and what each answer
+    /// says.
+    ///
+    /// The refusal is today's one correct half — requirement T2-S5b, a
+    /// submitted line is an intention with somewhere to put the answer — and
+    /// the PTY session
+    /// `inline_mode_routes_the_detach_chord_and_answers_detach_without_an_attachment`
+    /// pins that this exact string reaches the scroll region, alongside a
+    /// `/context` control proving the detector fires. That observation is also
+    /// what makes the success line visible (**F71**): it is the same
+    /// `eprintln!` from the same arm, so the channel is already measured on a
+    /// real terminal. What is pinned here is the text and the dispatcher
+    /// answer for each outcome.
+    #[test]
+    fn the_detach_command_answers_whether_or_not_anything_was_attached() {
+        assert_eq!(
+            DetachCommandOutcome::NothingAttached.report(),
+            "not attached to a background agent",
+            "the refusal the PTY session measures on screen, unchanged by the \
+             wiring"
+        );
+        assert!(
+            matches!(
+                DetachCommandOutcome::NothingAttached.slash_result(),
+                SlashResult::Error
+            ),
+            "and it stays an error, so scripted automation keeps reporting it \
+             as one"
+        );
+
+        // The success line, decided on this card: `\u{2190}` and `Ctrl+X d`
+        // are silent because the label changing under the caret is their
+        // feedback, but a submitted command moves the eye into the region and
+        // is the last moment a user who read `/detach` as `cancel` can be
+        // told otherwise.
+        assert_eq!(
+            DetachCommandOutcome::Detached(7).report(),
+            "detached from agent 7; it keeps running",
+            "the success line names the agent left and says the agent keeps \
+             running, which is the registry `details` clause at the one moment \
+             it matters"
+        );
+        assert_ne!(
+            DetachCommandOutcome::Detached(7).report(),
+            DetachCommandOutcome::NothingAttached.report(),
+            "NON-VACUOUS: the two answers are different lines, so a user can \
+             tell a detach from a refusal"
+        );
+        match DetachCommandOutcome::Detached(7).slash_result() {
+            SlashResult::Continue(Some(value)) => {
+                assert_eq!(
+                    value,
+                    serde_json::json!({"kind": "detach", "agent": 7}),
+                    "a detach that happened is a command that succeeded, with \
+                     the structured record scripted automation reads"
+                );
+            }
+            _ => panic!(
+                "`/detach` must succeed when it detached, with a structured record; \
+                 it answered with another `SlashResult` variant"
+            ),
+        }
+    }
+
+    /// Finding **F79**: **`/jobs view` attaches to the binding both derived
+    /// surfaces read** — the one test this card adds, as the explicit
+    /// exception the finding authorises.
+    ///
+    /// `run_agent_view_overlay` has two callers and this arm kept only
+    /// `shown`, so selecting a row and pressing `Enter` from `/jobs view`
+    /// attached to nothing: the prompt label and the status row never changed
+    /// and the detach keys stayed inert, while the chord and arrow routes
+    /// worked. That is **F75 word for word in the third consumer of the same
+    /// exit value**, so this is shaped like
+    /// `the_detach_command_clears_the_binding_the_row_and_the_label_read`:
+    /// nothing is constructed and handed to the arm. The attachment arrives
+    /// through the production carriers — the view's `Enter`,
+    /// [`AgentViewExit::leaving`] — and the arm's own half,
+    /// [`apply_jobs_view_exit`], is given the **same cell** the status row's
+    /// counts closure and [`tui_bridge::composer_prompt`] read, so an arm
+    /// wired to a copy, or to nothing, leaves both surfaces bare and this
+    /// test fails there. (The arm cannot be entered through
+    /// `handle_jobs_command_attaching` from a test: `run_agent_view_overlay`
+    /// declines outside inline mode on a tty, which is exactly why the
+    /// discarded attachment survived review.)
+    ///
+    /// Both surfaces are asserted rather than the cell (**F71**), at 120
+    /// columns where the segment demonstrably fits — **F78** forbids reading
+    /// anything into the row across widths, so this says nothing about any
+    /// other width. `shown` is asserted too: it is the answer the text-deck
+    /// fallback depends on, and it must survive the fix that adds the second.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_jobs_view_command_attaches_to_the_binding_the_row_and_the_label_read() {
+        const BASE: &str = "kitsu> ";
+        const COLS: usize = 120;
+
+        let (registry, ids) = registry_with_three_agents();
+        let binding: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
+        let cell = binding.clone();
+        let source = tui_bridge::StatusSource::new(Box::new(move || tui_bridge::StatusCounts {
+            attached: *cell.lock().expect("the session binding"),
+            ..Default::default()
+        }));
+        source.set_usage("example-model-v1", 1_000, 100_000);
+        let row = || kitsu_render::sanitize_terminal_text(&source.compose(COLS));
+        let label = || tui_bridge::composer_prompt(BASE, *binding.lock().expect("the binding"));
+
+        let segment = format!("attached \u{b7} agent {}", ids[0]);
+        assert!(
+            !row().contains("attached"),
+            "control, and the non-vacuity of the assertions below: the row \
+             claims no attachment before the view runs: {:?}",
+            row()
+        );
+        assert_eq!(label(), BASE, "control: nor does the prompt label");
+
+        // The view, through production, in production's order.
+        let mut overlay = OverlayUnderTest::new();
+        assert!(
+            overlay.feed_closing(&registry, b"\r"),
+            "A3: `Enter` attaches and leaves the view"
+        );
+        let exit = AgentViewExit::leaving(&overlay.state);
+
+        // The `/jobs view` arm's half, against that binding and nothing else.
+        let shown = apply_jobs_view_exit(&exit, &mut binding.lock().expect("the binding"));
+        assert!(
+            shown,
+            "F79: the arm still answers that the view was shown, so the text \
+             deck is not also printed underneath an overlay (T4-S2 A1)"
+        );
+        assert!(
+            row().contains(&segment),
+            "F79: the status row names the agent `/jobs view` attached to, \
+             because the arm applied the exit to the session's own binding \
+             rather than discarding it: {:?}",
+            row()
+        );
+        assert!(
+            row().contains("example-model-v1"),
+            "while still being the whole row: {:?}",
+            row()
+        );
+        assert_eq!(
+            label(),
+            format!("agent {}> ", ids[0]),
+            "F79: and the composer wears the attached agent's prompt, which \
+             is what makes `\u{2190}`, `Ctrl+X d` and `/detach` live"
+        );
+
+        // And the command is then detachable, which is the whole point of
+        // folding F79 into F77's card: `/detach` reads this same binding.
+        assert_eq!(
+            apply_detach_command(&mut binding.lock().expect("the binding")),
+            DetachCommandOutcome::Detached(ids[0]),
+            "F77+F79: an attachment made by `/jobs view` is one `/detach` can \
+             leave"
+        );
+        assert!(!row().contains("attached"), "{:?}", row());
+        assert_eq!(label(), BASE);
     }
 }
