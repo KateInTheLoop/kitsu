@@ -1,5 +1,5 @@
 //! The runtime agent loop. Implements the pseudocode in
-//! docs/architecture.md §5: call model → parse tool calls → run tools →
+//! Agent loop: call model → parse tool calls → run tools →
 //! append results → repeat until the model stops or a cap is hit.
 
 use crate::context::{

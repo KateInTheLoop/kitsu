@@ -664,7 +664,7 @@ fn format_message(s: &str, styled: bool) -> String {
     out
 }
 
-/// Named kitsune palette (design.md §8, docs/ux-design.md). Truecolor RGB,
+/// Named kitsune palette. Truecolor RGB,
 /// used only when the destination is a styled TTY. These constants are the
 /// DEFAULT theme's values; live rendering reads the active [`Theme`] instead
 /// so `/theme` can restyle the whole surface at runtime.
@@ -849,7 +849,7 @@ pub fn theme_row(theme: &Theme, active: bool, styled: bool, plain: bool) -> Stri
     }
 }
 
-/// Kitsu's own structural glyph set (design.md §8). Defined once here so every
+/// Kitsu's own structural glyph set. Defined once here so every
 /// surface uses the same symbols; `--plain` maps each to stable ASCII via
 /// [`ascii_structural_markers`].
 /// Tool call marker (`--plain`: the `tool>` prefix).
@@ -1723,7 +1723,7 @@ pub fn compaction_boundary() {
     milestone("context compacted (older turns summarized)");
 }
 
-/// The attention state of one agent-deck row (docs/ux-design.md D1). Fill level
+/// The attention state of one agent-deck row. Fill level
 /// carries the state, matching the established glyph semantics: `◆` filled =
 /// live action, `◈` = a durable result awaiting custody, `◇` hollow = spent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
