@@ -7833,7 +7833,7 @@ fn collect_current_session_snapshot(
     let commands_enabled = session
         .tool_names
         .iter()
-        .any(|tool_name| tool_name == "command_exec");
+        .any(|tool_name| matches!(tool_name.as_str(), "command_exec" | "git"));
     let authority = current_session_authority_input(
         mode,
         read_roots,
@@ -10306,6 +10306,7 @@ fn chat_system_prompt(tool_names: &[String], environment: &PromptEnvironment) ->
         let has_write = tool_names.iter().any(|name| name == "fs_write_file");
         let has_edit = tool_names.iter().any(|name| name == "fs_edit_file");
         let has_commands = tool_names.iter().any(|name| name == "command_exec");
+        let has_git = tool_names.iter().any(|name| name == "git");
         let has_spawn = tool_names.iter().any(|name| name == "spawn_agent_bg");
         let has_workspace_diff = tool_names.iter().any(|name| name == "workspace_diff");
         let mut prompt = format!(
@@ -10382,6 +10383,20 @@ fn chat_system_prompt(tool_names: &[String], environment: &PromptEnvironment) ->
                 }
                 prompt.push_str(". ");
             }
+        }
+        if has_git {
+            prompt.push_str(
+                "For Git operations, use the git tool with literal args and cwd, including \
+                 status, diff, switch -c, add, and commit when the user requests them. \
+                 Git uses separate exact command approvals and OS containment. ",
+            );
+        }
+        if !has_commands && !has_git {
+            prompt.push_str(
+                "Git and other developer commands are not enabled for this invocation. \
+                 If a requested task requires Git, explain that `kitsu chat --enable-commands` \
+                 enables guarded Git/command tools with separate exact approvals. ",
+            );
         }
         if has_spawn {
             prompt.push_str(
@@ -15115,6 +15130,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         || !command_runtime_roots.is_empty()
         || !allow_commands.is_empty()
         || !command_env.is_empty();
+    // Interactive developer chat offers Git without exposing a general command
+    // runner. Every Git invocation still uses the independent approval policy.
+    let default_git = interactive
+        && !no_tools
+        && std::env::current_dir().is_ok_and(|cwd| {
+            reject_credential_command_root(&cwd, &setup.state_dir, "default Git root").is_ok()
+        });
     let automatic_artifacts = setup.artifact_policy == ArtifactStoragePolicy::Automatic;
     if cli.jsonl && interactive {
         return Err(CliError::user(
@@ -15352,21 +15374,22 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             required_write_structured_repair(&contracts, &journal)
         })
     });
-    let command_artifact_sink = (command_requested && automatic_artifacts).then(|| {
-        let quota = command_artifact::CommandArtifactQuota::new(
-            command_artifact::DEFAULT_COMMAND_ARTIFACT_COUNT,
-            command_artifact::DEFAULT_COMMAND_ARTIFACT_TOTAL_BYTES,
-            command_artifact::CommandArtifactOverflowPolicy::PruneOldest,
-        )
-        .expect("non-zero built-in command artifact quota");
-        command_artifact::CommandArtifactSink::with_quota(quota)
-    });
+    let command_artifact_sink =
+        ((command_requested || default_git) && automatic_artifacts).then(|| {
+            let quota = command_artifact::CommandArtifactQuota::new(
+                command_artifact::DEFAULT_COMMAND_ARTIFACT_COUNT,
+                command_artifact::DEFAULT_COMMAND_ARTIFACT_TOTAL_BYTES,
+                command_artifact::CommandArtifactOverflowPolicy::PruneOldest,
+            )
+            .expect("non-zero built-in command artifact quota");
+            command_artifact::CommandArtifactSink::with_quota(quota)
+        });
     let command_pregrant_specs: Vec<PregrantedCommandSpec> = allow_commands
         .iter()
         .map(|encoded| PregrantedCommandSpec::parse(encoded))
         .collect::<Result<_, _>>()?;
     let mut explicit_command_grants: Vec<PregrantedCommand> = Vec::new();
-    let command_policy = if command_requested {
+    let command_policy = if command_requested || default_git {
         let launch_dir = std::env::current_dir().map_err(|error| {
             CliError::user(format!("cannot resolve command directory: {error}"))
         })?;
@@ -15510,9 +15533,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             can_read,
             can_write,
             &write_journal,
-            command_policy.as_ref(),
+            command_policy.as_ref().filter(|_| command_requested),
             tool_tier,
         )?;
+        if default_git && !command_requested {
+            let (descriptor, handler) = builtins::command::git_tool(
+                command_policy
+                    .as_ref()
+                    .expect("default Git owns a command policy")
+                    .clone(),
+            );
+            t.register_with_descriptor(descriptor, handler)?;
+        }
         Arc::new(t)
     };
 
@@ -15625,9 +15657,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             can_read,
             can_write,
             &write_journal,
-            command_policy.as_ref(),
+            command_policy.as_ref().filter(|_| command_requested),
             tool_tier,
         )?;
+        if default_git && !command_requested {
+            let (descriptor, handler) = builtins::command::git_tool(
+                command_policy
+                    .as_ref()
+                    .expect("default Git owns a command policy")
+                    .clone(),
+            );
+            tools.register_with_descriptor(descriptor, handler)?;
+        }
     }
     let mut sub_cfg = build_agent_config(
         initial_model.clone(),
@@ -20437,6 +20478,19 @@ fn map_provider_error_with_diagnostics(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn system_prompt_names_git_only_when_the_tool_is_available() {
+        let environment = PromptEnvironment::default();
+        let enabled = chat_system_prompt(&["git".to_string()], &environment);
+        assert!(enabled.contains("use the git tool with literal args and cwd"));
+        assert!(!enabled.contains("commands are not enabled"));
+        let disabled = chat_system_prompt(&["fs_read_file".to_string()], &environment);
+        assert!(disabled.contains("kitsu chat --enable-commands"));
+        assert!(!disabled.contains("use the git tool"));
+        let commands_only = chat_system_prompt(&["command_exec".to_string()], &environment);
+        assert!(!commands_only.contains("use the git tool"));
+    }
 
     #[test]
     fn failure_count_phrase_pluralizes_naturally() {

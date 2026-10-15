@@ -158,6 +158,8 @@ struct Options {
     /// still running, so a session that suspends itself would simply poll to
     /// the deadline.
     resume_on_stop: bool,
+    rows: u16,
+    cols: u16,
 }
 
 impl Default for Options {
@@ -165,6 +167,8 @@ impl Default for Options {
         Self {
             no_session: true,
             resume_on_stop: false,
+            rows: ROWS,
+            cols: COLS,
         }
     }
 }
@@ -216,8 +220,8 @@ fn run_styled_chat_pty_with(
     // arithmetic is deterministic rather than inherited from the test runner's
     // terminal (or absent, falling back to 80x24 by accident).
     let size = libc::winsize {
-        ws_row: ROWS,
-        ws_col: COLS,
+        ws_row: options.rows,
+        ws_col: options.cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
@@ -377,7 +381,7 @@ fn run_styled_chat_pty_with(
         std::thread::sleep(Duration::from_millis(5));
     };
 
-    let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+    let mut parser = vt100::Parser::new(options.rows, options.cols, 0);
     parser.process(&raw);
     Session {
         raw,
@@ -1201,4 +1205,71 @@ fn inline_mode_shows_the_slash_completion_hint_on_the_viewport_row() {
         "the hint must not have been submitted as text; whole screen:\n{}",
         Session::dump(&after)
     );
+}
+
+/// A real provider response taller than the terminal must retain its final
+/// unterminated line when the live editor resumes and the tool receipt prints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn long_wrapped_response_preserves_its_tail_on_short_terminals() {
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+    let server = MockServer::start().await;
+    let text = format!(
+        "{}\nFINAL_TAIL_NO_NEWLINE",
+        "a long paragraph that wraps in a narrow terminal ".repeat(150)
+    );
+    let chunk =
+        serde_json::json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]});
+    let done = serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":200,"completion_tokens":500,"total_tokens":700}});
+    let response = format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(response, "text/event-stream"))
+        .mount(&server)
+        .await;
+    for mode in [None, Some("inline")] {
+        for (rows, cols) in [(8, 32), (24, 80)] {
+            let home = TempDir::new().unwrap();
+            write_config(home.path());
+            let config = home.path().join(".kitsu/config.toml");
+            fs::write(
+                &config,
+                fs::read_to_string(&config)
+                    .unwrap()
+                    .replace("https://gateway.invalid", &server.uri()),
+            )
+            .unwrap();
+            let steps = [
+                Step {
+                    trigger: RAW_MODE_MARKER,
+                    send: "say a long paragraph\r",
+                },
+                Step {
+                    trigger: "500 output",
+                    send: "/quit\r",
+                },
+            ];
+            let session = run_styled_chat_pty_with(
+                home.path(),
+                mode,
+                &steps,
+                Options {
+                    rows,
+                    cols,
+                    ..Options::default()
+                },
+            );
+            assert!(session.status.success(), "{}", session.raw_text());
+            let mut parser = vt100::Parser::new(rows, cols, 1000);
+            parser.process(&session.raw[..session.marks[1]]);
+            assert!(
+                parser.screen().contents().contains("FINAL_TAIL_NO_NEWLINE"),
+                "tail lost in {mode:?} at {cols}x{rows}: {}",
+                parser.screen().contents()
+            );
+        }
+    }
 }
