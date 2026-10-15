@@ -21620,14 +21620,18 @@ mod tests {
 
         let flat = format_jobs(&registry);
         let view = format_jobs_view(&registry);
-        let counts = "3 total · 1 running · 1 done · 1 failed · 0 cancelled";
+        let counts = if kitsu_render::plain_mode() {
+            "3 total | 1 running | 1 done | 1 failed | 0 cancelled"
+        } else {
+            "3 total · 1 running · 1 done · 1 failed · 0 cancelled"
+        };
         assert!(flat.contains(counts), "{flat}");
         assert!(view.contains(counts), "{view}");
         // The header summary is the flat deck's summary with the grouped lead.
         let flat_header = flat.lines().next().unwrap();
         let view_header = view.lines().next().unwrap();
         assert_eq!(
-            view_header.replace("agent deck by state — ", "agent deck — "),
+            view_header.replace("agent deck by state", "agent deck"),
             flat_header,
             "{view_header} vs {flat_header}"
         );
@@ -21738,7 +21742,7 @@ mod tests {
         assert_no_debug_leak(&flat);
         assert!(!flat.contains('\u{1b}'), "{flat}");
         if kitsu_render::plain_mode() {
-            assert!(flat.starts_with("# agent deck —"), "{flat}");
+            assert!(flat.starts_with("# agent deck -"), "{flat}");
             assert!(flat.contains("[run] #"), "{flat}");
             assert!(flat.contains("[rdy] #"), "{flat}");
             assert!(flat.contains("[err] #"), "{flat}");
