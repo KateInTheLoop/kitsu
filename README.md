@@ -659,6 +659,8 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--plain` | off | Use stable ASCII markers, disable color/animation, and select literal line-oriented input. |
 | `--screen-reader` | off | Use escape-free, literal line-oriented input and plain rendering; `KITSU_SCREEN_READER` is the environment equivalent. |
 | `--reduced-motion` | off | Keep styled output but replace animated waiting indicators with a static status. |
+| `--tui <MODE>` | `classic` | Select the renderer: `classic` or `inline`. Overrides `[tui] mode`; `/tui` switches at runtime. |
+| `--no-alt-screen` | off | Force `[tui] alternate_screen` to `never`, for multiplexers where the alternate screen misbehaves. |
 | `--temperature <f>` | unset | Sampling temperature. Omitted from the request unless set (some models reject it). |
 | `--reasoning-effort <level>` | unset | Forward `none`, `minimal`, `low`, `medium`, `high`, or `xhigh` to compatible gateways; omitted otherwise. `/reasoning` can change it between chat turns. |
 | `--max-rounds <n>` | `10` | Max agent tool-call rounds per turn (minimum `1`). Raise (e.g. `40`) for tool-heavy work. |
