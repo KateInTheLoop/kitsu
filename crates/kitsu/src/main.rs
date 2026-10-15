@@ -6797,10 +6797,6 @@ enum SteerLineStep {
 /// editor already holds that line for newlines: a bracketed paste never
 /// submits. The `Enter` that submits is one typed outside a paste.
 #[cfg(unix)]
-// Bound to `s` by T4-S4b's loop; the fields are read by `SteerLine`'s own
-// methods, which are stubs until card T4-S4b-ii drives the editor from them:
-// bound by T4-S4b-ii.
-#[allow(dead_code)]
 struct SteerLine {
     editor: kitsu_editor::TypeaheadEditor,
     id: u64,
@@ -6813,36 +6809,68 @@ impl SteerLine {
     /// line is not the composer, and recalling a prompt into a correction
     /// would be a surprise with a real effect.
     fn new(id: u64) -> Self {
-        let _ = id;
-        unimplemented!("card T4-S4b: the steer line")
+        Self {
+            editor: kitsu_editor::TypeaheadEditor::new(Vec::new()),
+            id,
+        }
     }
 
     /// Which agent this line will steer, fixed when the line opened rather
     /// than re-read from the selection on submit: a repaint may have moved it.
     fn id(&self) -> u64 {
-        unimplemented!("card T4-S4b: the steer line")
+        self.id
     }
 
     /// The echo, for `agents_view::steer_prompt_rows`.
     fn draft(&self) -> String {
-        unimplemented!("card T4-S4b: the steer line")
+        self.editor.buffer_string()
     }
 
     /// The caret, as a char offset into [`SteerLine::draft`].
     fn cursor(&self) -> usize {
-        unimplemented!("card T4-S4b: the steer line")
+        self.editor.cursor()
     }
 
     /// Feed one chunk of raw bytes.
     fn feed(&mut self, bytes: &[u8]) -> SteerLineStep {
-        let _ = bytes;
-        unimplemented!("card T4-S4b: the steer line")
+        // The raw bytes, straight into the editor: that is what keeps the
+        // bracketed-paste rule *the editor's*, so a pasted multi-line
+        // correction cannot submit at its first newline. The overlay's own
+        // `OverlayDecoder` is deliberately not in this path — it strips the
+        // delimiters and reports `OverlayInput::Paste` (finding **F68**), and
+        // unbracketed text fed to the editor would submit on that newline,
+        // which is F68 again one layer down.
+        let outcome = self.editor.feed(bytes);
+        for action in outcome.actions {
+            // Only `Submit` means anything here. The editor's other actions
+            // belong to the composer's collector — history recall, EOF,
+            // suspend, a repaint request — and a correction line has no use
+            // for any of them, so they leave the line open rather than ending
+            // it in a way the overlay never advertised.
+            if let kitsu_editor::EditorAction::Submit(correction) = action {
+                return SteerLineStep::Submit(correction);
+            }
+        }
+        SteerLineStep::Editing
     }
 
     /// What the overlay does when the grace expires with no byte waiting: a
     /// held `ESC` was the `Esc` key.
     fn quiet_tick(&mut self) -> SteerLineStep {
-        unimplemented!("card T4-S4b: the steer line")
+        // `escape_pending` and not `resolve_lone_escape`'s bool: the latter
+        // reports whether the *draft changed*, so it answers `false` for an
+        // `Esc` pressed on an empty line — which is still a cancel.
+        if !self.editor.escape_pending() {
+            return SteerLineStep::Editing;
+        }
+        self.editor.resolve_lone_escape();
+        SteerLineStep::Cancelled
+    }
+
+    /// Whether a lone `ESC` is held, so the overlay knows to spend the grace
+    /// period on it and nothing else.
+    fn escape_held(&self) -> bool {
+        self.editor.escape_pending()
     }
 }
 
@@ -7207,17 +7235,23 @@ enum OverlayPrompt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OverlayTextPrompt {
     Rename,
+    // No longer opened by the loop: card T4-S4b-ii replaced `s`'s naive line
+    // with `SteerLine` over `kitsu-editor`, and `n`'s is the only text prompt
+    // left. The variant stays because the loop's lifted-out test model still
+    // exercises both kinds through this one type, and because the wording
+    // below is the line the steer line's frame inherited.
+    #[cfg_attr(not(test), allow(dead_code))]
     Steer,
 }
 
 #[cfg(unix)]
 impl OverlayPrompt {
     /// The prompt as the one report row the frame has room for. The draft is
-    /// echoed with no caret because both prompts append at the end: there is
-    /// nowhere else the next character could go. Card T4-S4b-ii replaces `s`'s
-    /// line with `agents_view::steer_prompt_rows` and a real caret over
-    /// `kitsu-editor`; until then this is the whole echo, and it is honest
-    /// about the way out.
+    /// echoed with no caret because `n`'s name appends at the end: there is
+    /// nowhere else the next character could go. `s`'s line is no longer one
+    /// of these — card T4-S4b-ii gave it `agents_view::steer_prompt_rows` and
+    /// a real caret over `kitsu-editor` — and the `Steer` wording is kept
+    /// here as the line that frame inherited.
     fn report_line(&self) -> String {
         match self {
             Self::Decision(id) => format!(
@@ -7387,13 +7421,29 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
     // (requirement T2-S5b).
     let mut report: Option<String> = None;
     let mut prompt: Option<OverlayPrompt> = None;
+    // `s`'s text sub-mode (card T4-S4b-ii): a line edited by `kitsu-editor`,
+    // which reads the raw bytes itself while it is open. It is its own state
+    // rather than an `OverlayPrompt`, because the prompts are fed decoded
+    // keys and this is fed bytes -- the reason the editor is reusable here at
+    // all is that this is where the bytes are read.
+    let mut steering: Option<SteerLine> = None;
     let mut stdin = std::io::stdin();
     let mut buffer = [0u8; 256];
     let mut decoder = OverlayDecoder::new();
     loop {
         let view_rows = agent_view_rows(registry);
         selection.sync(&view_rows);
-        let content = if helping {
+        let content = if let Some(line) = steering.as_ref() {
+            // The innermost frame of all: while a correction is being typed
+            // it owns the screen, caret included, because the overlay hides
+            // the terminal's own cursor.
+            kitsu_tui::agents_view::steer_prompt_rows(
+                line.id(),
+                &line.draft(),
+                line.cursor(),
+                cols as usize,
+            )
+        } else if helping {
             kitsu_tui::agents_view::overlay_help_rows(cols as usize)
         } else if let Some(panel) = peeking.as_ref() {
             panel.clone()
@@ -7429,7 +7479,22 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
         // is what tells the two apart — the same answer T4-S2 gave at the
         // idle composer, where a lone `ESC` stays pending until the next byte
         // and is resolved on a quiet tick.
-        if decoder.escape_pending() && !stdin_waiting(ESC_SEQUENCE_GRACE) {
+        // The steer line resolves its own held `ESC`, on the same grace and
+        // for the same reason: inside it, `Esc` cancels the line and sends
+        // nothing. A tick with no `ESC` held is not even waited for, so the
+        // line costs no latency per keystroke.
+        if steering.as_ref().is_some_and(SteerLine::escape_held)
+            && !stdin_waiting(ESC_SEQUENCE_GRACE)
+        {
+            if let Some(line) = steering.as_mut() {
+                if line.quiet_tick() == SteerLineStep::Cancelled {
+                    steering = None;
+                    report = None;
+                }
+            }
+            continue;
+        }
+        if steering.is_none() && decoder.escape_pending() && !stdin_waiting(ESC_SEQUENCE_GRACE) {
             decoder.resolve_escape();
             // A real `Esc`: step back out of a prompt, out of the help, out of
             // a peek, or out of the view.
@@ -7456,6 +7521,24 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
+        // An open steer line reads the bytes itself, bypassing the decoder
+        // entirely: the editor needs the real `ESC[200~`/`ESC[201~` to apply
+        // its "a paste never submits" rule, and it is also what makes a
+        // multi-byte character split across two reads work here.
+        if let Some(line) = steering.as_mut() {
+            match line.feed(&buffer[..count]) {
+                SteerLineStep::Editing => {}
+                SteerLineStep::Submit(correction) => {
+                    report = Some(agent_view_steer(registry, line.id(), &correction).line);
+                    steering = None;
+                }
+                SteerLineStep::Cancelled => {
+                    steering = None;
+                    report = None;
+                }
+            }
+            continue;
+        }
         let mut closing = false;
         for input in decoder.feed(&buffer[..count]) {
             // A prompt is taken out of the state for the duration of the key
@@ -7624,11 +7707,18 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
                                 Some(id) => match pressed {
                                     'r' => prompt = Some(OverlayPrompt::Decision(id)),
                                     's' => {
-                                        prompt = Some(OverlayPrompt::Text {
-                                            id,
-                                            kind: OverlayTextPrompt::Steer,
-                                            draft: String::new(),
-                                        });
+                                        // Card T4-S4b-ii: the real line over
+                                        // `kitsu-editor`, in place of T4-S4b's
+                                        // naive one. `n` keeps that line: a
+                                        // name is one line and `rename`
+                                        // refuses control characters anyway.
+                                        steering = Some(SteerLine::new(id));
+                                        // The rest of this chunk is not a
+                                        // correction anybody typed -- the
+                                        // line opened on this very keystroke
+                                        // -- and the bytes after `s` are read
+                                        // by the line itself from here on.
+                                        break;
                                     }
                                     'n' => {
                                         prompt = Some(OverlayPrompt::Text {

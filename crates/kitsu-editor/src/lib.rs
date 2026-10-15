@@ -294,7 +294,7 @@ impl TypeaheadEditor {
     /// `Esc` resolved on an already-empty line. `false` mid-paste, for the
     /// same reason `resolve_lone_escape` never fires there.
     pub fn escape_pending(&self) -> bool {
-        unimplemented!("card T4-S4b: the steer line's Esc")
+        self.pending == Pending::Escape && !self.in_paste
     }
 
     /// Drop all transient input state (paste mode, partial escape/UTF-8

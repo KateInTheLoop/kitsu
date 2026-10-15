@@ -568,8 +568,46 @@ pub const STEER_CARET: char = '\u{2588}';
 /// `id` is on the frame: the agent being steered is the one the keystroke was
 /// typed on, and steering has a real effect, so the surface says which.
 pub fn steer_prompt_rows(id: u64, draft: &str, cursor: usize, cols: usize) -> Vec<String> {
-    let _ = (id, draft, cursor, cols);
-    unimplemented!("card T4-S4b: the steer line's frame")
+    const INDENT: &str = "  ";
+    // Every control character becomes a space, for the reason
+    // `overlay_rows_with_report` flattens one: a pasted correction carries
+    // real newlines (finding F68), and a newline left in the echo would paint
+    // a row the frame never budgeted for. One space per character, so the
+    // caret's offset is still the editor's.
+    let characters: Vec<char> = draft
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let at = cursor.min(characters.len());
+    // The echo is windowed rather than merely fitted: a correction longer than
+    // the terminal would otherwise push the caret off the right edge, and a
+    // caret a user cannot see is the one thing this frame exists to show. The
+    // text behind the caret is kept first (it is what was just typed) and the
+    // text ahead of it fills whatever is left.
+    let budget = cols.saturating_sub(INDENT.chars().count());
+    let room = budget.saturating_sub(1);
+    let before = at.min(room);
+    let after = (characters.len() - at).min(room - before);
+    let mut echo = String::from(INDENT);
+    echo.extend(&characters[at - before..at]);
+    echo.push(STEER_CARET);
+    echo.extend(&characters[at..at + after]);
+    fit_all(
+        vec![
+            title_row(&format!("{OVERLAY_TITLE} \u{2014} steer #{id}"), cols),
+            String::new(),
+            echo,
+            String::new(),
+            format!("{INDENT}enter sends the correction to agent #{id}, esc cancels"),
+        ],
+        cols,
+    )
 }
 
 /// The row list with one **report line** under it: what the last action key

@@ -299,6 +299,12 @@ clamps at the ends instead of wrapping, moving it never collects a result, and
 if the selected agent is pruned the selection falls to the row that took its
 place.
 
+`s` steers the selected agent, opening an editable line with a caret that
+windows around the cursor so a correction longer than the terminal still shows
+where you are typing. `Enter` sends it; `Esc` cancels and sends nothing; an
+empty correction is refused. A pasted multi-line correction is content, not a
+submission -- the line waits for your own `Enter`.
+
 `r` replies to a blocked agent (a single key -- `y`, `a` or `n` -- read through
 the same parser `/jobs reply` uses, not a line of text), `x` stops it (press
 twice; on an agent that has already finished, the second press prunes it), `n`

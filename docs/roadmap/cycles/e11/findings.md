@@ -3592,3 +3592,27 @@ Paste is detected two ways because one is not always available: **bracketed** (t
 ### A trap worth keeping
 
 **`ESC` alone is a strict prefix of `ESC[200~`.** A naive "hold the partial delimiter" implementation **silently kills F65's lone-`ESC` grace** — `escape_pending()` goes false and `Esc` stops working. Recognising `200~`/`201~` inside the existing CSI state is cleaner than prefix-holding. This cost the test author a design iteration and is pinned by explicit controls.
+
+## F69 — a test model that mirrors a loop stops mirroring it, and nothing fails
+
+Flagged by the implementer rather than hidden, which is the only reason it is visible.
+
+The overlay's byte loop cannot be called without a tty, so F68's registry-level tests drive it through `OverlayUnderTest` (`main.rs` ~30800), a test-local model that mirrors `match prompt.take()` **arm for arm** — and whose own comment says that is what it is for.
+
+T4-S4b-ii then changed the real `s`: an open steer line **bypasses `OverlayDecoder` entirely** and feeds raw bytes to the editor. The model still routes `s` to the naive `OverlayPrompt::Text { kind: Steer }` it replaced. So **the model's paste-into-the-steer-draft test now describes the model, not the product.**
+
+### Why this is not a false alarm, and not a reject either
+
+The behaviour it claims — a pasted newline is content and does not submit — **is still true of the real path, by a stronger route**: the editor enforces it as the one parser that owns bracketed paste, pinned by `pasted.feed(b"\x1b[200~one\ntwo\x1b[201~")` answering `Editing`. So coverage did not vanish; it **moved**, and the product is correct. Nothing was accepted on the strength of a test that passes while the product is wrong.
+
+But the model is now a **mirror that no longer reflects**, and the next person to change `s` will read it as authoritative. The failure mode is specific: a test model diverging from the code it models **cannot fail** when they disagree — agreement is not among the things it checks.
+
+### The family this belongs to
+
+**F57**: *a single source of truth guarantees readers agree with it; it guarantees nothing about whether anyone acts on what they read.* This is the same hole with the pieces swapped — the model and the loop are two readers of one design, and nothing compares them. The only honest fixes are to make the model reachable from the loop (so divergence is a compile error) or to delete the model and pin the loop through the PTY, which a fixture session with zero agents cannot currently do.
+
+**A nearby symptom, same cause:** `OverlayTextPrompt::Steer` is no longer constructed by production code at all — only by the model — so it now carries `#[cfg_attr(not(test), allow(dead_code))]`. **A production enum variant kept alive only by a test is a smell, not a fix.** Deleting it requires editing the model, so both belong to one follow-up card.
+
+### Also recorded: my sixth brief error (F64's tally)
+
+My brief said an empty correction is the registry's own `Empty` refusal **and not** a key-level guard. `agent_view_steer` **does** have a `correction.trim().is_empty()` guard — it just constructs the registry's own error so the wording is identical. Pre-existing, pinned by a passing test, left alone. The agent checked rather than believing me, which is now the sixth time across five cards.
