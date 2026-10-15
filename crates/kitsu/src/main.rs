@@ -1,5 +1,4 @@
-//! kitsu — CLI entry. MVP target: `kitsu ask --gateway example "hello"` runs the
-//! agent loop against the gateway (Mistral). See docs/architecture.md §6.
+//! kitsu CLI entry point and chat integration. See docs/architecture.md.
 
 mod agent_hook;
 mod agent_state_file;
@@ -12439,7 +12438,7 @@ fn format_write_checkpoint(
     undo_hint: bool,
 ) -> String {
     let label = terminal_inline(&report.label);
-    // `◈` is the receipt glyph (design.md §8): a durable artifact was created.
+    // `◈` is the receipt glyph: a durable artifact was created.
     let marker = if kitsu_render::plain_mode() {
         "#"
     } else {
@@ -15592,7 +15591,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     )
     .map_err(|error| CliError::user(format!("invalid background-thread limits: {error}")))?;
 
-    // G3 (docs/chat-ux-cycle-10.md): per-turn subagent spawn budget. Prompt
+    // Per-turn subagent spawn budget. Prompt
     // guidance demonstrably does not restrain small local models from agent
     // storms, so the cap is enforced at the tool boundary; the orchestrator
     // resets it each main-conversation turn. Scripted/piped automation gets a
@@ -16178,7 +16177,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // First-contact orientation (cycle-11 audit): one torii line at the
         // session gate — the model/gateway you are talking to and the two
         // things a new user needs (`/help`, how to leave). The torii is the
-        // session-boundary marker (docs/ui_guidelines.md), and opening the
+        // session-boundary marker (see docs/architecture.md), and opening the
         // session is its most natural gate.
         kitsu_render::milestone(&format!(
             "kitsu chat — {} via {} · /help for commands · Ctrl+D exits",
