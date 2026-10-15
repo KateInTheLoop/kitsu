@@ -5332,4 +5332,186 @@ mod tests {
             "POSITIVE CONTROL: the default profile is always available"
         );
     }
+
+    // ------------------------------------------------------------------
+    // Card **T4-S6b**: the routed composer's **steer** half.
+    //
+    // Split here for the reason T4-S4b, T4-S6a and T4-S7 were all split
+    // here: a *steerable* agent is one with a live thread and an open
+    // correction channel, and that needs a provider fixture
+    // (`SteeringProvider`, `empty_profile_runtime`, `spawn_agent_bg_tool`)
+    // which exists only in this module. `main.rs`'s registry fixtures can
+    // reach every refusal and the whole answer route, and pin those; the one
+    // thing they cannot build is a steer that *succeeds*, which is this
+    // test.
+    //
+    // The routed function itself lives in `main.rs` (the crate root), beside
+    // the composer loop that calls it; a child module can reach it.
+    // ------------------------------------------------------------------
+
+    /// Every transcript line painted through the renderer's surface seam.
+    /// **F71**: the receipt claim is made against the painted bytes, not
+    /// against a returned `String` no one proved reaches a terminal.
+    #[derive(Default)]
+    struct PaintedLines(Mutex<Vec<String>>);
+
+    impl kitsu_render::surface::Surface for PaintedLines {
+        fn transcript_line(&self, fd: kitsu_render::surface::Fd, text: &str) {
+            assert_eq!(
+                fd,
+                kitsu_render::surface::Fd::Stderr,
+                "a receipt is a meta line: {text:?}"
+            );
+            self.0.lock().expect("painted lines").push(text.to_string());
+        }
+    }
+
+    /// Install a recorder over the process-global surface slot and restore
+    /// the displaced surface on drop, so a panicking assertion cannot leave
+    /// this binary's later tests writing into a dead recorder.
+    struct SurfaceProbe {
+        previous: Option<Arc<dyn kitsu_render::surface::Surface>>,
+        painted: Arc<PaintedLines>,
+    }
+
+    impl SurfaceProbe {
+        fn install() -> Self {
+            let painted = Arc::new(PaintedLines::default());
+            let previous = kitsu_render::surface::set_surface(painted.clone());
+            Self {
+                previous: Some(previous),
+                painted,
+            }
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.painted.0.lock().expect("painted lines").clone()
+        }
+    }
+
+    impl Drop for SurfaceProbe {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                kitsu_render::surface::set_surface(previous);
+            }
+        }
+    }
+
+    /// **The steer route, end to end: a composer line corrects the attached
+    /// agent's work.**
+    ///
+    /// FAILS today: `route_attached_submission` sends nothing.
+    ///
+    /// The assertion is what the route **causes** (T4-S8's vacuity result):
+    /// the in-flight attempt is cancelled and restarted, the provider is
+    /// called a second time, and the restarted turn's answer carries the
+    /// user's words. A route that merely reported a receipt would fail on
+    /// every one of those.
+    ///
+    /// The receipt is pinned as `format_steering_receipt`'s own output
+    /// (`/jobs steer`'s and `s`'s wording) rather than as a second spelling
+    /// of it; only the discarded-progress duration, which is wall-clock, is
+    /// left unpinned, and it is bracketed on both sides so nothing can be
+    /// inserted around it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn a_composer_line_while_attached_steers_the_agent_and_restarts_its_turn() {
+        use std::time::Duration;
+
+        let registry = AgentRegistry::new();
+        let provider = Arc::new(SteeringProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
+        let mut cfg = sub_cfg();
+        cfg.quiet = true;
+        let (_descriptor, handler) = spawn_agent_bg_tool(
+            provider.clone(),
+            Arc::new(Registry::new()),
+            cfg,
+            live,
+            String::new(),
+            registry.clone(),
+            empty_profile_runtime(),
+            open_budget(),
+        );
+        handler(r#"{"task":"review the parser"}"#.to_string())
+            .await
+            .unwrap();
+        // The thread must be live and steerable before the line is routed,
+        // or a refusal would masquerade as the behaviour under test.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !registry
+                .thread_snapshot(1)
+                .is_some_and(|snapshot| snapshot.steering_open)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the spawned agent's correction channel opens");
+
+        let probe = SurfaceProbe::install();
+        let submit = crate::route_attached_submission(&registry, 1, "focus on UTF-8 boundaries");
+
+        assert_eq!(
+            submit.route,
+            crate::AttachedRoute::Steered,
+            "A5: while attached to a working agent, the composer steers it"
+        );
+        assert_eq!(
+            submit.draft, "",
+            "a delivered correction is gone from the composer"
+        );
+
+        let painted = probe.lines();
+        assert_eq!(painted.len(), 1, "exactly one receipt: {painted:?}");
+        let receipt = &painted[0];
+        // `format_steering_receipt`'s own output, pinned around its two
+        // runtime fields -- the queue depth (the restart may already have
+        // taken the correction off the queue) and the wall-clock progress it
+        // discarded -- so nothing can be inserted anywhere in the line.
+        assert!(
+            receipt
+                .starts_with("restarting background agent #1 with your correction (sequence 1; ")
+                && receipt.contains(" queued) - ")
+                && receipt
+                    .ends_with("s of in-flight progress discarded; completed file changes kept"),
+            "the receipt `/jobs steer` prints, not a second wording of it: \
+             {receipt:?}"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while registry.progress_snapshot().running != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the steered turn restarts and finishes");
+        assert_eq!(
+            provider.calls.load(AtomicOrdering::SeqCst),
+            2,
+            "the in-flight attempt was cancelled and a second one started"
+        );
+        let result = registry.peek_result(1).expect("agent #1 has a result");
+        assert!(
+            result.contains("focus on UTF-8 boundaries"),
+            "and the restarted turn followed the line the user typed into the \
+             composer: {result}"
+        );
+        assert!(
+            registry
+                .thread_snapshot(1)
+                .expect("agent #1 exists")
+                .timeline
+                .entries
+                .iter()
+                .any(|entry| {
+                    entry.kind == thread::AgentTimelineKind::Lifecycle
+                        && entry.text.contains("correction #1 applied")
+                }),
+            "and the thread records the correction as applied"
+        );
+    }
 }

@@ -323,6 +323,15 @@ longer than the limit, or carrying control characters) is reported on the rename
 line itself and leaves what you typed in place to be corrected; `Esc` cancels
 without renaming.
 
+While you are attached, a line you submit belongs to that agent: it steers the
+agent, or -- if the agent is blocked waiting on a permission -- answers it with
+`y`, `a` or `n` (the same spellings `/jobs reply` takes). Which one happens is
+decided when you press `Enter`, not when you started typing, and the registry has
+the last word: if the agent finished, stopped, or blocked while you were typing,
+nothing is sent, the agent's own refusal is printed, and **your line stays in the
+composer**. Slash commands are still commands while attached, so `/detach` always
+works.
+
 `?` lists every key the view binds, and `/help keys` prints the same list
 without opening the view -- both render one table, so neither can drift from the
 other or from what the keys actually do. `Enter` or `→` attaches to the selected

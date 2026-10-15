@@ -706,6 +706,45 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   Attaching never pauses the foreground turn; the foreground turn's output is
   buffered and replayed on detach.
 
+  **The routed composer (T4-S6b, shipped) routes on submit-time state, with the
+  registry as final adjudicator and no refusal that destroys text.**
+  - **Blocked at submit → answer**, through the **one** shared
+    `parse_permission_answer` (**F45** was closed by retiring a second answer
+    parser; `r`'s decision read uses the same one). A line that parser rejects is
+    **refused with nothing sent** — the agent stays blocked, which is the one
+    state it can still be answered correctly from.
+  - **Anything else → steer**, and `AgentRegistry::steer` adjudicates: an agent
+    that blocked or finished in the gap refuses **in its own words** rather than
+    being corrected or answered off a stale read.
+  - **Every refusal sends nothing and hands the line back** as the next read's
+    draft (**F76**), with the reason painted through the renderer's surface
+    (**F71**). In the implementation "refused" and "keeps the line" are the
+    **same boolean**, so they cannot drift.
+  - **Open-time routing was rejected** because it can only ever be wrong — a
+    steer the registry must refuse, or an answer taken from a stale block.
+    Submit-time plus "a refusal keeps the text" makes the user's worst case **one
+    extra keystroke with their words intact**, which is what stops the race being
+    a design problem.
+  - **A slash command stays a command while attached** (and a blank line stays
+    blank). Otherwise an attached session could never leave by `/detach`.
+  - **No new wording except the milestone**: `/jobs reply`'s own receipt on an
+    answer, `/jobs steer`'s own on a steer, `r`'s own refusal when a correction
+    reaches a blocked agent, and the registry's own `Display` for steer refusals.
+
+  **The `⛩` attach milestone is painted here**, in the one seam both attach
+  routes pass through, once per **change** of binding — nothing on a declined
+  exit, nothing on a re-attach to the same agent. Its text **names the route**,
+  not just the agent: *attached to agent N; your next line steers it, or answers
+  it while it is blocked*. The reason is **F82**: this route adds **no key** — it
+  changes what `Enter` means — so **the only thing that can enumerate it is the
+  moment it begins.** A key table cannot advertise a route that has no key.
+
+  **The inline composer does not share F72's unbracketed-paste gap** — checked,
+  not assumed. `KeyFilter` owns the bracketed-paste state machine, so a paste
+  arrives as **one draft** and a pasted multi-line correction routes as one
+  line; F72 applies to the overlay's four bypass lines only. `parse_permission_answer`
+  also strips paste markers, so a pasted `y` still answers.
+
   **T4-S6 was split into three, and A5 therefore lands in three pieces.**
   **T4-S6a** (shipped) is attachment itself and the keys that enter and leave
   it; **T4-S6b** is the routed composer, which needs a live thread with an open

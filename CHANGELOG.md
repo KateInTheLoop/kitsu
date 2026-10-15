@@ -113,6 +113,15 @@ shapes may change in any minor release.
   including one whose characters arrive split across reads, and a refused name
   stays on screen with the message so the one wrong character can be corrected
   rather than the whole name retyped.
+- **While attached to an agent, what you type goes to that agent.** A line steers
+  it; if it is blocked waiting on a permission, `y`, `a` or `n` answers it. Attaching
+  now announces this (`⛩ attached to agent 3; your next line steers it, or answers
+  it while it is blocked`), because the route changes what `Enter` does without
+  adding a key to find in the help. Slash commands still work while attached, so
+  `/detach` always gets you out.
+  **A refusal never eats your line:** if the agent finished, stopped, or blocked
+  while you were typing, nothing is sent, you are told why in the agent's own
+  words, and your text is still in the composer.
 - **`/help keys`** prints the agent view's key bindings without opening the view,
   and the view's own `?` help now prints the same rows from the same table — so
   the two can no longer disagree about what a key does.

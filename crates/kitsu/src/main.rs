@@ -6406,11 +6406,26 @@ fn read_chat_line_inline(
         // it — the next iteration re-derives the prompt label off it, so the
         // composer visibly goes back to the session's own prompt and the
         // `\u{2190}` route goes back to the agent view's two-press arm. The
-        // `\u{26E9}` milestone and the recap are **not** this card's (design
-        // \u{00a7}4.5: they land with T4-S6b and T4-S6c).
+        // `\u{26E9}` *attach* milestone landed in T4-S6b and is painted in
+        // `apply_agent_view_exit`; only the **recap** is still outstanding
+        // (T4-S6c, design \u{00a7}4.5). This comment claimed both were
+        // outstanding until T4-S6b shipped one of them -- the **F77** shape,
+        // a comment true when written and wrong once a later card landed.
         if let Ok(tui_bridge::InlineRead::Detached(draft)) = outcome {
             carried = apply_inline_detach(attached, draft);
             continue;
+        }
+        // Card **T4-S6b**, requirement A5: while attached, a submitted line
+        // is the attached agent's -- a steer, or an answer while it is
+        // blocked -- and never a turn. Routed here, before the line can
+        // become a `ChatReadline::Line`, because this is the one place that
+        // can still replay a refusal's draft through `carried` (**F76**): a
+        // refused line is back in the composer on the next read.
+        if let Ok(tui_bridge::InlineRead::Submitted(line)) = &outcome {
+            if let Some(id) = attached_route_target(line, *attached) {
+                carried = route_attached_submission(registry, id, line).draft;
+                continue;
+            }
         }
         // Finding F21: Ctrl+Z. The reader is pure, so the whole suspend is
         // sequenced here, through the seam that makes the ordering testable.
@@ -8344,7 +8359,25 @@ impl AgentViewExit {
 #[cfg(unix)]
 fn apply_agent_view_exit(exit: &AgentViewExit, attached: &mut Option<u64>) {
     if let Some(id) = exit.attached {
-        *attached = Some(id);
+        // Card **T4-S6b**: the `\u{26E9}` milestone (design \u{a7}4.5), painted
+        // here because this is the one seam both attach routes go through,
+        // and only on a **change** of binding -- re-attaching to the agent
+        // already attached changes nothing, and a second identical milestone
+        // would claim something happened.
+        //
+        // It names the **route**, not just the agent (**F82**): attaching
+        // adds no key, it changes what `Enter` means, so the moment the
+        // binding begins is the only place that change can be enumerated.
+        if *attached != Some(id) {
+            *attached = Some(id);
+            kitsu_render::surface::active_surface().transcript_line(
+                kitsu_render::surface::Fd::Stderr,
+                &kitsu_render::milestone_line(&format!(
+                    "attached to agent {id}; your next line steers it, or \
+                     answers it while it is blocked"
+                )),
+            );
+        }
     }
 }
 
@@ -8364,6 +8397,139 @@ fn apply_agent_view_exit(exit: &AgentViewExit, attached: &mut Option<u64>) {
 fn apply_inline_detach(attached: &mut Option<u64>, draft: String) -> String {
     *attached = None;
     draft
+}
+
+/// Which agent, if any, one submitted line belongs to (card **T4-S6b**,
+/// requirement A5: *"while attached, the composer sends `steer`, or an
+/// approval answer when the agent is blocked"*).
+///
+/// Pure, and the only decision about **whether** the composer's line leaves
+/// the session at all: the composer loop asks this and, on `Some`, hands the
+/// line to [`route_attached_submission`] instead of making it a turn.
+///
+/// Two lines are **not** the attached agent's, however attached the session
+/// is: a slash command (which is how `/detach` can still be reached from an
+/// attached composer -- a session that could not leave by command would be a
+/// trap) and a blank line (which the loop already drops).
+///
+#[cfg(unix)]
+fn attached_route_target(line: &str, attached: Option<u64>) -> Option<u64> {
+    let id = attached?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        return None;
+    }
+    Some(id)
+}
+
+/// What one routed composer line did to the attached agent (card **T4-S6b**).
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AttachedRoute {
+    /// The line was queued as a correction on a working agent.
+    Steered,
+    /// The line was read as an approval answer -- by
+    /// [`parse_permission_answer`], **the** parser (**F45**) -- and delivered
+    /// to the blocked agent's parked request.
+    Answered(Decision),
+    /// Nothing was sent. Every refusal, including a correction typed while the
+    /// agent was blocking.
+    Refused,
+}
+
+/// One routed composer submission: what it did, and the draft the next read
+/// must replay (**F76**).
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttachedSubmit {
+    /// Which route the line took.
+    route: AttachedRoute,
+    /// Empty when the line was delivered; the user's line verbatim on every
+    /// refusal, so a refused correction is still in the composer afterwards.
+    draft: String,
+}
+
+/// Send one composer line to the agent the session is attached to (card
+/// **T4-S6b**, requirement A5).
+///
+/// **The steer-versus-answer rule**, which A5 leaves open: the agent's state
+/// is read **once, at submit time**, and
+///
+/// * a **blocked** agent is answered -- through
+///   [`parse_permission_answer`] and nothing else -- and a line that parser
+///   does not accept is **refused with nothing sent**, because a correction
+///   typed while the agent happened to block must not be guessed at as
+///   `y`/`a`/`n`;
+/// * any other state is **steered**, and the registry is the final
+///   adjudicator: an agent that blocked (or finished) between the read and
+///   the call refuses in its own words rather than being answered from a
+///   stale read.
+///
+/// So neither race can destroy what the user typed: every refusal hands the
+/// line back in `draft` and paints its reason through the renderer's surface,
+/// where the eye already is (**F71**).
+///
+/// This function is also the **only** place either route is taken, so the
+/// answer the user reads and the thing that happened cannot come from two
+/// places (**F69**): the receipt painted is `/jobs steer`'s and `/jobs
+/// reply`'s own ([`format_steering_receipt`], [`jobs_reply_receipt`]), never a
+/// second wording of them.
+///
+#[cfg(unix)]
+fn route_attached_submission(
+    registry: &subagent::AgentRegistry,
+    id: u64,
+    line: &str,
+) -> AttachedSubmit {
+    // The state, read once, here: everything below decides off this one read,
+    // and the registry adjudicates whichever route it picks.
+    let blocked = registry
+        .progress_snapshot()
+        .agents
+        .into_iter()
+        .any(|agent| agent.id == id && agent.status == subagent::AgentProgressStatus::Blocked);
+    let (line_painted, route, delivered) = if blocked {
+        // The decision the one parser reads, so `Answered` can carry it; the
+        // report below calls that same parser, and this card adds no second
+        // `match` on `y`/`a`/`n` (**F45**).
+        let decision = parse_permission_answer(line);
+        // `r`'s own path: its receipt on an answer, its refusal wording on a
+        // line the parser cannot read -- never a second spelling of either.
+        let report = agent_view_reply(registry, id, line);
+        let route = match decision {
+            Some(decision) if report.changed => AttachedRoute::Answered(decision),
+            // Not an answer at all, or the agent stopped blocking in the gap:
+            // nothing was sent, so the line comes back.
+            _ => AttachedRoute::Refused,
+        };
+        let delivered = report.changed;
+        (report.line, route, delivered)
+    } else {
+        // Any other state steers, and the registry has the last word: an
+        // agent that blocked or finished while the line was being typed
+        // refuses in its own words.
+        match registry.steer(id, line) {
+            Ok(receipt) => (
+                format_steering_receipt(&receipt),
+                AttachedRoute::Steered,
+                true,
+            ),
+            Err(error) => (error.to_string(), AttachedRoute::Refused, false),
+        }
+    };
+    // Through the renderer's surface, where the eye already is (**F71**).
+    kitsu_render::surface::active_surface()
+        .transcript_line(kitsu_render::surface::Fd::Stderr, &line_painted);
+    AttachedSubmit {
+        route,
+        // **F76**: a delivered line is gone from the composer, and every
+        // refusal hands it back as the next read's draft.
+        draft: if delivered {
+            String::new()
+        } else {
+            line.to_string()
+        },
+    }
 }
 
 /// The `/jobs view` arm's whole half of one agent view run (**F79**).
@@ -35328,6 +35494,429 @@ mod tests {
             printed, overlay,
             "`/help keys` lists the overlay's keys, all of them, in the \
              overlay's order:\n{text}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Card **T4-S6b**: **the routed composer while attached**, requirement
+    // A5, plus the `\u{26E9}` attach milestone (design \u{a7}4.5).
+    //
+    // Every test under this banner FAILS today: `attached_route_target`
+    // answers `None` for everything, `route_attached_submission` sends
+    // nothing and paints nothing, and `apply_agent_view_exit` paints no
+    // milestone.
+    //
+    // **The steer-versus-answer rule this card settles.** A5 says the
+    // composer "sends `steer`, or an approval answer when the agent is
+    // blocked" and does not say *when* that is decided. The race is real:
+    // you are attached to a working agent, you type a correction, the agent
+    // blocks on a permission while you are typing, and you press Enter.
+    // Routing by the state at **open** time would send a steer the registry
+    // must refuse; routing by the state at **submit** time would feed a
+    // carefully typed correction to `parse_permission_answer`, which does not
+    // read it as `y`/`a`/`n`. Neither is acceptable on its own, so the rule
+    // is submit-time state **plus a refusal that destroys nothing**:
+    //
+    // * the state is read **once**, at submit time;
+    // * **blocked** \u{2192} answered, by [`parse_permission_answer`] and nothing
+    //   else (**F45**: there is one parser, and this card does not add a
+    //   third); a line that parser does not accept is **refused with nothing
+    //   sent**, which leaves the agent in the one state from which it can
+    //   still be answered correctly;
+    // * **anything else** \u{2192} steered, and the *registry* adjudicates: an
+    //   agent that blocked or finished in the gap refuses in its own words
+    //   rather than being answered or corrected from a stale read;
+    // * **every** refusal hands the line back as the next read's draft
+    //   (**F76**) and paints its reason through the renderer's surface
+    //   (**F71**), so the user keeps their words and reads why on the frame
+    //   they are looking at.
+    //
+    // The user is told by the receipts `/jobs steer` and `/jobs reply`
+    // already print, and refused in the words `r`'s decision read already
+    // uses -- derived here rather than respelled, so this route cannot drift
+    // from the two that exist.
+    //
+    // **What enumerates the route (F82).** The route adds no key: it changes
+    // what `Enter` means, and the only moment that change is announced is the
+    // attach itself. That is why the `\u{26E9}` milestone belongs to this card
+    // and is asserted to **name the route**, not merely the agent.
+    // ------------------------------------------------------------------
+
+    /// Every transcript line written through the renderer's surface seam,
+    /// with the stream it was written on.
+    ///
+    /// **F71**: a visibility claim has to go through the surface that paints.
+    /// A test that read a returned `String` would pass against a route that
+    /// computed a refusal and painted nothing -- which is exactly T4-S8's
+    /// vacuity result -- so the painted bytes are the assertion here.
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct PaintedLines(std::sync::Mutex<Vec<(kitsu_render::surface::Fd, String)>>);
+
+    #[cfg(unix)]
+    impl kitsu_render::surface::Surface for PaintedLines {
+        fn transcript_line(&self, fd: kitsu_render::surface::Fd, text: &str) {
+            self.0
+                .lock()
+                .expect("painted lines")
+                .push((fd, text.to_string()));
+        }
+    }
+
+    /// Install a recorder over the surface slot, and put the displaced
+    /// surface back on drop: a panicking assertion must not leak a recorder
+    /// into the rest of this test binary, where it would swallow every later
+    /// transcript line. Tests using it are `#[serial]`, the slot being
+    /// process-global.
+    #[cfg(unix)]
+    struct SurfaceProbe {
+        previous: Option<std::sync::Arc<dyn kitsu_render::surface::Surface>>,
+        painted: std::sync::Arc<PaintedLines>,
+    }
+
+    #[cfg(unix)]
+    impl SurfaceProbe {
+        fn install() -> Self {
+            let painted = std::sync::Arc::new(PaintedLines::default());
+            let previous = kitsu_render::surface::set_surface(painted.clone());
+            Self {
+                previous: Some(previous),
+                painted,
+            }
+        }
+
+        /// The stderr lines painted so far. Meta lines -- milestones,
+        /// receipts, refusals -- are stderr by the seam's own contract
+        /// (`Fd::Stderr`), and asserting the stream is part of the claim: a
+        /// receipt on stdout would land in a redirected transcript file.
+        fn lines(&self) -> Vec<String> {
+            self.painted
+                .0
+                .lock()
+                .expect("painted lines")
+                .iter()
+                .map(|(fd, text)| {
+                    assert_eq!(
+                        *fd,
+                        kitsu_render::surface::Fd::Stderr,
+                        "a meta line belongs on stderr: {text:?}"
+                    );
+                    text.clone()
+                })
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SurfaceProbe {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                kitsu_render::surface::set_surface(previous);
+            }
+        }
+    }
+
+    /// The exit an agent view leaves behind when `Enter`/`\u{2192}` attached to
+    /// `id`, built as [`AgentViewExit::leaving`] builds it.
+    #[cfg(unix)]
+    fn attaching_exit(id: u64) -> AgentViewExit {
+        AgentViewExit {
+            shown: true,
+            attached: Some(id),
+        }
+    }
+
+    /// The milestone message for one attach: the `\u{26E9}` line's text, without
+    /// the glyph and styling [`kitsu_render::milestone_line`] adds.
+    ///
+    /// **It names the route** (**F82**). The composer's `Enter` has just
+    /// changed meaning, no key was added that a key table could enumerate,
+    /// and this line is the one place that change is announced; a bare
+    /// "attached to agent 7" would leave the user to discover by experiment
+    /// that their next line leaves the session.
+    #[cfg(unix)]
+    fn attach_milestone_message(id: u64) -> String {
+        format!(
+            "attached to agent {id}; your next line steers it, or answers it \
+             while it is blocked"
+        )
+    }
+
+    /// **The `\u{26E9}` milestone, through the surface that paints it.**
+    ///
+    /// Driven through `apply_agent_view_exit` -- the **one** seam both attach
+    /// routes (the `\u{2190}\u{2190}` overlay and `/jobs view`) go through, and the
+    /// seam T4-S6a's tests already drive -- so this is the wired route and
+    /// not a formatter called in a vacuum.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn attaching_paints_one_torii_milestone_that_names_the_agent_and_the_route() {
+        let probe = SurfaceProbe::install();
+        let mut attached: Option<u64> = None;
+
+        // CONTROL, and the non-vacuity of the claim below: a view closed with
+        // `q` attached to nothing, so nothing is announced.
+        apply_agent_view_exit(&AgentViewExit::declined(), &mut attached);
+        assert_eq!(attached, None);
+        assert!(
+            probe.lines().is_empty(),
+            "leaving the view without attaching announces nothing: {:?}",
+            probe.lines()
+        );
+
+        apply_agent_view_exit(&attaching_exit(7), &mut attached);
+        assert_eq!(attached, Some(7), "control: the binding took the agent");
+        assert_eq!(
+            probe.lines(),
+            vec![kitsu_render::milestone_line(&attach_milestone_message(7))],
+            "design \u{a7}4.5: attaching paints exactly one `\u{26E9}` milestone, \
+             through the renderer's surface, and it says what the composer \
+             now does with a submitted line"
+        );
+    }
+
+    /// The milestone is painted for a **change** of binding and nothing else.
+    ///
+    /// Both halves matter. `Enter` in the view on the agent you are already
+    /// attached to is a no-op, and a second identical milestone would be a
+    /// claim that something happened; attaching to a *different* agent is a
+    /// real change and must announce the new id, or a user who re-attached
+    /// would steer an agent the transcript never named.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn the_attach_milestone_is_painted_once_per_change_of_binding() {
+        let probe = SurfaceProbe::install();
+        let mut attached: Option<u64> = None;
+
+        apply_agent_view_exit(&attaching_exit(7), &mut attached);
+        let after_first = probe.lines();
+        assert_eq!(after_first.len(), 1, "control: {after_first:?}");
+
+        apply_agent_view_exit(&attaching_exit(7), &mut attached);
+        assert_eq!(
+            probe.lines(),
+            after_first,
+            "re-attaching to the agent already attached changes nothing, so \
+             it announces nothing"
+        );
+
+        apply_agent_view_exit(&attaching_exit(9), &mut attached);
+        assert_eq!(attached, Some(9));
+        assert_eq!(
+            probe.lines(),
+            vec![
+                kitsu_render::milestone_line(&attach_milestone_message(7)),
+                kitsu_render::milestone_line(&attach_milestone_message(9)),
+            ],
+            "and moving the attachment announces the agent it moved to"
+        );
+    }
+
+    /// **Which lines are the attached agent's at all.**
+    ///
+    /// The composer's loop asks this one question before routing, so what it
+    /// excludes is as load-bearing as what it claims: a session whose every
+    /// line went to the agent could not reach `/detach` and would be a trap.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_non_command_line_at_an_attached_composer_belongs_to_the_agent() {
+        assert_eq!(
+            attached_route_target("fix the UTF-8 boundary", Some(3)),
+            Some(3),
+            "A5: while attached, a typed line is the agent's"
+        );
+        assert_eq!(
+            attached_route_target("fix the UTF-8 boundary", None),
+            None,
+            "CONTROL: detached, the same line is the model's"
+        );
+        for command in ["/detach", "/jobs steer 3 later", "/help", "  /detach  "] {
+            assert_eq!(
+                attached_route_target(command, Some(3)),
+                None,
+                "a command stays a command while attached, or the session \
+                 could never leave by command: {command:?}"
+            );
+        }
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                attached_route_target(blank, Some(3)),
+                None,
+                "a blank line is not a correction: {blank:?}"
+            );
+        }
+        assert_eq!(
+            attached_route_target("   fix the parser", Some(3)),
+            Some(3),
+            "leading whitespace does not make a line a command"
+        );
+    }
+
+    /// **The answer route: a blocked agent, answered through the one
+    /// parser.**
+    ///
+    /// Every spelling `parse_permission_answer` accepts is driven, and the
+    /// expected decision is taken **from that parser** rather than written
+    /// out here (**F45**): a route that grew its own `match` on `y`/`a`/`n`
+    /// would drift from the foreground prompt and from `/jobs reply` the
+    /// first time the vocabulary changed, and this test would then fail on
+    /// the spelling it stopped sharing.
+    ///
+    /// Non-vacuous by the gate: the agent's parked request really resolves
+    /// with that decision, so an implementation that computed an answer and
+    /// delivered nothing fails here.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn a_line_typed_at_a_blocked_attached_agent_answers_it_through_the_one_parser() {
+        for spelling in ["y", "yes", "YES", "a", "always", "n", "no", " y\n"] {
+            let expected = parse_permission_answer(spelling)
+                .unwrap_or_else(|| panic!("the one parser accepts {spelling:?}"));
+            let (registry, id, answer) = registry_with_one_blocked_agent().await;
+            let probe = SurfaceProbe::install();
+
+            let submit = route_attached_submission(&registry, id, spelling);
+
+            assert_eq!(
+                submit.route,
+                AttachedRoute::Answered(expected),
+                "A5: a blocked attached agent is answered, not steered \
+                 ({spelling:?})"
+            );
+            assert_eq!(
+                submit.draft, "",
+                "a delivered line is gone from the composer ({spelling:?})"
+            );
+            assert_eq!(
+                answer.await.expect("the gate's oneshot is resolved"),
+                expected,
+                "the agent's parked request sees exactly the decision the one \
+                 parser read ({spelling:?})"
+            );
+            assert_eq!(
+                registry.snapshot().blocked,
+                0,
+                "and it is no longer blocked ({spelling:?})"
+            );
+            assert_eq!(
+                probe.lines(),
+                vec![jobs_reply_receipt(
+                    id,
+                    subagent::AgentAnswerOutcome::Answered,
+                    expected
+                )],
+                "the user reads `/jobs reply`'s own receipt, painted through \
+                 the surface -- not a second wording of it ({spelling:?})"
+            );
+        }
+    }
+
+    /// **The race, settled: a correction typed while the agent blocks.**
+    ///
+    /// The line is not `y`, `a` or `n`, so it is not an answer; the agent is
+    /// blocked, so it cannot be steered. The rule is that **nothing is sent**
+    /// and **nothing is lost**: the agent stays blocked (the one state from
+    /// which the user can still answer it), the line comes back as the next
+    /// read's draft (**F76**), and the reason is painted where the eye is
+    /// (**F71**).
+    ///
+    /// The refusal's wording is **derived from `r`'s**: `agent_view_reply`
+    /// with an unreadable key returns its refusal before touching the
+    /// registry, so calling it here is side-effect free and pins "the
+    /// composer refuses in the words the decision read already uses". A
+    /// second wording of "that is not an answer" is exactly the drift F45 was
+    /// closed to stop.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn a_correction_typed_while_the_agent_blocked_sends_nothing_and_keeps_the_line() {
+        const CORRECTION: &str = "no, use the byte offsets from the lexer";
+        assert!(
+            parse_permission_answer(CORRECTION).is_none(),
+            "premise: the one parser does not read a correction as an answer"
+        );
+
+        let (registry, id, mut answer) = registry_with_one_blocked_agent().await;
+        let expected_refusal = agent_view_reply(&registry, id, CORRECTION);
+        assert!(
+            !expected_refusal.changed,
+            "premise: `r`'s refusal path changes nothing, so deriving the \
+             wording from it leaves the agent blocked"
+        );
+        let probe = SurfaceProbe::install();
+
+        let submit = route_attached_submission(&registry, id, CORRECTION);
+
+        assert_eq!(
+            submit.route,
+            AttachedRoute::Refused,
+            "a correction is never guessed at as `y`/`a`/`n`"
+        );
+        assert_eq!(
+            submit.draft, CORRECTION,
+            "F76: the half-typed line survives the refusal -- losing it is a \
+             defect this epic has already paid for once"
+        );
+        assert!(
+            matches!(
+                answer.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "nothing reached the agent's parked request"
+        );
+        assert_eq!(
+            registry.snapshot().blocked,
+            1,
+            "and it is still blocked, which is the one state it can still be \
+             answered from"
+        );
+        assert_eq!(
+            probe.lines(),
+            vec![expected_refusal.line],
+            "F71: the refusal is painted through the surface, in the words \
+             `r`'s decision read already uses"
+        );
+    }
+
+    /// **The other half of the race: the agent finished while you typed.**
+    ///
+    /// Not blocked, so the line is steered -- and the registry is the
+    /// adjudicator, so a line aimed at an agent that is no longer running is
+    /// refused **in the registry's own words**, with the line kept. An
+    /// implementation that pre-judged the state and invented a wording would
+    /// fail on the text; one that swallowed the line would fail on the draft.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn a_line_routed_to_an_agent_that_is_no_longer_running_is_refused_in_its_own_words() {
+        const CORRECTION: &str = "stop at the first failing case";
+        let registry = subagent::AgentRegistry::new();
+        let id = registry.start("already done".to_string()).unwrap();
+        registry.finish(id, Ok("done".to_string()));
+
+        // Derived, not spelled: a refused steer changes nothing, so asking
+        // the registry for its own refusal is side-effect free.
+        let expected = registry
+            .steer(id, CORRECTION)
+            .expect_err("a terminal agent cannot be steered")
+            .to_string();
+        let probe = SurfaceProbe::install();
+
+        let submit = route_attached_submission(&registry, id, CORRECTION);
+
+        assert_eq!(submit.route, AttachedRoute::Refused);
+        assert_eq!(
+            submit.draft, CORRECTION,
+            "F76: a refusal the user could not have predicted must not cost \
+             them the line"
+        );
+        assert_eq!(
+            probe.lines(),
+            vec![expected],
+            "the registry's own words for the refusal, painted through the \
+             surface"
         );
     }
 }
