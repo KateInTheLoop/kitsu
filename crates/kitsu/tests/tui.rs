@@ -6942,3 +6942,381 @@ fn inline_mode_routes_the_detach_chord_and_answers_detach_without_an_attachment(
         Session::dump(&detached)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Card F94: a dying signal must give the alternate screen back.
+//
+// `SIGNAL_RESTORE` (`tui_bridge.rs`) is `ESC[r ESC[?25h ESC[?2004l
+// ESC[23;2t` -- region reset, show cursor, bracketed paste off, title pop --
+// and **no `ESC[?1049l`**. Two surfaces in this binary take the alternate
+// screen: the agent-view overlay (`main.rs`, written straight-line, restored
+// only on the normal path) and `FullscreenSegment` (a guard, restored only by
+// `Drop`). `Drop` does not run on a signal and the handler writes no
+// `?1049l`, so a `SIGINT` or a `SIGTERM` taken while either surface is up
+// leaves the user looking at kitsu's alternate screen with their transcript
+// stranded on the primary one. That is requirement N5's signal clause, open
+// for the overlay since T4-S2 and for fullscreen since T5-S2.
+//
+// Nothing caught it because no test in this file had ever killed the process
+// while a surface held the alternate screen: every `Action::Signal` script
+// above signals an inline session, which takes no alternate screen at all.
+// The absence was the bug; these four tests are the thing that was missing.
+//
+// The two restores below are deliberately *counted*, not merely found. The
+// restore has to be emitted when the screen is held and **not** when it is
+// not -- a handler that wrote `?1049l` unconditionally would move the cursor
+// to a stale DECSC slot on every `SIGTERM` of a session that never left
+// inline -- so the no-regression and once-only tests are as load-bearing as
+// the two that fail today, and they are what distinguishes a gated restore
+// from an unconditional one.
+// ---------------------------------------------------------------------------
+
+/// Open the agent view with `/jobs view`, let it paint, then kill the child
+/// while it is up.
+///
+/// `/jobs view` rather than the `Ctrl+X a` chord because it is one line with
+/// a receipt-free, already-satisfied trigger and the overlay it reaches is
+/// the same one (`jobs_view_opens_the_overlay_in_inline_mode_and_prints_the_deck_in_classic`
+/// pins that equivalence). The pause is the mark: it separates the overlay's
+/// paint from everything the child writes *after* the signal, which is the
+/// only window in which the restore can be observed.
+fn jobs_view_then_signal(signal_number: libc::c_int) -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/jobs view\r"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        signal(RAW_MODE_MARKER, signal_number),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+    ]
+}
+
+/// Assert that a session which was holding the alternate screen when it was
+/// signalled gave it back.
+///
+/// Both halves are needed and neither is the other's restatement: the screen
+/// must have been *taken* before the signal, or there is nothing owed, and
+/// the leave must appear in the window **after** the signal, or it is the
+/// normal path's leave being read twice.
+fn assert_alt_screen_released_after_signal(session: &Session, step: usize, label: &str) {
+    let before = String::from_utf8_lossy(&session.raw[..session.marks[step]]).into_owned();
+    assert!(
+        before.contains(ALT_SCREEN_ON),
+        "{label}: the alternate screen must have been taken before the signal, \
+         or there is nothing to give back; raw before the signal:\n{}",
+        before.escape_debug()
+    );
+    assert!(
+        !before.contains(ALT_SCREEN_OFF),
+        "{label}: and it must still have been held at the signal -- a session \
+         that had already left it cannot measure the dying restore; raw before \
+         the signal:\n{}",
+        before.escape_debug()
+    );
+
+    let after = session.raw_after(step);
+    assert!(
+        after.contains(ALT_SCREEN_OFF),
+        "{label}: a terminal left on kitsu's alternate screen hides the user's \
+         own transcript until they run `reset`, so every exit path owes \
+         `ESC[?1049l` (N5); everything the child wrote after the signal \
+         was:\n{}",
+        after.escape_debug()
+    );
+}
+
+/// **The overlay's hole, five cards old: `SIGINT` with the agent view up.**
+///
+/// Fails today in the one way that matters: the window after the signal
+/// carries the handler's `ESC[r ESC[?25h ESC[?2004l ESC[23;2t` and nothing
+/// else, so the assertion prints a restore that gave back the title and kept
+/// the screen.
+#[test]
+#[serial]
+fn agent_view_sigint_gives_the_alternate_screen_back() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &jobs_view_then_signal(libc::SIGINT),
+    );
+    assert_alt_screen_released_after_signal(&session, 2, "SIGINT with the agent view up");
+    // The rest of N5's signal clause still holds for this session, so a fix
+    // that reached the alternate screen by rewriting the handler's one
+    // `write(2)` into something that drops the other sequences fails here
+    // rather than passing above.
+    let after = session.raw_after(2);
+    assert!(
+        after.contains(REGION_RESET) && after.contains(PASTE_OFF),
+        "the region reset and the paste-off the handler already wrote must \
+         survive whatever gives the screen back; after the signal the child \
+         wrote:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        session.raw_mode_off(),
+        "and the pty must be canonical again, but it reads {}",
+        session.termios_dump()
+    );
+}
+
+/// Script: switch into fullscreen from inline, then take a `SIGTERM` inside
+/// the fullscreen segment.
+///
+/// Entered by a switch rather than by starting the session in fullscreen, and
+/// that is a measurement rather than a preference: `install` is inert in
+/// fullscreen, so a session *started* there never reaches
+/// `install_exit_restore` and has no dying-signal handler at all. A script
+/// that started in fullscreen would fail this test for that second, larger
+/// reason and say nothing about the alternate screen. See the report.
+fn switch_into_fullscreen_then_sigterm() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/tui fullscreen\r"),
+        signal(ALT_SCREEN_ON, libc::SIGTERM),
+        pause(ALT_SCREEN_ON, SETTLE_MS),
+    ]
+}
+
+/// **Fullscreen's inherited hole: `SIGTERM` inside the segment.**
+///
+/// The same assertion as the overlay's, on the other surface, and it is a
+/// separate test because the two takers are separate code with separate
+/// restores -- a fix that gates on a flag only one of them sets passes one of
+/// these and fails the other, which is the enumeration this card exists to
+/// force.
+#[test]
+#[serial]
+fn fullscreen_segment_sigterm_gives_the_alternate_screen_back() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &switch_into_fullscreen_then_sigterm(),
+    );
+    assert_alt_screen_released_after_signal(&session, 1, "SIGTERM in fullscreen");
+    assert!(
+        !session.status.success(),
+        "a signalled session does not exit successfully; it exited {:?}",
+        session.status
+    );
+}
+
+/// **A GUARD, green today, and the one that says the restore must be gated.**
+///
+/// An inline session takes no alternate screen, so it is owed none back. The
+/// cheapest fix for the two tests above is to append `ESC[?1049l` to the
+/// handler's `const` unconditionally, and this is the test that refuses it:
+/// `?1049l` is not inert on the primary screen -- xterm's `rmcup` restores
+/// the cursor from the DECSC slot, so an unconditional leave on a session
+/// that never took the screen can park the shell's next prompt wherever that
+/// slot happens to point.
+///
+/// Counted over the whole session rather than the post-signal window: this
+/// script never opens a surface, so *any* `?1049l` in it came from the dying
+/// handler.
+#[test]
+#[serial]
+fn inline_sigterm_gives_back_no_alternate_screen_it_never_took() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &help_then_draft_then_signal(libc::SIGTERM),
+    );
+    let text = session.raw_text();
+    // NON-VACUOUS: the handler did run in this session, so the count below is
+    // a statement about what it wrote and not about whether it fired.
+    assert!(
+        session.raw_after(2).contains(REGION_RESET),
+        "NON-VACUOUS: the dying restore must have run, or this session proves \
+         nothing about what it writes; after the signal the child wrote:\n{}",
+        session.raw_after(2).escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        0,
+        "NON-VACUOUS: no surface in this script takes the alternate screen, \
+         so any leave below is the handler's; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_OFF),
+        0,
+        "a dying signal must not give back an alternate screen the session \
+         never took; raw:\n{}",
+        text.escape_debug()
+    );
+}
+
+/// Open the agent view, close it with `Esc`, **then** signal.
+fn jobs_view_closed_then_sigint() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/jobs view\r"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        signal(RAW_MODE_MARKER, libc::SIGINT),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+    ]
+}
+
+/// **A GUARD, green today: the restore is given once, not twice.**
+///
+/// The overlay's normal close already wrote `ESC[?1049l`; a signal arriving
+/// afterwards is on the primary screen again and owes nothing. So the whole
+/// session holds exactly one leave for exactly one take, and whatever tracks
+/// "the screen is held" has to be cleared on the way out as well as set on
+/// the way in -- the half of a gated fix that is easy to forget, and the half
+/// that this test is the only reader of.
+#[test]
+#[serial]
+fn agent_view_closed_before_a_signal_gives_the_screen_back_exactly_once() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &jobs_view_closed_then_sigint());
+    let text = session.raw_text();
+
+    // NON-VACUOUS, both ways: the overlay really opened and really closed, so
+    // the count is about the restore's discipline and not about a view that
+    // never appeared.
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "NON-VACUOUS: the overlay must have taken the alternate screen once; \
+         raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.raw_after(4).contains(REGION_RESET),
+        "NON-VACUOUS: and the dying restore must have run after the close; \
+         after the signal the child wrote:\n{}",
+        session.raw_after(4).escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_OFF),
+        1,
+        "one take, one leave: the overlay's own close gave the screen back, so \
+         the dying handler must not write a second leave; raw:\n{}",
+        text.escape_debug()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Card F96: a session *started* in fullscreen installs no dying-signal
+// handler at all, which is strictly worse than F94 and shipped one card ago.
+//
+// `install_exit_restore` was called only inside `if installed.is_some()`
+// (`main.rs`), and `install` returns `None` for `Classic | Fullscreen` --
+// fullscreen pins no region, which is right. The conjunction was the defect:
+// `--tui fullscreen` left `SIGINT` and `SIGTERM` on the **default
+// disposition**, so the process died before anything ran. No scroll-region
+// reset, no title pop, no alternate-screen release, and -- the serious half
+// -- no `tcsetattr` back to canonical termios, which is a shell with no echo
+// and no line editing until the user types `reset` blind.
+//
+// Nothing covered it because the four transition tests above all *switch*
+// into fullscreen, so the inline segment they came from had already installed
+// the handler; and the two scripts that start in fullscreen exit normally,
+// which is the one exit path that does not need it. Starting in fullscreen
+// and then dying is the uncovered intersection, and this is the test for it.
+// ---------------------------------------------------------------------------
+
+/// Start in fullscreen, wait until the session owns raw mode, then `SIGTERM`.
+///
+/// Triggered on [`RAW_MODE_MARKER`] rather than on the alternate screen, and
+/// that is the point of the script rather than a detail: the termios half is
+/// the serious half, so the signal has to land while raw mode is actually
+/// engaged. The trailing pause is the window the dying restore is read in.
+fn fullscreen_start_then_sigterm() -> Vec<Step> {
+    vec![
+        signal(RAW_MODE_MARKER, libc::SIGTERM),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+    ]
+}
+
+/// **A session started in fullscreen gets its terminal back on a signal.**
+///
+/// The three observations are one requirement (N5) in three places, and each
+/// was false before this card:
+///
+/// * **Termios.** The pty's line settings outlive the child -- the harness
+///   holds its own descriptor on the slave -- so `ICANON`/`ECHO`/`ISIG` are
+///   the state a real user's shell would be left in. This is the assertion
+///   that fails on a missing *handler* rather than on missing bytes, and it
+///   is why this test is not a restatement of F94's: a flag that tells the
+///   handler to write more does nothing when there is no handler.
+/// * **The alternate screen.** Taken by `enter_fullscreen` at startup and
+///   owed back by whatever ends the process.
+/// * **The title.** Pushed by the same call, popped by the handler's stream.
+#[test]
+#[serial]
+fn fullscreen_start_sigterm_restores_termios_and_the_screen() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("fullscreen"),
+        &fullscreen_start_then_sigterm(),
+    );
+    let text = session.raw_text();
+    let before = String::from_utf8_lossy(&session.raw[..session.marks[0]]).into_owned();
+
+    // NON-VACUOUS, both halves: the session really was in fullscreen holding
+    // the alternate screen when the signal landed, so the restores below are
+    // about a terminal that was really taken.
+    assert!(
+        before.contains(ALT_SCREEN_ON),
+        "NON-VACUOUS: `--tui fullscreen` must have taken the alternate screen \
+         before the signal; raw before the signal:\n{}",
+        before.escape_debug()
+    );
+    assert!(
+        !before.contains(ALT_SCREEN_OFF),
+        "NON-VACUOUS: and must still have been holding it -- a session that \
+         had already left cannot measure the dying restore; raw before the \
+         signal:\n{}",
+        before.escape_debug()
+    );
+
+    // The termios half, and the one that says the handler exists at all: a
+    // child killed on the default disposition leaves these three cleared.
+    assert!(
+        session.raw_mode_off(),
+        "a session started in fullscreen must install the dying-signal \
+         handler too: without it the signal's default disposition kills the \
+         process with the terminal still in raw mode, and the user's shell \
+         has no echo and no line editing until they type `reset` blind. The \
+         pty reads {} and the child wrote this after the signal:\n{}",
+        session.termios_dump(),
+        session.raw_after(0).escape_debug()
+    );
+
+    let after = session.raw_after(0);
+    assert!(
+        after.contains(REGION_RESET) && after.contains(PASTE_OFF),
+        "and the handler's own stream must have run on this exit path like \
+         any other; after the signal the child wrote:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        after.contains(ALT_SCREEN_OFF),
+        "the alternate screen the startup took must be given back, or the \
+         user's own transcript stays hidden under kitsu's screen (N5); after \
+         the signal the child wrote:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        after.contains(TITLE_POP),
+        "and so must the title the same call pushed; after the signal the \
+         child wrote:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        !session.status.success(),
+        "a signalled session does not exit successfully; it exited {:?}, \
+         raw:\n{}",
+        session.status,
+        text.escape_debug()
+    );
+}

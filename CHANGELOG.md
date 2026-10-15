@@ -131,6 +131,15 @@ shapes may change in any minor release.
   **A refusal never eats your line:** if the agent finished, stopped, or blocked
   while you were typing, nothing is sent, you are told why in the agent's own
   words, and your text is still in the composer.
+- **Fixed:** pressing `Ctrl+C` while the agent view or the fullscreen renderer was
+  on screen left your terminal on kitsu's alternate screen, hiding your own
+  scrollback until you ran `reset`. This had been true of the agent view for
+  several releases. Every exit path -- a normal close, `/quit`, a dying signal and
+  a panic -- now gives the screen back, and only when kitsu actually took it.
+- **Fixed:** a session started with `--tui fullscreen` (or `[tui] mode =
+  "fullscreen"`) installed no signal restore at all, so `Ctrl+C` left the
+  terminal in raw mode -- no echo, no line editing -- as well as on the alternate
+  screen. It now restores both.
 - **A fullscreen renderer.** `/tui fullscreen` (also `--tui fullscreen` and
   `[tui] mode = "fullscreen"`) takes the terminal's alternate screen and paints
   the viewport's scrollback, and gives the screen and your window title back when
