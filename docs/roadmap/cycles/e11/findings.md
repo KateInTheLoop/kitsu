@@ -4139,3 +4139,39 @@ It is now pinned deliberately: `re_attaching_to_another_agent_replays_the_first_
 I argued from F52's units. The stronger argument is the dependency graph, verified: **`Surface` lives in `kitsu-render`; `CellRing` lives in `kitsu-tui`; and `kitsu-render` does not depend on `kitsu-tui`.** A buffer that decorates `Surface` must live beside the trait, so **the ring is unreachable from it regardless of how it is bounded.** The split that created this card feared a deferral past R6 if the implementer "reached for the ring" — it cannot be reached, so there is nothing to defer.
 
 **`cell_ring_lines` still has no reader.** This card does not become one, and **F52 stays open** for the overlay and the `[` dump; it is decided only for this buffer (byte-budgeted, oldest evicted, loss noted, clamped lines reset).
+
+## F85 — a plan row's named acceptance test already existed, and writing it again would have been a flake
+
+I challenged T5-S1's row on the grounds that a **"5 000-line RSS test"** would be flaky and would assert a property **F52** explicitly leaves open. The test author agreed and then produced a better objection I had missed.
+
+**The test already exists.** `crates/kitsu-tui/src/cells.rs:177`, `cell_ring_bound_holds_under_far_more_pushes_than_the_limit` — **5 000 pushes behind a bound of 64**, written in T3-S6. Verified.
+
+So the row's acceptance criterion had been **satisfied two milestones before the card ran**, and anyone following the row literally would have written a **duplicate** of a passing test — in the one form (RSS) that is both flaky and false, since one pathological line defeats a byte bound by design.
+
+**The lesson: a plan row's acceptance can be satisfied before its card runs, and the row will not say so.** The row is a plan written once; the suite moves every card. Checking whether the named test *already passes* is cheap and was not in anyone's routine, including mine — I questioned the test's *shape* and never asked whether it existed.
+
+### The byte assertion that is achievable, which I had written off
+
+I said the honest claim is structural — the ring's retained count is independent of conversation length — and that bytes were off the table while F52 is open. **Half right.** A byte assertion *is* available, just not from the allocator: **the sum of the retained lines' own byte lengths is identical after 10 000 pushes and after 5 000.** Computed from the ring's contents, so it is deterministic, allocator-independent and parallelism-independent, and it pins exactly what RSS was reaching for — *the evicted lines' bytes are not retained anywhere.*
+
+What remains untestable while F52 is open is only the form "retained bytes ≤ K for fixed K". **"No byte-level claim is testable" was my overcorrection**, and N4 should record the distinction so the next reader does not inherit it.
+
+## F86 — the feed must land after the reader, and N4 already said so
+
+T5-S1 splits three ways, and the ordering is the interesting part.
+
+**The ring going live is a separate card, and it is *not* first.** N4: the ring is *"not fed in production until R6's overlay reads it — feeding an unread ring would spend up to ten thousand styled lines of memory for no benefit."*
+
+**The precondition is a reader.** Shipping liveness first would spend that memory during the window before the renderer lands — **the exact expenditure the requirement forbids**. So the order is **reader → feed**, and I had it backwards in my brief: I suggested "the ring becomes live" might be the natural *first* piece because it is the bigger change. Bigger, but second.
+
+**The alternate screen needs no code at all.** `TuiRuntime::enter`/`leave` already do the alt-screen, title and raw-mode lifecycle, panic restore and signal restore already cover **N5**, and all of it is tested. What is missing is a **caller** — and the only thing that can select fullscreen is **T5-S2's switch**, which owns that wiring. So **N5's "vacuous today" note is slightly wrong**: it says the clauses become real "when T5's fullscreen renderer uses that runtime", but the renderer is **pure by design** and never touches a terminal; it is the *switch* that calls `enter`.
+
+Keeping the renderer pure is what lets follow and paging be asserted through painted rows rather than a pty (**F71**).
+
+## F84 applied before the bug, not after it
+
+**F84** (*enumerating the routes out of a state is not enumerating the transitions out of it*) was one card old, and the test author answered it structurally: an **eleven-row transition table** against four keys, with **three transitions no key triggers** — the auto-follow **re-latch** (paging down onto the newest line resumes following), **append while following**, and the one the ring forces: **eviction past the anchor**.
+
+That third one changed the design: `Anchor::Pinned` stores an **absolute** line ordinal (`evicted() + index`) rather than an index into the retained lines, because **an index would drift under eviction while the anchor looked unchanged.** That is the same class of bug as F84's silently-dropped buffer — state that moves underneath something that believes it is still pointing at the same thing — and it was designed out rather than discovered.
+
+**Auto-follow and the paging keys are one card, not two**, for the same reason: they are one state machine with two states, the re-latch is a transition belonging to *neither* half, and splitting them would put one `Anchor` under two cards and give the first a state it cannot reach.
