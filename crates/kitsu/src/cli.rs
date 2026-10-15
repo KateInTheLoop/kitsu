@@ -15,9 +15,13 @@ use clap::{Parser, Subcommand};
 #[derive(Clone, Copy, Debug)]
 struct TuiModeParser;
 
-/// The modes `--tui` accepts. `fullscreen` is T5's renderer and is absent
-/// until it exists, so the name cannot silently select the inline viewport.
-const TUI_FLAG_MODES: [&str; 2] = ["classic", "inline"];
+/// The modes `--tui` accepts, in the order `--help` lists them.
+///
+/// `fullscreen` was absent while its renderer was unreachable, so the name
+/// could not silently select the inline viewport. It is accepted now that a
+/// session can actually start in it: a mode `/tui` switches to must be a mode
+/// the flag can start in, or the two surfaces disagree about the grammar.
+const TUI_FLAG_MODES: [&str; 3] = ["classic", "inline", "fullscreen"];
 
 impl clap::builder::TypedValueParser for TuiModeParser {
     type Value = String;
@@ -303,7 +307,8 @@ pub struct Cli {
     pub skill: Vec<String>,
 
     /// Which renderer interactive chat runs: `classic` (today's line
-    /// renderer) or `inline` (the pinned viewport preview). Overrides the
+    /// renderer), `inline` (the pinned viewport preview) or `fullscreen` (the
+    /// alternate screen, painted from the inline cell ring). Overrides the
     /// config key `[tui] mode`; there is no environment variable — the
     /// `KITSU_TUI` preview gate was retired, so this flag and the config key
     /// are the only two sources, in that order.
@@ -326,13 +331,14 @@ pub struct Cli {
 
 impl Cli {
     /// `--tui` as the config's own mode type, or `None` when the flag is
-    /// absent. clap has already rejected everything but the two accepted
-    /// spellings, so an unreachable third value is a bug here rather than a
-    /// silent fallback to classic.
+    /// absent. clap has already rejected everything but the accepted
+    /// spellings in [`TUI_FLAG_MODES`], so an unreachable value is a bug here
+    /// rather than a silent fallback to classic.
     pub fn tui_mode(&self) -> Option<crate::config::TuiMode> {
         match self.tui.as_deref() {
             Some("classic") => Some(crate::config::TuiMode::Classic),
             Some("inline") => Some(crate::config::TuiMode::Inline),
+            Some("fullscreen") => Some(crate::config::TuiMode::Fullscreen),
             _ => None,
         }
     }

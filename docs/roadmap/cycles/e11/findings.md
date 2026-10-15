@@ -4164,7 +4164,27 @@ T5-S1 splits three ways, and the ordering is the interesting part.
 
 **The precondition is a reader.** Shipping liveness first would spend that memory during the window before the renderer lands — **the exact expenditure the requirement forbids**. So the order is **reader → feed**, and I had it backwards in my brief: I suggested "the ring becomes live" might be the natural *first* piece because it is the bigger change. Bigger, but second.
 
-**The alternate screen needs no code at all.** `TuiRuntime::enter`/`leave` already do the alt-screen, title and raw-mode lifecycle, panic restore and signal restore already cover **N5**, and all of it is tested. What is missing is a **caller** — and the only thing that can select fullscreen is **T5-S2's switch**, which owns that wiring. So **N5's "vacuous today" note is slightly wrong**: it says the clauses become real "when T5's fullscreen renderer uses that runtime", but the renderer is **pure by design** and never touches a terminal; it is the *switch* that calls `enter`.
+**CORRECTED IN T5-S2 — the sentence below was false, and it is the most damaging
+kind of error this file can hold.** `TuiRuntime::enter` writes `PUSH_TITLE`, the
+optional OSC 2 title and raw mode. **It does not write `ESC[?1049h`, and never
+has** — verified: `1049` appears only in `main.rs`, in `run_agent_view_overlay`,
+which has taken the alternate screen since T4-S2. So `enter`/`leave` deliver **one**
+of N5's two clauses (the title), and **the alternate screen is code someone must
+write.** The original claim, kept for the record:
+
+> **The alternate screen needs no code at all.** `TuiRuntime::enter`/`leave` already do the alt-screen, title and raw-mode lifecycle, panic restore and signal restore already cover **N5**, and all of it is tested. What is missing is a **caller** — and the only thing that can select fullscreen is **T5-S2's switch**, which owns that wiring. So **N5's "vacuous today" note is slightly wrong**: it says the clauses become real "when T5's fullscreen renderer uses that runtime", but the renderer is **pure by design** and never touches a terminal; it is the *switch* that calls `enter`.
+
+**How it got in:** I recorded it from an agent's report, which had read it off a doc
+comment's summary rather than the function body — the same shape as **F90**, where a
+deliberate refusal was read as an absence. It then travelled: into my brief, and from
+there into the next agent's own report (*"nothing emits `?1049h` today"* — it is
+emitted today, by the overlay).
+
+**The lesson, and it is about this file rather than the code: a findings entry is read
+by every later card as settled fact, so a false one is worse than a false brief.** A
+brief is questioned by the agent it is handed to; this file is quoted. Entries that
+assert *"X already does Y"* need the line that shows it, or they are hearsay with a
+number on it.
 
 Keeping the renderer pure is what lets follow and paging be asserted through painted rows rather than a pty (**F71**).
 
@@ -4175,3 +4195,207 @@ Keeping the renderer pure is what lets follow and paging be asserted through pai
 That third one changed the design: `Anchor::Pinned` stores an **absolute** line ordinal (`evicted() + index`) rather than an index into the retained lines, because **an index would drift under eviction while the anchor looked unchanged.** That is the same class of bug as F84's silently-dropped buffer — state that moves underneath something that believes it is still pointing at the same thing — and it was designed out rather than discovered.
 
 **Auto-follow and the paging keys are one card, not two**, for the same reason: they are one state machine with two states, the re-latch is a transition belonging to *neither* half, and splitting them would put one `Anchor` under two cards and give the first a state it cannot reach.
+
+## F87 — `install` has two production callers, and I missed the one that mattered
+
+I corrected the previous card's claim that `tui_bridge::install` *"has dozens of call sites across `tui_bridge.rs`'s own test module"* — a **name-match count**, the same error class as my own **F74** (where I recorded "12 construction sites" for a struct by grepping its type name and the real number was two). I counted **three**: one production caller and two tests.
+
+**I was wrong. There are four, and the one I missed is a second production caller:** `main.rs:20650`, the **`/tui inline` re-install** inside the renderer switch, after a classic segment. Verified.
+
+**The consequence, had it stayed unthreaded:** `/tui classic` then `/tui inline` would reinstall a **ring-less** viewport, and the fullscreen overlay would go blind **for the rest of the session** — invisible until someone opened the overlay *after* a renderer switch, which is exactly the kind of state nobody tests by hand.
+
+### Why I made it, having just warned about the opposite error
+
+I grepped `install(` across the crate, filtered the obvious impostors (`SurfaceProbe::install`, `before_install`, `install_panic_restore`), and **read the surviving list** — which was correct as far as it went, but `main.rs:20650` appeared in my own output as a truncated line (`tui_bridge_gu…`) and I did not expand it. **I warned about counting name matches and then undercounted by trusting a truncated line.** This project already has a finding on exactly that: *never assert absence from a truncated search.*
+
+**The durable rule: a count is not finished until every match has been read in full.** Filtering a list is not reading it, and a column-truncated grep is a filtered list.
+
+### The obligation this creates
+
+**Any future parameter added to `install` has a two-site obligation**, and the second site is a re-install that only runs after a mode switch — so forgetting it produces a defect that is **silent until a specific sequence of user actions**. Worth a note wherever `install`'s signature is documented.
+
+### And a gap the author flagged rather than papered over
+
+**Nothing asserts that `main.rs` passes the *configured* value rather than a literal.** There is no seam in `run_chat` to observe it, so the install-level test proves the parameter is **honoured** and the two call sites are **eyeball-verified only**. That is the honest position, stated — not a test pretending to cover it.
+
+## F88 — a fifth flake, from a card of my own
+
+`tests::the_recap_holds_only_what_the_foreground_produced_while_attached` — from **T4-S6c**, two cards ago — failed **once** in a parallel debug `--bins` run, then passed alone and in four of four subsequent full runs. **Captured to its own file from occurrence one** (`scratchpad/flake-the_recap_holds_only_what_the_foreground_produced_while_attached.txt`), per the rule F39's eighth occurrence added.
+
+It is **not** one of the four already on the books. The shape is suggestive: T4-S6c's buffer lives behind a **process-global slot**, and **F84** records that a stale buffer in that same slot caused cross-test interference during that card's own development. So this is plausibly the same global, surfacing under parallelism rather than ordering — which would make it a **test-isolation** defect in the card I accepted, not a product defect.
+
+Not chased, per the rule. Recorded so occurrence two is the second and not the first.
+
+## F89 — REJECTED: the feed landed before a *reachable* reader, and the conflation was mine
+
+T5-S1b is correct code, fully tested, every gate green — and **rejected**, because it spends memory N4 forbids spending.
+
+### What N4 actually says
+
+> the ring is **not fed in production until R6's overlay reads it** — feeding an unread ring would spend up to ten thousand styled lines of memory for no benefit.
+
+**R6's overlay** is T4-S9's transcript overlay. **It does not exist.**
+
+### What I wrote in the brief
+
+> *"T5-S1a shipped the reader (`2cd3559`, the pure fullscreen view). **It is the reader N4 required before the feed.**"*
+
+**That sentence is wrong, and it is mine.** T5-S1a shipped a **pure view with no caller** — deliberately so, and I accepted it on that basis, noting in its own cycle record that *"no user-visible behaviour ships here — the view has no caller yet."* Verified now: `FullscreenView` is constructed **only inside test modules**, and every reader of the ring outside its own definition is a test.
+
+So after T5-S1b, every inline session retains up to **ten thousand styled lines** that **nothing in production can display** — N4's forbidden state, reached by a card whose brief cited N4 as its authority.
+
+### The distinction I lost
+
+**A reader that exists is not a reader that reads.** F86 argued the ordering correctly — reader before feed — and I turned "a reader exists" into "the precondition is met" without asking whether anything *reaches* it. The pure view's purity, which was its virtue in T5-S1a, is exactly what makes it not a reader: it holds no terminal, has no key, and nobody calls it.
+
+**This is the seventh variant in this epic of *the thing we checked was not the thing that matters*** — after F57 (a registered command nobody dispatched), F69 (a mirror that stopped reflecting), F70 (a rule no keystroke could satisfy), F71 (a message only the test could see), F75 (a state nobody read) and F79 (a caller nobody enumerated). **And it is the first where I was the one who wrote the false premise into the brief**, rather than inheriting or failing to catch it.
+
+It is also the same shape as two cards I **rejected**: a key that *appears* to work, and a state nobody reads. **Memory nobody can read is that again.** Accepting it would make the standard I enforce on agents one I do not apply to myself.
+
+### The rework
+
+**The feed must land with, or after, a reader a user can reach** — not merely a type that compiles. So T5-S1b merges with the wiring: the fullscreen view needs a production caller before the ring is fed. The implementation itself is sound and should be reused verbatim; only its **order** is wrong.
+
+Concretely, one of:
+- **wire the view** (T5-S2's `/tui fullscreen` switch, which also owns the alternate screen N5 needs) and feed the ring in the same card; or
+- **gate the feed** on the renderer actually being fullscreen, so inline-only sessions pay nothing — a product change, and the weaker option, since N4 names the ring as inline's scrollback.
+
+**N4 also needs amending** either way: it names "R6's overlay" as the reader, and there are now **two** candidate readers (the transcript overlay and the fullscreen view). Whichever lands first should be named, because this ambiguity is what let the conflation through.
+
+## F90 — `fullscreen` was never missing: it was a tested refusal, and my brief called it a gap
+
+The rework agent **stopped without writing a test** and was right to. Two things it found, both verified by me.
+
+### The premise was false, again, and in a new way
+
+My brief said: *"`fullscreen` is the one spelling it lacks."* **It is not lacked. It is present as a deliberate, multiply-pinned refusal.**
+
+`main.rs:22842` has a third `/tui` arm whose own comment reads *"`fullscreen` is a mode the design's grammar has, and it is inert here"*, printing `/tui fullscreen is not available yet; accepted: classic, inline`. Around it: twelve call sites of the accepted-modes literals, **four test functions** asserting the refusal, and a `/help` details string saying *"`fullscreen` is not available yet: it arrives with its own renderer"* — itself asserted.
+
+**So this card's cost is not "add a variant". It is retiring a boundary that four tests and a help string exist to hold.** That is a different card shape, and my brief priced it as the cheap one. Eleventh mechanism error in my briefs, and the first where the mistake was reading a **deliberate, documented state as an absence**.
+
+**The lesson: "X is missing" and "X is refused" look identical from the outside and are opposite facts.** A grep for the accepted list finds the former; only reading the arm finds the latter. I have now made the inverse error too (**F87**: reading a truncated line as the whole list).
+
+### A test that passes by luck
+
+`tui_mode_rejects_unknown_values_instead_of_falling_back_to_classic` requires the error message to contain `` "`classic`, `inline`" ``. Verified: `TUI_MODES` is exactly that string, and `"expected one of `classic`, `inline`, `fullscreen`"` **still contains it**. So that test survives this card **by luck, not by design.**
+
+**That is F41's hazard running backwards.** F41 banned substring *bans* because they constrain the product; this is a substring **require** that keeps passing after the thing it describes has changed. A requirement-shaped assertion that cannot fail when its subject changes is as empty as a ban that forbids the wrong things. **It should be strengthened in the same card**, not left to pass silently.
+
+### And one correction to the agent's framing
+
+It wrote that *"the tree is already in N4's forbidden state, so 'never feed an unread ring' is no longer achievable by ordering; only shortening the window is."* True of the **working tree** — and not of **HEAD**, which is why the rejection mattered. The feed is uncommitted, so **committed history never enters the forbidden state**, and ordering is still fully achievable: the feed and a reachable reader land in one commit, or neither does.
+
+**Worth stating because it is the point of rejecting rather than following up:** a follow-up card would have left a commit in history where the ring is fed and unreadable. The reject keeps that window from ever existing.
+
+## F91 — a false entry in this file is worse than a false brief
+
+**F86 contained a flatly false sentence for three cards**: *"The alternate screen needs no code at all. `TuiRuntime::enter`/`leave` already do the alt-screen, title and raw-mode lifecycle."*
+
+Verified false: `enter` writes `PUSH_TITLE`, the optional OSC 2 title and raw mode — **no `ESC[?1049h`**. That sequence appears **only** in `main.rs`, in `run_agent_view_overlay`, which has taken the alternate screen since **T4-S2**. So the runtime delivers **one** of N5's two clauses, and the alternate screen is code someone must write. Corrected in place at F86, with the original kept.
+
+### How it travelled, which is the point
+
+1. An agent read it off a **doc comment's summary** rather than the function body, and reported it.
+2. **I recorded it in this file without checking** — the one step where checking was cheapest and mattered most.
+3. It went into my next brief as established fact.
+4. The agent receiving that brief **repeated a corollary of it** in its own report (*"nothing emits `?1049h` today"* — it is emitted today, by the overlay), having taken it from the brief without grepping.
+
+Four hops, one unverified read, and at no point did anything fail. **The only thing that stopped it was an agent reading `lib.rs:109` while writing a test against bytes.**
+
+### The rule
+
+**A findings entry is read by every later card as settled fact, so a false one is worse than a false brief.** A brief is handed to an agent who questions it — that is what the eleven corrections to my briefs are. This file gets **quoted**, including by me, including into briefs.
+
+**So: an entry that asserts *"X already does Y"* needs the line that shows it, or it is hearsay with a number on it.** Every claim in this file about what the code *does* — as opposed to what a card *decided* — should carry a file and line, and the ones that already do are the ones that have never misled anyone.
+
+### Related, and why this one is not F90
+
+**F90** was reading a **deliberate refusal** as an absence — the code said one thing and I read another. **This** is reading a **summary** as the implementation: the doc comment was not wrong, it was a summary, and the summary was over-read. Both produce a confident false claim about existing code; the first is cured by reading the arm, the second by reading the body rather than the comment above it.
+
+The test author's response to finding it is the part worth copying: it had already written the assertions **against bytes rather than call sites**, so the error changed nothing it had to redo and left the implementer free to source the alternate screen from anywhere. **A test that pins an observable byte survives being wrong about which function emits it.**
+
+## F92 — the cell ring does not record the binary's diagnostics, and nothing had ever said so
+
+The implementer stopped on `tui_switch_from_inline_into_fullscreen_repaints_the_ring` and was right to. **The test's premise is false, and I specified it.**
+
+**Measured, not inferred.** It temporarily printed the retained count inside the alternate screen so it landed in the panic's tail:
+
+```
+DEBUGRING retained=0
+```
+
+**Why:** the binary's own `eprintln!` is a `macro_rules!` at `main.rs:221` that expands to **`std::eprintln!`** — straight to fd 2. The ring is fed **only** by surface-routed writers (`InlineSurface::transcript_line`/`write_block`, reached from `print_fragment`, `finish_line`, `tool_activity`, `tool_result_error`, `milestone`, `render_error`). `TUI_MARK_1` is `/theme zz1`'s error, printed through that macro, so **it never enters the ring in any mode.**
+
+The feed is live and the reader reads it. **They simply never meet on a session with no turn and no tool call** — which is every script in that test.
+
+### The requirements fact this exposes
+
+**N4 says the ring is "the sole source for the transcript overlay and the `[` dump" and never says what it is a record *of*.** It turns out to be **the rendered conversation** — model output, tool activity, milestones — and **not** the binary's diagnostics, receipts or command errors. That distinction was never written down, and it is load-bearing: it decides what a user sees when they scroll back in fullscreen.
+
+### The decision, and why the cheap option is the wrong one
+
+Two ways to make the assertion satisfiable:
+
+- **(a) Use a surface-routed marker** — a streamed turn, a tool result, or a `kitsu_render::milestone` call. **Taken.** The assertion keeps its full force: a second occurrence after the `?1049h` offset still can only come from a reader that read the ring.
+- **(b) Route the binary's diagnostics into the ring.** **Rejected.** It looks like a one-place change to the `eprintln!` macro, which is exactly what makes it dangerous: it would re-route several hundred call sites onto `transcript_line`/`write_block`, change **inline** line endings (`transcript_line` writes its own `\r\n` while `ONLCR` is on), change **classic** bytes too (`ClassicSurface::transcript_line` wraps writes in `with_live_row_suspended`), reorder diagnostics against `println!`, and make the ring far fuller than N4's sizing assumed. **309 tests pin those bytes.**
+
+**(b) is a requirements change about what the ring records, disguised as a wiring fix.** The implementer refused to take it and asked, which is the correct instinct: *a one-line change with a three-hundred-test blast radius is not a small change.*
+
+### Method worth copying
+
+**It settled the question by measuring rather than reasoning** — a temporary print inside the alternate screen, placed where the failure's own output would carry it out. Then removed, with `grep -c` to prove it. Three cards have now been decided by a disposable measurement rather than an argument.
+
+## F93 — why the alternate screen is not taken through `TuiRuntime`, which vindicates writing it directly
+
+**F91** corrected my false claim that `TuiRuntime::enter` already takes the alternate screen. It does not — but there is a second, stronger reason not to route fullscreen through it, which the implementer found and which belongs beside the correction:
+
+**`TuiRuntime::enter` also calls crossterm's `enable_raw_mode`, which clears `OPOST`.** This binary has **several hundred direct `println!`/`eprintln!` writers**, and `run_agent_view_overlay`'s own comment already records the consequence: *"Enabling a second, fuller raw mode here (crossterm's, which clears OPOST) would staircase all of them down the screen."* It would also nest a second raw mode under `RawStdinGuard`, whose dying-signal restore snapshots termios.
+
+So the fullscreen segment writes the four sequences itself (`?1049h`+clear+home, `?1049l`, `22;2t`, `23;2t`) and **leaves termios alone** — raw mode in this process stays `RawStdinGuard`'s. The tests assert bytes, so this was permitted, and it is the right answer rather than a workaround.
+
+**The general shape: a runtime that bundles two capabilities is unusable by a caller that wants one of them.** N5's title clause and its alt-screen clause looked like one lifecycle; they are separable, and one of them drags termios with it.
+
+## F94 — a signal or panic in fullscreen leaves the alternate screen taken
+
+Flagged by the implementer rather than widened into this card. **`install_exit_restore` gives back the inline region only**, and nothing restores the alternate screen on a dying signal or a panic while fullscreen is active.
+
+**N5 requires restore on every exit path including panics and signals.** The inline path has it; the new mode does not. It is a real hole and it is **not** what this card's tests pin — so it is carded, not quietly patched, and N5 should record that its signal clause is met for inline and open for fullscreen rather than reading as satisfied.
+
+### F92 sharpened — there are TWO bypasses, and what lands in the ring depends on whether tools were offered
+
+Option (a) was authorised and **its obvious form failed too.** Re-scripted onto a plain streamed answer, the ring held **one line, and it was empty**:
+
+```
+DEBUGRING n=1 lines=[""]
+```
+
+A **second** bypass, independent of `eprintln!`:
+
+- `orchestrator.rs:1727` — *when tools are advertised this round, text is **not** streamed live; it is buffered.* Interactive chat advertises six tools by default, so `print_fragment` is never called on a single-turn answer.
+- The buffered answer is printed by **`kitsu_render::print_message`**, which does `let mut out = io::stdout(); out.write_all(…)` **directly**, inside `with_live_row_suspended`, **never through the surface seam**. Verified at `kitsu-render/src/lib.rs:439`.
+- The one line the ring did get came from `finish_line`'s trailing newline: `"\n".lines()` is `[""]`.
+
+**So the ring carries the *streamed* conversation, not the rendered conversation** — and **what lands in it depends on whether tools were offered that round.** Nobody would guess that from N4, and it is the fact a user scrolling back in fullscreen will meet: *the same answer is in the ring or not depending on whether the model was offered tools.*
+
+This also explains **F51** from the other side: with tools enabled an ordinary answer does not stream, which was recorded as a product decision about *visible* behaviour. It turns out to decide what the scrollback **contains** as well.
+
+**The test ships with `--no-tools`**, which makes the answer stream through `print_fragment` → `write_block` → the ring, using harness machinery that already existed.
+
+**A third discovery, written into the script so nobody re-derives it:** triggering `/tui` on the turn-done marker is **not** enough. That summary line is printed *by* the turn, so a line sent the instant it appears still reaches the mid-turn collector and is refused with *"~ /tui is accepted only between turns"*. `/quit` is not gated that way, which is why every other streaming script can trigger on that marker and this one cannot; it uses the harness's own bounded pause instead.
+
+**Non-vacuity here is a measurement, not an argument.** This one assertion **failed twice today for two different reasons** — ring empty via `eprintln!`, ring empty via buffered `print_message` — and passes only with a surface-routed line present **and** a reader that pulls it out. A view that merely compiles fails it; a fed ring with no reader fails it.
+
+**And the discipline worth copying:** it passed once *with* the second debug print still in place, so the agent re-ran after removing it rather than trusting that green. **A pass obtained with instrumentation in the tree is not a pass.**
+
+## F95 — my own heredoc ate a word out of a cycle record
+
+Small, mine, and worth one line because it is a tooling trap I have been walking past for fifty commits.
+
+Cycle records are written with `cat > file <<EOF` — an **unquoted** delimiter, because the template interpolates a timestamp. That means **backticks inside the body are executed as command substitution**, and this project's prose is full of backticked identifiers. I have been escaping each one by hand; this time one escaped my escaping, and `` `fullscreen` `` was run as a command. Bash said `fullscreen: command not found`, the word was replaced with nothing, and the sentence shipped as *"brief said \" is the one spelling it lacks.\""* — in the very paragraph about reading code carefully.
+
+Repaired, and the commit amended (local and unpushed).
+
+**The fix for next time is not more care, it is a different tool:** compute the timestamp into the file afterwards, or use a quoted delimiter and substitute the one variable with `sed`/Python. **A hand-escaping discipline applied to dozens of occurrences per file will fail on one of them** — which is the same argument as **F82**'s (*a rule applied per-change is not a rule enforced*), in my own toolchain rather than the product's.
+
+Nothing else was affected: the cycle record's remaining backticks were escaped correctly, the findings file uses a **quoted** delimiter throughout, and no source file is written this way.

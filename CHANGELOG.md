@@ -131,6 +131,15 @@ shapes may change in any minor release.
   **A refusal never eats your line:** if the agent finished, stopped, or blocked
   while you were typing, nothing is sent, you are told why in the agent's own
   words, and your text is still in the composer.
+- **A fullscreen renderer.** `/tui fullscreen` (also `--tui fullscreen` and
+  `[tui] mode = "fullscreen"`) takes the terminal's alternate screen and paints
+  the viewport's scrollback, and gives the screen and your window title back when
+  you switch away. Switching keeps the conversation, as the other modes do.
+  Paging keys are not wired yet, so it shows the most recent lines.
+  **What the scrollback holds is worth knowing:** the streamed conversation --
+  not kitsu's own messages and receipts, and not an answer that was buffered
+  because tools were offered that round, which is the default. Run with
+  `--no-tools` and answers stream, and the scrollback has them.
 - **`/help keys`** prints the agent view's key bindings without opening the view,
   and the view's own `?` help now prints the same rows from the same table — so
   the two can no longer disagree about what a key does.

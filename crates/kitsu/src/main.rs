@@ -5633,9 +5633,9 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "tui",
-        args: "[classic|inline]",
+        args: "[classic|inline|fullscreen]",
         description: "report or switch the live renderer",
-        details: "Switches the renderer in place: `classic` is the line renderer kitsu has always had, `inline` is the pinned bottom viewport. The conversation is unchanged by a switch — the transcript already on screen stays exactly where it is, and nothing is replayed. Bare /tui reports the renderer in use. Accepted only between turns; a /tui typed during a turn is refused rather than queued. `fullscreen` is not available yet: it arrives with its own renderer. Persist a choice with `mode = \"inline\"` under `[tui]` in the config or --tui.",
+        details: "Switches the renderer in place: `classic` is the line renderer kitsu has always had, `inline` is the pinned bottom viewport, `fullscreen` takes the terminal's alternate screen and repaints the tail of the transcript the inline viewport retained. The conversation is unchanged by a switch — the transcript already on screen stays exactly where it is, and nothing is replayed, except into fullscreen, where the alternate screen starts blank and the retained tail is painted onto it. Leaving fullscreen gives the screen back untouched. Bare /tui reports the renderer in use. Accepted only between turns; a /tui typed during a turn is refused rather than queued. Persist a choice with `mode = \"inline\"` under `[tui]` in the config or --tui.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -19418,8 +19418,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // renderer at the idle-prompt seam by dropping this guard (which runs the
     // established teardown in its established order) or by installing a fresh
     // one. There is deliberately no second teardown path.
+    // Card **T5-S2**: the fullscreen segment is the second half of the same
+    // decision, so it is resolved in the same block and from the same mode.
+    // `None` in classic and inline; `Some` for as long as this session holds
+    // the terminal's alternate screen, which is what `/tui`'s report and the
+    // switch arm below both key on. Dropping it gives the screen and the
+    // title back, on a renderer switch and on every exit path out of this
+    // function alike.
     #[cfg(unix)]
-    let mut tui_bridge_guard = {
+    let (mut tui_bridge_guard, mut fullscreen_segment) = {
         // T3-S2 resolves the whole `[tui]` table here, at the one point where
         // the renderer is chosen. Only `mode` has a consumer today; the
         // remaining four are resolved and bound so that the alternate-screen
@@ -19437,15 +19444,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         });
         // Still resolved here and still without a consumer: the
         // alternate-screen force (the agent view takes the alternate screen
-        // unconditionally today), the title row and the cell ring.
+        // unconditionally today) and the title row. The cell ring is no longer
+        // parked here -- it is handed to `install` below.
         let _resolved_tui = (
             setup.tui.effective_alternate_screen(cli.no_alt_screen),
             setup.tui.title,
-            setup.tui.cell_ring_lines,
         );
         let mode = match setup.tui.effective_mode(cli.tui_mode()) {
             crate::config::TuiMode::Classic => tui_bridge::TuiMode::Classic,
             crate::config::TuiMode::Inline => tui_bridge::TuiMode::Inline,
+            crate::config::TuiMode::Fullscreen => tui_bridge::TuiMode::Fullscreen,
         };
         // A failed geometry probe (not a terminal, or an ioctl refusal) falls
         // back to the conventional 80x24, the same fallback the renderer's own
@@ -19455,6 +19463,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             mode,
             rows,
             1,
+            setup.tui.cell_ring_lines,
             "kitsu",
             Box::new(std::io::stdout()),
             Box::new(std::io::stderr()),
@@ -19468,7 +19477,19 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             // stream is unchanged, signal or no signal.
             tui_bridge::install_exit_restore();
         }
-        installed
+        // `install` is inert in fullscreen -- it pins no region and installs
+        // no surface -- so the alternate screen is taken here instead, with
+        // an empty frame: a session that starts in fullscreen has no inline
+        // segment behind it and therefore no ring to repaint.
+        let fullscreen = (mode == tui_bridge::TuiMode::Fullscreen).then(|| {
+            tui_bridge::enter_fullscreen(
+                Box::new(std::io::stderr()),
+                &[],
+                rows,
+                kitsu_render::live::terminal_columns(),
+            )
+        });
+        (installed, fullscreen)
     };
     let publish_agent_state = |turn_active: bool| {
         if !agent_state_enabled {
@@ -20614,7 +20635,22 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     {
                         match request {
                             TuiRendererRequest::Classic => {
-                                if tui_bridge_guard.is_some() {
+                                if fullscreen_segment.is_some() {
+                                    // Dropping the segment **is** the
+                                    // teardown here too: the alternate screen
+                                    // is given back and the title popped, in
+                                    // that order, by the one `Drop` every
+                                    // other exit path runs as well. The
+                                    // terminal is then whole -- this session
+                                    // owns no pinned row, no scroll region,
+                                    // no alternate screen and no title of its
+                                    // own.
+                                    fullscreen_segment = None;
+                                    eprintln!(
+                                        "~ switched to the {} renderer; the conversation is unchanged",
+                                        request.label()
+                                    );
+                                } else if tui_bridge_guard.is_some() {
                                     // Dropping the guard **is** the teardown,
                                     // in the order earlier cards established:
                                     // the status painter is unpublished, then
@@ -20641,6 +20677,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                         request.label()
                                     );
                                 } else {
+                                    // Out of fullscreen first, when that is
+                                    // where this session was: the alternate
+                                    // screen has to be given back *before*
+                                    // the viewport pins a region and writes
+                                    // its pinned row, or the user's
+                                    // transcript lands on a screen that is
+                                    // about to be discarded. A terminal too
+                                    // short for a region then leaves the
+                                    // session on classic, which the message
+                                    // below says -- the screen is given back
+                                    // either way.
+                                    fullscreen_segment = None;
                                     // The geometry is probed again rather than
                                     // remembered: the terminal may have been
                                     // resized during the classic segment, when
@@ -20651,6 +20699,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                         tui_bridge::TuiMode::Inline,
                                         rows,
                                         1,
+                                        setup.tui.cell_ring_lines,
                                         "kitsu",
                                         Box::new(std::io::stdout()),
                                         Box::new(std::io::stderr()),
@@ -20697,6 +20746,49 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                             "the inline renderer needs a terminal at least 3 rows tall; staying on the classic renderer"
                                         ),
                                     }
+                                }
+                            }
+                            TuiRendererRequest::Fullscreen => {
+                                if fullscreen_segment.is_some() {
+                                    eprintln!(
+                                        "~ already using the {} renderer; nothing changed",
+                                        request.label()
+                                    );
+                                } else {
+                                    // Requirement **N4**: the ring is the
+                                    // inline viewport's scrollback, and it
+                                    // belongs to the surface the teardown is
+                                    // about to put back -- so it is read
+                                    // *before* the guard is dropped. Out of
+                                    // classic there is no guard and therefore
+                                    // no ring, and the frame is empty: classic
+                                    // feeds nothing, so there is nothing to
+                                    // repaint and nothing is painted.
+                                    let retained = tui_bridge_guard
+                                        .as_ref()
+                                        .and_then(tui_bridge::BridgeGuard::cell_lines)
+                                        .unwrap_or_default();
+                                    // The inline teardown, in its established
+                                    // order and through the one path that
+                                    // runs it, before any byte reaches the
+                                    // alternate screen.
+                                    tui_bridge_guard = None;
+                                    // Probed again, for the reason the inline
+                                    // arm gives: the terminal may have been
+                                    // resized while no viewport was listening
+                                    // for SIGWINCH.
+                                    let (cols, rows) =
+                                        crossterm::terminal::size().unwrap_or((80, 24));
+                                    fullscreen_segment = Some(tui_bridge::enter_fullscreen(
+                                        Box::new(std::io::stderr()),
+                                        &retained,
+                                        rows,
+                                        cols as usize,
+                                    ));
+                                    eprintln!(
+                                        "~ switched to the {} renderer; the conversation is unchanged",
+                                        request.label()
+                                    );
                                 }
                             }
                         }
@@ -21579,7 +21671,8 @@ enum SlashResult {
     ArchiveSession(String),
     RestoreSession(String),
     DeleteSession(String),
-    /// `/tui classic|inline`: swap the live renderer between turns.
+    /// `/tui classic|inline|fullscreen`: swap the live renderer between
+    /// turns.
     ///
     /// Carried out of the dispatcher rather than performed in it, because the
     /// swap is the `BridgeGuard`'s business and the guard is a `run_chat`
@@ -21596,6 +21689,7 @@ enum SlashResult {
 enum TuiRendererRequest {
     Classic,
     Inline,
+    Fullscreen,
 }
 
 impl TuiRendererRequest {
@@ -21603,14 +21697,15 @@ impl TuiRendererRequest {
         match self {
             TuiRendererRequest::Classic => "classic",
             TuiRendererRequest::Inline => "inline",
+            TuiRendererRequest::Fullscreen => "fullscreen",
         }
     }
 }
 
 /// The modes `/tui` accepts, named in every message it prints so a user who
-/// reads any one of them learns the whole grammar. `fullscreen` is T5's
-/// renderer and is deliberately absent.
-const TUI_ACCEPTED_MODES: &str = "accepted: classic, inline";
+/// reads any one of them learns the whole grammar, `fullscreen` among them
+/// now that a session can both start in it and switch into it.
+const TUI_ACCEPTED_MODES: &str = "accepted: classic, inline, fullscreen";
 
 /// The refusal a `/tui` typed **during a turn** gets.
 ///
@@ -22834,13 +22929,11 @@ async fn handle_slash(
                 }
                 "classic" => SlashResult::SwitchTui(TuiRendererRequest::Classic),
                 "inline" => SlashResult::SwitchTui(TuiRendererRequest::Inline),
-                // Refused **by name**, not as a typo and not as an unknown
-                // command: `fullscreen` is a mode the design's grammar has,
-                // and it is inert here — nothing is torn down or pinned.
-                "fullscreen" => {
-                    eprintln!("/tui fullscreen is not available yet; {TUI_ACCEPTED_MODES}");
-                    SlashResult::Error
-                }
+                // The third renderer, answered exactly like the other two.
+                // This arm used to refuse the name by hand, while the mode had
+                // no renderer to select; it has one now, so the refusal is
+                // retired rather than left to tell the user something untrue.
+                "fullscreen" => SlashResult::SwitchTui(TuiRendererRequest::Fullscreen),
                 other => {
                     eprintln!(
                         "unknown tui mode '{}'; {TUI_ACCEPTED_MODES}",
@@ -30716,8 +30809,8 @@ mod tests {
             .iter()
             .find(|spec| spec.name == "tui")
             .expect("/tui is registered");
-        assert_eq!(tui.args, "[classic|inline]");
-        assert_eq!(tui.syntax(), "/tui [classic|inline]");
+        assert_eq!(tui.args, "[classic|inline|fullscreen]");
+        assert_eq!(tui.syntax(), "/tui [classic|inline|fullscreen]");
         assert_eq!(
             tui.alias_of, None,
             "/tui is a command in its own right, not an alias"
@@ -30727,18 +30820,32 @@ mod tests {
             CommandGroup::Session,
             "the renderer is session state, which is where /theme lives too"
         );
-        // The advertised vocabulary is exactly `[tui] mode`'s: `fullscreen` is
-        // T5's renderer and must not be advertised by a surface that would
-        // then refuse it.
+        // The advertised vocabulary is exactly `[tui] mode`'s, and **T5-S2
+        // inverts this clause**: until this card the assertion here was
+        // `!tui.args.contains("fullscreen")`, on the ground that "the args row
+        // must not advertise a mode that is refused". `fullscreen` is no
+        // longer refused — it has its renderer, its switch arm and its
+        // alternate screen — so the same rule now obliges the opposite. The
+        // rule did not change; its subject did.
         assert!(
-            !tui.args.contains("fullscreen"),
-            "the args row must not advertise a mode that is refused: {}",
+            tui.args.contains("fullscreen"),
+            "the args row must advertise every mode the switch accepts, and \
+             `fullscreen` is now one of them: {}",
             tui.args
         );
         assert!(
             tui.details.contains("fullscreen"),
-            "the details, however, must say where `fullscreen` went, because \
-             the design's grammar has it: {}",
+            "the details must still describe `fullscreen`, because the \
+             design's grammar has it: {}",
+            tui.details
+        );
+        // ...and must no longer describe it as absent. This is the assertion
+        // that catches the half-done card: a renderer that ships behind a
+        // help string still telling the user it has not shipped.
+        assert!(
+            !tui.details.contains("not available yet"),
+            "the details must not still announce `fullscreen` as unavailable \
+             once the renderer is reachable: {}",
             tui.details
         );
         assert!(
@@ -30746,6 +30853,44 @@ mod tests {
             "and must state R2's gate — a switch keeps the conversation: {}",
             tui.details
         );
+    }
+
+    /// **T5-S2.** The two literals `/tui`'s own messages are built from, and
+    /// the third renderer request.
+    ///
+    /// Pinned as equalities rather than `contains` for the reason F90 gives:
+    /// `TUI_ACCEPTED_MODES` was `"accepted: classic, inline"` and every
+    /// message that interpolates it keeps containing that string after a
+    /// third mode is appended, so a `contains` here would survive this card
+    /// without noticing it. What is asserted is what the constant **is**.
+    ///
+    /// This is a vocabulary test, not a reachability one. That a `/tui
+    /// fullscreen` typed at a prompt actually reaches
+    /// `TuiRendererRequest::Fullscreen`, enters the alternate screen and
+    /// paints the ring is **F89**'s question, and no unit test can answer it:
+    /// it is answered in `tests/tui.rs` on the raw byte stream.
+    ///
+    /// The third variant's own label is **deliberately not named here.**
+    /// `TuiRendererRequest::Fullscreen` does not exist yet, and a unit test
+    /// that named it would not fail — it would fail to **compile**, taking
+    /// all 927 `--bins` tests with it and hiding every other result in this
+    /// card. A failing-first test has to leave the suite legible. The label
+    /// is pinned where it is user-visible instead:
+    /// `TUI_SWITCHED_TO_FULLSCREEN` in `tests/tui.rs` is the receipt
+    /// `run_chat` builds from `label()`, so a variant labelled anything but
+    /// `"fullscreen"` fails there.
+    #[test]
+    fn the_tui_vocabulary_names_all_three_renderers() {
+        assert_eq!(TUI_ACCEPTED_MODES, "accepted: classic, inline, fullscreen");
+        assert_eq!(TuiRendererRequest::Classic.label(), "classic");
+        assert_eq!(TuiRendererRequest::Inline.label(), "inline");
+        // Tightened once the variant existed. The doc above states where the
+        // third label is pinned *instead* (`TUI_SWITCHED_TO_FULLSCREEN`, in
+        // the pty suite, because naming the variant here before it existed
+        // would have been a compile failure rather than a test failure). The
+        // two pins are not redundant now that both can be had: one fails in
+        // three seconds, the other in forty-seven.
+        assert_eq!(TuiRendererRequest::Fullscreen.label(), "fullscreen");
     }
 
     /// The remaining registry-fed sites, in one test, because one entry is
@@ -30763,14 +30908,20 @@ mod tests {
     #[test]
     fn every_registry_fed_surface_shows_the_tui_switch() {
         let help = slash_help("test-model", false);
+        // T5-S2 re-quotes both literals, mechanically. This test holds no
+        // opinion about the mode vocabulary — its subject is registry drift,
+        // "no unchecked string literal of its own on these four surfaces" —
+        // so when `SlashCommandSpec::args` gains a mode, the string these
+        // traversals must equal gains it too. The claim is unchanged; the
+        // quotation of the registry's own output is what moved.
         assert!(
-            help.contains("/tui [classic|inline]"),
+            help.contains("/tui [classic|inline|fullscreen]"),
             "/help lists the command: {help}"
         );
 
         let detail = slash_command_help("tui");
         assert!(
-            detail.starts_with("/tui [classic|inline]"),
+            detail.starts_with("/tui [classic|inline|fullscreen]"),
             "/help tui leads with the syntax: {detail}"
         );
 

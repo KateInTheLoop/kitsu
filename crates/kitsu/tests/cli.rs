@@ -20281,9 +20281,14 @@ fn test_help_exposes_the_tui_mode_flag_and_no_alt_screen() {
         stdout.contains("--no-alt-screen"),
         "--no-alt-screen must appear: {stdout}"
     );
+    // T5-S2: `fullscreen` has its renderer, so `--tui` advertises it. The
+    // intent is unchanged — every mode the flag accepts is discoverable from
+    // `--help` and no accepted mode is hidden — and the list is pinned whole
+    // rather than by a `contains` per mode, so appending a fourth mode
+    // without saying so here fails.
     assert!(
-        stdout.contains("[possible values: classic, inline]"),
-        "the accepted modes must be listed (fullscreen is T5): {stdout}"
+        stdout.contains("[possible values: classic, inline, fullscreen]"),
+        "the accepted modes must be listed, fullscreen among them: {stdout}"
     );
 }
 
@@ -20293,7 +20298,20 @@ fn test_help_exposes_the_tui_mode_flag_and_no_alt_screen() {
 #[test]
 fn test_tui_flag_rejects_an_unknown_mode_naming_the_value() {
     let home = TempDir::new().unwrap();
-    for value in ["Inline", "INLINE", "viewport", "fullscreen", "1", ""] {
+    // `fullscreen` left this list in T5-S2 and joined the accepted one
+    // below: the mode now has a renderer, so the flag must take it. The
+    // intent survives intact — a value typed on purpose is clap's own loud
+    // error and never a silent fallback to classic — and the case typos stay
+    // here, which is what keeps the move from being a relaxation.
+    for value in [
+        "Inline",
+        "INLINE",
+        "viewport",
+        "Fullscreen",
+        "FULLSCREEN",
+        "1",
+        "",
+    ] {
         let output = base_cmd(home.path())
             .args(["--tui", value, "doctor"])
             .output()
@@ -20309,9 +20327,11 @@ fn test_tui_flag_rejects_an_unknown_mode_naming_the_value() {
         );
     }
 
-    // ...and the two accepted values are accepted, so the loop above is not
-    // rejecting every invocation.
-    for value in ["classic", "inline"] {
+    // ...and the accepted values are accepted, so the loop above is not
+    // rejecting every invocation. `fullscreen` is one of them now, and this
+    // is the surface Decision 1 of T5-S2 is about: a mode a session can
+    // switch to must be a mode it can *start* in.
+    for value in ["classic", "inline", "fullscreen"] {
         let output = base_cmd(home.path())
             .args(["--tui", value, "doctor"])
             .output()

@@ -201,6 +201,23 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   losing the conversation; `--tui <mode>` and `[tui] mode` in `kitsu.toml`
   set the start mode.
 
+  **R2 is complete as of T5-S2.** `fullscreen` was never *missing* — it was a
+  **deliberate, multiply-pinned refusal** (**F90**): an arm whose own comment
+  called it *"a mode the design's grammar has"*, twelve call sites of the
+  accepted-modes literals, four test functions and an asserted `/help` string
+  saying it *"is not available yet"*. **Retiring that boundary, not filling a
+  gap, was the card's actual cost** — seven test collisions, six authorised
+  changes by name, and two stops.
+
+  All three spellings now accept it, and **they cross together on purpose**:
+  the code calls them *"the one spelling `/tui`, `--tui` and `[tui] mode` all
+  use"*, and a mode you can switch to but cannot start in would be incoherent.
+  The four advertised surfaces — `/tui`'s args/syntax, `/help tui`'s details,
+  `--tui`'s possible values, and `[tui] mode`'s error — are pinned as **one
+  vocabulary**, with an added ban on the details still announcing fullscreen as
+  unavailable: *a renderer that ships behind a help string saying it has not
+  shipped is a half-done card.*
+
   **Completed in T3-S9, which decided three things R2 left open.** All three are
   user-visible rules, not implementation details, so they belong here:
   - **`fullscreen` is refused** until T5's renderer exists, naming what is
@@ -1043,6 +1060,26 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   structural-marker substitution is **not** applied at storage — it is an output
   transform, not a storage one.
 
+  **What the ring is a record of — never stated until T5-S2 had to measure it
+  (F92).** It is the **streamed** conversation, and **not**: the binary's own
+  diagnostics, receipts or command errors (`eprintln!` expands to
+  `std::eprintln!` and goes straight to fd 2), nor a **buffered** answer
+  (`print_message` writes directly to stdout inside the live-row suspension).
+  Because text is buffered rather than streamed **whenever tools are advertised
+  that round**, and interactive chat advertises six by default, **what the
+  scrollback contains depends on whether the model was offered tools** — the same
+  answer is in the ring or not accordingly. That is the fact a user scrolling
+  back in fullscreen meets, and it sharpens **F51** from the other side: that
+  finding recorded buffering as a decision about *visible* behaviour, and it also
+  decides what the scrollback **holds**.
+
+  **Routing the binary's diagnostics into the ring was considered and rejected**
+  (**F92**): it looks like a one-place macro change and would re-route several
+  hundred call sites, change **inline** line endings and **classic** bytes,
+  reorder diagnostics against `println!`, and make the ring far fuller than the
+  sizing here assumed — with **309 tests** pinning those bytes. It is a
+  requirements change about what the ring records, disguised as a wiring fix.
+
   **The reader lands before the feed (T5-S1, F86).** This clause says the ring is
   not fed until something reads it — so the **order of work follows from the
   requirement**: the fullscreen view (T5-S1a) ships first and is the reader;
@@ -1131,6 +1168,36 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   **no caller in the binary**, so nothing pushes a title or enters the alt
   screen and nothing has to restore them. A test asserting their restore would
   pass by construction, which is why none was written.
+
+  **Status as of T5-S2: the title clause is MET, the alt-screen clause is MET for
+  a normal switch, and the signal/panic clause is OPEN for fullscreen (F94).**
+  `install_exit_restore` gives back the **inline region only**, so a dying signal
+  or a panic while fullscreen is active **leaves the alternate screen taken** and
+  the user's terminal in it. This requirement demands restore on *every* exit
+  path including panics and signals; that holds for inline and does not yet hold
+  for fullscreen. **Carded, not quietly patched** — it is a real hole in a mode
+  this epic now ships, and it is not what T5-S2's tests pin.
+
+  **And why fullscreen does not go through `TuiRuntime` at all (F93).** Beyond
+  the correction below: `enter` also calls **crossterm's `enable_raw_mode`, which
+  clears `OPOST`**, and this binary has several hundred direct
+  `println!`/`eprintln!` writers — the agent-view overlay's own comment already
+  records that this would *"staircase all of them down the screen"*. It would
+  also nest a second raw mode under `RawStdinGuard`, whose dying-signal restore
+  snapshots termios. So the fullscreen segment writes the four sequences itself
+  and leaves termios alone. **The general shape: a runtime that bundles two
+  capabilities is unusable by a caller that wants one of them** — this
+  requirement's title and alt-screen clauses looked like one lifecycle, and one
+  of them drags termios with it.
+
+  **Corrected again in T5-S2, because the narrowing was still wrong about the
+  mechanism.** `TuiRuntime::enter` writes `PUSH_TITLE`, the optional OSC 2 title
+  and raw mode — **it does not write `ESC[?1049h` and never has** (verified: that
+  sequence appears only in `main.rs`, in the agent-view overlay, which has taken
+  the alternate screen since T4-S2). So the runtime delivers **one** of this
+  requirement's two clauses, the **title**, and **the alternate screen is code the
+  switch writes.** A findings entry claiming otherwise stood for three cards and
+  travelled into two briefs before an agent read the function body; see **F91**.
 
   **Narrowed in T5-S1a:** this previously said the clauses become real "when T5's
   fullscreen renderer uses that runtime". **It is not the renderer.** The

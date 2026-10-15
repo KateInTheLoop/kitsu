@@ -151,10 +151,12 @@ pub struct HooksConfig {
 
 /// Which renderer a chat session runs (`[tui] mode`, design §4.8).
 ///
-/// `fullscreen` is in the design's grammar but deliberately absent here: the
-/// fullscreen renderer is T5 work, and a value that parses today and silently
-/// behaves as `inline` is the quiet coercion this table exists to prevent. It
-/// becomes a variant when its renderer does.
+/// All three spellings of the design's grammar parse. `fullscreen` was held
+/// back while there was nothing to select — a value that parsed and silently
+/// behaved as `inline` is the quiet coercion this table exists to prevent —
+/// and it became a variant when its renderer became reachable: the switch
+/// takes the terminal's alternate screen and paints the inline cell ring's
+/// tail through `kitsu_tui::fullscreen::FullscreenView`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TuiMode {
     /// The line renderer kitsu has always had, and the default: the inline
@@ -164,6 +166,12 @@ pub enum TuiMode {
     Classic,
     /// The pinned inline viewport from `kitsu-tui`.
     Inline,
+    /// The fullscreen transcript renderer: the terminal's alternate screen,
+    /// painted from the cell ring the inline viewport retains. A session can
+    /// start in it (`--tui fullscreen`, `mode = "fullscreen"`) and `/tui
+    /// fullscreen` switches into it, because a mode a user can switch to but
+    /// cannot start in is incoherent.
+    Fullscreen,
 }
 
 /// Whether a session takes the terminal's alternate screen (`[tui]
@@ -193,7 +201,7 @@ pub enum AlternateScreen {
 const TUI_VALUE_ERROR: &str = "invalid value for `[tui]` key ";
 
 /// The accepted `mode` spellings, as the error messages list them.
-const TUI_MODES: &str = "`classic`, `inline`";
+const TUI_MODES: &str = "`classic`, `inline`, `fullscreen`";
 /// The accepted `alternate_screen` spellings.
 const TUI_ALTERNATE_SCREENS: &str = "`auto`, `always`, `never`";
 
@@ -224,6 +232,7 @@ where
     match raw.as_str() {
         "classic" => Ok(TuiMode::Classic),
         "inline" => Ok(TuiMode::Inline),
+        "fullscreen" => Ok(TuiMode::Fullscreen),
         _ => Err(invalid()),
     }
 }
@@ -1198,12 +1207,16 @@ mod tests {
     //
     // Scope decisions pinned here, with their reasons:
     //
-    // * `mode` accepts `classic` and `inline` only. The design's grammar also
-    //   lists `fullscreen`, but fullscreen is T5 work; a name that parses
-    //   today and silently behaves as `inline` is exactly the kind of
-    //   quiet coercion this card's risk gate exists to forbid. When T5 lands,
-    //   `tui_mode_rejects_fullscreen_until_the_t5_renderer_exists` is the test
-    //   to change, deliberately.
+    // * `mode` accepted `classic` and `inline` only, while the design's
+    //   grammar also listed `fullscreen`: a name that parsed and silently
+    //   behaved as `inline` is exactly the kind of quiet coercion this card's
+    //   risk gate exists to forbid. **That boundary has since been retired**,
+    //   deliberately and in the card that made the third renderer reachable.
+    //   All three spellings parse, and
+    //   `tui_mode_accepts_fullscreen_now_that_the_t5_renderer_exists` is
+    //   where the third one is pinned. (The test this note used to name,
+    //   `tui_mode_rejects_fullscreen_until_the_t5_renderer_exists`, is the
+    //   one it replaced and no longer exists.)
     // * `cell_ring_lines` is range-checked HERE, not in T3-S6. The ring is
     //   built in T3-S6; if the parser admits `0` or `4_000_000_000`, T3-S6 has
     //   to invent a silent fallback, and a memory bound you cannot state is
@@ -1436,10 +1449,29 @@ mod tests {
             // variant`, which would echo `value` back and so could not be
             // surfaced by `Config::load` at all. The assertion is still that
             // the value is REJECTED, loudly and by name.
+            //
+            // **Strengthened in T5-S2 (finding F90).** This was two
+            // `contains` checks, one of them for `` `classic`, `inline` ``.
+            // That substring is still present once a third mode is appended,
+            // so the assertion could not fail when its own subject changed —
+            // it survived this card by luck. F41 banned substring *bans* for
+            // over-constraining the product; this is the inverse hazard, a
+            // substring *require* that under-constrains it to nothing. So the
+            // whole message is pinned: what is asserted is what the user
+            // reads, and appending, removing or reordering a mode fails here.
+            assert_eq!(
+                message,
+                "invalid value for `[tui]` key `mode`: expected one of \
+                 `classic`, `inline`, `fullscreen`",
+                "mode = {value:?} must fail with the one key-naming message, \
+                 listing exactly the modes that parse"
+            );
+            // And the credential boundary this file exists to hold: the
+            // rejected value is never echoed back. Kept as a ban because
+            // here the product claim *is* an absence.
             assert!(
-                message.contains("invalid value for `[tui]` key `mode`")
-                    && message.contains("`classic`, `inline`"),
-                "mode = {value:?} must fail naming the key and the modes: {message}"
+                value.is_empty() || !message.contains(value),
+                "the message must never repeat what the user wrote: {message}"
             );
         }
 
@@ -1448,27 +1480,59 @@ mod tests {
         assert_eq!(parsed.tui.unwrap_or_default().mode, TuiMode::Inline);
     }
 
-    /// Fullscreen is T5's renderer. Until it exists the name is rejected, so
-    /// nobody is silently handed the inline viewport under a third name.
-    /// **Change this test deliberately in T5**, not incidentally.
+    /// Fullscreen is T5's renderer, and **T5-S2 is where it arrives**, so
+    /// `[tui] mode = "fullscreen"` parses.
+    ///
+    /// **This is the deliberate change the test asked for.** Its own comment
+    /// said "**Change this test deliberately in T5**, not incidentally", and
+    /// this card is that T5: the switch, the renderer request, the alternate
+    /// screen and the ring reader land together. The intent that survives is
+    /// the one it was written for — **no silent coercion**: before, a third
+    /// name must not quietly parse as `inline`; now it must parse as itself,
+    /// `TuiMode::Fullscreen`, and the test still fails if `fullscreen` is
+    /// mapped onto either of the other two.
+    ///
+    /// Decision 1 of this card is why a config test changes at all: `/tui`,
+    /// `--tui` and `[tui] mode` cross together, because a mode a user can
+    /// switch to but cannot start in is incoherent.
     #[test]
-    fn tui_mode_rejects_fullscreen_until_the_t5_renderer_exists() {
-        let error = toml::from_str::<Config>("[tui]\nmode = \"fullscreen\"\n")
-            .expect_err("fullscreen must not parse before the T5 renderer exists");
-        let message = error.message();
-        // Authorised change (coordinator, T3-S2): the message names the KEY
-        // and the modes that exist, not the rejected word — a value out of a
-        // config file is never echoed. "expected one of `classic`, `inline`"
-        // states the T5 boundary at least as clearly as naming `fullscreen`
-        // did.
-        assert!(
-            message.contains("invalid value for `[tui]` key `mode`"),
-            "the message must name the key: {message}"
+    fn tui_mode_accepts_fullscreen_now_that_the_t5_renderer_exists() {
+        let parsed: Config = toml::from_str("[tui]\nmode = \"fullscreen\"\n")
+            .expect("fullscreen parses now that the T5 renderer is reachable");
+        let mode = parsed.tui.unwrap_or_default().mode;
+        // **Tightened as the test author instructed.** This was an
+        // `assert_ne!(mode, TuiMode::Inline)` / `assert_ne!(mode,
+        // TuiMode::Classic)` pair, which the author wrote only because
+        // `TuiMode::Fullscreen` did not exist yet: naming it would have been
+        // a **compile** failure and every other test in the crate would have
+        // stopped reporting. The variant exists now, so the pair is replaced
+        // by the equality it was standing in for. "Neither classic nor
+        // inline" is "fullscreen" only while there are exactly three modes —
+        // a fourth would let it pass for the wrong mode, which is the F41
+        // shape. Both of the intents it carried survive here: no coercion
+        // onto either of the other two renderers, and `fullscreen` parsing as
+        // itself.
+        assert_eq!(
+            mode,
+            TuiMode::Fullscreen,
+            "`fullscreen` must parse as itself and must not be coerced onto \
+             the inline viewport or onto classic — the silent fallback this \
+             test has guarded since T3-S2"
         );
-        assert!(
-            message.contains("classic") && message.contains("inline"),
-            "and list what is accepted today: {message}"
-        );
+
+        // The byte-exact discipline is unchanged by the new variant: a near
+        // miss on the new name is still a loud error, not a third coercion.
+        for typo in [
+            "Fullscreen",
+            "FULLSCREEN",
+            "fullscreen ",
+            "full-screen",
+            "full",
+        ] {
+            let text = format!("[tui]\nmode = \"{typo}\"\n");
+            toml::from_str::<Config>(&text)
+                .expect_err(&format!("mode = {typo:?} must be rejected, not defaulted"));
+        }
     }
 
     /// `alternate_screen` is the tri-state of design §4.8, not a boolean. A
