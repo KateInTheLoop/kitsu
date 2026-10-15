@@ -368,10 +368,10 @@ fixtures byte-identical in classic/plain/JSONL; both profiles; `cargo test
 | **F77 + F79 fixed** | `/detach` wired through a 17th `&mut Option<u64>` on `handle_slash`; `/jobs view` no longer discards the attachment (**F79**, the third consumer of the same exit value); a `#[cfg(test)]` shim removed on review | done | this commit |
 | T4-S6-ordinal | `Ctrl+X 1..9` as a **1-based ordinal over A2's display order**, never an id | **not started** | — |
 | ~~T4-S6~~ | Attach/detach: `⛩` milestones, routed composer (`steer`, `y/a/n` when blocked), 64 KiB foreground buffer replayed with recap; `Ctrl+X d`, `←`, `/detach`; `Ctrl+C` = clear draft / detach | Failing fake-provider integration test | `tui_bridge.rs`, overlay, `status.rs` | (A5) |
-| T4-S7 | Dispatch from the view composer (`@profile task`) admitted by `AgentRegistryLimits`, not `SpawnBudget` | Failing over-capacity test | `tui_bridge.rs`, `subagent.rs` | (A6) |
+| T4-S7 | Dispatch from the agent view with `+` (`task` or `@profile task`), admitted by `AgentRegistryLimits`, **not** `SpawnBudget` — the view's **fourth** edited line | done, this commit | `main.rs`, `kitsu-tui/src/agents_view.rs`, `subagent.rs` — *corrected in T4-S7: the row named `tui_bridge.rs`, which is the **inline** composer and is untouched here; T4-S6b is the card that lands there* | (A6) |
 | T4-S8 | Ambient counter ≤ 250 ms (watch-driven) in TUI; classic tag from T1-S2 documented | Failing paused-clock timing test | `status.rs` | (A8) |
 | T4-S9 | Transcript overlay (`Ctrl+O`): scroll, `/`, `n/N`, `{ }`, `v`, `q` over the cell ring | Failing search/jump unit test | `overlay/transcript.rs` | (R6) |
-| T4-S10 | Single bindings table → help overlay + `/help keys`; docs (`ux-design.md` glyph `◉` row rule, `functionality.md`) | Failing bindings-table test | `kitsu-tui/src/keys.rs`, `docs/` | (§4.7) |
+| T4-S10 | Single bindings table → help overlay + `/help keys` — **note:** the help literal now has **six** rows to absorb (`up/dn`, `space`, `/`, `+`, `?`, `esc`), one added by each of T4-S3, T4-S4a, T4-S5 and T4-S7; docs (`ux-design.md` glyph `◉` row rule, `functionality.md`) | Failing bindings-table test | `kitsu-tui/src/keys.rs`, `docs/` | (§4.7) |
 
 **Exit gate:** fake-provider integration (two agents, one blocks, view shows
 it first, reply, attach, detach, acknowledged); exit guard unchanged; both

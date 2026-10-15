@@ -323,6 +323,15 @@ longer than the limit, or carrying control characters) is reported on the rename
 line itself and leaves what you typed in place to be corrected; `Esc` cancels
 without renaming.
 
+`+` opens a dispatch line: type a task to start a background agent on the
+default profile, or `@<profile> <task>` to choose one. `Enter` starts it, `Esc`
+cancels and starts nothing. Refusals -- a line it cannot read, an unknown
+profile, or the registry already at `max_running` or `max_records` -- are
+reported on the dispatch line and leave what you typed in place. Dispatches from
+the view are admitted by the registry's own ceilings, **not** by the model's
+per-turn spawn cap, which exists to stop a model storming agents within one turn.
+Starting an agent leaves the selection where it was.
+
 `/` opens a filter line: `s:<state> n:<text> o:<text> p:<profile>`, each term
 confined to its own field, so a name filter cannot match a task. A term it
 cannot read is refused with the key it did not recognise, and what you typed

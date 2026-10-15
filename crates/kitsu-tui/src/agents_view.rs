@@ -389,6 +389,130 @@ fn accepted_state_words() -> String {
 /// grammar advertised two ways is a grammar that can be advertised wrongly.
 const FILTER_GRAMMAR: &str = "s:<state> n:<text> o:<text> p:<profile>";
 
+/// The key that opens the agent view's **dispatch line** (card T4-S7,
+/// requirement A6). Exported so the help row, the overlay's key arm and the
+/// tests all read one letter: a key advertised in one place and bound in
+/// another is a key that can be advertised wrongly (the defect two earlier
+/// cards fixed from its two sides).
+///
+/// `+` and not a letter, for two reasons. It is "add an agent", which is what
+/// the line does; and `0x2b` is **outside** a CSI sequence's final-byte range
+/// (`0x40..=0x7e`), so an arrow key immediately before it cannot swallow it —
+/// the property **F65** is about and the reason `/` was chosen for the filter.
+pub const DISPATCH_KEY: char = '+';
+
+/// A6's dispatch grammar, in the one wording the help row and the dispatch
+/// frame's footer both print. Spelled once, for `FILTER_GRAMMAR`'s reason.
+const DISPATCH_GRAMMAR: &str = "<task>, or @<profile> <task>";
+
+/// One dispatch the view's composer collected: A6's *plain text spawns a
+/// background agent with the default profile; `@<profile> <task>` selects a
+/// profile*.
+///
+/// `profile: None` **is** the default profile — the absence of a selection,
+/// exactly as `spawn_agent_bg`'s optional `profile` argument is. Whether the
+/// name exists is not a question about the syntax, so it is not answered here:
+/// the catalog answers it at dispatch, in the registry's own words.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ViewDispatch {
+    /// The task, trimmed. Interior whitespace is the user's and is kept.
+    pub task: String,
+    /// The profile `@` selected, without its `@`.
+    pub profile: Option<String>,
+}
+
+/// Why a dispatch line was rejected. A malformed dispatch is an **error**,
+/// never a guess: a dispatch starts real work with a real gateway cost, and
+/// guessing at `@` would start the wrong kind of agent on the wrong task.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchError {
+    message: String,
+}
+
+impl DispatchError {
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+/// Parse a dispatch line: plain text is a task for the default profile, and a
+/// leading `@<profile>` selects one.
+///
+/// **Card T4-S7 is written test-first; this is the seam the tests pin and the
+/// implementer fills.**
+pub fn parse_dispatch(input: &str) -> Result<ViewDispatch, DispatchError> {
+    fn reject(what: &str) -> DispatchError {
+        DispatchError {
+            message: format!("{what} \u{2014} {DISPATCH_GRAMMAR}"),
+        }
+    }
+
+    let line = input.trim();
+    if line.is_empty() {
+        // Not `/`'s empty line, which clears a filter: there is no such thing
+        // as an agent with no task, so an empty dispatch is a refusal.
+        return Err(reject("a dispatch needs a task"));
+    }
+    let Some(rest) = line.strip_prefix('@') else {
+        // Only a *leading* `@` selects: a task really does carry an address or
+        // a handle, and hunting for one anywhere would send the work to a
+        // profile nobody named.
+        return Ok(ViewDispatch {
+            task: line.to_string(),
+            profile: None,
+        });
+    };
+    let mut words = rest.splitn(2, char::is_whitespace);
+    let profile = words.next().unwrap_or_default();
+    if profile.is_empty() {
+        return Err(reject("`@` selects a profile and none was named"));
+    }
+    let task = words.next().unwrap_or_default().trim();
+    if task.is_empty() {
+        return Err(reject("a profile was named and no task was given"));
+    }
+    Ok(ViewDispatch {
+        task: task.to_string(),
+        profile: Some(profile.to_string()),
+    })
+}
+
+/// The frame for the dispatch line, the view's fourth edited line.
+///
+/// The same drawn echo and caret the other three have, because it is the same
+/// kind of line read by the same editor; `report` is the refusal of the
+/// dispatch just submitted, painted **on this frame** for
+/// `filter_prompt_rows`' reason (**F71**): a refused dispatch leaves the line
+/// open, so the message and the text it is about are on screen together.
+///
+/// **Card T4-S7 is written test-first; this is the seam the tests pin and the
+/// implementer fills.**
+pub fn dispatch_prompt_rows(
+    draft: &str,
+    cursor: usize,
+    cols: usize,
+    report: Option<&str>,
+) -> Vec<String> {
+    let mut out = vec![
+        title_row(&format!("{OVERLAY_TITLE} \u{2014} dispatch"), cols),
+        String::new(),
+        line_echo(draft, cursor, cols),
+        String::new(),
+        format!("{LINE_INDENT}{DISPATCH_GRAMMAR}; enter starts it, esc cancels"),
+    ];
+    if let Some(report) = report {
+        out.push(String::new());
+        out.push(format!("{LINE_INDENT}{}", flatten_report(report)));
+    }
+    fit_all(out, cols)
+}
+
 /// The one token every frame of the overlay prints, on its first row.
 ///
 /// The design calls the surface "the agent view overlay" throughout (§3.2 A1,
@@ -554,6 +678,14 @@ pub fn overlay_help_rows(cols: usize) -> Vec<String> {
         // miss. Like the entries above, this literal is what T4-S10 replaces
         // with the one bindings table.
         ("/", &format!("filter the rows \u{2014} {FILTER_GRAMMAR}")),
+        // The dispatch key (card T4-S7, requirement A6). Like `/` it needs no
+        // selection -- it is about an agent that does not exist yet -- and the
+        // grammar is on the row because the parser is strict and `@` is the
+        // only way to select a profile from here.
+        (
+            &DISPATCH_KEY.to_string(),
+            &format!("start an agent \u{2014} {DISPATCH_GRAMMAR}"),
+        ),
         ("?", "show this help"),
         ("esc", "leave a prompt or the help, then close the view"),
     ] {
@@ -1799,6 +1931,295 @@ mod tests {
                 .any(|other| other.trim_start().starts_with("esc ")),
             "the help still lays its keys out in a key column: \n{}",
             rows.join("\n")
+        );
+    }
+
+    // ---- Card T4-S7, requirement A6: dispatch from the view composer ----
+    //
+    // The parse, the frame and the help row live here because they are pure
+    // and because this is where `/`'s three equivalents already live. What
+    // *admits* a dispatch is the registry's and is pinned in `subagent.rs`;
+    // what the key does is the overlay's and is pinned in `main.rs`.
+
+    /// **A6's first clause: plain text is a task for the default profile.**
+    ///
+    /// `profile: None` is the default profile — the same absence
+    /// `spawn_agent_bg`'s optional argument means by it — so this also pins
+    /// that a task is not quietly given a profile nobody asked for.
+    ///
+    /// The surrounding whitespace is trimmed and the interior whitespace is
+    /// not: the task is prose and its spacing is the user's.
+    #[test]
+    fn a_plain_dispatch_line_is_a_task_for_the_default_profile() {
+        let parsed =
+            super::parse_dispatch("  measure  the paste latency  ").expect("plain text is a task");
+        assert_eq!(
+            parsed,
+            super::ViewDispatch {
+                task: "measure  the paste latency".to_string(),
+                profile: None,
+            },
+            "the task is trimmed at the ends and untouched inside, and no \
+             profile is invented for it"
+        );
+    }
+
+    /// **A6's second clause: `@<profile> <task>` selects a profile.**
+    ///
+    /// The `@` is not part of the name — the name is what the catalog is asked
+    /// for — and the whitespace between the two is a separator and not part of
+    /// either.
+    #[test]
+    fn an_at_prefix_selects_the_profile_and_the_rest_is_the_task() {
+        let parsed = super::parse_dispatch("   @reviewer    review the diff   ")
+            .expect("`@profile task` is the A6 form");
+        assert_eq!(
+            parsed,
+            super::ViewDispatch {
+                task: "review the diff".to_string(),
+                profile: Some("reviewer".to_string()),
+            },
+            "the profile is the word after `@` without its `@`, and the task \
+             is everything after the separator"
+        );
+    }
+
+    /// **An `@` that is not the first character is text.**
+    ///
+    /// A task really does contain `@` — an address, a handle, a path — and a
+    /// parser that hunted for one anywhere would send the task to a profile
+    /// the user never named, which is the wrong *kind* of agent on the work.
+    #[test]
+    fn an_at_inside_the_line_is_part_of_the_task_and_selects_nothing() {
+        let parsed = super::parse_dispatch("ask @bob about the gateway 429s")
+            .expect("an interior `@` is text");
+        assert_eq!(
+            parsed,
+            super::ViewDispatch {
+                task: "ask @bob about the gateway 429s".to_string(),
+                profile: None,
+            },
+            "only a leading `@` selects"
+        );
+    }
+
+    /// **The four lines a user will actually type wrong, each refused and each
+    /// distinct.**
+    ///
+    /// Distinct because a dispatch starts real work at a real cost: "you typed
+    /// `@` and no profile" and "you named a profile and no task" are different
+    /// mistakes with different corrections, and one shared message would make
+    /// the user guess which they made. The empty line is refused too — it is
+    /// *not* `/`'s empty line, which clears a filter: there is no such thing
+    /// as an agent with no task.
+    #[test]
+    fn every_malformed_dispatch_line_is_refused_with_its_own_message() {
+        let refusals: Vec<String> = [
+            "",
+            "   ",
+            "@",
+            "@   do the thing",
+            "@reviewer",
+            "@reviewer   ",
+        ]
+        .iter()
+        .map(|line| {
+            super::parse_dispatch(line)
+                .expect_err(&format!("{line:?} is not a dispatch"))
+                .message()
+                .to_string()
+        })
+        .collect();
+
+        // An empty line and a whitespace-only one are the same mistake, as are
+        // a bare `@` and an `@` with a space after it, and a profile with no
+        // task however much whitespace follows it. Three mistakes, three
+        // messages, and each message is about the mistake it is for.
+        assert_eq!(refusals[0], refusals[1], "empty is whitespace-only");
+        assert_eq!(refusals[2], refusals[3], "`@` with no profile, twice over");
+        assert_eq!(
+            refusals[4], refusals[5],
+            "a profile with no task, twice over"
+        );
+        let distinct: std::collections::BTreeSet<&String> = refusals.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "three distinct mistakes get three distinct messages: {refusals:?}"
+        );
+        // And each one tells the user what to type instead, by naming the
+        // grammar: a refusal that does not is a dead end.
+        for refusal in &refusals {
+            assert!(
+                refusal.contains(super::DISPATCH_GRAMMAR),
+                "every dispatch refusal names the grammar, and {refusal:?} \
+                 does not"
+            );
+        }
+    }
+
+    /// **The dispatch line's frame**, which is the fourth edited line's and is
+    /// built like the other three: the draft verbatim, exactly one caret at
+    /// the cursor's char offset, the way out advertised, and the grammar on
+    /// the footer because the parser is strict.
+    #[test]
+    fn the_dispatch_line_echoes_its_draft_and_advertises_the_grammar() {
+        // The caret is *drawn into* the echo, so the verbatim check is made
+        // with the cursor at the end of the draft, exactly as the steer
+        // frame's is; where the caret sits is measured separately below.
+        let frame = super::dispatch_prompt_rows("review the diff", 15, 80, None);
+        let joined = frame.join("\n");
+        assert!(
+            joined.contains(super::OVERLAY_TITLE),
+            "every frame of the view carries its title: {joined:?}"
+        );
+        assert!(
+            joined.contains("review the diff"),
+            "the draft is echoed verbatim: {joined:?}"
+        );
+        assert_eq!(
+            joined.matches(super::STEER_CARET).count(),
+            1,
+            "exactly one caret, as on the other three lines: {joined:?}"
+        );
+        let mid = super::dispatch_prompt_rows("review the diff", 7, 80, None);
+        let echo = mid
+            .iter()
+            .find(|row| row.contains(super::STEER_CARET))
+            .expect("the echoed row");
+        let at = echo.find(super::STEER_CARET).expect("the caret");
+        assert!(
+            echo[at + super::STEER_CARET.len_utf8()..].starts_with("the diff"),
+            "and it sits at the cursor's char offset, with the rest of the \
+             draft after it: {echo:?}"
+        );
+        for way_out in ["esc", "enter"] {
+            assert!(
+                joined.to_lowercase().contains(way_out),
+                "a sub-mode advertises how to submit and how to cancel, and \
+                 {way_out:?} is missing: {joined:?}"
+            );
+        }
+        assert!(
+            joined.contains(super::DISPATCH_GRAMMAR),
+            "the footer repeats the grammar, as `/`'s does, because the parser \
+             is strict and a guess is a refusal: {joined:?}"
+        );
+
+        // **F71**: a refusal handed to this frame is painted ON it, because a
+        // refused dispatch leaves the line open and the message belongs beside
+        // the text it is about. NON-VACUOUS: the frame without one does not
+        // carry the string.
+        let refusal = "background-agent concurrency limit reached (8 running, limit 8)";
+        assert!(
+            !joined.contains(refusal),
+            "NON-VACUOUS: the refusal is not already in the frame: {joined:?}"
+        );
+        let refused = super::dispatch_prompt_rows("review the diff", 15, 80, Some(refusal));
+        assert!(
+            refused.iter().any(|row| row.contains(refusal)),
+            "the refusal is painted on this frame: {refused:?}"
+        );
+        // One refusal is one row, whatever is in it, exactly as the other
+        // lines flatten theirs.
+        let flattened = super::dispatch_prompt_rows("t", 1, 80, Some("refused\nwith\na\nnewline"));
+        assert_eq!(
+            flattened.len(),
+            refused.len(),
+            "a report with newlines in it is still one row: {flattened:?}"
+        );
+        for row in &flattened {
+            assert!(!row.contains('\n'), "and no row carries one: {row:?}");
+        }
+    }
+
+    /// Every row of the frame is fitted to the terminal, as every other frame
+    /// here is: a 40-column terminal gets 40 columns.
+    #[test]
+    fn the_dispatch_line_fits_a_narrow_terminal() {
+        let long = "r".repeat(200);
+        let frame = super::dispatch_prompt_rows(&long, long.chars().count(), 40, Some(&long));
+        for row in &frame {
+            assert!(
+                row.chars().count() <= 40,
+                "every row is fitted to the width: {row:?}"
+            );
+        }
+    }
+
+    /// Card T4-S7, applying the same lesson T4-S3, T4-S4b and T4-S5 applied:
+    /// **a key that works while being unadvertised is half-shipped.**
+    ///
+    /// Pinned as the row the help *is*: one row whose key column is the
+    /// dispatch key, saying that it starts an agent and naming the `@` form,
+    /// because a user told there is a composer and not told its grammar
+    /// cannot select a profile with it.
+    #[test]
+    fn the_help_advertises_the_dispatch_key_and_its_grammar() {
+        let rows = super::overlay_help_rows(100);
+        let key = super::DISPATCH_KEY.to_string();
+        let dispatch_rows: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.trim_start().starts_with(&key))
+            .collect();
+        assert_eq!(
+            dispatch_rows.len(),
+            1,
+            "exactly one help row is the dispatch key's, like every other \
+             key's: \n{}",
+            rows.join("\n")
+        );
+        let row = dispatch_rows[0].to_lowercase();
+        assert!(
+            row.contains("agent") && (row.contains("start") || row.contains("dispatch")),
+            "and it says the key starts an agent: {row:?}"
+        );
+        assert!(
+            dispatch_rows[0].contains('@'),
+            "and it names the `@<profile>` form, so selecting a profile is \
+             discoverable: {:?}",
+            dispatch_rows[0]
+        );
+        // NON-VACUOUS: the rows already advertised are still advertised, so
+        // this cannot pass on a help screen that had stopped listing keys.
+        for already in ["peek", "move", "filter"] {
+            assert!(
+                rows.join("\n").to_lowercase().contains(already),
+                "the keys already advertised are still there: {already:?}"
+            );
+        }
+    }
+
+    /// **The dispatch key is a key the view did not already have**, and it is
+    /// one an arrow cannot swallow.
+    ///
+    /// The first half is the whole hazard of adding a key to a view whose keys
+    /// act on a selected agent: a letter already bound would make one keystroke
+    /// mean two things. The second is **F65**: a CSI sequence's final byte is
+    /// `0x40..=0x7e`, so a key inside that range can be consumed as the end of
+    /// an arrow sequence, and `/` was chosen for the filter precisely because
+    /// it is not.
+    #[test]
+    fn the_dispatch_key_is_unbound_elsewhere_and_no_sequences_final_byte() {
+        for bound in ['r', 's', 'x', 'n', 'p', '/', '?', 'q', ' '] {
+            assert_ne!(
+                super::DISPATCH_KEY,
+                bound,
+                "the dispatch key cannot be a key A3 already binds"
+            );
+        }
+        assert!(
+            super::DISPATCH_KEY.is_ascii(),
+            "the overlay decodes printable keys as ASCII, so the key must be \
+             one: {:?}",
+            super::DISPATCH_KEY
+        );
+        let byte = super::DISPATCH_KEY as u32;
+        assert!(
+            !(0x40..=0x7e).contains(&byte),
+            "F65: the key must not be in a CSI sequence's final-byte range, or \
+             an arrow immediately before it swallows it: {:#x}",
+            byte
         );
     }
 }

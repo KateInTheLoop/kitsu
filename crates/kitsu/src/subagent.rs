@@ -2412,6 +2412,152 @@ pub fn spawn_agent_bg_tool_with_binder<P: Provider + 'static>(
     (descriptor, handler)
 }
 
+/// How the agent view's composer starts an agent (card T4-S7, requirement
+/// **A6**): a task and an optional profile name in, an id or one line of
+/// refusal out.
+///
+/// A closure rather than a function the overlay calls, because the overlay has
+/// no provider: the binder, the subagent registry, the config template and the
+/// profile catalog are all the session's, and the view holds only this.
+///
+/// **It takes no [`SpawnBudget`], and that is the point of the card.** The
+/// budget is the *model's* per-turn fan-out cap — it exists so a storming model
+/// cannot fan out against the gateway, and `spawn_cap_error` is phrased as an
+/// instruction to a model for exactly that reason. A human typing a task into
+/// the view is not a storming model, so admission here is the registry's own
+/// ceilings ([`AgentRegistryLimits`]) and nothing else. A dispatch refused
+/// because the *model* had already spent the turn's budget would be a refusal
+/// with nothing to do with the person who typed it.
+///
+/// The `String` error is a line for the frame, and it is the registry's or the
+/// catalog's own wording ([`AgentStartError`]'s `Display`, or
+/// `spawn_agent_bg`'s unknown-profile message) rather than a second wording of
+/// either.
+pub type ViewDispatcher = Arc<dyn Fn(String, Option<String>) -> Result<u64, String> + Send + Sync>;
+
+/// Build the agent view's dispatcher over a provider binder.
+///
+/// The same arguments `spawn_agent_bg_tool_with_binder` takes, minus the
+/// budget, and the same work: resolve the profile against the catalog, build
+/// the effective tools and system prompt, and admit through
+/// `AgentRegistry::spawn_background_thread`.
+///
+/// **Card T4-S7 is written test-first; this is the seam the tests pin and the
+/// implementer fills.**
+#[allow(clippy::too_many_arguments)]
+pub fn view_dispatcher<P: Provider + 'static>(
+    provider: ProviderBinder<P>,
+    sub_tools: Arc<Registry>,
+    sub_cfg: AgentConfig,
+    live: LiveModelWindow,
+    extra_system: String,
+    registry: Arc<AgentRegistry>,
+    profile_runtime: BackgroundProfileRuntime,
+) -> ViewDispatcher {
+    Arc::new(move |task: String, profile: Option<String>| {
+        // The catalog answers the one question the view's parser deliberately
+        // did not: whether the name `@` selected exists. Its own wording,
+        // because a second wording of "no such profile" would be a second
+        // source of truth about which profiles exist.
+        let selected_profile = match profile.as_deref() {
+            Some(name) => Some(profile_runtime.catalog.get(name).cloned().ok_or_else(|| {
+                format!("unknown background-agent profile '{name}'; use /profiles")
+            })?),
+            None => None,
+        };
+        let mut cfg = resolve_cfg(&sub_cfg, &live);
+        let effective_tools = selected_profile
+            .as_ref()
+            .and_then(|profile| profile_runtime.tools.get(&profile.name))
+            .cloned()
+            .unwrap_or_else(|| sub_tools.clone());
+        let mut effective_system = extra_system.clone();
+        if let Some(profile) = selected_profile.as_ref() {
+            if let Some(profile_model) = profile.model.as_ref() {
+                cfg.model = profile_model.clone();
+            }
+            // Forward-only-if-explicitly-requested, exactly as the model's
+            // tool does it: a profile that says nothing keeps the parent's
+            // omission, so gateways that reject the field are not broken by
+            // merely selecting a profile.
+            if let Some(effort) = profile.reasoning_effort.requested() {
+                cfg.reasoning_effort = Some(effort);
+            }
+            if !profile.instructions.trim().is_empty() {
+                if !effective_system.is_empty() {
+                    effective_system.push_str("\n\n");
+                }
+                effective_system.push_str(&profile.instructions);
+            }
+            debug_assert!(profile.tool_policy.accepts_registry(&effective_tools));
+        }
+        let provider = provider
+            .resolve(&cfg.model)
+            .map_err(|error| error.to_string())?;
+        let model = cfg.model.clone();
+        let preview = task_preview(&task);
+        let profile_name = selected_profile
+            .as_ref()
+            .map(|profile| profile.name.clone());
+        let rejected_field_hint = selected_profile.as_ref().and_then(|profile| {
+            profile.reasoning_effort.requested().map(|_| {
+                format!(
+                    "profile '{}' requested reasoning_effort={} \u{2014} this gateway rejected \
+                     that request field; see /profiles or dispatch without a profile",
+                    profile.name,
+                    profile.reasoning_effort.label()
+                )
+            })
+        });
+        // **A6's whole point**: admission is the registry's ceilings here and
+        // nothing else. No `SpawnBudget` is consulted, because the budget caps
+        // a *model's* per-turn fan-out and a human typing a task is not a
+        // storming model.
+        registry
+            .spawn_background_thread(
+                preview,
+                task.clone(),
+                model,
+                profile_name,
+                move |id, running_registry, runtime| async move {
+                    let prompt_route = match running_registry.blocking() {
+                        crate::config::AgentBlockingMode::Ask => {
+                            Some(running_registry.prompt_sender())
+                        }
+                        crate::config::AgentBlockingMode::FailClosed => None,
+                    };
+                    let run = run_subagent_report_with_progress(
+                        &provider,
+                        &effective_tools,
+                        &cfg,
+                        &effective_system,
+                        task,
+                        Some((running_registry, id)),
+                        Some(runtime),
+                    );
+                    let mut report = match prompt_route {
+                        Some(sender) => {
+                            kitsu_tools::scope_with_registry_prompts(id, sender, run).await
+                        }
+                        None => kitsu_tools::scope_without_interactive_prompts(run).await,
+                    };
+                    if report.telemetry.failure_class
+                        == Some(AgentFailureClass::ProviderClientError)
+                    {
+                        if let (Err(error), Some(hint)) =
+                            (&mut report.result, rejected_field_hint.as_ref())
+                        {
+                            error.push_str("; ");
+                            error.push_str(hint);
+                        }
+                    }
+                    report
+                },
+            )
+            .map_err(|error| error.to_string())
+    })
+}
+
 /// Build the `agent_result` tool: fetch a background agent's status or result by
 /// id (returns "still running" until it finishes).
 pub fn agent_result_tool(registry: Arc<AgentRegistry>) -> (ToolDescriptor, HandlerFn) {
@@ -4964,5 +5110,226 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- Card T4-S7, requirement A6: what admits a dispatch ----
+    //
+    // The view's half (the key, the parse, the painted refusal) is pinned in
+    // `main.rs`; this is the half that needs a provider, which is why the card
+    // splits here -- the same split T4-S4b and T4-S6b were made along.
+
+    fn dispatcher_over(registry: Arc<AgentRegistry>, live: LiveModelWindow) -> ViewDispatcher {
+        let mut cfg = sub_cfg();
+        cfg.quiet = true;
+        view_dispatcher(
+            ProviderBinder::fixed(Arc::new(EchoProvider)),
+            Arc::new(Registry::new()),
+            cfg,
+            live,
+            String::new(),
+            registry,
+            empty_profile_runtime(),
+        )
+    }
+
+    /// **Requirement A6's risk gate, in the positive form: a dispatch succeeds
+    /// in a state where the model's per-turn `SpawnBudget` would have refused
+    /// it.**
+    ///
+    /// A test that merely avoided mentioning `SpawnBudget` would prove nothing
+    /// -- it would pass against an implementation that consulted a budget
+    /// which happened to be open. So the budget here is really exhausted, and
+    /// the POSITIVE CONTROL is the model's own `spawn_agent_bg` being refused
+    /// by it on the very next call, against the same registry, in the same
+    /// state, with the same task.
+    ///
+    /// `SpawnBudget` exists to stop a *storming model* fanning out within one
+    /// turn -- `spawn_cap_error` is phrased as an instruction to a model for
+    /// exactly that reason. A human typing a task into the agent view is not a
+    /// storming model, and a dispatch refused because the model had already
+    /// spent the turn's budget would be a refusal with nothing to do with the
+    /// person who typed it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_dispatch_is_admitted_by_the_registry_and_never_by_the_spawn_budget() {
+        let registry = AgentRegistry::new();
+        let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
+        let budget = Arc::new(SpawnBudget::new(1));
+        let mut cfg = sub_cfg();
+        cfg.quiet = true;
+        let (_descriptor, model_spawn) = spawn_agent_bg_tool(
+            Arc::new(EchoProvider),
+            Arc::new(Registry::new()),
+            cfg,
+            live.clone(),
+            String::new(),
+            registry.clone(),
+            empty_profile_runtime(),
+            budget.clone(),
+        );
+
+        // The turn's one allowed model spawn, spent.
+        model_spawn(r#"{"task":"the model's first spawn"}"#.to_string())
+            .await
+            .expect("the first spawn is within the cap");
+        assert_eq!(budget.used(), 1, "the turn's budget is now exhausted");
+
+        // POSITIVE CONTROL: in exactly this state the model is refused.
+        let refused = model_spawn(r#"{"task":"the model's second spawn"}"#.to_string())
+            .await
+            .expect_err("POSITIVE CONTROL: the budget refuses the model here");
+        assert!(
+            refused.to_string().contains("agent spawn cap reached"),
+            "and it is the budget that refused it: {refused}"
+        );
+        let before = registry.progress_snapshot().total;
+
+        // The person's dispatch, in the same state, against the same registry.
+        let dispatch = dispatcher_over(registry.clone(), live);
+        let id = dispatch("the person's dispatch".to_string(), None).expect(
+            "A6: the registry admits this -- the model's per-turn budget is not \
+             consulted for a dispatch a human typed",
+        );
+        assert!(id > 0, "a dispatch returns the id the view reports");
+        assert_eq!(
+            registry.progress_snapshot().total,
+            before + 1,
+            "and the record really exists: the dispatch started an agent"
+        );
+        assert_eq!(
+            budget.used(),
+            1,
+            "the budget was neither consulted nor spent by the dispatch"
+        );
+    }
+
+    /// **The card's named acceptance, at the registry: at `max_running` a
+    /// dispatch is refused, in the registry's own words, naming the ceiling.**
+    ///
+    /// Refused and not queued: A6 gives the view the registry's ceilings, and
+    /// `check_capacity` never evicts existing work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_dispatch_over_max_running_is_refused_in_the_registrys_own_words() {
+        let registry = AgentRegistry::with_limits(AgentRegistryLimits {
+            max_running: 1,
+            max_records: 64,
+        });
+        let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
+        let dispatch = dispatcher_over(registry.clone(), live);
+
+        // One running agent, which is this registry's whole running capacity.
+        // `start` leaves it `Running` with no task to finish, so the ceiling
+        // below is reached deterministically.
+        let held = registry
+            .start("the one running agent".to_string())
+            .expect("the first start is within the limit");
+        assert_eq!(registry.running(), 1, "NON-VACUOUS: the ceiling is reached");
+
+        let error = dispatch("one agent too many".to_string(), None)
+            .expect_err("A6: the registry's running ceiling refuses this");
+        assert_eq!(
+            error,
+            AgentStartError {
+                kind: AgentCapacityKind::Running,
+                current: 1,
+                limit: 1,
+            }
+            .to_string(),
+            "the refusal is the registry's own sentence, which names the \
+             ceiling and what to do about it"
+        );
+        assert_eq!(
+            registry.progress_snapshot().total,
+            1,
+            "and nothing was started: the refusal never evicts the work \
+             already running"
+        );
+
+        // POSITIVE CONTROL: with the ceiling freed the same dispatch is
+        // admitted, so this is a capacity refusal and not a dispatcher that
+        // refuses everything.
+        registry.finish(held, Ok("done".to_string()));
+        assert!(
+            dispatch("one agent after all".to_string(), None).is_ok(),
+            "POSITIVE CONTROL: the same dispatch succeeds once a slot frees"
+        );
+    }
+
+    /// **A6 names both ceilings, and `max_records` is not `max_running`.**
+    ///
+    /// They fail differently and the correction differs: a terminal agent
+    /// still occupies a *record*, so a registry with nothing running can still
+    /// refuse, and the answer is to prune rather than to wait. A view that
+    /// only knew about `max_running` would refuse this dispatch with no
+    /// explanation at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_dispatch_over_max_records_is_refused_as_a_record_ceiling() {
+        let registry = AgentRegistry::with_limits(AgentRegistryLimits {
+            max_running: 4,
+            max_records: 1,
+        });
+        let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
+        let dispatch = dispatcher_over(registry.clone(), live);
+
+        let finished = registry
+            .start("an agent that has finished".to_string())
+            .expect("the first start is within both limits");
+        registry.finish(finished, Ok("its result".to_string()));
+        assert_eq!(
+            (registry.running(), registry.progress_snapshot().total),
+            (0, 1),
+            "NON-VACUOUS: nothing is running, so only the record ceiling can \
+             refuse the dispatch below"
+        );
+
+        let error = dispatch("one record too many".to_string(), None)
+            .expect_err("A6: the registry's record ceiling refuses this");
+        assert_eq!(
+            error,
+            AgentStartError {
+                kind: AgentCapacityKind::Records,
+                current: 1,
+                limit: 1,
+            }
+            .to_string(),
+            "and it is the *record* ceiling's sentence, which says to prune"
+        );
+    }
+
+    /// **An unknown profile is refused, and it starts nothing.**
+    ///
+    /// `@<profile>` is syntax the view can parse and a name only the catalog
+    /// can judge, so this refusal is the dispatcher's. It is `spawn_agent_bg`'s
+    /// own wording, because a second wording of "no such profile" would be a
+    /// second source of truth about which profiles exist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_dispatch_with_an_unknown_profile_starts_nothing() {
+        let registry = AgentRegistry::new();
+        let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
+        let dispatch = dispatcher_over(registry.clone(), live);
+
+        let error = dispatch(
+            "review the diff".to_string(),
+            Some("no-such-profile".to_string()),
+        )
+        .expect_err("the catalog has no such profile");
+        assert!(
+            error.contains("unknown background-agent profile 'no-such-profile'"),
+            "the catalog's own refusal, naming the profile that does not \
+             exist: {error}"
+        );
+        assert_eq!(
+            registry.progress_snapshot().total,
+            0,
+            "and nothing was started with the default profile instead: a \
+             dispatch that silently dropped the selection would run the wrong \
+             kind of agent on the work"
+        );
+
+        // POSITIVE CONTROL: the same dispatch with no profile at all is
+        // admitted, so the refusal above is the name and not the dispatcher.
+        assert!(
+            dispatch("review the diff".to_string(), None).is_ok(),
+            "POSITIVE CONTROL: the default profile is always available"
+        );
     }
 }

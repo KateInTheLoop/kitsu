@@ -6197,6 +6197,7 @@ fn read_chat_line(
 /// every submitted line — so Up/Down at the inline prompt walks the same list,
 /// even though rustyline's own composer never runs.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn read_idle_chat_line(
     editor: &mut rustyline::Editor<ChatHelper, rustyline::history::DefaultHistory>,
     bridge: Option<&tui_bridge::BridgeGuard>,
@@ -6205,13 +6206,24 @@ fn read_idle_chat_line(
     assistive: bool,
     initial: &str,
     attached: &mut Option<u64>,
+    // Card **T4-S7**: the agent view's dispatcher, on its way to the overlay
+    // the inline reader can open.
+    view_dispatcher: Option<&subagent::ViewDispatcher>,
 ) -> ChatReadline {
     if let Some(bridge) = bridge {
         // Assistive and non-TTY carriers keep their existing readers: neither
         // can be painted into a viewport row.
         if !assistive && kitsu_render::stdin_is_tty() && kitsu_render::stderr_styled() {
             let history: Vec<String> = editor.history().iter().cloned().collect();
-            return read_chat_line_inline(bridge, registry, prompt, &history, initial, attached);
+            return read_chat_line_inline(
+                bridge,
+                registry,
+                prompt,
+                &history,
+                initial,
+                attached,
+                view_dispatcher,
+            );
         }
     }
     read_chat_line(editor, prompt, assistive, initial)
@@ -6267,6 +6279,9 @@ fn read_chat_line_inline(
     history: &[String],
     initial: &str,
     attached: &mut Option<u64>,
+    // Card **T4-S7**: carried through to the overlay this reader opens, which
+    // is one of the agent view's two routes.
+    view_dispatcher: Option<&subagent::ViewDispatcher>,
 ) -> ChatReadline {
     use std::io::Read as _;
 
@@ -6374,7 +6389,7 @@ fn read_chat_line_inline(
             // overlay must not engage a second one: `RawStdinGuard::engage`
             // snapshots the modes it displaces, and nesting would publish the
             // *raw* modes as the canonical ones for the dying-signal restore.
-            let exit = run_agent_view_overlay(registry, false);
+            let exit = run_agent_view_overlay(registry, false, view_dispatcher);
             // Card **T4-S6a**, requirement A3: the view's `Enter`/`\u{2192}`
             // attaches, and this is the one place that attachment becomes the
             // composer's. The view is gone by now (attach closes it), so the
@@ -6789,6 +6804,57 @@ fn agent_view_rename(registry: &subagent::AgentRegistry, id: u64, name: &str) ->
         },
         subagent::AgentRenameOutcome::NotFound => AgentViewReport {
             line: format!("no background job #{id}"),
+            changed: false,
+        },
+    }
+}
+
+/// The dispatch key: start a background agent on the line the composer
+/// collected (card **T4-S7**, requirement **A6**).
+///
+/// Split from the overlay's key arm for [`agent_view_steer_report`]'s reason,
+/// and it is the same fixture reason: a dispatch that really starts an agent
+/// needs a provider, a subagent registry and a profile catalog — none of which
+/// the overlay has and none of which a unit-level registry fixture builds — so
+/// the view holds a [`subagent::ViewDispatcher`] and this is the wiring that
+/// turns one line of text into one report.
+///
+/// Admission is the dispatcher's, which is the **registry's**
+/// (`AgentRegistryLimits`) and never the model's per-turn `SpawnBudget`
+/// (**A6**); the syntax is `agents_view::parse_dispatch`'s. Both refusals come
+/// back in their own author's words rather than a second wording here.
+///
+/// **Card T4-S7 is written test-first; this is the seam the tests pin and the
+/// implementer fills.**
+/// What the dispatch line answers on a carrier that never built a dispatcher
+/// (card **T4-S7**): the line is still read, because the key opened it, and
+/// the answer says why nothing started rather than discarding the task.
+#[cfg(unix)]
+const DISPATCH_WITHOUT_DISPATCHER: &str =
+    "this session cannot start background agents from the view";
+
+#[cfg(unix)]
+fn agent_view_dispatch(dispatcher: &subagent::ViewDispatcher, text: &str) -> AgentViewReport {
+    // The syntax first, because refusing it costs no gateway call: a
+    // malformed line never reaches the dispatcher at all.
+    let parsed = match kitsu_tui::agents_view::parse_dispatch(text) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return AgentViewReport {
+                line: error.message().to_string(),
+                changed: false,
+            }
+        }
+    };
+    match dispatcher(parsed.task, parsed.profile) {
+        Ok(id) => AgentViewReport {
+            line: format!("started background agent #{id}"),
+            changed: true,
+        },
+        // The registry's or the catalog's own sentence, carried and not
+        // reworded: it is what names the ceiling that refused.
+        Err(error) => AgentViewReport {
+            line: error,
             changed: false,
         },
     }
@@ -7531,6 +7597,25 @@ struct OverlayState {
     /// construction, so the decoded prompt this replaces could not express a
     /// legal name at all (**F70**).
     renaming: Option<SteerLine>,
+    /// The dispatch line while a task is being typed (card **T4-S7**,
+    /// requirement **A6**): the view's **fourth** edited line, on the same
+    /// byte bypass as the three above it and for the same three reasons — a
+    /// task may be non-ASCII, a paste is content and must not submit, and a
+    /// character really does arrive split across two reads.
+    ///
+    /// It has no id, like `/`'s and unlike `s`'s and `n`'s: a dispatch is
+    /// about an agent that does not exist yet, so there is nothing selected
+    /// for it to act on.
+    ///
+    /// It inherits **F72** with the other three: these lines are fed raw bytes
+    /// and the overlay's decoder is not in the path, so the burst fallback
+    /// does not protect them and on a terminal that does not bracket pastes a
+    /// pasted task submits at its first newline. That gap is not this card's.
+    dispatching: Option<OverlayLine>,
+    /// How a submitted dispatch line starts an agent: the session's binder,
+    /// subagent registry, config template and profile catalog, closed over
+    /// (card **T4-S7**). `None` where the carrier never built one.
+    dispatcher: Option<subagent::ViewDispatcher>,
     /// `/`'s filter line while it is being typed, read as raw bytes for the
     /// same reasons `s`'s is — a term may be non-ASCII, a paste is content,
     /// and a character may arrive split across two reads (card T4-S5).
@@ -7566,6 +7651,8 @@ impl OverlayState {
             steering: None,
             renaming: None,
             filtering: None,
+            dispatching: None,
+            dispatcher: None,
             attaching: None,
             filter: kitsu_tui::agents_view::AgentFilter::default(),
         }
@@ -7615,6 +7702,14 @@ fn overlay_escape_held(state: &OverlayState, decoder: &OverlayDecoder) -> bool {
             .as_ref()
             .is_some_and(OverlayLine::escape_held);
     }
+    // The dispatch line, identically: while it is up the decoder is not in
+    // the path and the line holds its own `ESC`.
+    if state.dispatching.is_some() {
+        return state
+            .dispatching
+            .as_ref()
+            .is_some_and(OverlayLine::escape_held);
+    }
     decoder.escape_pending()
 }
 
@@ -7659,6 +7754,17 @@ fn overlay_resolve_held_escape(state: &mut OverlayState, decoder: &mut OverlayDe
         if let Some(line) = state.filtering.as_mut() {
             if line.quiet_tick() == SteerLineStep::Cancelled {
                 state.filtering = None;
+                state.report = None;
+            }
+        }
+        return false;
+    }
+    // The dispatch line resolves its own held `ESC` the same way, and
+    // cancelling it starts nothing: `Esc` steps out of one frame.
+    if state.dispatching.is_some() {
+        if let Some(line) = state.dispatching.as_mut() {
+            if line.quiet_tick() == SteerLineStep::Cancelled {
+                state.dispatching = None;
                 state.report = None;
             }
         }
@@ -7779,6 +7885,52 @@ fn overlay_feed_chunk(
         }
         return false;
     }
+    // The dispatch line (card **T4-S7**, requirement **A6**), on the same
+    // byte bypass as the three above it and for the same three reasons: a
+    // task may be non-ASCII, a bracketed paste is content and must not
+    // submit, and a multi-byte character really does arrive split across two
+    // reads.
+    //
+    // The dispatcher is cloned out of the state before the line is borrowed:
+    // it is an `Arc`, and the alternative is holding two borrows of the same
+    // state across the submit.
+    let dispatcher = state.dispatcher.clone();
+    if let Some(line) = state.dispatching.as_mut() {
+        match line.feed(bytes) {
+            SteerLineStep::Editing => {}
+            SteerLineStep::Submit(text) => match dispatcher.as_ref() {
+                Some(dispatcher) => {
+                    let report = agent_view_dispatch(dispatcher, &text);
+                    if report.changed {
+                        state.dispatching = None;
+                    } else {
+                        // Refused: the line stays **open** carrying the task,
+                        // as `/`'s refused term and `n`'s refused name do, so
+                        // the refusal and the text it is about are on screen
+                        // together and the dispatch is retried with one
+                        // keystroke rather than retyped. The refusal is
+                        // painted on *this* frame, the innermost one
+                        // (**F71**).
+                        line.restore(&text);
+                    }
+                    state.report = Some(report.line);
+                }
+                // A carrier that never built a dispatcher cannot start an
+                // agent, and says so rather than swallowing the line: a key
+                // that acts silently is indistinguishable from one that
+                // failed (requirement T2-S5b).
+                None => {
+                    line.restore(&text);
+                    state.report = Some(DISPATCH_WITHOUT_DISPATCHER.to_string());
+                }
+            },
+            SteerLineStep::Cancelled => {
+                state.dispatching = None;
+                state.report = None;
+            }
+        }
+        return false;
+    }
     let mut closing = false;
     for input in decoder.feed(bytes) {
         match handle_overlay_input(registry, state, view_rows, cols, input) {
@@ -7836,6 +7988,18 @@ fn overlay_frame_rows(
         // The filter line is an innermost frame too, for the same reason:
         // it owns the caret the view otherwise hides.
         return kitsu_tui::agents_view::filter_prompt_rows(
+            line.draft(),
+            line.cursor(),
+            cols,
+            state.report.as_deref(),
+        );
+    }
+    if let Some(line) = state.dispatching.as_ref() {
+        // The dispatch line is an innermost frame too, and it takes the
+        // report with it: a refused dispatch leaves the line open, and the
+        // registry's reason belongs on the frame the task was typed on rather
+        // than under a row list this frame covers (**F71**).
+        return kitsu_tui::agents_view::dispatch_prompt_rows(
             line.draft(),
             line.cursor(),
             cols,
@@ -8098,6 +8262,24 @@ fn handle_overlay_input(
                     };
                 }
             }
+            // The dispatch key opens the view's fourth edited line (card
+            // **T4-S7**, requirement **A6**). Like `/` it needs no selection:
+            // a dispatch is about an agent that does not exist yet, so there
+            // is nothing selected for it to act on. It is a keystroke that is
+            // not `x`, so it disarms a half-pressed stop.
+            OverlayKey::Char(pressed) if pressed == kitsu_tui::agents_view::DISPATCH_KEY => {
+                if !state.helping && state.peeking.is_none() {
+                    state.selection.disarm();
+                    state.dispatching = Some(OverlayLine::new());
+                    // The previous key's report is not this frame's: the
+                    // dispatch frame paints a refusal of what is typed *into*
+                    // it, and a stale line there would read as one (**F71**).
+                    state.report = None;
+                    // The bytes after the key in this very chunk are the
+                    // line's to read, exactly as they are after `s`.
+                    return OverlayStep::StopChunk;
+                }
+            }
             // Every other printable byte is the view's and goes no
             // further: the overlay owns the keyboard while it is up.
             OverlayKey::Char(_) => {}
@@ -8304,7 +8486,18 @@ fn apply_detach_command(attached: &mut Option<u64>) -> DetachCommandOutcome {
 /// would snapshot the *raw* modes as the canonical ones for the dying-signal
 /// restore.
 #[cfg(unix)]
-fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) -> AgentViewExit {
+fn run_agent_view_overlay(
+    registry: &subagent::AgentRegistry,
+    engage_raw: bool,
+    // Card **T4-S7**, requirement **A6**: how this run of the view starts an
+    // agent. A parameter and not something the view builds, because the
+    // binder, the subagent registry, the config template and the profile
+    // catalog are all the session's — and a parameter because **both** of this
+    // function's callers must be able to dispatch: the chord/`\u{2190}\u{2190}`
+    // route and `/jobs view`. **F77/F79** is what a second carrier that
+    // reached only one of them costs.
+    view_dispatcher: Option<&subagent::ViewDispatcher>,
+) -> AgentViewExit {
     use std::io::{Read as _, Write as _};
 
     if tui_bridge::live_mode() != tui_bridge::TuiMode::Inline {
@@ -8361,6 +8554,7 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
     // It is a struct rather than seven locals because [`handle_overlay_input`]
     // is what changes it: one dispatch, which the tests call too (**F69**).
     let mut state = OverlayState::new();
+    state.dispatcher = view_dispatcher.cloned();
     let mut stdin = std::io::stdin();
     let mut buffer = [0u8; 256];
     let mut decoder = OverlayDecoder::new();
@@ -14037,6 +14231,11 @@ async fn handle_jobs_command_attaching(
     journal: &kitsu_tools::builtins::fs::WriteJournal,
     arg: &str,
     attached: &mut Option<u64>,
+    // Card **T4-S7**: `/jobs view` is the agent view's **second** route, and
+    // it must be able to dispatch too. **F79**'s lesson applied before the
+    // defect: a carrier that reached only the chord route would start agents
+    // on one route and silently refuse on the other.
+    view_dispatcher: Option<&subagent::ViewDispatcher>,
 ) -> Result<serde_json::Value, ()> {
     let mut parts = arg.split_whitespace();
     let action = parts.next().unwrap_or("list");
@@ -14060,9 +14259,15 @@ async fn handle_jobs_command_attaching(
             // keep only `shown`, so `/jobs view` + `Enter` attached to
             // nothing. The attachment goes where the inline reader puts it.
             #[cfg(unix)]
-            let shown = apply_jobs_view_exit(&run_agent_view_overlay(registry, true), attached);
+            let shown = apply_jobs_view_exit(
+                &run_agent_view_overlay(registry, true, view_dispatcher),
+                attached,
+            );
             #[cfg(not(unix))]
-            let shown = false;
+            let shown = {
+                let _ = view_dispatcher;
+                false
+            };
             if !shown {
                 eprintln!("{}", format_jobs_view(registry));
             }
@@ -15758,6 +15963,10 @@ async fn run_scripted_body(
                 registry,
                 command_runtime_log.as_ref(),
                 &mut attached_agent,
+                // The scripted body cannot open the overlay at all -- it
+                // declines outside inline mode on a tty with styled stderr --
+                // so there is nothing for a dispatcher to reach here.
+                None,
             )
             .await;
             let finish_command = |status: &str, error_message: Option<&str>, exit_code: i32| {
@@ -18312,6 +18521,38 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             skillset.index("")
         )
     };
+    // Card **T4-S7**, requirement **A6**: the agent view's dispatcher. Built
+    // here, where the session's binder, subagent registry, config template and
+    // profile catalog all exist, and handed to **both** of the view's routes
+    // (the composer's chord/`\u{2190}\u{2190}` route and `/jobs view`).
+    //
+    // It is built whatever `spawn_cap` is and whether or not the model got the
+    // agent tools: `spawn_cap` is the *model's* per-turn fan-out cap, and a
+    // human typing a task into the view is not a storming model (A6). What
+    // admits a dispatch is the registry's own ceilings and nothing else.
+    // Unconditional, and `Some` on every carrier that reaches here: the two
+    // routes are what must not disagree, so the dispatcher is not gated on a
+    // condition one route could satisfy and the other not. A carrier that
+    // cannot draw the view declines the overlay itself, upstream of this.
+    let view_dispatcher: Option<subagent::ViewDispatcher> = {
+        let view_route = provider.clone();
+        let mut view_cfg = sub_cfg.clone();
+        view_cfg.quiet = true;
+        Some(subagent::view_dispatcher(
+            subagent::ProviderBinder::<ProviderRouteHandle<CompiledProvider>>::new(move |model| {
+                view_route
+                    .bind_model(model)
+                    .map(Arc::new)
+                    .map_err(ProviderError::from)
+            }),
+            sub_tools.clone(),
+            view_cfg,
+            live_mw.clone(),
+            sub_system.clone(),
+            agent_registry.clone(),
+            subagent::BackgroundProfileRuntime::new(profile_catalog.clone(), profile_tools.clone()),
+        ))
+    };
     if !no_tools && spawn_cap > 0 {
         let subagent_route = provider.clone();
         let subagent_provider =
@@ -19968,6 +20209,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     assistive_input,
                     &initial,
                     &mut attached_agent,
+                    view_dispatcher.as_ref(),
                 );
                 #[cfg(not(unix))]
                 let read = read_chat_line(&mut rl, &visible_prompt, assistive_input, &initial);
@@ -20028,6 +20270,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 &agent_registry,
                 command_runtime_log.as_ref(),
                 &mut attached_agent,
+                // Card **T4-S7**: `/jobs view` is the agent view's second
+                // route, and it dispatches through the same closure the
+                // composer's route does.
+                view_dispatcher.as_ref(),
             )
             .await;
             // Keep subagents in sync with any `/model` change (which may have
@@ -21608,6 +21854,10 @@ async fn handle_slash(
     // (**F77**) and `jobs view` sets it (**F79**) — and it is a `&mut`
     // rather than a copy so the answer and the write are the same event.
     attached: &mut Option<u64>,
+    // Card **T4-S7**: handed on to `/jobs view`, which is one of the agent
+    // view's two routes. `None` from a carrier that never built one — the
+    // scripted body cannot open the overlay at all.
+    view_dispatcher: Option<&subagent::ViewDispatcher>,
 ) -> SlashResult {
     let mut parts = cmd.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("");
@@ -22387,7 +22637,14 @@ async fn handle_slash(
             } else {
                 arg.to_string()
             };
-            return match handle_jobs_command_attaching(registry, journal, &command, attached).await
+            return match handle_jobs_command_attaching(
+                registry,
+                journal,
+                &command,
+                attached,
+                view_dispatcher,
+            )
+            .await
             {
                 Ok(mut payload) => {
                     payload["alias"] = serde_json::Value::String("agents".to_string());
@@ -22397,7 +22654,15 @@ async fn handle_slash(
             };
         }
         "agent" => {
-            return match handle_jobs_command_attaching(registry, journal, arg, attached).await {
+            return match handle_jobs_command_attaching(
+                registry,
+                journal,
+                arg,
+                attached,
+                view_dispatcher,
+            )
+            .await
+            {
                 Ok(mut payload) => {
                     payload["alias"] = serde_json::Value::String("agent".to_string());
                     SlashResult::Continue(Some(payload))
@@ -22406,7 +22671,15 @@ async fn handle_slash(
             };
         }
         "jobs" => {
-            return match handle_jobs_command_attaching(registry, journal, arg, attached).await {
+            return match handle_jobs_command_attaching(
+                registry,
+                journal,
+                arg,
+                attached,
+                view_dispatcher,
+            )
+            .await
+            {
                 Ok(payload) => SlashResult::Continue(Some(payload)),
                 Err(()) => SlashResult::Error,
             };
@@ -29597,10 +29870,15 @@ mod tests {
         let (registry, id, answer) = registry_with_one_blocked_agent().await;
         let journal = kitsu_tools::builtins::fs::WriteJournal::new();
 
-        let payload =
-            handle_jobs_command_attaching(&registry, &journal, &format!("reply {id} a"), &mut None)
-                .await
-                .expect("replying to a blocked agent succeeds");
+        let payload = handle_jobs_command_attaching(
+            &registry,
+            &journal,
+            &format!("reply {id} a"),
+            &mut None,
+            None,
+        )
+        .await
+        .expect("replying to a blocked agent succeeds");
 
         assert_eq!(payload["kind"], "jobs");
         assert_eq!(payload["action"], "reply");
@@ -29633,6 +29911,7 @@ mod tests {
             &journal,
             &format!("reply {running} y"),
             &mut None,
+            None,
         )
         .await
         .expect("a reported no-op is not a failure");
@@ -29641,12 +29920,13 @@ mod tests {
         assert_eq!(payload["outcome"], "not_blocked");
 
         assert_eq!(
-            handle_jobs_command_attaching(&registry, &journal, "reply 9999 y", &mut None).await,
+            handle_jobs_command_attaching(&registry, &journal, "reply 9999 y", &mut None, None)
+                .await,
             Err(()),
             "an unknown id is rejected"
         );
         assert_eq!(
-            handle_jobs_command_attaching(&registry, &journal, "reply", &mut None).await,
+            handle_jobs_command_attaching(&registry, &journal, "reply", &mut None, None).await,
             Err(()),
             "a missing id is a usage error"
         );
@@ -29655,7 +29935,8 @@ mod tests {
                 &registry,
                 &journal,
                 &format!("reply {running} maybe"),
-                &mut None
+                &mut None,
+                None
             )
             .await,
             Err(()),
@@ -34154,5 +34435,531 @@ mod tests {
         );
         assert!(!row().contains("attached"), "{:?}", row());
         assert_eq!(label(), BASE);
+    }
+
+    // ---- Card T4-S7, requirement A6: dispatch from the view composer ----
+    //
+    // What is pinned here is the overlay's half: the key that opens the
+    // fourth line, what the line hands the dispatcher, and that every refusal
+    // is painted **on the frame the user is looking at** (**F71**). What
+    // *admits* a dispatch is the registry's and is pinned in `subagent.rs`,
+    // where a provider fixture exists -- the same split T4-S4b and T4-S6b
+    // were made along, and for the same reason: a dispatch that really starts
+    // an agent needs a provider, and the registry fixture here has none.
+
+    /// The dispatch key as the bytes a terminal delivers for it, read off the
+    /// one constant the help row and the overlay's arm also read. The letter
+    /// is not spelled in these tests: that is `agents_view`'s to choose, and a
+    /// test that re-spelled it would be a second source of truth for it.
+    #[cfg(unix)]
+    fn dispatch_key() -> Vec<u8> {
+        kitsu_tui::agents_view::DISPATCH_KEY
+            .to_string()
+            .into_bytes()
+    }
+
+    /// A dispatcher that records what it was handed and answers however the
+    /// test says, without a provider anywhere near it.
+    ///
+    /// This is the seam the card exists to create: the overlay holds a
+    /// [`subagent::ViewDispatcher`] and nothing else, so everything the view
+    /// does with a dispatch is observable here, and whether the *registry*
+    /// admits it is a question for `subagent.rs`.
+    /// What a recording dispatcher saw: one `(task, profile)` per dispatch.
+    #[cfg(unix)]
+    type DispatchesSeen = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    #[cfg(unix)]
+    fn recording_dispatcher(
+        answer: Result<u64, String>,
+    ) -> (subagent::ViewDispatcher, DispatchesSeen) {
+        let seen: DispatchesSeen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let dispatcher: subagent::ViewDispatcher = Arc::new(move |task, profile| {
+            recorded
+                .lock()
+                .expect("the recording dispatcher")
+                .push((task, profile));
+            answer.clone()
+        });
+        (dispatcher, seen)
+    }
+
+    /// **The report one dispatch produces, in its author's own words.**
+    ///
+    /// Three outcomes and three authors: the registry refuses over capacity
+    /// and its own `AgentStartError` is the line, the parser refuses a
+    /// malformed line and its own message is the line, and a started agent is
+    /// named by its id. A second wording of either refusal would be a second
+    /// source of truth about what the key just did -- the shape
+    /// `agent_view_steer_report` and `agent_view_rename` both avoid.
+    ///
+    /// The capacity string is **derived** from `AgentStartError`, not spelled:
+    /// it is the registry's sentence and the view only carries it.
+    #[cfg(unix)]
+    #[test]
+    fn the_dispatch_report_carries_the_registrys_own_refusal_and_names_the_ceiling() {
+        let (started, _) = recording_dispatcher(Ok(7));
+        let report = agent_view_dispatch(&started, "measure the paste latency");
+        assert_eq!(
+            report.line, "started background agent #7",
+            "a started dispatch is reported by the id the user can now act on"
+        );
+        assert!(report.changed, "and it changed the registry");
+
+        for error in [
+            subagent::AgentStartError {
+                kind: subagent::AgentCapacityKind::Running,
+                current: 8,
+                limit: 8,
+            },
+            subagent::AgentStartError {
+                kind: subagent::AgentCapacityKind::Records,
+                current: 128,
+                limit: 128,
+            },
+        ] {
+            let (refusing, _) = recording_dispatcher(Err(error.to_string()));
+            let report = agent_view_dispatch(&refusing, "one more agent");
+            assert_eq!(
+                report.line,
+                error.to_string(),
+                "the registry's own sentence is the line, and it names the \
+                 ceiling that refused: {error}"
+            );
+            assert!(
+                !report.changed,
+                "and a refused dispatch changed nothing: {}",
+                report.line
+            );
+            assert!(
+                report.line.contains(&error.limit.to_string()),
+                "A6 names both ceilings, so the limit is in the line the user \
+                 reads: {}",
+                report.line
+            );
+        }
+
+        // A malformed line never reaches the dispatcher at all: the parse is
+        // the view's and refusing it costs no gateway call.
+        let (never, seen) = recording_dispatcher(Ok(9));
+        let report = agent_view_dispatch(&never, "@");
+        assert_eq!(
+            report.line,
+            kitsu_tui::agents_view::parse_dispatch("@")
+                .expect_err("`@` with no profile is not a dispatch")
+                .message(),
+            "the parser's own message is the line"
+        );
+        assert!(!report.changed);
+        assert!(
+            seen.lock().expect("the recording dispatcher").is_empty(),
+            "and nothing was dispatched"
+        );
+        // POSITIVE CONTROL: the same dispatcher really does get called for a
+        // line the parser accepts, so the emptiness above is the refusal and
+        // not a dispatcher that had stopped being called.
+        let _ = agent_view_dispatch(&never, "@reviewer review the diff");
+        assert_eq!(
+            *seen.lock().expect("the recording dispatcher"),
+            vec![("review the diff".to_string(), Some("reviewer".to_string()))],
+            "POSITIVE CONTROL: an accepted line reaches the dispatcher, \
+             profile and task apart"
+        );
+    }
+
+    /// **Requirement A6: the key opens the view's fourth line.**
+    ///
+    /// Pinned through the painter and not through the state (**F71**): the
+    /// frame the loop would paint after the keystroke *is* the dispatch
+    /// line's, built by the one function that builds it.
+    ///
+    /// The NON-VACUOUS half is the frame before the key: the row list, which
+    /// is not the dispatch frame.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_dispatch_key_opens_the_views_fourth_edited_line() {
+        let (registry, _) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        let (dispatcher, _seen) = recording_dispatcher(Ok(4));
+        overlay.state.dispatcher = Some(dispatcher);
+
+        let before = overlay.feed_and_frame(&registry, b"");
+        let empty_line =
+            kitsu_tui::agents_view::dispatch_prompt_rows("", 0, OVERLAY_TEST_COLS, None);
+        assert_ne!(
+            before, empty_line,
+            "NON-VACUOUS: the view is painting its row list before the key"
+        );
+
+        let frame = overlay.feed_and_frame(&registry, &dispatch_key());
+        assert_eq!(
+            frame, empty_line,
+            "the key opens an empty dispatch line, and the frame is the one \
+             `dispatch_prompt_rows` paints"
+        );
+    }
+
+    /// **A6's two clauses, typed**: plain text dispatches with the default
+    /// profile, and `@<profile> <task>` selects one -- through the loop's own
+    /// byte path, one `read` per keystroke, which is how a terminal delivers
+    /// typing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_typed_dispatch_reaches_the_dispatcher_with_and_without_a_profile() {
+        let (registry, _) = registry_with_three_agents();
+        for (typed, expected) in [
+            (
+                "measure the paste latency",
+                ("measure the paste latency".to_string(), None),
+            ),
+            (
+                "@reviewer review the diff",
+                ("review the diff".to_string(), Some("reviewer".to_string())),
+            ),
+        ] {
+            let mut overlay = OverlayUnderTest::new();
+            let (dispatcher, seen) = recording_dispatcher(Ok(4));
+            overlay.state.dispatcher = Some(dispatcher);
+            overlay.feed(&registry, &dispatch_key());
+            type_filter(&mut overlay, &registry, typed);
+            assert!(
+                seen.lock().expect("the recording dispatcher").is_empty(),
+                "nothing is dispatched while the line is still being typed: a \
+                 dispatch happens on Enter, not per keystroke"
+            );
+            overlay.feed(&registry, b"\r");
+            assert_eq!(
+                *seen.lock().expect("the recording dispatcher"),
+                vec![expected.clone()],
+                "{typed:?} dispatches exactly once, with the task and profile \
+                 A6 says it has. Reports: {:?}",
+                overlay.reports
+            );
+        }
+    }
+
+    /// **The card's named acceptance: at `max_running` the dispatch is refused,
+    /// the refusal names the ceiling, and the user can see it.**
+    ///
+    /// *Can see it* is the whole point (**F71**, and four findings in that
+    /// family): the refusal is asserted on the rows
+    /// [`overlay_frame_rows`] would paint, which is the only surface that
+    /// answers whether a message is on screen. A refused dispatch leaves the
+    /// line **open** carrying the task, as `/`'s refused term and `n`'s
+    /// refused name do, so the message and the text it is about are on screen
+    /// together and the user can wait and press Enter again rather than
+    /// retyping the task.
+    ///
+    /// **F78/F58**: painted at 120 columns, where the registry's sentence
+    /// demonstrably fits -- at 80 it would be truncated and the comparison
+    /// below would be unsatisfiable arithmetic.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_over_capacity_dispatch_is_refused_on_the_frame_and_the_line_stays_open() {
+        const WIDE: usize = 120;
+        let error = subagent::AgentStartError {
+            kind: subagent::AgentCapacityKind::Running,
+            current: 8,
+            limit: 8,
+        };
+        assert!(
+            error.to_string().chars().count() + 2 <= WIDE,
+            "F58: the refusal must fit the width it is asserted at, indent \
+             included: {}",
+            error
+        );
+
+        let (registry, _) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        let (dispatcher, seen) = recording_dispatcher(Err(error.to_string()));
+        overlay.state.dispatcher = Some(dispatcher);
+        overlay.feed(&registry, &dispatch_key());
+        type_filter(&mut overlay, &registry, "one more agent");
+        let frame = overlay.feed_and_frame_at(&registry, b"\r", WIDE);
+
+        assert_eq!(
+            seen.lock().expect("the recording dispatcher").len(),
+            1,
+            "the dispatch really was attempted, and refused by the registry"
+        );
+        assert!(
+            frame.iter().any(|row| row.trim() == error.to_string()),
+            "the ceiling that refused is painted on the frame the task was \
+             typed on, in the registry's own words:\n{}",
+            frame.join("\n")
+        );
+        assert!(
+            frame.iter().any(|row| row.contains("one more agent")),
+            "and the task is still on screen beside it, because the line \
+             stayed open:\n{}",
+            frame.join("\n")
+        );
+
+        // The line really is still open, asserted on the paint and not on a
+        // flag: inside a line `x` is a character, and over the row list it
+        // arms a stop and says so. The refused dispatch can therefore be
+        // retried with one keystroke rather than retyped.
+        let after_x = overlay.feed_and_frame_at(&registry, b"x", WIDE);
+        assert!(
+            after_x.iter().any(|row| row.contains("one more agentx")),
+            "the line is still open and `x` went into it as text:\n{}",
+            after_x.join("\n")
+        );
+        let mut over_rows = OverlayUnderTest::new();
+        let armed = over_rows.feed_and_frame_at(&registry, b"x", WIDE);
+        assert!(
+            armed.iter().any(|row| row.contains("press x again")),
+            "POSITIVE CONTROL: over the row list the same byte arms a stop and \
+             says so, so the frame above is an open line and not a dead \
+             key:\n{}",
+            armed.join("\n")
+        );
+    }
+
+    /// **A6 names both ceilings, and they fail differently.**
+    ///
+    /// `max_records` is not `max_running`: a pruned-but-recorded agent still
+    /// occupies a record, so a view with nothing running can still refuse, and
+    /// the correction is different -- prune a terminal agent rather than wait
+    /// for a running one. Both are painted, and the two sentences differ.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_record_capacity_refusal_is_painted_and_says_something_else() {
+        const WIDE: usize = 120;
+        let running = subagent::AgentStartError {
+            kind: subagent::AgentCapacityKind::Running,
+            current: 8,
+            limit: 8,
+        };
+        let records = subagent::AgentStartError {
+            kind: subagent::AgentCapacityKind::Records,
+            current: 128,
+            limit: 128,
+        };
+        assert_ne!(
+            running.to_string(),
+            records.to_string(),
+            "NON-VACUOUS: the registry already distinguishes the two ceilings"
+        );
+        assert!(
+            records.to_string().chars().count() + 2 <= WIDE,
+            "F58: {records}"
+        );
+
+        let (registry, _) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        let (dispatcher, _seen) = recording_dispatcher(Err(records.to_string()));
+        overlay.state.dispatcher = Some(dispatcher);
+        overlay.feed(&registry, &dispatch_key());
+        type_filter(&mut overlay, &registry, "one more agent");
+        let frame = overlay.feed_and_frame_at(&registry, b"\r", WIDE);
+        assert!(
+            frame.iter().any(|row| row.trim() == records.to_string()),
+            "the record ceiling is painted in its own words:\n{}",
+            frame.join("\n")
+        );
+        assert!(
+            !frame.iter().any(|row| row.trim() == running.to_string()),
+            "and not as the other ceiling's:\n{}",
+            frame.join("\n")
+        );
+    }
+
+    /// **A started dispatch is on screen at once, and it does not move the
+    /// selection.**
+    ///
+    /// Two claims a user meets immediately. The first is that the view does
+    /// not need closing and reopening to show the agent just started -- its
+    /// rows are read off the registry every repaint, so the record the
+    /// dispatcher made is already among them. The display order is derived
+    /// through `agents_view::group_rows` and never off `overlay_visible_rows`,
+    /// which is **registry** order (**F73**).
+    ///
+    /// The second is a safety property, and it is T4-S4a's: the keys act on
+    /// the **selected** agent, so a dispatch that silently moved the selection
+    /// would repoint the next `x` or `p` at an agent the user never chose.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dispatched_agent_is_on_screen_at_once_and_moves_no_selection() {
+        let (registry, ids) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        // The dispatcher a session builds really does make a record; this one
+        // makes the same record without a provider.
+        let registered = registry.clone();
+        let dispatcher: subagent::ViewDispatcher =
+            Arc::new(move |task, _profile| registered.start(task).map_err(|e| e.to_string()));
+        overlay.state.dispatcher = Some(dispatcher);
+
+        overlay.feed(&registry, b"\x1b[B");
+        assert_eq!(
+            overlay.selected(&registry),
+            Some(ids[1]),
+            "NON-VACUOUS: the selection is on the second agent, which is not \
+             where a fresh view leaves it and not the agent about to start"
+        );
+
+        overlay.feed(&registry, &dispatch_key());
+        type_filter(&mut overlay, &registry, "delta: dispatched from the view");
+        overlay.feed(&registry, b"\r");
+
+        let displayed: Vec<u64> = kitsu_tui::agents_view::group_rows(overlay.visible(&registry))
+            .into_iter()
+            .flat_map(|group| group.rows)
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(
+            displayed.len(),
+            4,
+            "the agent just dispatched is among the rows on screen, with no \
+             reopen: {displayed:?}. Reports: {:?}",
+            overlay.reports
+        );
+        assert_eq!(
+            displayed.iter().filter(|id| !ids.contains(id)).count(),
+            1,
+            "and it is a row the fixture did not put there: {displayed:?}"
+        );
+        assert_eq!(
+            overlay.selected(&registry),
+            Some(ids[1]),
+            "and the selection is where the user left it: a dispatch is not a \
+             selection move, and moving it would repoint the next x or p"
+        );
+        assert!(
+            overlay
+                .reports
+                .last()
+                .is_some_and(|line| line.contains('#')),
+            "and the view says which agent it started: {:?}",
+            overlay.reports
+        );
+    }
+
+    /// **A paste into the dispatch line is content and never submits** --
+    /// finding **F68**, one layer down, which is why this line is on the byte
+    /// bypass with the other three: the editor applies the bracketed-paste
+    /// rule and the overlay's decoder is not in the path.
+    ///
+    /// A pasted task really does contain newlines, and a line that submitted
+    /// at the first one would start an agent on half a task and leave the rest
+    /// as keys over the row list -- where `x` stops agents.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_paste_into_the_dispatch_line_is_content_and_never_submits() {
+        let (registry, ids) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        let (dispatcher, seen) = recording_dispatcher(Ok(4));
+        overlay.state.dispatcher = Some(dispatcher);
+        overlay.feed(&registry, &dispatch_key());
+
+        let mut pasted = Vec::new();
+        pasted.extend_from_slice(OVERLAY_PASTE_START);
+        pasted.extend_from_slice(PASTED_CORRECTION.as_bytes());
+        pasted.extend_from_slice(OVERLAY_PASTE_END);
+        let frame = overlay.feed_and_frame(&registry, &pasted);
+
+        assert!(
+            seen.lock().expect("the recording dispatcher").is_empty(),
+            "a paste never submits: nothing was dispatched"
+        );
+        assert_eq!(
+            registry.progress_snapshot().total,
+            ids.len(),
+            "and the `x` bytes inside the paste stopped nothing"
+        );
+        assert_eq!(
+            frame,
+            kitsu_tui::agents_view::dispatch_prompt_rows(
+                &overlay
+                    .state
+                    .dispatching
+                    .as_ref()
+                    .map(|line| line.draft().to_string())
+                    .expect("the line is still open, carrying the pasted text"),
+                overlay
+                    .state
+                    .dispatching
+                    .as_ref()
+                    .map(OverlayLine::cursor)
+                    .expect("the line is still open"),
+                OVERLAY_TEST_COLS,
+                None,
+            ),
+            "the view is still painting the dispatch line, with the paste in \
+             it as content"
+        );
+        assert!(
+            overlay
+                .state
+                .dispatching
+                .as_ref()
+                .is_some_and(|line| line.draft().contains("and fix the bug")),
+            "and the pasted text really is the draft: {:?}",
+            overlay.state.dispatching.as_ref().map(OverlayLine::draft)
+        );
+
+        // POSITIVE CONTROL: the same line, typed and submitted, really does
+        // dispatch -- so the silence above is the paste rule and not a line
+        // that had stopped working.
+        overlay.feed(&registry, b"\r");
+        assert_eq!(
+            seen.lock().expect("the recording dispatcher").len(),
+            1,
+            "POSITIVE CONTROL: a typed Enter submits the line the paste filled"
+        );
+    }
+
+    /// **`Esc` cancels the dispatch line and starts nothing**, resolved on the
+    /// loop's own 50 ms grace, exactly as the other three lines resolve theirs
+    /// -- and an arrow key is still an arrow and not a cancel.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn esc_cancels_the_dispatch_line_and_starts_nothing() {
+        let (registry, _) = registry_with_three_agents();
+        let mut overlay = OverlayUnderTest::new();
+        let (dispatcher, seen) = recording_dispatcher(Ok(4));
+        overlay.state.dispatcher = Some(dispatcher);
+        overlay.feed(&registry, &dispatch_key());
+        type_filter(&mut overlay, &registry, "delta: never started");
+
+        // An arrow arrives as `ESC [ B`: the line is fed the bytes and no
+        // grace is held, so this is not a cancel.
+        overlay.feed(&registry, b"\x1b[B");
+        assert!(
+            !overlay.quiet_tick(),
+            "an arrow is not a held ESC, so the grace has nothing to resolve"
+        );
+        assert!(
+            overlay.state.dispatching.is_some(),
+            "and the line is still open after it"
+        );
+
+        overlay.feed(&registry, b"\x1b");
+        assert!(
+            !overlay.quiet_tick(),
+            "the view does not close: Esc steps out of the line it is in"
+        );
+        assert!(
+            overlay.state.dispatching.is_none(),
+            "the held ESC resolved as the Esc key and cancelled the line"
+        );
+        assert!(
+            seen.lock().expect("the recording dispatcher").is_empty(),
+            "and nothing was dispatched"
+        );
+        assert_eq!(
+            overlay.feed_and_frame(&registry, b""),
+            {
+                let rows = overlay.visible(&registry);
+                kitsu_tui::agents_view::overlay_rows_with_report(
+                    rows,
+                    OVERLAY_TEST_COLS,
+                    overlay.state.selection.selected(),
+                    None,
+                )
+            },
+            "the view is back on its row list with no stale report under it"
+        );
     }
 }
