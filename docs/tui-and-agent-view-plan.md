@@ -147,7 +147,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T3-S7b in-loop approval read; answer off the transcript; F55 starvation fixed, **F45 closed** | done | b62e3ed |
 | T3-S8 `Ctrl+L` + restore on SIGINT/SIGTERM/panic; N5 amended (two clauses vacuous); resize pinned, not rebuilt | done | e2654f4 |
 | T3-S9 `/tui classic\|inline` runtime switch; R2 completed; F57 reachability, F58 unsatisfiable test | done | d4d213b |
-| T3-S10 census answered (421, triaged); **`write_block` ring gap fixed**; F17 corrected, N4 limitation list | done | this commit |
+| T3-S10 census answered (421, triaged); **`write_block` ring gap fixed**; F17 corrected, N4 limitation list | done | 4d567bf |
+| T3-S11 Windows half measured (renderer crates clean; F59 corrects the premise); **matrix still needs a human** | partial | this commit |
 
 > **`KITSU_TUI` is retired as of T3-S2.** Mentions of it in the T0-T2 rows and
 > requirement text below are **historical** — they record how the preview was
@@ -325,7 +326,7 @@ Starts after the T0 **go** record.
 | T3-S8 | Resize reflow (region reset + repaint, no duplicate lines); `Ctrl+L`; restore on panic/SIGINT/SIGTERM | Failing PTY `TIOCSWINSZ` test | `viewport.rs`, `lib.rs` | No duplicate cell; `kill -INT` restores (R8, N5) |
 | T3-S9 | `/tui classic\|inline` runtime switch (seam swap between turns) | Failing PTY switch test | `main.rs`, `surface.rs` | Transcript continues (R2 partial; fullscreen in T5) |
 | T3-S10 | Stray-writer follow-up from the T0 census: wrap or route the remaining idle writers; documented limitation list for the cell ring | Failing test per wrapped site | `main.rs` | Census count reaches zero or the remainder is documented (Q3) |
-| T3-S11 | Terminal matrix + fallbacks: tmux, zellij (`--no-alt-screen`), screen; Windows Terminal = classic fallback until T5; **Windows `cargo check`**: `rustup target add x86_64-pc-windows-gnu && cargo check --target x86_64-pc-windows-gnu -p kitsu` (no linker needed) and remove the `cfg(unix)` gate where it compiles | — | `viewport.rs`, `tui_bridge.rs` | Matrix in the cycle record; Windows check green (N6) |
+| T3-S11 | Terminal matrix + fallbacks: tmux, zellij (`--no-alt-screen`), screen; Windows Terminal = classic fallback until T5. **Windows check, measured in T3-S11:** `kitsu-tui`, `kitsu-render` and `kitsu-editor` all `cargo check --target x86_64-pc-windows-gnu` **clean**; the whole-binary check needs a **MinGW cross-compiler** for `ring`'s build script — the row's "(no linker needed)" was wrong, because `cargo check` skips linking but still runs build scripts (**F59**). `cfg(unix)` narrowing (4 in `tui_bridge.rs`, 85 in `main.rs`) deliberately **not attempted** without a compiler to prove it; `viewport.rs` has none. **The live matrix still needs a human** (Q1) | — | `viewport.rs`, `tui_bridge.rs` | Matrix in the cycle record; renderer crates Windows-green (N6 partial) |
 | T3-S12 | Frame coalescing (≤ 60 fps), synchronized-update probe, `--reduced-motion` behavior | Failing scheduler unit test | `lib.rs` | PTY under `--reduced-motion` static (N3, N9) |
 | T3-S13 | N2 benchmark (test binary timing 10 KiB paste through the PTY, reported not gating); docs: `ux-design.md` surface section, `functionality.md` (`/tui`, flags), `ui_guidelines.md`; design status → "implemented through T3" | — | `tests/`, `docs/` | Numbers in the PR text |
 
