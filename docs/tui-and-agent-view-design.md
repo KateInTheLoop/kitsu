@@ -587,6 +587,46 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
     reach it, and a second line editor there would be a second parser of the
     same bytes, which is what **F45** was closed by removing.
 
+  **`/` was listed and unbound until T4-S5, which decided these four points.**
+
+  - **The filter's rows are the selection's rows. This is a safety property.**
+    The selection is keyed on an agent id, and a filter **hides rows without the
+    agents going away** — so `AgentSelection::sync` is handed the **filtered**
+    rows. Handed the full rows it would leave the selection on a **hidden**
+    agent, and the dispatch would then let `x`, `r`, `n` or `p` act on an agent
+    **not on screen**: the **F68** family exactly, a privileged action with no
+    visible intent. Consequences, each pinned: a filter that hides the selected
+    agent **moves the selection to a visible row**; a filter matching nothing
+    leaves **no** selection, so `x` reports the no-selection line rather than
+    stopping the agent that *used* to be selected. **Clearing the filter does not
+    restore the old selection** — a remembered-and-restored selection is hidden
+    state steering a destructive key, which is the same hazard with one more
+    step.
+  - **The filter line reads raw bytes through `kitsu-editor`**, joining `s`'s
+    bypass, rather than the decoded text prompt. `n:café` is a plausible **and
+    legal** filter, and `OverlayKey::Char` is **ASCII-only by construction**, so
+    a decoded-key prompt cannot express it — see **F70**, where that same gap is
+    a live defect in the `n` key. The editor also brings the paste rule in the
+    same place as every other text field (**F68** satisfied without a second
+    decision) and handles a multi-byte character **split across reads**, which
+    byte-by-byte typing really produces. **F45**: a second line editor here
+    would be a second parser of the same bytes.
+  - **An invalid term is refused, the rows are left alone, and the line stays
+    open**, reporting **the parser's own message**. The two rejected readings:
+    *filtering to nothing* shows an empty view with nothing saying why — and in
+    this view an empty view can mean failing to show the agent waiting on an
+    answer; *closing the line* makes the user retype a filter that is one
+    character wrong. An **empty** line clears the filter, since the empty filter
+    already matches everything.
+  - **The filter survives a regroup and does not survive a close.** It lives in
+    the overlay's state, so repaints and an agent finishing keep it in force; a
+    reopen starts fresh, so the view always opens showing everything — a filter
+    outliving its screen would hide agents for a reason nothing on screen
+    explains, and the keys would act inside that hidden state. **`Esc` cancels
+    the line and leaves a filter already in force untouched:** cancelling is not
+    clearing, or `Esc` would do two things at once and abandoning a half-typed
+    term would lose the view you set up.
+
   **The filter grammar was under-specified; T4-S1 decided these four points and
   pinned each to an exact message.**
   - **`o:` was never defined here.** It matches the **task/objective**

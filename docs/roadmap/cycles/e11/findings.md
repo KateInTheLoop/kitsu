@@ -3682,3 +3682,62 @@ Neither compared assertion changed by a byte; nothing was normalised out of the 
 ### Tally
 
 Baseline release 9/20 pass. `/quit wait` experiment 13/20. **Fix: 40 release and 10 debug runs, 0 failures**, each to its own numbered file, plus three full release suites at 245. My own independent check: 6 release runs green, full release `--test cli` **245**.
+
+## F70 — the `n` key silently drops a name the registry would accept
+
+**I hypothesised this in a brief and labelled it a hypothesis; the test author confirmed it with live evidence.** Both halves matter: the guess was right, and it was still checked before being believed.
+
+- `OverlayKey::Char` is **ASCII-only by construction**: `plain()` maps `0x20..=0x7e` and **drops** every other byte.
+- The `n` key fills its draft solely from `OverlayKey::Char(typed) => draft.push(typed)`.
+- `AgentRegistry::rename` rejects only empty, over-length and `char::is_control` names. **`café` is accepted** — asserted and passing.
+
+**Observed, not reasoned:** typing `n:café` over the row list produced the report
+
+```
+named background agent #1 :caf (was café)
+```
+
+The `n` key opened the rename prompt, `:caf` entered the draft, **the two bytes of `é` were silently dropped**, and the agent was renamed to `:caf`.
+
+### Why this slipped through a card I accepted
+
+T4-S4a wrote `n`'s legality rules into A3 — *"non-ASCII is legal — the rule is control characters, not ASCII-only"* — and the registry implements exactly that, pinned by its own tests. **The rule and its enforcement agreed; nothing tested whether the only path a user has could reach it.** That is **F57**'s hole once more (*a single source of truth guarantees readers agree with it; it guarantees nothing about whether anyone acts on what they read*), and it is the third time this epic has paid for it — F57 itself, F69's unreflecting mirror, and now a legality rule no keystroke can satisfy.
+
+**The pattern worth naming: a validation rule is only as wide as the narrowest input path that feeds it.** Writing "non-ASCII is legal" in a requirement and implementing it in the registry proves nothing about the keyboard.
+
+### Not fixed here, deliberately
+
+T4-S5 needed the same decision for its own filter line — `n:café` is a plausible *and legal* filter — and resolved it by reading the filter line's bytes through `kitsu-editor`, which handles non-ASCII, split multi-byte characters and bracketed paste. **`n`'s fix is the same shape**, and doing it inside T4-S5 would have meant an implementer changing behaviour no test of that card covered.
+
+**It is its own card**, and it has a pleasing side effect: `n` is the last consumer of the decoded text prompt, so routing it through the editor **removes that prompt entirely** — one fewer parser of the same bytes (**F45**), and one fewer surface where an input path can be narrower than the rule it feeds.
+
+### Also recorded: an unidentified `--test tui` flake
+
+One debug `--test tui -- --test-threads=1` run came back **59 passed, 1 failed**; the immediate re-run and the release run were both 60/60. **The failing test's name was not captured — grep consumed the output.**
+
+That is the same evidence loss F39's eighth occurrence warned about, and the rule it added (**one output file per suite**) exists precisely for this. An unidentified flake is strictly worse than a characterised one: F39 took **eight** occurrences to pin because the first two destroyed their own evidence. Probing deferred until the tree is quiet, since running these suites concurrently with another agent's can itself produce failures.
+
+## F71 — a message the test can read and the user can never see
+
+Caught by the implementer, **beyond its brief**, and it is the most valuable thing in T4-S5.
+
+T4-S5 decided that an invalid filter term is refused with the parser's own message. The obvious implementation puts that message in `state.report`, which the tests collect and assert — and the tests would have passed.
+
+**But the overlay's frame chain puts the open line innermost.** A report row painted under the row list is **not on screen while the filter line is open**. So the refusal would have been:
+
+- **observable to the test**, which reads `state.report` directly, and
+- **invisible to the user**, who sees the filter frame and nothing else.
+
+The card's own decision — *tell the user which character is wrong instead of showing an empty view* — would have shipped as a message nobody could read, with a green suite.
+
+### Why this is its own finding and not a detail
+
+Every "is this visible?" failure in this epic so far has been about the **product** lying to the user. This one is about the **test** being satisfied by something the user cannot reach: the test and the user were reading **different surfaces**, and only one of them is the product.
+
+**The rule: a test that asserts a message exists has not asserted that the message is on screen.** Collecting from state is the convenient thing to assert and the wrong thing to trust, and the gap is invisible precisely because the assertion passes.
+
+This is the same family as **F57** (readers agree with the source; nobody checks whether anyone acts on it), **F69** (a mirror that no longer reflects cannot fail) and **F70** (a legality rule no keystroke can satisfy) — four occurrences in one epic of *the thing we checked was not the thing that matters*. The fix here was to paint the refusal **on the filter frame itself** (`filter_prompt_rows` takes the report), and to clear a stale report when `/` opens, so the frame only ever shows a refusal of what was typed into it.
+
+### The unidentified `--test tui` flake did not reproduce
+
+Five green runs across both profiles — three of mine with one output file each, two of the implementer's. **That is not proof of absence**, and the original failing test's name was never captured, so it stays open. Recorded so the next occurrence is the second and not the first.

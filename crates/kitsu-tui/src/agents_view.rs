@@ -384,6 +384,11 @@ fn accepted_state_words() -> String {
     format!("{} or {last}", head.join(", "))
 }
 
+/// A3's filter grammar, in the one wording the help row and the filter
+/// frame's footer both print. Spelled once because the parser is strict: a
+/// grammar advertised two ways is a grammar that can be advertised wrongly.
+const FILTER_GRAMMAR: &str = "s:<state> n:<text> o:<text> p:<profile>";
+
 /// The one token every frame of the overlay prints, on its first row.
 ///
 /// The design calls the surface "the agent view overlay" throughout (§3.2 A1,
@@ -543,6 +548,12 @@ pub fn overlay_help_rows(cols: usize) -> Vec<String> {
         ),
         ("n", "rename the selected agent: type a name, enter applies"),
         ("p", "acknowledge the selected agent's result"),
+        // `/` was A3's last key with no binding (card T4-S5). The grammar is
+        // on the row because the parser is strict: a user told there is a
+        // filter but not told its shape gets an error message, not a near
+        // miss. Like the entries above, this literal is what T4-S10 replaces
+        // with the one bindings table.
+        ("/", &format!("filter the rows \u{2014} {FILTER_GRAMMAR}")),
         ("?", "show this help"),
         ("esc", "leave a prompt or the help, then close the view"),
     ] {
@@ -568,7 +579,78 @@ pub const STEER_CARET: char = '\u{2588}';
 /// `id` is on the frame: the agent being steered is the one the keystroke was
 /// typed on, and steering has a real effect, so the surface says which.
 pub fn steer_prompt_rows(id: u64, draft: &str, cursor: usize, cols: usize) -> Vec<String> {
-    const INDENT: &str = "  ";
+    fit_all(
+        vec![
+            title_row(&format!("{OVERLAY_TITLE} \u{2014} steer #{id}"), cols),
+            String::new(),
+            line_echo(draft, cursor, cols),
+            String::new(),
+            format!("{LINE_INDENT}enter sends the correction to agent #{id}, esc cancels"),
+        ],
+        cols,
+    )
+}
+
+/// The frame for `/`'s filter line (card T4-S5, requirement A3's `/ filter`).
+///
+/// The same drawn echo and caret `s`'s frame has, because it is the same kind
+/// of line read by the same editor; what differs is the title and the footer,
+/// and the footer repeats the grammar, because the parser is strict and a
+/// guess is an error message rather than a near miss.
+///
+/// `report` is the parser's refusal of the term just submitted, when there is
+/// one. It is painted **on this frame** rather than on the row list, because a
+/// refused term leaves the line open: the message and the text it is about are
+/// on screen together, and a refusal painted on a frame the user is not
+/// looking at is a key that failed silently (requirement T2-S5b). One refusal
+/// is one row, flattened like every other report here, so registry or user
+/// text cannot grow the frame.
+pub fn filter_prompt_rows(
+    draft: &str,
+    cursor: usize,
+    cols: usize,
+    report: Option<&str>,
+) -> Vec<String> {
+    let mut out = vec![
+        title_row(&format!("{OVERLAY_TITLE} \u{2014} filter"), cols),
+        String::new(),
+        line_echo(draft, cursor, cols),
+        String::new(),
+        format!("{LINE_INDENT}{FILTER_GRAMMAR}; enter applies, esc cancels"),
+    ];
+    if let Some(report) = report {
+        out.push(String::new());
+        out.push(format!("{LINE_INDENT}{}", flatten_report(report)));
+    }
+    fit_all(out, cols)
+}
+
+/// Every control character in a report becomes a space, so one report is one
+/// row whatever the text in it came from (a pasted filter term, a name a human
+/// typed, a registry receipt).
+fn flatten_report(report: &str) -> String {
+    report
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+/// The indent an echoed line carries, and the width its windowing budgets for.
+const LINE_INDENT: &str = "  ";
+
+/// One edited line echoed with its caret **drawn**, windowed to `cols`.
+///
+/// Shared by `s`'s steer frame and `/`'s filter frame: both are lines read by
+/// `kitsu-editor` and painted by a view that hides the terminal's own cursor,
+/// and a second copy of this windowing would be the F45 family — two
+/// renderers of one thing, free to drift.
+fn line_echo(draft: &str, cursor: usize, cols: usize) -> String {
     // Every control character becomes a space, for the reason
     // `overlay_rows_with_report` flattens one: a pasted correction carries
     // real newlines (finding F68), and a newline left in the echo would paint
@@ -585,29 +667,20 @@ pub fn steer_prompt_rows(id: u64, draft: &str, cursor: usize, cols: usize) -> Ve
         })
         .collect();
     let at = cursor.min(characters.len());
-    // The echo is windowed rather than merely fitted: a correction longer than
-    // the terminal would otherwise push the caret off the right edge, and a
-    // caret a user cannot see is the one thing this frame exists to show. The
-    // text behind the caret is kept first (it is what was just typed) and the
-    // text ahead of it fills whatever is left.
-    let budget = cols.saturating_sub(INDENT.chars().count());
+    // The echo is windowed rather than merely fitted: a line longer than the
+    // terminal would otherwise push the caret off the right edge, and a caret
+    // a user cannot see is the one thing these frames exist to show. The text
+    // behind the caret is kept first (it is what was just typed) and the text
+    // ahead of it fills whatever is left.
+    let budget = cols.saturating_sub(LINE_INDENT.chars().count());
     let room = budget.saturating_sub(1);
     let before = at.min(room);
     let after = (characters.len() - at).min(room - before);
-    let mut echo = String::from(INDENT);
+    let mut echo = String::from(LINE_INDENT);
     echo.extend(&characters[at - before..at]);
     echo.push(STEER_CARET);
     echo.extend(&characters[at..at + after]);
-    fit_all(
-        vec![
-            title_row(&format!("{OVERLAY_TITLE} \u{2014} steer #{id}"), cols),
-            String::new(),
-            echo,
-            String::new(),
-            format!("{INDENT}enter sends the correction to agent #{id}, esc cancels"),
-        ],
-        cols,
-    )
+    echo
 }
 
 /// The row list with one **report line** under it: what the last action key
@@ -628,16 +701,7 @@ pub fn overlay_rows_with_report(
         // in registry text (a name a human typed, a receipt) would otherwise
         // paint a second row the frame never budgeted for, pushing the rows
         // above it off the bottom. One report is one row, by construction.
-        let flattened = report
-            .chars()
-            .map(|character| {
-                if character.is_control() {
-                    ' '
-                } else {
-                    character
-                }
-            })
-            .collect::<String>();
+        let flattened = flatten_report(report);
         out.push(kitsu_render::fit_row_to_width(
             &format!("  {flattened}"),
             cols,
@@ -1655,6 +1719,52 @@ mod tests {
         assert!(
             help.contains("twice") || help.contains("two"),
             "the help says `x` is two presses:\n{help}"
+        );
+    }
+
+    /// Card T4-S5: **the help advertises `/`, and says what to type into it.**
+    ///
+    /// An advertised-but-unbound key and a bound-but-unadvertised one are the
+    /// same defect from the two sides, and two earlier cards fixed it; `/` was
+    /// A3's last key with no binding, so it is the last one missing here.
+    ///
+    /// What is pinned is the row the help *is*: one row whose key column is
+    /// `/`, naming the grammar's four keys, because a user who is told there
+    /// is a filter and not told its grammar cannot use it — and the grammar is
+    /// strict, so a guess is an error message (T4-S1).
+    #[test]
+    fn the_help_advertises_the_filter_key_and_its_grammar() {
+        let rows = super::overlay_help_rows(100);
+        let filter_rows: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.trim_start().starts_with('/'))
+            .collect();
+        assert_eq!(
+            filter_rows.len(),
+            1,
+            "exactly one help row is the `/` key's, like every other key's: \n{}",
+            rows.join("\n")
+        );
+        let row = filter_rows[0];
+        assert!(
+            row.to_lowercase().contains("filter"),
+            "and it says the key filters: {row:?}"
+        );
+        for term in ["s:", "n:", "o:", "p:"] {
+            assert!(
+                row.contains(term),
+                "and it names the grammar's `{term}` so the user does not have \
+                 to guess at a strict parser: {row:?}"
+            );
+        }
+        // NON-VACUOUS: the row really is laid out like the keys already
+        // advertised, so this does not pass on a row that merely begins with a
+        // slash somewhere in the frame.
+        assert!(
+            rows.iter()
+                .any(|other| other.trim_start().starts_with("esc ")),
+            "the help still lays its keys out in a key column: \n{}",
+            rows.join("\n")
         );
     }
 }
