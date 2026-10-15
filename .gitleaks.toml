@@ -1,0 +1,9 @@
+# Keep the full built-in ruleset. Exempt only this exact synthetic fixture,
+# used by scan_secrets_end_to_end_and_allowlist to test secret detection.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Exact synthetic GitHub token used by the secret-scanner regression test"
+regexTarget = "secret"
+regexes = ['''^ghp_0123456789abcdefghij$''']
