@@ -124,6 +124,20 @@ fn terminal_cols() -> usize {
     80
 }
 
+fn terminal_rows() -> usize {
+    #[cfg(unix)]
+    {
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: size is a valid output buffer for stderr's terminal ioctl.
+        if unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut size) } == 0
+            && size.ws_row > 0
+        {
+            return usize::from(size.ws_row);
+        }
+    }
+    24
+}
+
 /// Control characters a draft may legitimately contain (multi-line pastes,
 /// Alt+Enter newlines, pasted tabs) render as visible placeholders so the
 /// row never breaks its single-physical-line invariant.
@@ -644,7 +658,7 @@ fn redraw_locked(row_state: &mut LiveRowState) {
     }
     let mut err = io::stderr().lock();
     let cols = terminal_cols();
-    render_region(&mut err, row_state, cols);
+    render_region(&mut err, row_state, cols, terminal_rows());
 }
 
 /// The full region-painting state machine, with the writer and terminal
@@ -653,7 +667,8 @@ fn redraw_locked(row_state: &mut LiveRowState) {
 /// the exact territory where the cycle-9 review found bugs. The public
 /// wrappers supply `io::stderr()` and the real ioctl width; behavior is
 /// identical.
-fn render_region(err: &mut impl Write, row_state: &mut LiveRowState, cols: usize) {
+fn render_region(err: &mut impl Write, row_state: &mut LiveRowState, cols: usize, rows: usize) {
+    row_state.drawn_rows = row_state.drawn_rows.min(rows.max(1));
     if row_state.spinner.is_none() && row_state.draft.is_none() {
         if row_state.drawn_rows > 0 {
             clear_region_locked(err, row_state.drawn_rows);
@@ -695,7 +710,7 @@ fn render_region(err: &mut impl Write, row_state: &mut LiveRowState, cols: usize
             segment_width,
         ));
     }
-    let (status, cursor_col) = compose_row(
+    let (mut status, mut cursor_col) = compose_row(
         row_state.spinner.as_deref(),
         row_state.draft.as_ref(),
         row_state.blocked,
@@ -703,6 +718,27 @@ fn render_region(err: &mut impl Write, row_state: &mut LiveRowState, cols: usize
         row_state.queued,
         cols,
     );
+    // Leave a transcript row visible even when queued prompts and a multi-line
+    // draft would otherwise occupy the whole terminal. Keep the context nearest
+    // the cursor, dropping older preview rows first.
+    let max_upper = rows.saturating_sub(2);
+    if upper.len() > max_upper {
+        upper.drain(..upper.len() - max_upper);
+    }
+    // A spinner without a draft, or tags/prompt wider than a tiny terminal,
+    // must not wrap into physical rows that drawn_rows does not account for.
+    let available = cols.saturating_sub(1);
+    if display_width(&sanitize_terminal_text(&status)) > available {
+        let mut used = 0;
+        status = sanitize_terminal_text(&status)
+            .chars()
+            .take_while(|&ch| {
+                used += crate::char_display_width(ch);
+                used <= available
+            })
+            .collect();
+        cursor_col = cursor_col.map(|col| col.min(available + 1));
+    }
     let wanted_rows = upper.len() + 1;
     if row_state.drawn_rows == wanted_rows
         && !row_state.region_dirty
@@ -1301,16 +1337,50 @@ mod tests {
     }
 
     #[test]
+    fn live_region_leaves_transcript_space_on_a_short_terminal() {
+        let mut state = drafted_state();
+        state.queued = 4;
+        state.previews = vec!["queued work".to_string(); 4];
+        state.draft.as_mut().unwrap().buffer = "first\nsecond\nthird".to_string();
+        state.draft.as_mut().unwrap().cursor = 18;
+        let mut out = Vec::new();
+        render_region(&mut out, &mut state, 20, 3);
+        assert!(state.drawn_rows <= 2);
+        assert!(state.last_upper.len() <= 1);
+    }
+
+    #[test]
+    fn spinner_and_prompt_cannot_wrap_outside_the_accounted_live_rows() {
+        for cols in [1, 4, 8, 16, 32] {
+            for has_draft in [false, true] {
+                let mut state = drafted_state();
+                state.spinner = Some("a long thinking spinner that cannot fit".to_string());
+                if !has_draft {
+                    state.draft = None;
+                }
+                let mut out = Vec::new();
+                render_region(&mut out, &mut state, cols, 3);
+                let text = sanitize_terminal_text(&String::from_utf8(out).unwrap());
+                assert!(
+                    display_width(text.trim_matches(['\r', '\n'])) < cols,
+                    "{cols}: {text:?}"
+                );
+                assert_eq!(state.drawn_rows, 1);
+            }
+        }
+    }
+
+    #[test]
     fn render_region_first_paint_then_fast_path_then_full_repaint() {
         let mut state = drafted_state();
         let mut out: Vec<u8> = Vec::new();
         // First paint: full path (last_cols 0 → dirty), one row.
-        render_region(&mut out, &mut state, 80);
+        render_region(&mut out, &mut state, 80, 24);
         assert_eq!(state.drawn_rows, 1);
         assert!(!state.region_dirty);
         // Steady state: the fast path repaints ONLY the bottom row in place.
         out.clear();
-        render_region(&mut out, &mut state, 80);
+        render_region(&mut out, &mut state, 80, 24);
         let bytes = String::from_utf8(out.clone()).unwrap();
         assert!(bytes.starts_with("\r\u{1b}[2K"), "fast path clears one row");
         assert!(
@@ -1323,7 +1393,7 @@ mod tests {
         state.previews = vec!["first".to_string(), "second".to_string()];
         state.region_dirty = true;
         out.clear();
-        render_region(&mut out, &mut state, 80);
+        render_region(&mut out, &mut state, 80, 24);
         assert_eq!(state.drawn_rows, 3);
         let bytes = String::from_utf8(out).unwrap();
         assert_eq!(bytes.matches("\r\n").count(), 2, "two upper rows painted");
@@ -1336,12 +1406,12 @@ mod tests {
         state.queued = 2;
         state.previews = vec!["first".to_string(), "second".to_string()];
         let mut out: Vec<u8> = Vec::new();
-        render_region(&mut out, &mut state, 80);
+        render_region(&mut out, &mut state, 80, 24);
         assert_eq!(state.drawn_rows, 3);
         // Draft hidden (approval handoff): spinner-only, shrink 3 → 1.
         state.draft = None;
         out.clear();
-        render_region(&mut out, &mut state, 80);
+        render_region(&mut out, &mut state, 80, 24);
         assert_eq!(state.drawn_rows, 1);
         let bytes = String::from_utf8(out.clone()).unwrap();
         // Old region cleared bottom-up (two 1A2K pairs), then two \n steps
@@ -1351,11 +1421,11 @@ mod tests {
         // Everything gone: clear-only branch zeroes the region.
         state.spinner = None;
         out.clear();
-        render_region(&mut out, &mut state, 80);
+        render_region(&mut out, &mut state, 80, 24);
         assert_eq!(state.drawn_rows, 0);
         // And a further call writes nothing at all.
         out.clear();
-        render_region(&mut out, &mut state, 80);
+        render_region(&mut out, &mut state, 80, 24);
         assert!(out.is_empty());
     }
 
@@ -1365,25 +1435,25 @@ mod tests {
         state.draft.as_mut().unwrap().buffer = "one\ntwo\nthree".to_string();
         state.draft.as_mut().unwrap().cursor = 13; // end of "three"
         let mut out: Vec<u8> = Vec::new();
-        render_region(&mut out, &mut state, 80);
+        render_region(&mut out, &mut state, 80, 24);
         let rows_before = state.drawn_rows;
         assert!(rows_before > 1, "multi-line draft has context rows");
         // Same content, same width: fast path (no upper repaint).
         out.clear();
-        render_region(&mut out, &mut state, 80);
+        render_region(&mut out, &mut state, 80, 24);
         assert!(!String::from_utf8(out.clone()).unwrap().contains("\r\n"));
         // Cursor crosses a line boundary: same row count possible, but the
         // upper CONTENT changes → last_upper comparison forces full repaint.
         state.draft.as_mut().unwrap().cursor = 5; // inside "two"
         out.clear();
-        render_region(&mut out, &mut state, 80);
+        render_region(&mut out, &mut state, 80, 24);
         assert!(
             String::from_utf8(out.clone()).unwrap().contains("\r\n"),
             "upper-content change repaints fully"
         );
         // Resize: content identical but width changed → full repaint.
         out.clear();
-        render_region(&mut out, &mut state, 60);
+        render_region(&mut out, &mut state, 60, 24);
         assert!(String::from_utf8(out).unwrap().contains("\r\n"));
         assert_eq!(state.last_cols, 60);
     }

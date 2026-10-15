@@ -2022,6 +2022,9 @@ where
                     tracing::warn!("response truncated: model hit its output length limit");
                     const MARKER: &str = "\n[truncated: model output length limit reached]";
                     assistant_text.push_str(MARKER);
+                    if cfg.stream && !cfg.quiet {
+                        kitsu_render::print_message(MARKER);
+                    }
                     if cfg.stream {
                         if let Some(log) = &cfg.event_log {
                             log.record(AgentRuntimeEvent::AssistantDelta {
@@ -2164,7 +2167,7 @@ where
                 let mut summary = format_tool_result(&tc.tool_name, &tc.args, &content, is_err);
                 // UI-parity item 3: every receipt carries its duration, except
                 // command_exec whose result already reports its own elapsed.
-                if tc.tool_name != "command_exec" {
+                if !matches!(tc.tool_name.as_str(), "command_exec" | "git") {
                     summary.push_str(&format!(
                         " · {}",
                         format_tool_elapsed(call_started.elapsed())
@@ -2464,10 +2467,19 @@ fn event_preview(value: &str) -> String {
 }
 
 fn command_runtime_invocation(name: &str, args: &str) -> Option<CommandRuntimeInvocation> {
-    if name != "command_exec" {
-        return None;
-    }
-    let args = serde_json::from_str::<CommandExecArgs>(args).ok()?;
+    let args = match name {
+        "command_exec" => serde_json::from_str::<CommandExecArgs>(args).ok()?,
+        "git" => {
+            let mut value: serde_json::Value = serde_json::from_str(args).ok()?;
+            let object = value.as_object_mut()?;
+            let suffix = object.remove("args")?;
+            let mut argv = vec![serde_json::Value::String("git".to_string())];
+            argv.extend(suffix.as_array()?.iter().cloned());
+            object.insert("argv".to_string(), serde_json::Value::Array(argv));
+            serde_json::from_value::<CommandExecArgs>(value).ok()?
+        }
+        _ => return None,
+    };
     Some(CommandRuntimeInvocation {
         argv: args.argv,
         cwd: args.cwd,
@@ -2561,15 +2573,20 @@ fn bounded_human_value(value: &str, max_chars: usize) -> String {
 }
 
 fn format_tool_header(name: &str, args: &str) -> String {
-    if name == "command_exec" {
-        return serde_json::from_str::<CommandExecArgs>(args)
-            .ok()
+    if matches!(name, "command_exec" | "git") {
+        let label = if name == "git" { "Git" } else { "Command" };
+        return command_runtime_invocation(name, args)
             .map(|args| {
-                let argv = bounded_human_value(&args.display_argv(), 320);
-                let cwd = bounded_human_value(&args.cwd, 240);
-                format!("Command(argv={argv}; cwd={cwd:?})")
+                let invocation = CommandExecArgs {
+                    argv: args.argv,
+                    cwd: args.cwd,
+                    timeout_ms: args.timeout_ms,
+                };
+                let argv = bounded_human_value(&invocation.display_argv(), 320);
+                let cwd = bounded_human_value(&invocation.cwd, 240);
+                format!("{label}(argv={argv}; cwd={cwd:?})")
             })
-            .unwrap_or_else(|| "Command(invalid arguments)".to_string());
+            .unwrap_or_else(|| format!("{label}(invalid arguments)"));
     }
     let friendly = match name {
         "fs_read_file" => "Read",
@@ -2678,7 +2695,7 @@ fn format_tool_result(name: &str, args: &str, content: &str, is_err: bool) -> St
         return "error".to_string();
     }
     match name {
-        "command_exec" => serde_json::from_str::<CommandOutput>(content)
+        "command_exec" | "git" => serde_json::from_str::<CommandOutput>(content)
             .ok()
             .map(|output| format_command_result(&output))
             .unwrap_or_else(|| "command completed (invalid result metadata)".to_string()),
@@ -4255,7 +4272,7 @@ fn prepare_tool_output(
 ) -> PreparedToolOutput {
     // Native command results are already bounded per stream and must remain
     // valid JSON so the event layer can parse their authoritative counters.
-    if request.tool_name == "command_exec" {
+    if matches!(request.tool_name, "command_exec" | "git") {
         let retention = ToolOutputRetention::complete(&content);
         return PreparedToolOutput {
             content,

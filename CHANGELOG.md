@@ -9,7 +9,17 @@ shapes may change in any minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve the last line of long assistant replies before live-row redraws;
+  bound the live composer to terminal height and prevent narrow-window wrapping.
+  Model output limits now print a truncation marker in streaming human output.
+
 ### Added
+
+- A `git` tool for local repository operations, enabled with `--enable-commands`
+  and backed by the existing exact command approvals and Linux containment.
+
 
 #### Terminal UI (preview)
 

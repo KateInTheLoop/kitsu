@@ -419,14 +419,24 @@ pub fn print_fragment(s: &str) {
 pub fn print_message(s: &str) {
     let sanitized = sanitize_terminal_text(s);
     let rendered = format_message(&sanitized, stdout_style());
-    if !rendered.is_empty() {
-        ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
-        TURN_ASSISTANT_OUTPUT.store(true, Ordering::Release);
+    if rendered.is_empty() {
+        return;
     }
-    live::with_live_row_suspended(|| {
-        let mut out = io::stdout();
+    TURN_ASSISTANT_OUTPUT.store(true, Ordering::Release);
+    // A complete message must leave the cursor on a fresh line before the
+    // surface repaints the live row. Otherwise its CR/erase sequence destroys
+    // the final physical line, especially after long or wrapped responses.
+    active_surface().write_block(Fd::Stdout, &mut |out| {
+        stream_buffer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .flush_unstyled(out);
         let _ = out.write_all(rendered.as_bytes());
+        if !rendered.ends_with('\n') {
+            let _ = out.write_all(b"\n");
+        }
         let _ = out.flush();
+        ASSISTANT_OUTPUT_WRITTEN.store(false, Ordering::Release);
     });
 }
 
@@ -1984,9 +1994,10 @@ pub fn emit_turn_stats(
     context: Option<(u64, u64, u64)>,
     elapsed: Option<std::time::Duration>,
 ) {
-    let mut err = io::stderr();
-    let destination_is_tty = err.is_terminal();
-    let _ = write_turn_stats(&mut err, destination_is_tty, usage, context, elapsed);
+    let destination_is_tty = io::stderr().is_terminal();
+    active_surface().write_block(Fd::Stderr, &mut |out| {
+        let _ = write_turn_stats(out, destination_is_tty, usage, context, elapsed);
+    });
 }
 
 /// End-of-turn telemetry for a FAILED turn. A person at a terminal gets no
@@ -2010,7 +2021,7 @@ pub fn emit_failed_turn_stats(
 /// Callers that route telemetry somewhere other than stderr can pass that
 /// destination's real TTY state. This avoids accidentally choosing human versus
 /// machine formatting from an unrelated stream such as stdout.
-pub fn write_turn_stats<W: Write>(
+pub fn write_turn_stats<W: Write + ?Sized>(
     destination: &mut W,
     destination_is_tty: bool,
     usage: Option<(u64, u64, u64)>,
@@ -2027,7 +2038,7 @@ pub fn write_turn_stats<W: Write>(
     )
 }
 
-fn write_turn_stats_with_mode<W: Write>(
+fn write_turn_stats_with_mode<W: Write + ?Sized>(
     destination: &mut W,
     destination_is_tty: bool,
     plain: bool,
@@ -2054,7 +2065,7 @@ fn write_turn_stats_with_mode<W: Write>(
     destination.flush()
 }
 
-fn write_context_record<W: Write>(
+fn write_context_record<W: Write + ?Sized>(
     destination: &mut W,
     used: u64,
     effective: u64,
@@ -2066,7 +2077,7 @@ fn write_context_record<W: Write>(
     )
 }
 
-fn write_usage<W: Write>(
+fn write_usage<W: Write + ?Sized>(
     destination: &mut W,
     prompt_tokens: u64,
     completion_tokens: u64,
@@ -3735,9 +3746,9 @@ mod surface_seam_tests {
 
     use super::surface::suspends_for;
     use super::{
-        error_lines, finish_line, print_fragment, render_error, sanitize_terminal_text,
-        stdout_style, stream_buffer, stream_sanitizer, LineStyler, ASSISTANT_OUTPUT_WRITTEN,
-        TURN_ASSISTANT_OUTPUT,
+        error_lines, finish_line, print_fragment, print_message, render_error,
+        sanitize_terminal_text, stdout_style, stream_buffer, stream_sanitizer,
+        turn_wrote_assistant_output, LineStyler, ASSISTANT_OUTPUT_WRITTEN, TURN_ASSISTANT_OUTPUT,
     };
     use std::sync::atomic::Ordering;
 
@@ -3961,6 +3972,39 @@ mod surface_seam_tests {
                  line (before {before}, inside {depth})"
             );
         }
+    }
+
+    #[test]
+    fn complete_message_keeps_a_long_tail_and_terminates_before_repaint() {
+        let _guard = surface_slot_lock();
+        let _state = StreamStateGuard::new();
+        let message = format!(
+            "{}FINAL_TAIL_WITHOUT_NEWLINE",
+            "long wrapped transcript line ".repeat(600)
+        );
+        let calls = record_calls(|| print_message(&message));
+        let (fd, bytes) = one_block(&calls);
+        assert_eq!(fd, Fd::Stdout);
+        assert_eq!(sanitize_terminal_text(&bytes), format!("{message}\n"));
+        assert!(turn_wrote_assistant_output());
+        let calls = record_calls(finish_line);
+        assert_eq!(one_block(&calls).1, "");
+    }
+
+    #[test]
+    fn complete_message_flushes_a_streamed_tail_before_the_next_message() {
+        let _guard = surface_slot_lock();
+        let _state = StreamStateGuard::new();
+        stream_buffer()
+            .lock()
+            .unwrap()
+            .buffer
+            .push_str("partial tail");
+        let calls = record_calls(|| print_message("\n[stopped]"));
+        assert_eq!(
+            sanitize_terminal_text(&one_block(&calls).1),
+            "partial tail\n[stopped]\n"
+        );
     }
 
     /// (4) `print_fragment` on a completed line routes through the seam as one

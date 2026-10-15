@@ -8,14 +8,16 @@ use std::sync::Arc;
 use crate::permissions::Permissions;
 use crate::{Registry, RegistryError};
 
-/// Register the guarded developer-command tool against its independent
+/// Register the guarded developer-command and Git tools against their independent
 /// command authority. Calling this function is the explicit enablement step;
 /// filesystem permissions and auto-approval never register or authorize it.
 pub fn register_command_tool(
     registry: &mut Registry,
     policy: Arc<command::CommandPolicy>,
 ) -> Result<(), RegistryError> {
-    let (descriptor, handler) = command::command_exec_tool(policy);
+    let (descriptor, handler) = command::command_exec_tool(policy.clone());
+    registry.register_with_descriptor(descriptor, handler)?;
+    let (descriptor, handler) = command::git_tool(policy);
     registry.register_with_descriptor(descriptor, handler)
 }
 
@@ -563,6 +565,7 @@ mod tests {
         register_command_tool(&mut registry, command_policy).unwrap();
 
         assert!(registry.is_registered("command_exec"));
+        assert!(registry.is_registered("git"));
         assert!(registry
             .descriptors()
             .iter()
