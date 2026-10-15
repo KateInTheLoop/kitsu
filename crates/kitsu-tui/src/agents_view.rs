@@ -320,6 +320,15 @@ pub fn overlay_help_rows(cols: usize) -> Vec<String> {
         String::new(),
     ];
     for (key, what) in [
+        // `space` is listed because T4-S3 wired it and a key that works while
+        // being unadvertised is half-shipped (F38's lesson, applied to keys).
+        // This literal list is itself the thing T4-S10 replaces with the one
+        // bindings table; adding a correct entry to it is not new duplication,
+        // whereas leaving a working key out is a defect a user meets.
+        (
+            "space",
+            "peek the selected agent; counts as collecting its result",
+        ),
         ("?", "show this help"),
         ("esc", "leave the help, then close the view"),
     ] {

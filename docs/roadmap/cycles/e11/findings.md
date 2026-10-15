@@ -3463,3 +3463,25 @@ decided in T4-S2:
 Recorded because each is the kind of decision that gets re-litigated by the next
 person to touch the reader, and because the *reasons* are the durable part — the
 behaviours are easy to re-derive once the reasoning is written down.
+
+## F64 — I have now propagated an unverified mechanism into a brief twice, and an agent caught it both times
+
+**F43** recorded the first instance: I wrote that a cancelled approval was "recorded as timed out", taking the mechanism from an implementer's report without tracing the path. The agent I briefed read the code, found cancellation never reaches that path at all, and said so instead of building what I asked for.
+
+**T4-S3 is the second, and the shape is identical.** The plan row's acceptance says *"unviewed failed agent still refuses"* and I repeated it in the brief as "the guard refuses to quit while a finished agent's result is unobserved". **Verified false:** the only refusal on the quit path counts `Running | Blocked` agents, so a finished-but-unviewed agent does **not** block `/quit`. What protects an unobserved result is **surfacing** — the loop prints `~ surfaced N previously unopened background result(s) before exit` on the way out.
+
+The agent **stopped rather than writing the test**, because a test asserting `/quit` refuses would have contradicted the quit path and the exit tests that pass today — an **F61**-shaped conflict, recognised as one.
+
+### Why the error is easy to make here, which is the useful part
+
+**The codebase itself calls this "the exit guard on unviewed results".** A doc comment on `agent_explain_view` says `/jobs explain` "never calls `result`, which acknowledges too, so diagnosing an agent cannot take custody of its result and defeat the exit guard on unviewed results." So the **name** is accurate and long-established; only the **mechanism** differs from what the name suggests. "Guard" implies refusal; this one surfaces.
+
+That is a better explanation than carelessness, and it generalises: **a well-named mechanism invites you to assume its implementation.** The name was right, the inference from the name was wrong, and nothing in the row or the doc comment would have corrected it.
+
+### The rule, now with two instances
+
+**A mechanism named in a plan row, a requirement, or another agent's report is a hypothesis until someone reads the path** — and that applies to *my* briefs, which are the specification an implementer builds to. Both times the cost was one review round because the agent stopped; the counterfactual is a product change built to a false premise, which is what F58 and F61 are about.
+
+Practically: when a brief asserts how something behaves, it should either cite the line that shows it or mark the claim as needing verification. This epic's briefs now routinely say "verified by me" against specific line numbers; the two failures are both places where I did not.
+
+**The plan row's acceptance needs amending** from "an unviewed failed agent still refuses" to "an unviewed failed result is still surfaced at exit, and a peeked one is not" — or the quit path changes, which would be a different card with its own requirement.

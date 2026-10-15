@@ -5443,6 +5443,78 @@ fn assert_opened_and_restored(session: &Session, before: usize, open: usize, clo
     );
 }
 
+/// Test T4-S3a. **`Space` never reaches the composer underneath.**
+///
+/// A GUARD: green today, because the overlay's byte loop ignores every key it
+/// does not bind, and required to stay green once `Space` is bound to peek. An
+/// implementer who forwards the unhandled-key case to the editor, or who makes
+/// `Space` close the view, breaks it.
+///
+/// What `Space` *shows* is pinned at unit level in `main.rs` (a fixture PTY
+/// session has no agents in it, so there is no row to peek and no handoff to
+/// acknowledge here). What only a PTY can answer is the routing: the byte is
+/// read by the overlay, so the draft on the pinned row underneath is
+/// untouched, and `Space` is not an exit either.
+///
+/// The POSITIVE CONTROL is the last step: after the view is closed, the same
+/// single space typed at the idle composer *does* change the pinned row. So
+/// the equality asserted while the view was up is a claim about the overlay
+/// consuming the key and not about a space being invisible.
+#[test]
+#[serial]
+fn inline_mode_agent_view_answers_space_without_typing_into_the_composer() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let script = vec![
+        send(RAW_MODE_MARKER, CTRL_X_A),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, " "),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, " "),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+    ];
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &script);
+
+    let (before, opened, peeked, typed) = (
+        session.screen_at(0),
+        session.screen_at(1),
+        session.screen_at(3),
+        session.screen_at(7),
+    );
+    assert!(
+        agent_view_open(&opened),
+        "the view must be open before `Space` is pressed; whole screen:\n{}",
+        Session::dump(&opened)
+    );
+    assert!(
+        agent_view_open(&peeked),
+        "`Space` is peek, not an exit: the agent view is still the surface on \
+         screen; whole screen:\n{}",
+        Session::dump(&peeked)
+    );
+    assert_eq!(
+        pinned_row(&peeked),
+        pinned_row(&opened),
+        "`Space` belongs to the view: nothing may be typed into the composer \
+         underneath it; screen with the view up:\n{}\nscreen after `Space`:\n{}",
+        Session::dump(&opened),
+        Session::dump(&peeked)
+    );
+    assert_ne!(
+        pinned_row(&typed),
+        pinned_row(&before),
+        "POSITIVE CONTROL: the same single space typed at the idle composer \
+         does change the pinned row, so the equality above is a real claim; \
+         screen before the open:\n{}\nscreen after typing a space:\n{}",
+        Session::dump(&before),
+        Session::dump(&typed)
+    );
+    assert_opened_and_restored(&session, 0, 1, 5);
+}
+
 /// Test T4-S2a. **`Ctrl+X a` opens the agent view, `Esc` closes it.**
 ///
 /// The default `[tui] prefix` is `ctrl+x`, so this is the chord A1 names. Four

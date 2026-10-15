@@ -291,7 +291,13 @@ with `?` for the key list and `Esc` to close; `Ctrl+X a` (following
 `[tui] prefix`) and pressing left twice on an empty composer open it too, the
 first press only hinting so it cannot open by accident. Left on a non-empty
 draft still moves the cursor, and up-arrow history recall is untouched.
-`[tui] left_arrow_opens_agents = false` disables the left-arrow route alone. The
+`[tui] left_arrow_opens_agents = false` disables the left-arrow route alone.
+`Space` peeks the selected agent -- the same bounded redacted timeline
+`/jobs show` prints, the permission kind it waits on if blocked, and its result
+or failure if finished. Peeking takes custody of the result exactly as
+`/jobs show` does, so a peeked result is not surfaced again at exit while an
+unviewed one is; peeking a blocked agent takes custody of nothing, and opening
+the view takes custody of nothing. The
 deck is not also printed in inline mode, since it would scroll the transcript
 beneath the overlay unseen. A blocked agent carries its own marker -- `◉`, or `[blk]`
 under `--plain` -- in every agent surface, so the one waiting on an answer is

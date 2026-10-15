@@ -6426,6 +6426,80 @@ fn agent_view_rows(registry: &subagent::AgentRegistry) -> Vec<kitsu_tui::agents_
         .collect()
 }
 
+/// Card T4-S3: `Space` peeks the selected row of the agent view.
+///
+/// Returns the panel's rows for `id`, or `None` for an id the registry does
+/// not hold.
+///
+/// Requirement A4: the panel shows the bounded redacted timeline `/jobs show`
+/// renders, the pending approval request while the agent is blocked, and the
+/// result once it is terminal. It never shows a tool argument or raw tool
+/// output — by construction, because the thread snapshot it reads carries an
+/// approval **kind** only (F40, T2-S6).
+///
+/// Requirement A7: peeking a terminal agent acknowledges its handoff exactly
+/// as `/jobs show` does (`peek_result` then `acknowledge_result`), so the exit
+/// guard on unviewed results and the strict-automation rules are unchanged.
+/// Only peeking does this: building the view's rows, opening it, or moving the
+/// selection acknowledges nothing.
+#[cfg(unix)]
+fn agent_view_peek(registry: &subagent::AgentRegistry, id: u64) -> Option<Vec<String>> {
+    let thread = registry.thread_snapshot(id)?;
+    // `/jobs show`'s own renderer, not a second one: the phase label, the
+    // handoff and the `bounded redacted timeline:` section are whatever that
+    // surface prints, so the two cannot drift.
+    let mut lines: Vec<String> = format_agent_thread(&thread)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    // The pending request while the agent is blocked, by kind only — the same
+    // `permission to <kind>` line the deck's blocked row carries.
+    if let Some(request) = pending_approval_request(&thread) {
+        lines.push(format!("  waiting on: {request}"));
+    }
+    // The result, and the acknowledgement that goes with having seen it,
+    // exactly as `/jobs show` sequences them: `peek_result` then
+    // `acknowledge_result`, and neither for an agent that is still running.
+    // A blocked agent has no handoff, so the acknowledgement is a no-op there.
+    if !matches!(thread.phase, subagent::thread::AgentThreadPhase::Running) {
+        if let Some(result) = registry.peek_result(id) {
+            lines.push("result:".to_string());
+            lines.extend(
+                kitsu_render::sanitize_terminal_text(&result)
+                    .lines()
+                    .map(str::to_string),
+            );
+        }
+        let _ = registry.acknowledge_result(id);
+    }
+    Some(lines)
+}
+
+/// The peek panel as an overlay frame: the view's own title row, so the
+/// surface on screen is still recognisably the agent view, and the panel
+/// under it fitted to the terminal's width.
+#[cfg(unix)]
+fn agent_view_peek_frame(
+    registry: &subagent::AgentRegistry,
+    id: u64,
+    cols: usize,
+) -> Option<Vec<String>> {
+    let panel = agent_view_peek(registry, id)?;
+    let mut rows = vec![
+        format!(
+            "{} \u{2014} agent #{id}",
+            kitsu_tui::agents_view::OVERLAY_TITLE
+        ),
+        String::new(),
+    ];
+    rows.extend(panel);
+    Some(
+        rows.into_iter()
+            .map(|row| kitsu_render::fit_row_to_width(&row, cols))
+            .collect(),
+    )
+}
+
 /// Open the agent view overlay and run it until it is closed, returning
 /// whether it was opened at all (card T4-S2, requirement A1).
 ///
@@ -6482,11 +6556,16 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
     // Which frame is on screen. `?` is help and `Esc` steps back out of it,
     // so the key never leaves the user somewhere they cannot return from.
     let mut helping = false;
+    // The peek panel for one agent (card T4-S3), while `Space` is holding it
+    // up. `Esc` steps back out of it the way it steps out of the help.
+    let mut peeking: Option<Vec<String>> = None;
     let mut stdin = std::io::stdin();
     let mut buffer = [0u8; 256];
     loop {
         let content = if helping {
             kitsu_tui::agents_view::overlay_help_rows(cols as usize)
+        } else if let Some(panel) = peeking.as_ref() {
+            panel.clone()
         } else {
             kitsu_tui::agents_view::overlay_rows(agent_view_rows(registry), cols as usize)
         };
@@ -6516,11 +6595,27 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
         for byte in &buffer[..count] {
             match byte {
                 b'?' => helping = true,
-                // Esc: out of the help if it is showing, out of the view
-                // otherwise. `q` is the conventional synonym for the latter.
+                // Space: peek. The byte is the view's and goes no further —
+                // nothing is forwarded to the composer underneath, and it is
+                // not an exit either (test T4-S3a). With no rows there is
+                // nothing to peek and the frame is unchanged. Peeking is the
+                // only read here that acknowledges a handoff; painting rows
+                // does not.
+                b' ' => {
+                    if !helping && peeking.is_none() {
+                        if let Some(first) = agent_view_rows(registry).first().map(|row| row.id) {
+                            peeking = agent_view_peek_frame(registry, first, cols as usize);
+                        }
+                    }
+                }
+                // Esc: out of the help if it is showing, out of a peek panel
+                // if one is up, out of the view otherwise. `q` is the
+                // conventional synonym for the latter.
                 0x1b => {
                     if helping {
                         helping = false;
+                    } else if peeking.is_some() {
+                        peeking = None;
                     } else {
                         closing = true;
                     }
@@ -28327,5 +28422,262 @@ mod tests {
         dispatcher.dispatch("an ordinary follow-up", &mut result);
         assert_eq!(queue.lock().unwrap().iter().len(), 1);
         assert_eq!(result.captured, 1);
+    }
+
+    // --- card T4-S3: peek (`Space`), and the exit guard ---
+    //
+    // The exit guard on unviewed results is
+    // `AgentRegistry::take_unobserved_terminal_results`, which the interactive
+    // loop calls once on its way out (`surface_unobserved_background_results`).
+    // It keys on the *handoff* -- `AgentHandoffState::Ready` -- and not on the
+    // phase, so a failed agent is in it exactly as a done one is. These tests
+    // are therefore pinned at unit level against a real `AgentRegistry`, which
+    // is where `peek_result`/`acknowledge_result` live and where the guard
+    // reads: a PTY session has no agents in it at all, so the round trip
+    // cannot be observed there. `Space`'s key routing is pinned in the PTY
+    // suite, which is the only place it can be.
+
+    /// Card T4-S3, requirement A7, forward direction. Peeking a done agent
+    /// acknowledges its handoff, so the exit guard no longer holds its result
+    /// back as unobserved -- and the same panel shows the bounded redacted
+    /// timeline and the result.
+    ///
+    /// The backward direction is in the same test and is what makes the
+    /// forward one a claim: a second done agent that was never peeked is
+    /// still handed to the guard.
+    #[cfg(unix)]
+    #[test]
+    fn peeking_a_done_agent_acknowledges_it_so_the_exit_guard_lets_the_session_go() {
+        let registry = subagent::AgentRegistry::new();
+        let peeked = registry.start("peeked work".to_string()).unwrap();
+        let untouched = registry.start("untouched work".to_string()).unwrap();
+        registry.finish(peeked, Ok("the peeked answer".to_string()));
+        registry.finish(untouched, Ok("the untouched answer".to_string()));
+        assert_eq!(
+            registry.snapshot().unacknowledged,
+            2,
+            "both results start out unobserved"
+        );
+
+        assert!(
+            agent_view_peek(&registry, 9_999).is_none(),
+            "an id the registry does not hold has no panel"
+        );
+
+        let snapshot = registry
+            .thread_snapshot(peeked)
+            .expect("the peeked agent has a thread snapshot");
+        assert!(
+            !snapshot.timeline.entries.is_empty(),
+            "non-vacuous: this sample thread really did retain timeline events"
+        );
+
+        let panel = agent_view_peek(&registry, peeked)
+            .unwrap_or_else(|| panic!("peek must answer for agent #{peeked}"))
+            .join("\n");
+        assert!(
+            panel.contains("the peeked answer"),
+            "A4: a done agent's result is in its peek panel: {panel}"
+        );
+        for entry in &snapshot.timeline.entries {
+            assert!(
+                panel.contains(&entry.text),
+                "A4: the panel shows the same bounded redacted timeline \
+                 `/jobs show` renders, so {:?} must be in it: {panel}",
+                entry.text
+            );
+        }
+        assert!(
+            !panel.contains("the untouched answer"),
+            "the panel is one agent's, not the deck's: {panel}"
+        );
+
+        assert_eq!(
+            registry.handoff_state(peeked),
+            Some(subagent::thread::AgentHandoffState::Acknowledged),
+            "A7: viewing a done agent acknowledges its handoff, exactly as \
+             `/jobs show` does"
+        );
+        assert_eq!(
+            registry.handoff_state(untouched),
+            Some(subagent::thread::AgentHandoffState::Ready),
+            "peeking one row must not acknowledge another"
+        );
+
+        let unobserved = registry
+            .take_unobserved_terminal_results()
+            .iter()
+            .map(|result| result.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unobserved,
+            vec![untouched],
+            "the exit guard keeps the unpeeked result and lets the peeked one \
+             go"
+        );
+    }
+
+    /// Card T4-S3, requirement A7, the direction a careless implementation
+    /// gets wrong: **opening** the view, and **moving the selection** over its
+    /// rows, acknowledge nothing. Only `Space` does.
+    ///
+    /// What opening paints is `agent_view_rows` fed through
+    /// `overlay_rows`; moving the selection repaints the same two sources, so
+    /// the loop below is every read the view performs short of a peek. An
+    /// implementer who adds selection state must keep that true of it too.
+    ///
+    /// The POSITIVE CONTROL is in this test and on these same two rows:
+    /// peeking one of them does acknowledge, so the negative assertions above
+    /// it are about opening and moving rather than about a registry that never
+    /// acknowledges anything.
+    #[cfg(unix)]
+    #[test]
+    fn opening_the_agent_view_and_moving_over_its_rows_acknowledges_nothing() {
+        let registry = subagent::AgentRegistry::new();
+        let done = registry.start("done work".to_string()).unwrap();
+        let failed = registry.start("failed work".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+        registry.finish(failed, Err("boom".to_string()));
+
+        for _ in 0..3 {
+            let rows = agent_view_rows(&registry);
+            assert_eq!(rows.len(), 2, "both agents are rows in the view");
+            for _selected in 0..rows.len() {
+                let painted = kitsu_tui::agents_view::overlay_rows(agent_view_rows(&registry), 80);
+                assert!(
+                    !painted.is_empty(),
+                    "non-vacuous: the overlay really painted a frame"
+                );
+            }
+        }
+        for id in [done, failed] {
+            assert_eq!(
+                registry.handoff_state(id),
+                Some(subagent::thread::AgentHandoffState::Ready),
+                "opening the view and moving the selection must not acknowledge \
+                 agent #{id}"
+            );
+        }
+        assert_eq!(
+            registry.snapshot().unacknowledged,
+            2,
+            "the exit guard still holds both results after the view was opened"
+        );
+
+        let _ = agent_view_peek(&registry, failed)
+            .unwrap_or_else(|| panic!("peek must answer for agent #{failed}"));
+        assert_eq!(
+            registry.handoff_state(failed),
+            Some(subagent::thread::AgentHandoffState::Acknowledged),
+            "POSITIVE CONTROL: a peek on one of the very rows just painted \
+             does acknowledge"
+        );
+        assert_eq!(
+            registry.handoff_state(done),
+            Some(subagent::thread::AgentHandoffState::Ready),
+            "and only the peeked row"
+        );
+        let unobserved = registry
+            .take_unobserved_terminal_results()
+            .iter()
+            .map(|result| result.id)
+            .collect::<Vec<_>>();
+        assert_eq!(unobserved, vec![done]);
+    }
+
+    /// Card T4-S3, the row's named case: a **failed** agent is not quietly
+    /// exempted from the exit guard. The guard keys on the handoff, which
+    /// `AgentThreadState::finish` sets to `Ready` for a failure exactly as for
+    /// a success, so an unviewed failed result is still held back and a peeked
+    /// one is released.
+    #[cfg(unix)]
+    #[test]
+    fn peeking_a_failed_agent_shows_the_failure_and_releases_only_that_one() {
+        let registry = subagent::AgentRegistry::new();
+        let peeked = registry.start("will fail".to_string()).unwrap();
+        let unviewed = registry.start("will also fail".to_string()).unwrap();
+        registry.finish(peeked, Err("boom".to_string()));
+        registry.finish(unviewed, Err("also boom".to_string()));
+        for id in [peeked, unviewed] {
+            assert_eq!(
+                registry.handoff_state(id),
+                Some(subagent::thread::AgentHandoffState::Ready),
+                "a failure is handed off exactly as a success is"
+            );
+        }
+
+        let panel = agent_view_peek(&registry, peeked)
+            .unwrap_or_else(|| panic!("peek must answer for agent #{peeked}"))
+            .join("\n");
+        assert!(
+            panel.contains(&format!("agent #{peeked} failed: boom")),
+            "A4: the panel shows a failed agent's failure: {panel}"
+        );
+        assert!(
+            panel.contains(subagent::thread::AgentThreadPhase::Failed.label()),
+            "the panel names the phase in the DTO's own spelling: {panel}"
+        );
+
+        let unobserved = registry
+            .take_unobserved_terminal_results()
+            .iter()
+            .map(|result| result.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unobserved,
+            vec![unviewed],
+            "an unviewed failed agent is still held by the exit guard; the \
+             peeked one is not"
+        );
+    }
+
+    /// Card T4-S3, requirement A4 on a blocked agent: the panel names the
+    /// pending request by its **kind**, and the tool argument that produced it
+    /// is nowhere in it. That is structural rather than filtered -- the thread
+    /// snapshot carries `AgentApprovalKind`, a unit enum (F40, T2-S6) -- and
+    /// peeking a blocked agent acknowledges nothing, because it has no
+    /// handoff to acknowledge.
+    ///
+    /// The absence is NON-VACUOUS because of the first half: redaction leaves
+    /// paths untouched, so a second agent in the same registry whose result
+    /// text holds the very same path shows it. A panel that scrubbed paths
+    /// wholesale, or one that printed nothing at all, fails there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn peeking_a_blocked_agent_shows_the_permission_kind_and_never_the_tool_argument() {
+        let (registry, blocked, _answer) = registry_with_one_blocked_agent().await;
+
+        let leaky = registry.start("a second job".to_string()).unwrap();
+        registry.finish(leaky, Ok("wrote /work/notes.txt".to_string()));
+        let control = agent_view_peek(&registry, leaky)
+            .unwrap_or_else(|| panic!("peek must answer for agent #{leaky}"))
+            .join("\n");
+        assert!(
+            control.contains("/work/notes.txt"),
+            "NON-VACUITY: this panel prints a path it is given, so the absence \
+             asserted below is a real claim: {control}"
+        );
+
+        let panel = agent_view_peek(&registry, blocked)
+            .unwrap_or_else(|| panic!("peek must answer for agent #{blocked}"))
+            .join("\n");
+        assert!(
+            panel.contains(&format!(
+                "permission to {}",
+                subagent::thread::AgentApprovalKind::WriteFile.label()
+            )),
+            "A4: the panel names the pending request by its kind: {panel}"
+        );
+        for argument in ["/work/notes.txt", "notes.txt", "/work"] {
+            assert!(
+                !panel.contains(argument),
+                "A4: the peek panel leaked a tool argument ({argument}): {panel}"
+            );
+        }
+        assert_eq!(
+            registry.handoff_state(blocked),
+            Some(subagent::thread::AgentHandoffState::Unavailable),
+            "a blocked agent has no handoff, so peeking it acknowledges nothing"
+        );
     }
 }

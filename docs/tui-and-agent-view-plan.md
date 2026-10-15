@@ -153,7 +153,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T3-S13 N2 measured (**5 ms vs 100 ms budget**); exit gate run clause by clause, **one clause has no test (F60)**; doc sweep | done | aae5874 |
 | **T3 complete.** T4-S1 agent-view model: `AgentViewState` single source, filter grammar, DTO mapping; A2/A3 amended; F61 | done | 76bfc7c |
 | marker story (between T4-S1 and T4-S2): `DeckState::Blocked`, one vocabulary via `deck_state()`; **F34 and F3 closed**, §4.4 amended | done | bd9d845 |
-| T4-S2 agent view overlay opens/closes; `[tui] prefix` + `left_arrow_opens_agents` get their first consumer; A1's two stale clauses corrected | done | this commit |
+| T4-S2 agent view overlay opens/closes; `[tui] prefix` + `left_arrow_opens_agents` get their first consumer; A1's two stale clauses corrected | done | e791fa2 |
+| T4-S3 peek (`Space`) reusing `/jobs show`'s renderers; A4 shown satisfied by construction, A7 clarified; **F64** (my second unverified premise) | done | this commit |
 
 > **`KITSU_TUI` is retired as of T3-S2.** Mentions of it in the T0-T2 rows and
 > requirement text below are **historical** — they record how the preview was
@@ -348,7 +349,7 @@ fixtures byte-identical in classic/plain/JSONL; both profiles; `cargo test
 |---|---|---|---|---|
 | T4-S1 | Pure model in `kitsu-tui`: `AgentRow`/`AgentGroup` plain structs, grouping, ordering, filter grammar; `tui_bridge.rs` maps `AgentThreadSnapshotDto` → `AgentRow` | Failing table-driven grouping test | `kitsu-tui/src/agents_view.rs`, `tui_bridge.rs` | (A2, A3 filter) |
 | T4-S2 | Overlay: list, `↑/↓`, `?`, `Esc`; opened by `Ctrl+X a`, `/jobs view` (TUI mode), `←`-twice on empty composer (config); `←` never consumes a draft; `↑` recall untouched | Failing PTY open/close test | `overlay/agents.rs`, `tui_bridge.rs` | (A1) |
-| T4-S3 | Peek (`Space`): redacted timeline, pending request, result; viewing acknowledges via `peek_result` + `acknowledge_result` | Failing exit-guard test (unviewed failed agent still refuses) | `overlay/agents.rs` | (A4, A7) |
+| T4-S3 | Peek (`Space`): redacted timeline, pending request, result; viewing acknowledges via `peek_result` + `acknowledge_result` | Failing test: **a peeked result is not surfaced at exit, an unviewed one still is** — *amended in T4-S3: the original read "unviewed failed agent still refuses", but nothing refuses `/quit` for a finished agent; only `Running`/`Blocked` block it, and unviewed results are **surfaced** at exit, not refused (**F64**)* | `overlay/agents.rs` | (A4, A7) |
 | T4-S4 | Keys → registry calls: `r` reply, `s` steer, `x` stop/prune, `n` rename (new `AgentRegistry::rename`), `p` acknowledge | Failing outcome tests | `subagent.rs`, overlay | (A3) |
 | T4-S5 | `tail_timeline(id) -> broadcast::Receiver` (cap 256; lag → "n skipped") | Failing lag test | `subagent.rs`, `thread.rs` | Timeline bounds unchanged |
 | T4-S6 | Attach/detach: `⛩` milestones, routed composer (`steer`, `y/a/n` when blocked), 64 KiB foreground buffer replayed with recap; `Ctrl+X d`, `←`, `/detach`; `Ctrl+C` = clear draft / detach | Failing fake-provider integration test | `tui_bridge.rs`, overlay, `status.rs` | (A5) |

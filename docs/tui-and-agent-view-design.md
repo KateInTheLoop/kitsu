@@ -436,6 +436,22 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   shows today, the pending approval request if blocked, and the result if
   done. It MUST never show tool arguments or raw tool output (existing
   redaction rule).
+
+  **Satisfied by construction, confirmed in T4-S3 — this is not a filter.** The
+  snapshot's `waiting_for` is an `AgentApprovalKind`, a **unit enum**, so a path
+  or argv word is **not representable**; timeline text is redacted at the source
+  and the DTO's `validate` **rejects** any entry whose text is not already
+  redacted; and approval entries are written as `approval to <kind> …`, kind
+  only. So rendering the same snapshot satisfies the clause, and the panel reuses
+  `/jobs show`'s own renderers — `format_agent_thread`, `pending_approval_request`,
+  `peek_result` and `sanitize_terminal_text` — in the same order, rather than a
+  second renderer that could drift. See **F40** for why the protection had to be
+  made structural, and **F52**/**F47** for what the ring does and does not hold.
+
+  A later reader should not add a scrubbing filter here: redaction deliberately
+  leaves paths untouched, so a panel that scrubbed them wholesale would hide a
+  legitimate result, and a test pins exactly that by requiring a result
+  containing a path to show it.
 - **A5** Attach MUST stream the agent's timeline live into the main viewport
   with an `⛩ attached to agent N` milestone, let the composer send steering
   (or an approval answer when blocked), and `←` on an empty composer or
@@ -451,6 +467,27 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   `Acknowledged`, exactly as `/jobs show` does (`peek_result` +
   `acknowledge_result`), so the exit guard and strict-automation rules are
   unchanged.
+
+  **Clarified in T4-S3, because "the exit guard" invites a wrong inference.**
+  The guard on unviewed results **surfaces** them, it does not refuse the exit:
+  on the way out the session prints `~ surfaced N previously unopened
+  background result(s) before exit`. Only **running or blocked** agents refuse
+  `/quit` (`exit blocked: N background agent(s) still running`). So peeking a
+  done agent means its result is **not reprinted at exit**, and an unviewed one
+  still is — that is the round trip, and it is what the tests pin. See **F64**:
+  the name is accurate and long-established, but it implies refusal, and both a
+  plan row and one of my briefs inferred refusal from it.
+
+  **Peeking a blocked agent acknowledges nothing**, because there is no result
+  to take custody of: `acknowledge_result` returns `NotReady` for a handoff of
+  `Unavailable` and does not mutate. **Opening the view, and repainting its
+  rows, acknowledge nothing either** — the peek is the single acknowledging call
+  site. Whoever adds selection state must preserve that: moving over a row must
+  not take custody of its result, or the guard stops meaning anything.
+
+  **A failed agent is not exempt.** `AgentThreadState::finish` sets
+  `handoff = Ready` for `Failed` and `Cancelled` exactly as for `Done`, and the
+  guard keys on the **handoff**, never the phase.
 - **A8** The ambient counter (R5) MUST update within 250 ms of a registry
   change in TUI modes. In `classic` it refreshes on the live status row once
   per input poll tick while a turn runs, and the idle prompt keeps reporting
