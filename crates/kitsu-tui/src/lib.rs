@@ -37,6 +37,7 @@
 pub mod agents_view;
 pub mod cells;
 pub mod composer;
+pub mod keys;
 pub mod status;
 pub mod viewport;
 

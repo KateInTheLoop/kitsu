@@ -384,10 +384,12 @@ fn accepted_state_words() -> String {
     format!("{} or {last}", head.join(", "))
 }
 
-/// A3's filter grammar, in the one wording the help row and the filter
-/// frame's footer both print. Spelled once because the parser is strict: a
-/// grammar advertised two ways is a grammar that can be advertised wrongly.
-const FILTER_GRAMMAR: &str = "s:<state> n:<text> o:<text> p:<profile>";
+/// A3's filter grammar and A6's dispatch grammar, in the one wording every
+/// reader prints. Card **T4-S10** moved both into [`crate::keys`], because
+/// the bindings table's `what` column is now where the help's words are
+/// spelled and the grammars are part of them; this `use` keeps the frame
+/// footers below reading the same two names they always did.
+pub(crate) use crate::keys::{DISPATCH_GRAMMAR, FILTER_GRAMMAR};
 
 /// The key that opens the agent view's **dispatch line** (card T4-S7,
 /// requirement A6). Exported so the help row, the overlay's key arm and the
@@ -400,10 +402,6 @@ const FILTER_GRAMMAR: &str = "s:<state> n:<text> o:<text> p:<profile>";
 /// (`0x40..=0x7e`), so an arrow key immediately before it cannot swallow it —
 /// the property **F65** is about and the reason `/` was chosen for the filter.
 pub const DISPATCH_KEY: char = '+';
-
-/// A6's dispatch grammar, in the one wording the help row and the dispatch
-/// frame's footer both print. Spelled once, for `FILTER_GRAMMAR`'s reason.
-const DISPATCH_GRAMMAR: &str = "<task>, or @<profile> <task>";
 
 /// One dispatch the view's composer collected: A6's *plain text spawns a
 /// background agent with the default profile; `@<profile> <task>` selects a
@@ -630,69 +628,43 @@ pub fn overlay_rows_selected(
     fit_all(out, cols)
 }
 
-/// The overlay's help frame: the keys this card answers, and nothing it does
-/// not. The title row still carries [`OVERLAY_TITLE`], because the help is a
+/// The overlay's help frame: [`crate::keys::BINDINGS`] rendered, and nothing
+/// else. The title row still carries [`OVERLAY_TITLE`], because the help is a
 /// frame *of* the view rather than a different surface.
+///
+/// Card **T4-S10**: this used to be a literal list of `(key, what)` pairs
+/// that four cards each appended a row to, which is why three bound keys
+/// (`q`, `Enter` and `\u{2192}`) were never advertised. There is one table now,
+/// and this function is one of its readers rather than a second list.
 pub fn overlay_help_rows(cols: usize) -> Vec<String> {
     let mut out = vec![
         title_row(&format!("{OVERLAY_TITLE} \u{2014} keys"), cols),
         String::new(),
     ];
-    for (key, what) in [
-        (
-            "up/dn",
-            "move the selection; moving disarms a half-pressed stop",
-        ),
-        // `space` is listed because T4-S3 wired it and a key that works while
-        // being unadvertised is half-shipped (F38's lesson, applied to keys).
-        // This literal list is itself the thing T4-S10 replaces with the one
-        // bindings table; adding a correct entry to it is not new duplication,
-        // whereas leaving a working key out is a defect a user meets.
-        (
-            "space",
-            "peek the selected agent; counts as collecting its result",
-        ),
-        // The action keys A3 binds (card T4-S4b). Each line says what the key
-        // does to the *selected* agent, because that is the only thing any of
-        // them acts on, and `x` says it is two presses: the first changes
-        // nothing in the registry, so a user who does not know that reads it
-        // as a key that failed.
-        (
-            "r",
-            "reply to the selected agent: the next key is y, a or n",
-        ),
-        (
-            "s",
-            "steer the selected agent: type a correction, enter sends",
-        ),
-        (
-            "x",
-            "stop the selected agent; press twice (the second press prunes a \
-             finished one)",
-        ),
-        ("n", "rename the selected agent: type a name, enter applies"),
-        ("p", "acknowledge the selected agent's result"),
-        // `/` was A3's last key with no binding (card T4-S5). The grammar is
-        // on the row because the parser is strict: a user told there is a
-        // filter but not told its shape gets an error message, not a near
-        // miss. Like the entries above, this literal is what T4-S10 replaces
-        // with the one bindings table.
-        ("/", &format!("filter the rows \u{2014} {FILTER_GRAMMAR}")),
-        // The dispatch key (card T4-S7, requirement A6). Like `/` it needs no
-        // selection -- it is about an agent that does not exist yet -- and the
-        // grammar is on the row because the parser is strict and `@` is the
-        // only way to select a profile from here.
-        (
-            &DISPATCH_KEY.to_string(),
-            &format!("start an agent \u{2014} {DISPATCH_GRAMMAR}"),
-        ),
-        ("?", "show this help"),
-        ("esc", "leave a prompt or the help, then close the view"),
-    ] {
-        out.push(format!("  {key:<6} {what}"));
+    for binding in crate::keys::BINDINGS {
+        out.push(help_key_row(binding));
     }
     fit_all(out, cols)
 }
+
+/// One key row, in the layout the help frame and `/help keys` share: the key
+/// column padded to [`KEY_COLUMN`], then what the key does.
+///
+/// Shared so the two readers cannot lay the same table out two ways, and
+/// public to the crate's consumers because the binary's `/help keys` is the
+/// other reader.
+pub fn help_key_row(binding: &crate::keys::Binding) -> String {
+    format!(
+        "{LINE_INDENT}{:<KEY_COLUMN$} {}",
+        binding.label, binding.what
+    )
+}
+
+/// The width the key column is padded to, so the descriptions line up. Labels
+/// wider than this (`enter/\u{2192}`) simply take the space they need: a row
+/// that pushes its own description right is still legible, and truncating a
+/// key's name is not.
+const KEY_COLUMN: usize = 6;
 
 /// The caret the steer line draws, because the overlay hides the terminal's
 /// own cursor (there is no caret anywhere else in this view). Exported so a
@@ -1851,41 +1823,193 @@ mod tests {
         }
     }
 
-    /// Card T4-S4b, applying F38's lesson to keys as T4-S3 did for `space`: a
-    /// key that works while being unadvertised is half-shipped. Every key
-    /// A3 binds is in the help.
+    /// The width card T4-S10's help assertions paint at.
+    ///
+    /// Wide on purpose: every help row goes through `fit_row_to_width`, so a
+    /// narrow frame truncates the longest description and an equality against
+    /// the table's own text becomes arithmetically unsatisfiable (**F58**).
+    /// Width-fitting is pinned separately by `the_help_frame_fits_the_width`.
+    const HELP_TEST_COLS: usize = 200;
+
+    /// The help frame's key rows, parsed back out of the **painted frame**:
+    /// one `(label, what)` pair per row, in paint order.
+    ///
+    /// The frame is the title row, a blank, then one `  {label:<6} {what}` row
+    /// per binding, so this reads what a user sees rather than any state
+    /// behind it (**F71**).
+    fn help_key_rows(cols: usize) -> Vec<(String, String)> {
+        super::overlay_help_rows(cols)
+            .into_iter()
+            .skip(2)
+            .filter(|row| !row.trim().is_empty())
+            .map(|row| {
+                let body = row.trim_start();
+                let (label, what) = body.split_once(' ').unwrap_or((body, ""));
+                (label.to_string(), what.trim_start().to_string())
+            })
+            .collect()
+    }
+
+    /// Card **T4-S10**: **the help frame _is_ the one bindings table**, row
+    /// for row, label and description, in order.
+    ///
+    /// This test keeps card T4-S4b's name and inverts how it works. It used
+    /// to carry its **own** list of the action keys -- `("r", "reply")`,
+    /// `("s", "steer")` and three more -- and lowercase the whole frame
+    /// looking for those substrings. Both halves were defects this card is
+    /// here to remove:
+    ///
+    /// * the list was a **third** place to forget a key, beside the help's
+    ///   own literal and the dispatch's arms, so a key added to the product
+    ///   and to the help but not to the list made this test cover *less*
+    ///   while still passing;
+    /// * `contains` over a lowercased frame is a bare substring check
+    ///   (**F41**): it passes on the word "reply" appearing anywhere, in any
+    ///   row, in any role.
+    ///
+    /// What is pinned instead is an equality: the painted key rows are
+    /// [`crate::keys::BINDINGS`] rendered, and nothing else is on the frame.
+    /// A key in the table and not in the help fails it; a key in the help and
+    /// not in the table fails it; a row whose wording drifts from the table's
+    /// fails it. Whether the *dispatch* agrees with the table cannot be asked
+    /// from this crate -- the arms are in the binary -- and is pinned by the
+    /// binary's own total sweep over the key space (**F57**).
     #[test]
     fn the_help_advertises_every_key_the_view_binds() {
-        let help = super::overlay_help_rows(100).join("\n").to_lowercase();
-        for (key, what) in [
-            ("r", "reply"),
-            ("s", "steer"),
-            ("x", "stop"),
-            ("n", "rename"),
-            ("p", "acknowledge"),
-        ] {
-            assert!(
-                help.contains(what),
-                "the help must say what `{key}` does, and {what:?} is not in \
-                 it:\n{help}"
-            );
-        }
-        // NON-VACUOUS: the keys T4-S3 and T4-S4a advertised are still there,
-        // so a help screen that had simply stopped listing anything would not
-        // pass this test by listing nothing.
-        for already in ["peek", "move"] {
-            assert!(
-                help.contains(already),
-                "the keys already advertised are still advertised: {already:?}\n{help}"
-            );
-        }
-        // `x` is two presses and the help must say so, because the first
-        // press does nothing visible to the registry and a user who does not
-        // know that reads it as a key that failed.
-        assert!(
-            help.contains("twice") || help.contains("two"),
-            "the help says `x` is two presses:\n{help}"
+        let painted: Vec<String> = help_key_rows(HELP_TEST_COLS)
+            .into_iter()
+            .map(|(label, what)| format!("{label}\t{what}"))
+            .collect();
+        let table: Vec<String> = crate::keys::BINDINGS
+            .iter()
+            .map(|binding| format!("{}\t{}", binding.label, binding.what))
+            .collect();
+        assert_eq!(
+            painted,
+            table,
+            "the help frame is the bindings table rendered: one row per \
+             binding, in the table's order, with the table's own wording. \
+             Painted:\n{}\nTable:\n{}",
+            painted.join("\n"),
+            table.join("\n")
         );
+        // NON-VACUOUS: the degenerate agreement -- an empty table and a help
+        // frame that lists nothing -- is the one way the equality above can
+        // hold while the view is undocumented, and it is exactly the shape
+        // the last card's vacuous acceptance test had. The frame has rows.
+        assert!(
+            !painted.is_empty(),
+            "a help frame with no key rows agrees with an empty table and \
+             tells the user nothing"
+        );
+    }
+
+    /// Card **T4-S10**: **the table expresses kinds, not just letters** --
+    /// and each kind is a thing the help row has to *say*.
+    ///
+    /// A flat list of letters cannot carry this view's keys. Four of the
+    /// distinctions the dispatch already makes are things a user must know
+    /// before pressing: the arrows are a **pair** (one row, two presses, one
+    /// description); `x` only **arms** on its first press, so a user who does
+    /// not know that reads it as a key that failed; `r` reads the **next
+    /// single key** rather than a line, so a user who types a word into it
+    /// answers a permission with its first letter; and `s`, `n`, `/` and the
+    /// dispatch key open **lines**, which is why their rows carry a grammar.
+    ///
+    /// Pinned through each binding's kind *and* the consequence that kind has
+    /// on the painted description, so a kind that is only a label on a struct
+    /// field fails this.
+    #[test]
+    fn the_bindings_table_expresses_each_binding_kind() {
+        use crate::keys::{BindingKind, Press};
+        let find = |press: Press| {
+            crate::keys::BINDINGS
+                .iter()
+                .find(|binding| binding.presses.contains(&press))
+        };
+
+        // The arrows: **one** row with two presses. Two rows would describe
+        // one movement twice and let the pair drift apart.
+        let arrows = find(Press::Up).expect("`up` is bound: it moves the selection");
+        assert!(
+            arrows.presses.contains(&Press::Down),
+            "the arrows are one row with both presses on it, not two rows: \
+             {:?}",
+            arrows.presses
+        );
+        assert_eq!(
+            arrows.kind,
+            BindingKind::Selection,
+            "the arrows move the selection"
+        );
+
+        // `x` arms first and acts second, and the row says so.
+        let stop = find(Press::Char('x')).expect("`x` is bound: it stops the selected agent");
+        assert_eq!(
+            stop.kind,
+            BindingKind::TwoPress,
+            "`x` is two presses: the first changes nothing in the registry"
+        );
+        assert!(
+            stop.what.contains("twice") || stop.what.contains("two"),
+            "and the help row says it is two presses, because the first press \
+             is invisible: {:?}",
+            stop.what
+        );
+
+        // `r` reads one key, and the row names the three it accepts.
+        let reply = find(Press::Char('r')).expect("`r` is bound: it answers a permission");
+        assert_eq!(
+            reply.kind,
+            BindingKind::DecisionRead,
+            "`r` opens a decision read, not a line: the next key is the answer"
+        );
+        for answer in ['y', 'a', 'n'] {
+            assert!(
+                reply.what.contains(answer),
+                "and the row names `{answer}`, because the next key *is* the \
+                 answer and a guess answers a permission: {:?}",
+                reply.what
+            );
+        }
+
+        // The four keys that open an edited line.
+        for (press, what) in [
+            (Press::Char('s'), "steer"),
+            (Press::Char('n'), "rename"),
+            (Press::Char('/'), "filter"),
+            (Press::Char(super::DISPATCH_KEY), "dispatch"),
+        ] {
+            let binding = find(press).unwrap_or_else(|| panic!("{press:?} is bound: it {what}s"));
+            assert_eq!(
+                binding.kind,
+                BindingKind::OpensLine,
+                "{press:?} opens an edited line; the bytes after it are the \
+                 line's"
+            );
+        }
+
+        // `?` and `esc` are not agent keys -- they act on the view itself and
+        // keep working while the help is up -- and they are in the table.
+        for press in [Press::Char('?'), Press::Esc] {
+            let binding = find(press).unwrap_or_else(|| panic!("{press:?} is in the table"));
+            assert_eq!(
+                binding.kind,
+                BindingKind::View,
+                "{press:?} acts on the view, not on an agent, so it is not \
+                 inert while the help is up"
+            );
+        }
+
+        // The keys that act on the selected agent at once.
+        for press in [Press::Char(' '), Press::Char('p')] {
+            let binding = find(press).unwrap_or_else(|| panic!("{press:?} is bound"));
+            assert_eq!(
+                binding.kind,
+                BindingKind::SelectedAgent,
+                "{press:?} acts on the selected agent and reports what it did"
+            );
+        }
     }
 
     /// Card T4-S5: **the help advertises `/`, and says what to type into it.**

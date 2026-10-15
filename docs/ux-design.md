@@ -42,7 +42,7 @@ Diff rendering keeps conventional green/red/cyan.
 |-------|---------------------|----------------------------|-----------|
 | `◆`   | `GLYPH_TOOL_CALL`   | tool call (FOX)            | `tool>` prefix (`*` in free text) |
 | `◇`   | `GLYPH_TOOL_RESULT` | tool result (dim; EMBER on error) | `result>` prefix (`>`) |
-| `◉`   | `GLYPH_APPROVAL`    | permission/approval prompt | `permission>` prefix (`o`) |
+| `◉`   | `GLYPH_APPROVAL`    | **a permission request, in both places one appears**: the `◉ permission — …` prompt and receipt, **and** the deck / agent-view row of an agent blocked waiting for one (`DeckState::Blocked`) | **two** plain forms, because they come from different tables: `permission>` prefix (`o`) for the prompt, **`[blk]`** for the row (`plain_marker`) |
 | `◈`   | `GLYPH_RECEIPT`     | receipts/section marker    | `#` |
 | `⛩`   | `GLYPH_TORII`       | session-boundary milestone | `*` |
 | `🦊`  | banner title        | identity (banner only)     | absent (one-line banner) |
@@ -50,6 +50,23 @@ Diff rendering keeps conventional green/red/cyan.
 
 Torii milestones mark the session passing a gate — compaction, `/new`,
 `/resume`, checkpoint `/undo` — one line per event, never in tool receipts.
+
+
+**One glyph, two surfaces, two plain forms (recorded in T4-S10).** `◉` was listed
+here with one meaning and one plain form while the code gave it two. The reuse is
+deliberate and the code says so — the state-marker table's comment reads *"`◉` is
+`GLYPH_APPROVAL`, already the permission glyph"* — but the **plain** forms are
+produced by **different functions**, so a reader of this table who assumed
+`--plain` renders `permission>` in an agent-view row would be wrong. `--plain` is
+a byte contract, so that mattered.
+
+**The keys surface introduces no glyph at all.** The help overlay is a title row
+plus one `  {label:<6} {what}` row per binding, ASCII throughout, and
+`/help keys` prints the same rows. The agent view's only glyphs are
+`deck_marker`'s four state markers (`◆` running, `◉` blocked, `◈` result ready,
+`◇` failed or stopped) and **`*` for the selected row** — which deliberately
+reuses `kitsu_render`'s profile-list mark rather than inventing one, the same
+rule that closed **F34**'s duplicate marker table.
 
 ## Key surfaces
 

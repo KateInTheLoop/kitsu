@@ -951,7 +951,7 @@ Slash commands inside the REPL:
 | `/delete <id>` | Permanently delete an exact inactive live-session ID. |
 | `/undo [id]` | Restore the latest or selected model-write checkpoint only when its files still match. |
 | `/clear` | Save the current durable conversation, start a fresh session/context, and keep the prior ID resumable. With autosave disabled, clear memory with an explicit non-preservation warning. |
-| `/help` | Show help. |
+| `/help [command\|keys]` | Show help. `/help <command>` explains one command; **`/help keys`** prints the agent view's key bindings — the same table the view's own `?` help shows, from one source, so the two cannot disagree. |
 | `/exit [wait\|cancel]` (or `/quit`) | Exit only when jobs are done, explicitly wait, or immediately cancel the foreground plus queued/background work and join it first. |
 
 ### Coding workflows: paste & file generation

@@ -5425,9 +5425,9 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "help",
-        args: "",
+        args: "[command|keys]",
         description: "show command help",
-        details: "Grouped command list. `/help <command>` shows that command's syntax, explanation, and aliases.",
+        details: "Grouped command list. `/help <command>` shows that command's syntax, explanation, and aliases, and `/help keys` prints the agent view's bindings.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -21648,10 +21648,34 @@ fn closest_jobs_subcommand(name: &str) -> Option<&'static str> {
         .map(|(_, cmd)| cmd)
 }
 
+/// `/help keys`: the agent view's bindings table as text (card **T4-S10**).
+///
+/// One row per binding, laid out by the same `help_key_row` the overlay's
+/// help frame paints, so the two readers cannot print one table two ways.
+/// The header is prose and carries no key label, so a reader matching rows by
+/// their key column does not mistake it for a binding.
+fn agent_view_keys_help() -> String {
+    let mut out = String::from("the agent view's keys (/jobs view, or ctrl+x a):\n");
+    for binding in kitsu_tui::keys::BINDINGS {
+        out.push_str(&kitsu_tui::agents_view::help_key_row(binding));
+        out.push('\n');
+    }
+    out.push_str("  the composer's own chords are listed by /help tui.");
+    out
+}
+
 /// `/help <command>`: syntax, explanation, and aliases for one command.
 /// Aliases resolve to their parent; unknown names get a nearest-help nudge.
 fn slash_command_help(query: &str) -> String {
     let query = query.trim_start_matches('/');
+    // Card **T4-S10**: `/help keys` is not a new slash command but an
+    // argument to this one, so there is no registry entry without an arm
+    // (**F57**) -- `/help`'s arm already feeds any argument here. It prints
+    // `kitsu_tui::keys::BINDINGS`, the same table and the same wording the
+    // agent view's help overlay paints, in the overlay's order.
+    if query == "keys" {
+        return agent_view_keys_help();
+    }
     let Some(spec) = SLASH_COMMANDS.iter().find(|spec| spec.name == query) else {
         return format!(
             "no command named /{} — /help lists every command",
@@ -35036,6 +35060,274 @@ mod tests {
         assert!(
             tick > std::time::Duration::ZERO,
             "a zero timeout is a busy loop, not a tick"
+        );
+    }
+
+    // ---- Card T4-S10: the one bindings table ------------------------------
+    //
+    // §4.7: "bindings are declared in one table consumed by the help overlay
+    // and `/help keys` so docs cannot drift". The table is
+    // `kitsu_tui::keys::BINDINGS` and the help overlay's agreement with it is
+    // pinned in `kitsu-tui`, where both live.
+    //
+    // The third reader is the **dispatch**, and it cannot be pinned that way:
+    // `handle_overlay_input` matches on `OverlayKey`, a type private to this
+    // binary, so a table in `kitsu-tui` cannot be the `match` and cannot call
+    // it either. Finding **F57** is exactly the trap that leaves: a single
+    // source of truth makes every reader agree with it and says nothing about
+    // whether anything acts on what they read, and the guard that reads the
+    // same source it is checking cannot fail. So the guard here reads
+    // **neither** source: it sweeps the key space the overlay's decoder can
+    // produce, presses every key, and asks the painted frame whether anything
+    // happened.
+
+    /// The width the T4-S10 sweep paints at. Wide on purpose: a truncated
+    /// frame can hide the difference a key made and make the sweep claim a
+    /// bound key is inert (**F58**, **F78**).
+    #[cfg(unix)]
+    const BINDINGS_SWEEP_COLS: usize = 200;
+
+    /// Card **T4-S10**, requirement 1 and finding **F57**: **every press the
+    /// overlay dispatches is in the bindings table, and every press in the
+    /// table is dispatched.**
+    ///
+    /// The sweep is over the *keyboard*, not over the arms: every printable
+    /// byte the decoder can turn into an `OverlayKey::Char` (`0x20..=0x7e` by
+    /// construction), plus each non-printable key it decodes -- the arrows,
+    /// `Enter`, `Backspace` and a resolved `Esc`. Nothing here reads the
+    /// dispatch's arms or the help's rows, so it cannot agree with either by
+    /// construction, which is what F57's guard could not do.
+    ///
+    /// "Dispatched" is asked of the **painted frame** and of whether the view
+    /// closed (**F71**), never of a state field: a key that changes the frame
+    /// or ends the view did something a user can see, and a key that changes
+    /// neither did not.
+    ///
+    /// Two presses are deliberately *not* in the table and are asserted
+    /// inert, so this is not satisfiable by a table that lists the whole
+    /// keyboard: `Backspace`, which belongs to the prompts and must not reach
+    /// the composer underneath, and a letter with no binding at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_press_the_overlay_dispatches_is_in_the_bindings_table() {
+        use kitsu_tui::keys::{Press, BINDINGS};
+
+        /// One key of the sweep: how a terminal delivers it, and the
+        /// `Press` the bindings table would have to name it by.
+        struct Swept {
+            name: String,
+            bytes: Vec<u8>,
+            /// `None` for a key the table cannot name: `Backspace` has no
+            /// `Press` variant because it is bound to nothing.
+            press: Option<Press>,
+            /// `Esc` is one byte and the start of every arrow, so it is only
+            /// a key once a quiet tick has resolved it.
+            held: bool,
+        }
+
+        let mut sweep: Vec<Swept> = Vec::new();
+        for byte in 0x20u8..=0x7e {
+            let typed = byte as char;
+            sweep.push(Swept {
+                name: format!("`{typed}`"),
+                bytes: vec![byte],
+                press: Some(Press::Char(typed)),
+                held: false,
+            });
+        }
+        for (name, bytes, press) in [
+            ("up", &b"\x1b[A"[..], Some(Press::Up)),
+            ("down", &b"\x1b[B"[..], Some(Press::Down)),
+            ("right", &b"\x1b[C"[..], Some(Press::Right)),
+            ("enter", &b"\r"[..], Some(Press::Enter)),
+            ("backspace", &b"\x7f"[..], None),
+        ] {
+            sweep.push(Swept {
+                name: name.to_string(),
+                bytes: bytes.to_vec(),
+                press,
+                held: false,
+            });
+        }
+        sweep.push(Swept {
+            name: "esc".to_string(),
+            bytes: b"\x1b".to_vec(),
+            press: Some(Press::Esc),
+            held: true,
+        });
+
+        let mut acts: Vec<String> = Vec::new();
+        let mut inert: Vec<String> = Vec::new();
+        for key in &sweep {
+            // A fresh registry and a fresh view per key: `x`, `p` and the
+            // dispatch key change the registry, and a shared one would make
+            // the sweep's answer depend on its order.
+            let (registry, _ids) = registry_with_three_agents();
+            let mut overlay = OverlayUnderTest::new();
+            // Two presses of `\u{2193}` first, so that there *is* a selected
+            // agent (the keys that act on one are otherwise inert, and the
+            // sweep would call them unbound) and so that `\u{2191}` has a row
+            // to move back to rather than clamping where it stands.
+            overlay.feed_and_frame_at(&registry, b"\x1b[B", BINDINGS_SWEEP_COLS);
+            let before = overlay.feed_and_frame_at(&registry, b"", BINDINGS_SWEEP_COLS);
+            let closing = overlay.feed_closing(&registry, &key.bytes);
+            let closing = closing || (key.held && overlay.quiet_tick());
+            let after = {
+                let rows = overlay.visible(&registry);
+                overlay_frame_rows(&overlay.state, &rows, BINDINGS_SWEEP_COLS)
+            };
+            if closing || after != before {
+                acts.push(key.name.clone());
+            } else {
+                inert.push(key.name.clone());
+            }
+        }
+
+        // NON-VACUOUS, both ways: a sweep that found every key inert, or
+        // every key bound, would prove nothing about the table.
+        assert!(
+            !acts.is_empty() && !inert.is_empty(),
+            "the sweep must find both bound and unbound keys; bound: \
+             {acts:?}, unbound: {inert:?}"
+        );
+
+        let tabled = |press: Option<Press>| {
+            press.is_some_and(|press| {
+                BINDINGS
+                    .iter()
+                    .any(|binding| binding.presses.contains(&press))
+            })
+        };
+
+        // Direction one, the F57 direction the brief could not guard before:
+        // a key that *does* something and is in no table row is a key no
+        // reader can advertise.
+        let undocumented: Vec<&str> = sweep
+            .iter()
+            .filter(|key| acts.contains(&key.name) && !tabled(key.press))
+            .map(|key| key.name.as_str())
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "every press that changes the frame or closes the view is one \
+             row of the bindings table; these are dispatched and in no row: \
+             {undocumented:?}"
+        );
+
+        // Direction two: a row nothing acts on is F57 verbatim -- the help
+        // would advertise a key that does nothing.
+        let unbound: Vec<&str> = sweep
+            .iter()
+            .filter(|key| tabled(key.press) && inert.contains(&key.name))
+            .map(|key| key.name.as_str())
+            .collect();
+        assert!(
+            unbound.is_empty(),
+            "every row of the bindings table is a press the dispatch acts \
+             on; these are advertised and inert: {unbound:?}"
+        );
+
+        // And the two presses that must stay out of the table, so this is
+        // not satisfiable by listing the keyboard.
+        assert!(
+            inert.iter().any(|name| name == "backspace"),
+            "backspace belongs to the prompts: over the row list it does \
+             nothing and must not reach the composer underneath"
+        );
+        assert!(
+            inert.iter().any(|name| name == "`z`"),
+            "`z` is bound to nothing, and the overlay still owns the byte"
+        );
+    }
+
+    /// Card **T4-S10**, requirement 3: **`/help keys` prints the one bindings
+    /// table.**
+    ///
+    /// Note what `/help keys` *is*: not a new slash command but a new
+    /// argument to the already-registered, already-dispatched `/help`, whose
+    /// arm feeds any argument to `slash_command_help`. So F57's
+    /// registered-without-an-arm hazard does not arise here, and the opposite
+    /// one does: today the arm runs and answers "no command named /keys",
+    /// which is a dispatched wrong answer. Both halves are pinned --
+    /// `/help`'s own registry entry advertises the argument, so it is
+    /// discoverable, and the argument prints the table.
+    #[test]
+    fn slash_help_keys_prints_the_one_bindings_table() {
+        let spec = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "help")
+            .expect("/help is registered");
+        assert!(
+            spec.args.contains("keys"),
+            "the registry entry advertises the argument, or nothing offers it \
+             in `/help` or in completion: {:?}",
+            spec.args
+        );
+
+        let text = slash_command_help("keys");
+        for binding in kitsu_tui::keys::BINDINGS {
+            let rows: Vec<&str> = text
+                .lines()
+                .filter(|line| {
+                    line.split_whitespace()
+                        .next()
+                        .is_some_and(|first| first == binding.label)
+                })
+                .collect();
+            assert_eq!(
+                rows.len(),
+                1,
+                "exactly one row of `/help keys` is {:?}'s, as on the help \
+                 overlay:\n{text}",
+                binding.label
+            );
+            assert!(
+                rows[0].contains(binding.what),
+                "and it carries the table's own wording for it, not a second \
+                 phrasing that can drift: {:?} is not in {:?}",
+                binding.what,
+                rows[0]
+            );
+        }
+
+        // NON-VACUOUS: `keys` is answered because it is `keys`, not because
+        // every unknown argument now prints the table.
+        let unknown = slash_command_help("nosuchthing");
+        assert!(
+            unknown.starts_with("no command named /nosuchthing"),
+            "an argument that is neither a command nor `keys` still gets the \
+             nudge: {unknown:?}"
+        );
+    }
+
+    /// Card **T4-S10**, requirement 1: **the two readers print the same
+    /// bindings.**
+    ///
+    /// The overlay's agreement with the table and `/help keys`' agreement
+    /// with it are each pinned above; this is the consequence a user meets,
+    /// and it fails if either reader keeps a list of its own.
+    #[test]
+    fn the_overlay_help_and_slash_help_keys_print_the_same_bindings() {
+        let overlay: Vec<String> = kitsu_tui::agents_view::overlay_help_rows(200)
+            .into_iter()
+            .skip(2)
+            .filter(|row| !row.trim().is_empty())
+            .filter_map(|row| row.split_whitespace().next().map(str::to_string))
+            .collect();
+        assert!(
+            !overlay.is_empty(),
+            "the help overlay paints key rows at all"
+        );
+        let text = slash_command_help("keys");
+        let printed: Vec<String> = text
+            .lines()
+            .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+            .filter(|first| overlay.iter().any(|label| label == first))
+            .collect();
+        assert_eq!(
+            printed, overlay,
+            "`/help keys` lists the overlay's keys, all of them, in the \
+             overlay's order:\n{text}"
         );
     }
 }
