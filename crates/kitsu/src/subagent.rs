@@ -1,4 +1,4 @@
-//! Subagents (design docs/subagents-design.md, Stage A): the `spawn_agent` tool
+//! Subagents (see docs/architecture.md): the `spawn_agent` tool
 //! runs a nested, ISOLATED agent loop on a delegated task and returns only the
 //! conclusion to the parent — so a big exploration stays out of the main context.
 //!

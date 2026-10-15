@@ -21,7 +21,7 @@ homepage = "https://github.com/KateInTheLoop/kitsu"
 authors = ["CatherinaInTheLoop <CatherinaInTheLoop@pm.me>"]
 
 [workspace.dependencies]
-# Async runtime + HTTP (locked decisions, development_plan.md)
+# Async runtime + HTTP
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 tokio-stream = "0.1"
