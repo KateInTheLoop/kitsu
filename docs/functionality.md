@@ -342,7 +342,14 @@ works.
 
 `/tui fullscreen` switches the renderer to a fullscreen view over the viewport's
 scrollback: it takes the terminal's alternate screen, paints the retained lines,
-and gives the screen and the window title back when you leave it. `--tui
+**repaints them as new output arrives**, and gives the screen and the window
+title back when you leave it. A prompt that follows no new output repaints
+nothing, so an idle session is still.
+
+**Two rough edges, both known.** The prompt, its hint row and the slash-command
+palette are still drawn by the ordinary line editor, so between turns they paint
+over the frame -- the frame itself stays correct and current. And paging is not
+wired, so the view follows the newest lines rather than letting you scroll back. `--tui
 fullscreen` and `[tui] mode = "fullscreen"` start there instead; a session that
 starts in fullscreen has nothing behind it to paint yet. Paging is not wired, so
 the view shows the newest lines that fit.

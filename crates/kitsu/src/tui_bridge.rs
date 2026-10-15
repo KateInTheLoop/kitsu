@@ -150,8 +150,8 @@ pub(crate) fn install(
         // Inert: no bytes, no surface swap, and the live-row setting
         // untouched. Fullscreen shares the arm because it pins no region and
         // installs no surface of its own -- it takes the alternate screen
-        // through `enter_fullscreen` and lets the displaced surface keep
-        // printing the transcript onto it.
+        // through `enter_fullscreen`, which taps the displaced surface and
+        // leaves it printing the transcript onto that screen.
         TuiMode::Classic | TuiMode::Fullscreen => return None,
         TuiMode::Inline => {}
     }
@@ -261,9 +261,154 @@ pub(crate) struct FullscreenSegment {
     /// Whether the terminal has already been given back, so the restore bytes
     /// are written at most once per segment.
     left: bool,
+    /// The lines the entry frame was painted from, oldest first: the outgoing
+    /// inline viewport's ring, or empty out of classic and at startup.
+    ///
+    /// Kept because the ring they came from belongs to the surface the inline
+    /// teardown has already put back, so there is nowhere else to read them
+    /// from once the segment is live.
+    seed: Vec<kitsu_tui::cells::CellLine>,
+    /// The seam tap, which records what the session writes onto the alternate
+    /// screen so the frame can be painted again from it.
+    tap: Arc<FullscreenTap>,
+    /// The surface the tap displaced, put back by [`Self::leave`].
+    previous_surface: Arc<dyn Surface>,
+    /// How many of the tap's lines the last frame was painted from, so a
+    /// prompt that follows no new output repaints nothing and the byte stream
+    /// of an idle fullscreen session is the one it was before this card.
+    painted_tap_lines: usize,
+}
+
+/// The seam tap a live fullscreen segment installs: every transcript line the
+/// session writes while the alternate screen is held is forwarded verbatim to
+/// the surface fullscreen displaced, and a copy is kept in a line-bounded
+/// ring so the frame can be painted again from it (requirement **N4**'s bound,
+/// and **F52**'s: lines, never bytes).
+///
+/// The tap **only records.** The repaint is driven by
+/// [`FullscreenSegment::repaint_if_the_ring_grew`] at the idle prompt, never
+/// from inside a write: a repaint at the seam would reach the inline and
+/// classic renderers as well, whose contracts are one write per transcript
+/// line (**R3**) and a byte stream identical to the unrouted writers'.
+struct FullscreenTap {
+    /// The surface fullscreen displaced. It still owns every byte: this type
+    /// adds no output of its own.
+    inner: Arc<dyn Surface>,
+    /// What the session has written since the segment took the screen, oldest
+    /// first.
+    ring: std::sync::Mutex<kitsu_tui::cells::CellRing>,
+}
+
+impl FullscreenTap {
+    /// The recorded lines, oldest first.
+    fn lines(&self) -> Vec<kitsu_tui::cells::CellLine> {
+        lock(&self.ring).lines()
+    }
+}
+
+impl Surface for FullscreenTap {
+    /// Forward first, record after: the bytes reach the terminal before any
+    /// bookkeeping, exactly as `InlineSurface` orders the same pair, and the
+    /// recorded order is the written order by construction.
+    fn transcript_line(&self, fd: kitsu_render::surface::Fd, text: &str) {
+        self.inner.transcript_line(fd, text);
+        lock(&self.ring).push(fd, text);
+    }
+
+    /// The block runs against the displaced surface's own writer, so its
+    /// single-suspension property and its descriptor are the displaced
+    /// surface's: this override exists to *see* the bytes, not to buffer them.
+    ///
+    /// A block whose bytes end without a newline is recorded as a short line,
+    /// for the reason `InlineSurface::write_block` states: text that is on the
+    /// terminal and absent from the ring would be lost from the frame for
+    /// good.
+    fn write_block(
+        &self,
+        fd: kitsu_render::surface::Fd,
+        block: &mut dyn FnMut(&mut dyn std::io::Write),
+    ) {
+        let mut seen: Vec<u8> = Vec::new();
+        self.inner.write_block(fd, &mut |writer| {
+            let mut tee = Tee {
+                inner: writer,
+                seen: &mut seen,
+            };
+            block(&mut tee);
+        });
+        let text = String::from_utf8_lossy(&seen);
+        let mut ring = lock(&self.ring);
+        for line in text.lines() {
+            ring.push(fd, line);
+        }
+    }
+
+    /// Forwarded whole: the queued-prompt rows belong to a backend with pinned
+    /// bottom rows, and a fullscreen segment pins none, so this is the
+    /// displaced surface's answer and never a ring entry.
+    fn queue(&self, rows: &[String]) {
+        self.inner.queue(rows);
+    }
+}
+
+/// A writer that copies what it forwards, for [`FullscreenTap::write_block`].
+struct Tee<'a> {
+    inner: &'a mut dyn std::io::Write,
+    seen: &'a mut Vec<u8>,
+}
+
+impl std::io::Write for Tee<'_> {
+    /// Only the bytes the inner writer accepted are recorded, so a short write
+    /// cannot put a line in the ring that never reached the terminal.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.seen.extend_from_slice(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 impl FullscreenSegment {
+    /// Paint the frame again when the session has written something since the
+    /// last one, and write nothing at all when it has not (**F97**).
+    ///
+    /// Called from the idle prompt, which is the one place in a fullscreen
+    /// session where no turn is streaming and the screen is therefore not
+    /// being written by anything else. The frame is the seed lines the entry
+    /// paint used followed by everything the tap recorded, so the line that
+    /// was retained from the inline segment stays above the ones the
+    /// fullscreen segment added.
+    ///
+    /// The gate is what keeps an idle session's byte stream unchanged: a
+    /// prompt that follows no output repaints nothing, so the frame is written
+    /// once per growth of the ring rather than once per prompt.
+    pub(crate) fn repaint_if_the_ring_grew(&mut self, rows: u16, cols: usize) {
+        if self.left {
+            return;
+        }
+        let recorded = self.tap.lines();
+        if recorded.len() <= self.painted_tap_lines {
+            return;
+        }
+        self.painted_tap_lines = recorded.len();
+        let mut lines = self.seed.clone();
+        lines.extend(recorded);
+        let frame = fullscreen_frame(&lines, rows, cols);
+        // The clear and the home cursor are the entry paint's, minus the
+        // alternate-screen enable: this is a repaint of a screen already held,
+        // so re-enabling it would be a second `ESC[?1049h` the leave has no
+        // counterpart for.
+        let _ = self.err.write_all(b"\x1b[2J\x1b[H");
+        for row in &frame {
+            let _ = self.err.write_all(row.as_bytes());
+            let _ = self.err.write_all(b"\r\n");
+        }
+        let _ = self.err.flush();
+    }
+
     /// Give the terminal back: the alternate screen first, then the title.
     ///
     /// Idempotent, and every I/O result is dropped: this is the body of
@@ -278,6 +423,19 @@ impl FullscreenSegment {
         // Before the bytes, so `/tui`'s report cannot observe a renderer the
         // terminal has already been taken back from.
         FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        // And before them for a second reason: the next transcript line must
+        // not be recorded into a frame that no longer has a screen. The
+        // put-back is conditional on the tap still being the installed
+        // surface, because the switch into inline installs its viewport
+        // *after* dropping this segment on one path and could not be relied
+        // on to stay in that order; an unconditional `set_surface` here would
+        // then displace the incoming renderer.
+        if Arc::ptr_eq(
+            &kitsu_render::surface::active_surface(),
+            &(self.tap.clone() as Arc<dyn Surface>),
+        ) {
+            set_surface(self.previous_surface.clone());
+        }
         let _ = self.err.write_all(LEAVE_ALT_SCREEN);
         let _ = self.err.write_all(POP_TITLE);
         let _ = self.err.flush();
@@ -317,6 +475,14 @@ impl Drop for FullscreenSegment {
 /// strictly more than the classic renderer shows of a transcript that has
 /// scrolled away.
 ///
+/// Finding **F97**: the entry frame is not the only frame. The segment
+/// installs a [`FullscreenTap`] over the surface fullscreen displaced, so
+/// what the session writes onto the alternate screen is recorded as well as
+/// printed, and [`FullscreenSegment::repaint_if_the_ring_grew`] paints the
+/// seed lines and the recorded ones again at the idle prompt. The frame
+/// therefore follows the ring instead of freezing at the moment of the
+/// switch.
+///
 /// The rows are written as lines rather than at absolute addresses, with this
 /// backend's own CRLF: the cursor is then left under the frame, where the
 /// receipt and everything the session prints next belong.
@@ -325,13 +491,9 @@ pub(crate) fn enter_fullscreen(
     lines: &[kitsu_tui::cells::CellLine],
     rows: u16,
     cols: usize,
+    ring_lines: usize,
 ) -> FullscreenSegment {
-    let mut ring = kitsu_tui::cells::CellRing::new(lines.len().max(1));
-    for line in lines {
-        ring.push(line.fd(), line.styled());
-    }
-    let frame =
-        kitsu_tui::fullscreen::FullscreenView::new().frame(&ring, rows.saturating_sub(1), cols);
+    let frame = fullscreen_frame(lines, rows, cols);
 
     let mut err = err;
     // Card F94: **before** the bytes, and the opposite order to
@@ -353,7 +515,41 @@ pub(crate) fn enter_fullscreen(
     // After the bytes: the terminal is held by the time anything can report
     // that it is.
     FULLSCREEN_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
-    FullscreenSegment { err, left: false }
+    // Last, and after the entry frame's bytes: the tap records what the
+    // session writes *onto the alternate screen*, so installing it before the
+    // frame would put the frame's own rows in the ring if a writer reached the
+    // seam in between.
+    //
+    // The bound is the caller's configured cell-ring line count, the same one
+    // `install` hands the inline viewport, and it is a count of lines --
+    // **F52**'s bound is never bytes.
+    let tap = Arc::new(FullscreenTap {
+        inner: kitsu_render::surface::active_surface(),
+        ring: std::sync::Mutex::new(kitsu_tui::cells::CellRing::new(ring_lines.max(1))),
+    });
+    let previous_surface = set_surface(tap.clone());
+    FullscreenSegment {
+        err,
+        left: false,
+        seed: lines.to_vec(),
+        tap,
+        previous_surface,
+        painted_tap_lines: 0,
+    }
+}
+
+/// The rows of one fullscreen frame over `lines`, oldest line first.
+///
+/// The ring is rebuilt over the caller's copy because the ring the seed lines
+/// came from belongs to the surface the inline teardown already put back. Its
+/// limit is the line count, so nothing is evicted and the view's follow anchor
+/// resolves to the newest `rows - 1` lines.
+fn fullscreen_frame(lines: &[kitsu_tui::cells::CellLine], rows: u16, cols: usize) -> Vec<String> {
+    let mut ring = kitsu_tui::cells::CellRing::new(lines.len().max(1));
+    for line in lines {
+        ring.push(line.fd(), line.styled());
+    }
+    kitsu_tui::fullscreen::FullscreenView::new().frame(&ring, rows.saturating_sub(1), cols)
 }
 
 /// The pinned pane: the inline viewport plus the geometry currently latched

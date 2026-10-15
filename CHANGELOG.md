@@ -142,8 +142,11 @@ shapes may change in any minor release.
   screen. It now restores both.
 - **A fullscreen renderer.** `/tui fullscreen` (also `--tui fullscreen` and
   `[tui] mode = "fullscreen"`) takes the terminal's alternate screen and paints
-  the viewport's scrollback, and gives the screen and your window title back when
-  you switch away. Switching keeps the conversation, as the other modes do.
+  the viewport's scrollback, **repainting as the conversation grows**, and gives
+  the screen and your window title back when you switch away.
+  **Rough edge, being worked on:** the prompt and the slash-command palette are
+  still drawn by the ordinary line editor, so they paint over the frame between
+  turns. The frame is correct and current; what is on top of it is not tidy yet. Switching keeps the conversation, as the other modes do.
   Paging keys are not wired yet, so it shows the most recent lines.
   **What the scrollback holds is worth knowing:** the streamed conversation --
   not kitsu's own messages and receipts, and not an answer that was buffered

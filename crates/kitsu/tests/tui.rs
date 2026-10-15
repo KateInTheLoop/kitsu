@@ -5559,6 +5559,291 @@ fn tui_switch_from_fullscreen_into_classic_restores_the_screen_and_the_title() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Card T5-S1c: the fullscreen frame must FOLLOW the ring, not freeze at entry.
+//
+// Finding **F97**. `enter_fullscreen` paints one frame and returns: there is
+// no repaint, no read loop and no output routing, so `/tui fullscreen` today
+// means "take the alternate screen, print the ring's tail once, then carry on
+// writing to that screen normally". The frame is a snapshot the conversation
+// scrolls over.
+//
+// Every T5-S2 transition test above is satisfied by that single paint —
+// including `tui_switch_from_inline_into_fullscreen_repaints_the_ring`, whose
+// second occurrence of the marker proves the ring *was* read. **A test that
+// proves the ring was read does not prove the ring is being read**, and the
+// test below is the one that separates them: it makes the ring grow *while
+// fullscreen is live* and asserts the retained line is painted again
+// afterwards.
+//
+// The non-regression test after it pins the other half: inline and classic
+// have no fullscreen frame, so neither may grow one.
+// ---------------------------------------------------------------------------
+
+/// The second streamed marker, for the turn that runs **inside** fullscreen.
+///
+/// Chosen for the four properties [`RING_MARK`]'s doc comment lists, and for
+/// the same reason it is a streamed fragment rather than a diagnostic: only a
+/// writer that goes through the surface seam can reach a ring at all, and
+/// `eprintln!` bypasses it.
+const RING_MARK_2: &str = "RING_BETA";
+
+/// Inline -> fullscreen with the marker in the ring, then a **second streamed
+/// turn while fullscreen holds the screen**, then out.
+///
+/// The second turn is what this script adds to [`inline_then_fullscreen`], and
+/// it is submitted at fullscreen's own idle prompt. Both waits are [`pause`]s
+/// on a trigger that is already satisfied, which is the separation this file's
+/// streaming scripts use: a line written the instant a turn's output appears
+/// still reaches the mid-turn collector, where `/tui` is refused and the
+/// prompt would be queued instead of read.
+fn fullscreen_then_a_second_streamed_turn() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "say hello\r"),
+        pause(TURN_DONE_MARKER, 500),
+        send(TURN_DONE_MARKER, "/tui fullscreen\r"),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 500),
+        send(TUI_SWITCHED_TO_FULLSCREEN, "say more\r"),
+        pause(RING_MARK_2, 800),
+        send(RING_MARK_2, "/quit\r"),
+    ]
+}
+
+/// **F97's missing assertion: the frame follows the ring.**
+///
+/// The test above it proves a reader read the ring once. This one proves the
+/// frame is still the ring's: the session streams [`RING_MARK`] while inline,
+/// switches into fullscreen (which paints it), and then streams
+/// [`RING_MARK_2`] with fullscreen holding the alternate screen.
+///
+/// # Why counting [`RING_MARK`] is the assertion
+///
+/// A single paint can only ever put that line on the stream **twice**: once
+/// as the inline transcript wrote it, and once in the entry frame. Nothing
+/// else in the process holds it — the primary screen's copy is bytes already
+/// past, and the alternate screen starts blank. So a **third** occurrence can
+/// only come from a frame painted again after entry, which is what a renderer
+/// that follows its ring does when the ring grows and what a snapshot cannot
+/// do at all.
+///
+/// # And why the order of the last two occurrences is the follow
+///
+/// The frame is painted oldest line first, so the retained line sits *above*
+/// the new one. Asserting that the stream's **last** occurrence of
+/// [`RING_MARK`] is inside the alternate screen and is followed by
+/// [`RING_MARK_2`] pins both halves of transition 10 in
+/// `kitsu_tui::fullscreen`'s table — the appended line entered the frame, and
+/// the frame it entered is the one still showing the older line — without
+/// duplicating the view's own unit coverage of it (the view is pure and
+/// already pinned there; what is unpinned is whether production ever paints a
+/// second frame).
+///
+/// This is deliberately silent about *how* the new line reaches the screen: a
+/// renderer may write the line and then repaint, or route it through the ring
+/// and let the repaint be its only appearance. Both satisfy the assertions
+/// here, and choosing between them is the implementation's.
+#[test]
+#[serial]
+fn tui_fullscreen_frame_follows_the_ring_while_it_is_live() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &fullscreen_then_a_second_streamed_turn(),
+        vec![
+            Turn {
+                events: vec![delta(&format!("{RING_MARK}\n")), finish("stop")],
+                gap: Duration::from_millis(60),
+            },
+            Turn {
+                events: vec![delta(&format!("{RING_MARK_2}\n")), finish("stop")],
+                gap: Duration::from_millis(60),
+            },
+        ],
+        &["--no-tools".to_string()],
+    );
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.bodies.len(),
+        2,
+        "two turns are two requests, so the second fragment really came from \
+         the mock and was really streamed after the switch; bodies: {:?}",
+        session.bodies
+    );
+
+    // The switch ran, exactly once, and this session is in fullscreen for the
+    // whole of the second turn.
+    let entered_at = text.find(ALT_SCREEN_ON).unwrap_or_else(|| {
+        panic!(
+            "the switch must enter the alternate screen; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "exactly once: one switch, and no agent view is opened here; raw:\n{}",
+        text.escape_debug()
+    );
+    let first_mark = text.find(RING_MARK).unwrap_or_else(|| {
+        panic!(
+            "the inline segment must stream its marker into the ring; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert!(
+        first_mark < entered_at,
+        "the first marker must be written while inline, so the ring is what \
+         holds it once the alternate screen is entered; raw:\n{}",
+        text.escape_debug()
+    );
+    let second_mark = text.find(RING_MARK_2).unwrap_or_else(|| {
+        panic!(
+            "the second turn must stream its marker; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert!(
+        entered_at < second_mark,
+        "and the second turn must run with fullscreen already holding the \
+         screen, or this test measures the entry frame again; raw:\n{}",
+        text.escape_debug()
+    );
+
+    // F97's assertion. Two occurrences is the single paint; three is a frame
+    // painted again after the ring grew.
+    assert!(
+        session.raw_count(RING_MARK) >= 3,
+        "the fullscreen frame must FOLLOW the ring: the retained line is \
+         painted once by the inline transcript and once by the entry frame, \
+         so a third occurrence is the repaint that a mode which paints one \
+         frame and returns can never produce (F97). Counted {}; \
+         everything from the alternate screen onwards:\n{}",
+        session.raw_count(RING_MARK),
+        text[entered_at..].escape_debug()
+    );
+
+    // ...and that repaint is a frame, with the appended line below the
+    // retained one (`fullscreen`'s transition 10).
+    let last_mark = text
+        .rfind(RING_MARK)
+        .expect("the marker was just counted at least three times");
+    assert!(
+        last_mark > entered_at,
+        "the last paint of the retained line must be inside the alternate \
+         screen, not back in the inline transcript; everything from the \
+         alternate screen onwards:\n{}",
+        text[entered_at..].escape_debug()
+    );
+    assert!(
+        text[last_mark..].contains(RING_MARK_2),
+        "and the appended line must be on screen *below* the retained one, \
+         which is what makes the repaint a frame that follows rather than a \
+         stray reprint of one line; everything from that paint onwards:\n{}",
+        text[last_mark..].escape_debug()
+    );
+
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_OFF),
+        1,
+        "the alternate screen is still given back exactly once; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "`/quit` must still work after a turn taken in fullscreen, but the \
+         session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+    assert!(
+        session.raw_mode_off(),
+        "the pty must be canonical again after the session: {}",
+        session.termios_dump()
+    );
+}
+
+/// Two streamed turns and no switch at all, for the renderer named by `tui`.
+fn two_streamed_turns() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "say hello\r"),
+        pause(TURN_DONE_MARKER, 500),
+        send(TURN_DONE_MARKER, "say more\r"),
+        pause(RING_MARK_2, 800),
+        send(RING_MARK_2, "/quit\r"),
+    ]
+}
+
+/// **The other half of T5-S1c: inline and classic have no frame to follow.**
+///
+/// A repaint wired at the wrong level — in the surface seam rather than in the
+/// fullscreen segment — would reach these two renderers as well, and inline's
+/// contract is that the transcript goes to the terminal's own scrollback
+/// exactly once (R3) while classic's is that its byte stream is unchanged.
+/// Both are asserted here as counts on the two streamed markers, and as the
+/// absence of the alternate screen, which neither renderer may take.
+///
+/// Two sessions in one test because they assert the same three things about
+/// two renderers; the fullscreen session that *must* repaint is the test
+/// above.
+#[test]
+#[serial]
+fn tui_two_streamed_turns_paint_each_line_once_without_fullscreen() {
+    for mode in ["inline", "classic"] {
+        let home = TempDir::new().expect("temp home");
+        let session = run_styled_streaming_chat_pty_with_args(
+            home.path(),
+            Some(mode),
+            &two_streamed_turns(),
+            vec![
+                Turn {
+                    events: vec![delta(&format!("{RING_MARK}\n")), finish("stop")],
+                    gap: Duration::from_millis(60),
+                },
+                Turn {
+                    events: vec![delta(&format!("{RING_MARK_2}\n")), finish("stop")],
+                    gap: Duration::from_millis(60),
+                },
+            ],
+            &["--no-tools".to_string()],
+        );
+        let text = session.raw_text();
+        assert_eq!(
+            session.bodies.len(),
+            2,
+            "two turns are two requests in {mode} too; bodies: {:?}",
+            session.bodies
+        );
+        assert_eq!(
+            session.raw_count(ALT_SCREEN_ON),
+            0,
+            "the {mode} renderer must never take the alternate screen; \
+             raw:\n{}",
+            text.escape_debug()
+        );
+        assert_eq!(
+            session.raw_count(RING_MARK),
+            1,
+            "and each streamed line reaches the terminal exactly once in \
+             {mode}: there is no frame here to repaint it into; raw:\n{}",
+            text.escape_debug()
+        );
+        assert_eq!(
+            session.raw_count(RING_MARK_2),
+            1,
+            "...the second line included; raw:\n{}",
+            text.escape_debug()
+        );
+        assert!(
+            session.status.success(),
+            "the {mode} session exits cleanly, but exited {:?}; screen:\n{}",
+            session.status,
+            session.screen_dump()
+        );
+    }
+}
+
 /// Switch into inline, then **switch again**, then take a `SIGTERM`.
 fn switch_twice_then_sigterm() -> Vec<Step> {
     vec![
