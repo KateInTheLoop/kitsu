@@ -14,3 +14,14 @@
 
 # Release packaging output
 /dist
+
+# Local credentials and environment overrides
+/.aws/
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Local Kitsu state; keep reusable project skills versioned
+/.kitsu/*
+!/.kitsu/skills/
