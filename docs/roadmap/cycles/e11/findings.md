@@ -3967,3 +3967,77 @@ Three things make the diagnosis likely without chasing it: the three tests fail 
 **The concurrency is partly my doing**, and worth recording as a cause rather than a coincidence: earlier in this session I ran suites myself while an agent was running its own, which is the condition under which this appeared. Later briefs now say **do not run suites concurrently**, and the following card's agent ran them one at a time and saw nothing.
 
 So the standing flake list is now four: the two characterised ones, the **unidentified `--test tui`** (twelve runs clean, name never captured), and this. **F39 took eight occurrences to pin because its first two destroyed their own evidence** — this one has its evidence on disk from occurrence one, which is the whole point of the one-file-per-suite rule.
+
+## F81 — A8 is violated at the TUI idle composer, and the codebase already contained the argument
+
+I asked whether T4-S8 was test-only, since **F50** had established that A8's 250 ms budget was satisfied by a 50 ms poll tick and asserted nowhere. The answer is **no**: A8 is **broken**, at a path nobody had looked at.
+
+### The violation, verified
+
+- `sync_agent_counts` and `repaint_status_row` are called from **exactly one loop** — `run_live_typeahead`, the *during-a-turn* typeahead. `repaint_status_row` has only two other production callers, one of them the overlay handing the terminal back.
+- **At the idle composer there is no cadence at all.** `read_line_inline_with_keys` blocks in `input.read(&mut buffer)` with **no timeout** (verified: no poll above it); its only non-byte wake is an interrupted read plus a pending `SIGWINCH`, and a wake with no resize is explicitly retried **without a frame**.
+- **The idle composer's bottom row does carry the ambient tag** — `status_row()` → `StatusSource::compose` → `compose_status_row` (verified). So the counter is **on screen and indefinitely stale**.
+- The counts are a **pull**, read through a closure at paint time, so nothing needs pushing. **The entire gap is that at idle nobody calls paint.**
+
+**So a background agent that blocks while the user sits at the prompt changes nothing on screen until a keystroke, a terminal resize, or a submitted line.** That is precisely what the whole T2 blocked-agent surfacing exists to prevent.
+
+### A8's carve-out does not cover it
+
+A8 grants the "idle prompt keeps reporting at the next prompt cycle" latitude to **`classic`**, by its own sentence. The TUI idle composer gets no such grant, so this is an unqualified violation rather than an under-specified corner.
+
+### The part worth keeping: the argument was already written down
+
+Two comments in the tree bear on this, and they disagree:
+
+- `crates/kitsu/tests/tui.rs:2842` records the rationale for having no idle cadence: *"`read_line_inline` is deliberately not a cadence … between turns R5's elapsed segment is `None` anyway, so the idle prompt has nothing to tick."* **True of the clock. False of the ambient tag.**
+- `crates/kitsu/src/tui_bridge.rs:450`, in the reduced-motion logic, states the counter-argument exactly: the queue and ambient tags stay in the key *"because they are state and not animation: **freezing them would hide a blocked agent**."*
+
+**The same reasoning, about the same segment, written by the same project — applied to reduced motion and not to idle.** Nobody had to discover that freezing the tag hides a blocked agent; it was already a sentence in the file. The gap was that the rationale for no-idle-cadence reasoned about *elapsed time* and silently generalised to *everything on the row.*
+
+**The lesson: a justification that is true of one segment is not true of the row.** "Nothing to tick" was a claim about a clock, and it was allowed to excuse a surface that also carries state.
+
+### A second, smaller gap
+
+Mid-turn, `run_live_typeahead`'s approval arms `continue` **before** `sync_agent_counts`, so while an approval modal is up — which can be minutes — the ambient counter is frozen, and the modal paints a status row of its own, so the stale count is visible. Noted, not tested (adjacent to F54's territory).
+
+### Two corrections to my own records
+
+- **F50's proposed cheap fix described a constant that did not exist.** It said "a unit assertion on the poll interval constant"; the poll was a **bare literal `50`**. There was nothing to assert until this card introduced `AMBIENT_TICK_POLL_MS`. An F64-family slip in a finding of mine.
+- **The plan row's `Files: status.rs` is wrong.** `crates/kitsu-tui/src/status.rs` is pure painting — no clock, no cadence. The mechanism lives in `main.rs` and `tui_bridge.rs`.
+
+### And the row's "watch-driven" is right for the wrong reason
+
+It is needed not to tighten 50 ms to something smaller, but to give the **idle** composer a cadence it has never had. `registry.subscribe()` already exists, and because the counts are a pull the implementer needs **a caller, not a rewrite**. The classic-mode notifier is not that caller: it is gated on an opt-in environment variable and an assistive-input check, so a default TUI session has **no subscriber at all**.
+
+### The vacuous-pass trap, flagged by the test author in its own seam
+
+`idle_ambient_refresh_interval() -> Option<Duration>` can be made `Some(..)` **without wiring anything**, which would be *exactly* F50's failure — a requirement passing a test while nothing holds it. The seam's doc comment says so, and the implementer owes a **behavioural** test that an idle registry change reaches the surface **with no byte read**. That test could not be written in advance because it needs whichever wake mechanism the implementer chooses.
+
+### No sleeping test
+
+Both new tests are structural. The during-turn guard reads the named constant so raising the tick past 250 ms **fails by name** — F50's loud guard, finally built. The idle test asserts the painted row through the surface. The only sleep is the existing frame-budget helper that clears N3's coalescing window, which is the in-tree idiom and not a latency measurement. With four open flakes, waiting out a 250 ms budget on a loaded machine was not worth it.
+
+### F81's resolution, and the acceptance test that would have passed a lie
+
+The idle composer now has a cadence, driven by **`registry.subscribe()`** rather than a timeout on the idle read. The reason for that choice is worth keeping: `read_line_inline_with_keys` is **generic over `R: std::io::Read`** and is driven by in-memory cursors throughout the editor and composer tests, so giving it an fd to poll would mean a signature change to **the one function that owns the decoder and the three editor lines' byte bypass** — the path **F68** and **F72** say not to disturb. Because the counts are a pull, a subscriber only needs to *trigger a paint*: the composer stays blocked in `read()` and the row is repainted around it. **A caller, not a rewrite.**
+
+**A bare wake still paints nothing** — verified by reading: the step awaits `changed()`, compares the projected `(blocked, running)` against what it last showed, and **returns without painting** when they match. So a generation-only bump emits no bytes and reduced motion and N3's frame budget are untouched.
+
+### The result that matters most
+
+The implementer prototyped the broken shape I asked for — interval returning `Some(..)`, both repaints removed — and the outcome was:
+
+- **the test author's acceptance test PASSED**, and
+- the implementer's own behavioural test **failed** at the painted-row assertion (`left: ""`).
+
+**So the acceptance test alone would have accepted an implementation that paints nothing.** That is *exactly* **F50**'s failure mode — a requirement passing a test while nothing holds it — reproduced inside the card written to fix F50, and caught only because the test author flagged the trap in its own seam's doc comment and I required a behavioural test from the implementer.
+
+**The general lesson: a test that asserts a *capability exists* is not a test that the capability *does anything*.** `idle_ambient_refresh_interval() == Some(..)` is a claim about configuration; "an idle registry change reaches the screen with no byte read" is a claim about behaviour. The first is cheap to satisfy falsely. This is the seventh variant in this epic of *the thing we checked was not the thing that matters* — after F57, F69, F70, F71, F75 and F79 — and the first one caught **before** shipping rather than after.
+
+### A hazard found while implementing
+
+`repaint_status_row` **drops a paint inside N3's 1/60 s window without recording the key**, so a change arriving in that window could wait for a registry event that never comes while an agent sits blocked. The step therefore repaints, sleeps one frame interval, and repaints again; the dedupe makes the second call free when the first landed. **A rate limiter that silently discards rather than defers is a correctness problem for anything event-driven behind it.**
+
+### The mid-turn gap stays open
+
+`run_live_typeahead`'s approval arm still `continue`s **before** `sync_agent_counts`, so while an approval modal is up the counter is frozen and the modal's own row shows a stale count. Out of scope here (adjacent to **F54**, whose signal path is still unexplained). The implementer notes the new cadence may now refresh that row **incidentally**, since a registry change wakes the task during a turn too — but **asserted nothing about it and changed nothing in that arm**, which is the right call: an accidental fix is not a tested one.

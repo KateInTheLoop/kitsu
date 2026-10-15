@@ -17497,6 +17497,26 @@ fn read_approval_key(stop: &AtomicBool) -> Option<char> {
 /// streamed output and tool receipts keep flowing above it. Approval prompts
 /// take stdin back by claiming `APPROVAL_INPUT_ACTIVE`: raw mode is released
 /// and the draft row hidden until the approval completes.
+/// The ambient tick: [`run_live_typeahead`]'s stdin poll timeout, in
+/// milliseconds, and therefore the **staleness bound** on R5's status row and
+/// on requirement **A8**'s ambient background-agent counter during a
+/// foreground turn.
+///
+/// Named rather than inlined because it is load-bearing for a numbered
+/// requirement: A8 gives the counter 250 ms, this loop re-pulls the registry
+/// (`sync_agent_counts`) and repaints (`repaint_status_row`) once per
+/// timeout, and `the_during_turn_ambient_tick_stays_inside_a8s_budget` fails
+/// if the value is raised past the budget. Finding **F50**: the budget was
+/// met by construction and asserted nowhere, so nothing failed if someone
+/// raised the interval to a second.
+///
+/// Only this loop's poll uses it. The other `libc::poll` sites in this file
+/// (the approval-key read, the canonical collector, the assistive line read)
+/// refresh no counter, so they are not A8's business and keep their own
+/// literals.
+#[cfg(unix)]
+const AMBIENT_TICK_POLL_MS: libc::c_int = 50;
+
 #[cfg(unix)]
 fn run_live_typeahead(
     raw: RawStdinGuard,
@@ -17626,7 +17646,7 @@ fn run_live_typeahead(
         };
         // SAFETY: one initialized pollfd for the duration of the call; stdin
         // stays process-owned.
-        let ready = unsafe { libc::poll(&mut descriptor, 1, 50) };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, AMBIENT_TICK_POLL_MS) };
         if ready < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
@@ -20102,6 +20122,30 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         }
         Some(source)
     };
+    // Card **T4-S8**, requirement **A8**, finding **F81**: the **idle**
+    // composer's ambient cadence, and the only one it has.
+    //
+    // During a turn `run_live_typeahead` repaints once per
+    // `AMBIENT_TICK_POLL_MS`. Between turns `read_line_inline_with_keys`
+    // blocks in `read()` with no timeout, so a background agent that blocks
+    // while the user sits at the prompt used to change the registry and
+    // change nothing on screen until the next keystroke, resize or submitted
+    // line -- which is exactly what the blocked-agent surfacing exists to
+    // prevent, and what `tui_bridge.rs` already said in as many words: the
+    // ambient tag is "state and not animation", so freezing it hides a
+    // blocked agent.
+    //
+    // A subscriber, not a rewrite: the counts are a pull read through the
+    // closure above at paint time, so the watch channel only has to trigger a
+    // paint. Ungated on purpose -- the `KITSU_LIVE_NOTICES` notifier below is
+    // opt-in and assistive-gated, which is why a default TUI session had no
+    // subscriber at all. Held for the session; the task ends when the
+    // registry's sender drops.
+    #[cfg(unix)]
+    let _idle_ambient_cadence = tui_bridge::spawn_idle_ambient_cadence(
+        agent_registry.subscribe(),
+        |snapshot: &subagent::AgentRegistrySnapshot| (snapshot.blocked, snapshot.running),
+    );
     let mut exit_after_queue = false;
     // Session transitions are control-plane actions, not user prompts. They
     // always run before queued model work and never consume bounded queue
@@ -34960,6 +35004,38 @@ mod tests {
                 )
             },
             "the view is back on its row list with no stale report under it"
+        );
+    }
+
+    /// Card **T4-S8**, requirement **A8**, during-turn half: the ambient
+    /// tick stays inside the 250 ms budget.
+    ///
+    /// Finding **F50**: A8 was met by construction — a 50 ms `libc::poll`
+    /// timeout, twenty times finer than the clock it carries — and asserted
+    /// **nowhere**, so raising the interval to a second would have broken a
+    /// numbered requirement silently. This is the loud failure. It is a
+    /// structural assertion on the interval the loop actually polls with, not
+    /// a measurement: nothing sleeps, so it cannot join this tree's four open
+    /// timing flakes.
+    ///
+    /// The guard is only as strong as the constant being the one the loop
+    /// uses, which is why `AMBIENT_TICK_POLL_MS` is referenced by
+    /// `run_live_typeahead`'s poll and by nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn the_during_turn_ambient_tick_stays_inside_a8s_budget() {
+        let tick = std::time::Duration::from_millis(
+            u64::try_from(AMBIENT_TICK_POLL_MS).expect("a positive poll timeout"),
+        );
+        assert!(
+            tick <= tui_bridge::AMBIENT_LATENCY_BUDGET,
+            "A8 gives the ambient background-agent counter {:?} from a registry change; \
+             `run_live_typeahead` re-pulls the counts once per {tick:?} poll tick",
+            tui_bridge::AMBIENT_LATENCY_BUDGET,
+        );
+        assert!(
+            tick > std::time::Duration::ZERO,
+            "a zero timeout is a busy loop, not a tick"
         );
     }
 }

@@ -323,6 +323,12 @@ longer than the limit, or carrying control characters) is reported on the rename
 line itself and leaves what you typed in place to be corrected; `Esc` cancels
 without renaming.
 
+The status row's background-agent counter follows the registry while you are at
+the prompt, not only while a turn is running -- so an agent that parks on a
+permission shows up without you having to touch the keyboard. A registry change
+with nothing new to show paints nothing, so the row stays still when the state
+does.
+
 `+` opens a dispatch line: type a task to start a background agent on the
 default profile, or `@<profile> <task>` to choose one. `Enter` starts it, `Esc`
 cancels and starts nothing. Refusals -- a line it cannot read, an unknown
