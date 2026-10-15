@@ -353,10 +353,17 @@ composer, both deliberate: there is **no slash-command palette** (the only rows 
 could use are the frame's), and the agent-view keys are **off** while fullscreen
 holds the screen, since the agent view wants that same alternate screen.
 
-**Still missing:** paging, so the view follows the newest lines rather than
-letting you scroll back. `Ctrl+Z` suspends from fullscreen through the same path
-the other renderers use, though the alternate screen's contents are the
-terminal's across the stop. `--tui
+`PgUp` and `PgDn` page the retained transcript; `Ctrl+Home` jumps to the oldest
+line the ring still holds and `Ctrl+End` returns to following the newest. They
+move the **frame**, not the caret, and only while fullscreen holds the screen --
+in the other renderers those sequences keep the meanings they always had, so
+`Ctrl+Home` still moves your cursor to the start of the line. Paging pins the
+view: new output stops dragging it to the bottom until you page back down or
+press `Ctrl+End`. A paged sequence arriving inside a paste is content, not a
+keypress.
+
+`Ctrl+Z` suspends from fullscreen through the same path the other renderers use,
+though the alternate screen's contents are the terminal's across the stop. `--tui
 fullscreen` and `[tui] mode = "fullscreen"` start there instead; a session that
 starts in fullscreen has nothing behind it to paint yet. Paging is not wired, so
 the view shows the newest lines that fit.

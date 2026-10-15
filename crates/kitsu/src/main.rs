@@ -5635,7 +5635,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "tui",
         args: "[classic|inline|fullscreen]",
         description: "report or switch the live renderer",
-        details: "Switches the renderer in place: `classic` is the line renderer kitsu has always had, `inline` is the pinned bottom viewport, `fullscreen` takes the terminal's alternate screen and repaints the tail of the transcript the inline viewport retained. The conversation is unchanged by a switch — the transcript already on screen stays exactly where it is, and nothing is replayed, except into fullscreen, where the alternate screen starts blank and the retained tail is painted onto it. Leaving fullscreen gives the screen back untouched. Bare /tui reports the renderer in use. Accepted only between turns; a /tui typed during a turn is refused rather than queued. Persist a choice with `mode = \"inline\"` under `[tui]` in the config or --tui.",
+        details: "Switches the renderer in place: `classic` is the line renderer kitsu has always had, `inline` is the pinned bottom viewport, `fullscreen` takes the terminal's alternate screen and repaints the tail of the transcript the inline viewport retained. The conversation is unchanged by a switch — the transcript already on screen stays exactly where it is, and nothing is replayed, except into fullscreen, where the alternate screen starts blank and the retained tail is painted onto it. In fullscreen, `PgUp` and `PgDn` move the frame back and forward by a window, `Ctrl+Home` moves it to the oldest line the transcript ring still retains and `Ctrl+End` brings it back to the newest and resumes following the output; all four move the frame rather than the caret, and only while fullscreen holds the screen. Leaving fullscreen gives the screen back untouched. Bare /tui reports the renderer in use. Accepted only between turns; a /tui typed during a turn is refused rather than queued. Persist a choice with `mode = \"inline\"` under `[tui]` in the config or --tui.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -6384,6 +6384,10 @@ fn read_chat_line_inline(
                 // same binding the prompt label above was derived from: a
                 // second carrier for it would be a second source of truth.
                 *attached,
+                // Inline pages nothing: the keys are live only while the
+                // fullscreen segment holds the screen, and a surface with no
+                // frame to move has nothing for a press to mean.
+                None,
             )
         };
         // Whatever happened, the row must not keep showing a draft that is
@@ -6578,6 +6582,14 @@ fn read_chat_line_fullscreen(
         }
         let mut input = std::io::Cursor::new(carried.clone().into_bytes()).chain(std::io::stdin());
         let read = {
+            // `paint` and `page` both need the segment mutably, and the reader
+            // holds both for the whole read, so the segment is shared through
+            // a `RefCell` rather than borrowed twice: the two are called from
+            // the same loop and never from inside one another, so no borrow
+            // of it overlaps another at run time. The cell dies with this
+            // block, which is what lets the outcome arms below take the
+            // segment back.
+            let shared = std::cell::RefCell::new(&mut *segment);
             let mut paint = |draft: &str, cursor: usize, hint: &str, hint_reserved: bool| {
                 // Probed per paint rather than captured: see the resize note
                 // above. The fallback is the conventional 80x24 every other
@@ -6593,7 +6605,17 @@ fn read_chat_line_fullscreen(
                     hint: hint.to_string(),
                     hint_reserved,
                 };
-                segment.paint_composer(&composed, rows, cols as usize);
+                shared
+                    .borrow_mut()
+                    .paint_composer(&composed, rows, cols as usize);
+            };
+            // One press, one repaint, and the geometry probed per press for
+            // `paint`'s reason. The frame follows the ring only when the ring
+            // grows, so the press's own repaint is the only thing that can
+            // answer the key.
+            let mut page = |press: kitsu_tui::fullscreen::Page| {
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                shared.borrow_mut().page(press, rows, cols as usize);
             };
             let mut on_resize = || {};
             tui_bridge::read_line_inline_with_keys(
@@ -6603,6 +6625,11 @@ fn read_chat_line_fullscreen(
                 &mut on_resize,
                 tui_bridge::InlineKeys::disabled(),
                 None,
+                // The paging sink: this is the surface that has a frame for a
+                // press to move, so this is the only call site that passes
+                // one. The sink *is* the gate -- the inline reader's `None`
+                // leaves all four sequences to the editor.
+                Some(&mut page),
             )
         };
         match read {
@@ -31125,6 +31152,49 @@ mod tests {
         );
     }
 
+    /// **T5-S1c-iii.** The four paging keys' only advertisement.
+    ///
+    /// Design §4.7 keeps a computed-label chord out of `keys::BINDINGS`
+    /// because it never reaches the swept dispatch, and these keys add a
+    /// third reason: they are live **only while fullscreen holds the
+    /// screen**, so a static row would advertise them at the inline and
+    /// classic composers, where they do nothing. There is therefore no row
+    /// and no second table, and the honest place left is `/tui`'s own
+    /// `details` -- the string requirement R2 already pins across four
+    /// spellings and `the_command_registry_advertises_the_tui_switch`
+    /// already asserts.
+    ///
+    /// A capability a user cannot find is not one they have, so this asserts
+    /// the sentence is there **and** that it says what the keys do: the key
+    /// names, and the fact that they scroll the frame rather than the caret.
+    #[test]
+    fn the_tui_details_advertise_the_fullscreen_paging_keys() {
+        let tui = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "tui")
+            .expect("/tui is registered");
+
+        for key in ["PgUp", "PgDn", "Ctrl+Home", "Ctrl+End"] {
+            assert!(
+                tui.details.contains(key),
+                "the details are where the paging keys are advertised, and \
+                 `{key}` is one of the four: there is no `keys::BINDINGS` row \
+                 for them, so a user who is not told here is not told at all \
+                 (F89: a capability that is unreachable is not one). The \
+                 details read: {}",
+                tui.details
+            );
+        }
+        assert!(
+            tui.details.contains("frame"),
+            "...and the sentence must say what they move. `Ctrl+Home` is \
+             also plain `Home`'s modified form, and plain `Home` still moves \
+             the caret, so naming the keys without naming the frame \
+             advertises an ambiguity rather than a capability: {}",
+            tui.details
+        );
+    }
+
     /// **T5-S2.** The two literals `/tui`'s own messages are built from, and
     /// the third renderer request.
     ///
@@ -34436,6 +34506,7 @@ mod tests {
                 &mut || {},
                 keys,
                 attached,
+                None,
             )
             .expect("a cursor cannot fail to read")
         }
@@ -34565,6 +34636,7 @@ mod tests {
                 &mut || {},
                 keys,
                 attached,
+                None,
             )
             .expect("a cursor cannot fail to read")
         }
@@ -34680,6 +34752,7 @@ mod tests {
                 &mut || {},
                 keys,
                 attached,
+                None,
             )
             .expect("a cursor cannot fail to read")
         }
@@ -36488,6 +36561,7 @@ mod tests {
             &mut || {},
             keys,
             attached,
+            None,
         )
         .expect("a cursor cannot fail to read")
     }
