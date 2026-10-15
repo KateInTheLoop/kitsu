@@ -222,6 +222,131 @@ fn accepted_state_words() -> String {
     format!("{} or {last}", head.join(", "))
 }
 
+/// The one token every frame of the overlay prints, on its first row.
+///
+/// The design calls the surface "the agent view overlay" throughout (§3.2 A1,
+/// §4.4), and these two words are what the PTY measurement reads to decide
+/// whether the view is on screen at all, so they live here rather than being
+/// spelled per frame.
+pub const OVERLAY_TITLE: &str = "agent view";
+
+/// The hint the title row carries: the two keys this card actually answers.
+///
+/// Deliberately ASCII. The overlay's only non-ASCII characters are the state
+/// markers, and those come from [`kitsu_render::deck_marker`], which already
+/// degrades to a stable ASCII tier; a separator glyph invented here would have
+/// no such tier.
+const OVERLAY_KEYS_HINT: &str = "? keys   esc close";
+
+/// What the overlay says when nothing has been spawned yet.
+const OVERLAY_EMPTY: &str = "no agents yet";
+
+/// One group heading: the state's own A2 label and the member count.
+///
+/// Headings are unglyphed and two-space indented, exactly as `/jobs view`'s
+/// text deck prints them, so the two surfaces read the same.
+fn group_heading(group: &AgentGroup) -> String {
+    format!("  {} ({})", group.state.label(), group.rows.len())
+}
+
+/// One agent's row: the state marker, the id, A2's head, the model and the
+/// profile, then the activity and the tokens when they are known.
+///
+/// The marker comes from [`kitsu_render::deck_marker`] applied to
+/// [`AgentViewState::deck_state`] and from nowhere else. That is the whole
+/// reason this function exists rather than a `format!` at the call site: a
+/// second marker table here is the F2/F38/F45/F57 drift family, and it is also
+/// what keeps a *blocked* agent from rendering identically to a busy one.
+fn agent_line(row: &AgentRow) -> String {
+    let mut line = format!(
+        "    {} #{} {}",
+        kitsu_render::deck_marker(row.state.deck_state()),
+        row.id,
+        row.head()
+    );
+    line.push_str(&format!("  {}", row.model));
+    if let Some(profile) = &row.profile {
+        line.push_str(&format!("  [{profile}]"));
+    }
+    if let Some(activity) = &row.last_activity {
+        line.push_str(&format!("  {activity}"));
+        if let Some(age) = row.last_activity_age {
+            line.push_str(&format!(" ({}s ago)", age.as_secs()));
+        }
+    }
+    if let Some(tokens) = row.tokens {
+        line.push_str(&format!("  {tokens} tok"));
+    }
+    line
+}
+
+/// The overlay's list frame: the title row, then A2's groups in A2's order.
+///
+/// Every row is plain text, already fitted to `cols` by
+/// [`kitsu_render::fit_row_to_width`], and the caller positions them
+/// absolutely — this function knows nothing about the terminal.
+pub fn overlay_rows(rows: Vec<AgentRow>, cols: usize) -> Vec<String> {
+    let count = rows.len();
+    let mut out = vec![
+        title_row(
+            &format!(
+                "{OVERLAY_TITLE} \u{2014} {count} agent{}",
+                if count == 1 { "" } else { "s" }
+            ),
+            cols,
+        ),
+        String::new(),
+    ];
+    if count == 0 {
+        out.push(format!("  {OVERLAY_EMPTY}"));
+        return fit_all(out, cols);
+    }
+    for group in group_rows(rows) {
+        out.push(group_heading(&group));
+        for row in &group.rows {
+            out.push(agent_line(row));
+        }
+        out.push(String::new());
+    }
+    fit_all(out, cols)
+}
+
+/// The overlay's help frame: the keys this card answers, and nothing it does
+/// not. The title row still carries [`OVERLAY_TITLE`], because the help is a
+/// frame *of* the view rather than a different surface.
+pub fn overlay_help_rows(cols: usize) -> Vec<String> {
+    let mut out = vec![
+        title_row(&format!("{OVERLAY_TITLE} \u{2014} keys"), cols),
+        String::new(),
+    ];
+    for (key, what) in [
+        ("?", "show this help"),
+        ("esc", "leave the help, then close the view"),
+    ] {
+        out.push(format!("  {key:<6} {what}"));
+    }
+    fit_all(out, cols)
+}
+
+/// The title row: the frame's own heading on the left and the key hint right
+/// aligned, or the heading alone on a terminal too narrow for both.
+fn title_row(heading: &str, cols: usize) -> String {
+    let needed = heading.chars().count() + OVERLAY_KEYS_HINT.chars().count() + 2;
+    if cols < needed {
+        return heading.to_string();
+    }
+    let gap = cols - heading.chars().count() - OVERLAY_KEYS_HINT.chars().count();
+    format!("{heading}{}{OVERLAY_KEYS_HINT}", " ".repeat(gap))
+}
+
+/// Fit every row to the terminal's width, so no overlay row can wrap into the
+/// row below it.
+fn fit_all(rows: Vec<String>, cols: usize) -> Vec<String> {
+    rows.into_iter()
+        .map(|row| kitsu_render::fit_row_to_width(&row, cols))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{group_rows, parse_filter, AgentFilter, AgentRow};

@@ -1148,6 +1148,231 @@ impl Drop for BridgeGuard {
     }
 }
 
+/// Which keys the inline reader answers **itself**, rather than handing to the
+/// editor (card T4-S2).
+///
+/// Resolved once, where `[tui]` is resolved, and published through
+/// [`set_inline_keys`]: the reader is reached through two call frames that
+/// carry no configuration, and threading a copy down each of them would make
+/// the chord prefix a parameter of functions that have no other business with
+/// it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct InlineKeys {
+    /// The control byte `[tui] prefix` names, or `None` when the spelling is
+    /// not one this reader can recognise — in which case the chord route is
+    /// simply absent rather than silently bound to something else.
+    pub(crate) prefix: Option<u8>,
+    /// `[tui] left_arrow_opens_agents`: whether the two-press `←` route exists
+    /// at all. It is a *route* switch, not a feature switch — the chord keeps
+    /// working with it off.
+    pub(crate) left_arrow_opens_agents: bool,
+}
+
+impl InlineKeys {
+    /// No chord prefix and no `←` route: what the reader's own unit tests run
+    /// under, so every keystroke they feed reaches the editor exactly as it
+    /// did before this card.
+    pub(crate) fn disabled() -> Self {
+        Self::default()
+    }
+}
+
+/// The published [`InlineKeys`], or `None` before `[tui]` has been resolved.
+static INLINE_KEYS: std::sync::Mutex<Option<InlineKeys>> = std::sync::Mutex::new(None);
+
+/// Publish the resolved key configuration for the inline reader.
+pub(crate) fn set_inline_keys(keys: InlineKeys) {
+    *lock(&INLINE_KEYS) = Some(keys);
+}
+
+/// The published key configuration, or [`InlineKeys::disabled`] when `[tui]`
+/// was never resolved (a non-unix build, or a carrier that never installs a
+/// renderer). Defaulting to *disabled* rather than to the shipped defaults is
+/// deliberate: an unresolved config must not conjure a binding the user's
+/// config file could have turned off.
+pub(crate) fn inline_keys() -> InlineKeys {
+    lock(&INLINE_KEYS).unwrap_or_else(InlineKeys::disabled)
+}
+
+/// The control byte a `ctrl+<letter>` key spelling sends.
+///
+/// `[tui] prefix` is prose (`"ctrl+x"`), and a terminal sends one byte, so one
+/// of the two has to be translated. Only the `ctrl+<letter>` family is
+/// accepted, because that is the only family whose byte is unambiguous: a
+/// function key or an `alt+` combination arrives as an escape *sequence*, and
+/// answering one would mean a second escape-sequence parser beside the
+/// editor's.
+pub(crate) fn chord_prefix_byte(spelling: &str) -> Option<u8> {
+    let lowered = spelling.trim().to_ascii_lowercase();
+    let letter = lowered
+        .strip_prefix("ctrl+")
+        .or_else(|| lowered.strip_prefix("ctrl-"))
+        .or_else(|| lowered.strip_prefix("c-"))
+        .or_else(|| lowered.strip_prefix("^"))?;
+    let mut chars = letter.chars();
+    let key = chars.next()?;
+    if chars.next().is_some() || !key.is_ascii_lowercase() {
+        return None;
+    }
+    // `ctrl+a` is 0x01, so the byte is the letter's position in the alphabet.
+    Some(key as u8 - b'a' + 1)
+}
+
+/// The letter that, after the chord prefix, opens the agent view (A1).
+const AGENT_VIEW_CHORD_KEY: u8 = b'a';
+
+/// `ESC [ D`, the left arrow as every terminal sends it, and what the editor
+/// reads as backward-char.
+const LEFT_ARROW: &[u8] = b"\x1b[D";
+/// The bracketed-paste opening delimiter.
+const PASTE_START: &[u8] = b"\x1b[200~";
+/// The bracketed-paste closing delimiter.
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// One thing the key filter found in a chunk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum KeyItem {
+    /// Bytes for the editor, verbatim and in order.
+    Bytes(Vec<u8>),
+    /// One left-arrow keystroke, lifted out so the reader can ask whether the
+    /// composer is empty *at this point in the chunk* before deciding whether
+    /// it is cursor movement or half of the two-press affordance.
+    Left,
+    /// `<prefix> a`: open the agent view.
+    Open,
+}
+
+/// Splits a read chunk into [`KeyItem`]s: the chord prefix and its letter are
+/// taken out of the stream, left arrows are lifted out, and everything else is
+/// passed through untouched.
+///
+/// # Why this is not a second keymap
+///
+/// It recognises exactly three things — the prefix byte, `ESC [ D`, and the
+/// two bracketed-paste delimiters — and forwards every other byte to the
+/// editor, which remains the only keymap. The paste delimiters are tracked for
+/// one reason: inside a paste the payload is *text*, so a `0x18` or an
+/// `ESC [ D` in pasted content must reach the editor as content and not be
+/// read as a chord.
+///
+/// A chunk that ends part-way through one of those sequences **holds** the
+/// partial bytes until the next read, so a left arrow split across two reads
+/// is still one keystroke. The held bytes are released in front of the next
+/// chunk, so the editor sees the same byte stream either way.
+struct KeyFilter {
+    keys: InlineKeys,
+    /// The prefix byte has arrived and the next byte is its chord letter.
+    /// Carried across reads, because a user's two keystrokes are routinely two
+    /// chunks.
+    pending_prefix: bool,
+    /// Inside a bracketed-paste block.
+    in_paste: bool,
+    /// A partial sequence held back from the end of the previous chunk.
+    held: Vec<u8>,
+}
+
+impl KeyFilter {
+    fn new(keys: InlineKeys) -> Self {
+        Self {
+            keys,
+            pending_prefix: false,
+            in_paste: false,
+            held: Vec::new(),
+        }
+    }
+
+    /// Whether `data` is a strict, non-empty prefix of `pattern`: the chunk
+    /// ran out mid-sequence and the rest may still arrive.
+    fn is_partial(data: &[u8], pattern: &[u8]) -> bool {
+        data.len() < pattern.len() && pattern.starts_with(data)
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Vec<KeyItem> {
+        let mut data = std::mem::take(&mut self.held);
+        data.extend_from_slice(chunk);
+        let mut items: Vec<KeyItem> = Vec::new();
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut index = 0usize;
+        while index < data.len() {
+            let rest = &data[index..];
+            if self.in_paste {
+                if rest.starts_with(PASTE_END) {
+                    self.in_paste = false;
+                    bytes.extend_from_slice(PASTE_END);
+                    index += PASTE_END.len();
+                } else if Self::is_partial(rest, PASTE_END) {
+                    self.held = rest.to_vec();
+                    break;
+                } else {
+                    bytes.push(data[index]);
+                    index += 1;
+                }
+                continue;
+            }
+            if self.pending_prefix {
+                self.pending_prefix = false;
+                if data[index] == AGENT_VIEW_CHORD_KEY {
+                    if !bytes.is_empty() {
+                        items.push(KeyItem::Bytes(std::mem::take(&mut bytes)));
+                    }
+                    items.push(KeyItem::Open);
+                }
+                // Any other letter is inert. Dropping it rather than typing it
+                // into the draft is what makes a mistyped chord a no-op
+                // instead of a stray character in the user's prompt.
+                index += 1;
+                continue;
+            }
+            if Some(data[index]) == self.keys.prefix {
+                self.pending_prefix = true;
+                index += 1;
+                continue;
+            }
+            if data[index] == 0x1b {
+                if rest.starts_with(PASTE_START) {
+                    self.in_paste = true;
+                    bytes.extend_from_slice(PASTE_START);
+                    index += PASTE_START.len();
+                    continue;
+                }
+                if rest.starts_with(LEFT_ARROW) {
+                    if !bytes.is_empty() {
+                        items.push(KeyItem::Bytes(std::mem::take(&mut bytes)));
+                    }
+                    items.push(KeyItem::Left);
+                    index += LEFT_ARROW.len();
+                    continue;
+                }
+                if Self::is_partial(rest, PASTE_START) || Self::is_partial(rest, LEFT_ARROW) {
+                    self.held = rest.to_vec();
+                    break;
+                }
+            }
+            bytes.push(data[index]);
+            index += 1;
+        }
+        if !bytes.is_empty() {
+            items.push(KeyItem::Bytes(bytes));
+        }
+        items
+    }
+}
+
+/// Re-pin the DECSTBM region and repaint the status row, for a full-screen
+/// surface that has just handed the terminal back (card T4-S2's overlay).
+///
+/// Only control bytes and the pinned row are written, so the transcript region
+/// is left exactly as the alternate-screen restore found it. It goes through
+/// the published pane for [`paint_approval_modal`]'s reason: the caller may
+/// hold no [`BridgeGuard`].
+pub(crate) fn reinstall_pinned_region() {
+    let Some(pane) = lock(&MODAL_PANE).clone() else {
+        return;
+    };
+    pane.viewport.show(pane.rows(), pane.viewport_rows());
+    repaint_status_row();
+}
+
 /// How one inline idle-prompt read ended.
 ///
 /// T0-S5b. The reader is the inline mode's answer to rustyline: with the
@@ -1164,6 +1389,16 @@ pub(crate) enum InlineRead {
     /// Ctrl+C on an empty draft. A non-empty draft is cleared instead and the
     /// read continues, which is what the editor already does.
     Interrupted,
+    /// Card **T4-S2**: the agent view overlay was asked for, by the chord
+    /// `<prefix> a` or by a second `\u{2190}` on an untouched empty composer,
+    /// with the draft as it stood.
+    ///
+    /// The reader stays **pure** for exactly [`InlineRead::Suspended`]'s
+    /// reason: the overlay owns the terminal, the alternate screen and its own
+    /// key loop, none of which belong in a function whose whole value is being
+    /// testable without one. So the keystroke is reported and the draft handed
+    /// back, and the caller re-enters the reader with it afterwards.
+    OpenAgentView(String),
     /// Ctrl+Z (finding F21): the draft as it stood when the byte arrived.
     ///
     /// The reader stays **pure** — it raises no signal and touches no
@@ -1190,11 +1425,53 @@ pub(crate) enum InlineRead {
 /// `kitsu_render::live::live_input_update`, so the inline row and the classic
 /// live row cannot drift in *what* they are told about a draft.
 /// `history` seeds the up/down walk.
+// The reader's own unit tests are its only callers now: production resolves
+// `[tui]` and goes through `read_line_inline_with_keys`. Kept as the
+// routes-off entry point, which is what makes those tests measure the editor's
+// keymap and nothing this card added.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn read_line_inline<R: std::io::Read>(
     input: &mut R,
     paint: &mut dyn FnMut(&str, usize, &str, bool),
     history: &[String],
     on_resize: &mut dyn FnMut(),
+) -> std::io::Result<InlineRead> {
+    read_line_inline_with_keys(input, paint, history, on_resize, InlineKeys::disabled())
+}
+
+/// What the **first** `\u{2190}` on an untouched empty composer puts in the hint
+/// slot: that another press is needed, and what it would open.
+///
+/// A two-press key whose first press is silent is a key that did nothing, so
+/// this is the affordance rather than decoration. Plain ASCII words, not an
+/// arrow glyph: the slot is text on a row whose styling tier is the
+/// renderer's, and the hint has to read the same in all of them.
+const LEFT_ARM_HINT: &str = "  press left again for the agent view";
+
+/// [`read_line_inline`] with card T4-S2's key routes live.
+///
+/// The two routes are kept out of the editor entirely, and that separation is
+/// the point rather than tidiness. `kitsu-editor`'s `history_prev` emits
+/// `EditorAction::RecallRequest` only on an *empty, walk-free* buffer, and the
+/// arm below declines it so `\u{2191}` walks history at the idle prompt. If the
+/// `\u{2190}` route shared that empty-draft or recall state — by arming through
+/// an editor action, or by consuming the key that follows — the first `\u{2191}`
+/// would stop walking history, which is the regression a user notices
+/// immediately. So the arming state is one local counter in *this* loop, fed
+/// by [`KeyFilter`] from the raw byte stream, and the editor is never told that
+/// a left arrow happened at all when the composer is empty (where backward-char
+/// is a no-op anyway).
+///
+/// The counter is reset by **any** other item in the chunk, so the armed state
+/// belongs to an uninterrupted run of `\u{2190}`s on an untouched empty
+/// composer. Arming until the view opens would make a keystroke's meaning
+/// depend on something the user did minutes ago and can no longer see.
+pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
+    input: &mut R,
+    paint: &mut dyn FnMut(&str, usize, &str, bool),
+    history: &[String],
+    on_resize: &mut dyn FnMut(),
+    keys: InlineKeys,
 ) -> std::io::Result<InlineRead> {
     use kitsu_editor::{EditorAction, FeedOutcome, TypeaheadEditor};
 
@@ -1205,7 +1482,13 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
     ///
     /// `search_status` already carries its own two-space separator, so the
     /// renderer must not add another one.
-    fn hint_of(editor: &TypeaheadEditor) -> (String, bool) {
+    ///
+    /// `armed` — one `\u{2190}` seen and the next one would open the agent view
+    /// — takes the slot, reserved, so the affordance keeps its columns.
+    fn hint_of(editor: &TypeaheadEditor, armed: bool) -> (String, bool) {
+        if armed {
+            return (LEFT_ARM_HINT.to_string(), true);
+        }
         let search_status = editor.search_status();
         let hint_reserved = search_status.is_some();
         let hint = search_status.unwrap_or_else(|| crate::idle_slash_hint(&editor.buffer_string()));
@@ -1213,9 +1496,14 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
     }
 
     let mut editor = TypeaheadEditor::new(history.to_vec());
+    let mut filter = KeyFilter::new(keys);
+    // How many `\u{2190}`s of the current uninterrupted run have been seen. A
+    // fresh read starts disarmed, so a press that opened the view cannot leak
+    // into the next line.
+    let mut left_presses = 0u8;
     // The first frame, before any byte arrives: the row must show the (possibly
     // empty) draft rather than whatever the previous paint left there.
-    let (mut last_hint, mut last_reserved) = hint_of(&editor);
+    let (mut last_hint, mut last_reserved) = hint_of(&editor, false);
     paint(
         &editor.buffer_string(),
         editor.cursor(),
@@ -1240,7 +1528,7 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
                     // The row's content is the live draft, not the status: the
                     // resize deliberately painted nothing, so the first frame
                     // at the new geometry is drawn here.
-                    let (hint, hint_reserved) = hint_of(&editor);
+                    let (hint, hint_reserved) = hint_of(&editor, left_presses == 1);
                     paint(
                         &editor.buffer_string(),
                         editor.cursor(),
@@ -1254,12 +1542,59 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
             }
             Err(error) => return Err(error),
         };
-        // Fed verbatim: the editor owns the keymap, the escape-sequence state
-        // machine and the bracketed-paste block, so the reader must not look
-        // for terminators itself (that would split a paste at its newlines).
-        let outcome = editor.feed(&buffer[..count]);
-        let mut changed = outcome.changed;
-        for action in outcome.actions {
+        // Fed verbatim *within each item*: the editor owns the keymap, the
+        // escape-sequence state machine and the bracketed-paste block, so the
+        // reader must not look for terminators itself (that would split a
+        // paste at its newlines). With both routes off, `KeyFilter` yields one
+        // `Bytes` item holding the whole chunk, so this is the pre-T4-S2 call.
+        let mut changed = false;
+        let mut actions: Vec<EditorAction> = Vec::new();
+        let mut open_agent_view = false;
+        for item in filter.feed(&buffer[..count]) {
+            match item {
+                KeyItem::Bytes(bytes) => {
+                    // Any keystroke that is not a `\u{2190}` disarms.
+                    left_presses = 0;
+                    let outcome = editor.feed(&bytes);
+                    changed |= outcome.changed;
+                    actions.extend(outcome.actions);
+                }
+                KeyItem::Left => {
+                    // The composer's emptiness is asked *here*, after every
+                    // earlier item in the chunk has been applied, so a
+                    // `x<BS><left><left>` chunk is judged on the draft the
+                    // backspace left behind and not on the one the chunk
+                    // started with.
+                    if keys.left_arrow_opens_agents && editor.buffer_string().is_empty() {
+                        left_presses = left_presses.saturating_add(1);
+                        if left_presses >= 2 {
+                            left_presses = 0;
+                            open_agent_view = true;
+                            break;
+                        }
+                        // Nothing about the draft changed; the hint slot did,
+                        // and the repaint below is driven off that.
+                    } else {
+                        // A non-empty draft: this is cursor movement and
+                        // nothing else, so the bytes go to the editor exactly
+                        // as they arrived and the affordance disarms.
+                        left_presses = 0;
+                        let outcome = editor.feed(LEFT_ARROW);
+                        changed |= outcome.changed;
+                        actions.extend(outcome.actions);
+                    }
+                }
+                KeyItem::Open => {
+                    left_presses = 0;
+                    open_agent_view = true;
+                    break;
+                }
+            }
+        }
+        if open_agent_view {
+            return Ok(InlineRead::OpenAgentView(editor.buffer_string()));
+        }
+        for action in actions {
             match action {
                 EditorAction::Submit(line) => return Ok(InlineRead::Submitted(line)),
                 EditorAction::Eof => return Ok(InlineRead::Eof),
@@ -1332,7 +1667,7 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
         // the painted `(hint, hint_reserved)` pair against the last one makes
         // the row's hint a function of editor state rather than of which
         // transitions the editor chooses to report.
-        let (hint, hint_reserved) = hint_of(&editor);
+        let (hint, hint_reserved) = hint_of(&editor, left_presses == 1);
         if changed || hint != last_hint || hint_reserved != last_reserved {
             paint(
                 &editor.buffer_string(),
@@ -1496,9 +1831,8 @@ impl kitsu_tui::composer::ComposerDecoration for InlineComposerHost {
 /// whether its handoff is still `Ready` (nobody has looked) and the two
 /// terminal failures stay distinct. The order comes from
 /// [`AgentViewState::order`] and is never restated here.
-// Exercised by this module's tests; T4-S2's overlay is its first
-// non-test caller. Same deliberate `allow` the T2-S3 lifecycle used.
-#[allow(dead_code)]
+// T4-S2's overlay is this mapping's first non-test caller, so the deliberate
+// `allow(dead_code)` the T2-S3 lifecycle used is gone with this card.
 pub(crate) fn agent_view_state_of(
     phase: thread::AgentThreadPhase,
     handoff: thread::AgentHandoffState,
@@ -1529,9 +1863,8 @@ pub(crate) fn agent_view_state_of(
 /// mapping leaves `tokens`, `last_activity` and `last_activity_age` as `None`
 /// rather than inventing a zero, and a caller that has the telemetry fills
 /// them in afterwards.
-// Exercised by this module's tests; T4-S2's overlay is its first
-// non-test caller. Same deliberate `allow` the T2-S3 lifecycle used.
-#[allow(dead_code)]
+// T4-S2's overlay is this mapping's first non-test caller, so the deliberate
+// `allow(dead_code)` the T2-S3 lifecycle used is gone with this card.
 pub(crate) fn agent_row_from_thread_dto(
     dto: &thread::AgentThreadSnapshotDto,
 ) -> kitsu_tui::agents_view::AgentRow {

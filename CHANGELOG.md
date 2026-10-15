@@ -92,6 +92,14 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- **The agent view opens.** In the inline viewport, `Ctrl+X a`, `/jobs view` (or
+  `/agents view`), or pressing **←** twice on an empty composer opens an overlay
+  listing your background agents grouped by state — agents needing input first —
+  with `?` for keys and `Esc` to close. The chord follows `[tui] prefix`, and
+  `[tui] left_arrow_opens_agents = false` turns off the ← route while leaving the
+  chord. The first ← only hints, so it cannot open by accident, and ← on a
+  non-empty draft still just moves the cursor. `↑` history recall is unchanged.
+  In classic mode `/jobs view` keeps printing the text deck as before.
 - A background agent that is **waiting for your answer now has its own marker**
   in `/jobs list`, `/jobs view`, `/jobs show` and `/jobs explain` — `◉`, or
   `[blk]` under `--plain`. It previously shared the busy agent's marker, so the

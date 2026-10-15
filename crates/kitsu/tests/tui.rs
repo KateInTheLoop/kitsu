@@ -5241,3 +5241,683 @@ fn classic_mode_under_reduced_motion_emits_no_viewport_bytes() {
         text.escape_debug()
     );
 }
+
+// ---------------------------------------------------------------------------
+// T4-S2: the agent view overlay opens and closes (requirement A1)
+// ---------------------------------------------------------------------------
+//
+// Card T4-S2's acceptance is a *failing* PTY open/close test, and these are
+// it. Nothing below passes today: `[tui] prefix` and
+// `[tui] left_arrow_opens_agents` are resolved at `main.rs:16840-16841` and
+// consumed by nobody, and `kitsu-tui::agents_view` is a model with no
+// renderer. The whole card is the wiring these measure.
+//
+// # What a test may say about chrome that does not exist yet
+//
+// Finding **F58** says to derive every expectation from a real sample, and
+// there is no sample of an overlay nobody has drawn. So the overlay's chrome
+// is pinned here by exactly **one** token, [`AGENT_VIEW_TITLE`], and the
+// `←`-hint by two words — the minimum that distinguishes "the agent view is on
+// screen" from "it is not" — and everything else is asserted *structurally*:
+// which row the thing appears on, whether the screen changed, and whether it
+// changed back. The two literals are this card's contract, not a transcription
+// of something already shipped; see the report for the amendment they imply.
+//
+// # Where the overlay is, and why `closing restores` is checkable at all
+//
+// `[tui] alternate_screen` defaults to `auto` and these sessions run on a real
+// pty, so an overlay takes the alternate screen and the restore on close is
+// the *terminal's*, exact by construction. That is what lets the close half
+// assert whole-row equality with the screen as it stood before the open
+// rather than naming lines. The design's own `alternate_screen = never` path
+// (overlays drawn inside the viewport area) is not exercised here; under it
+// the restore is the cell ring's and the documented ring limitation applies.
+
+/// The one token the overlay must print somewhere above the pinned row. The
+/// design calls the surface "the agent view overlay" throughout (§3.2 A1,
+/// §4.4) and no shipped output contains these two words today, which is what
+/// makes it usable as the detector: `raw_count` of it is 0 in every session in
+/// this file that never opens the view.
+const AGENT_VIEW_TITLE: &str = "agent view";
+
+/// What the **first** `←` on an empty composer must put in the hint slot: that
+/// another press is needed, and what it would open. Two words rather than a
+/// sentence, so the wording stays the implementer's while the affordance is
+/// pinned — a hint that fails to say "again" leaves the user with a keystroke
+/// that silently did nothing, which is the whole hazard of a two-press key.
+const LEFT_HINT_WORDS: [&str; 2] = ["again", "agent"];
+
+/// The heading `/jobs view`'s text deck prints (`main.rs:11592`, through
+/// `deck_header`, so the styled tier prefixes a marker and the words survive).
+/// In TUI modes the overlay replaces that deck; in classic it is unchanged.
+const JOBS_VIEW_DECK_HEADING: &str = "agent deck by state";
+
+/// `Ctrl+X`, the default `[tui] prefix` (`TuiConfig::DEFAULT_PREFIX`).
+const CTRL_X: &str = "\x18";
+
+/// `Ctrl+X a`: the chord itself, as the two bytes a terminal sends for it.
+const CTRL_X_A: &str = "\x18a";
+
+/// `Ctrl+X b`: the default prefix with a letter that is **not** `a`, used
+/// where a test needs the prefix byte to be inert and the letter to be
+/// observable in the draft.
+const CTRL_X_B: &str = "\x18b";
+
+/// `Ctrl+T a` under `[tui] prefix = "ctrl+t"`. `0x14` is unbound in the
+/// editor's keymap today (it binds 0x01, 0x02, 0x04, 0x05, 0x06, 0x08, 0x09,
+/// 0x0b, 0x0c, 0x12, 0x15, 0x17, 0x1a and 0x1c, and ignores the rest), so a
+/// re-configured prefix cannot pass by colliding with an existing binding.
+const CTRL_T_A: &str = "\x14a";
+
+/// The left-arrow key as the terminal sends it (CSI D), which is also what
+/// `TypeaheadEditor` reads as backward-char today.
+const LEFT: &str = "\x1b[D";
+
+/// Two left arrows in one write: the whole two-press affordance in a single
+/// read, which is also the harder case for an implementation that keys the
+/// state off reads rather than keystrokes.
+const LEFT_TWICE: &str = "\x1b[D\x1b[D";
+
+/// Two up arrows in one write, as the existing recall measurement sends them.
+const UP_TWICE: &str = "\x1b[A\x1b[A";
+
+/// The last step of every script below: leave.
+///
+/// The three `Ctrl+U`s are sacrificial and the reason is measurable in a
+/// transcript. At the idle composer an `ESC` byte with no continuation stays
+/// *pending* in the editor's escape-sequence state machine until another byte
+/// arrives, and that byte is then consumed as part of the sequence - so a
+/// script that sends `Esc` and later `/quit` submits `quit`, which is a
+/// **prompt**, which reaches the gateway, which is unreachable. The session
+/// then never exits and the measurement is reported as a 20-second timeout
+/// instead of as the assertion that actually failed (finding **F46**).
+///
+/// `Ctrl+U` is the right sacrifice: it kills to the start of the line, so it
+/// is a no-op on the empty composer whether it is swallowed by a pending
+/// escape or read as itself, and it clears any draft a test left behind.
+/// Once the overlay exists and consumes the `Esc` itself, nothing is pending
+/// and all three are no-ops.
+const QUIT_AFTER_CLOSE: &str = "\x15\x15\x15/quit\r";
+
+/// How long a step waits for the child to finish reacting before the stream is
+/// marked. Generous, because every assertion below is taken on a *mark* rather
+/// than on a trigger: a step that waits for bytes the surface cannot print yet
+/// would time the session out at [`DEADLINE`] and report nothing about what is
+/// missing, which is finding **F46**.
+const SETTLE_MS: u64 = 500;
+
+/// Write `~/.kitsu/config.toml` with one unreachable gateway **and** a `[tui]`
+/// table. `write_config`'s body is reused verbatim and the table appended, so
+/// the gateway the other sessions run under cannot drift from this one.
+fn write_config_with_tui(home: &Path, tui_table: &str) {
+    write_config(home);
+    let path = home.join(".kitsu").join("config.toml");
+    let base = fs::read_to_string(&path).expect("read the config just written");
+    fs::write(&path, format!("{base}\n[tui]\n{tui_table}\n")).expect("append the [tui] table");
+}
+
+/// Whether the agent view is on screen: the title on any row **inside** the
+/// scroll region, i.e. anywhere but the pinned bottom row.
+///
+/// Excluding the pinned row is load-bearing rather than tidy: the `←` hint
+/// names the view it would open, so a detector that read the whole screen
+/// would call a session with the hint showing "open" and the two-press
+/// assertion below would be vacuous in the one direction that matters.
+fn agent_view_open(screen: &[String]) -> bool {
+    screen[..(ROWS - 1) as usize]
+        .iter()
+        .any(|row| row.to_lowercase().contains(AGENT_VIEW_TITLE))
+}
+
+/// The pinned bottom row: the composer, its hint slot and the status.
+fn pinned_row(screen: &[String]) -> String {
+    screen[(ROWS - 1) as usize].to_lowercase()
+}
+
+/// Assert the `←` hint is showing on the pinned row, and say what it reads
+/// instead when it is not.
+fn assert_left_hint(screen: &[String], context: &str) {
+    let row = pinned_row(screen);
+    for word in LEFT_HINT_WORDS {
+        assert!(
+            row.contains(word),
+            "{context}: the first \u{2190} must hint that another press opens the \
+             agent view, but the pinned row reads {row:?} (missing {word:?}); \
+             whole screen:\n{}",
+            Session::dump(screen)
+        );
+    }
+}
+
+/// Assert the `←` hint is **not** showing. Paired with a positive observation
+/// at every call site, never alone.
+fn assert_no_left_hint(screen: &[String], context: &str) {
+    let row = pinned_row(screen);
+    assert!(
+        !row.contains(LEFT_HINT_WORDS[0]),
+        "{context}: nothing may arm the two-press \u{2190} affordance here, but \
+         the pinned row reads {row:?}; whole screen:\n{}",
+        Session::dump(screen)
+    );
+}
+
+/// The closing half, shared by every open/close script: the screen with the
+/// overlay up must differ from the screen before it opened, and the screen
+/// after `Esc` must be that pre-open screen again, row for row inside the
+/// region.
+///
+/// The inequality is what keeps the equality honest: an overlay that painted
+/// nothing at all would "restore" perfectly.
+fn assert_opened_and_restored(session: &Session, before: usize, open: usize, closed: usize) {
+    let (before_screen, open_screen, closed_screen) = (
+        session.screen_at(before),
+        session.screen_at(open),
+        session.screen_at(closed),
+    );
+    let region = |screen: &[String]| screen[..(ROWS - 1) as usize].to_vec();
+    assert!(
+        agent_view_open(&open_screen),
+        "the agent view must be on screen at mark {open}; whole screen:\n{}",
+        Session::dump(&open_screen)
+    );
+    assert_ne!(
+        region(&open_screen),
+        region(&before_screen),
+        "an overlay that changes nothing inside the region has not opened; \
+         screen before:\n{}\nscreen with the view up:\n{}",
+        Session::dump(&before_screen),
+        Session::dump(&open_screen)
+    );
+    assert!(
+        !agent_view_open(&closed_screen),
+        "Esc must close the agent view; whole screen:\n{}",
+        Session::dump(&closed_screen)
+    );
+    assert_eq!(
+        region(&closed_screen),
+        region(&before_screen),
+        "closing must restore what was on screen; screen before the open:\n{}\n\
+         screen after the close:\n{}",
+        Session::dump(&before_screen),
+        Session::dump(&closed_screen)
+    );
+}
+
+/// Test T4-S2a. **`Ctrl+X a` opens the agent view, `Esc` closes it.**
+///
+/// The default `[tui] prefix` is `ctrl+x`, so this is the chord A1 names. Four
+/// things are measured: the view appears inside the region, the region really
+/// changed, `Esc` takes it away, and what was on screen comes back.
+///
+/// That the chord was read as a *chord* and not as two inert keystrokes is
+/// pinned by the exit: `0x18` is ignored by the editor's control catch-all
+/// today, so an unimplemented chord leaves `a` in the draft, `/quit` arrives
+/// as `a/quit`, and the session cannot exit at all. A clean exit is therefore
+/// positive evidence that the `a` was consumed by the binding.
+#[test]
+#[serial]
+fn inline_mode_opens_the_agent_view_on_the_default_prefix_chord_and_closes_on_escape() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let script = vec![
+        send(RAW_MODE_MARKER, CTRL_X_A),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+    ];
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &script);
+
+    assert_opened_and_restored(&session, 0, 1, 3);
+    assert!(
+        session.status.success(),
+        "the chord must consume its `a`, so `/quit` submits and the session \
+         exits cleanly; exit was {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+}
+
+/// Test T4-S2b. **The chord is the *configured* prefix, not a literal.**
+///
+/// `[tui] prefix = "ctrl+t"` and the session must answer `Ctrl+T a` and ignore
+/// `Ctrl+X a`. The negative half is not vacuous twice over: the `b` typed
+/// after the `Ctrl+X` lands in the draft and is asserted on the pinned row —
+/// so the keystrokes demonstrably arrived and the prefix byte was inert — and
+/// the configured chord then opens the very surface the first chord failed to.
+#[test]
+#[serial]
+fn inline_mode_opens_the_agent_view_on_the_chord_the_tui_prefix_configures() {
+    let home = TempDir::new().expect("temp home");
+    write_config_with_tui(home.path(), "prefix = \"ctrl+t\"");
+    let script = vec![
+        send(RAW_MODE_MARKER, CTRL_X_B),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, CTRL_T_A),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+    ];
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &script);
+
+    let unbound = session.screen_at(1);
+    assert!(
+        !agent_view_open(&unbound),
+        "`{}` is not the configured prefix and must not open the view; whole \
+         screen:\n{}",
+        CTRL_X.escape_debug(),
+        Session::dump(&unbound)
+    );
+    assert!(
+        pinned_row(&unbound).contains('b'),
+        "non-vacuous: the keystrokes arrived and the unbound prefix byte was \
+         inert, so its `b` is in the draft; pinned row {:?}; whole screen:\n{}",
+        pinned_row(&unbound),
+        Session::dump(&unbound)
+    );
+    assert_opened_and_restored(&session, 1, 3, 5);
+}
+
+/// Test T4-S2c. **`←` twice on an empty composer opens it; once only hints.**
+///
+/// A1's two-press rule, with the hint as the first press's entire observable
+/// effect. The first-press assertion is non-vacuous because it is *positive*:
+/// the hint has to be on the pinned row, which is only possible if the
+/// keystroke was seen at all.
+#[test]
+#[serial]
+fn inline_mode_opens_the_agent_view_on_a_second_left_arrow_and_hints_on_the_first() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let script = vec![
+        send(RAW_MODE_MARKER, LEFT),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, LEFT),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+    ];
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &script);
+
+    let hinted = session.screen_at(1);
+    assert!(
+        !agent_view_open(&hinted),
+        "one \u{2190} must not open the view; whole screen:\n{}",
+        Session::dump(&hinted)
+    );
+    assert_left_hint(&hinted, "one \u{2190} on an empty composer");
+    assert_opened_and_restored(&session, 1, 3, 5);
+}
+
+/// Test T4-S2d. **`←` never consumes a draft** — and the cursor really moved.
+///
+/// The draft is `/contextXY`; two `←`s then two forward deletes remove the
+/// `XY` and the submitted line is `/context`, whose output is asserted inside
+/// the region. That is the positive control the negative assertion needs: the
+/// command could only have run if the cursor sat two characters from the end,
+/// which is what `←` does and what opening an overlay instead would not.
+///
+/// The same session then presses `←` twice on the *emptied* composer and the
+/// view must open, so "the view did not open on a draft" is measured against a
+/// detector proven to fire in the same session, at the same geometry.
+#[test]
+#[serial]
+fn inline_mode_left_arrow_moves_the_cursor_in_a_draft_and_never_opens_the_agent_view() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let script = vec![
+        send(RAW_MODE_MARKER, "/contextXY"),
+        send("/contextXY", LEFT_TWICE),
+        pause("/contextXY", SETTLE_MS),
+        // Delete forward twice: with the cursor moved left twice this eats the
+        // `XY` and leaves `/context`, which the carriage return then submits.
+        send("/contextXY", "\x1b[3~\x1b[3~\r"),
+        send("context window source", LEFT_TWICE),
+        pause("context window source", SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+    ];
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &script);
+
+    let drafting = session.screen_at(2);
+    assert!(
+        !agent_view_open(&drafting),
+        "\u{2190} on a NON-empty composer is cursor movement and must not open \
+         the view; whole screen:\n{}",
+        Session::dump(&drafting)
+    );
+    assert!(
+        pinned_row(&drafting).contains("/contextxy"),
+        "\u{2190} must not consume the draft: the pinned row still reads the \
+         whole of it, but it reads {:?}; whole screen:\n{}",
+        pinned_row(&drafting),
+        Session::dump(&drafting)
+    );
+    assert_no_left_hint(&drafting, "\u{2190} on a non-empty composer");
+
+    // The cursor moved: only a line whose `XY` was deleted from in front of
+    // the cursor can run as `/context`.
+    let submitted = session.screen_at(4);
+    assert!(
+        submitted[..(ROWS - 1) as usize]
+            .iter()
+            .any(|row| row.contains("context window source")),
+        "the two \u{2190}s must have moved the cursor, so the forward deletes \
+         left `/context` to submit; whole screen:\n{}",
+        Session::dump(&submitted)
+    );
+
+    // And the detector above is live: on the now-empty composer the same two
+    // keystrokes do open the view.
+    assert_opened_and_restored(&session, 4, 5, 7);
+}
+
+/// Test T4-S2e. **`left_arrow_opens_agents = false` disables the `←` route
+/// and nothing else.**
+///
+/// The chord in the same session is the positive control: with the config off
+/// `←←` must do nothing and `Ctrl+X a` must still open the view, so the
+/// setting is a route switch rather than a feature switch.
+#[test]
+#[serial]
+fn inline_mode_left_arrow_route_is_disabled_by_config_while_the_chord_still_opens() {
+    let home = TempDir::new().expect("temp home");
+    write_config_with_tui(home.path(), "left_arrow_opens_agents = false");
+    let script = vec![
+        send(RAW_MODE_MARKER, LEFT_TWICE),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, CTRL_X_A),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+    ];
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &script);
+
+    let disabled = session.screen_at(1);
+    assert!(
+        !agent_view_open(&disabled),
+        "`left_arrow_opens_agents = false` must disable the \u{2190} route; \
+         whole screen:\n{}",
+        Session::dump(&disabled)
+    );
+    assert_no_left_hint(
+        &disabled,
+        "a disabled \u{2190} route hints nothing either (the hint is the \
+         affordance, so showing it would promise a key that does nothing)",
+    );
+    assert_opened_and_restored(&session, 1, 3, 5);
+}
+
+/// Test T4-S2f. **A stale first `←` must not open the view later.**
+///
+/// Press `←` once (armed), type, delete back to empty, press `←` once: that
+/// press is the *first* of a new pair and must only hint. The second then
+/// opens, which is the in-test positive control.
+///
+/// This pins the reset rule the card asks for: the armed state belongs to an
+/// uninterrupted run of `←`s on an untouched empty composer, and **any other
+/// keystroke that reaches the composer clears it**. The alternative — arming
+/// until the view opens — is a keystroke whose meaning depends on something
+/// the user did minutes ago and can no longer see, which is the bug this test
+/// exists to forbid.
+#[test]
+#[serial]
+fn inline_mode_a_stale_first_left_press_does_not_open_the_agent_view() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let script = vec![
+        send(RAW_MODE_MARKER, LEFT),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "zz"),
+        send("zz", "\x7f\x7f"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, LEFT),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, LEFT),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+    ];
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &script);
+
+    let restarted = session.screen_at(6);
+    assert!(
+        !agent_view_open(&restarted),
+        "typing and clearing between the two \u{2190}s must reset the \
+         affordance, so this press cannot be the second one; whole screen:\n{}",
+        Session::dump(&restarted)
+    );
+    assert_left_hint(
+        &restarted,
+        "the press after the draft was touched is a FIRST press",
+    );
+    assert_opened_and_restored(&session, 6, 8, 10);
+}
+
+/// Test T4-S2g. **`↑` recall is untouched by the `←` binding.**
+///
+/// The existing behaviour: at the idle prompt the editor emits
+/// `EditorAction::RecallRequest` on `↑` over an empty, walk-free draft
+/// (`kitsu-editor/src/lib.rs:703`) and the inline reader **declines** it,
+/// calling `history_prev_forced` so the press walks history instead
+/// (`tui_bridge.rs`'s `RecallRequest` arm, measured by
+/// `inline_mode_recalls_history_persisted_by_an_earlier_session` and by the
+/// reader's own test 10). A `←` binding that shared that empty-draft state, or
+/// that consumed the next key, would break history recall on the first press —
+/// which is the regression a user notices immediately.
+///
+/// So: arm the `←` affordance, then walk two entries back, and the recalled
+/// line must land on the pinned row exactly as it does with no `←` pressed.
+/// The run then clears the draft and opens the view with `←←`, so the recall
+/// assertion is not quietly measuring a session where the binding is absent.
+#[test]
+#[serial]
+fn inline_mode_up_arrow_recall_is_unchanged_with_the_left_arrow_binding_armed() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session_options = Options {
+        no_session: false,
+        ..Options::default()
+    };
+
+    let first = run_styled_chat_pty_with(
+        home.path(),
+        Some("inline"),
+        &submit_context_then_quit(),
+        session_options,
+    );
+    assert!(
+        first.status.success(),
+        "the first session must exit cleanly so its history is saved; screen:\n{}",
+        first.screen_dump()
+    );
+
+    let script = vec![
+        send(RAW_MODE_MARKER, LEFT),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, UP_TWICE),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        // Ctrl+C abandons the recalled draft, which also resets the `←` state.
+        send(RAW_MODE_MARKER, "\x03"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, LEFT_TWICE),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+    ];
+    let second = run_styled_chat_pty_with(home.path(), Some("inline"), &script, session_options);
+
+    let recalled = second.screen_at(3);
+    assert!(
+        pinned_row(&recalled).contains("/context"),
+        "two \u{2191}s must still walk history onto the pinned row with the \
+         \u{2190} affordance armed, but it reads {:?}; whole screen:\n{}",
+        pinned_row(&recalled),
+        Session::dump(&recalled)
+    );
+    assert!(
+        !agent_view_open(&recalled),
+        "\u{2191} is not the \u{2190} route's second press; whole screen:\n{}",
+        Session::dump(&recalled)
+    );
+    assert_no_left_hint(
+        &recalled,
+        "\u{2191} touched the draft, so the \u{2190} affordance is disarmed",
+    );
+    assert_opened_and_restored(&second, 5, 7, 9);
+}
+
+/// Test T4-S2h. **`/jobs view` opens the overlay in a TUI mode and keeps its
+/// text deck in classic.**
+///
+/// Both halves run here so each is the other's control: the classic session
+/// must print `agent deck by state` and never the overlay's title, and the
+/// inline session must open the overlay and never print the deck heading *at
+/// all*. The deck half of the inline assertion is taken on the raw byte stream
+/// rather than the screen, because an overlay on the alternate screen would
+/// hide a deck that had been printed underneath it.
+#[test]
+#[serial]
+fn jobs_view_opens_the_overlay_in_inline_mode_and_prints_the_deck_in_classic() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+
+    let classic = run_styled_chat_pty(
+        home.path(),
+        None,
+        &[
+            send(RAW_MODE_MARKER, "/jobs view\r"),
+            pause(RAW_MODE_MARKER, SETTLE_MS),
+            send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+        ],
+    );
+    assert!(
+        classic.raw_count(JOBS_VIEW_DECK_HEADING) >= 1,
+        "classic mode keeps the text deck; raw:\n{}",
+        classic.raw_text().escape_debug()
+    );
+    assert_eq!(
+        classic.raw_count(AGENT_VIEW_TITLE),
+        0,
+        "and classic mode opens no overlay; raw:\n{}",
+        classic.raw_text().escape_debug()
+    );
+
+    let inline = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "/jobs view\r"),
+            pause(RAW_MODE_MARKER, SETTLE_MS),
+            send(RAW_MODE_MARKER, "\x1b"),
+            pause(RAW_MODE_MARKER, SETTLE_MS),
+            send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+        ],
+    );
+    assert_opened_and_restored(&inline, 0, 1, 3);
+    assert_eq!(
+        inline.raw_count(JOBS_VIEW_DECK_HEADING),
+        0,
+        "in a TUI mode `/jobs view` is the overlay, not the deck as well; \
+         raw:\n{}",
+        inline.raw_text().escape_debug()
+    );
+}
+
+/// Test T4-S2i. **The `/agents` alias reaches the overlay too.**
+///
+/// A1 widens "the `/agents` alias arm, which today forwards only an empty or
+/// numeric argument". It does not: the arm at `main.rs:20259` already forwards
+/// any other argument verbatim to `handle_jobs_command`, and two unit tests
+/// pin that it advertises `view`. What is missing is only the overlay at the
+/// far end, so this measures the alias end to end rather than the forwarding.
+#[test]
+#[serial]
+fn agents_view_alias_opens_the_overlay_in_inline_mode() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "/agents view\r"),
+            pause(RAW_MODE_MARKER, SETTLE_MS),
+            send(RAW_MODE_MARKER, "\x1b"),
+            pause(RAW_MODE_MARKER, SETTLE_MS),
+            send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+        ],
+    );
+    assert_opened_and_restored(&session, 0, 1, 3);
+}
+
+/// Test T4-S2j. **`?` shows the key help without closing the view, and `Esc`
+/// still gets out.**
+///
+/// A3 gives `?` to help and `Esc` to close; what the help *says* is T4-S10's
+/// (the single bindings table feeding a help overlay and `/help keys`), so
+/// this pins only what T4-S2 owes: the key is answered — the screen changes —
+/// the view is still the surface on screen afterwards, and the session can get
+/// back out of both.
+///
+/// Two `Esc`s are sent deliberately. Whether the first returns from the help
+/// to the list or closes the view outright is the implementer's to choose;
+/// what is asserted is that after them the view is gone and what was on screen
+/// before the open is back. A spare `Esc` at the idle composer is inert on an
+/// empty draft (`resolve_lone_escape` clears a draft and there is none), so
+/// neither choice makes the script wrong.
+#[test]
+#[serial]
+fn inline_mode_agent_view_answers_the_help_key_and_still_closes() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let script = vec![
+        send(RAW_MODE_MARKER, CTRL_X_A),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "?"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+    ];
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &script);
+
+    let (opened, helped) = (session.screen_at(1), session.screen_at(3));
+    let region = |screen: &[String]| screen[..(ROWS - 1) as usize].to_vec();
+    assert!(
+        agent_view_open(&opened),
+        "the view must be open before `?` is pressed; whole screen:\n{}",
+        Session::dump(&opened)
+    );
+    assert_ne!(
+        region(&helped),
+        region(&opened),
+        "`?` must show the key help, so the screen cannot be unchanged; \
+         screen with the view up:\n{}\nscreen after `?`:\n{}",
+        Session::dump(&opened),
+        Session::dump(&helped)
+    );
+    assert!(
+        agent_view_open(&helped),
+        "`?` is help, not an exit: the agent view is still the surface on \
+         screen; whole screen:\n{}",
+        Session::dump(&helped)
+    );
+    // Non-vacuous in the other direction too: `?` did not type itself into the
+    // composer underneath, which is what an unhandled key would do.
+    assert!(
+        !pinned_row(&helped).contains('?'),
+        "`?` belongs to the view, not to the composer; pinned row {:?}; whole \
+         screen:\n{}",
+        pinned_row(&helped),
+        Session::dump(&helped)
+    );
+    assert_opened_and_restored(&session, 0, 1, 7);
+}

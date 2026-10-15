@@ -152,7 +152,8 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T3-S12 reduced motion reaches the viewport; 60 fps enforced **in the painter** (was ~109k-400k fps); sync output deferred with reason | done | eeaa51e |
 | T3-S13 N2 measured (**5 ms vs 100 ms budget**); exit gate run clause by clause, **one clause has no test (F60)**; doc sweep | done | aae5874 |
 | **T3 complete.** T4-S1 agent-view model: `AgentViewState` single source, filter grammar, DTO mapping; A2/A3 amended; F61 | done | 76bfc7c |
-| marker story (between T4-S1 and T4-S2): `DeckState::Blocked`, one vocabulary via `deck_state()`; **F34 and F3 closed**, §4.4 amended | done | this commit |
+| marker story (between T4-S1 and T4-S2): `DeckState::Blocked`, one vocabulary via `deck_state()`; **F34 and F3 closed**, §4.4 amended | done | bd9d845 |
+| T4-S2 agent view overlay opens/closes; `[tui] prefix` + `left_arrow_opens_agents` get their first consumer; A1's two stale clauses corrected | done | this commit |
 
 > **`KITSU_TUI` is retired as of T3-S2.** Mentions of it in the T0-T2 rows and
 > requirement text below are **historical** — they record how the preview was

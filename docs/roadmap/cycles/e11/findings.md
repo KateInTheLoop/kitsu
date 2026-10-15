@@ -3411,3 +3411,55 @@ pinned by a dedicated test so a sixth state cannot renumber the five.
 exists; the rename was correct, since "marked_live" was the claim being
 retracted. Anyone following that reference should look for
 `the_blocked_deck_row_is_marked_blocked_and_reads_blocked`.
+
+## F62 — `[tui] alternate_screen` is the last key without a consumer, and the overlay bypasses it
+
+T4-S2's overlay takes the **alternate screen unconditionally**. So
+`[tui] alternate_screen = never` — a documented, parsed, validated value — has
+no effect on the one surface it was introduced for.
+
+**Why it happened, and why I accepted it.** The alternate screen is what makes
+the close assertion true *by construction*: the transcript stays on the primary
+screen, so the restore is the terminal's own and the closed screen equals the
+pre-open screen row for row, while the open screen necessarily differs. An
+in-viewport overlay would have to repaint the region itself, and its restore
+would come from **the cell ring** — which is not fed in production (**N4**,
+**F52**) and carries a documented limitation list. So the `never` path depends
+on a reader that does not exist yet.
+
+**The honest status**, rather than calling the key done: of the six `[tui]`
+keys, `mode` (T3-S2), `prefix` and `left_arrow_opens_agents` (this card) have
+consumers; `cell_ring_lines` has a ring that nothing reads until R6; `title` and
+`alternate_screen` have none. Three cards have now bound keys "so they are not
+silently unreachable" and left them inert — a pattern worth watching, because a
+validated key that changes nothing is indistinguishable from a broken one from
+the user's side.
+
+**What closing it needs:** an in-viewport overlay path, which wants the ring fed
+(R6) so the restore has a source. That makes it T5 work, not a small follow-up.
+Until then the design says plainly that the `never` path is unexercised.
+
+## F63 — three T4-S2 behaviours the requirement did not specify, decided and recorded
+
+A1 specified *that* `←` opens the view on a second press. It did not say what
+**disarms** the first press, what happens to a `←` **inside a paste**, or what a
+**malformed `[tui] prefix`** does. All three are user-visible and all three were
+decided in T4-S2:
+
+1. **Any keystroke other than `←` disarms.** The alternative — arming until the
+   view opens — makes a keystroke's meaning depend on something the user did
+   minutes ago and can no longer see. Typing and deleting back to empty requires
+   two presses again.
+2. **A `←` or a prefix byte inside bracketed-paste content is content.** The
+   byte filter tracks the paste delimiters for exactly this reason, and holds a
+   sequence split across two reads so the editor sees the same stream either
+   way. Without that, pasting text containing the chord byte would open the
+   overlay mid-paste.
+3. **An unrecognisable prefix spelling yields no chord route at all**, rather
+   than falling back to the default. A silent rebinding to a chord the user did
+   not ask for is worse than a chord that does nothing, because the user cannot
+   tell the config was rejected.
+
+Recorded because each is the kind of decision that gets re-litigated by the next
+person to touch the reader, and because the *reasons* are the durable part — the
+behaviours are easy to re-derive once the reasoning is written down.
