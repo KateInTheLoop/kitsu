@@ -523,12 +523,89 @@ pub fn overlay_help_rows(cols: usize) -> Vec<String> {
             "space",
             "peek the selected agent; counts as collecting its result",
         ),
+        // The action keys A3 binds (card T4-S4b). Each line says what the key
+        // does to the *selected* agent, because that is the only thing any of
+        // them acts on, and `x` says it is two presses: the first changes
+        // nothing in the registry, so a user who does not know that reads it
+        // as a key that failed.
+        (
+            "r",
+            "reply to the selected agent: the next key is y, a or n",
+        ),
+        (
+            "s",
+            "steer the selected agent: type a correction, enter sends",
+        ),
+        (
+            "x",
+            "stop the selected agent; press twice (the second press prunes a \
+             finished one)",
+        ),
+        ("n", "rename the selected agent: type a name, enter applies"),
+        ("p", "acknowledge the selected agent's result"),
         ("?", "show this help"),
-        ("esc", "leave the help, then close the view"),
+        ("esc", "leave a prompt or the help, then close the view"),
     ] {
         out.push(format!("  {key:<6} {what}"));
     }
     fit_all(out, cols)
+}
+
+/// The caret the steer line draws, because the overlay hides the terminal's
+/// own cursor (there is no caret anywhere else in this view). Exported so a
+/// test can find it without hard-coding the implementer's glyph.
+pub const STEER_CARET: char = '\u{2588}';
+
+/// The frame for `s`'s text sub-mode (card T4-S4b, requirement A3's
+/// *`s` steer (prompt for text)*).
+///
+/// The overlay has no caret and hides the cursor, so the echo and the caret
+/// are **drawn**: `draft` is shown verbatim and [`STEER_CARET`] is placed at
+/// `cursor`, a **char** offset into `draft` (the editor's own unit). The frame
+/// also advertises how to submit and how to cancel, because a sub-mode a user
+/// cannot get out of is worse than no sub-mode.
+///
+/// `id` is on the frame: the agent being steered is the one the keystroke was
+/// typed on, and steering has a real effect, so the surface says which.
+pub fn steer_prompt_rows(id: u64, draft: &str, cursor: usize, cols: usize) -> Vec<String> {
+    let _ = (id, draft, cursor, cols);
+    unimplemented!("card T4-S4b: the steer line's frame")
+}
+
+/// The row list with one **report line** under it: what the last action key
+/// did (card T4-S4b). `None` is the frame exactly as T4-S4a painted it.
+///
+/// One report is always **one row**: a report built from registry text (a
+/// steering receipt, a name, a refusal) must not be able to grow the frame or
+/// push rows off it.
+pub fn overlay_rows_with_report(
+    rows: Vec<AgentRow>,
+    cols: usize,
+    selected: Option<u64>,
+    report: Option<&str>,
+) -> Vec<String> {
+    let mut out = overlay_rows_selected(rows, cols, selected);
+    if let Some(report) = report {
+        // Every control character becomes a space *before* the fit: a newline
+        // in registry text (a name a human typed, a receipt) would otherwise
+        // paint a second row the frame never budgeted for, pushing the rows
+        // above it off the bottom. One report is one row, by construction.
+        let flattened = report
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        out.push(kitsu_render::fit_row_to_width(
+            &format!("  {flattened}"),
+            cols,
+        ));
+    }
+    out
 }
 
 /// The title row: the frame's own heading on the left and the key hint right
@@ -1365,5 +1442,181 @@ mod tests {
         selection.sync(&[]);
         assert_eq!(selection.press_stop(), super::StopPress::NoSelection);
         assert!(!selection.stop_armed());
+    }
+
+    // --- card T4-S4b: the action keys' two new pure frames ---
+
+    /// Card T4-S4b. **The steer line echoes what was typed and draws a
+    /// caret**, because the overlay hides the terminal's cursor and has none
+    /// of its own.
+    ///
+    /// Four things are pinned: the draft appears verbatim, the caret is
+    /// exactly one and sits at the cursor's char offset, the agent being
+    /// steered is named, and the way out is advertised.
+    #[test]
+    fn the_steer_line_echoes_the_draft_and_draws_one_caret_at_the_cursor() {
+        let frame = super::steer_prompt_rows(7, "slow down", 9, 80);
+        let joined = frame.join("\n");
+        assert!(
+            joined.contains("slow down"),
+            "the draft is echoed verbatim: {joined:?}"
+        );
+        assert!(
+            joined.contains('7'),
+            "the frame names the agent being steered, because steering has a \
+             real effect on it: {joined:?}"
+        );
+        assert_eq!(
+            joined.matches(super::STEER_CARET).count(),
+            1,
+            "exactly one caret: {joined:?}"
+        );
+        for way_out in ["esc", "enter"] {
+            assert!(
+                joined.to_lowercase().contains(way_out),
+                "a sub-mode must advertise how to submit and how to cancel, \
+                 and {way_out:?} is missing: {joined:?}"
+            );
+        }
+
+        // The caret sits where the cursor is, not merely somewhere. Measured
+        // as the echo row's text on either side of it, so this is a claim
+        // about position and not about the glyph being present.
+        for (cursor, before, after) in [
+            (0usize, "", "slow down"),
+            (4, "slow", " down"),
+            (9, "slow down", ""),
+        ] {
+            let frame = super::steer_prompt_rows(7, "slow down", cursor, 80);
+            let echo = frame
+                .iter()
+                .find(|row| row.contains(super::STEER_CARET))
+                .unwrap_or_else(|| panic!("no row carries the caret: {frame:?}"));
+            let at = echo
+                .find(super::STEER_CARET)
+                .expect("the row was found by its caret");
+            assert!(
+                echo[..at].ends_with(before),
+                "with the cursor at {cursor} the caret must follow {before:?}; \
+                 echo row: {echo:?}"
+            );
+            assert!(
+                echo[at + super::STEER_CARET.len_utf8()..].starts_with(after),
+                "with the cursor at {cursor} the caret must precede {after:?}; \
+                 echo row: {echo:?}"
+            );
+        }
+    }
+
+    /// Card T4-S4b: the steer line fits its terminal like every other overlay
+    /// frame. A row that wrapped would push the frame down and leave the row
+    /// underneath it painted twice.
+    #[test]
+    fn the_steer_line_fits_a_narrow_terminal() {
+        let long = "x".repeat(200);
+        let frame = super::steer_prompt_rows(7, &long, long.chars().count(), 40);
+        assert!(!frame.is_empty(), "NON-VACUOUS: a frame really was built");
+        for row in &frame {
+            assert_eq!(
+                kitsu_render::fit_row_to_width(row, 40),
+                *row,
+                "every row is already fitted to 40 columns; this one is not: \
+                 {row:?}"
+            );
+        }
+    }
+
+    /// Card T4-S4b. **One report is one row**, and the row list under it is
+    /// unchanged.
+    ///
+    /// The report is built from registry text — a steering receipt, a name a
+    /// human typed, a refusal — so a newline in it must not be able to grow
+    /// the frame and push rows off the bottom.
+    #[test]
+    fn a_report_line_adds_exactly_one_row_and_leaves_the_rows_alone() {
+        let rows = vec![
+            full_row(1, AgentViewState::Working),
+            full_row(2, AgentViewState::NeedsInput),
+        ];
+        let plain = super::overlay_rows_with_report(rows.clone(), 80, Some(1), None);
+        assert_eq!(
+            plain,
+            super::overlay_rows_selected(rows.clone(), 80, Some(1)),
+            "with no report the frame is exactly T4-S4a's"
+        );
+
+        let reported =
+            super::overlay_rows_with_report(rows.clone(), 80, Some(1), Some("stopped agent #1"));
+        assert_eq!(
+            reported.len(),
+            plain.len() + 1,
+            "a report is one row: {reported:?}"
+        );
+        assert_eq!(
+            reported[..plain.len()],
+            plain[..],
+            "and it is added under the rows rather than replacing any of them"
+        );
+        assert!(
+            reported[plain.len()].contains("stopped agent #1"),
+            "the report says what happened: {:?}",
+            reported[plain.len()]
+        );
+
+        let multiline = super::overlay_rows_with_report(
+            rows.clone(),
+            80,
+            Some(1),
+            Some("renamed to\nsomething\nelse"),
+        );
+        assert_eq!(
+            multiline.len(),
+            plain.len() + 1,
+            "a report carrying newlines is still one row, or it would push \
+             rows off the frame: {multiline:?}"
+        );
+        for row in &multiline {
+            assert!(
+                !row.contains('\n'),
+                "and no row carries a newline into the paint: {row:?}"
+            );
+        }
+    }
+
+    /// Card T4-S4b, applying F38's lesson to keys as T4-S3 did for `space`: a
+    /// key that works while being unadvertised is half-shipped. Every key
+    /// A3 binds is in the help.
+    #[test]
+    fn the_help_advertises_every_key_the_view_binds() {
+        let help = super::overlay_help_rows(100).join("\n").to_lowercase();
+        for (key, what) in [
+            ("r", "reply"),
+            ("s", "steer"),
+            ("x", "stop"),
+            ("n", "rename"),
+            ("p", "acknowledge"),
+        ] {
+            assert!(
+                help.contains(what),
+                "the help must say what `{key}` does, and {what:?} is not in \
+                 it:\n{help}"
+            );
+        }
+        // NON-VACUOUS: the keys T4-S3 and T4-S4a advertised are still there,
+        // so a help screen that had simply stopped listing anything would not
+        // pass this test by listing nothing.
+        for already in ["peek", "move"] {
+            assert!(
+                help.contains(already),
+                "the keys already advertised are still advertised: {already:?}\n{help}"
+            );
+        }
+        // `x` is two presses and the help must say so, because the first
+        // press does nothing visible to the registry and a user who does not
+        // know that reads it as a key that failed.
+        assert!(
+            help.contains("twice") || help.contains("two"),
+            "the help says `x` is two presses:\n{help}"
+        );
     }
 }

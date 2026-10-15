@@ -463,6 +463,99 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
     model-produced label and is exactly the silent rejection this project
     refuses for a name a human just typed.
 
+  **`x` was under-specified, and T4-S4b settled it against a hazard this
+  requirement did not anticipate.**
+
+  - **The reading.** `x` arms; the **second press stops a live agent and prunes
+    an already-terminal one.** That is how "stop (twice to prune)" is satisfied
+    without a third press and without changing T4-S4a's arming. The premise was
+    verified rather than assumed: `cancel`'s terminal predicate and `prune`'s
+    `Running` predicate are the **exact complement** (both `Running | Blocked`),
+    so "stop would answer `AlreadyTerminal`" and "prune would answer `Pruned`"
+    describe the same set. The implementation **sequences** the stop and then the
+    prune rather than reading a phase and then calling, so nothing can finish in
+    the gap.
+  - **`x` refuses to prune a terminal agent whose result is still unviewed**,
+    reports that the result is waiting, and prunes on the identical press once
+    `Space` or `p` has collected it. The reason is **F67**: `prune` removes the
+    record, and the guard that surfaces unviewed results can only iterate records
+    that still exist — so pruning discards the result **and the guard cannot
+    know**.
+  - **This is deliberately asymmetric with `/jobs prune <id>`,** which does
+    discard such a result today. That is an explicit command naming a specific
+    id, and its JSON path returns the terminal payload, so automation keeps the
+    result; only the interactive path loses it. **The second press of an arming
+    is neither explicit nor id-naming.** The asymmetry is the point: *the same
+    registry call is safe behind a typed id and unsafe behind a keystroke.*
+    Whether `/jobs prune` should also print the result before discarding it is an
+    open product question recorded in **F67**, not something the key works
+    around.
+  - **Every action key has a no-selection report**, never silence — the same
+    reasoning that gave T4-S4a's `press_stop` a `NoSelection` answer rather than
+    a silent `Armed`. Likewise every failure case is **distinguishable** (`r` on
+    an agent that is not blocked, `x` on an already-terminal one, `p` with
+    nothing to acknowledge, `n` with an illegal name), because a human typing
+    into a racy world must be able to tell *nothing happened* from *it worked*.
+  - **Nothing in a paste is ever a key (F68).** This is a **safety** clause, not
+    a convenience one. The overlay reads raw bytes and processes a whole chunk
+    at once, and it never asked the terminal to bracket pastes — so before this
+    rule a paste was indistinguishable from typing, and **one pasted line of
+    prose was shown to approve a parked filesystem write and then stop the
+    agent** (`allow_once`, 34 keys from one chunk). Pasted text must never
+    become a privileged action.
+
+    - **Inside a text prompt** (`n`'s name, `s`'s correction) the whole payload
+      is content, **newlines included**; the prompt stays open and the user
+      presses `Enter` themselves. This keeps **one** answer to "what is a byte
+      inside a paste?" across the binary: `kitsu-editor` already holds that a
+      bracketed paste never submits, and T4-S2 decided a prefix byte inside a
+      paste is content.
+    - **Over the row list, and inside `r`'s decision read, a paste is dropped
+      entirely** — never an action, and the decision read stays open rather than
+      resolving to a pasted letter.
+    - **Detection is two-sided**, because one side is not always available: the
+      overlay emits `ESC[?2004h` itself (it owns the terminal, as
+      `tui_bridge::KeyFilter` does without rustyline), **and** treats a chunk
+      yielding more than one printable key as a burst rather than typing — the
+      latter is what protects a terminal that does not report pastes at all.
+    - **The burst rule is a heuristic and fails safe:** a fast typist, or a
+      terminal that batches bytes, can have two quick presses read as one burst
+      and dropped. That direction is deliberate, but it meets T2-S5b's rule that
+      a human must be able to tell *nothing happened* from *it worked*, so a
+      swallowed burst **says so**, names how many characters it ignored, and
+      says how to make a paste mean something (`n` opens a name, `s` a
+      correction).
+    - **It reports the count and never the text.** The payload is the user's
+      clipboard and may hold a secret, so painting it into the frame would be a
+      new disclosure — the same reasoning as **F40**, where the timeline's
+      protection had to become structural rather than accidental. Inside `r`'s
+      decision read the paste is silent **by construction**: an open prompt owns
+      the report row, and the read's own `y allow once, a allow always, n deny`
+      line is the honest thing to show while it is still open.
+    - **The overlay enables bracketed paste but does not disable it on exit**,
+      deliberately. `RawStdinGuard` owns that pair (`engage` writes `?2004h`,
+      `Drop` writes `?2004l`). At the inline idle reader the overlay runs
+      *inside* the caller's still-live guard, so writing `?2004l` on close would
+      strip bracketed paste from the composer underneath **for the rest of the
+      session** — a regression in the surface that needs it most. The enable is
+      belt-and-braces by the surface that depends on it; the disable stays with
+      the owner.
+
+    **F65 and F68 are one root with opposite signs**, and both belong in any
+    future key work: *an arrow key is not one byte*, and *a chunk of bytes is
+    not a sequence of intentions*. A loop that treats every decoded key as a
+    deliberate keystroke is safe only while no key does anything.
+
+  - **`s`'s text sub-mode is T4-S4b-ii and is not shipped yet.** Its decisions
+    are pinned by tests but not implemented: `ESC` cancels the line under the
+    same 50 ms grace T4-S4a introduced, a newline **inside a paste is content**
+    (consistent with T4-S2's prefix-byte rule), and an empty correction is the
+    registry's own `Empty` refusal rather than a key-level guard. The input is
+    the existing `kitsu-editor` line editor, reached from `main.rs` where the
+    overlay loop runs — `kitsu-tui` depends on `kitsu-render` only and cannot
+    reach it, and a second line editor there would be a second parser of the
+    same bytes, which is what **F45** was closed by removing.
+
   **The filter grammar was under-specified; T4-S1 decided these four points and
   pinned each to an exact message.**
   - **`o:` was never defined here.** It matches the **task/objective**

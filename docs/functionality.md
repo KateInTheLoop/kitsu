@@ -299,6 +299,23 @@ clamps at the ends instead of wrapping, moving it never collects a result, and
 if the selected agent is pruned the selection falls to the row that took its
 place.
 
+`r` replies to a blocked agent (a single key -- `y`, `a` or `n` -- read through
+the same parser `/jobs reply` uses, not a line of text), `x` stops it (press
+twice; on an agent that has already finished, the second press prunes it), `n`
+renames it, and `p` marks its result collected. Every one of them names its
+outcome, names its refusals, and says so when nothing is selected.
+
+`x` will not prune an agent whose result nobody has read: it says the result is
+waiting, and the same keystroke prunes once you have peeked with `Space` or
+collected with `p`. This is deliberately stricter than `/jobs prune <id>`, which
+names an id explicitly and whose JSON reply carries the result; the second press
+of a keystroke is neither.
+
+Pasted text is never keystrokes here. In a name or correction line a paste is
+content, newlines included, and the line stays open for you to submit it.
+Anywhere else it is ignored with a line saying how many characters were skipped
+-- the text is never echoed back, because a clipboard may hold a secret.
+
 `Space` peeks the selected agent -- the same bounded redacted timeline
 `/jobs show` prints, the permission kind it waits on if blocked, and its result
 or failure if finished. Peeking takes custody of the result exactly as

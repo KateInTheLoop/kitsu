@@ -473,7 +473,6 @@ pub enum AgentHandoffAckOutcome {
 /// deliberately does not borrow `safe_inline_label`, which coerces an empty
 /// label to `unknown` and truncates with an ellipsis — right for a label the
 /// model produced, wrong for a name a human just typed.
-#[cfg_attr(not(test), allow(dead_code))] // Read by `n`'s report in T4-S4b.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentRenameOutcome {
     /// Named, reporting the name this one replaced so the user can tell the
@@ -1435,9 +1434,6 @@ impl AgentRegistry {
     /// A name stands in for the task head on A2's row, so the budget is the
     /// head's: a name that fitted the row and a task head that fitted it are
     /// the same width.
-    // `allow(dead_code)` until T4-S4b binds `n` to it: the signature is
-    // settled by this card so the key has something to call.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub const NAME_MAX_CHARS: usize = kitsu_tui::agents_view::AgentRow::TASK_HEAD_CHARS;
 
     /// Name one agent, for the agent view's `n` key.
@@ -1450,7 +1446,6 @@ impl AgentRegistry {
     /// untouched here, so the exit guard still holds an unread result back.
     ///
     /// A refused name leaves the previous name exactly as it was.
-    #[cfg_attr(not(test), allow(dead_code))] // Bound to `n` by T4-S4b.
     pub fn rename(&self, id: u64, name: &str) -> AgentRenameOutcome {
         let name = name.trim();
         if name.is_empty() {

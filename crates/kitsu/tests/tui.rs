@@ -6086,3 +6086,176 @@ fn inline_mode_agent_view_answers_the_arrow_keys_without_typing_into_the_compose
     );
     assert_opened_and_restored(&session, 0, 1, 11);
 }
+
+/// Test T4-S4b. **None of the action keys reaches the composer underneath,
+/// and none of them is an exit.**
+///
+/// A GUARD in the same shape as T4-S3a's `Space` test, and for the same
+/// reason: a fixture PTY session has **zero agents**, so every one of `r`,
+/// `s`, `x`, `n` and `p` meets the no-selection case here and there is
+/// nothing for it to act on. What the keys *do* is pinned at unit level in
+/// `main.rs` against a real `AgentRegistry`. What only a PTY can answer is
+/// the routing, and it is the half that regresses: an implementer who
+/// forwards an unhandled key to the editor, or who lets `n` fall through to
+/// the draft, breaks this.
+///
+/// `s` is the one to watch. It opens a line of text when there *is* a
+/// selection, and a sub-mode that read bytes before checking the selection
+/// would start echoing here, with no agent to steer and no obvious way back.
+///
+/// The POSITIVE CONTROL is the `?` after all five: the overlay still answers
+/// its own key, so the five equalities above are about keys being consumed
+/// and not about a loop that had already exited or desynchronised.
+#[test]
+#[serial]
+fn inline_mode_agent_view_answers_the_action_keys_without_typing_into_the_composer() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let script = vec![
+        send(RAW_MODE_MARKER, CTRL_X_A),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "r"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "s"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "x"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "n"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "p"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "?"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+    ];
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &script);
+
+    let opened = session.screen_at(1);
+    assert!(
+        agent_view_open(&opened),
+        "the view must be open before the action keys are pressed; whole \
+         screen:\n{}",
+        Session::dump(&opened)
+    );
+    for (key, mark) in [("r", 3), ("s", 5), ("x", 7), ("n", 9), ("p", 11)] {
+        let screen = session.screen_at(mark);
+        assert!(
+            agent_view_open(&screen),
+            "`{key}` acts on the selected agent; it is not an exit, so the \
+             agent view must still be the surface on screen; whole screen:\n{}",
+            Session::dump(&screen)
+        );
+        assert_eq!(
+            pinned_row(&screen),
+            pinned_row(&opened),
+            "`{key}` belongs to the view: nothing may be typed into the \
+             composer underneath it; screen with the view up:\n{}\nscreen \
+             after `{key}`:\n{}",
+            Session::dump(&opened),
+            Session::dump(&screen)
+        );
+    }
+
+    let region = |screen: &[String]| screen[..(ROWS - 1) as usize].to_vec();
+    let helped = session.screen_at(13);
+    assert_ne!(
+        region(&helped),
+        region(&opened),
+        "POSITIVE CONTROL: `?` pressed after all five action keys still \
+         brings up the key help, so the overlay was reading keys throughout \
+         and the assertions above are not about a loop that had already \
+         exited; screen with the view up:\n{}\nscreen after `?`:\n{}",
+        Session::dump(&opened),
+        Session::dump(&helped)
+    );
+    assert!(
+        agent_view_open(&helped),
+        "whole screen:\n{}",
+        Session::dump(&helped)
+    );
+    assert_opened_and_restored(&session, 0, 1, 17);
+}
+
+/// Finding **F68**, the routing half: **a bracketed paste is not a string of
+/// overlay keys.**
+///
+/// The registry half — that a paste answers no permission and stops no agent
+/// — is pinned at unit level in `main.rs` against a real `AgentRegistry`, for
+/// T4-S3's and T4-S4a's reason: a fixture PTY session has **zero agents**, so
+/// no key here can act on one. What only a PTY can answer is whether the
+/// overlay is still the surface on screen afterwards and whether any pasted
+/// byte reached the composer underneath, and both regress the moment a paste
+/// is decoded as keys: the payload below carries `q`, which **closes the
+/// view**, and a newline, which submits whatever prompt is open.
+///
+/// The paste is sent **bracketed** (`ESC[200~` … `ESC[201~`) on purpose. It is
+/// what a terminal with paste reporting sends, and it is the only spelling
+/// that is immune to the pty splitting the write: the delimiters carry the
+/// state, so the assertion does not depend on how the bytes arrive.
+///
+/// The POSITIVE CONTROL is the `?` afterwards: the overlay still answers its
+/// own key, so this is not a loop that had already exited, and the `Esc`
+/// closes it, so it is not one that has stopped answering `Esc` either.
+#[test]
+#[serial]
+fn inline_mode_agent_view_treats_a_bracketed_paste_as_text_and_not_as_keys() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let script = vec![
+        send(RAW_MODE_MARKER, CTRL_X_A),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(
+            RAW_MODE_MARKER,
+            "\x1b[200~retry the exxtract\nand quit the bug\x1b[201~",
+        ),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "?"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, QUIT_AFTER_CLOSE),
+    ];
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &script);
+
+    let opened = session.screen_at(1);
+    assert!(
+        agent_view_open(&opened),
+        "the view must be open before the paste; whole screen:\n{}",
+        Session::dump(&opened)
+    );
+    let pasted = session.screen_at(3);
+    assert!(
+        agent_view_open(&pasted),
+        "a paste is text, not keys: its `q` must not close the view; whole \
+         screen:\n{}",
+        Session::dump(&pasted)
+    );
+    assert_eq!(
+        pinned_row(&pasted),
+        pinned_row(&opened),
+        "and no pasted byte reaches the composer underneath; screen with the \
+         view up:\n{}\nscreen after the paste:\n{}",
+        Session::dump(&opened),
+        Session::dump(&pasted)
+    );
+
+    let region = |screen: &[String]| screen[..(ROWS - 1) as usize].to_vec();
+    let helped = session.screen_at(5);
+    assert_ne!(
+        region(&helped),
+        region(&opened),
+        "POSITIVE CONTROL: `?` pressed after the paste still brings up the \
+         key help, so the overlay was reading bytes throughout and the \
+         assertions above are not about a loop that had already exited; \
+         screen with the view up:\n{}\nscreen after `?`:\n{}",
+        Session::dump(&opened),
+        Session::dump(&helped)
+    );
+    assert_opened_and_restored(&session, 0, 1, 9);
+}
