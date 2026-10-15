@@ -144,9 +144,12 @@ shapes may change in any minor release.
   `[tui] mode = "fullscreen"`) takes the terminal's alternate screen and paints
   the viewport's scrollback, **repainting as the conversation grows**, and gives
   the screen and your window title back when you switch away.
-  **Rough edge, being worked on:** the prompt and the slash-command palette are
-  still drawn by the ordinary line editor, so they paint over the frame between
-  turns. The frame is correct and current; what is on top of it is not tidy yet. Switching keeps the conversation, as the other modes do.
+  **It has its own prompt**, drawn on the bottom row, so the frame is no longer
+  painted over between turns -- typing cannot scroll it at all. The slash-command
+  palette is deliberately absent there (the only rows it could use are the
+  frame's), and the agent-view keys are off while fullscreen holds the screen.
+  **Still missing:** paging, so the view follows the newest lines rather than
+  letting you scroll back. Switching keeps the conversation, as the other modes do.
   Paging keys are not wired yet, so it shows the most recent lines.
   **What the scrollback holds is worth knowing:** the streamed conversation --
   not kitsu's own messages and receipts, and not an answer that was buffered

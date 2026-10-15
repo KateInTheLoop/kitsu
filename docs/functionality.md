@@ -346,10 +346,17 @@ scrollback: it takes the terminal's alternate screen, paints the retained lines,
 title back when you leave it. A prompt that follows no new output repaints
 nothing, so an idle session is still.
 
-**Two rough edges, both known.** The prompt, its hint row and the slash-command
-palette are still drawn by the ordinary line editor, so between turns they paint
-over the frame -- the frame itself stays correct and current. And paging is not
-wired, so the view follows the newest lines rather than letting you scroll back. `--tui
+Fullscreen draws its own prompt on the bottom row, so the frame is not painted
+over between turns: the composer writes only to that row and never a line feed,
+so typing cannot scroll the frame at all. Two differences from the inline
+composer, both deliberate: there is **no slash-command palette** (the only rows it
+could use are the frame's), and the agent-view keys are **off** while fullscreen
+holds the screen, since the agent view wants that same alternate screen.
+
+**Still missing:** paging, so the view follows the newest lines rather than
+letting you scroll back. `Ctrl+Z` suspends from fullscreen through the same path
+the other renderers use, though the alternate screen's contents are the
+terminal's across the stop. `--tui
 fullscreen` and `[tui] mode = "fullscreen"` start there instead; a session that
 starts in fullscreen has nothing behind it to paint yet. Paging is not wired, so
 the view shows the newest lines that fit.

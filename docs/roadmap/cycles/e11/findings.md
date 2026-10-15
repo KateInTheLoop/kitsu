@@ -4526,3 +4526,38 @@ I recorded fullscreen as painting one frame that *"the conversation scrolls over
 Paired with a guard that inline and classic paint each line **exactly once**, which refuses the tempting wiring: repainting at the **surface seam** would duplicate inline's transcript and break classic's byte-identity.
 
 **This is F97's own lesson turned on the test that missed it:** the existing assertion proves the ring **was** read; the count-of-three proves it **keeps** being read.
+
+## F98 — a third variant of the restore hole: the `/tui fullscreen` arm registers nothing
+
+Found by T5-S1c-ii's test author while enumerating exit paths, and verified by me: the `TuiRendererRequest::Fullscreen` arm is `enter_fullscreen` plus an `eprintln!` — **and nothing else.** It does not call `install_exit_restore`.
+
+So the **classic → fullscreen** route leaves the session holding the alternate screen on the **default signal disposition**. A `SIGTERM` there writes no restore of any kind.
+
+### Why three cards in a row each found one of these
+
+- **F94**: the dying handler wrote the title pop but not the alternate screen — open for the **agent view since T4-S2**.
+- **F96**: a session **started** in fullscreen installed no handler, because the handler was installed where the pinned region was and fullscreen pins none.
+- **F98**: the **`/tui` switch into** fullscreen installs no handler either, for the same reason one level along.
+
+**Every existing signal test enters fullscreen by a route that happens to have a handler already** — from inline (the inline segment installed it) or by starting in fullscreen (F96's fix installs it for the mode). **The one route nobody had taken is the one with the gap.**
+
+That is the enumeration lesson biting a third time, and the sharpest statement of it so far: **exit paths are enumerable, but so are the paths *into* a state — and a restore installed on entry is only as good as the entries that install it.** F94 taught me to enumerate exits. F98 is about enumerating **entrances**, because each one decides whether the exit machinery exists at all.
+
+### Kept in T5-S1c-ii rather than carded
+
+Three reasons: it is the **same mechanism** (exit-restore registration), it is **one test**, and **it becomes a termios hole as well** the moment that card gives fullscreen raw mode — which is precisely what it does. Splitting it would mean shipping a card that *creates* the second half of a defect it had already found.
+
+## F99 — an agent applied F97's lesson to its own tests, twice, before review
+
+Worth recording as a method observation rather than a defect.
+
+T5-S1c-ii's test author **stopped twice on its own work**, both times because a test would have been **green and proved nothing**:
+
+1. Its first frame assertion was *"a keystroke must not cost the frame a row."* **Measured:** rustyline costs **zero** rows for a plain draft, because it rewrites prompt and hint in place. The defect only bites when a **palette** opens — so the test gained a slash prefix, and asserts **after** dismissal.
+2. Its **decoder test passed on its first run.** Asserting only that a draft is painted under the frame is something **rustyline satisfies perfectly well**. It replaced that with a per-keystroke window assertion tying the paint to *not rustyline*.
+
+**Both were discarded rather than kept as green "failing tests"** — which is the trap **F97** named and which I only caught *after* accepting a card. This is the first time an agent caught it in its own tests before handing them over, and it did so by **measuring the current behaviour first** rather than reasoning about what ought to fail.
+
+**The generalisable practice: before writing a failing test, measure what the current code actually does to the thing you are about to assert.** A test derived from a description of the defect can be satisfied by the defect; a test derived from a measurement of it cannot.
+
+The discriminator it chose is the other half of the lesson: the `model … cwd` hint row has **exactly one producer**, whose only caller is rustyline's hinter, and the inline painter never writes it. **That row on the alternate screen *is* rustyline reading the surface** — a by-construction fact rather than a substring guess (**F41**).
