@@ -1,9 +1,10 @@
 # kitsu configuration — gateway profiles.
 #
 # kitsu talks to ANY endpoint that speaks the OpenAI chat/completions wire
-# protocol. That covers hosted APIs (OpenAI, Anthropic, Hugging Face, Mistral,
-# your own corporate gateway) and local servers (Ollama, vLLM). Nothing is
-# hardcoded in the binary — define one [gateways.<name>] block per endpoint and
+# protocol, or the native Anthropic Messages API via its compiled adapter.
+# Compatible APIs include OpenAI, Hugging Face, Mistral,
+# custom gateways, and local servers (Ollama, vLLM). Endpoints are configured,
+# not hardcoded — define one [gateways.<name>] block per endpoint and
 # select it with `--gateway <name>`, or set `default_gateway` below.
 #
 # Auth methods:
@@ -11,7 +12,7 @@
 #   { method = "bearer-env", env = "SOME_TOKEN" }         # env first; `kitsu auth login` fallback
 #   { method = "static", token = "..." }                  # inline token (discouraged)
 #
-# See README.md for the full guide and per-provider recipes.
+# See docs/usage.md for the full guide and per-provider recipes.
 
 default_gateway = "ollama"
 
@@ -131,7 +132,7 @@ auth        = { method = "bearer-env", env = "OPENAI_API_KEY", refresh_hint = "c
 # ── Anthropic direct, via Kitsu's compiled native Messages adapter ──────────
 # Requires a developer API key (sk-ant-...) from console.anthropic.com — a
 # claude.ai Pro/Max subscription login does NOT work here. Anthropic requires a
-# max_tokens, so pass `--max-output-tokens N`.
+# max_tokens; Kitsu defaults to 4096. Use `--max-output-tokens N` to change it.
 [gateways.anthropic]
 flavor      = "anthropic"
 adapter     = "anthropic-messages"

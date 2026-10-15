@@ -48,3 +48,22 @@ README.
 
 Describe the problem, resulting behavior, and validation in the pull request.
 Use [the release guide](docs/releasing.md) when cutting a release.
+
+## Credential checks
+
+Keep tokens in environment variables or Kitsu's private credential store.
+Never commit `.env` overrides, cloud credential directories, private keys, or
+captured provider traffic. Synthetic security-test credentials must be clearly
+identified as fixtures.
+
+With Gitleaks installed, scan current files and reachable history before
+publishing changes that touch authentication or logging:
+
+```bash
+gitleaks dir --redact .
+gitleaks git --redact --log-opts="--all" .
+```
+
+Inspect findings locally with redacted output. Do not paste credential values
+into issues or PRs. A confirmed published secret needs revocation or rotation;
+removing it from a current file does not remove it from Git history.

@@ -378,7 +378,9 @@ auth        = { method = "none" }
 ```
 
 ```bash
-ollama serve && ollama pull llama3.2
+ollama serve
+# In another terminal:
+ollama pull llama3.2
 kitsu --gateway ollama ask "hi"
 ```
 
@@ -451,8 +453,8 @@ kitsu --gateway huggingface ask "hi"
 
 - **Token:** create one at <https://huggingface.co/settings/tokens> with the
   "Make calls to Inference Providers" permission.
-- **HF PRO** ($9/mo) adds a monthly inference-credit allowance and higher rate
-  limits, drawn down through that same token.
+- **Billing and limits:** check your Hugging Face account for current inference
+  credits, usage charges, and provider limits.
 - **Model IDs** are `<org>/<model>`. Append `:fastest` (the default policy),
   `:cheapest`, or `:preferred` for server-side provider selection, or pin one
   with `:<provider>` (for example `openai/gpt-oss-120b:groq`). Only models with
@@ -486,7 +488,7 @@ adapter     = "anthropic-messages"
 base_url    = "https://api.anthropic.com"
 chat_path   = "/v1/messages"
 models_path = ""
-model       = "claude-opus-4-8"
+model       = "your-claude-model-id"
 auth        = { method = "bearer-env", env = "ANTHROPIC_API_KEY", header = "x-api-key", scheme = "", expires_env = "" }
 ```
 
@@ -497,9 +499,11 @@ kitsu --gateway anthropic ask --max-output-tokens 1024 "hi"
 
 - Requires a **developer API key** (`sk-ant-…`). A claude.ai Pro/Max
   **subscription** login does *not* grant API access — it's a separate system.
-- Anthropic's endpoint requires a `max_tokens`, so pass `--max-output-tokens N`
-  for ordinary chat. This adapter is streaming-only and does not expose model
-  catalog, structured-output, image-input, or prompt-cache capabilities yet.
+- Replace `your-claude-model-id` with a model available to your API account.
+- The native Messages adapter supplies `max_tokens = 4096` when no
+  `--max-output-tokens` is set. Set the flag to choose another cap. This adapter
+  is streaming-only; `--no-stream`, structured output, and model-catalog
+  operations are unsupported. Image input and prompt caching are not exposed.
 
 ---
 
@@ -644,18 +648,20 @@ single tool-free `ask` turn and exits after the answer.
 | `agents [--all] [--json]` | Host-only, provider-free listing of the background agents every kitsu process on this machine is publishing, read from the advisory state files `[agents] state_file` writes. Dead processes are skipped unless `--all`. A file written by a newer kitsu is reported as schema-unsupported instead of dropped, and a thread record this binary cannot validate is counted rather than blanking the listing. The reader creates, modifies, and deletes nothing. |
 | `chat [prompt]` | Interactive multi-turn REPL. An optional first prompt is queued as the first turn. With piped stdin (non-TTY), the prompt/stdin is a single turn. |
 
-**Global flags** (apply to any command)
+**Global flags** (accepted before or after a command; effects depend on the command)
 
 `--version` reports the package version, Git commit, and source-commit date.
 The date is provenance from Git history, not the wall-clock build time.
 
 | Flag | Default | Description |
 |---|---|---|
+| `-h, --help` | — | Show command help; append to any subcommand for its own flags and arguments. |
+| `-V, --version` | — | `-V` shows the package version; `--version` adds Git provenance. |
 | `--gateway <name>` | `KITSU_GATEWAY`, then `default_gateway` | Which `[gateways.<name>]` profile to use. |
 | `--model <id>` | `KITSU_MODEL`, then profile's `model` | Override the model for this launch; `/model` can replace it inside chat. |
 | `-p, --prompt <text>` | unset | Run one prompt non-interactively and exit; cannot be combined with a subcommand. |
 | `--config <path>` | see resolution order | Path to the config file. |
-| `--no-stream` | off | Request a single non-streamed completion. |
+| `--no-stream` | off | Request a single non-streamed completion; unsupported by the native Anthropic Messages adapter. |
 | `--jsonl` | off | Emit versioned `kitsu.chat.v1` JSON Lines events. Interactive TTY chat and human help/version output are rejected so stdout stays machine-only. |
 | `-o, --output-last-message <PATH>` | unset | Atomically write the last fully committed assistant message to a host-owned file (`0600` on Unix) after non-interactive ask, review, piped chat, or scripted chat. Stdout/JSONL is unchanged; discarded or committed-partial output never replaces the file. |
 | `--output-schema <PATH>` | unset | Constrain non-interactive final answers with a bounded strict JSON Schema. Kitsu sends the schema through OpenAI-compatible `response_format` and independently validates the exact assistant bytes before commit; invalid output exits `2` and cannot replace `-o`. |
@@ -668,7 +674,9 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--timeout-secs <n>` | `120` | Total inference deadline, including retries, backoff, streamed body reads, and every provider/tool round in one scripted turn. One-shot chat also charges piped-input and attachment acquisition to the same deadline; a positional prompt never waits for unrelated stdin EOF. If the deadline expires after real output already streamed, one-shot runs keep it: the answer ends with a `[stopped: deadline expired …]` marker and is labeled partial (exit code stays `2`). |
 | `--agent-join-timeout <n>` | `--timeout-secs` | How long a non-interactive exit (scripted or piped chat) waits for live background agents to finish before cancelling them. |
 | `--agent-spawn-cap <n>` | `8` interactive, `2` automation | Per-turn cap shared by synchronous, parallel, and background subagent spawns. `0` disables spawning and removes all four multi-agent tools from `/tools`, the system prompt, and provider requests. |
-| `--max-output-tokens <n>` | unset (gateway default) | Cap output tokens. Required by some gateways (e.g. Anthropic). If the model hits an explicit cap, strict one-shot/scripted runs keep the partial text visible but do not commit the turn, exit `2`, and suggest retrying with twice the current value. |
+| `--max-output-tokens <n>` | compatible: gateway default; native Messages: `4096` | Cap output tokens. If the model hits an explicit cap, strict one-shot/scripted runs keep the partial text visible but do not commit the turn, exit `2`, and suggest retrying with twice the current value. |
+| `--offload-cap <CHARS>` | about `8192` | Offload successful tool results above this character threshold to a re-readable file; smaller values reduce inline context. `--no-artifacts` disables automatic offloading. |
+| `--theme <NAME>` | config, else `kitsune` | Select `kitsune`, `sakura`, `ocean`, `forest`, `ember`, or `mono`; `/theme` changes it during chat. Plain mode overrides styling. |
 | `--yes` | off | Never prompt for filesystem access; enabled tools remain confined to explicit/current roots and requests outside them are denied. Never enables tools or approves developer commands. |
 | `--dangerously-allow-all-filesystem` | off | **DANGER:** let enabled filesystem tools access every non-protected host path without prompting. This is the explicit global bypass; it still never enables tools or approves commands. |
 | `--dangerously-skip-permissions`, `--yolo` | off | **DANGER:** run fully unattended. `--yolo` is an exact alias for the long spelling: enabled filesystem tools may access every non-protected path, read/write tools are registered for automation, and commands are auto-approved only when command capability is separately enabled. Kitsu-private paths, explicit `/permissions protect` guards, command roots/validation/containment, and secret-environment filtering remain enforced. |
@@ -690,14 +698,44 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--require-write-sha256 <PATH=SHA256>` | Add an exact raw-byte SHA-256 expectation to the same verified-write/net-change contract (repeatable). Input hex is case-insensitive and normalized lowercase; parsing uses the final `=`, so paths may contain `=`. It grants no authority, and a mismatch fails before `-o` is replaced. With structured output, a descriptor-verified mismatch may use remaining bounded tool rounds for correction before finalization. |
 | `--enable-commands` | Enable guarded literal-argv developer commands. Approval is independent from filesystem access and `--yes`. |
 | `--command-root <PATH>` | Add an existing writable root to mandatory Linux command containment (repeatable; implies `--enable-commands`). Exact argv/cwd approval remains a separate gate. **The approved executable's own directory is a second, independent root requirement** — if a tool lives outside every `--command-root` (e.g. `~/.local/bin/pytest`), containment denies it at run time; the denial names the exact missing directory and the `--command-root` flag to add. |
+| `--command-runtime-root <PATH>` | Mount an additional directory read-only inside Linux command containment (repeatable; implies `--enable-commands`). Its `bin/` joins PATH; `.cargo` and `.rustup` roots also set CARGO_HOME and RUSTUP_HOME. Use for toolchains outside `/usr`; avoid credential directories or whole-home mounts. |
 | `--allow-command <JSON_ARGV>` | Pre-approve one exact argv (repeatable). `'["cargo","test"]'` binds it to the launch directory; `'{"argv":["cargo","test"],"cwd":"/abs/dir"}'` binds it to an explicit directory inside a `--command-root`. The grant is exact argv **and** exact cwd. Every pregrant is also named verbatim (argv + cwd) in the system prompt, so the model can call it directly instead of guessing. |
 | `--command-env <NAME[=VALUE]>` | Opt-in, explicit environment pass-through into contained commands (repeatable), layered on top of the fixed non-secret base set (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`). Needed for interpreter-based toolchains (`pytest`, `npm test`, ...) whose module search path is env-driven (`PYTHONPATH`, `NODE_PATH`, ...). Bare `NAME` reads the value from kitsu's own environment and is refused for names that look secret-bearing (case-insensitive substring match on `KEY`/`TOKEN`/`SECRET`/`PASSWORD`); use `NAME=value` to pass an explicit literal value regardless of name. Nothing else is inherited from the host — deny-by-default is unchanged. Disclosed in `/permissions` and JSONL (secret-shaped values are redacted there even though the contained process receives the real value). |
 | `--no-tools` | Offer no model tools for the whole chat. Project context, explicit skill preloads, client-side attachments, and session continuity remain available; `--allow-path` can authorize client-side reads, while write and command capability flags conflict. |
 | `--script <FILE>` | Run turns from a file non-interactively (deterministic multi-turn). One turn per line; `#` comments and blank lines skipped; `/slash` commands work; a `<<< … >>>` block is a single multi-line turn. |
-| `--resume [ID]` | Resume and autosave a saved session in interactive, scripted, or piped chat; omit the ID for `last`. Saved permissions are never restored; current invocation grants remain. `--resume` already implies `--session`, so passing both explicitly is a harmless no-op confirmation, not an error. |
+| `--resume [ID]` | Resume and autosave a saved session in interactive, scripted, or piped chat; omit the ID for `last`; names and `auto` (newest in the current directory) also work. Saved permissions are never restored; current invocation grants remain. `--resume` already implies `--session`, so passing both explicitly is a harmless no-op confirmation, not an error. |
+| `--name <NAME>` | Name the session using 1–40 letters, digits, `-`, or `_`. Implies `--session`, conflicts with `--no-session`, and renames a resumed session. |
 | `--session` | Explicitly create and autosave a new scripted or piped session. |
 | `--no-session` | Disable conversation snapshots and prompt-history persistence for this chat. |
 | `--allow-turn-errors` | Let a script exit 0 after failed turns/commands; strict nonzero exit is the default. Accepts *partial* success only: if every turn and command failed, the script still exits nonzero. |
+
+
+### Other command flags and arguments
+
+Global flags above remain available. `--json` below means one ordinary JSON
+result; it is separate from the event stream selected by `--jsonl`.
+
+| Command | Flags and arguments |
+| --- | --- |
+| `init` | `--path <PATH>` chooses the new config file (otherwise `--config`, then `./kitsu.toml`). `--json` emits a JSON result. Existing files are never overwritten. |
+| `doctor` | `--online` checks the model catalog; `--inference` sends one potentially billable, tool-free completion. These flags conflict. `--json` emits the report as JSON. |
+| `auth` | `login`, `status`, and `logout` manage the selected gateway's local credential. `--json` works before or after the action. `login --token-stdin` reads a credential from stdin; otherwise login requires hidden terminal input. No secret is accepted as a command-line argument. |
+| `ask <PROMPT>` | Required positional prompt; accepts global flags. It offers no model tools. |
+| `review [PATH]` | Default scope is all working changes. Choose one of `--staged`, `--unstaged`, `--base <REV>`, or `--commit <REV>`. The optional path narrows evidence. `--instructions <TEXT>` adds a focus. `--session` saves a new review, or `--resume [ID]` continues one (default `last`); those two flags conflict. Review offers no tools. |
+| `models [FILTER]` | Optional case-insensitive substring filter. Model discovery depends on the adapter and configured catalog route. |
+| `agents` | `--all` includes stale files from processes that have exited; `--json` emits a JSON listing. Reads local state without contacting a provider. |
+| `artifacts [list]` | List retained command-output generations. `--json` works on the parent or action. |
+| `artifacts prune <ID\|all>` | Remove inactive generations; `--older-than <DURATION>` narrows by age (for example `7d` or `12h`), and `--dry-run` previews without deleting. Live generations are skipped. |
+| `sessions [list [FILTER]]` | List saved sessions, optionally filtered by ID or preview. `--json` is accepted on the parent and all actions below. |
+| `sessions show <ID>` | Show the bounded transcript for an exact ID or `last`. |
+| `sessions resume [ID]` | Default `last`; accepts a name or `auto`. Opens chat on a terminal and prints the exact resume command otherwise. |
+| `sessions fork [ID]` | Default `last`; clone under a fresh ID without carrying permissions. |
+| `sessions export <ID> <DESTINATION>` | Export without overwriting. `--format <markdown\|json>` selects the format; otherwise a `.json` destination chooses JSON, and other names choose Markdown. Artifact sidecars may accompany the export. |
+| `sessions rename <ID> [NAME]` | Set a 1–40 character name (letters, digits, `-`, `_`); omit the name to clear it. ID may also be a current name or `last`. |
+| `sessions archive <ID>` | Move an exact inactive session to recoverable archive storage. |
+| `sessions restore <ID>` | Restore an exact archived session. |
+| `sessions delete <ID>` | Permanently delete an exact inactive live session. |
+
 
 Examples:
 
@@ -706,7 +744,7 @@ kitsu                                                        # interactive chat
 kitsu -p "Summarize the CAP theorem."                       # one prompt, then exit
 KITSU_GATEWAY=ollama KITSU_MODEL=qwen2.5-coder:latest kitsu # reusable local defaults
 kitsu --gateway openai ask "Summarize the CAP theorem."
-kitsu --gateway anthropic --model claude-opus-4-8 ask --max-output-tokens 2000 "..."
+kitsu --gateway anthropic --model YOUR_MODEL_ID ask --max-output-tokens 2000 "..."
 echo "explain this error" | kitsu --gateway ollama chat        # one-shot via stdin
 kitsu --gateway ollama chat "let's pair on a bug"              # interactive
 kitsu --gateway ollama chat --no-tools "draft release notes"  # tool-free chat

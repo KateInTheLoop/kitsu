@@ -2,8 +2,22 @@
 
 A Rust terminal coding agent for hosted gateways and local model servers.
 Use interactive chat, one-shot prompts, or scripts with permission-gated tools,
-resumable sessions, and background agents. Gateway profiles support
-OpenAI-compatible chat completions and the native Anthropic Messages API.
+resumable sessions, and background agents. Connect to **Hugging Face,
+Anthropic, OpenAI-compatible gateways, Ollama, or vLLM** using gateway profiles.
+
+## Choose your provider
+
+| Service | Connection | Setup |
+| --- | --- | --- |
+| Hugging Face (HF) | Inference Providers router | [HF token and profile](docs/usage.md#hugging-face-inference-providers) |
+| Anthropic | Native Messages API | [API key and profile](docs/usage.md#anthropic) |
+| OpenAI or a compatible gateway | Chat Completions API | [OpenAI](docs/usage.md#openai) · [Custom gateway](docs/usage.md#custom--corporate-gateway) |
+| Ollama | Local compatible API | [Start a local model](docs/usage.md#ollama-local) |
+| vLLM | Local or self-hosted compatible API | [Server setup](docs/usage.md#vllm-local--self-hosted) |
+
+The example [`kitsu.toml`](kitsu.toml) includes profiles for all five.
+Select one with `--gateway huggingface`, `anthropic`, `openai`, `ollama`, or
+`vllm`. Model availability and features depend on the selected server.
 
 ## Install
 
@@ -36,13 +50,14 @@ replacing an existing file. Check it with `kitsu --config ./kitsu.toml doctor`.
 The default config location is `~/.kitsu/config.toml`; `--config` or
 `KITSU_CONFIG` selects another file.
 
-With a config loaded, `--gateway local` can discover a model server on the
-standard Ollama, LM Studio, llama.cpp, or vLLM ports. For hosted services, add a
-[gateway profile](docs/usage.md#how-it-works-gateway-profiles) and configure its
-authentication. Credentials belong in the configured environment variable or
-`kitsu auth login`, never in Git.
+`--gateway local` discovers servers on standard local ports. For hosted
+services, follow the provider setup above. Keep credentials in the configured
+environment variable or `kitsu auth login`, never in Git.
 
 ## Everyday commands
+
+These examples use `~/.kitsu/config.toml`; add `--config ./kitsu.toml` to use
+the repository config instead.
 
 ```bash
 kitsu                                  # interactive chat
@@ -55,11 +70,10 @@ kitsu agents                           # inspect published local agent state
 kitsu --help                           # commands and flags
 ```
 
-In chat, use `/help`, `/permissions`, `/diff`, `/review`, `/jobs`, and
-`/context`. Filesystem access requires permission; developer commands are
-opt-in and require Linux containment. Review evidence can be disclosed without
-granting a standing filesystem read root. See the
-[tool and permission reference](docs/usage.md#tools-in-chat).
+In chat, `/help` lists commands, `/jobs` shows background work, and `/context`
+shows context usage. Reads in the launch directory are allowed in interactive
+chat; writes and other paths ask for permission. Developer commands are opt-in
+and require Linux containment. See [tools and permissions](docs/usage.md#tools-in-chat).
 
 `--plain` and `--screen-reader` select literal input and plain output.
 `NO_COLOR` disables styling while retaining interactive editing.
