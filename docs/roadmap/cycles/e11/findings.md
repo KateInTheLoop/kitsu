@@ -518,13 +518,39 @@ future suspend/repaint coordination — not pixel correctness.
 So routing hundreds of writers is **not** required for idle slash output, which
 removes the most expensive branch Q3 threatened.
 
-**The condition, and it matters:** this was measured at idle **in cooked mode**.
-Nothing has entered raw mode for the session yet — rustyline enters it only
-while reading a line — so `ONLCR` is still supplying the carriage return those
-392 writers omit. Once T0-S5d owns stdin in raw mode for the whole session they
-lose it and will staircase, exactly as F14 describes. **The harness must be
-re-run after the input path lands**, and the answer above must not be quoted as
-unconditional.
+**The original condition is DISCHARGED, and replaced — corrected in T3-S10.**
+
+The caveat used to read: this was measured at idle in cooked mode, so the
+harness must be re-run once the input path owns raw mode, and the answer must
+not be quoted as unconditional.
+
+**It was re-run, and this finding did not know for seven cards.** The test is
+`inline_mode_raw_idle_input_does_not_staircase_command_output`
+(`crates/kitsu/tests/tui.rs`, "Test 6. The staircase question, re-asked for raw
+input mode"). The mechanism: `RawStdinGuard::engage` clears only `c_lflag`
+(`ICANON`, `ECHO`, `ISIG`) and **leaves `c_oflag` alone**, so `OPOST`/`ONLCR`
+still supplies the carriage return the direct writers omit. The answer may now
+be quoted for **both cooked and raw idle input**.
+
+Verified in T3-S10 that every `tcsetattr` in the workspace preserves that:
+`RawStdinGuard::engage` (`c_lflag` only), `read_secret_tty` (`ECHO` only), the
+dying-signal handler (restores a snapshot taken *before* raw mode), and the
+in-loop approval read, which reuses `RawStdinGuard` and has no termios of its
+own.
+
+**The condition that IS still live:** the answer depends on nothing in `kitsu`
+ever entering **crossterm's** raw mode, which *does* clear `OPOST`.
+`kitsu_tui::TuiRuntime::enter` calls `crossterm::enable_raw_mode()` and has **no
+caller in `kitsu`** — a standing fact already recorded in `tests/tui.rs`. **The
+day someone wires `TuiRuntime` in, the staircase question reopens for every
+direct writer**, which is also the day N5's title and alt-screen clauses stop
+being vacuous. Both are T5's problem, and they arrive together.
+
+**The count drifts upward and no test asserts it:** 392 when this finding was
+written, **421** in T3-S10 (`eprintln!` 366, `println!` 43, `eprint!` 10,
+`print!` 2, tests excluded). A count assertion was deliberately **not** written —
+see the reasoning in N4's limitation list, since 132 of those sites are on paths
+where no viewport can exist.
 
 
 ## F18 — inline teardown prints the closing summary after releasing the region
@@ -3116,3 +3142,36 @@ for this one line.
 requirement is amended deliberately — the product is not changed incidentally
 to satisfy it.** An implementer forbidden from touching tests must flag the
 conflict, as this one did, rather than resolve it in the product.
+
+## F39 third occurrence — and the first one with a name and a shape
+
+The two earlier occurrences were unidentified, and in both cases the evidence
+was destroyed by how we looked at the output: once by re-running (my mistake),
+once by piping the only copy through `tail`.
+
+T3-S10's implementer hit a third, **and this one is identified**:
+`test_scripted_and_jsonl_runs_are_byte_identical_under_the_default`
+(`crates/kitsu/tests/cli.rs`) failed once in a workspace run, with one side
+producing only `"FOREGROUND_DONE\n"` instead of the full scripted transcript.
+
+**It is a shape, not a mystery.** One side finished and reported before the
+background agent's output had joined, so the comparison ran against a truncated
+transcript — a **join-timing** difference, not a byte-content difference. That is
+a far more actionable description than either earlier occurrence got.
+
+**It handled it correctly**, which is why the diagnosis exists: it did not
+re-run to make it pass. It verified the test passes standalone, verified a
+workspace run with its change **stashed** also passed, and reasoned that the
+code it touched is reachable only from tests (`with_cell_ring` has no production
+caller) so it cannot influence the CLI harness at all.
+
+**What this suggests about the family.** All three occurrences are in suites that
+drive real child processes and wait on asynchronous completion, and this one's
+shape — comparing output before a background contributor has joined — would
+explain an intermittent byte-identity failure without any product defect. The
+earlier two may well be the same thing wearing different names.
+
+**The actionable fix is in the test, not the product:** the byte-identity
+comparison should wait on a completion signal from the background agent rather
+than on the foreground's own done-marker. Worth a small card, and worth checking
+whether the other byte-identity tests share the pattern.

@@ -498,6 +498,43 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   **compile-time** property rather than a runtime guard. The ring is therefore
   **not fed in production until R6's overlay reads it** — feeding an unread ring
   would spend up to ten thousand styled lines of memory for no benefit.
+
+  **The limitation list, added in T3-S10, in descending severity.** N4 calls the
+  ring "the sole source"; these are the ways that is not yet literally true.
+
+  1. **Output that bypasses the surface is permanently absent from the ring, and
+     this is accepted.** There are **421** direct `eprintln!`/`println!` sites in
+     `main.rs`: about **251** are chat-path output a user could reasonably expect
+     in the overlay (`handle_slash` 114, `run_chat` 100, `handle_jobs_command`
+     37), and about **132** are on paths where no viewport can exist at all (the
+     subcommands and scripted runners), so those can never be a gap. **F17**
+     established this is visually harmless — a direct write inherits the parked
+     cursor and the terminal scrolls the region whoever wrote the bytes — so it
+     is a **data-completeness** gap, not a corruption one. `/export` is the route
+     to what the overlay cannot show, the same escape hatch this requirement
+     already names for evicted content.
+
+     **No test asserts the count**, deliberately: a `== 421` assertion fails on
+     every new diagnostic, which is noise rather than protection, and it would
+     make the 132 irrelevant sites indistinguishable from the 251 that matter.
+     The number belongs here; the test belongs on the mechanism.
+
+     The cheap lever, when R6 gives completeness a reader, is to **wrap the slash
+     dispatcher** — one site covering 114 of them — and it should be spent then.
+
+  2. **A block that ends without a newline is retained as a short ring line**,
+     not held back until terminated. The ring is the sole record, so holding a
+     partial back means text already on the terminal is missing from the overlay,
+     and a final partial never terminated would be lost permanently — exactly
+     the shape of **F47**. Retaining it short can split one logical line into two
+     entries: visible, recoverable, never lost.
+
+  3. **(Fixed in T3-S10, recorded because it was nearly shipped.)**
+     `write_block` went *through* the seam and fed the ring **nothing**, because
+     it overrides a trait default that would have forwarded each line to the fed
+     path. It carries the **streamed assistant reply** and every `! error:`
+     notice, so the ring would have held every tool line and no assistant text —
+     the exact inverse of the gap anyone was looking for.
 - **N5** Terminal restore MUST happen on every exit path including panics and
   `SIGINT` (raw mode off, alt screen left, bracketed paste off, title reset).
 
