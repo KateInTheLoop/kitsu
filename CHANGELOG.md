@@ -92,6 +92,20 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- In the agent view, **`r` replies to a blocked agent, `x` stops it (twice; on
+  an already-finished agent the second press prunes it), `n` renames it and `p`
+  marks its result collected.** Each names its outcome, including the failures —
+  replying to an agent that is not blocked, stopping one already finished,
+  acknowledging one with nothing to acknowledge, or an illegal name — and each
+  says so when nothing is selected rather than doing nothing silently.
+- **`x` refuses to prune an agent whose result nobody has read**, tells you the
+  result is waiting, and prunes on the same keystroke once you have peeked it
+  with `Space` or collected it with `p`.
+- **Pasted text is never treated as keystrokes in the agent view.** Inside a
+  name or correction line a paste is content, newlines included, and the line
+  stays open for you to submit. Elsewhere it is ignored, with a line saying how
+  many characters were skipped and how to open a field for them — the text
+  itself is never echoed, since a clipboard may hold a secret.
 - In the agent view, **`↑`/`↓` move the selection**, which now actually works:
   the arrow keys used to close the view and leak their escape sequence into the
   prompt underneath. The selection follows **the agent**, not the row position,

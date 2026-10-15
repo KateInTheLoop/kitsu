@@ -6500,6 +6500,352 @@ fn agent_view_peek_frame(
     )
 }
 
+/// What one of the agent view's action keys did, in the words the overlay
+/// shows (card T4-S4b, requirement A3's `r`, `s`, `x`, `n`, `p`).
+///
+/// Requirement **T2-S5b** — a human must be able to tell *nothing happened*
+/// from *it worked* — is a **wiring** obligation here rather than a registry
+/// change: all five registry calls already answer with distinguishable
+/// outcome enums, and this is the type that must not collapse them into one
+/// line. `changed` is that distinction made machine-readable: `false` is every
+/// "nothing happened" answer, including every refusal.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentViewReport {
+    /// The line the overlay paints under the row list.
+    line: String,
+    /// Whether the registry changed. Every refusal is `false`.
+    changed: bool,
+}
+
+/// `r`: answer the selected agent's parked permission request.
+///
+/// `typed` is the one key the decision read collected, and it is resolved by
+/// [`parse_permission_answer`] — **the** parser, the second one having been
+/// retired to close **F45**. A spelling that parser does not accept is
+/// refused here rather than guessed at.
+#[cfg(unix)]
+fn agent_view_reply(registry: &subagent::AgentRegistry, id: u64, typed: &str) -> AgentViewReport {
+    let Some(decision) = parse_permission_answer(typed) else {
+        // Not guessed at, and nothing is sent: the agent stays blocked, which
+        // is the one state from which the user can still answer it correctly.
+        return AgentViewReport {
+            line: format!(
+                "cannot read {} as an answer for background agent #{id}; press y, a or n",
+                terminal_inline(typed.trim())
+            ),
+            changed: false,
+        };
+    };
+    let outcome = registry.answer(id, decision);
+    AgentViewReport {
+        // The receipt `/jobs reply` prints, not a second wording of it.
+        line: jobs_reply_receipt(id, outcome, decision),
+        changed: matches!(outcome, subagent::AgentAnswerOutcome::Answered),
+    }
+}
+
+/// `s`: steer the selected agent with the line the sub-mode collected.
+///
+/// An empty or whitespace-only correction is a **refusal**, not a no-op:
+/// steering restarts the thread and discards every millisecond it has already
+/// spent, so a blank line must never reach the registry. On success the
+/// receipt is shown — including the progress it discarded.
+#[cfg(unix)]
+fn agent_view_steer(
+    registry: &subagent::AgentRegistry,
+    id: u64,
+    correction: &str,
+) -> AgentViewReport {
+    if correction.trim().is_empty() {
+        // Refused here rather than at the registry: a blank correction would
+        // throw away the thread's progress for nothing. The registry answers
+        // the same `Empty`, so the line is the same either way.
+        return agent_view_steer_report(Err(subagent::thread::AgentSteeringError::new(
+            id,
+            subagent::thread::AgentSteeringErrorKind::Empty,
+            None,
+        )));
+    }
+    agent_view_steer_report(registry.steer(id, correction))
+}
+
+/// `s`'s report, over the registry's own answer.
+///
+/// Split from [`agent_view_steer`] for one reason, and it is the reason this
+/// key is a card of its own: a *steerable* agent is one with a live thread and
+/// an open correction channel (`AgentSteeringErrorKind::Closed` otherwise), so
+/// the success path cannot be reached from a registry a unit test builds with
+/// `start`. The wording is therefore pinned over a receipt, and
+/// `agent_view_steer` is this function applied to `AgentRegistry::steer`.
+#[cfg(unix)]
+fn agent_view_steer_report(
+    outcome: Result<subagent::thread::AgentSteeringReceipt, subagent::thread::AgentSteeringError>,
+) -> AgentViewReport {
+    match outcome {
+        // The registry's own receipt, which is what `/jobs steer` prints: it
+        // already names the restart and the in-flight progress discarded.
+        Ok(receipt) => AgentViewReport {
+            line: format_steering_receipt(&receipt),
+            changed: true,
+        },
+        // And the registry's own words for every refusal, for the same
+        // reason: a second wording of `Closed` would be a second source of
+        // truth about what the key just did.
+        Err(error) => AgentViewReport {
+            line: error.to_string(),
+            changed: false,
+        },
+    }
+}
+
+/// `x`, confirmed: stop a live agent, or prune an already-terminal one.
+///
+/// A3 says *"`x` stop (twice to prune)"* and T4-S4a built the arming whose
+/// second press is `StopPress::Confirmed`. Both are satisfied without a third
+/// press and without changing T4-S4a: stopping an agent that has already
+/// finished is meaningless (`AlreadyTerminal` changes nothing), so the second
+/// press on a finished agent is the prune. It is sequenced as
+/// `stop(id).await` *then* prune, rather than as a phase read followed by a
+/// call, so no agent can finish in the gap between deciding and acting.
+///
+/// One exception, and it is the reason this is not a bare `prune`: pruning
+/// **removes the record**, so pruning an agent whose result nobody has read
+/// yet would destroy it and silence the exit guard
+/// (`take_unobserved_terminal_results` can only see records that exist). An
+/// unviewed result is therefore refused with a report saying so; `Space` or
+/// `p` collects it first.
+#[cfg(unix)]
+async fn agent_view_stop_or_prune(registry: &subagent::AgentRegistry, id: u64) -> AgentViewReport {
+    match registry.stop(id).await {
+        subagent::AgentCancelOutcome::Cancelled(status) => {
+            // The agent the user just stopped by hand: its cancellation is
+            // delivered *here*, on the report line, so the exit guard does
+            // not print it again as an unobserved result at shutdown. This is
+            // custody of the row the key was pressed on and of no other.
+            let _ = registry.acknowledge_result(status.id);
+            AgentViewReport {
+                line: format!("stopped background agent #{}", status.id),
+                changed: true,
+            }
+        }
+        subagent::AgentCancelOutcome::AlreadyTerminal(status) => {
+            // Already finished, so stopping it is meaningless and this press
+            // is the prune A3 asks the second press for -- except when the
+            // result is still waiting. `prune` *removes the record*, and
+            // `take_unobserved_terminal_results` can only report records that
+            // exist, so pruning here would destroy the result and silence the
+            // exit guard with it.
+            if registry.handoff_state(id) == Some(subagent::thread::AgentHandoffState::Ready) {
+                return AgentViewReport {
+                    line: format!(
+                        "background agent #{id} has a result nobody has read; peek it with space or acknowledge it with p, then press x again"
+                    ),
+                    changed: false,
+                };
+            }
+            match registry.prune(id) {
+                subagent::AgentPruneOutcome::Pruned(status) => AgentViewReport {
+                    line: format!(
+                        "pruned background agent #{} ({})",
+                        status.id,
+                        terminal_agent_status_label(&status.status)
+                    ),
+                    changed: true,
+                },
+                // Neither is reachable from the sequencing above -- the record
+                // was terminal under the same lock a moment ago -- but a
+                // report is cheaper than an unwrap.
+                subagent::AgentPruneOutcome::Running => AgentViewReport {
+                    line: format!("background agent #{} is still running", status.id),
+                    changed: false,
+                },
+                subagent::AgentPruneOutcome::NotFound => AgentViewReport {
+                    line: format!("no background job #{id}"),
+                    changed: false,
+                },
+            }
+        }
+        subagent::AgentCancelOutcome::NotFound => AgentViewReport {
+            line: format!("no background job #{id}"),
+            changed: false,
+        },
+    }
+}
+
+/// `n`: name the selected agent. Legality is `AgentRegistry::rename`'s, pinned
+/// by T4-S4a; this is the wiring that makes each of its refusals a line.
+#[cfg(unix)]
+fn agent_view_rename(registry: &subagent::AgentRegistry, id: u64, name: &str) -> AgentViewReport {
+    match registry.rename(id, name) {
+        subagent::AgentRenameOutcome::Renamed { previous } => AgentViewReport {
+            line: match previous {
+                Some(previous) => format!(
+                    "named background agent #{id} {} (was {})",
+                    terminal_inline(name.trim()),
+                    terminal_inline(&previous)
+                ),
+                None => format!(
+                    "named background agent #{id} {}",
+                    terminal_inline(name.trim())
+                ),
+            },
+            changed: true,
+        },
+        // The refusals carry no name: an empty one and a whitespace-only one
+        // are the same refusal, which is `AgentRenameOutcome::Empty`'s own
+        // grouping, and an unprintable one must not be echoed into the paint.
+        subagent::AgentRenameOutcome::Empty => AgentViewReport {
+            line: format!("a name for background agent #{id} cannot be empty"),
+            changed: false,
+        },
+        subagent::AgentRenameOutcome::TooLong { max } => AgentViewReport {
+            line: format!(
+                "a name for background agent #{id} is at most {max} characters; it was not shortened for you"
+            ),
+            changed: false,
+        },
+        subagent::AgentRenameOutcome::Unprintable => AgentViewReport {
+            line: format!(
+                "a name for background agent #{id} cannot carry control characters"
+            ),
+            changed: false,
+        },
+        subagent::AgentRenameOutcome::NotFound => AgentViewReport {
+            line: format!("no background job #{id}"),
+            changed: false,
+        },
+    }
+}
+
+/// `p`: take custody of the selected agent's result. The **deliberate**
+/// exception to T4-S3's rule that peek is the only call site that does.
+#[cfg(unix)]
+fn agent_view_acknowledge(registry: &subagent::AgentRegistry, id: u64) -> AgentViewReport {
+    match registry.acknowledge_result(id) {
+        subagent::AgentHandoffAckOutcome::Acknowledged => AgentViewReport {
+            line: format!("acknowledged background agent #{id}'s result"),
+            changed: true,
+        },
+        subagent::AgentHandoffAckOutcome::AlreadyAcknowledged => AgentViewReport {
+            line: format!("background agent #{id}'s result was already collected"),
+            changed: false,
+        },
+        subagent::AgentHandoffAckOutcome::NotReady => AgentViewReport {
+            line: format!("background agent #{id} has no result to acknowledge yet"),
+            changed: false,
+        },
+        subagent::AgentHandoffAckOutcome::NotFound => AgentViewReport {
+            line: format!("no background job #{id}"),
+            changed: false,
+        },
+    }
+}
+
+/// Any action key pressed with **no selection at all** — an empty view, or one
+/// whose rows the filter took away.
+///
+/// Its own report rather than a silent nothing, for the reason T4-S4a gave
+/// `press_stop` a `NoSelection` answer: a key that looks broken is worse than
+/// a key that says there is nothing to act on.
+#[cfg(unix)]
+fn agent_view_no_selection(key: char) -> AgentViewReport {
+    AgentViewReport {
+        line: format!("no agent is selected, so `{key}` has nothing to act on"),
+        changed: false,
+    }
+}
+
+/// What one chunk of bytes did to the steer line (card T4-S4b).
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))] // Bound by T4-S4b's loop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SteerLineStep {
+    /// Still editing: repaint the echo and the caret.
+    Editing,
+    /// `Enter` outside a paste: send this correction.
+    Submit(String),
+    /// A resolved lone `Esc`: leave the line, send nothing.
+    Cancelled,
+}
+
+/// `s`'s text sub-mode: a line of text collected inside the overlay.
+///
+/// # Where the input lives, and why
+///
+/// It is `kitsu-editor`'s [`kitsu_editor::TypeaheadEditor`], driven from here.
+/// `kitsu-tui` depends on `kitsu-render` alone and cannot reach the editor —
+/// but the overlay's loop lives in this file, which does depend on it, so the
+/// editor is reusable exactly where the bytes are read. The alternative was a
+/// second line editor inside `kitsu-tui`, which would have had to re-solve
+/// split UTF-8, bracketed paste and the `ESC` ambiguity of **F65** — a second
+/// parser of the same bytes, which is what **F45** was closed by removing.
+/// `kitsu-tui` keeps the *painting* (`agents_view::steer_prompt_rows`); this
+/// keeps the editing; neither grows a copy of the other.
+///
+/// # `ESC`
+///
+/// It **cancels the line**, sending nothing, and it inherits T4-S4a's 50 ms
+/// grace: inside this overlay `Esc` already means *step back out of the frame
+/// you are in* (the help, a peek, the view), and the steer line is one more
+/// frame. The grace is what keeps an arrow key from reading as a cancel —
+/// **F65**, met again by a sub-mode that reads arbitrary bytes.
+///
+/// # A newline inside a paste
+///
+/// **Content.** T4-S2 decided a prefix byte inside a paste is content, and the
+/// editor already holds that line for newlines: a bracketed paste never
+/// submits. The `Enter` that submits is one typed outside a paste.
+#[cfg(unix)]
+// Bound to `s` by T4-S4b's loop; the fields are read by `SteerLine`'s own
+// methods, which are stubs until card T4-S4b-ii drives the editor from them:
+// bound by T4-S4b-ii.
+#[allow(dead_code)]
+struct SteerLine {
+    editor: kitsu_editor::TypeaheadEditor,
+    id: u64,
+}
+
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))] // Bound to `s` by T4-S4b's loop.
+impl SteerLine {
+    /// A fresh, empty line for one agent. No history: the agent view's steer
+    /// line is not the composer, and recalling a prompt into a correction
+    /// would be a surprise with a real effect.
+    fn new(id: u64) -> Self {
+        let _ = id;
+        unimplemented!("card T4-S4b: the steer line")
+    }
+
+    /// Which agent this line will steer, fixed when the line opened rather
+    /// than re-read from the selection on submit: a repaint may have moved it.
+    fn id(&self) -> u64 {
+        unimplemented!("card T4-S4b: the steer line")
+    }
+
+    /// The echo, for `agents_view::steer_prompt_rows`.
+    fn draft(&self) -> String {
+        unimplemented!("card T4-S4b: the steer line")
+    }
+
+    /// The caret, as a char offset into [`SteerLine::draft`].
+    fn cursor(&self) -> usize {
+        unimplemented!("card T4-S4b: the steer line")
+    }
+
+    /// Feed one chunk of raw bytes.
+    fn feed(&mut self, bytes: &[u8]) -> SteerLineStep {
+        let _ = bytes;
+        unimplemented!("card T4-S4b: the steer line")
+    }
+
+    /// What the overlay does when the grace expires with no byte waiting: a
+    /// held `ESC` was the `Esc` key.
+    fn quiet_tick(&mut self) -> SteerLineStep {
+        unimplemented!("card T4-S4b: the steer line")
+    }
+}
+
 /// How long the overlay waits for the rest of an escape sequence before it
 /// treats a trailing `ESC` byte as the `Esc` key.
 ///
@@ -6525,17 +6871,29 @@ enum OverlayPending {
 }
 
 /// One key the agent view understands, decoded from the byte stream.
+///
+/// A printable byte is reported as the character it is rather than as a named
+/// key, because the same byte means two things depending on the frame: `n` is
+/// *rename* over the row list and the letter `n` inside a name. Which it is
+/// belongs to the loop, which knows the frame; the decoder's job is the one
+/// thing a `match` on bytes cannot do at the call site -- telling `Esc` from
+/// the first byte of an arrow (card T4-S4a, finding F65).
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OverlayKey {
-    Help,
-    Peek,
     Up,
     Down,
     /// A resolved `Esc`: step back out of the frame on screen.
     StepBack,
-    /// `q`, the conventional synonym for closing outright.
-    Close,
+    /// `Enter`: submit whatever prompt is open. Inert over the row list.
+    Enter,
+    /// `Backspace` or `Delete`: take a character back out of a prompt.
+    Backspace,
+    /// One printable ASCII character. Non-ASCII bytes are dropped: the view's
+    /// prompts are a name and a correction typed into an overlay that paints
+    /// plain ASCII rows, and a half-decoded UTF-8 character has no business
+    /// reaching either (`kitsu-editor` owns that problem for the composer).
+    Char(char),
 }
 
 /// Decode a chunk of raw bytes into the keys the overlay acts on, carrying
@@ -6560,9 +6918,9 @@ fn decode_overlay_keys(bytes: &[u8], pending: &mut OverlayPending) -> Vec<Overla
     }
     fn plain(byte: u8) -> Option<OverlayKey> {
         match byte {
-            b'?' => Some(OverlayKey::Help),
-            b' ' => Some(OverlayKey::Peek),
-            b'q' => Some(OverlayKey::Close),
+            b'\r' | b'\n' => Some(OverlayKey::Enter),
+            0x7f | 0x08 => Some(OverlayKey::Backspace),
+            0x20..=0x7e => Some(OverlayKey::Char(byte as char)),
             _ => None,
         }
     }
@@ -6607,6 +6965,312 @@ fn decode_overlay_keys(bytes: &[u8], pending: &mut OverlayPending) -> Vec<Overla
         }
     }
     keys
+}
+
+/// One thing the overlay found in a chunk of raw bytes: a **keystroke**, or a
+/// **paste** — text that arrived as a burst and is therefore content, never a
+/// command (finding **F68**).
+///
+/// # Why a second decoded form at all
+///
+/// [`decode_overlay_keys`] answers "what keys are in these bytes", which is
+/// the right question for `↑`, `Esc` and `?` — and the wrong one the moment a
+/// key has an effect. `r` then `y` answers a pending permission and `x` twice
+/// stops an agent, so a chunk of pasted prose containing those letters would
+/// *act*: **a chunk of bytes is not a sequence of intentions**, which is
+/// **F65**'s root with the opposite sign.
+///
+/// Pasted text is recognised two ways, because one of them is not always
+/// available:
+///
+/// 1. **Bracketed paste.** The overlay owns the terminal while it is up and
+///    already writes its own control sequences there, so it enables `ESC[?2004h`
+///    on entry and disables it on exit, exactly as the inline reader does
+///    outside rustyline (`tui_bridge`'s `KeyFilter`). The payload between
+///    `ESC[200~` and `ESC[201~` is one [`OverlayInput::Paste`], and the block
+///    may be split across reads, so the state rides in `pending`.
+/// 2. **A burst, with no brackets.** A terminal that does not report pastes
+///    delivers them as plain bytes, so a chunk carrying **more than one**
+///    printable character or newline is a burst and not typing: no human
+///    produces two printable keystrokes in one read. That chunk is one
+///    `Paste` too, carrying its text.
+///
+/// Everything else is unchanged: one printable byte is one `Key`, and `ESC`'s
+/// pending state and its 50 ms lone-`Esc` grace (**F65**, card T4-S4a) are
+/// untouched — a chunk that is exactly one arrow is still one `Key`.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OverlayInput {
+    Key(OverlayKey),
+    /// Burst text, verbatim and newlines included.
+    Paste(String),
+}
+
+/// The overlay's byte decoder, carrying everything that cannot be decided
+/// from one chunk: the `ESC` ambiguity of **F65**, a bracketed-paste block in
+/// progress, and a delimiter split across two reads.
+///
+/// It is a struct rather than [`decode_overlay_keys`]'s `&mut OverlayPending`
+/// because a paste block has *text* in flight, not just a state — the same
+/// reason `tui_bridge::KeyFilter` holds `held` bytes.
+///
+/// This replaces [`decode_overlay_keys`] at the overlay's read site: the loop
+/// must route a `Paste` as text, which means **content** inside a text prompt
+/// (newline and all — a paste never submits, `kitsu-editor`'s line and
+/// T4-S2's) and **nothing at all** over the row list or inside `r`'s decision
+/// read, where a paste has no meaning and acting on it would be a privileged
+/// action the user never asked for.
+#[cfg(unix)]
+struct OverlayDecoder {
+    pending: OverlayPending,
+    /// The parameter and intermediate bytes of the CSI sequence in progress,
+    /// which is the whole reason this is a struct and not a `Copy` enum: the
+    /// difference between an arrow and a paste delimiter is `200`/`201`
+    /// *before* the final `~`, and a read can cut a delimiter anywhere.
+    ///
+    /// Recognising the delimiters inside the CSI state is deliberate. The
+    /// obvious alternative — holding a partial `ESC[200~` prefix — would
+    /// silently kill **F65**'s lone-`ESC` grace, because `ESC` alone is a
+    /// strict prefix of `ESC[200~`: a held `ESC` would stop being observable
+    /// as a pending `Esc` and the key would stop working.
+    csi: Vec<u8>,
+    /// The payload of the bracketed-paste block in progress, if one is open.
+    /// A block may span reads, so the text rides here until `ESC[201~`.
+    pasting: Option<Vec<u8>>,
+}
+
+#[cfg(unix)]
+impl OverlayDecoder {
+    /// The bracketed-paste delimiters' CSI parameters: `ESC[200~` opens a
+    /// pasted block and `ESC[201~` closes it.
+    const PASTE_START_PARAMS: &'static [u8] = b"200";
+    const PASTE_END_PARAMS: &'static [u8] = b"201";
+
+    fn new() -> Self {
+        Self {
+            pending: OverlayPending::None,
+            csi: Vec::new(),
+            pasting: None,
+        }
+    }
+
+    /// One `read` of the descriptor.
+    ///
+    /// Each byte is handed to [`decode_overlay_keys`], which stays the single
+    /// authority on the `ESC`/CSI/SS3 transitions and on what a plain byte
+    /// means (finding **F45**: one parser, not two). What this adds around it
+    /// is the one thing keys cannot express — *where the human's intent
+    /// ended*:
+    ///
+    /// * the CSI parameters are observed as they go by, so `ESC[200~` and
+    ///   `ESC[201~` are recognised without a second state machine and without
+    ///   holding an `ESC` prefix;
+    /// * bytes inside an open block are payload, not keys;
+    /// * and a chunk that yields more than one printable key or newline is a
+    ///   burst on a terminal that does not report pastes, so it collapses into
+    ///   one [`OverlayInput::Paste`] carrying its text.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<OverlayInput> {
+        let mut inputs: Vec<OverlayInput> = Vec::new();
+        for &byte in bytes {
+            // Payload: inside an open block every byte is text. `ESC` is the
+            // exception, because the closing delimiter starts with one.
+            if self.pasting.is_some() && self.pending == OverlayPending::None && byte != 0x1b {
+                if let Some(text) = self.pasting.as_mut() {
+                    text.push(byte);
+                }
+                continue;
+            }
+            let was = self.pending;
+            let keys = decode_overlay_keys(&[byte], &mut self.pending);
+            let mut delimiter = false;
+            match was {
+                // `ESC [`: a CSI sequence begins, so its parameters do too.
+                OverlayPending::Escape if byte == b'[' => self.csi.clear(),
+                OverlayPending::Csi => {
+                    if self.pending == OverlayPending::Csi {
+                        // Still a parameter or intermediate byte.
+                        self.csi.push(byte);
+                    } else if byte == b'~' {
+                        delimiter = match self.csi.as_slice() {
+                            Self::PASTE_START_PARAMS => {
+                                self.pasting = Some(Vec::new());
+                                true
+                            }
+                            Self::PASTE_END_PARAMS => {
+                                if let Some(text) = self.pasting.take() {
+                                    // Lossy: the payload is whatever the
+                                    // terminal sent, and a prompt echoing
+                                    // plain ASCII rows is no place for a
+                                    // half-decoded character.
+                                    inputs.push(OverlayInput::Paste(
+                                        String::from_utf8_lossy(&text).into_owned(),
+                                    ));
+                                }
+                                true
+                            }
+                            _ => false,
+                        };
+                        self.csi.clear();
+                    } else {
+                        self.csi.clear();
+                    }
+                }
+                _ => {}
+            }
+            // A delimiter yields no keys anyway (`~` is not an arrow); an
+            // `ESC` sequence *inside* a block is not content either, and its
+            // keys are not the user's keystrokes, so neither is forwarded.
+            if !delimiter && self.pasting.is_none() {
+                inputs.extend(keys.into_iter().map(OverlayInput::Key));
+            }
+        }
+        Self::collapse_a_burst(inputs)
+    }
+
+    /// The unbracketed half of the rule: a terminal with no paste reporting
+    /// delivers a paste as plain bytes, so a chunk carrying **more than one**
+    /// printable character or newline is a burst and not typing — no human
+    /// produces two printable keystrokes inside one `read`.
+    ///
+    /// The heuristic is deliberately one-sided. Its false positive is a very
+    /// fast typist whose two keys land in one read, and then the keys are
+    /// dropped rather than acted on; its false negative would be a paste
+    /// executed as privileged actions, which is finding **F68** itself. The
+    /// dropped case is reported on screen by the loop, so "nothing happened"
+    /// is still distinguishable from "it worked" (requirement T2-S5b).
+    fn collapse_a_burst(inputs: Vec<OverlayInput>) -> Vec<OverlayInput> {
+        let text_key = |input: &OverlayInput| {
+            matches!(
+                input,
+                OverlayInput::Key(OverlayKey::Char(_)) | OverlayInput::Key(OverlayKey::Enter)
+            )
+        };
+        if inputs.iter().filter(|input| text_key(input)).count() < 2 {
+            return inputs;
+        }
+        let first = inputs
+            .iter()
+            .position(text_key)
+            .expect("a counted text key has a position");
+        let burst: String = inputs
+            .iter()
+            .filter_map(|input| match input {
+                OverlayInput::Key(OverlayKey::Char(typed)) => Some(*typed),
+                OverlayInput::Key(OverlayKey::Enter) => Some('\n'),
+                _ => None,
+            })
+            .collect();
+        let bracketed = |input: &&OverlayInput| matches!(input, OverlayInput::Paste(_));
+        let mut collapsed: Vec<OverlayInput> = inputs
+            .iter()
+            .take(first)
+            .filter(bracketed)
+            .cloned()
+            .collect();
+        collapsed.push(OverlayInput::Paste(burst));
+        collapsed.extend(inputs.iter().skip(first).filter(bracketed).cloned());
+        collapsed
+    }
+
+    /// Whether a lone `ESC` is held, still ambiguous — the question the 50 ms
+    /// grace answers (**F65**, card T4-S4a). A chunk that ends inside a paste
+    /// block or part-way through a delimiter is **not** a held `Esc`.
+    fn escape_pending(&self) -> bool {
+        self.pending == OverlayPending::Escape && self.pasting.is_none()
+    }
+
+    /// The grace expired with nothing waiting: the held `ESC` was the `Esc`
+    /// key, and the caller is about to act on it.
+    fn resolve_escape(&mut self) {
+        self.pending = OverlayPending::None;
+    }
+}
+
+/// The prompt the overlay has open, if any (card T4-S4b). A prompt is the
+/// innermost frame of the view: `Esc` leaves it before it leaves the help, a
+/// peek or the view itself.
+#[cfg(unix)]
+enum OverlayPrompt {
+    /// `r`: a **decision read**, not a text prompt. One key, resolved by
+    /// [`parse_permission_answer`] -- the one parser (finding F45).
+    Decision(u64),
+    /// A line of text: `n`'s name, or `s`'s correction.
+    Text {
+        id: u64,
+        kind: OverlayTextPrompt,
+        draft: String,
+    },
+}
+
+/// Which line of text a [`OverlayPrompt::Text`] is collecting.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverlayTextPrompt {
+    Rename,
+    Steer,
+}
+
+#[cfg(unix)]
+impl OverlayPrompt {
+    /// The prompt as the one report row the frame has room for. The draft is
+    /// echoed with no caret because both prompts append at the end: there is
+    /// nowhere else the next character could go. Card T4-S4b-ii replaces `s`'s
+    /// line with `agents_view::steer_prompt_rows` and a real caret over
+    /// `kitsu-editor`; until then this is the whole echo, and it is honest
+    /// about the way out.
+    fn report_line(&self) -> String {
+        match self {
+            Self::Decision(id) => format!(
+                "reply to background agent #{id}: y allow once, a allow always, n deny (esc cancels)"
+            ),
+            Self::Text {
+                id,
+                kind: OverlayTextPrompt::Rename,
+                draft,
+            } => format!("name background agent #{id}: {draft} (enter applies, esc cancels)"),
+            Self::Text {
+                id,
+                kind: OverlayTextPrompt::Steer,
+                draft,
+            } => format!("steer background agent #{id}: {draft} (enter sends, esc cancels)"),
+        }
+    }
+}
+
+/// Await one of the registry's `async` actions from the overlay's synchronous
+/// key loop.
+///
+/// `AgentRegistry::stop` is `async` and this loop is not, and the overlay has
+/// **two** call sites with different contexts: the inline reader's, which runs
+/// off the runtime, and `handle_jobs_command`'s, which is an `async fn` and so
+/// runs *on* a runtime worker. A bare `Handle::block_on` panics on the second
+/// and `block_in_place` panics when there is no multi-threaded runtime around
+/// at all, so neither is right for both. Driving the future on a thread of its
+/// own is: the future leaves whichever thread it was called from, this one
+/// blocks on the join, and the result is the same in both contexts. The work
+/// the future awaits (an aborted task's `JoinHandle`) is driven by the
+/// runtime that owns it, which is still running on its other workers.
+#[cfg(unix)]
+fn overlay_block_on<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => std::thread::scope(|scope| {
+            scope
+                .spawn(|| handle.block_on(future))
+                .join()
+                .expect("the agent view's action thread")
+        }),
+        // No runtime in sight (a test, or a carrier that never built one): one
+        // current-thread runtime for the duration of this one action.
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime for one agent view action")
+            .block_on(future),
+    }
 }
 
 /// Whether stdin has a byte waiting within `timeout`.
@@ -6692,7 +7356,18 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
     let mut err = std::io::stderr();
     // Enter, clear, and hide the cursor: the view has no caret of its own, and
     // a cursor parked on a painted row reads as a prompt that is not there.
-    let _ = err.write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l");
+    // Bracketed paste on with the screen: the payload then arrives wrapped
+    // in `ESC[200~`/`ESC[201~`, which is how [`OverlayDecoder`] tells a paste
+    // from typing without guessing (finding **F68**). The idle reader's
+    // `RawStdinGuard` has already enabled it when it owns raw mode, and this
+    // guard's own `engage` does when the overlay owns it, so this is a
+    // belt-and-braces statement of the mode by the surface that depends on
+    // it; terminals without support ignore the sequence.
+    //
+    // It is deliberately **not** disabled on the way out: the composer
+    // underneath needs it on, and whichever `RawStdinGuard` owns the terminal
+    // turns it off in its `Drop` when stdin goes back to rustyline.
+    let _ = err.write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h");
     let _ = err.flush();
 
     // Which frame is on screen. `?` is help and `Esc` steps back out of it,
@@ -6706,9 +7381,15 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
     // rows regroup under it; the sync acknowledges nothing, and neither does
     // painting the mark.
     let mut selection = kitsu_tui::agents_view::AgentSelection::new();
+    // What the last action key did, and the prompt one of them has open
+    // (card T4-S4b). Both are painted as the one report row under the rows:
+    // a key that acts silently is indistinguishable from a key that failed
+    // (requirement T2-S5b).
+    let mut report: Option<String> = None;
+    let mut prompt: Option<OverlayPrompt> = None;
     let mut stdin = std::io::stdin();
     let mut buffer = [0u8; 256];
-    let mut pending = OverlayPending::None;
+    let mut decoder = OverlayDecoder::new();
     loop {
         let view_rows = agent_view_rows(registry);
         selection.sync(&view_rows);
@@ -6717,10 +7398,17 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
         } else if let Some(panel) = peeking.as_ref() {
             panel.clone()
         } else {
-            kitsu_tui::agents_view::overlay_rows_selected(
+            // An open prompt owns the report row; otherwise the last action's
+            // report has it.
+            let line = match prompt.as_ref() {
+                Some(open) => Some(open.report_line()),
+                None => report.clone(),
+            };
+            kitsu_tui::agents_view::overlay_rows_with_report(
                 view_rows.clone(),
                 cols as usize,
                 selection.selected(),
+                line.as_deref(),
             )
         };
         // Repainted whole, with absolute addressing, and never into the last
@@ -6741,11 +7429,14 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
         // is what tells the two apart — the same answer T4-S2 gave at the
         // idle composer, where a lone `ESC` stays pending until the next byte
         // and is resolved on a quiet tick.
-        if pending == OverlayPending::Escape && !stdin_waiting(ESC_SEQUENCE_GRACE) {
-            pending = OverlayPending::None;
-            // A real `Esc`: step back out of the help, out of a peek, or out
-            // of the view.
-            if helping {
+        if decoder.escape_pending() && !stdin_waiting(ESC_SEQUENCE_GRACE) {
+            decoder.resolve_escape();
+            // A real `Esc`: step back out of a prompt, out of the help, out of
+            // a peek, or out of the view.
+            if prompt.is_some() {
+                prompt = None;
+                report = None;
+            } else if helping {
                 helping = false;
             } else if peeking.is_some() {
                 peeking = None;
@@ -6766,51 +7457,217 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
             Err(_) => break,
         };
         let mut closing = false;
-        for key in decode_overlay_keys(&buffer[..count], &mut pending) {
-            match key {
-                OverlayKey::Help => helping = true,
-                // Space: peek the selected agent. The byte is the view's and
-                // goes no further — nothing is forwarded to the composer
-                // underneath, and it is not an exit either (test T4-S3a).
-                // With no rows there is nothing to peek and the frame is
-                // unchanged. Peeking is the only read here that acknowledges a
-                // handoff; painting rows and moving the selection do not.
-                OverlayKey::Peek => {
-                    if !helping && peeking.is_none() {
-                        if let Some(id) = selection.selected() {
-                            peeking = agent_view_peek_frame(registry, id, cols as usize);
+        for input in decoder.feed(&buffer[..count]) {
+            // A prompt is taken out of the state for the duration of the key
+            // and put back if it is still open afterwards: that is what lets
+            // each arm close it without holding a borrow of it.
+            //
+            // Pasted text is routed before any of that, because a paste is
+            // **content and never a command** (finding **F68**): it fills a
+            // text prompt's draft, newline included and without submitting,
+            // and it means nothing at all over the row list or inside `r`'s
+            // decision read.
+            let key = match input {
+                OverlayInput::Key(key) => key,
+                OverlayInput::Paste(text) => {
+                    match prompt.take() {
+                        Some(OverlayPrompt::Text {
+                            id,
+                            kind,
+                            mut draft,
+                        }) => {
+                            draft.push_str(&text);
+                            prompt = Some(OverlayPrompt::Text { id, kind, draft });
+                        }
+                        // The read stays open rather than resolving to a
+                        // pasted letter: `r` then a pasted `y` would approve
+                        // a filesystem write nobody approved. The open read
+                        // owns the report row, so it keeps saying what it
+                        // wants and nothing is lost by staying quiet here.
+                        Some(OverlayPrompt::Decision(id)) => {
+                            prompt = Some(OverlayPrompt::Decision(id));
+                        }
+                        // Over the row list the paste is dropped — and said
+                        // so. A key that acts silently is indistinguishable
+                        // from one that failed (requirement T2-S5b), and the
+                        // unbracketed-burst rule has a false positive (a fast
+                        // typist's two keys in one read), so the one case a
+                        // user cannot otherwise explain is exactly this one.
+                        // The count is reported and the text is not: it is
+                        // the user's clipboard, not the view's to paint.
+                        None => {
+                            report = Some(format!(
+                                "ignored a paste of {} characters: pasted text is not keys here, \
+                                 so open a line first (n names, s steers)",
+                                text.chars().count()
+                            ));
                         }
                     }
+                    continue;
                 }
-                // The arrows move the selection and nothing else: they are
-                // not an exit, and no byte of their escape sequence reaches
-                // the composer underneath. They clamp rather than wrap, and
-                // they are inert while the help or a peek panel is up, where
-                // there is no row list on screen to move over.
-                OverlayKey::Up => {
-                    if !helping && peeking.is_none() {
-                        selection.move_up(&view_rows);
+            };
+            match prompt.take() {
+                // `r`'s decision read: the next key is the answer, and
+                // `parse_permission_answer` is what reads it.
+                Some(OverlayPrompt::Decision(id)) => match key {
+                    OverlayKey::StepBack => report = None,
+                    OverlayKey::Char(typed) => {
+                        report = Some(agent_view_reply(registry, id, &typed.to_string()).line);
                     }
-                }
-                OverlayKey::Down => {
-                    if !helping && peeking.is_none() {
-                        selection.move_down(&view_rows);
+                    // An arrow or an Enter inside the read is neither an
+                    // answer nor a cancel, so the read stays open rather than
+                    // resolving to a guess.
+                    OverlayKey::Up
+                    | OverlayKey::Down
+                    | OverlayKey::Enter
+                    | OverlayKey::Backspace => prompt = Some(OverlayPrompt::Decision(id)),
+                },
+                // A line of text: `n`'s name or `s`'s correction.
+                Some(OverlayPrompt::Text {
+                    id,
+                    kind,
+                    mut draft,
+                }) => match key {
+                    OverlayKey::StepBack => report = None,
+                    OverlayKey::Enter => {
+                        report = Some(
+                            match kind {
+                                OverlayTextPrompt::Rename => {
+                                    agent_view_rename(registry, id, &draft)
+                                }
+                                OverlayTextPrompt::Steer => agent_view_steer(registry, id, &draft),
+                            }
+                            .line,
+                        );
                     }
-                }
-                // Esc, resolved as a real key press rather than as the start
-                // of a sequence: out of the help if it is showing, out of a
-                // peek panel if one is up, out of the view otherwise. `q` is
-                // the conventional synonym for the latter.
-                OverlayKey::StepBack => {
-                    if helping {
-                        helping = false;
-                    } else if peeking.is_some() {
-                        peeking = None;
-                    } else {
-                        closing = true;
+                    OverlayKey::Backspace => {
+                        draft.pop();
+                        prompt = Some(OverlayPrompt::Text { id, kind, draft });
                     }
-                }
-                OverlayKey::Close => closing = true,
+                    OverlayKey::Char(typed) => {
+                        draft.push(typed);
+                        prompt = Some(OverlayPrompt::Text { id, kind, draft });
+                    }
+                    // The arrows do not edit this line: there is no caret to
+                    // move, and moving the selection under an open prompt
+                    // would retarget it.
+                    OverlayKey::Up | OverlayKey::Down => {
+                        prompt = Some(OverlayPrompt::Text { id, kind, draft });
+                    }
+                },
+                None => match key {
+                    // Esc, resolved as a real key press rather than as the
+                    // start of a sequence: out of the help if it is showing,
+                    // out of a peek panel if one is up, out of the view
+                    // otherwise. `q` is the conventional synonym for the
+                    // latter.
+                    OverlayKey::StepBack => {
+                        if helping {
+                            helping = false;
+                        } else if peeking.is_some() {
+                            peeking = None;
+                        } else {
+                            closing = true;
+                        }
+                    }
+                    // The arrows move the selection and nothing else: they are
+                    // not an exit, and no byte of their escape sequence
+                    // reaches the composer underneath. They clamp rather than
+                    // wrap, and they are inert while the help or a peek panel
+                    // is up, where there is no row list on screen to move
+                    // over.
+                    OverlayKey::Up => {
+                        if !helping && peeking.is_none() {
+                            selection.move_up(&view_rows);
+                        }
+                    }
+                    OverlayKey::Down => {
+                        if !helping && peeking.is_none() {
+                            selection.move_down(&view_rows);
+                        }
+                    }
+                    // Enter and Backspace belong to the prompts; over the row
+                    // list there is nothing for them to do, and they must not
+                    // reach the composer underneath either.
+                    OverlayKey::Enter | OverlayKey::Backspace => {}
+                    OverlayKey::Char('?') => helping = true,
+                    OverlayKey::Char('q') => closing = true,
+                    // Space: peek the selected agent. The byte is the view's
+                    // and goes no further -- nothing is forwarded to the
+                    // composer underneath, and it is not an exit either (test
+                    // T4-S3a). With no rows there is nothing to peek and the
+                    // frame is unchanged. Peeking is the only *read* here that
+                    // acknowledges a handoff; painting rows and moving the
+                    // selection do not, and neither do `r`, `x` and `n`.
+                    OverlayKey::Char(' ') => {
+                        if !helping && peeking.is_none() {
+                            selection.disarm();
+                            if let Some(id) = selection.selected() {
+                                peeking = agent_view_peek_frame(registry, id, cols as usize);
+                            }
+                        }
+                    }
+                    // The action keys (card T4-S4b, requirement A3). Every one
+                    // of them acts on the selected agent and reports what it
+                    // did, including when there is nothing selected: a key
+                    // that looks broken is worse than one that says so. They
+                    // are inert while the help or a peek panel is up, like the
+                    // arrows, because the selected row is not on screen there.
+                    //
+                    // Each of them is also a keystroke that is not `x`, so
+                    // each disarms a half-pressed stop (T4-S4a).
+                    OverlayKey::Char(pressed @ ('r' | 's' | 'n' | 'p')) => {
+                        if !helping && peeking.is_none() {
+                            selection.disarm();
+                            match selection.selected() {
+                                None => report = Some(agent_view_no_selection(pressed).line),
+                                Some(id) => match pressed {
+                                    'r' => prompt = Some(OverlayPrompt::Decision(id)),
+                                    's' => {
+                                        prompt = Some(OverlayPrompt::Text {
+                                            id,
+                                            kind: OverlayTextPrompt::Steer,
+                                            draft: String::new(),
+                                        });
+                                    }
+                                    'n' => {
+                                        prompt = Some(OverlayPrompt::Text {
+                                            id,
+                                            kind: OverlayTextPrompt::Rename,
+                                            draft: String::new(),
+                                        });
+                                    }
+                                    _ => {
+                                        report = Some(agent_view_acknowledge(registry, id).line);
+                                    }
+                                },
+                            }
+                        }
+                    }
+                    // `x` is two presses: the first arms, the second stops a
+                    // live agent and prunes an already-terminal one. The
+                    // arming is T4-S4a's and is not changed here; what the
+                    // confirmation *does* was never pinned, and this is it.
+                    OverlayKey::Char('x') => {
+                        if !helping && peeking.is_none() {
+                            let armed_on = selection.selected();
+                            report = match selection.press_stop() {
+                                kitsu_tui::agents_view::StopPress::Armed => armed_on.map(|id| {
+                                    format!("press x again to stop background agent #{id}")
+                                }),
+                                kitsu_tui::agents_view::StopPress::Confirmed(id) => Some(
+                                    overlay_block_on(agent_view_stop_or_prune(registry, id)).line,
+                                ),
+                                kitsu_tui::agents_view::StopPress::NoSelection => {
+                                    Some(agent_view_no_selection('x').line)
+                                }
+                            };
+                        }
+                    }
+                    // Every other printable byte is the view's and goes no
+                    // further: the overlay owns the keyboard while it is up.
+                    OverlayKey::Char(_) => {}
+                },
             }
         }
         if closing {
@@ -29230,6 +30087,1202 @@ mod tests {
             registry.take_unobserved_terminal_results().is_empty(),
             "POSITIVE CONTROL: the guard does let a collected result go, so \
              the assertion above is about the rename"
+        );
+    }
+    // --- card T4-S4b: the action keys `r`, `s`, `x`, `n`, `p` ---
+    //
+    // Pinned at unit level against a real `AgentRegistry` for T4-S3's and
+    // T4-S4a's reason, which has not changed: a fixture PTY session has zero
+    // agents, so every key bound to "the selected agent" would answer the
+    // no-selection case there. The PTY answers routing only.
+
+    /// Card T4-S4b, the `r` key: **a decision read, not a text prompt**, and
+    /// the decision is resolved by `parse_permission_answer` — *the* parser,
+    /// the second one having been retired to close **F45**.
+    ///
+    /// That the key really goes through that parser is pinned by behaviour
+    /// rather than by inspection: for every spelling the parser accepts, the
+    /// decision the gate receives is the one the parser returns for it. A key
+    /// with its own little match would have to agree with the parser on all
+    /// six, including `yes`/`always`/`no`, which no single keystroke produces
+    /// and a hand-rolled reader would therefore not bother with.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replying_to_the_selected_agent_reads_a_decision_through_the_one_shared_parser() {
+        let mut lines = Vec::new();
+        for spelling in ["y", "yes", "a", "always", "n", "no"] {
+            let expected = parse_permission_answer(spelling)
+                .unwrap_or_else(|| panic!("NON-VACUOUS: the shared parser accepts {spelling:?}"));
+            let (registry, id, answer) = registry_with_one_blocked_agent().await;
+            let report = agent_view_reply(&registry, id, spelling);
+            assert!(
+                report.changed,
+                "`r` with {spelling:?} answered the agent, so something changed: \
+                 {report:?}"
+            );
+            assert_eq!(
+                answer.await.expect("the gate is resolved"),
+                expected,
+                "the gate receives exactly the decision the shared parser \
+                 returns for {spelling:?}"
+            );
+            assert_no_debug_leak(&report.line);
+            lines.push(report.line);
+        }
+
+        // A spelling the parser refuses is refused here too, and the agent is
+        // left blocked rather than answered with a guess.
+        let (registry, id, answer) = registry_with_one_blocked_agent().await;
+        assert!(
+            parse_permission_answer("maybe").is_none(),
+            "NON-VACUOUS: the shared parser refuses {:?}",
+            "maybe"
+        );
+        let refused = agent_view_reply(&registry, id, "maybe");
+        assert!(
+            !refused.changed,
+            "an unreadable decision changes nothing: {refused:?}"
+        );
+        assert_eq!(
+            registry.answer(id, Decision::Deny),
+            subagent::AgentAnswerOutcome::Answered,
+            "NON-VACUOUS: the agent really was still blocked after the \
+             refusal, so the refusal sent nothing"
+        );
+        assert_eq!(answer.await.expect("the gate is resolved"), Decision::Deny);
+        lines.push(refused.line);
+
+        // `r` on an agent that is not blocked, and on one that does not
+        // exist: each its own answer, neither of them a success.
+        let registry = subagent::AgentRegistry::new();
+        let running = registry.start("nothing to answer".to_string()).unwrap();
+        let not_blocked = agent_view_reply(&registry, running, "y");
+        assert!(
+            !not_blocked.changed,
+            "`r` on an agent with no parked request changes nothing: \
+             {not_blocked:?}"
+        );
+        let missing = agent_view_reply(&registry, 9_999, "y");
+        assert!(!missing.changed, "`r` on an unknown id: {missing:?}");
+        lines.push(not_blocked.line);
+        lines.push(missing.line);
+
+        // Every answer the user can meet reads differently. The six
+        // successes may share wording with each other only if they name the
+        // decision, so they are compared as a set against the refusals rather
+        // than pairwise among themselves.
+        for line in &lines {
+            assert_no_debug_leak(line);
+            assert!(
+                line.contains("1") || line.contains("9999") || line.contains("9_999"),
+                "every report names the agent it is about: {line:?}"
+            );
+        }
+        let distinguishable = [
+            lines[0].clone(),
+            lines[6].clone(),
+            lines[7].clone(),
+            lines[8].clone(),
+        ];
+        for (index, left) in distinguishable.iter().enumerate() {
+            for right in &distinguishable[index + 1..] {
+                assert_ne!(
+                    left, right,
+                    "answered, unreadable, not-blocked and not-found must not \
+                     print the same line (T2-S5b)"
+                );
+            }
+        }
+    }
+
+    /// Card T4-S4b, the `s` key: the correction's **receipt is shown**, and an
+    /// empty line is a **refusal** rather than a no-op.
+    ///
+    /// Steering restarts the thread and throws away every millisecond it has
+    /// already spent — the receipt says how many — so a user who typed a blank
+    /// line must be told rather than left wondering whether it went. The
+    /// registry already refuses one (`AgentSteeringErrorKind::Empty`); what
+    /// this pins is that the refusal becomes a line and not a silence.
+    ///
+    /// The success path is pinned over a receipt rather than over a steered
+    /// agent: a steerable agent needs a live thread with an open correction
+    /// channel, which `AgentRegistry::start` does not give (it answers
+    /// `Closed`), and building one needs the provider, config and spawn
+    /// helpers that live in `subagent`'s own test module. That boundary is the
+    /// clearest argument for `s` being its own card.
+    #[cfg(unix)]
+    #[test]
+    fn steering_the_selected_agent_shows_its_receipt_and_names_every_refusal() {
+        use subagent::thread::{AgentSteeringErrorKind, AgentSteeringReceipt};
+
+        // A real sample: the receipt the registry hands back, formatted by
+        // the formatter `/jobs steer` already prints.
+        let receipt = AgentSteeringReceipt {
+            id: 7,
+            sequence: 1,
+            pending: 0,
+            discarded_ms: 2_500,
+        };
+        let sent = agent_view_steer_report(Ok(receipt));
+        assert!(sent.changed, "a correction was sent: {sent:?}");
+        assert!(
+            sent.line.contains(&format_steering_receipt(&receipt)),
+            "`s` shows the registry's own receipt, which reads {:?}; the \
+             report line is {:?}",
+            format_steering_receipt(&receipt),
+            sent.line
+        );
+        assert!(
+            sent.line.contains("discarded"),
+            "so it says that in-flight progress was thrown away, because that \
+             is the cost of the key: {:?}",
+            sent.line
+        );
+        assert_no_debug_leak(&sent.line);
+
+        // Every refusal the registry can answer with becomes its own line.
+        // The messages are `AgentSteeringError`'s own `Display`, which is what
+        // `/jobs steer` prints, rather than a second wording for the same
+        // failure.
+        let mut refusals = Vec::new();
+        for kind in [
+            AgentSteeringErrorKind::Empty,
+            AgentSteeringErrorKind::NotRunning,
+            AgentSteeringErrorKind::Closed,
+            AgentSteeringErrorKind::UnknownAgent,
+            AgentSteeringErrorKind::Full,
+        ] {
+            let error = subagent::thread::AgentSteeringError::new(7, kind, None);
+            let report = agent_view_steer_report(Err(error.clone()));
+            assert!(
+                !report.changed,
+                "a refused correction changes nothing: {report:?}"
+            );
+            assert!(
+                report.line.contains(&error.to_string()),
+                "and it says why, in the registry's own words ({}): {:?}",
+                error,
+                report.line
+            );
+            assert_no_debug_leak(&report.line);
+            refusals.push(report.line);
+        }
+        for (index, left) in refusals.iter().enumerate() {
+            for right in &refusals[index + 1..] {
+                assert_ne!(
+                    left, right,
+                    "every refusal reads differently, because a human must be \
+                     able to tell them apart (T2-S5b)"
+                );
+            }
+            assert_ne!(
+                *left, sent.line,
+                "and none of them reads like a correction that went"
+            );
+        }
+
+        // `agent_view_steer` is that report applied to the registry's answer,
+        // not a second wording of it. Pinned on real samples: an empty line
+        // and an unknown id, both of which a registry built with `start` can
+        // really produce.
+        let registry = subagent::AgentRegistry::new();
+        let id = registry.start("long task".to_string()).unwrap();
+        for (correction, target, kind) in [
+            ("", id, AgentSteeringErrorKind::Empty),
+            ("   ", id, AgentSteeringErrorKind::Empty),
+            ("slow down", 9_999, AgentSteeringErrorKind::UnknownAgent),
+        ] {
+            let through_the_key = agent_view_steer(&registry, target, correction);
+            assert!(
+                !through_the_key.changed,
+                "steer({correction:?}) on #{target} is refused: \
+                 {through_the_key:?}"
+            );
+            assert_eq!(
+                through_the_key,
+                agent_view_steer_report(Err(subagent::thread::AgentSteeringError::new(
+                    target, kind, None
+                ))),
+                "the key reports the registry's answer through the one report \
+                 function, rather than inventing a second wording for \
+                 {kind:?}"
+            );
+        }
+        // NON-VACUOUS: the registry really does answer those two, so the
+        // equality above is not comparing two unimplemented branches.
+        assert_eq!(
+            registry
+                .steer(id, "")
+                .expect_err("an empty line is refused")
+                .kind,
+            AgentSteeringErrorKind::Empty
+        );
+        assert_eq!(
+            registry
+                .steer(9_999, "slow down")
+                .expect_err("an unknown id is refused")
+                .kind,
+            AgentSteeringErrorKind::UnknownAgent
+        );
+    }
+
+    /// Card T4-S4b, `s`'s text sub-mode: it **edits, echoes, cancels and
+    /// submits**, over `kitsu-editor`'s editor rather than a second byte loop.
+    ///
+    /// The three cases that are not happy paths are the point:
+    ///
+    /// 1. a lone `ESC` cancels — on the *quiet tick*, inheriting T4-S4a's
+    ///    50 ms grace, so nothing is sent;
+    /// 2. an `ESC` that turns out to be an arrow does **not** cancel and does
+    ///    not corrupt the draft. That is **F65**, which cost the overlay's
+    ///    close key its first arrow, met again by a sub-mode that reads
+    ///    arbitrary bytes;
+    /// 3. a newline **inside a paste** is content, as T4-S2 decided for a
+    ///    prefix byte inside a paste; the `Enter` that submits is one typed
+    ///    outside one.
+    #[cfg(unix)]
+    #[test]
+    fn the_steer_line_edits_echoes_cancels_and_submits() {
+        let mut line = SteerLine::new(7);
+        assert_eq!(line.id(), 7, "the line is fixed to the agent it opened on");
+        assert_eq!(line.draft(), "");
+        assert_eq!(line.cursor(), 0);
+
+        assert_eq!(line.feed(b"slow "), SteerLineStep::Editing);
+        assert_eq!(line.feed(b"downn"), SteerLineStep::Editing);
+        assert_eq!(line.draft(), "slow downn");
+        // Backspace: the minimum editing a line needs to be usable.
+        assert_eq!(line.feed(b"\x7f"), SteerLineStep::Editing);
+        assert_eq!(line.draft(), "slow down");
+        assert_eq!(line.cursor(), "slow down".chars().count());
+
+        // A multi-byte character split across two reads, which a raw byte
+        // loop of its own would have had to re-solve.
+        assert_eq!(line.feed(b" caf\xc3"), SteerLineStep::Editing);
+        assert_eq!(line.feed(b"\xa9"), SteerLineStep::Editing);
+        assert_eq!(line.draft(), "slow down café");
+
+        // An `ESC` that is the first byte of an arrow: not a cancel, and the
+        // draft survives it.
+        assert_eq!(line.feed(b"\x1b"), SteerLineStep::Editing);
+        assert_eq!(line.feed(b"[D"), SteerLineStep::Editing);
+        assert_eq!(
+            line.draft(),
+            "slow down café",
+            "F65: an arrow is not a cancel and no byte of it enters the draft"
+        );
+        assert_eq!(
+            line.cursor(),
+            "slow down café".chars().count() - 1,
+            "and the arrow moved the caret, so it was read as the arrow it is"
+        );
+
+        // `Enter` outside a paste submits, verbatim and untrimmed-of-content.
+        assert_eq!(
+            line.feed(b"\r"),
+            SteerLineStep::Submit("slow down café".to_string()),
+            "Enter sends the line that was typed"
+        );
+
+        // A newline inside a bracketed paste is content: a paste never
+        // submits, so a pasted multi-line correction is not cut at its first
+        // line, and the `Enter` after it is what sends the whole thing.
+        let mut pasted = SteerLine::new(7);
+        assert_eq!(
+            pasted.feed(b"\x1b[200~one\ntwo\x1b[201~"),
+            SteerLineStep::Editing,
+            "a newline inside a paste is content, not a submit"
+        );
+        assert_eq!(pasted.draft(), "one\ntwo");
+        assert_eq!(
+            pasted.feed(b"\r"),
+            SteerLineStep::Submit("one\ntwo".to_string()),
+            "and the Enter after the paste sends all of it"
+        );
+
+        // A lone `ESC`, resolved the way T4-S4a resolves one: on a quiet tick
+        // once the grace has passed with nothing waiting. It cancels, and the
+        // cancel is not a submit of the empty line -- which the refusal above
+        // would merely have reported, while this sends nothing at all.
+        let mut cancelled = SteerLine::new(7);
+        assert_eq!(cancelled.feed(b"half typed"), SteerLineStep::Editing);
+        assert_eq!(
+            cancelled.feed(b"\x1b"),
+            SteerLineStep::Editing,
+            "an ESC is still ambiguous when it arrives"
+        );
+        assert_eq!(
+            cancelled.quiet_tick(),
+            SteerLineStep::Cancelled,
+            "the grace passed with nothing after it, so it was the Esc key"
+        );
+
+        // NON-VACUOUS, the other half of the same claim: a quiet tick with no
+        // ESC held changes nothing, so the cancel above is about the `ESC`
+        // and not about every quiet tick ending the line.
+        let mut quiet = SteerLine::new(7);
+        assert_eq!(quiet.feed(b"half typed"), SteerLineStep::Editing);
+        assert_eq!(quiet.quiet_tick(), SteerLineStep::Editing);
+        assert_eq!(quiet.draft(), "half typed");
+        // And a quiet tick in the middle of an arrow's sequence does not end
+        // the line either: the ESC there is spoken for.
+        assert_eq!(quiet.feed(b"\x1b["), SteerLineStep::Editing);
+        assert_eq!(quiet.quiet_tick(), SteerLineStep::Editing);
+    }
+
+    /// Card T4-S4b, the `x` key's **second press**: it stops a live agent and
+    /// prunes an already-terminal one.
+    ///
+    /// This is how A3's *"`x` stop (twice to prune)"* and T4-S4a's shipped
+    /// arming are both satisfied: T4-S4a's second press answers
+    /// `StopPress::Confirmed`, and what confirming *does* was never pinned.
+    /// Stopping an agent that has already finished is meaningless, so on a
+    /// finished agent the second press is the prune — no third press, no
+    /// second key, and no change to T4-S4a.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_the_selected_agent_twice_stops_a_live_one_and_prunes_a_terminal_one() {
+        let registry = subagent::AgentRegistry::new();
+        let live = registry.start("still working".to_string()).unwrap();
+        let stopped = agent_view_stop_or_prune(&registry, live).await;
+        assert!(stopped.changed, "a live agent was stopped: {stopped:?}");
+        assert!(
+            registry.thread_snapshot(live).is_some(),
+            "stopping is not pruning: the row is still there to be read, \
+             which is the whole difference between the two presses"
+        );
+
+        // The same agent again, now terminal: this press prunes it. Its
+        // result is collected first, because an unviewed one is refused (see
+        // the test below).
+        let _ = registry.acknowledge_result(live);
+        let pruned = agent_view_stop_or_prune(&registry, live).await;
+        assert!(pruned.changed, "a terminal agent was pruned: {pruned:?}");
+        assert!(
+            registry.thread_snapshot(live).is_none(),
+            "pruning removes the record: {pruned:?}"
+        );
+        assert_ne!(
+            pruned.line, stopped.line,
+            "stopped and pruned must not print the same line: a human cannot \
+             otherwise tell which of the two just happened (T2-S5b)"
+        );
+
+        // A blocked agent is live, not terminal: the second press stops it
+        // rather than pruning it, and its parked request is resolved.
+        let (blocked_registry, blocked, answer) = registry_with_one_blocked_agent().await;
+        let blocked_report = agent_view_stop_or_prune(&blocked_registry, blocked).await;
+        assert!(
+            blocked_report.changed,
+            "a blocked agent is stoppable: {blocked_report:?}"
+        );
+        assert!(
+            blocked_registry.thread_snapshot(blocked).is_some(),
+            "and stopped, not pruned"
+        );
+        assert_eq!(
+            answer.await.expect("the gate is resolved"),
+            Decision::Interrupt,
+            "NON-VACUOUS: the stop really reached the agent"
+        );
+
+        // An id the registry does not hold is its own answer.
+        let missing = agent_view_stop_or_prune(&registry, 9_999).await;
+        assert!(!missing.changed, "`x` on an unknown id: {missing:?}");
+        for line in [&stopped.line, &pruned.line, &missing.line] {
+            assert_no_debug_leak(line);
+        }
+        assert_ne!(missing.line, pruned.line);
+        assert_ne!(missing.line, stopped.line);
+    }
+
+    /// Card T4-S4b, the one thing `x` must **refuse**: pruning an agent whose
+    /// result nobody has read.
+    ///
+    /// `AgentRegistry::prune` removes the record, and
+    /// `take_unobserved_terminal_results` can only report records that exist
+    /// — so pruning an unviewed result destroys it *and* silences the exit
+    /// guard that T4-S3 and T4-S4a spent two cards protecting. `x` is the only
+    /// key that can do that, so it is the key that refuses.
+    ///
+    /// The POSITIVE CONTROL is the second half: once the result is collected,
+    /// the very same press prunes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_terminal_agent_whose_result_is_unviewed_refuses_to_prune_it() {
+        let registry = subagent::AgentRegistry::new();
+        let id = registry.start("will finish".to_string()).unwrap();
+        registry.finish(id, Ok("nobody has read me".to_string()));
+        assert_eq!(
+            registry.handoff_state(id),
+            Some(subagent::thread::AgentHandoffState::Ready),
+            "NON-VACUOUS: the result really is waiting to be collected"
+        );
+
+        let refused = agent_view_stop_or_prune(&registry, id).await;
+        assert!(
+            !refused.changed,
+            "an unviewed result is not destroyed by a keystroke: {refused:?}"
+        );
+        assert!(
+            refused.line.contains("result"),
+            "and the report says what is in the way, so the user knows to \
+             peek or acknowledge first: {:?}",
+            refused.line
+        );
+        assert!(
+            registry.thread_snapshot(id).is_some(),
+            "the record is still there: {refused:?}"
+        );
+        assert_eq!(
+            registry
+                .take_unobserved_terminal_results()
+                .iter()
+                .map(|result| result.id)
+                .collect::<Vec<_>>(),
+            vec![id],
+            "and the exit guard still holds the result"
+        );
+
+        // POSITIVE CONTROL: with the result collected, the same press prunes.
+        let registry = subagent::AgentRegistry::new();
+        let id = registry.start("will finish".to_string()).unwrap();
+        registry.finish(id, Ok("collect me".to_string()));
+        assert!(
+            agent_view_acknowledge(&registry, id).changed,
+            "`p` collects it"
+        );
+        let pruned = agent_view_stop_or_prune(&registry, id).await;
+        assert!(
+            pruned.changed,
+            "POSITIVE CONTROL: a collected result can be pruned, so the \
+             refusal above is about the unviewed one: {pruned:?}"
+        );
+        assert!(registry.thread_snapshot(id).is_none());
+        assert_ne!(
+            pruned.line, refused.line,
+            "pruned and refused are two answers (T2-S5b)"
+        );
+    }
+
+    /// Card T4-S4b, the `n` key: `AgentRegistry::rename`'s refusals each
+    /// become their own line. The legality rules themselves are T4-S4a's and
+    /// are pinned there; this is the wiring, which is what T2-S5b is about.
+    #[cfg(unix)]
+    #[test]
+    fn renaming_the_selected_agent_through_the_n_key_reports_each_refusal() {
+        let registry = subagent::AgentRegistry::new();
+        let id = registry.start("summarize the crate".to_string()).unwrap();
+
+        let named = agent_view_rename(&registry, id, "reviewer-1");
+        assert!(named.changed, "a legal name is accepted: {named:?}");
+        assert!(
+            named.line.contains("reviewer-1"),
+            "and the report shows the name that is now on the row: {:?}",
+            named.line
+        );
+
+        let mut lines = vec![named.line.clone()];
+        for illegal in [
+            "",
+            "   ",
+            &"n".repeat(subagent::AgentRegistry::NAME_MAX_CHARS + 1),
+            "two\nlines",
+        ] {
+            let report = agent_view_rename(&registry, id, illegal);
+            assert!(
+                !report.changed,
+                "rename({illegal:?}) is refused: {report:?}"
+            );
+            assert_no_debug_leak(&report.line);
+            lines.push(report.line);
+        }
+        let missing = agent_view_rename(&registry, 9_999, "ghost");
+        assert!(!missing.changed, "`n` on an unknown id: {missing:?}");
+        lines.push(missing.line);
+        assert_eq!(
+            registry
+                .thread_snapshot(id)
+                .expect("a snapshot")
+                .name
+                .as_deref(),
+            Some("reviewer-1"),
+            "NON-VACUOUS: every refusal left the name the one legal rename \
+             gave it, so none of them was quietly applied"
+        );
+
+        // Empty, too long, unprintable and not-found are four refusals, and
+        // the acceptance is a fifth answer: five lines, five readings. The
+        // two empty spellings share an answer by design (both are `Empty`),
+        // so they are compared as one.
+        let distinct = [
+            lines[0].clone(),
+            lines[1].clone(),
+            lines[3].clone(),
+            lines[4].clone(),
+            lines[5].clone(),
+        ];
+        for (index, left) in distinct.iter().enumerate() {
+            for right in &distinct[index + 1..] {
+                assert_ne!(
+                    left, right,
+                    "every rename answer reads differently (T2-S5b)"
+                );
+            }
+        }
+        assert_eq!(
+            lines[1], lines[2],
+            "a trimmed-to-nothing name is the same refusal as an empty one, \
+             which is `AgentRenameOutcome::Empty`'s own grouping"
+        );
+    }
+
+    /// Card T4-S4b, the custody property for a third time. T4-S3 made peek the
+    /// single call site that takes custody of a result; T4-S4a pinned that
+    /// moving the selection does not become a second one. **`r`, `s`, `x` and
+    /// `n` must not become one either.** `p` is the deliberate exception, and
+    /// it is this test's positive control.
+    ///
+    /// `x` is the interesting one: its prune *removes* a record, which is a
+    /// stronger thing than acknowledging one, and the sibling test above pins
+    /// that it refuses to do so to an unviewed result. Here it is the stop,
+    /// on a live agent, that must leave every other result alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_action_keys_other_than_p_take_no_custody_of_a_result() {
+        let registry = subagent::AgentRegistry::new();
+        let done = registry.start("done work".to_string()).unwrap();
+        let failed = registry.start("failed work".to_string()).unwrap();
+        let live = registry.start("still running".to_string()).unwrap();
+        registry.finish(done, Ok("the answer".to_string()));
+        registry.finish(failed, Err("boom".to_string()));
+        assert_eq!(
+            registry.snapshot().unacknowledged,
+            2,
+            "NON-VACUOUS: there really are two results waiting to be collected"
+        );
+
+        // `n` on a done one and `x` on the live one: keys that act, and whose
+        // action is not a collection. `s` is here as its refusal only --
+        // steering a registry built with `start` answers `Closed` -- so the
+        // key that acts and collects nothing is `n`, with `x` the destructive
+        // one.
+        assert!(!agent_view_steer(&registry, live, "slow down").changed);
+        assert!(agent_view_rename(&registry, done, "the-one-with-the-answer").changed);
+        assert!(agent_view_stop_or_prune(&registry, live).await.changed);
+        for id in [done, failed] {
+            assert_eq!(
+                registry.handoff_state(id),
+                Some(subagent::thread::AgentHandoffState::Ready),
+                "no action key took custody of agent #{id}'s result"
+            );
+        }
+        assert_eq!(
+            registry.snapshot().unacknowledged,
+            2,
+            "the exit guard still holds both results"
+        );
+
+        // `r` has its own registry, because answering needs a blocked agent
+        // and a blocked agent is the one phase that has no result yet. What
+        // it must not do is collect somebody else's.
+        let (replying, blocked, answer) = registry_with_one_blocked_agent().await;
+        let collectable = replying.start("done elsewhere".to_string()).unwrap();
+        replying.finish(collectable, Ok("not yours".to_string()));
+        assert!(agent_view_reply(&replying, blocked, "y").changed);
+        assert_eq!(
+            answer.await.expect("the gate is resolved"),
+            Decision::AllowOnce
+        );
+        assert_eq!(
+            replying.handoff_state(collectable),
+            Some(subagent::thread::AgentHandoffState::Ready),
+            "`r` collects nothing"
+        );
+
+        // POSITIVE CONTROL: `p`, the deliberate exception, does collect.
+        assert!(
+            agent_view_acknowledge(&registry, done).changed,
+            "POSITIVE CONTROL: `p` takes custody, so the assertions above are \
+             about the other keys and not about a registry that never \
+             acknowledges anything"
+        );
+        assert_eq!(
+            registry
+                .take_unobserved_terminal_results()
+                .iter()
+                .map(|result| result.id)
+                .collect::<Vec<_>>(),
+            vec![failed],
+            "and only the row `p` was pressed on"
+        );
+    }
+
+    /// Card T4-S4b: **an action key with no selection says so.** T4-S4a gave
+    /// `press_stop` a `NoSelection` answer rather than a silent `Armed` for
+    /// this reason, and the same holds for the other four keys: a key that
+    /// looks broken is worse than one that says there is nothing to act on.
+    ///
+    /// The NON-VACUOUS half is the last assertion: the no-selection line is
+    /// not the line any key prints when it does act.
+    #[cfg(unix)]
+    #[test]
+    fn an_action_key_with_nothing_selected_says_so_rather_than_nothing() {
+        let mut lines = Vec::new();
+        for key in ['r', 's', 'x', 'n', 'p'] {
+            let report = agent_view_no_selection(key);
+            assert!(
+                !report.changed,
+                "with nothing selected, `{key}` changes nothing: {report:?}"
+            );
+            assert!(
+                !report.line.trim().is_empty(),
+                "but it is not silent either: `{key}` printed {:?}",
+                report.line
+            );
+            assert_no_debug_leak(&report.line);
+            lines.push(report.line);
+        }
+
+        let registry = subagent::AgentRegistry::new();
+        let id = registry.start("summarize the crate".to_string()).unwrap();
+        let acted = agent_view_rename(&registry, id, "reviewer-1");
+        assert!(acted.changed, "NON-VACUOUS: a key with a selection acts");
+        for line in &lines {
+            assert_ne!(
+                *line, acted.line,
+                "the no-selection report is not what a key prints when it does \
+                 act"
+            );
+        }
+    }
+
+    // --- card T4-S4b-i, finding F68: a paste is not a sequence of keys ---
+    //
+    // The action keys of T4-S4b bound effects to bare letters: `r` opens the
+    // decision read whose next key *answers a pending permission*, and `x`
+    // twice stops a live agent or prunes a terminal one. The overlay reads raw
+    // bytes and does not enable bracketed paste, so a pasted correction is
+    // indistinguishable from typing and every byte of it becomes a key: paste
+    // "retry the write" over the row list and `r` then `y` approves a
+    // filesystem write the user never approved.
+    //
+    // That is **F65**'s root with the opposite sign. F65: an arrow key is not
+    // one byte. F68: a chunk of bytes is not a sequence of intentions.
+    //
+    // Where each assertion lives, and why:
+    //
+    // * **The decoder** answers "what does this chunk *mean*", which is the
+    //   only place the paste/typing distinction exists at all — the loop has
+    //   nothing else to go on. [`OverlayDecoder`] is pure, so the meaning of
+    //   a pasted chunk is pinned with no terminal involved.
+    // * **A real `AgentRegistry`** answers "did anything *happen*", because a
+    //   permission still being pending is a registry fact. T4-S3 and T4-S4a
+    //   pinned the action keys here for the reason that has not changed: a
+    //   fixture PTY session has **zero agents**, so every key bound to the
+    //   selected agent meets the no-selection case there and no permission
+    //   can be answered at all.
+    // * **The PTY** keeps routing (`tests/tui.rs`): that the keys are the
+    //   view's and reach no composer. It cannot see a permission.
+    //
+    // The registry tests drive the decoder's output through the loop's own
+    // arms with [`OverlayUnderTest`], which mirrors
+    // `run_agent_view_overlay`'s `match prompt.take()` arm for arm. That is
+    // deliberate and is the cost of the loop not being callable without a
+    // tty: the fix must change *both* the decoder and the read site, and the
+    // PTY test is what keeps the read site honest.
+
+    /// The overlay's key-handling arms, lifted out of `run_agent_view_overlay`
+    /// so the registry effect of a chunk of bytes is observable without a
+    /// terminal. Every arm is the loop's, including `selection.disarm()` on a
+    /// key that is not `x`.
+    ///
+    /// The three `Paste` arms are F68's specification: content inside a text
+    /// prompt, and nothing at all over the row list or inside the decision
+    /// read.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    enum OverlayFrameUnderTest {
+        Rows,
+        Decision(u64),
+        Text {
+            id: u64,
+            kind: OverlayTextPrompt,
+            draft: String,
+        },
+    }
+
+    #[cfg(unix)]
+    struct OverlayUnderTest {
+        frame: OverlayFrameUnderTest,
+        selection: kitsu_tui::agents_view::AgentSelection,
+        decoder: OverlayDecoder,
+        reports: Vec<String>,
+    }
+
+    #[cfg(unix)]
+    impl OverlayUnderTest {
+        fn new() -> Self {
+            Self {
+                frame: OverlayFrameUnderTest::Rows,
+                selection: kitsu_tui::agents_view::AgentSelection::new(),
+                decoder: OverlayDecoder::new(),
+                reports: Vec::new(),
+            }
+        }
+
+        /// One `read` of the descriptor, decoded and applied.
+        async fn feed(&mut self, registry: &subagent::AgentRegistry, chunk: &[u8]) {
+            let rows = agent_view_rows(registry);
+            self.selection.sync(&rows);
+            for input in self.decoder.feed(chunk) {
+                let frame = std::mem::replace(&mut self.frame, OverlayFrameUnderTest::Rows);
+                match (frame, input) {
+                    // F68: a paste is text. Over the row list and inside the
+                    // decision read it is dropped; the read stays open rather
+                    // than resolving to a pasted letter.
+                    (OverlayFrameUnderTest::Rows, OverlayInput::Paste(_)) => {}
+                    (OverlayFrameUnderTest::Decision(id), OverlayInput::Paste(_)) => {
+                        self.frame = OverlayFrameUnderTest::Decision(id);
+                    }
+                    (
+                        OverlayFrameUnderTest::Text {
+                            id,
+                            kind,
+                            mut draft,
+                        },
+                        OverlayInput::Paste(text),
+                    ) => {
+                        draft.push_str(&text);
+                        self.frame = OverlayFrameUnderTest::Text { id, kind, draft };
+                    }
+                    (
+                        OverlayFrameUnderTest::Decision(id),
+                        OverlayInput::Key(OverlayKey::Char(typed)),
+                    ) => {
+                        self.reports
+                            .push(agent_view_reply(registry, id, &typed.to_string()).line);
+                    }
+                    (
+                        OverlayFrameUnderTest::Text {
+                            id,
+                            kind,
+                            mut draft,
+                        },
+                        OverlayInput::Key(key),
+                    ) => match key {
+                        OverlayKey::Enter => {
+                            self.reports.push(
+                                match kind {
+                                    OverlayTextPrompt::Rename => {
+                                        agent_view_rename(registry, id, &draft)
+                                    }
+                                    OverlayTextPrompt::Steer => {
+                                        agent_view_steer(registry, id, &draft)
+                                    }
+                                }
+                                .line,
+                            );
+                        }
+                        OverlayKey::Char(typed) => {
+                            draft.push(typed);
+                            self.frame = OverlayFrameUnderTest::Text { id, kind, draft };
+                        }
+                        OverlayKey::StepBack => {}
+                        _ => self.frame = OverlayFrameUnderTest::Text { id, kind, draft },
+                    },
+                    (
+                        OverlayFrameUnderTest::Rows,
+                        OverlayInput::Key(OverlayKey::Char(pressed @ ('r' | 's' | 'n' | 'p'))),
+                    ) => {
+                        self.selection.disarm();
+                        match self.selection.selected() {
+                            None => self.reports.push(agent_view_no_selection(pressed).line),
+                            Some(id) => match pressed {
+                                'r' => self.frame = OverlayFrameUnderTest::Decision(id),
+                                's' => {
+                                    self.frame = OverlayFrameUnderTest::Text {
+                                        id,
+                                        kind: OverlayTextPrompt::Steer,
+                                        draft: String::new(),
+                                    };
+                                }
+                                'n' => {
+                                    self.frame = OverlayFrameUnderTest::Text {
+                                        id,
+                                        kind: OverlayTextPrompt::Rename,
+                                        draft: String::new(),
+                                    };
+                                }
+                                _ => self.reports.push(agent_view_acknowledge(registry, id).line),
+                            },
+                        }
+                    }
+                    (OverlayFrameUnderTest::Rows, OverlayInput::Key(OverlayKey::Char('x'))) => {
+                        let armed_on = self.selection.selected();
+                        match self.selection.press_stop() {
+                            kitsu_tui::agents_view::StopPress::Armed => {
+                                if let Some(id) = armed_on {
+                                    self.reports.push(format!(
+                                        "press x again to stop background agent #{id}"
+                                    ));
+                                }
+                            }
+                            kitsu_tui::agents_view::StopPress::Confirmed(id) => {
+                                self.reports
+                                    .push(agent_view_stop_or_prune(registry, id).await.line);
+                            }
+                            kitsu_tui::agents_view::StopPress::NoSelection => {
+                                self.reports.push(agent_view_no_selection('x').line);
+                            }
+                        }
+                    }
+                    (frame, _) => self.frame = frame,
+                }
+            }
+        }
+
+        fn draft(&self) -> Option<&str> {
+            match &self.frame {
+                OverlayFrameUnderTest::Text { draft, .. } => Some(draft.as_str()),
+                _ => None,
+            }
+        }
+    }
+
+    /// The bracketed-paste delimiters, as every terminal that reports pastes
+    /// sends them. Spelled here rather than imported because the overlay has
+    /// no copy of them yet — enabling `ESC[?2004h` is part of F68's fix.
+    #[cfg(unix)]
+    const OVERLAY_PASTE_START: &[u8] = b"\x1b[200~";
+    #[cfg(unix)]
+    const OVERLAY_PASTE_END: &[u8] = b"\x1b[201~";
+
+    /// A real correction someone would paste into a steer line, and the reason
+    /// F68 is a rejection: its bytes contain `r`, then `y`, then `x` twice,
+    /// then a newline with more text after it (**F58** — the sample is the
+    /// expectation's source, not a letter picked to make a point).
+    #[cfg(unix)]
+    const PASTED_CORRECTION: &str = "retry the exxtract\nand fix the bug";
+
+    /// Finding **F68**, the decoder: **a pasted chunk is one paste, not a
+    /// sequence of keys** — bracketed or not.
+    ///
+    /// The POSITIVE CONTROLS are the second half and they are the test: the
+    /// same letters typed as their own reads are still ordinary keys, and
+    /// F65's arrow, lone `ESC` and `ESC`-then-key are decoded exactly as
+    /// before. A "fix" that simply stops decoding letters fails those.
+    #[cfg(unix)]
+    #[test]
+    fn a_pasted_chunk_decodes_as_one_paste_and_never_as_action_keys() {
+        let mut bracketed = Vec::from(OVERLAY_PASTE_START);
+        bracketed.extend_from_slice(PASTED_CORRECTION.as_bytes());
+        bracketed.extend_from_slice(OVERLAY_PASTE_END);
+        let mut decoder = OverlayDecoder::new();
+        assert_eq!(
+            decoder.feed(&bracketed),
+            vec![OverlayInput::Paste(PASTED_CORRECTION.to_string())],
+            "a bracketed paste is one paste carrying its text verbatim, \
+             newline included"
+        );
+        assert!(
+            !decoder.escape_pending(),
+            "and a closed paste block holds no `Esc`: the `ESC` bytes of the \
+             delimiters are the paste's, not the key's (F65's grace must not \
+             fire for them)"
+        );
+
+        // The same paste split across two reads, which is how a long one
+        // really arrives: still one paste in total, and still no keys.
+        let mut split = OverlayDecoder::new();
+        let cut = OVERLAY_PASTE_START.len() + 7;
+        let head = split.feed(&bracketed[..cut]);
+        let tail = split.feed(&bracketed[cut..]);
+        let pasted: String = head
+            .iter()
+            .chain(tail.iter())
+            .map(|input| match input {
+                OverlayInput::Paste(text) => text.clone(),
+                other => panic!("a split paste yields no keys, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            pasted, PASTED_CORRECTION,
+            "a paste split across reads is the same text"
+        );
+
+        // A terminal that does not report pastes sends the same text as plain
+        // bytes, which is the case the overlay cannot opt out of: a chunk
+        // carrying more than one printable character is a burst, not typing.
+        let mut unbracketed = OverlayDecoder::new();
+        assert_eq!(
+            unbracketed.feed(PASTED_CORRECTION.as_bytes()),
+            vec![OverlayInput::Paste(PASTED_CORRECTION.to_string())],
+            "an unbracketed burst is a paste too: no human produces two \
+             printable keystrokes in one read"
+        );
+
+        // POSITIVE CONTROL: typed one read at a time, every one of those
+        // letters is still the key it was.
+        for letter in ['r', 'y', 'x', 'n', 'p', 's', 'q', '?', ' '] {
+            let mut typed = OverlayDecoder::new();
+            let mut buffer = [0u8; 1];
+            letter.encode_utf8(&mut buffer);
+            assert_eq!(
+                typed.feed(&buffer),
+                vec![OverlayInput::Key(OverlayKey::Char(letter))],
+                "POSITIVE CONTROL: {letter:?} typed as its own read is still \
+                 one key, so the paste assertions above are about bursts and \
+                 not about letters having stopped working"
+            );
+        }
+
+        // POSITIVE CONTROL, **F65**: the pending-state decoder is unchanged.
+        // An arrow is one key, a lone `ESC` is held, and a key after a held
+        // `ESC` is both.
+        let mut f65 = OverlayDecoder::new();
+        assert_eq!(
+            f65.feed(b"\x1b[A"),
+            vec![OverlayInput::Key(OverlayKey::Up)],
+            "POSITIVE CONTROL (F65): an arrow key is not one byte and is not \
+             a burst either"
+        );
+        assert_eq!(
+            f65.feed(b"\x1b"),
+            Vec::new(),
+            "POSITIVE CONTROL (F65): a lone `ESC` is still held pending, \
+             which is what the 50 ms grace resolves"
+        );
+        assert!(
+            f65.escape_pending(),
+            "POSITIVE CONTROL (F65): and the overlay can tell, which is what \
+             the grace asks"
+        );
+        assert_eq!(
+            f65.feed(b"q"),
+            vec![
+                OverlayInput::Key(OverlayKey::StepBack),
+                OverlayInput::Key(OverlayKey::Char('q')),
+            ],
+            "POSITIVE CONTROL (F65): the `Esc` happened, and then the key did"
+        );
+        assert_eq!(
+            OverlayDecoder::new().feed(b"\r"),
+            vec![OverlayInput::Key(OverlayKey::Enter)],
+            "POSITIVE CONTROL: a typed Enter is one key, so the paste rule is \
+             about bursts and not about newlines"
+        );
+    }
+
+    /// Finding **F68**, the sharp case: **a pasted correction never answers a
+    /// blocked agent's permission.**
+    ///
+    /// `r` opens a decision read and the next key answers the gate, so a
+    /// paste whose bytes contain `r` and then `y` would approve a filesystem
+    /// write on a blocked agent. The agent's request must still be pending
+    /// afterwards, and that it is pending is proved rather than assumed: the
+    /// test answers it itself and the registry reports `Answered`, which only
+    /// a still-parked request can.
+    ///
+    /// The POSITIVE CONTROL is the second half: the same two letters as two
+    /// reads really do answer, so this is not a test that passes because `r`
+    /// and `y` stopped working.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pasted_correction_never_answers_a_blocked_agents_permission() {
+        let first_r = PASTED_CORRECTION
+            .find('r')
+            .expect("NON-VACUOUS: the sample carries an `r`");
+        assert!(
+            PASTED_CORRECTION[first_r + 1..].contains('y'),
+            "NON-VACUOUS: the sample really does carry `r` and then `y`, which \
+             is what would answer the gate: {PASTED_CORRECTION:?}"
+        );
+
+        let (registry, id, answer) = registry_with_one_blocked_agent().await;
+        let mut overlay = OverlayUnderTest::new();
+        overlay.feed(&registry, PASTED_CORRECTION.as_bytes()).await;
+        assert_eq!(
+            registry.answer(id, Decision::Deny),
+            subagent::AgentAnswerOutcome::Answered,
+            "the paste answered nothing: agent #{id}'s request is still \
+             parked, so this test's own answer is the one that reaches it. \
+             Reports the paste produced: {:?}",
+            overlay.reports
+        );
+        assert_eq!(
+            answer.await.expect("the gate is resolved"),
+            Decision::Deny,
+            "and the decision the agent receives is this test's `Deny`, not a \
+             pasted `y`"
+        );
+
+        // POSITIVE CONTROL, on a fresh blocked agent: `r` then `y`, each as
+        // its own read, is exactly the keystroke pair the paste must not be.
+        let (registry, id, answer) = registry_with_one_blocked_agent().await;
+        let mut typed = OverlayUnderTest::new();
+        typed.feed(&registry, b"r").await;
+        typed.feed(&registry, b"y").await;
+        assert_eq!(
+            answer.await.expect("the gate is resolved"),
+            Decision::AllowOnce,
+            "POSITIVE CONTROL: typed as two reads, `r` then `y` really does \
+             answer agent #{id}, so the assertion above is about the paste. \
+             Reports: {:?}",
+            typed.reports
+        );
+    }
+
+    /// Finding **F68**: **a pasted chunk never stops or prunes an agent.**
+    ///
+    /// `x` arms on the first press and stops on the second, so a paste
+    /// carrying two `x` bytes is a stop. The agent must still be running
+    /// afterwards.
+    ///
+    /// The POSITIVE CONTROL is the second half, and it is the same two bytes:
+    /// two reads of `x` really do stop a live agent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pasted_chunk_containing_two_x_bytes_never_stops_an_agent() {
+        assert!(
+            PASTED_CORRECTION.matches('x').count() >= 2,
+            "NON-VACUOUS: the sample really does carry at least two `x` bytes, \
+             which is an armed stop and then a confirmed one: \
+             {PASTED_CORRECTION:?}"
+        );
+
+        let registry = subagent::AgentRegistry::new();
+        let id = registry.start("still working".to_string()).unwrap();
+        let mut overlay = OverlayUnderTest::new();
+        overlay.feed(&registry, PASTED_CORRECTION.as_bytes()).await;
+        let rows = agent_view_rows(&registry);
+        assert_eq!(
+            rows.iter().find(|row| row.id == id).map(|row| row.state),
+            Some(kitsu_render::AgentViewState::Working),
+            "the paste stopped nothing: agent #{id} is still running. Rows: \
+             {rows:?}, reports: {:?}",
+            overlay.reports
+        );
+
+        // POSITIVE CONTROL: the same two bytes, one read each.
+        let mut typed = OverlayUnderTest::new();
+        typed.feed(&registry, b"x").await;
+        typed.feed(&registry, b"x").await;
+        let after = agent_view_rows(&registry);
+        assert_ne!(
+            after.iter().find(|row| row.id == id).map(|row| row.state),
+            Some(kitsu_render::AgentViewState::Working),
+            "POSITIVE CONTROL: `x` twice, typed as two reads, really does \
+             stop agent #{id}, so the assertion above is about the paste. \
+             Rows: {after:?}, reports: {:?}",
+            typed.reports
+        );
+    }
+
+    /// Finding **F68**, inside a text prompt: **a multi-line paste is
+    /// content, and its tail never executes.**
+    ///
+    /// What the newline does is the decision this card had to make, and it is
+    /// *content*: `kitsu-editor` already holds that a bracketed paste never
+    /// submits, and T4-S2 decided a prefix byte inside a paste is content.
+    /// Dropping the tail would be a second answer to the same question in the
+    /// same binary. So the whole paste lands in the draft, the prompt stays
+    /// open, nothing is sent, and the user presses Enter themselves — which
+    /// is also the only reading under which the bytes after the newline can
+    /// never be keys, because there is no submit for them to be after.
+    ///
+    /// The POSITIVE CONTROL is the typed Enter at the end: it submits, with
+    /// the whole pasted correction as the name, so the draft really was live
+    /// and the prompt really was open.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_multi_line_paste_into_an_overlay_text_prompt_is_content_and_its_tail_never_runs() {
+        assert!(
+            PASTED_CORRECTION.contains('\n')
+                && !PASTED_CORRECTION.ends_with('\n')
+                && PASTED_CORRECTION.lines().count() == 2,
+            "NON-VACUOUS: the sample is two lines, so there is a tail after \
+             the newline that could execute: {PASTED_CORRECTION:?}"
+        );
+
+        let registry = subagent::AgentRegistry::new();
+        let id = registry.start("needs a name".to_string()).unwrap();
+        let mut overlay = OverlayUnderTest::new();
+        // `n` opens the rename line, typed as its own read.
+        overlay.feed(&registry, b"n").await;
+        assert_eq!(
+            overlay.draft(),
+            Some(""),
+            "NON-VACUOUS: the rename line is open and empty before the paste"
+        );
+        overlay.feed(&registry, PASTED_CORRECTION.as_bytes()).await;
+        assert_eq!(
+            overlay.draft(),
+            Some(PASTED_CORRECTION),
+            "the whole paste is content, newline included: a paste never \
+             submits, so the tail is text in the draft and not keys"
+        );
+        assert!(
+            overlay.reports.is_empty(),
+            "and nothing was submitted and nothing acted: {:?}",
+            overlay.reports
+        );
+        assert_eq!(
+            agent_view_rows(&registry)
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.name.clone()),
+            None,
+            "the agent is still unnamed: the newline inside the paste did not \
+             submit the line"
+        );
+
+        // The Enter the user types themselves *does* submit — and the
+        // registry refuses a name carrying a control character, which is its
+        // own rule (`AgentRenameOutcome::Unprintable`) and not this card's.
+        // What matters here is that the submit happened only now.
+        overlay.feed(&registry, b"\r").await;
+        assert_eq!(
+            overlay.reports.len(),
+            1,
+            "the typed Enter submitted the line, once: {:?}",
+            overlay.reports
+        );
+        assert_eq!(
+            agent_view_rows(&registry)
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.name.clone()),
+            None,
+            "and the registry refuses a name with a newline in it, which is \
+             `AgentRenameOutcome::Unprintable`'s rule: {:?}",
+            overlay.reports
+        );
+
+        // POSITIVE CONTROL, on a fresh prompt: a name typed one read at a
+        // time and a typed Enter really do rename the agent, so every
+        // assertion above is about the paste and not about a prompt that had
+        // stopped working.
+        let mut typed = OverlayUnderTest::new();
+        typed.feed(&registry, b"n").await;
+        for byte in b"ok" {
+            typed.feed(&registry, &[*byte]).await;
+        }
+        assert_eq!(typed.draft(), Some("ok"));
+        typed.feed(&registry, b"\r").await;
+        assert_eq!(
+            agent_view_rows(&registry)
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.name.clone()),
+            Some("ok".to_string()),
+            "POSITIVE CONTROL: typed keys fill the line and a typed Enter \
+             submits it. Reports: {:?}",
+            typed.reports
+        );
+        assert!(
+            typed.draft().is_none(),
+            "and the prompt is closed after a submit"
         );
     }
 }

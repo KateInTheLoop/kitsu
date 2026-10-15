@@ -3505,3 +3505,90 @@ T4-S4's PTY test pressed `↓` in the agent view and failed with *"`↓` is move
 **Recorded because it has a consequence a later reader should see coming:** a **validation** bound is now a **display** constant, so changing the row's head width silently changes **what names are legal**, and the `TooLong { max }` message reports a number that came from a renderer. Names stored before a narrowing stay stored and render truncated by the normal width fitting — they do not break — but they can no longer be re-entered as typed.
 
 Not changed, because the coupling is intentional and documented, and splitting it would need a reason this card does not have. The note is here so that a future row-width change is recognised as a **product change to name validation**, not a layout tweak.
+
+## F67 — pruning destroys an unviewed result, and the exit guard cannot know
+
+**Read, not taken from a report** (F43/F64 discipline — the mechanism was handed to me by an agent and I traced it):
+
+- `AgentRegistry::prune` does `agents.remove(&id)` once the record is non-terminal-free.
+- `take_unobserved_terminal_results` iterates `self.agents`, so **a removed record is invisible to it**.
+- Therefore pruning a finished agent whose handoff is still `Ready` **discards its result and the exit guard never mentions it** — there is nothing left to surface.
+
+**The nuance that keeps this from being a plain bug, and which the first telling of it missed.** The two prune surfaces differ:
+
+- **`kitsu agents --json` / automation** gets `terminal_job_payload(&status)` in the response, so the result **survives** in the reply.
+- **An interactive human** gets only `~ pruned background job #{id}` on stderr. The result is **gone**, unprinted.
+
+So the loss is **interactive-only**, and `/jobs prune <id>` is an explicit command naming a specific id — a user who types it has arguably asked for exactly this. That is why this is recorded as a **product question**, not filed as a defect.
+
+### What is clearly right, and is pinned
+
+**The `x` key must not inherit the behaviour**, because the second press of an arming is *not* an explicit id. T4-S4b therefore refuses to prune a terminal agent whose result is still unviewed, reports that the result is waiting, and prunes on the identical press once `Space` or `p` has collected it. **This asymmetry is the finding's practical content: the same registry call is safe behind a typed id and unsafe behind a keystroke.**
+
+### The open question for `/jobs prune`
+
+Three options, none taken here: leave it (explicit command, automation keeps the payload); **print the result before discarding it** (cheapest, and makes the interactive path match the JSON one); or refuse unless `--force`, matching the key. My own lean is the second — it costs one line, loses nothing, and removes the only path by which a result silently disappears — but it changes the output of an existing command, so it is a decision rather than a fix, and `--plain`'s byte contract makes any output change a breaking one.
+
+## F68 — REJECTED: a pasted correction executes the rest of itself as overlay keys
+
+**T4-S4b-i was rejected on review for this.** Found by reading the loop, not by a test, and not claimed from a report — the path is quoted below.
+
+The overlay reads raw bytes and processes a whole chunk at once:
+
+```rust
+let count = match stdin.read(&mut buffer) { … };
+for key in decode_overlay_keys(&buffer[..count], &mut pending) { … }
+```
+
+**The overlay does not enable bracketed paste** — that is a rustyline setting, and the overlay does not run rustyline. So a paste is indistinguishable from typing, and every byte of it is a key.
+
+Paste `fix the bug\nand retry` into the new steer or rename line and: the first line fills the draft, the `\n` **submits** it and closes the prompt, and the remaining bytes of **the same chunk** are then executed as overlay keys — `a`, `n` (which opens the rename prompt), `d`, ` `, `r`, … 
+
+### Why this is a rejection and not a note
+
+Before this card the overlay bound `↑`/`↓`, `Space`, `?` and `Esc`; a stray paste could scroll or peek, which is harmless. This card bound keys with **effects**:
+
+- **`r` then `y` answers a pending permission.** A pasted correction containing the letters `r` and `y` in sequence can **approve a filesystem write** on a blocked agent.
+- **`x` twice stops an agent**, and on a terminal one prunes it.
+
+So the card turns pasted text into privileged actions. That is a different severity class from anything the overlay did before, and it is **introduced by this card**, not pre-existing.
+
+### What makes it a clean fix rather than a redesign
+
+**This is exactly what `kitsu-editor` already solves** — it handles bracketed paste, split UTF-8 and the `ESC` ambiguity, and documents that a paste never submits. T4-S4b-ii was already scoped to route `s` through it. The hazard exists because this card bound text prompts to a **naive** line of its own instead, to satisfy the help test's "an advertised key must be bound" rule.
+
+Two defensible resolutions, for the rework to choose with evidence:
+1. **Guard the chunk** — once a prompt submits or an action key fires, the rest of that chunk must not be executed as commands.
+2. **Leave `s` and `n` unbound** until they can use the editor, and remove them from the help; then also guard `r`'s decision read, since `r`+`y` inside a paste is the sharp case and needs no text prompt at all.
+
+### The lesson, which is F65's generalised
+
+**F65** was *an arrow key is not one byte*. This is the same root with the opposite sign: **a chunk of bytes is not a sequence of intentions.** A loop that treats every decoded key as a deliberate keystroke is safe only while no key does anything. The moment a key acts, the loop needs to know where the human's intent ended — and that is precisely the knowledge a line editor carries and a raw byte loop does not.
+
+### F68, confirmed empirically — and it was worse than the reading suggested
+
+I rejected the card from reading the loop. The test author then **reproduced it against the real code** (a temporary pass-through over today's `decode_overlay_keys`, since reverted). One paste of `"retry the exxtract\nand fix the bug"` as a single chunk produced, in order, from the loop's own arms:
+
+```
+cannot read e as an answer for background agent #1; press y, a or n
+answered background agent #1: allow_once
+press x again to stop background agent #1
+stopped background agent #1
+background agent #1 is not waiting on an answer
+```
+
+**One pasted correction approved a parked filesystem request and then stopped the agent.** `registry.answer(id, Deny)` afterwards returned `NotBlocked` and the row went `Working → Cancelled`. The decoder returned **34 keys** for that chunk. In the rename prompt the same paste left the draft as `"d fix the bug"` — the `\n` submitted, `a`/`n` reopened rename, the rest typed into it. The PTY half reproduced too: a bracketed paste containing the word "quit" **closed the overlay**.
+
+So the severity was not hypothetical, and `allow_once` is the worst available outcome: a **write approval granted by text the user pasted as prose.**
+
+### The resolution, and the one judgement left open
+
+**Nothing in a paste is ever a key.** Inside a text prompt the whole payload including newlines is content and the prompt stays open; over the row list and inside `r`'s decision read a paste is **dropped entirely**. This keeps one answer to "what is a byte inside a paste?" across the binary — `kitsu-editor` already holds that a paste never submits, and T4-S2 decided a prefix byte inside a paste is content.
+
+Paste is detected two ways because one is not always available: **bracketed** (the overlay owns the terminal, so it emits `ESC[?2004h` itself, as `tui_bridge::KeyFilter` does without rustyline) and **unbracketed burst** (a chunk yielding more than one printable key is not typing) — the latter being what actually blocks `r`+`y` on a terminal that does not report pastes.
+
+**The burst rule is a heuristic and therefore has a false positive:** a fast typist, or a terminal that batches bytes, can put two printable keys in one read, so two quick `x` presses over the row list could be dropped. It **fails safe**, which is the right direction, but it collides with T2-S5b's standing rule that *a human must be able to tell "nothing happened" from "it worked"* — so a swallowed burst should say so rather than be silent. Left to the implementer with reasoning required.
+
+### A trap worth keeping
+
+**`ESC` alone is a strict prefix of `ESC[200~`.** A naive "hold the partial delimiter" implementation **silently kills F65's lone-`ESC` grace** — `escape_pending()` goes false and `Esc` stops working. Recognising `200~`/`201~` inside the existing CSI state is cleaner than prefix-holding. This cost the test author a design iteration and is pinned by explicit controls.
