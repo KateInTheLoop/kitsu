@@ -18467,3 +18467,482 @@ async fn test_piped_deadline_preserves_completed_tool_round_as_resumable_session
         "one request per completed/timed-out round"
     );
 }
+
+/// `/jobs view` and its `/agents` alias, end to end over the JSONL script
+/// surface. The alias arm historically rejected any non-numeric argument, so
+/// the `/agents view` assertion is the one that catches a silent regression.
+/// A separate script, not an extension of the existing one, keeps every
+/// `results[N]` index in `test_jsonl_script_query_results_are_structured_and_framed`
+/// untouched.
+#[test]
+#[serial]
+fn test_jsonl_script_jobs_view_is_served_by_both_the_command_and_its_alias() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("jobs-view.txt");
+    fs::write(&script, "/jobs view\n/agents view\n/agents\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["--jsonl", "chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("jobs view script");
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let results = events
+        .iter()
+        .filter(|event| event["type"] == "command_result")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 3);
+
+    // `/jobs view`: the grouped deck is a `jobs` action with the same snapshot
+    // payload the flat `list` action already publishes.
+    assert_eq!(results[0]["result"]["kind"], "jobs");
+    assert_eq!(results[0]["result"]["action"], "view");
+    assert_eq!(results[0]["result"]["changed"], false);
+    assert_eq!(results[0]["result"]["snapshot"]["total"], 0);
+    assert!(results[0]["result"]["snapshot"]["agents"].is_array());
+    assert!(results[0]["result"]["alias"].is_null());
+
+    // `/agents view`: the alias forwards a non-numeric argument verbatim
+    // instead of erroring, and still stamps its own `alias` field.
+    assert_eq!(results[1]["result"]["kind"], "jobs");
+    assert_eq!(results[1]["result"]["action"], "view");
+    assert_eq!(results[1]["result"]["alias"], "agents");
+    assert_eq!(results[1]["result"]["snapshot"]["total"], 0);
+
+    // Bare `/agents` still means `list`: widening the alias keeps its shapes.
+    assert_eq!(results[2]["result"]["kind"], "jobs");
+    assert_eq!(results[2]["result"]["action"], "list");
+    assert_eq!(results[2]["result"]["alias"], "agents");
+}
+
+/// `/agents <id>` still maps to `show <id>`. With no background agents a
+/// nonexistent id is the only reachable case and the handler rejects it, so
+/// this runs without `--jsonl` to read the human message on stderr: only that
+/// message distinguishes "forwarded to `show`" from "rejected by the alias".
+#[test]
+#[serial]
+fn test_script_agents_with_an_id_still_maps_to_show() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("agents-id.txt");
+    fs::write(&script, "/agents 7\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("agents id script");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    // The argument reached `/jobs show 7`, not the alias' own usage line.
+    assert!(stderr.contains("no background job #7"), "{stderr}");
+    assert!(
+        !stderr.contains("usage: /agents"),
+        "the alias rejected its own numeric form: {stderr}"
+    );
+}
+
+/// `/jobs explain <id>` and `/agents explain <id>`. With no background agents
+/// the unknown-id rejection is the only reachable outcome, and under `--jsonl`
+/// both a forwarded `explain` and an alias-level rejection surface as the same
+/// framed failure — so this runs without `--jsonl` and reads stderr, which is
+/// the only place the two paths differ.
+#[test]
+#[serial]
+fn test_script_jobs_explain_is_served_by_both_the_command_and_its_alias() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("jobs-explain.txt");
+    fs::write(&script, "/jobs explain 7\n/agents explain 7\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("jobs explain script");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // Both spellings reached the `explain` arm and were rejected by the id
+    // lookup, not by the subcommand table or by the alias.
+    assert_eq!(
+        stderr.matches("no background job #7").count(),
+        2,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("unknown action 'explain'"), "{stderr}");
+    assert!(!stderr.contains("usage: /jobs ["), "{stderr}");
+    assert!(!stderr.contains("usage: /agents"), "{stderr}");
+    // A rejected lookup is not a usage error either.
+    assert!(!stderr.contains("usage: /jobs explain"), "{stderr}");
+}
+
+/// Run a one-command script with `agents_toml` appended to the config and the
+/// child pointed at its own runtime directory. Returns that runtime directory
+/// so the caller can assert on what the run left behind. The parent's own
+/// environment is never touched: `XDG_RUNTIME_DIR` is set on the child only.
+fn run_script_with_runtime_dir(
+    home: &TempDir,
+    runtime: &TempDir,
+    script_name: &str,
+    agents_toml: &str,
+) {
+    write_config(home.path(), "http://127.0.0.1:1");
+    if !agents_toml.is_empty() {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(home.path().join(".kitsu").join("config.toml"))
+            .expect("open config.toml to append the [agents] table");
+        write!(file, "\n{agents_toml}").expect("append the [agents] table");
+    }
+    let script = home.path().join(script_name);
+    fs::write(&script, "/jobs view\n/quit\n").expect("write script");
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .args(["--jsonl", "chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("scripted run");
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// The roadmap invariant: an optional integration left at its default writes
+/// no state at all. The file itself is removed on exit, so a finished run
+/// cannot be judged by the file — but the *directory* is never removed, so its
+/// absence proves no write was ever attempted.
+#[test]
+#[serial]
+fn test_script_run_with_default_config_writes_no_agent_state_directory() {
+    let home = TempDir::new().expect("temp home");
+    let runtime = TempDir::new().expect("temp runtime dir");
+
+    run_script_with_runtime_dir(&home, &runtime, "state-default.txt", "");
+
+    let dir = runtime.path().join("kitsu");
+    assert!(
+        !dir.exists(),
+        "a scripted carrier under the default `auto` mode must create nothing, found {dir:?}"
+    );
+    assert_eq!(
+        fs::read_dir(runtime.path()).unwrap().count(),
+        0,
+        "the runtime directory must be untouched"
+    );
+}
+
+/// `state_file = "on"` overrides the carrier rule: a scripted run writes. The
+/// per-pid file is gone because exit removed it, and the owner-only directory
+/// it left behind is the evidence that the write happened.
+#[test]
+#[serial]
+fn test_script_run_with_agents_state_file_on_writes_the_state_directory() {
+    let home = TempDir::new().expect("temp home");
+    let runtime = TempDir::new().expect("temp runtime dir");
+
+    run_script_with_runtime_dir(
+        &home,
+        &runtime,
+        "state-on.txt",
+        "[agents]\nstate_file = \"on\"\n",
+    );
+
+    let dir = runtime.path().join("kitsu");
+    assert!(
+        dir.is_dir(),
+        "`state_file = \"on\"` must create the state directory at {dir:?}"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the state directory must be owner-only"
+        );
+    }
+
+    let leftovers = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        leftovers.is_empty(),
+        "exit must remove the per-pid file and leave no temporary: {leftovers:?}"
+    );
+}
+
+/// The explicit opt-out works independently of the carrier rule: `off` is
+/// indistinguishable from the default here, which is the point.
+#[test]
+#[serial]
+fn test_script_run_with_agents_state_file_off_writes_no_agent_state_directory() {
+    let home = TempDir::new().expect("temp home");
+    let runtime = TempDir::new().expect("temp runtime dir");
+
+    run_script_with_runtime_dir(
+        &home,
+        &runtime,
+        "state-off.txt",
+        "[agents]\nstate_file = \"off\"\n",
+    );
+
+    let dir = runtime.path().join("kitsu");
+    assert!(
+        !dir.exists(),
+        "`state_file = \"off\"` must create nothing, found {dir:?}"
+    );
+    assert_eq!(fs::read_dir(runtime.path()).unwrap().count(), 0);
+}
+
+// -------------------------------------------------------------------------
+// `kitsu agents`: the host-only reader for the advisory per-process state
+// files (requirement H1). Each test points the child at its own
+// XDG_RUNTIME_DIR; the parent's environment is never touched.
+// -------------------------------------------------------------------------
+
+/// A well-formed `kitsu.agents.v1` state file for `pid`, written by hand into
+/// `$XDG_RUNTIME_DIR/kitsu` so the bytes under test are foreign to the writer.
+fn write_agent_state_fixture(runtime: &Path, pid: u32, schema: &str, state: &str) {
+    let dir = runtime.join("kitsu");
+    fs::create_dir_all(&dir).expect("create the agent state directory");
+    let body = serde_json::to_string_pretty(&serde_json::json!({
+        "schema": schema,
+        "pid": pid,
+        "cwd": "/workspace/kitsu",
+        "session_id": "sess-7",
+        "state": state,
+        "counts": {
+            "running": 1,
+            "blocked": 2,
+            "unacknowledged": 3,
+            "terminal": 4,
+            "failed": 5,
+        },
+        "threads": [],
+        "updated_at": "2026-10-13T12:00:00Z",
+    }))
+    .unwrap();
+    fs::write(dir.join(format!("{pid}.json")), body).expect("write the state fixture");
+}
+
+/// `kitsu agents --json` follows `kitsu sessions --json`: one pretty-printed
+/// JSON value on stdout, here the bare array of entries.
+#[test]
+fn test_agents_json_lists_a_live_process_from_its_state_file() {
+    let home = TempDir::new().expect("temp home");
+    let runtime = TempDir::new().expect("temp runtime dir");
+    write_config(home.path(), "http://127.0.0.1:1");
+    // The test process is unquestionably alive, so liveness cannot make this
+    // flaky and the entry must survive the default (live-only) filter.
+    let pid = std::process::id();
+    write_agent_state_fixture(runtime.path(), pid, "kitsu.agents.v1", "blocked");
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .args(["agents", "--json"])
+        .output()
+        .expect("kitsu agents --json");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let listed: serde_json::Value = serde_json::from_slice(&output.stdout).expect("one JSON value");
+    let entries = listed.as_array().expect("a bare JSON array of entries");
+    assert_eq!(entries.len(), 1, "{listed}");
+    let entry = &entries[0];
+    assert_eq!(entry["pid"], pid);
+    assert_eq!(entry["alive"], true);
+    assert_eq!(entry["status"], "ok");
+    assert_eq!(entry["schema"], "kitsu.agents.v1");
+    assert_eq!(entry["state"], "blocked");
+    assert_eq!(entry["cwd"], "/workspace/kitsu");
+    assert_eq!(entry["session_id"], "sess-7");
+    assert_eq!(entry["counts"]["running"], 1);
+    assert_eq!(entry["counts"]["blocked"], 2);
+    assert_eq!(entry["counts"]["unacknowledged"], 3);
+    assert_eq!(entry["updated_at"], "2026-10-13T12:00:00Z");
+    assert_eq!(entry["threads"], serde_json::json!([]));
+    assert_eq!(entry["unsupported_threads"], 0);
+
+    // A read reclaims nothing.
+    assert!(runtime
+        .path()
+        .join("kitsu")
+        .join(format!("{pid}.json"))
+        .is_file());
+}
+
+/// The human tier: a deck row for the live process, and a plain sentence when
+/// nothing is publishing - which is an empty answer, not a failure.
+#[test]
+fn test_agents_human_listing_prints_rows_and_an_empty_answer_exits_zero() {
+    let home = TempDir::new().expect("temp home");
+    let runtime = TempDir::new().expect("temp runtime dir");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let pid = std::process::id();
+    write_agent_state_fixture(runtime.path(), pid, "kitsu.agents.v1", "working");
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .arg("agents")
+        .output()
+        .expect("kitsu agents");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(stdout.contains("kitsu agents"), "{stdout}");
+    assert!(stdout.contains("1 process(es)"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "pid {pid} | working | running 1 | blocked 2 | unacknowledged 3 | /workspace/kitsu"
+        )),
+        "{stdout}"
+    );
+
+    let empty_runtime = TempDir::new().expect("temp runtime dir");
+    let mut empty = base_cmd(home.path());
+    let output = empty
+        .env("XDG_RUNTIME_DIR", empty_runtime.path())
+        .arg("agents")
+        .output()
+        .expect("kitsu agents against an empty runtime dir");
+    assert!(
+        output.status.success(),
+        "an empty answer must exit zero, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        stdout.contains("no kitsu process is publishing agent state"),
+        "{stdout}"
+    );
+    assert!(
+        !empty_runtime.path().join("kitsu").exists(),
+        "the reader must not create the state directory"
+    );
+}
+
+/// A newer sibling kitsu publishing a schema this binary does not know must
+/// be named in the listing, never silently dropped and never fatal.
+#[test]
+fn test_agents_json_reports_a_newer_schema_as_unsupported_without_failing() {
+    let home = TempDir::new().expect("temp home");
+    let runtime = TempDir::new().expect("temp runtime dir");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let pid = std::process::id();
+    write_agent_state_fixture(runtime.path(), pid, "kitsu.agents.v2", "whatever-v2-says");
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .args(["agents", "--json"])
+        .output()
+        .expect("kitsu agents --json with a v2 file");
+    assert!(
+        output.status.success(),
+        "a newer sibling must not break the listing, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let listed: serde_json::Value = serde_json::from_slice(&output.stdout).expect("one JSON value");
+    let entries = listed.as_array().expect("a bare JSON array of entries");
+    assert_eq!(entries.len(), 1, "the entry must not be dropped: {listed}");
+    assert_eq!(entries[0]["pid"], pid);
+    assert_eq!(entries[0]["status"], "schema_unsupported");
+    assert_eq!(
+        entries[0]["schema"], "kitsu.agents.v2",
+        "the schema found must be reported verbatim"
+    );
+}
+
+/// The global `--jsonl` flag is reserved for chat automation events, and six
+/// management paths already refuse it through `reject_jsonl_for_management`.
+/// `agents` is the seventh: without this test the call can simply be omitted
+/// and one management command would quietly accept a flag the others reject.
+///
+/// Once `--jsonl` is set that mode owns both channels: stdout carries only
+/// `kitsu.chat.v1` records and the terminal error is framed as an `error`
+/// event there, so human stderr is empty. The assertion shape therefore
+/// follows `test_jsonl_preflight_error_keeps_stdout_machine_only` - the same
+/// inline line-by-line parse plus `jsonl_fixture::inspect_jsonl` - rather than
+/// the human `--output-last-message` rejection.
+#[test]
+fn test_agents_rejects_the_global_jsonl_flag_and_names_its_replacement() {
+    let home = TempDir::new().expect("temp home");
+    let runtime = TempDir::new().expect("temp runtime dir");
+    write_config(home.path(), "http://127.0.0.1:1");
+    // A populated runtime directory, so the only possible cause of failure is
+    // the flag check and not an empty listing.
+    write_agent_state_fixture(
+        runtime.path(),
+        std::process::id(),
+        "kitsu.agents.v1",
+        "idle",
+    );
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .args(["--jsonl", "agents", "--json"])
+        .output()
+        .expect("kitsu --jsonl agents --json");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "",
+        "a JSONL run frames its terminal error on stdout and leaves stderr empty"
+    );
+
+    let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let kinds: Vec<_> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["error", "final_summary"]);
+    assert_eq!(events[0]["kind"], "user");
+    assert_eq!(events[0]["exit_code"], 1);
+    let message = events[0]["message"].as_str().expect("an error message");
+    assert!(message.contains("--jsonl"), "{message}");
+    assert!(
+        message.contains("kitsu agents --json"),
+        "the error must name the replacement for this command: {message}"
+    );
+    assert_eq!(events[1]["user_failures"], 1);
+
+    let facts = jsonl_fixture::inspect_jsonl(&events, 1).expect("inspect the rejection JSONL");
+    assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::UserFault);
+}

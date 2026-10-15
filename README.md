@@ -659,6 +659,7 @@ single tool-free `ask` turn and exits after the answer.
 | `models [filter]` | List models advertised by the selected gateway without requiring a configured model ID. |
 | `sessions [action]` | List/show/fork/export/archive/restore/delete sessions without a provider; fork receipts name the exact resolved source; `list [filter]` narrows by substring; `resume` launches chat on a TTY or emits exact argv otherwise. |
 | `artifacts [list\|prune <id\|all>]` | Host-only, provider-free inventory and reclamation of command-artifact storage left by earlier runs. Live generations are never removed. |
+| `agents [--all] [--json]` | Host-only, provider-free listing of the background agents every kitsu process on this machine is publishing, read from the advisory state files `[agents] state_file` writes. Dead processes are skipped unless `--all`. A file written by a newer kitsu is reported as schema-unsupported instead of dropped, and a thread record this binary cannot validate is counted rather than blanking the listing. The reader creates, modifies, and deletes nothing. |
 | `chat [prompt]` | Interactive multi-turn REPL. An optional first prompt is queued as the first turn. With piped stdin (non-TTY), the prompt/stdin is a single turn. |
 
 **Global flags** (apply to any command)
@@ -809,6 +810,27 @@ it won't ask again.
   through `/jobs show` are printed before a session switch or interactive exit,
   after live jobs have been joined. Scripted JSONL emits unopened terminal work
   as `background_result`; an unseen failed job makes strict automation nonzero.
+- Because background agents run **in-process**, nothing outside kitsu can see
+  them. `[agents] state_file` publishes a small advisory JSON hint — one file
+  per running process — that an outside tool such as a terminal multiplexer can
+  read to tell whether this kitsu is `idle`, `working`, or `blocked`, with the
+  same redacted thread records `/jobs` shows. `auto` (the default) writes only
+  in an interactive terminal session, so scripted, piped, `ask` and JSONL runs
+  write nothing at all; `on` always writes and `off` never does. It lives at
+  `$XDG_RUNTIME_DIR/kitsu/<pid>.json` (falling back to `$TMPDIR/kitsu-<uid>/`
+  then `/tmp/kitsu-<uid>/`), is created `0700`/`0600`, refuses a directory it
+  does not own or that others can write, never follows a symlink standing in
+  for it, is replaced atomically, refreshes at turn boundaries, and is removed
+  on clean exit. Treat it as a hint, never a source of truth: it may be stale,
+  absent, or left by a process that died, and writing it never affects a turn.
+- `[hooks] on_agent_state` runs a local command on each agent state change,
+  exporting `KITSU_AGENT_ID`, `KITSU_AGENT_STATE` and
+  `KITSU_AGENT_WAITING_FOR`. It is executed **directly, never through a shell,
+  with no expansion**, so config text cannot turn into shell execution; use a
+  script, or write `sh -c` yourself. Its output is discarded so it cannot
+  disturb kitsu's own rendering, kitsu never waits for it, and a failure,
+  nonzero exit or timeout is ignored — a notification never costs a turn. It
+  fires once per transition and works with or without `state_file`.
 - Access is **deny-by-default** at the boundary; paths are canonicalized (writes
   canonicalize the parent), so `..`/symlink traversal is rejected. Generated
   files are capped at 1 MiB. `repo_grep` is always available with read tools on
@@ -905,7 +927,7 @@ Slash commands inside the REPL:
 | `/compact` | Compact eligible older exchanges now and report the actual method and savings. |
 | `/profiles` | List validated background-agent profiles with their instructions, requested reasoning effort, tool grant, and session-grant inheritance. Built-ins are a read-only `reviewer` and tool-free `reasoning` worker; both inherit the invocation's reasoning-effort policy rather than requesting one, so they never add a request field a gateway may reject. |
 | `/agent [list\|show ID\|steer ID TEXT\|stop ID\|close ID]` | Inspect one bounded, redacted agent timeline; steer or stop that thread; acknowledge and close retained results. |
-| `/jobs [list\|show ID\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. Steering **restarts** the worker with the correction on a fresh transcript — the receipt reports the elapsed work that discards; completed file changes are kept. `/agents [id]` remains an alias. |
+| `/jobs [list\|view\|explain ID\|show ID\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. `view` groups the same deck by state, agents needing input first, so one row does not hide among many. `explain ID` answers why one agent is in its state, since when, and what it is waiting on, and is read-only: unlike `show` it never acknowledges a ready result, so diagnosing an agent cannot quietly satisfy the unobserved-result exit guard. Steering **restarts** the worker with the correction on a fresh transcript — the receipt reports the elapsed work that discards; completed file changes are kept. `/agents` remains an alias: bare lists, a numeric argument shows that thread, and any other argument is forwarded to `/jobs`. |
 | `/artifacts [list\|prune ID\|prune all]` | Inspect aggregate command-artifact quota/usage and explicitly prune retained evidence. Also reports what earlier runs left on disk; reclaim that with the host-only `kitsu artifacts`. |
 | `/queue [list\|add\|remove\|edit\|move\|promote\|clear]` | Inspect and edit the bounded eight-prompt FIFO; `/queue <prompt>` remains shorthand for add. A single word one edit away from a subaction (e.g. `/queue lst`) gets a close-match suggestion instead of being silently queued; `/queue add <word>` queues it verbatim. |
 | `/steer <correction>` | While a response is running on Unix, cancel its partial turn, keep/report completed file effects, and restart it immediately with the correction before queued follow-ups. |
@@ -1123,6 +1145,29 @@ If only color should be disabled, set `NO_COLOR=1`. It keeps plain rendering but
 retains the rich Rustyline editor, including history, completion, and bracketed
 multi-line paste. Pass `--reduced-motion` or set `KITSU_REDUCED_MOTION=1` to
 replace the animated wait indicator with a visible static status.
+
+Set `KITSU_TUI=inline` to opt into the **inline viewport**, a preview renderer
+that pins a status row to the bottom of the terminal and lets the transcript
+scroll above it, instead of repainting one status row in place. The value is
+matched exactly: only `inline` selects it, so `INLINE`, `Inline` or a stray
+trailing space leave you in the renderer you already had. The variable is
+unset by default and a session without it is byte-identical to one from before
+the viewport existed.
+
+It is a preview, and the idle prompt inside it is kitsu's own editor rather
+than Rustyline, so it does not yet have Tab completion or the bordered
+slash-command palette that lists and filters commands as you type. Command
+history **does** persist across sessions, and Ctrl+R reverse search works.
+What it does have:
+insertion and cursor motion, Home/End, Backspace/Delete, the Ctrl+U/K/W kills,
+Up/Down through the current session's history, bracketed paste kept as one
+draft, Ctrl+D to exit on an empty line, Ctrl+C to clear the line, and Ctrl+Z to
+suspend — which releases the pinned row and hands the shell back an ordinary
+terminal, then restores the row and your unsubmitted draft on `fg`. Ctrl+\ is
+deliberately inert: its usual action dumps core, and this process holds your API
+credentials and conversation in memory. Everything else — every tier, every byte of non-TTY, `--plain`,
+assistive and JSONL output — is unaffected, because the viewport requires a
+styled interactive terminal.
 
 Background-agent notices print between prompt cycles by default: rendering
 them live at an idle prompt requires a line-editor hook that measurably

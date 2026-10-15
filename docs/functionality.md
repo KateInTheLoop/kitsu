@@ -19,6 +19,7 @@ top-level entry points are:
 | `kitsu models [filter]` | Query the configured model catalog without requiring a configured model ID. |
 | `kitsu sessions [action]` | Provider-free list/show/resume/fork/export/archive/restore/delete operations, with `--json`; fork receipts identify the exact resolved source session. |
 | `kitsu artifacts [list\|prune <id\|all>]` | Host-only, provider-free inventory and reclamation of command-artifact storage left by earlier runs, with `--json`. |
+| `kitsu agents [--all] [--json]` | Host-only, provider-free listing of the background agents every kitsu process on this machine is publishing, read from the advisory per-process state files. Processes that are gone are skipped unless `--all`; a file from a newer kitsu is reported as schema-unsupported rather than dropped; nothing is created, modified, or deleted. |
 | `kitsu chat [prompt]` | Interactive chat on a TTY, deterministic `--script` chat, or one piped turn. |
 
 See the [README CLI reference](../README.md#cli-reference) for every flag and
@@ -262,13 +263,55 @@ oldest verified artifact. `/artifacts` lists usage and prunes by ID or all.
 
 `/jobs` exposes bounded running/record capacity, status, elapsed time, model,
 usage, tool/write counts, safe recent activity, failure class, terminal result
-handoff, targeted steering, joined cancellation, and pruning. `/agent show`
+handoff, targeted steering, joined cancellation, and pruning. `/jobs view`
+presents the same deck grouped by state, with agents needing input first and
+empty groups omitted. `/jobs explain <id>` answers why one agent is in its
+state, since when, and what it is waiting on, drawn from the phase, elapsed
+time, last activity, failure class, steering and handoff already recorded; it
+is read-only and, unlike `/jobs show`, never acknowledges a ready result, so
+diagnosing an agent cannot quietly satisfy the unobserved-result exit guard.
+`/agent show`
 adds a bounded redacted event timeline; tool arguments/output and partial model
 bodies are never copied into that inspection record. Built-in `/profiles`
 select a read-only reviewer or a tool-free reasoning worker, and background
 spawns can name a profile without inheriting broader capabilities. `/agents`
-remains a compatibility alias. Styled mode uses a redraw-safe external printer;
-literal plain/assistive input defers notices until the current line is submitted.
+remains a compatibility alias: a bare call lists, a numeric argument shows
+that thread, and any other argument is forwarded verbatim to `/jobs`, so every
+subcommand is reachable through either name.
+
+Background agents run in-process, so nothing outside kitsu can observe them.
+`[agents] state_file` publishes a small advisory JSON hint, one file per running
+process, that an outside tool such as a terminal multiplexer can read to tell
+whether this kitsu is `idle`, `working`, or `blocked`, alongside the same
+redacted thread records `/jobs` shows. `auto` (the default) writes only in an
+interactive terminal session, so scripted, piped, `ask` and JSONL runs write
+nothing at all; `on` writes regardless of how kitsu was invoked, and `off`
+never writes. The file lives at `$XDG_RUNTIME_DIR/kitsu/<pid>.json`, falling
+back to `$TMPDIR/kitsu-<uid>/` and then `/tmp/kitsu-<uid>/`; the directory is
+created `0700` and the file `0600`, a directory that is not a directory, not
+owned by this user, or group/world-writable is refused, and a symlink standing
+in for it is never followed. It is replaced atomically, refreshed at turn
+boundaries rather than continuously, and removed on clean exit. It is a hint,
+not a source of truth: it may be stale, absent, or left behind by a process
+that died, and writing it never affects a turn — every failure is silent.
+
+`[hooks] on_agent_state` runs a local command when a background agent changes
+state, with `KITSU_AGENT_ID`, `KITSU_AGENT_STATE` and `KITSU_AGENT_WAITING_FOR`
+added to the inherited environment. The command is split into arguments and
+executed **directly — never through a shell, and with no variable expansion**,
+so a stray metacharacter in the config cannot become execution and the
+behaviour does not depend on which shell is installed; point it at a script, or
+write `sh -c` yourself if you want interpolation. Its standard input, output
+and error are all discarded, because a hook that printed would splice into the
+live status row and break the byte-identical output tiers. kitsu never waits
+for it, bounds how long it may run, reaps it, and silently ignores a spawn
+failure, a nonzero exit, and a timeout: a notification must never cost a turn.
+A hook fires once per transition rather than once per observation, at the same
+turn boundaries the state file refreshes on, and it is independent of
+`[agents] state_file` — either may be used without the other. Styled mode prints background-agent notices
+between prompt cycles by default; `KITSU_LIVE_NOTICES=1` opts into a live
+redraw-safe external printer at the cost of idle input latency. Literal
+plain/assistive input defers notices until the current line is submitted.
 Any terminal result not opened through `/jobs show` is surfaced before a session
 switch or exit. Scripted JSONL emits the same retained evidence as
 `background_result`; an unacknowledged failed detached job makes strict

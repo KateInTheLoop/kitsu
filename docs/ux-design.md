@@ -64,12 +64,25 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   (below), never via bare `\r` writes.
 - **Live status row** (`kitsu-render::live`): during a foreground turn on a
   styled interactive TTY, one rewritable stderr row at the transcript bottom
-  holds the spinner segment and a live type-ahead draft — `kitsu> <text>`
-  with a real terminal cursor. stdin drops to raw mode (`ICANON|ECHO` off,
-  `ISIG` kept so Ctrl+C still cancels) and bytes feed the pure
+  holds the spinner segment, two dimmed ambient tags, and a live type-ahead
+  draft — `kitsu> <text>` with a real terminal cursor. The tags sit leftmost
+  in the order background agents then queue: `[N blocked]` or `[N agent(s)]`
+  (blocked outranks running, hidden when both are zero, refreshed from the
+  registry watch once per input poll tick) followed by `[N queued]`. Both tag
+  widths participate in the row's fit math, so the cursor column accounts for
+  them and the spinner is still the first segment dropped on a narrow
+  terminal. stdin drops to raw mode on the **input** flags only
+  (`ICANON|ECHO|ISIG` off in `c_lflag`, `c_oflag` untouched so `OPOST|ONLCR`
+  keep supplying the carriage return every ordinary `println!` relies on) and
+  bytes feed the pure
   `TypeaheadEditor` keymap: printable insert, ←/→/Home/End, Backspace/Delete,
   ↑/↓ history (seeded from the rustyline history, with a draft stash),
-  Ctrl+U/K/W kills, Ctrl+D EOF on an empty draft. Raw mode enables
+  Ctrl+U/K/W kills, Ctrl+D EOF on an empty draft. Ctrl+C is deliberately
+  **not** left to the kernel: clearing `ISIG` delivers it as a byte, so a
+  non-empty draft is cleared rather than the turn cancelled, and only on an
+  empty draft does the collector `raise(SIGINT)` itself — the same signal the
+  kernel would have sent, so cancellation is unchanged. Approval handoffs
+  restore the original termios, so approval prompts keep kernel Ctrl+C. Raw mode enables
   bracketed paste (`ESC[?2004h`, off again on release): a pasted block stays
   ONE draft — its newlines insert literally (`\r\n` collapsed, tabs kept)
   and render as `⏎`/`⇥` placeholders on the row — and Alt+Enter inserts a
@@ -84,6 +97,90 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   carried into the next live editor or pre-filled into the next idle prompt.
   Non-TTY, `--plain`, and assistive sessions keep the canonical
   line-collector loop with byte-identical output.
+- **Inline viewport** (`kitsu-tui`, preview, gated behind `KITSU_TUI=inline`):
+  an alternative to the live status row that keeps its rows **outside** a DEC
+  scroll region instead of repainting one row at the transcript bottom. On
+  entry it sets the region to rows `1..=height - viewport_rows`, parks the
+  cursor on the region's last row, and paints the status rows below it; on exit
+  it clears those rows, releases the region, and leaves the cursor on the first
+  freed row so later output lands below the transcript rather than over its
+  top.
+
+  **The two are mutually exclusive, and the viewport wins.** Both want the
+  bottom rows, and a live row painted while a region is active lands *inside*
+  it and scrolls away with the transcript. So installing the viewport sets
+  `kitsu_render::live::set_live_rows_enabled(false)`, which
+  `live_rows_supported()` consults alongside the existing styled-stderr and
+  plain checks. It defaults enabled, so a session without the viewport is
+  byte-identical to the pre-viewport renderer.
+
+  Because the region scrolls on a line feed regardless of which writer produced
+  it, transcript output that bypasses the render seam entirely — the binary's
+  several hundred direct prints, including all slash-command output — still
+  flows into the region correctly and leaves the status rows intact. This is
+  measured, not assumed, by the styled pseudo-terminal tests in
+  `crates/kitsu/tests/tui.rs`. The measurement holds **at idle in cooked
+  mode**, where the terminal still supplies the carriage return those writers
+  omit; a session that holds raw mode throughout needs them re-measured.
+
+  **What the pinned row shows.** It is the status row while the draft is empty
+  and the composer (`kitsu> <draft>`) as soon as anything is typed, rather than
+  an always-on composer. An empty draft showing `kitsu> ` would claim the row
+  for an editor that has nothing in it, and the row is the only place a status
+  can live once the live status row stands down.
+
+  **The idle prompt in inline mode is kitsu's own editor, not Rustyline**,
+  because Rustyline would draw its prompt line inside the scroll region with no
+  knowledge of the region. stdin uses the same input-flags-only raw mode as the
+  during-turn type-ahead row — `ICANON|ECHO|ISIG` cleared in `c_lflag`,
+  `c_oflag` untouched — which is what lets ordinary `println!` output keep
+  working while the reader holds the terminal. The editor is the same pure
+  `TypeaheadEditor`, so the keymap matches the during-turn row. One divergence
+  from that row: Ctrl+C on an empty draft clears the line and keeps the session
+  rather than re-raising `SIGINT`, because at an idle prompt there is no turn to
+  cancel and the raise would take the default disposition and exit.
+
+  **Suspension releases the terminal before stopping.** Ctrl+Z at the inline
+  prompt clears the pinned rows, releases the scroll region and restores
+  canonical terminal modes, *then* raises the stop signal, so the shell is
+  handed an ordinary full-screen terminal rather than one whose scrolling area
+  is a subset of the screen. On resume the region and status row are
+  reinstalled and the unsubmitted draft replays through the same mechanism that
+  carries a draft between prompts, so typing survives the cycle. The order is
+  the correctness property — a stopped process cannot clean up after itself —
+  so it is enforced behind a seam and pinned by a test rather than by review.
+
+  Ctrl+backslash is deliberately inert rather than raising its usual signal,
+  whose default action terminates *and dumps core*: this process holds API
+  tokens and conversation text in memory, so honouring the convention would
+  write credentials to disk on a stray keystroke.
+
+  **History and reverse search work; completion and the palette do not, for one
+  shared reason.** Inline mode borrows rustyline's history persistence wholesale
+  without ever running its composer — the file is loaded at startup, the inline
+  reader is handed that same list, and submitted lines are recorded on the
+  common path after the read — so Up/Down walks previous sessions. Ctrl+R is
+  resolved entirely inside `TypeaheadEditor`, which emits no action for it, so
+  reverse search works at the inline prompt as it does in the during-turn row.
+
+  **The hint slot**, mirroring the during-turn row: the pinned row carries one
+  hint beside the draft — the reverse-search status (`⌕ reverse-search '…'`)
+  while Ctrl+R is active, otherwise the inline slash-completion suffix (typing
+  `/s` hints `teer`). The two differ in how they compete for columns, exactly as
+  in the classic row: the search status is **reserved** and claims its columns
+  before the draft is windowed, so it survives a long draft, while the
+  completion suffix is unreserved and is dropped when the row is too narrow.
+
+  Still absent at the inline prompt, and **separate pieces of work rather than
+  one** — an earlier version of this file wrongly said a single seam change
+  covered them: **Tab completion**, which needs the reader to act on the
+  editor's completion request rather than drop it, and **the bordered
+  slash-command palette**, which lists and filters commands over several rows
+  and so needs a viewport taller than one row.
+
+  Tiering is unchanged: the viewport requires a styled interactive TTY, so
+  non-TTY, `--plain`, assistive and JSONL sessions never enter it and stay
+  byte-identical.
 - **Errors**: one weighted `! error: <message>` first line (EMBER, bold on a
   styled TTY) plus untinted hint lines; identical text with zero escape bytes
   elsewhere. Failed turns print no human stats line and no DISCARDED notice
@@ -100,7 +197,23 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
 - **Agent deck**: `/jobs` and `/agent` share one `◈ agent deck — N total · N
   running · N done · N failed · N cancelled · N running slot(s) free · N
   record slot(s) free` receipt line, then per-row status, or `no background
-  agents` when empty. `/profiles` uses the same `◈` receipt header with rows
+  agents` when empty. `/jobs view` renders that same data grouped by state —
+  the header lead becomes `agent deck by state —`, and the rows sit under
+  unglyphed headings `  <state> (N)` at two-space indent (rows 4, continuation
+  8; the flat deck stays 2 and 6) in the fixed order `needs input`, `working`,
+  `done, result ready`, `done, collected`, `failed`, `cancelled`, with empty
+  groups omitted. Those headings bypass `deck_header`, so they are pure ASCII
+  in every tier; both views build their counts from one shared expression and
+  their rows from one shared helper, so they cannot drift. `/jobs explain <id>`
+  renders one agent as a `deck_marker` header `agent #N explained | <phase>`
+  followed by `  <label>: <value>` lines in a fixed order — `since`,
+  `waiting on`, `because`, `last activity`, `steering`, `handoff` — each
+  present only when it applies. Separators are ASCII `|` and the static text
+  is pure ASCII, since these lines bypass `sanitize_plain_inline` too. Two
+  ages, two formats, deliberately: `since` is a run duration at one decimal
+  like the rest of this file, while an activity age uses
+  `format_wait_elapsed`, matching the deck's own activity line.
+  `/profiles` uses the same `◈` receipt header with rows
   prefixed `◆` (tool-capable / inherits session grants) or `◇` (reasoning-only
   / no tools), reusing the tool-call/tool-result glyphs to signal capability
   level rather than tool activity.

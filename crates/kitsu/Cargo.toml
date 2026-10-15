@@ -19,8 +19,10 @@ path = "src/main.rs"
 [dependencies]
 kitsu-core = { workspace = true }
 kitsu-providers = { workspace = true }
+kitsu-editor = { workspace = true }
 kitsu-tools = { workspace = true }
 kitsu-render = { workspace = true }
+kitsu-tui = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
@@ -31,6 +33,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 rustyline = { workspace = true }
+crossterm = "0.28"
 unicode-width = { workspace = true }
 futures = { workspace = true }
 zeroize = { workspace = true }
@@ -45,6 +48,9 @@ wiremock = { workspace = true }
 tokio = { workspace = true }
 serial_test = { workspace = true }
 futures = { workspace = true }
+# Pinned to the same 0.15 `kitsu-tui` uses: 0.16 bumps `unicode-width` past
+# ratatui's exact pin and fails to resolve.
+vt100 = "0.15"
 
 # ---------------------------------------------------------------------------
 # Distro packaging.

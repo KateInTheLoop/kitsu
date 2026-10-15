@@ -58,7 +58,39 @@ Recommended workspace:
 - `crates/kitsu-core` — orchestrator, sessions, prompt building, tool loop
 - `crates/kitsu-providers` — provider trait + `OllamaProvider`, `OpenAICompatProvider`
 - `crates/kitsu-tools` — tool registry, policy engine, built-in tools
-- `crates/kitsu-render` — terminal rendering + JSON output formatting
+- `crates/kitsu-render` — terminal rendering + JSON output formatting. Its
+  writers sit behind a `Surface` seam (`surface.rs`): `ClassicSurface` is
+  today's behaviour, and a second backend can be installed without touching
+  callers. The accessor returns a cloned `Arc` out of a short-lived read
+  guard, so a caller structurally cannot hold the lock across a call — which
+  matters because the live-row suspension is reentrant, notices nest inside
+  it, and approval prompters run synchronously under `spawn_blocking`.
+  `write_block` carries a multi-line block under **one** suspension, because
+  lifting the row per line would clear and repaint between lines and change
+  the emitted bytes; the backend decides whether to lift at all, since the row
+  lives on stderr and a redirected stdout cannot disturb it. `StreamBuffer`
+  takes the block's writer rather than owning an `io::stdout()` handle, so the
+  seam genuinely carries assistant text and a second backend receives it; the
+  remaining caveats are that a failed write is swallowed, as it was against
+  stdout, and the returned byte count is computed from the formatted text
+  rather than from what the writer accepted.
+- `crates/kitsu-editor` — the pure input keymap and line editor (printable
+  insert, motions, kills, history walk with a draft stash, reverse-i-search,
+  bracketed paste, lone-Escape resolution). Dependency-free and deliberately
+  a library rather than a module of the binary: `crates/kitsu` is binary-only,
+  so a library crate cannot import from it, and the planned terminal UI needs
+  the same editor the binary's input collector uses.
+- `crates/kitsu-tui` — the terminal UI: pinned `ratatui 0.29` plus
+  `crossterm 0.28` (0.30 of ratatui requires a newer Rust than this workspace
+  declares). Currently carries only the terminal lifecycle — raw mode, window
+  title push and pop, and restoration on drop, interrupt and panic — because
+  giving the terminal back on every exit path has to be right before anything
+  is drawn on it. `viewport.rs` adds `InlineSurface`, a `Surface` backend that
+  pins a bottom region with `DECSTBM` and paints its rows by absolute
+  positioning while transcript lines flow upward. Its sinks are injectable per
+  descriptor so the whole mechanism is testable in process, and it emits CRLF
+  rather than LF: it lives behind raw mode, which clears `ONLCR`, so each
+  backend supplies its own line ending.
 
 This separation keeps provider logic independent from CLI parsing and makes it easier to add:
 - new providers (e.g., llama.cpp server)
