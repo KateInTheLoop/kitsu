@@ -7231,17 +7231,14 @@ enum OverlayPrompt {
 }
 
 /// Which line of text a [`OverlayPrompt::Text`] is collecting.
+///
+/// `n`'s name is the only one left: card T4-S4b-ii replaced `s`'s naive line
+/// with `SteerLine` over `kitsu-editor`, and the `Steer` variant that outlived
+/// it was constructed only by a test model (finding **F69**), which is gone.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OverlayTextPrompt {
     Rename,
-    // No longer opened by the loop: card T4-S4b-ii replaced `s`'s naive line
-    // with `SteerLine` over `kitsu-editor`, and `n`'s is the only text prompt
-    // left. The variant stays because the loop's lifted-out test model still
-    // exercises both kinds through this one type, and because the wording
-    // below is the line the steer line's frame inherited.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Steer,
 }
 
 #[cfg(unix)]
@@ -7262,11 +7259,6 @@ impl OverlayPrompt {
                 kind: OverlayTextPrompt::Rename,
                 draft,
             } => format!("name background agent #{id}: {draft} (enter applies, esc cancels)"),
-            Self::Text {
-                id,
-                kind: OverlayTextPrompt::Steer,
-                draft,
-            } => format!("steer background agent #{id}: {draft} (enter sends, esc cancels)"),
         }
     }
 }
@@ -7340,6 +7332,294 @@ fn stdin_waiting(timeout: std::time::Duration) -> bool {
     }
 }
 
+/// The overlay's state between keys: everything a key can change that is not
+/// the terminal itself.
+///
+/// It exists so that [`handle_overlay_input`] can be the **one** `match` on
+/// [`OverlayInput`] in the binary (finding **F69**). The byte loop owns the
+/// terminal -- reading, the 50 ms grace, painting, the alternate screen -- and
+/// this is what it hands the dispatch.
+#[cfg(unix)]
+struct OverlayState {
+    /// Whether the help frame is on screen.
+    helping: bool,
+    /// The peek panel for one agent, while `Space` is holding it up.
+    peeking: Option<Vec<String>>,
+    /// Which agent the keys act on.
+    selection: kitsu_tui::agents_view::AgentSelection,
+    /// What the last action key did, painted as the one report row.
+    report: Option<String>,
+    /// The prompt one of the action keys has open.
+    prompt: Option<OverlayPrompt>,
+    /// `s`'s text sub-mode: a line edited by `kitsu-editor`, which reads the
+    /// raw bytes itself while it is open. It is its own state rather than an
+    /// [`OverlayPrompt`], because the prompts are fed decoded keys and this is
+    /// fed bytes.
+    steering: Option<SteerLine>,
+}
+
+#[cfg(unix)]
+impl OverlayState {
+    fn new() -> Self {
+        Self {
+            helping: false,
+            peeking: None,
+            selection: kitsu_tui::agents_view::AgentSelection::new(),
+            report: None,
+            prompt: None,
+            steering: None,
+        }
+    }
+}
+
+/// What the byte loop must do about the key it just handed to
+/// [`handle_overlay_input`], in the loop's own terms.
+#[cfg(unix)]
+#[derive(Debug, Eq, PartialEq)]
+enum OverlayStep {
+    /// Carry on with the rest of the decoded chunk.
+    Continue,
+    /// `q`, or an `Esc` with nothing left to step out of: finish the chunk and
+    /// leave the view.
+    Closing,
+    /// Stop reading this chunk: `s` opened the steer line on this very
+    /// keystroke, and the bytes after it are the line's to read, not the
+    /// decoder's.
+    StopChunk,
+}
+
+/// Every key and every paste the overlay acts on, in one place.
+///
+/// This is the whole of the view's input dispatch and the **only** `match` on
+/// [`OverlayInput`] in this binary: `run_agent_view_overlay` keeps the parts
+/// that need a terminal and calls this for the parts that do not, and the
+/// registry-level tests call this same function. A test model that mirrored
+/// these arms could stop reflecting them without anything failing, which is
+/// finding **F69**; there is no model to diverge from now.
+#[cfg(unix)]
+fn handle_overlay_input(
+    registry: &subagent::AgentRegistry,
+    state: &mut OverlayState,
+    view_rows: &[kitsu_tui::agents_view::AgentRow],
+    cols: usize,
+    input: OverlayInput,
+) -> OverlayStep {
+    // A prompt is taken out of the state for the duration of the key
+    // and put back if it is still open afterwards: that is what lets
+    // each arm close it without holding a borrow of it.
+    //
+    // Pasted text is routed before any of that, because a paste is
+    // **content and never a command** (finding **F68**): it fills a
+    // text prompt's draft, newline included and without submitting,
+    // and it means nothing at all over the row list or inside `r`'s
+    // decision read.
+    let key = match input {
+        OverlayInput::Key(key) => key,
+        OverlayInput::Paste(text) => {
+            match state.prompt.take() {
+                Some(OverlayPrompt::Text {
+                    id,
+                    kind,
+                    mut draft,
+                }) => {
+                    draft.push_str(&text);
+                    state.prompt = Some(OverlayPrompt::Text { id, kind, draft });
+                }
+                // The read stays open rather than resolving to a
+                // pasted letter: `r` then a pasted `y` would approve
+                // a filesystem write nobody approved. The open read
+                // owns the report row, so it keeps saying what it
+                // wants and nothing is lost by staying quiet here.
+                Some(OverlayPrompt::Decision(id)) => {
+                    state.prompt = Some(OverlayPrompt::Decision(id));
+                }
+                // Over the row list the paste is dropped — and said
+                // so. A key that acts silently is indistinguishable
+                // from one that failed (requirement T2-S5b), and the
+                // unbracketed-burst rule has a false positive (a fast
+                // typist's two keys in one read), so the one case a
+                // user cannot otherwise explain is exactly this one.
+                // The count is reported and the text is not: it is
+                // the user's clipboard, not the view's to paint.
+                None => {
+                    state.report = Some(format!(
+                        "ignored a paste of {} characters: pasted text is not keys here, \
+                             so open a line first (n names, s steers)",
+                        text.chars().count()
+                    ));
+                }
+            }
+            return OverlayStep::Continue;
+        }
+    };
+    match state.prompt.take() {
+        // `r`'s decision read: the next key is the answer, and
+        // `parse_permission_answer` is what reads it.
+        Some(OverlayPrompt::Decision(id)) => match key {
+            OverlayKey::StepBack => state.report = None,
+            OverlayKey::Char(typed) => {
+                state.report = Some(agent_view_reply(registry, id, &typed.to_string()).line);
+            }
+            // An arrow or an Enter inside the read is neither an
+            // answer nor a cancel, so the read stays open rather than
+            // resolving to a guess.
+            OverlayKey::Up | OverlayKey::Down | OverlayKey::Enter | OverlayKey::Backspace => {
+                state.prompt = Some(OverlayPrompt::Decision(id))
+            }
+        },
+        // A line of text: `n`'s name or `s`'s correction.
+        Some(OverlayPrompt::Text {
+            id,
+            kind,
+            mut draft,
+        }) => match key {
+            OverlayKey::StepBack => state.report = None,
+            OverlayKey::Enter => {
+                state.report = Some(
+                    match kind {
+                        OverlayTextPrompt::Rename => agent_view_rename(registry, id, &draft),
+                    }
+                    .line,
+                );
+            }
+            OverlayKey::Backspace => {
+                draft.pop();
+                state.prompt = Some(OverlayPrompt::Text { id, kind, draft });
+            }
+            OverlayKey::Char(typed) => {
+                draft.push(typed);
+                state.prompt = Some(OverlayPrompt::Text { id, kind, draft });
+            }
+            // The arrows do not edit this line: there is no caret to
+            // move, and moving the selection under an open prompt
+            // would retarget it.
+            OverlayKey::Up | OverlayKey::Down => {
+                state.prompt = Some(OverlayPrompt::Text { id, kind, draft });
+            }
+        },
+        None => match key {
+            // Esc, resolved as a real key press rather than as the
+            // start of a sequence: out of the help if it is showing,
+            // out of a peek panel if one is up, out of the view
+            // otherwise. `q` is the conventional synonym for the
+            // latter.
+            OverlayKey::StepBack => {
+                if state.helping {
+                    state.helping = false;
+                } else if state.peeking.is_some() {
+                    state.peeking = None;
+                } else {
+                    return OverlayStep::Closing;
+                }
+            }
+            // The arrows move the selection and nothing else: they are
+            // not an exit, and no byte of their escape sequence
+            // reaches the composer underneath. They clamp rather than
+            // wrap, and they are inert while the help or a peek panel
+            // is up, where there is no row list on screen to move
+            // over.
+            OverlayKey::Up => {
+                if !state.helping && state.peeking.is_none() {
+                    state.selection.move_up(view_rows);
+                }
+            }
+            OverlayKey::Down => {
+                if !state.helping && state.peeking.is_none() {
+                    state.selection.move_down(view_rows);
+                }
+            }
+            // Enter and Backspace belong to the prompts; over the row
+            // list there is nothing for them to do, and they must not
+            // reach the composer underneath either.
+            OverlayKey::Enter | OverlayKey::Backspace => {}
+            OverlayKey::Char('?') => state.helping = true,
+            OverlayKey::Char('q') => return OverlayStep::Closing,
+            // Space: peek the selected agent. The byte is the view's
+            // and goes no further -- nothing is forwarded to the
+            // composer underneath, and it is not an exit either (test
+            // T4-S3a). With no rows there is nothing to peek and the
+            // frame is unchanged. Peeking is the only *read* here that
+            // acknowledges a handoff; painting rows and moving the
+            // selection do not, and neither do `r`, `x` and `n`.
+            OverlayKey::Char(' ') => {
+                if !state.helping && state.peeking.is_none() {
+                    state.selection.disarm();
+                    if let Some(id) = state.selection.selected() {
+                        state.peeking = agent_view_peek_frame(registry, id, cols);
+                    }
+                }
+            }
+            // The action keys (card T4-S4b, requirement A3). Every one
+            // of them acts on the selected agent and reports what it
+            // did, including when there is nothing selected: a key
+            // that looks broken is worse than one that says so. They
+            // are inert while the help or a peek panel is up, like the
+            // arrows, because the selected row is not on screen there.
+            //
+            // Each of them is also a keystroke that is not `x`, so
+            // each disarms a half-pressed stop (T4-S4a).
+            OverlayKey::Char(pressed @ ('r' | 's' | 'n' | 'p')) => {
+                if !state.helping && state.peeking.is_none() {
+                    state.selection.disarm();
+                    match state.selection.selected() {
+                        None => state.report = Some(agent_view_no_selection(pressed).line),
+                        Some(id) => match pressed {
+                            'r' => state.prompt = Some(OverlayPrompt::Decision(id)),
+                            's' => {
+                                // Card T4-S4b-ii: the real line over
+                                // `kitsu-editor`, in place of T4-S4b's
+                                // naive one. `n` keeps that line: a
+                                // name is one line and `rename`
+                                // refuses control characters anyway.
+                                state.steering = Some(SteerLine::new(id));
+                                // The rest of this chunk is not a
+                                // correction anybody typed -- the
+                                // line opened on this very keystroke
+                                // -- and the bytes after `s` are read
+                                // by the line itself from here on.
+                                return OverlayStep::StopChunk;
+                            }
+                            'n' => {
+                                state.prompt = Some(OverlayPrompt::Text {
+                                    id,
+                                    kind: OverlayTextPrompt::Rename,
+                                    draft: String::new(),
+                                });
+                            }
+                            _ => {
+                                state.report = Some(agent_view_acknowledge(registry, id).line);
+                            }
+                        },
+                    }
+                }
+            }
+            // `x` is two presses: the first arms, the second stops a
+            // live agent and prunes an already-terminal one. The
+            // arming is T4-S4a's and is not changed here; what the
+            // confirmation *does* was never pinned, and this is it.
+            OverlayKey::Char('x') => {
+                if !state.helping && state.peeking.is_none() {
+                    let armed_on = state.selection.selected();
+                    state.report = match state.selection.press_stop() {
+                        kitsu_tui::agents_view::StopPress::Armed => armed_on
+                            .map(|id| format!("press x again to stop background agent #{id}")),
+                        kitsu_tui::agents_view::StopPress::Confirmed(id) => {
+                            Some(overlay_block_on(agent_view_stop_or_prune(registry, id)).line)
+                        }
+                        kitsu_tui::agents_view::StopPress::NoSelection => {
+                            Some(agent_view_no_selection('x').line)
+                        }
+                    };
+                }
+            }
+            // Every other printable byte is the view's and goes no
+            // further: the overlay owns the keyboard while it is up.
+            OverlayKey::Char(_) => {}
+        },
+    }
+    OverlayStep::Continue
+}
+
 /// Open the agent view overlay and run it until it is closed, returning
 /// whether it was opened at all (card T4-S2, requirement A1).
 ///
@@ -7404,36 +7684,30 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
     let _ = err.write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h");
     let _ = err.flush();
 
-    // Which frame is on screen. `?` is help and `Esc` steps back out of it,
-    // so the key never leaves the user somewhere they cannot return from.
-    let mut helping = false;
-    // The peek panel for one agent (card T4-S3), while `Space` is holding it
-    // up. `Esc` steps back out of it the way it steps out of the help.
-    let mut peeking: Option<Vec<String>> = None;
-    // Which agent the keys act on (card T4-S4a). Re-synced against freshly
-    // built rows on every repaint, which is what keeps it on its *agent* while
-    // rows regroup under it; the sync acknowledges nothing, and neither does
-    // painting the mark.
-    let mut selection = kitsu_tui::agents_view::AgentSelection::new();
-    // What the last action key did, and the prompt one of them has open
-    // (card T4-S4b). Both are painted as the one report row under the rows:
-    // a key that acts silently is indistinguishable from a key that failed
-    // (requirement T2-S5b).
-    let mut report: Option<String> = None;
-    let mut prompt: Option<OverlayPrompt> = None;
-    // `s`'s text sub-mode (card T4-S4b-ii): a line edited by `kitsu-editor`,
-    // which reads the raw bytes itself while it is open. It is its own state
-    // rather than an `OverlayPrompt`, because the prompts are fed decoded
-    // keys and this is fed bytes -- the reason the editor is reusable here at
-    // all is that this is where the bytes are read.
-    let mut steering: Option<SteerLine> = None;
+    // Everything a key can change: which frame is on screen (`?` is help and
+    // `Esc` steps back out of it, so the key never leaves the user somewhere
+    // they cannot return from), the peek panel (card T4-S3), which agent the
+    // keys act on (card T4-S4a; re-synced against freshly built rows on every
+    // repaint, which is what keeps it on its *agent* while rows regroup under
+    // it -- the sync acknowledges nothing, and neither does painting the
+    // mark), what the last action key did and the prompt one of them has open
+    // (card T4-S4b; both are painted as the one report row under the rows,
+    // because a key that acts silently is indistinguishable from a key that
+    // failed, requirement T2-S5b), and `s`'s steer line (card T4-S4b-ii,
+    // which reads the raw bytes itself while it is open -- the reason the
+    // editor is reusable here at all is that this is where the bytes are
+    // read).
+    //
+    // It is a struct rather than seven locals because [`handle_overlay_input`]
+    // is what changes it: one dispatch, which the tests call too (**F69**).
+    let mut state = OverlayState::new();
     let mut stdin = std::io::stdin();
     let mut buffer = [0u8; 256];
     let mut decoder = OverlayDecoder::new();
     loop {
         let view_rows = agent_view_rows(registry);
-        selection.sync(&view_rows);
-        let content = if let Some(line) = steering.as_ref() {
+        state.selection.sync(&view_rows);
+        let content = if let Some(line) = state.steering.as_ref() {
             // The innermost frame of all: while a correction is being typed
             // it owns the screen, caret included, because the overlay hides
             // the terminal's own cursor.
@@ -7443,21 +7717,21 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
                 line.cursor(),
                 cols as usize,
             )
-        } else if helping {
+        } else if state.helping {
             kitsu_tui::agents_view::overlay_help_rows(cols as usize)
-        } else if let Some(panel) = peeking.as_ref() {
+        } else if let Some(panel) = state.peeking.as_ref() {
             panel.clone()
         } else {
             // An open prompt owns the report row; otherwise the last action's
             // report has it.
-            let line = match prompt.as_ref() {
+            let line = match state.prompt.as_ref() {
                 Some(open) => Some(open.report_line()),
-                None => report.clone(),
+                None => state.report.clone(),
             };
             kitsu_tui::agents_view::overlay_rows_with_report(
                 view_rows.clone(),
                 cols as usize,
-                selection.selected(),
+                state.selection.selected(),
                 line.as_deref(),
             )
         };
@@ -7483,28 +7757,31 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
         // for the same reason: inside it, `Esc` cancels the line and sends
         // nothing. A tick with no `ESC` held is not even waited for, so the
         // line costs no latency per keystroke.
-        if steering.as_ref().is_some_and(SteerLine::escape_held)
+        if state.steering.as_ref().is_some_and(SteerLine::escape_held)
             && !stdin_waiting(ESC_SEQUENCE_GRACE)
         {
-            if let Some(line) = steering.as_mut() {
+            if let Some(line) = state.steering.as_mut() {
                 if line.quiet_tick() == SteerLineStep::Cancelled {
-                    steering = None;
-                    report = None;
+                    state.steering = None;
+                    state.report = None;
                 }
             }
             continue;
         }
-        if steering.is_none() && decoder.escape_pending() && !stdin_waiting(ESC_SEQUENCE_GRACE) {
+        if state.steering.is_none()
+            && decoder.escape_pending()
+            && !stdin_waiting(ESC_SEQUENCE_GRACE)
+        {
             decoder.resolve_escape();
             // A real `Esc`: step back out of a prompt, out of the help, out of
             // a peek, or out of the view.
-            if prompt.is_some() {
-                prompt = None;
-                report = None;
-            } else if helping {
-                helping = false;
-            } else if peeking.is_some() {
-                peeking = None;
+            if state.prompt.is_some() {
+                state.prompt = None;
+                state.report = None;
+            } else if state.helping {
+                state.helping = false;
+            } else if state.peeking.is_some() {
+                state.peeking = None;
             } else {
                 break;
             }
@@ -7525,239 +7802,29 @@ fn run_agent_view_overlay(registry: &subagent::AgentRegistry, engage_raw: bool) 
         // entirely: the editor needs the real `ESC[200~`/`ESC[201~` to apply
         // its "a paste never submits" rule, and it is also what makes a
         // multi-byte character split across two reads work here.
-        if let Some(line) = steering.as_mut() {
+        if let Some(line) = state.steering.as_mut() {
             match line.feed(&buffer[..count]) {
                 SteerLineStep::Editing => {}
                 SteerLineStep::Submit(correction) => {
-                    report = Some(agent_view_steer(registry, line.id(), &correction).line);
-                    steering = None;
+                    state.report = Some(agent_view_steer(registry, line.id(), &correction).line);
+                    state.steering = None;
                 }
                 SteerLineStep::Cancelled => {
-                    steering = None;
-                    report = None;
+                    state.steering = None;
+                    state.report = None;
                 }
             }
             continue;
         }
         let mut closing = false;
         for input in decoder.feed(&buffer[..count]) {
-            // A prompt is taken out of the state for the duration of the key
-            // and put back if it is still open afterwards: that is what lets
-            // each arm close it without holding a borrow of it.
-            //
-            // Pasted text is routed before any of that, because a paste is
-            // **content and never a command** (finding **F68**): it fills a
-            // text prompt's draft, newline included and without submitting,
-            // and it means nothing at all over the row list or inside `r`'s
-            // decision read.
-            let key = match input {
-                OverlayInput::Key(key) => key,
-                OverlayInput::Paste(text) => {
-                    match prompt.take() {
-                        Some(OverlayPrompt::Text {
-                            id,
-                            kind,
-                            mut draft,
-                        }) => {
-                            draft.push_str(&text);
-                            prompt = Some(OverlayPrompt::Text { id, kind, draft });
-                        }
-                        // The read stays open rather than resolving to a
-                        // pasted letter: `r` then a pasted `y` would approve
-                        // a filesystem write nobody approved. The open read
-                        // owns the report row, so it keeps saying what it
-                        // wants and nothing is lost by staying quiet here.
-                        Some(OverlayPrompt::Decision(id)) => {
-                            prompt = Some(OverlayPrompt::Decision(id));
-                        }
-                        // Over the row list the paste is dropped — and said
-                        // so. A key that acts silently is indistinguishable
-                        // from one that failed (requirement T2-S5b), and the
-                        // unbracketed-burst rule has a false positive (a fast
-                        // typist's two keys in one read), so the one case a
-                        // user cannot otherwise explain is exactly this one.
-                        // The count is reported and the text is not: it is
-                        // the user's clipboard, not the view's to paint.
-                        None => {
-                            report = Some(format!(
-                                "ignored a paste of {} characters: pasted text is not keys here, \
-                                 so open a line first (n names, s steers)",
-                                text.chars().count()
-                            ));
-                        }
-                    }
-                    continue;
-                }
-            };
-            match prompt.take() {
-                // `r`'s decision read: the next key is the answer, and
-                // `parse_permission_answer` is what reads it.
-                Some(OverlayPrompt::Decision(id)) => match key {
-                    OverlayKey::StepBack => report = None,
-                    OverlayKey::Char(typed) => {
-                        report = Some(agent_view_reply(registry, id, &typed.to_string()).line);
-                    }
-                    // An arrow or an Enter inside the read is neither an
-                    // answer nor a cancel, so the read stays open rather than
-                    // resolving to a guess.
-                    OverlayKey::Up
-                    | OverlayKey::Down
-                    | OverlayKey::Enter
-                    | OverlayKey::Backspace => prompt = Some(OverlayPrompt::Decision(id)),
-                },
-                // A line of text: `n`'s name or `s`'s correction.
-                Some(OverlayPrompt::Text {
-                    id,
-                    kind,
-                    mut draft,
-                }) => match key {
-                    OverlayKey::StepBack => report = None,
-                    OverlayKey::Enter => {
-                        report = Some(
-                            match kind {
-                                OverlayTextPrompt::Rename => {
-                                    agent_view_rename(registry, id, &draft)
-                                }
-                                OverlayTextPrompt::Steer => agent_view_steer(registry, id, &draft),
-                            }
-                            .line,
-                        );
-                    }
-                    OverlayKey::Backspace => {
-                        draft.pop();
-                        prompt = Some(OverlayPrompt::Text { id, kind, draft });
-                    }
-                    OverlayKey::Char(typed) => {
-                        draft.push(typed);
-                        prompt = Some(OverlayPrompt::Text { id, kind, draft });
-                    }
-                    // The arrows do not edit this line: there is no caret to
-                    // move, and moving the selection under an open prompt
-                    // would retarget it.
-                    OverlayKey::Up | OverlayKey::Down => {
-                        prompt = Some(OverlayPrompt::Text { id, kind, draft });
-                    }
-                },
-                None => match key {
-                    // Esc, resolved as a real key press rather than as the
-                    // start of a sequence: out of the help if it is showing,
-                    // out of a peek panel if one is up, out of the view
-                    // otherwise. `q` is the conventional synonym for the
-                    // latter.
-                    OverlayKey::StepBack => {
-                        if helping {
-                            helping = false;
-                        } else if peeking.is_some() {
-                            peeking = None;
-                        } else {
-                            closing = true;
-                        }
-                    }
-                    // The arrows move the selection and nothing else: they are
-                    // not an exit, and no byte of their escape sequence
-                    // reaches the composer underneath. They clamp rather than
-                    // wrap, and they are inert while the help or a peek panel
-                    // is up, where there is no row list on screen to move
-                    // over.
-                    OverlayKey::Up => {
-                        if !helping && peeking.is_none() {
-                            selection.move_up(&view_rows);
-                        }
-                    }
-                    OverlayKey::Down => {
-                        if !helping && peeking.is_none() {
-                            selection.move_down(&view_rows);
-                        }
-                    }
-                    // Enter and Backspace belong to the prompts; over the row
-                    // list there is nothing for them to do, and they must not
-                    // reach the composer underneath either.
-                    OverlayKey::Enter | OverlayKey::Backspace => {}
-                    OverlayKey::Char('?') => helping = true,
-                    OverlayKey::Char('q') => closing = true,
-                    // Space: peek the selected agent. The byte is the view's
-                    // and goes no further -- nothing is forwarded to the
-                    // composer underneath, and it is not an exit either (test
-                    // T4-S3a). With no rows there is nothing to peek and the
-                    // frame is unchanged. Peeking is the only *read* here that
-                    // acknowledges a handoff; painting rows and moving the
-                    // selection do not, and neither do `r`, `x` and `n`.
-                    OverlayKey::Char(' ') => {
-                        if !helping && peeking.is_none() {
-                            selection.disarm();
-                            if let Some(id) = selection.selected() {
-                                peeking = agent_view_peek_frame(registry, id, cols as usize);
-                            }
-                        }
-                    }
-                    // The action keys (card T4-S4b, requirement A3). Every one
-                    // of them acts on the selected agent and reports what it
-                    // did, including when there is nothing selected: a key
-                    // that looks broken is worse than one that says so. They
-                    // are inert while the help or a peek panel is up, like the
-                    // arrows, because the selected row is not on screen there.
-                    //
-                    // Each of them is also a keystroke that is not `x`, so
-                    // each disarms a half-pressed stop (T4-S4a).
-                    OverlayKey::Char(pressed @ ('r' | 's' | 'n' | 'p')) => {
-                        if !helping && peeking.is_none() {
-                            selection.disarm();
-                            match selection.selected() {
-                                None => report = Some(agent_view_no_selection(pressed).line),
-                                Some(id) => match pressed {
-                                    'r' => prompt = Some(OverlayPrompt::Decision(id)),
-                                    's' => {
-                                        // Card T4-S4b-ii: the real line over
-                                        // `kitsu-editor`, in place of T4-S4b's
-                                        // naive one. `n` keeps that line: a
-                                        // name is one line and `rename`
-                                        // refuses control characters anyway.
-                                        steering = Some(SteerLine::new(id));
-                                        // The rest of this chunk is not a
-                                        // correction anybody typed -- the
-                                        // line opened on this very keystroke
-                                        // -- and the bytes after `s` are read
-                                        // by the line itself from here on.
-                                        break;
-                                    }
-                                    'n' => {
-                                        prompt = Some(OverlayPrompt::Text {
-                                            id,
-                                            kind: OverlayTextPrompt::Rename,
-                                            draft: String::new(),
-                                        });
-                                    }
-                                    _ => {
-                                        report = Some(agent_view_acknowledge(registry, id).line);
-                                    }
-                                },
-                            }
-                        }
-                    }
-                    // `x` is two presses: the first arms, the second stops a
-                    // live agent and prunes an already-terminal one. The
-                    // arming is T4-S4a's and is not changed here; what the
-                    // confirmation *does* was never pinned, and this is it.
-                    OverlayKey::Char('x') => {
-                        if !helping && peeking.is_none() {
-                            let armed_on = selection.selected();
-                            report = match selection.press_stop() {
-                                kitsu_tui::agents_view::StopPress::Armed => armed_on.map(|id| {
-                                    format!("press x again to stop background agent #{id}")
-                                }),
-                                kitsu_tui::agents_view::StopPress::Confirmed(id) => Some(
-                                    overlay_block_on(agent_view_stop_or_prune(registry, id)).line,
-                                ),
-                                kitsu_tui::agents_view::StopPress::NoSelection => {
-                                    Some(agent_view_no_selection('x').line)
-                                }
-                            };
-                        }
-                    }
-                    // Every other printable byte is the view's and goes no
-                    // further: the overlay owns the keyboard while it is up.
-                    OverlayKey::Char(_) => {}
-                },
+            match handle_overlay_input(registry, &mut state, &view_rows, cols as usize, input) {
+                OverlayStep::Continue => {}
+                OverlayStep::Closing => closing = true,
+                // `s` opened the steer line: the rest of this chunk is not a
+                // correction anybody typed, and the bytes after it are read by
+                // the line itself from here on.
+                OverlayStep::StopChunk => break,
             }
         }
         if closing {
@@ -30876,165 +30943,76 @@ mod tests {
     //   view's and reach no composer. It cannot see a permission.
     //
     // The registry tests drive the decoder's output through the loop's own
-    // arms with [`OverlayUnderTest`], which mirrors
-    // `run_agent_view_overlay`'s `match prompt.take()` arm for arm. That is
-    // deliberate and is the cost of the loop not being callable without a
-    // tty: the fix must change *both* the decoder and the read site, and the
-    // PTY test is what keeps the read site honest.
+    // dispatch, [`handle_overlay_input`] -- the one `match` on
+    // [`OverlayInput`] in the binary. They used to drive a test-local model
+    // that mirrored those arms instead, and T4-S4b-ii made it diverge while
+    // every test still passed: a mirror that no longer reflects **cannot
+    // fail** when the two disagree, because agreement is not among the things
+    // it checks (finding **F69**). [`OverlayUnderTest`] is now only the
+    // terminal's half -- a `read` of the descriptor and the reports the frame
+    // would have painted -- so there is nothing left to diverge.
 
-    /// The overlay's key-handling arms, lifted out of `run_agent_view_overlay`
-    /// so the registry effect of a chunk of bytes is observable without a
-    /// terminal. Every arm is the loop's, including `selection.disarm()` on a
-    /// key that is not `x`.
+    /// The terminal's half of `run_agent_view_overlay`, and nothing else: one
+    /// `read` of the descriptor, the decoder, and the reports the frame would
+    /// have painted. Every key and every paste is handled by the loop's own
+    /// [`handle_overlay_input`], against the loop's own [`OverlayState`], so
+    /// the registry effect of a chunk of bytes is observable without a tty
+    /// and without a second copy of the arms.
     ///
-    /// The three `Paste` arms are F68's specification: content inside a text
-    /// prompt, and nothing at all over the row list or inside the decision
-    /// read.
-    #[cfg(unix)]
-    #[derive(Debug)]
-    enum OverlayFrameUnderTest {
-        Rows,
-        Decision(u64),
-        Text {
-            id: u64,
-            kind: OverlayTextPrompt,
-            draft: String,
-        },
-    }
-
+    /// The `Paste` arms it exercises are F68's specification: content inside a
+    /// text prompt, and nothing that acts over the row list or inside `r`'s
+    /// decision read.
     #[cfg(unix)]
     struct OverlayUnderTest {
-        frame: OverlayFrameUnderTest,
-        selection: kitsu_tui::agents_view::AgentSelection,
+        state: OverlayState,
         decoder: OverlayDecoder,
         reports: Vec<String>,
     }
+
+    /// The width the loop would have read from the terminal. Only the peek
+    /// panel and the painted rows use it, and neither is asserted here.
+    #[cfg(unix)]
+    const OVERLAY_TEST_COLS: usize = 80;
 
     #[cfg(unix)]
     impl OverlayUnderTest {
         fn new() -> Self {
             Self {
-                frame: OverlayFrameUnderTest::Rows,
-                selection: kitsu_tui::agents_view::AgentSelection::new(),
+                state: OverlayState::new(),
                 decoder: OverlayDecoder::new(),
                 reports: Vec::new(),
             }
         }
 
-        /// One `read` of the descriptor, decoded and applied.
-        async fn feed(&mut self, registry: &subagent::AgentRegistry, chunk: &[u8]) {
+        /// One `read` of the descriptor, decoded and applied -- the body of
+        /// the loop's `for input in decoder.feed(..)`, with the report row
+        /// collected instead of painted.
+        fn feed(&mut self, registry: &subagent::AgentRegistry, chunk: &[u8]) {
             let rows = agent_view_rows(registry);
-            self.selection.sync(&rows);
+            self.state.selection.sync(&rows);
             for input in self.decoder.feed(chunk) {
-                let frame = std::mem::replace(&mut self.frame, OverlayFrameUnderTest::Rows);
-                match (frame, input) {
-                    // F68: a paste is text. Over the row list and inside the
-                    // decision read it is dropped; the read stays open rather
-                    // than resolving to a pasted letter.
-                    (OverlayFrameUnderTest::Rows, OverlayInput::Paste(_)) => {}
-                    (OverlayFrameUnderTest::Decision(id), OverlayInput::Paste(_)) => {
-                        self.frame = OverlayFrameUnderTest::Decision(id);
-                    }
-                    (
-                        OverlayFrameUnderTest::Text {
-                            id,
-                            kind,
-                            mut draft,
-                        },
-                        OverlayInput::Paste(text),
-                    ) => {
-                        draft.push_str(&text);
-                        self.frame = OverlayFrameUnderTest::Text { id, kind, draft };
-                    }
-                    (
-                        OverlayFrameUnderTest::Decision(id),
-                        OverlayInput::Key(OverlayKey::Char(typed)),
-                    ) => {
-                        self.reports
-                            .push(agent_view_reply(registry, id, &typed.to_string()).line);
-                    }
-                    (
-                        OverlayFrameUnderTest::Text {
-                            id,
-                            kind,
-                            mut draft,
-                        },
-                        OverlayInput::Key(key),
-                    ) => match key {
-                        OverlayKey::Enter => {
-                            self.reports.push(
-                                match kind {
-                                    OverlayTextPrompt::Rename => {
-                                        agent_view_rename(registry, id, &draft)
-                                    }
-                                    OverlayTextPrompt::Steer => {
-                                        agent_view_steer(registry, id, &draft)
-                                    }
-                                }
-                                .line,
-                            );
-                        }
-                        OverlayKey::Char(typed) => {
-                            draft.push(typed);
-                            self.frame = OverlayFrameUnderTest::Text { id, kind, draft };
-                        }
-                        OverlayKey::StepBack => {}
-                        _ => self.frame = OverlayFrameUnderTest::Text { id, kind, draft },
-                    },
-                    (
-                        OverlayFrameUnderTest::Rows,
-                        OverlayInput::Key(OverlayKey::Char(pressed @ ('r' | 's' | 'n' | 'p'))),
-                    ) => {
-                        self.selection.disarm();
-                        match self.selection.selected() {
-                            None => self.reports.push(agent_view_no_selection(pressed).line),
-                            Some(id) => match pressed {
-                                'r' => self.frame = OverlayFrameUnderTest::Decision(id),
-                                's' => {
-                                    self.frame = OverlayFrameUnderTest::Text {
-                                        id,
-                                        kind: OverlayTextPrompt::Steer,
-                                        draft: String::new(),
-                                    };
-                                }
-                                'n' => {
-                                    self.frame = OverlayFrameUnderTest::Text {
-                                        id,
-                                        kind: OverlayTextPrompt::Rename,
-                                        draft: String::new(),
-                                    };
-                                }
-                                _ => self.reports.push(agent_view_acknowledge(registry, id).line),
-                            },
-                        }
-                    }
-                    (OverlayFrameUnderTest::Rows, OverlayInput::Key(OverlayKey::Char('x'))) => {
-                        let armed_on = self.selection.selected();
-                        match self.selection.press_stop() {
-                            kitsu_tui::agents_view::StopPress::Armed => {
-                                if let Some(id) = armed_on {
-                                    self.reports.push(format!(
-                                        "press x again to stop background agent #{id}"
-                                    ));
-                                }
-                            }
-                            kitsu_tui::agents_view::StopPress::Confirmed(id) => {
-                                self.reports
-                                    .push(agent_view_stop_or_prune(registry, id).await.line);
-                            }
-                            kitsu_tui::agents_view::StopPress::NoSelection => {
-                                self.reports.push(agent_view_no_selection('x').line);
-                            }
-                        }
-                    }
-                    (frame, _) => self.frame = frame,
+                let step = handle_overlay_input(
+                    registry,
+                    &mut self.state,
+                    &rows,
+                    OVERLAY_TEST_COLS,
+                    input,
+                );
+                // The loop paints the report row and keeps the last one; the
+                // tests want every line a key produced, so they are taken as
+                // they appear. Nothing in the dispatch reads the field back.
+                if let Some(line) = self.state.report.take() {
+                    self.reports.push(line);
+                }
+                if step == OverlayStep::StopChunk {
+                    break;
                 }
             }
         }
 
         fn draft(&self) -> Option<&str> {
-            match &self.frame {
-                OverlayFrameUnderTest::Text { draft, .. } => Some(draft.as_str()),
+            match &self.state.prompt {
+                Some(OverlayPrompt::Text { draft, .. }) => Some(draft.as_str()),
                 _ => None,
             }
         }
@@ -31191,7 +31169,7 @@ mod tests {
 
         let (registry, id, answer) = registry_with_one_blocked_agent().await;
         let mut overlay = OverlayUnderTest::new();
-        overlay.feed(&registry, PASTED_CORRECTION.as_bytes()).await;
+        overlay.feed(&registry, PASTED_CORRECTION.as_bytes());
         assert_eq!(
             registry.answer(id, Decision::Deny),
             subagent::AgentAnswerOutcome::Answered,
@@ -31211,8 +31189,8 @@ mod tests {
         // its own read, is exactly the keystroke pair the paste must not be.
         let (registry, id, answer) = registry_with_one_blocked_agent().await;
         let mut typed = OverlayUnderTest::new();
-        typed.feed(&registry, b"r").await;
-        typed.feed(&registry, b"y").await;
+        typed.feed(&registry, b"r");
+        typed.feed(&registry, b"y");
         assert_eq!(
             answer.await.expect("the gate is resolved"),
             Decision::AllowOnce,
@@ -31244,7 +31222,7 @@ mod tests {
         let registry = subagent::AgentRegistry::new();
         let id = registry.start("still working".to_string()).unwrap();
         let mut overlay = OverlayUnderTest::new();
-        overlay.feed(&registry, PASTED_CORRECTION.as_bytes()).await;
+        overlay.feed(&registry, PASTED_CORRECTION.as_bytes());
         let rows = agent_view_rows(&registry);
         assert_eq!(
             rows.iter().find(|row| row.id == id).map(|row| row.state),
@@ -31256,8 +31234,8 @@ mod tests {
 
         // POSITIVE CONTROL: the same two bytes, one read each.
         let mut typed = OverlayUnderTest::new();
-        typed.feed(&registry, b"x").await;
-        typed.feed(&registry, b"x").await;
+        typed.feed(&registry, b"x");
+        typed.feed(&registry, b"x");
         let after = agent_view_rows(&registry);
         assert_ne!(
             after.iter().find(|row| row.id == id).map(|row| row.state),
@@ -31299,13 +31277,13 @@ mod tests {
         let id = registry.start("needs a name".to_string()).unwrap();
         let mut overlay = OverlayUnderTest::new();
         // `n` opens the rename line, typed as its own read.
-        overlay.feed(&registry, b"n").await;
+        overlay.feed(&registry, b"n");
         assert_eq!(
             overlay.draft(),
             Some(""),
             "NON-VACUOUS: the rename line is open and empty before the paste"
         );
-        overlay.feed(&registry, PASTED_CORRECTION.as_bytes()).await;
+        overlay.feed(&registry, PASTED_CORRECTION.as_bytes());
         assert_eq!(
             overlay.draft(),
             Some(PASTED_CORRECTION),
@@ -31331,7 +31309,7 @@ mod tests {
         // registry refuses a name carrying a control character, which is its
         // own rule (`AgentRenameOutcome::Unprintable`) and not this card's.
         // What matters here is that the submit happened only now.
-        overlay.feed(&registry, b"\r").await;
+        overlay.feed(&registry, b"\r");
         assert_eq!(
             overlay.reports.len(),
             1,
@@ -31354,12 +31332,12 @@ mod tests {
         // assertion above is about the paste and not about a prompt that had
         // stopped working.
         let mut typed = OverlayUnderTest::new();
-        typed.feed(&registry, b"n").await;
+        typed.feed(&registry, b"n");
         for byte in b"ok" {
-            typed.feed(&registry, &[*byte]).await;
+            typed.feed(&registry, &[*byte]);
         }
         assert_eq!(typed.draft(), Some("ok"));
-        typed.feed(&registry, b"\r").await;
+        typed.feed(&registry, b"\r");
         assert_eq!(
             agent_view_rows(&registry)
                 .iter()
