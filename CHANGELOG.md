@@ -92,6 +92,11 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- In the agent view, **`s` steers the selected agent**: a real editable line
+  with a caret, which windows around the cursor so a long correction still shows
+  where you are typing. `Enter` sends it, `Esc` cancels and sends nothing, and a
+  pasted multi-line correction is content rather than a submission — the line
+  waits for you to press `Enter` yourself.
 - In the agent view, **`r` replies to a blocked agent, `x` stops it (twice; on
   an already-finished agent the second press prunes it), `n` renames it and `p`
   marks its result collected.** Each names its outcome, including the failures —

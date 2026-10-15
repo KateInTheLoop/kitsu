@@ -546,7 +546,38 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
     not a sequence of intentions*. A loop that treats every decoded key as a
     deliberate keystroke is safe only while no key does anything.
 
-  - **`s`'s text sub-mode is T4-S4b-ii and is not shipped yet.** Its decisions
+  - **`s`'s text sub-mode (T4-S4b-ii, shipped).** `s` opens a real editable line
+    over the existing `kitsu-editor`, not a second line editor — **F45** was
+    closed by removing a duplicate parser of the same bytes, and this is the
+    same rule. `kitsu-tui` paints it (`steer_prompt_rows`) and cannot reach the
+    editor; `main.rs`, where the loop runs, can.
+    - **`ESC` cancels the line and sends nothing**, under the same 50 ms grace
+      **F65** introduced. Inside this overlay `Esc` already means *step back out
+      of the frame you are in*, and the steer line is one more frame; two
+      meanings for `ESC` on one surface is the F65 ambiguity itself. Only one
+      surface resolves a held `ESC` at a time, and the grace is **spent only
+      when an `ESC` is actually held**, so an idle line costs no repaint spin.
+    - **While the line is open it reads the raw bytes itself, bypassing the
+      overlay decoder** — so the editor sees the terminal's real
+      `ESC[200~`/`ESC[201~` and enforces *a bracketed paste never submits* as
+      the one parser that owns that rule. This is the deliberate answer to a
+      hazard: F68's decoder **strips** the delimiters and yields plain text, so
+      feeding that text back through the editor would let an **unbracketed**
+      newline reach the submit path — F68 re-entering one layer down. A second
+      reason seals it: `OverlayKey::Char` is **ASCII-only by construction**, so
+      routing the line through the decoder would discard exactly the split-UTF-8
+      handling that justified reusing the editor.
+    - **Opening the line mid-chunk drops the rest of that read.** Those bytes
+      were decoded as keys before the line existed, and letting them fall
+      through to the row list could run `x`. A normal read carries one
+      keystroke.
+    - **An empty correction is refused.** The guard is key-level but constructs
+      the registry's own `Empty` error, so the wording is identical to
+      `/jobs steer`'s.
+    - **The echo flattens control characters one-for-one and windows around the
+      caret**, so a pasted newline cannot paint an unbudgeted row and a
+      correction longer than the terminal still shows the cursor instead of
+      pushing it off the edge. Its decisions
     are pinned by tests but not implemented: `ESC` cancels the line under the
     same 50 ms grace T4-S4a introduced, a newline **inside a paste is content**
     (consistent with T4-S2's prefix-byte rule), and an empty correction is the
