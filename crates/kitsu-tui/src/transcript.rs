@@ -107,6 +107,47 @@ impl TranscriptOverlay {
         self.view.jump(jump, ring, Self::content_rows(rows))
     }
 
+    /// **R6-b: the query line and the match walk.**
+    ///
+    /// These are the *policy* over [`FullscreenView::pin_to`]; `{`/`}` is the
+    /// other one, and there is deliberately no second anchor concept. Stubs
+    /// for now: the tests below are the specification, and an implementation
+    /// that satisfies them replaces these bodies.
+    ///
+    /// Open the query line (`/`).
+    pub fn begin_search(&mut self) {}
+
+    /// The query being typed, or `None` when no query line is open.
+    pub fn search_query(&self) -> Option<&str> {
+        None
+    }
+
+    /// Append one printable character to the open query line.
+    pub fn push_search_char(&mut self, _ch: char) {}
+
+    /// Delete the last character of the open query line.
+    pub fn backspace_search(&mut self) {}
+
+    /// Abandon the query line, leaving the overlay open and unmoved.
+    pub fn cancel_search(&mut self) {}
+
+    /// Run the typed query (`Enter`) and jump to its newest match, reporting
+    /// whether the frame moved.
+    pub fn submit_search(&mut self, _ring: &CellRing, _rows: u16) -> bool {
+        false
+    }
+
+    /// Walk to the next match in `dir` (`n`/`N`), reporting whether the frame
+    /// moved.
+    pub fn repeat_search(&mut self, _dir: Jump, _ring: &CellRing, _rows: u16) -> bool {
+        false
+    }
+
+    /// How many matches the last submitted query found.
+    pub fn match_count(&self) -> usize {
+        0
+    }
+
     /// The rows to paint, oldest first, with the footer last.
     pub fn frame(&self, ring: &CellRing, rows: u16, cols: usize) -> Vec<String> {
         if rows == 0 {
@@ -485,7 +526,7 @@ mod tests {
             !footer.is_empty(),
             "the overlay advertises its keys in situ"
         );
-        for advertised in ["q", "Esc", "PgUp", "PgDn", "{", "}"] {
+        for advertised in ["q", "Esc", "PgUp", "PgDn", "{", "}", "n/N"] {
             assert!(
                 footer.contains(advertised),
                 "the footer names {advertised:?}, which this overlay \
@@ -500,7 +541,19 @@ mod tests {
         // only its own fixture can satisfy (**F58**). The capability words are
         // what an over-eager row would actually say.
         let lowered = footer.to_ascii_lowercase();
-        for unanswered in ["search", "dump", "editor", "scrollback"] {
+        // **R6-b**: `search` has moved out of this list and into the required
+        // advertisements below, because `/` is now dispatched. `dump`,
+        // `editor` and `scrollback` stay forbidden -- R6-d is gated -- so the
+        // guard that has kept this footer honest through two cards is
+        // narrowed by exactly one word and not relaxed.
+        for advertised in ["search", "match"] {
+            assert!(
+                lowered.contains(advertised),
+                "the footer names the {advertised:?} capability, which R6-b \
+                 dispatches; it reads {footer:?}"
+            );
+        }
+        for unanswered in ["dump", "editor", "scrollback"] {
             assert!(
                 !lowered.contains(unanswered),
                 "the footer must not advertise {unanswered:?}: nothing \
