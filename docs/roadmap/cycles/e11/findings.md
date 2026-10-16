@@ -5064,3 +5064,26 @@ It does weaken something I required on T5-S1c-iii — that naming those keys wit
 **The literal pattern finds zero; a markdown-tolerant `not\*{0,2} wired` finds it.** The emphasis I add for readers defeats the search I rely on — and this sentence is one that *must* be found when R6-d finally ships.
 
 **Fixed in the sweep's pattern.** And this is the third false reading from my two mechanical checks (a compound row name, a bracketed enumeration, now markdown emphasis). The ratio is still worth it — between them they found a wholly undocumented overlay, two dangling references and three stale claims — but it confirms the rule: **these nominate, a human adjudicates, and a clean sweep is not evidence of a clean document.**
+
+## F116 — a comment I shipped one commit ago was backwards twice, and it shrinks F72
+
+Measured while scoping F72 as the next card. The comment, committed in `1f2af45`:
+
+> with no paste markers this loop cannot tell a pasted newline from a pressed `Enter` at all, which is **F72** proper and stays open — **the inline route never writes `?2004h`**
+
+**Both halves of that attribution are wrong.**
+
+1. **The enable sits in `run_transcript_overlay`'s `take_alternate_screen` branch**, which writes `ESC[?1049h ESC[2J ESC[H ESC[?25l ESC[?2004h`. The **inline** call site passes `true` — inline has no alternate screen, so the overlay takes it — and the **fullscreen** call site passes `false`, because its segment already holds the screen. **So the inline route is the only one that writes `?2004h`; the comment names it as the one that does not.**
+2. **It does not matter anyway, because a `RawStdinGuard` is held at both call sites.** `engage()` writes `?2004h` and its drop writes `?2004l`, with the stated reason *"so the editor can keep a paste as a single draft"*. There is even a comment at the inline site warning that the overlay **must not engage a second one**. So bracketed paste is on in both routes on any terminal that supports it.
+
+### What this does to F72
+
+**F72's residue on this surface is much narrower than my own comment claimed.** It is not "the inline route has no markers"; it is **"a terminal that *ignores* `ESC[?2004h` sends no markers"** — and then, and only then, the loop cannot distinguish a pasted newline from a pressed `Enter`.
+
+That changes the card. The fix is not "enable bracketed paste on the route that lacks it" (no such route) and not "add burst detection to this loop" as a default — it is a fallback for terminals without bracketed-paste support, which is a **much rarer** case and must be weighed against its cost. **`OverlayDecoder` already implements exactly that fallback** (**F68**: bracketed *plus* unbracketed-burst detection), and it is **deliberately excluded** from `SteerLine::feed`, whose own comment explains why: feeding unbracketed text to the editor *"would submit on that newline, which is F68 again one layer down."*
+
+**So F72 is a smaller and sharper card than its entry suggests**, and the thing to decide is whether terminals without bracketed paste are worth a burst heuristic on surfaces that currently rely on markers. **Q1's terminal matrix is the evidence that question needs, and it still needs a human.**
+
+### The pattern, and it is now the sixth
+
+I wrote a false attribution into a comment **while shipping the feature it described**, and it would have sent the next card at the wrong file — exactly what **F112**'s three errors did. The shape is the same every time: **a plausible mechanism, internally consistent, asserted without re-reading the line.** F91 named the rule (*an entry asserting "X already does Y" needs the line that shows it*), and this is the sixth instance of me breaking it. The comment is corrected **in place**, with the measurement, rather than deleted — **F90**: *"X is missing" and "X is refused" look identical from outside*, and so do *"the route lacks the enable"* and *"the route has it from its caller."*
