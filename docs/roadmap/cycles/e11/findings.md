@@ -5735,3 +5735,32 @@ The implementation was complete and green — and the chord was **advertised now
 **It made re-attaching idempotent**, by routing the switch through the existing `apply_agent_view_exit` seam, which acts only on a **change** of binding — so the chord typed on the already-attached agent is a no-op rather than a duplicate milestone. I asked only whether switching worked.
 
 **And the fixture is the anti-vacuity shape I asked for, exceeded:** ids `7, 3, 11, 2, 5, 9`, a filter leaving four, display order `#3, #7, #11, #5` — so **ordinal 1 selects id 3**, **id 2 exists but is filtered out**, and the test asserts *"no ordinal equals the id it selects"* **first**, with `assert_ne!`, before any behaviour.
+
+## F138 — writing the decision records found a decision that had been made and never closed
+
+**T5-S8 shipped**: three ADRs in `decisions.md`, and a **derived** requirement-traceability table appended to the design. **No test phase — the deliverable is prose, and saying so beats inventing an assertion.**
+
+### The catch: open question 7 was decided and still labelled open
+
+The design **stated the decision in one place** — *"(`background_blocked`), never as a new `status` value"* — and **still called it "(open question 7)" in another.** Two sentences disagreeing about whether a decision existed.
+
+**And the decision was right for a reason the epic later re-derived independently.** ADR-2's argument is that a new `status` value mutates a shape every consumer already parses, while a new event type leaves existing events byte-identical — **which is exactly the reasoning F120 applied to `tool_results_dropped` months of cards later**, arrived at from scratch. The decision was sound and its rationale was *in the file*; what was missing was the one word that said it was settled.
+
+**The lesson generalises past this epic:** a decision recorded in prose beside the thing it governs, but never **marked closed**, is **indistinguishable from an open one** to every later reader. Closing it is not bookkeeping — it is the difference between a reader applying the decision and re-litigating it. Now closed, pointing at ADR-2.
+
+### The traceability table, and the column I refused to add
+
+Derived by matching each requirement id the design **defines** (35) against every plan row that **cites** it. **All 35 are cited** — a clean negative, and the kind of result worth having explicitly.
+
+**I tried to add a "shipped" column and it was a fabrication.** A regex over the plan's prose reported **17 requirements unshipped**, including `B1`–`B5`, `H1`–`H3`, `R4` and `R8`. False, for two compounding reasons found by checking one case:
+
+1. **The plan has two tables.** Statuses live in a summary row (`T2-S1 … | done | c4bd57b`); requirement citations live in a detail row hundreds of lines away. Matching within a row can never see both.
+2. **The status vocabulary collides with the domain vocabulary.** `T2-S1`'s detail row contains the word **"Blocked"** — as a *request state*, `Registry{agent_id, sender}`'s sibling — and my exclusion treated it as a status marker.
+
+**So requirement→row is derivable; requirement→status is not.** I shipped the table without the column and said why, in the table. **This is the fourth time this session a derived artefact beat a curated one and the first time a derivation had to be abandoned** — which is the honest other half of F124's lesson: *derive rather than curate, and when the derivation cannot be trusted, publish the part that can and name the part that cannot.*
+
+### The ADRs record two things that are not "we decided X"
+
+**ADR-1** records a decision that is **accepted and unexecuted**: R1's renderer flip was never a question of *whether*, only *when*, and the answer is a release boundary. What blocks it is **Q1's live terminal matrix**, which no agent can produce. Worth stating plainly: **the flip is not blocked on engineering.**
+
+**ADR-3** records a **deferral with its reopening condition** — no socket API, because the state file and `agent_wait` already serve the integration, and **H4 is itself blocked on herdr's manifest spec**, so designing a socket against an unknown consumer is how a second control surface outlives its reason. *"Until one exists, the state file is the contract."*
