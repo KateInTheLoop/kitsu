@@ -5320,3 +5320,45 @@ So the gate list I have been pasting into briefs for a dozen cards **would have 
 **The implementer corrected my arithmetic**: I called the pinned event sequence "13-element"; it is **12**, and the tests were right. Cosmetic, reported rather than silently followed — which is the behaviour I want, since the alternative is an agent quietly "fixing" a test to match a number in my brief.
 
 **The two no-op arms are the right shape and are commented as decisions**, not omissions: *"Matched explicitly rather than swept into a wildcard so adding an activity line here stays a decision, not an accident."* The TTY surface is now **F122**, open — because N1 does not cover interactive TTY runs (clarified in the design doc this commit), so a human line there is permissible but ought to be chosen deliberately.
+
+## F124 — the gate list, derived from the workspace at last. It was missing two whole crates.
+
+**F123 said `kitsu-core` was absent from the baseline gate list I have pasted into a dozen briefs. It is worse than that.** Derived properly from `cargo metadata --no-deps`, then run:
+
+| crate | targets my list ran | targets it did **not** |
+|---|---|---|
+| `kitsu` | `--bins` + all 5 integration targets | — |
+| **`kitsu-core`** | **none** | **lib (160) + `run_contract` 9, `session_contract` 7, `session_k04` 3, `session_k07` 2, `session_k08` 2** |
+| `kitsu-editor` | lib + `public_api` (as `-p kitsu-editor`) | — |
+| **`kitsu-providers`** | **none** | **lib (120) + 7 route/wire targets: 2, 6, 4, 12, 4, 4, 31** |
+| `kitsu-render` | lib | — |
+| `kitsu-tools` | lib (413) | **`semantic_evidence` 15, `structural_context` 5** |
+| `kitsu-tui` | lib | — |
+
+**Two entire crates and four further targets — 1 140 tests across 21 targets in the non-`kitsu` half alone, of which my list reached 745.** All green; `cargo test --workspace --exclude kitsu` exits 0.
+
+### The canonical gate, to use in every brief from here
+
+```
+cargo test --workspace --exclude kitsu          # 21 targets, 1140 tests
+cargo test -p kitsu --bins                      # 975
+cargo test -p kitsu --test cli                  # 248
+cargo test -p kitsu --test tui -- --test-threads=1   # 75
+cargo test -p kitsu --test paste_latency        # 4
+cargo test -p kitsu --test carrier_matrix       # 7
+cargo test -p kitsu --test build_provenance     # 2
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace -- -D warnings
+```
+
+`kitsu` stays enumerated because **`--test tui` needs `--test-threads=1`**, which is why the workspace form cannot simply replace everything — and that constraint is almost certainly how the list came to be hand-written in the first place.
+
+### Why this happened, which is the transferable part
+
+**The list was assembled from the crates this epic's cards happened to touch** — a TUI epic, so `kitsu`, `kitsu-tui`, `kitsu-render`, `kitsu-editor`, `kitsu-tools` — **and then reused as if it were the workspace.** Nothing ever compared it against the member list. It was accurate for its first card and silently wrong for every card that reached further.
+
+**A gate list that is not derived is a gate list that excludes whatever you did not think of.** And the failure is invisible in exactly the wrong way: every brief reported *"all green, both profiles"*, truthfully, about a subset I had chosen without knowing I had chosen it.
+
+**It nearly cost something real.** F120 changed the history trimmer in `kitsu-core`, whose own test — `trim_tool_results_preserves_offload_pointer_but_drops_preview` — is *directly* about that behaviour and lives in a target my list never ran. The implementer ran it on initiative. **Had it not, the card would have shipped "fully verified" with the relevant test unexecuted.**
+
+**The same shape as F114**, one layer up: there I could not grep for a README row that was missing; here I could not notice a crate I had never listed. **Absence is the thing checklists cannot see, and the remedy is the same both times — derive the list from the system, do not curate it from memory.**
