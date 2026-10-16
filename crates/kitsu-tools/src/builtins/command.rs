@@ -2833,6 +2833,23 @@ async fn run_supervised_command(
 }
 
 fn command_failed(error: std::io::Error) -> ToolError {
+    // F135: `ETXTBSY` at `execve` means the executable's inode is open for
+    // writing somewhere right now, which is definitionally a passing
+    // condition. Name it as transient, additively -- the OS error text is
+    // never replaced (F131).
+    //
+    // The natural discriminator is `std::io::ErrorKind::ExecutableFileBusy`,
+    // but it is stable only since Rust 1.83 while this workspace declares
+    // `rust-version = "1.80"`, so `clippy::incompatible_msrv` rejects it --
+    // correctly, because the code really would not compile on 1.80. Match the
+    // named POSIX errno instead, and switch to the error kind once the MSRV
+    // rises past 1.83.
+    if error.raw_os_error() == Some(libc::ETXTBSY) {
+        return ToolError::ExecError(format!(
+            "command failed: {error}; this is transient -- the executable is open for \
+             writing right now, so retry once the writer has finished"
+        ));
+    }
     ToolError::ExecError(format!("command failed: {error}"))
 }
 
@@ -5091,5 +5108,152 @@ mod tests {
         assert!(output.success, "stderr: {}", output.stderr);
         assert_eq!(output.exit_code, Some(0));
         assert_eq!(output.stdout, "kitsu-alternatives-ok\n");
+    }
+
+    /// Writes a `#!/bin/sh` script, makes it executable, and returns the write
+    /// descriptor still open. Linux's `deny_write_access()` consults
+    /// `inode->i_writecount`, which is process-independent, so every `execve`
+    /// of this inode fails with `ETXTBSY` for as long as the returned handle
+    /// lives. That makes the F134 race a deterministic fixture: no sleeps, no
+    /// sibling forks and no wall-clock assertions are involved.
+    #[cfg(unix)]
+    fn write_test_executable_keeping_write_descriptor(path: &Path, output: &str) -> std::fs::File {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        file.write_all(format!("#!/bin/sh\nprintf '%s' '{output}'\n").as_bytes())
+            .unwrap();
+        file.flush().unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        file
+    }
+
+    /// F135: `ETXTBSY` at `execve` means "this inode is open for writing by
+    /// somebody" and is definitionally transient. The failure a person reads
+    /// must say so, and must still carry the underlying OS error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn etxtbsy_at_spawn_is_reported_as_a_transient_condition() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("busy-tool");
+        let writer = write_test_executable_keeping_write_descriptor(&executable, "never-runs");
+        let invocation = executable.to_string_lossy().into_owned();
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::AutoAllow).unwrap();
+
+        let error = execute_command(&policy, args(&[invocation.as_str()], dir.path()))
+            .await
+            .expect_err("a write descriptor held on the executable must fail the spawn");
+        drop(writer);
+
+        let ToolError::ExecError(message) = error else {
+            panic!("ETXTBSY at spawn must surface as an ExecError: {error:?}");
+        };
+        // The OS error survives: F131's rule is that a label never replaces the
+        // errno text.
+        assert!(
+            message.contains("os error 26"),
+            "the underlying ETXTBSY must still be reported: {message}"
+        );
+        let lowercase = message.to_lowercase();
+        assert!(
+            lowercase.contains("transient"),
+            "the message must name the condition as transient: {message}"
+        );
+        assert!(
+            lowercase.contains("retry") || lowercase.contains("again"),
+            "the message must tell the person that retrying can succeed: {message}"
+        );
+    }
+
+    /// Non-vacuity for the fixture above, in both directions: the spawn fails
+    /// with `ETXTBSY` precisely while a write descriptor is held, and the very
+    /// same executable at the very same path runs once it is closed. Nothing
+    /// here waits on the clock -- closing the descriptor is what clears
+    /// `i_writecount`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn releasing_the_write_descriptor_lets_the_same_command_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("briefly-busy-tool");
+        let writer = write_test_executable_keeping_write_descriptor(&executable, "ran-after-close");
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::AutoAllow).unwrap();
+        let program = executable.to_string_lossy().into_owned();
+        let invocation = args(&[program.as_str()], dir.path());
+
+        let error = execute_command(&policy, invocation.clone())
+            .await
+            .expect_err("the spawn must fail while the write descriptor is held");
+        assert!(
+            matches!(&error, ToolError::ExecError(message) if message.contains("os error 26")),
+            "the held descriptor must produce ETXTBSY, not some other failure: {error:?}"
+        );
+
+        drop(writer);
+
+        // Closing our descriptor clears *our* contribution to
+        // `inode->i_writecount`, but F134's mechanism means a sibling test in
+        // this binary may have forked while the descriptor above was open and
+        // still hold a copy of it in a child that has not reached `execve`.
+        // Measured: 1 failure in 30 runs of the three-test selection before
+        // this loop existed (capture:
+        // `f135-releasing-flake-run-8.txt`, assertion
+        // `closing the write descriptor must let the identical spawn succeed:
+        // ExecError("command failed: Text file busy (os error 26)")`). So this
+        // half re-attempts, bounded and without ever consulting the clock, and
+        // insists every intervening failure be exactly that external ETXTBSY.
+        let mut attempts = 0usize;
+        let output = loop {
+            attempts += 1;
+            match execute_command(&policy, invocation.clone()).await {
+                Ok(output) => break output,
+                Err(ToolError::ExecError(message))
+                    if message.contains("os error 26") && attempts < 64 => {}
+                Err(error) => panic!(
+                    "closing the write descriptor must let the identical spawn succeed; \
+                     attempt {attempts} failed with {error:?}"
+                ),
+            }
+        };
+        assert!(output.success, "stderr: {}", output.stderr);
+        assert_eq!(output.stdout, "ran-after-close");
+    }
+
+    /// The transient wording is earned by `ETXTBSY` alone. A spawn that fails
+    /// for a reason waiting cannot fix -- here, a shebang naming an interpreter
+    /// that does not exist -- must not be advertised as retryable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_spawn_failure_that_is_not_etxtbsy_is_not_called_transient() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("broken-interpreter-tool");
+        std::fs::write(&executable, "#!/kitsu-no-such-interpreter-f135\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::AutoAllow).unwrap();
+
+        let program = executable.to_string_lossy().into_owned();
+        let error = execute_command(&policy, args(&[program.as_str()], dir.path()))
+            .await
+            .expect_err("a missing interpreter must fail the spawn");
+
+        let ToolError::ExecError(message) = error else {
+            panic!("a failed spawn must surface as an ExecError: {error:?}");
+        };
+        assert!(
+            !message.contains("os error 26"),
+            "this fixture must not be an ETXTBSY: {message}"
+        );
+        let lowercase = message.to_lowercase();
+        assert!(
+            !lowercase.contains("transient"),
+            "a permanent spawn failure must not claim to be transient: {message}"
+        );
     }
 }
