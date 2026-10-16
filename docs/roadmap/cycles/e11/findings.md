@@ -5008,3 +5008,19 @@ The standing requirement warns that README's tables *"drift silently, so re-read
 **So the two sweeps I built cover false statements and dangling references, and neither covers silence.** The standing requirement already names the remedy and I had not been applying it: *re-read the affected row*. The affected rows are findable mechanically — a card that touches a config key or a user-visible key should grep README for that key's name — but what is missing cannot be found by grepping for what is missing.
 
 **Added to the per-card checks:** for every user-visible key, command or config key a card touches, grep README for it **by name** and confirm a row exists and says the current thing. That is a positive check, not a phrase sweep, and it is the only one of the three that would have caught this.
+
+### F114's check, refined on its second use: grep the bare word, not the `/cmd subcmd` literal
+
+Applied the new positive check retroactively over everything this epic shipped — `/detach`, `/jobs view`, `/jobs show`, `/jobs prune`, `/tui`, `/help keys`, `/help tui`, `cell_ring_lines`, `Ctrl+O`. It reported **`/jobs prune` absent**.
+
+**It is not absent, and the check was wrong.** README writes subcommands inside a bracketed enumeration:
+
+```
+| `/jobs [list|view|explain ID|show ID|reply ID y|a|n|steer ID TEXT|close-steering ID|stop ID|stop-all|prune ID|prune all]` |
+```
+
+So the literal string `/jobs prune` never appears, and a literal match on it is a **false negative**. The bare word `prune` is there, twice in that row.
+
+**Refined:** grep the **bare subcommand word**, then read the row. Had I acted on the check's first answer I would have added a **duplicate row** for a documented command — which is worse than the gap it was hunting, because two rows for one command is drift that a reader cannot resolve.
+
+**Both of the mechanical checks I have built have now produced a false hit on an early run** — F101's reference sweep on a compound row name, and this one on a bracketed enumeration. Neither is a reason to drop them: each has also found a real defect (two dangling references; a wholly undocumented overlay). The rule they share is the one that matters: **the sweep nominates, the human adjudicates.** Every one of these must stay a command whose output is read, never a gate, and never a thing to act on without opening the file.
