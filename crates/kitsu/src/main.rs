@@ -6809,7 +6809,20 @@ fn run_transcript_key_loop<R: std::io::Read>(
             // Outside a paste a bare `0x0a` is read as a submit, exactly as
             // `0x0d` is: with no paste markers this loop cannot tell a pasted
             // newline from a pressed `Enter` at all, which is **F72** proper
-            // and stays open -- the inline route never writes `?2004h`.
+            // and stays open.
+            //
+            // **Corrected (F116).** An earlier version of this comment blamed
+            // "the inline route never writes `?2004h`", which is backwards
+            // twice over. The enable sits in the `take_alternate_screen`
+            // branch above, and it is the *inline* route that passes `true`
+            // (inline has no alternate screen, so the overlay takes it); the
+            // *fullscreen* route passes `false` because its segment already
+            // holds the screen. And either way a `RawStdinGuard` is held at
+            // both call sites -- it writes `?2004h` on engage and `?2004l` on
+            // drop -- so markers are present on any terminal that supports
+            // them. What is left of F72 here is narrower than that comment
+            // claimed: a terminal that *ignores* `?2004h` sends no markers,
+            // and then this loop genuinely cannot tell paste from typing.
             if overlay.search_query().is_some() {
                 match byte {
                     0x0d | 0x0a => {
