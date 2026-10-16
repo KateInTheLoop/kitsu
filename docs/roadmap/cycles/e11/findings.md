@@ -3968,6 +3968,12 @@ The implementer found my brief wrong again (the tenth mechanism correction in th
 
 ## F80 — a fourth flake: the approval modal paints nothing in release, once
 
+> **RETRACTED by F112. This was never a flake.** The capture is a misfiled
+> **failing-first run of T3-S7a**: `approval_modal` unconditionally pushes its
+> header, so `left: []` is unreachable for it; the three tests read **no**
+> global; and the capture's binary ran **127** tests where the clean runs ran
+> **130**. Do not count this as a flake or as evidence about the surface slot.
+
 Seen once by the F76 test author and **captured to its own file** rather than lost:
 `scratchpad/flake-kitsu-render-lib-release-approval_modal.txt`.
 
@@ -4755,6 +4761,14 @@ Left as-is rather than fixed: the sweep's job is to be run after every edit, and
 
 ## F107 — the flakes' shared cause, named: one process-global surface slot with sixteen readers
 
+> **CORRECTED by F112, in three places.** `tui_bridge.rs:966` is `fn invalidate`,
+> not the slot — the real one is `kitsu-render/src/surface.rs:162`, a different
+> crate and never a `Mutex<Option<..>>`; the "16 readers" figure counts **nine
+> test-module readers** and omits **twelve** in `kitsu-render/src/lib.rs`; and the
+> recap test **was already `#[serial]`** when this was written, so the fix
+> proposed here was already in the tree. **It is test-only** — no production
+> defect, and the refactors contemplated here are all unjustified.
+
 Read-only diagnosis, recorded for a future card rather than acted on, because the files are in flight.
 
 **Two of the ten open flakes point at the same thing**, and it now has a name: `tui_bridge.rs:966` holds the installed surface in a **`std::sync::Mutex<Option<..>>` process global**, read through `active_surface()` at **16 sites** (11 in `tui_bridge.rs`, 5 in `main.rs`).
@@ -4894,3 +4908,68 @@ Built and ran as a command over the live documents — `not wired`, `not yet`, `
 **The sweep's value is not the hits, it is the ratio.** Of roughly twenty matches, three were wrong — so a human must still read each one, and any attempt to make this a failing test would be wrong, because *"is refused"* is usually the documentation of a correct decision. It belongs in the same family as F101's reference check: **a command whose output a person reads each card**, not a gate.
 
 **And it found drift in a file no card this epic had touched.** The negative-capability phrasing is where documentation rots, because it is written once as true and nothing about shipping the capability makes anyone revisit the sentence that denied it.
+
+## F112 — F107 was wrong in three places, one flake family never existed, and my "smaller fix" was already in the tree
+
+The F107 card was assessed and **correctly returned as "do not build it as scoped"**. Every claim below is one I verified myself before correcting the record.
+
+### 1. It is test-only. The globals are correct in production.
+
+The surface slot has **six production writers and all are on `run_chat`'s own thread** (`install`, `BridgeGuard::drop`, `enter_fullscreen`, `FullscreenSegment::leave`, and the two foreground-buffering calls). Everything on another thread — the cadence painter, the approval prompter, orchestrator tasks — **only reads**, through `active_surface()`, which clones the `Arc` and drops the guard before returning. One process, one terminal, one `run_chat`. `subagent.rs`'s two `set_surface` calls are **test-only**, which had to be checked because concurrent subagents would have made this a real defect.
+
+`ALTERNATE_SCREEN_TAKEN` is the same answer for a different reason: its two production restorers run **sequentially on the one panicking thread**, which is what the clearing read exists for.
+
+**So there is no production defect, no user-visible entry, and the three refactors F107 contemplated — scope per test, thread it through, restructure installation — are all refactors of a correct global justified by a bug that cannot happen.** Threading it would touch 19 call sites across three crates.
+
+### 2. Three factual errors in F107, which would have sent an implementer to the wrong file
+
+- **`tui_bridge.rs:966` is `fn invalidate`, not the slot.** The real slot is `crates/kitsu-render/src/surface.rs:162` — `static SLOT: OnceLock<RwLock<Arc<dyn Surface>>>`, **a different crate, and never a `Mutex<Option<..>>`.** The `Mutex<Option<..>>`s near that line are `STATUS_PAINTER` (990) and `MODAL_PANE` (1001) — **two other globals that I conflated into one.** It matters for blast radius: the real slot is shared by **four test binaries**, not one.
+- **"16 readers" is an exact count and a wrong claim.** **Nine of the sixteen are inside `mod tests`**; production readers are seven — and the figure omits **twelve more in `kitsu-render/src/lib.rs`**, which is the actual hot path. **F74 again, and this time in my own finding**: I counted name matches and reported them as call sites.
+- **"The recap test does not drive installation deliberately" is false.** It calls `SurfaceProbe::install()` and **has been `#[serial]` since the commit that introduced it** — nine commits before its third sighting. **So the "smaller fix" I proposed in the brief was already in the tree when the flake was sighted three times.** That is why the card as scoped would have fixed nothing.
+
+### 3. The actual cause: `#[serial]` excludes other `#[serial]` tests, not plain ones
+
+**Four `#[tokio::test]`s reach the slot through *production* code** rather than through `SurfaceProbe` — painting the attach row *and* installing a `BufferedSurface` over whatever is there — and **none was serialised.** All 87 `#[serial]` tests and every `SurfaceProbe` user were already mutually excluded; the gap was exclusion against tests that install **through production**.
+
+They reach it via module-local `one_read` helpers, **which is why a call-site grep misses them**. Found with **F108**'s instrument: one temporary line logging `std::thread::current().name()`, which under `cargo test` **is the test's name**. The failing run's log shows three different tests attaching concurrently, and the smoking gun is an id in the output that belongs to none of them — `agent 1`, where the test uses 7 and 9, is another test's fixture leaking through the shared slot.
+
+**`SurfaceProbe`'s own doc comment states the invariant as "Tests using it are `#[serial]`" — true and insufficient** (**F77**: a comment is worth what its claims are worth). `tui_bridge.rs:3090` has the same blind spot, reasoning about *"two bridge tests overlapping"*.
+
+### 4. F80 was never a flake. Remove it.
+
+The `approval_modal_*` capture is a **misfiled FAILING-FIRST run of T3-S7a**, and every step is checkable at HEAD:
+
+- `approval_modal` is a **pure function that unconditionally pushes the header**, verified — so `left: []` is **unreachable** for it.
+- Its three tests pass an explicit `false` and **read no global at all**, which is why they are the only slot-free tests in that file taking no `surface_slot_lock()`. *"A shared global not yet installed"* cannot explain a test that reads no global.
+- The capture shows `running 127 tests` with the three new tests failing **together**, every assertion empty — a stub. `git log -S"pub fn approval_modal"` returns **one** commit, which adds the function complete with its three tests. The "clean" comparison runs reported **130** tests: **a different binary.**
+
+**So: three globals, but two flake families — and one of the two I attributed to the surface slot never existed.** I filed a card's own red run as evidence of a race, and it sat in the findings for many cards being counted.
+
+### 5. A fifth guard, found by reading rather than by a sighting
+
+`tui_bridge.rs:7331 the_handler_byte_string_equals_the_restore_helper_output` is a **non-serial mutating reader of `ALTERNATE_SCREEN_TAKEN` in the `kitsu` bin binary**: it asserts the signal string equals `write_restore_sequences`' output, which holds only while the flag is `false` — and the serial fullscreen tests set it `true`. **Bidirectional**: it also *clears* the flag, so it can make a fullscreen test's `leave` skip its `ESC[?1049l`. **Zero sightings in 821 runs** because the window is one synchronous enter→leave. Guarded anyway: a latent race derived by reading is cheaper to close than to wait for.
+
+### The lesson, which is about findings files and not about mutexes
+
+**A findings file is read by every later card as settled fact, so a wrong entry in it is worse than a wrong brief** — that was **F91**, written about someone else's error travelling four hops. **F107 was mine, and it travelled further**: it set a card's scope, it was cited in four cycle records, it counted a non-existent flake family for ten cards, and I recommended it as "the most valuable card left" one commit ago.
+
+**What would have caught it: the same rule I apply to code.** F91 says an entry asserting *"X already does Y"* needs the line that shows it. **F107 asserted five such things and cited line numbers for none that I had re-read.** The figures were plausible, internally consistent, and three of them were wrong.
+
+### F112's verification: the recap flake is closed, and an eleventh flake surfaced
+
+**Measured after the five guards: 150 full `--bins` runs, debug, zero sightings of `the_recap_holds_only_what_the_foreground_produced_while_attached`** — against **3 failures in 421 unguarded runs** before. Combined with the assessor's 400 guarded runs, the recap flake is closed and **comes off the list**.
+
+**But one run of the 150 failed, on a test nobody had named:** `subagent::tests::spawn_agent_runs_nested_loop_and_returns_only_the_child_answer`. Not previously recorded, passes in isolation, `#[tokio::test]` with **no** guard, and **its body does not reach `set_surface` or the slot** — `subagent.rs`'s only two `set_surface` calls are in a different test. So it is probably **not** this family, and I am not claiming it is.
+
+**My capture was truncated and that is my error, not an agent's.** The loop appended `grep -A2 "^failures:" | head -3`, which caught the test's name and discarded its assertion — the one thing needed to classify it. **F39 exists because a flake without its output is a rumour**, and I wrote a capture that produced exactly that. The loop should have saved the whole failing run to its own file, as every agent-run capture this epic has done.
+
+Recorded as the **eleventh flake, mechanism unknown**, to be captured properly when next seen.
+
+### The corrected flake ledger
+
+Ten became **seven**, in both directions:
+
+- **Removed:** the three `approval_modal_*` entries (**never flakes** — F80 retracted), and the recap test (**fixed and measured**).
+- **Added:** `spawn_agent_runs_nested_loop_and_returns_only_the_child_answer` (new), and the latent `the_handler_byte_string_equals_the_restore_helper_output` (**guarded pre-emptively**, 0 sightings in 821 runs, derived by reading).
+
+**The ledger was wrong in both directions at once**, which is the argument for treating it as evidence rather than as a count: it carried three entries that were never flakes **and** missed one that had been failing all along.

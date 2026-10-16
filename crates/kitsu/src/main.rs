@@ -35178,6 +35178,12 @@ mod tests {
     /// uses.
     #[cfg(unix)]
     #[tokio::test]
+    // **F107**: not optional. `#[serial]` excludes other `#[serial]` tests, not
+    // plain ones, and this test reaches the process-global surface slot through
+    // PRODUCTION code rather than `SurfaceProbe`, so it can install over a
+    // serialised test's probe mid-run. Measured: 3 failures in 421 unguarded
+    // runs of `--bins`, 0 in 400 with this guard.
+    #[serial_test::serial]
     async fn the_views_attach_reaches_the_composer_and_makes_the_detach_keys_live() {
         /// One read of the inline composer, with `[tui]` resolved the way a
         /// configured session resolves it: the chord prefix bound and the
@@ -35427,6 +35433,12 @@ mod tests {
     /// `the_views_attach_reaches_the_composer_and_makes_the_detach_keys_live`.
     #[cfg(unix)]
     #[tokio::test]
+    // **F107**: not optional. `#[serial]` excludes other `#[serial]` tests, not
+    // plain ones, and this test reaches the process-global surface slot through
+    // PRODUCTION code rather than `SurfaceProbe`, so it can install over a
+    // serialised test's probe mid-run. Measured: 3 failures in 421 unguarded
+    // runs of `--bins`, 0 in 400 with this guard.
+    #[serial_test::serial]
     async fn the_status_row_and_the_prompt_label_read_the_one_attachment_binding() {
         /// One read of the inline composer with a configured keymap, as the
         /// F75 test drives it.
@@ -35690,6 +35702,12 @@ mod tests {
     /// across widths, so this test says nothing about other widths.
     #[cfg(unix)]
     #[tokio::test]
+    // **F107**: not optional. `#[serial]` excludes other `#[serial]` tests, not
+    // plain ones, and this test reaches the process-global surface slot through
+    // PRODUCTION code rather than `SurfaceProbe`, so it can install over a
+    // serialised test's probe mid-run. Measured: 3 failures in 421 unguarded
+    // runs of `--bins`, 0 in 400 with this guard.
+    #[serial_test::serial]
     async fn the_detach_command_clears_the_binding_the_row_and_the_label_read() {
         const BASE: &str = "kitsu> ";
         const COLS: usize = 120;
@@ -35875,6 +35893,12 @@ mod tests {
     /// fallback depends on, and it must survive the fix that adds the second.
     #[cfg(unix)]
     #[tokio::test]
+    // **F107**: not optional. `#[serial]` excludes other `#[serial]` tests, not
+    // plain ones, and this test reaches the process-global surface slot through
+    // PRODUCTION code rather than `SurfaceProbe`, so it can install over a
+    // serialised test's probe mid-run. Measured: 3 failures in 421 unguarded
+    // runs of `--bins`, 0 in 400 with this guard.
+    #[serial_test::serial]
     async fn the_jobs_view_command_attaches_to_the_binding_the_row_and_the_label_read() {
         const BASE: &str = "kitsu> ";
         const COLS: usize = 120;
