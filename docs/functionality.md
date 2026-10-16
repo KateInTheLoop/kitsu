@@ -382,11 +382,15 @@ buffered rather than streamed -- which happens whenever tools are advertised for
 that round, i.e. by default. With `--no-tools` the answer streams and the
 scrollback has it. `[tui] cell_ring_lines` bounds it in lines (default 10000).
 
-**It also does not hold your own prompts.** The line you submit is painted by the
-composer and then erased, so it never becomes a transcript line: the scrollback,
-and the `Ctrl+O` overlay built on it, show the assistant's side and the tool
-output, with your side missing. `/export` remains the route to the full
-conversation.
+**It does hold your own prompts.** A submitted line is retained as yours, split
+one cell per line so a multi-line or pasted prompt keeps its shape on screen, and
+filed with the conversation rather than with the tool output. Slash commands are
+retained as yours as well, since a report with no visible command is half a
+transcript. Two things are deliberately not marked as yours: a command **kitsu**
+injects on your behalf (`/resume` after a restart, `/retry`), because it is not
+your line even though you may type the same words yourself; and a line **refused**
+at an attached agent, which is handed back to your composer and was therefore
+never said. `/export` remains the route to the full conversation.
 
 `?` lists every key the view binds, and `/help keys` prints the same list
 without opening the view -- both render one table, so neither can drift from the

@@ -433,6 +433,21 @@ impl Surface for InlineSurface {
             }
         }
     }
+
+    /// Record the user's submitted prompt in the cell ring, **writing no
+    /// bytes** -- the whole reason this seam is not `transcript_line`.
+    ///
+    /// The composer painted the submitted row and erased it, so the line is on
+    /// no descriptor; writing it here would add a transcript line the inline
+    /// renderer's one-write-per-line contract (**R3**) says is not there and
+    /// change the byte stream of every session. A backend built without a ring
+    /// records nothing, exactly as the trait default does.
+    fn note_prompt(&self, text: &str) {
+        let mut inner = self.lock();
+        if let Some(ring) = inner.cells.as_mut() {
+            ring.push_prompt(text);
+        }
+    }
 }
 
 #[cfg(test)]

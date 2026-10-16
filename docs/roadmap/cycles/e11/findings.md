@@ -2864,6 +2864,22 @@ states a guarantee and a mechanism in one sentence can be wrong about the
 guarantee while being right about the mechanism**, and only someone implementing
 the mechanism notices.
 
+
+### Updated when prompts entered the ring: F52 now has an adversarial input
+
+Every line in the ring used to originate in **kitsu's own renderer**, so its width
+was bounded by what kitsu chose to print. Feeding the user's prompts changes the
+input class: **the ring accepts user paste, which is the one input nothing in the
+process limits.**
+
+Splitting a prompt on `\n` (required anyway, because both frames are one
+`fit_row_to_width` per cell) handles a many-line paste. It does **not** handle **a
+single multi-megabyte line with no newline**, which becomes one unbounded cell
+inside a ring whose bound is counted in **lines**.
+
+So F52's open question is no longer theoretical, and the counter-example is now
+reachable from the keyboard rather than requiring a pathological session. **Still
+needs a human**, but it should be decided before the bound is relied on.
 ## F53 — `--plain --tui inline` installs a viewport that plain output cannot use
 
 Found by the T3-S7a implementer, which asked rather than deciding for itself.
@@ -4730,3 +4746,77 @@ The test restates the footer's own guard on the new string: the details must not
 So the count is: a false claim surviving in a struck-through plan row; a fictional directory in four rows with one catch that never travelled; two dangling map references created *by* my corrections; and now **a sentence contradicting its own neighbour because I added the new text instead of searching for what it falsified.**
 
 **The sharpened rule, now applied:** after changing a document, grep it for the claim the change makes false — not just the place the new text goes. Adding is not the same operation as correcting, and I keep performing the first while believing I have done the second.
+
+### F101's sweep has one known false positive — recorded so it is not re-chased
+
+The reference check reports `T5-S2` dangling. It is not: the row exists as the **compound** `| T5-S1b + T5-S2 |`, and the sweep extracts `T5-S2` from the map's `T5-S1b + T5-S2 (merged)` as if it were a standalone reference, then fails to match it against a row key that *contains* rather than *starts with* it.
+
+Left as-is rather than fixed: the sweep's job is to be run after every edit, and a known, documented false positive is cheaper than a cleverer matcher that might mask a real one. **Noted here so the next run does not spend a card on it.**
+
+## F107 — the flakes' shared cause, named: one process-global surface slot with sixteen readers
+
+Read-only diagnosis, recorded for a future card rather than acted on, because the files are in flight.
+
+**Two of the ten open flakes point at the same thing**, and it now has a name: `tui_bridge.rs:966` holds the installed surface in a **`std::sync::Mutex<Option<..>>` process global**, read through `active_surface()` at **16 sites** (11 in `tui_bridge.rs`, 5 in `main.rs`).
+
+`cargo test` runs a crate's tests **in threads of one process**, so every test that installs a surface writes the **same slot** every other test reads. That is sufficient on its own to explain:
+
+- **F88/F104** — `the_recap_holds_only_what_the_foreground_produced_while_attached`, which fails under parallelism, passes in isolation, and has now been sighted **twice independently**, in two different cards' runs.
+- **F80** — three `approval_modal_*` tests in `kitsu-render --lib` release painting nothing (`left: []`), during a run **concurrent with another cargo test**.
+
+### Why this is worth a card and not a `--test-threads=1`
+
+The suite is already run single-threaded where it has to be (`--test tui`), and reaching for that flag more widely **hides the defect and costs wall-clock on every future run**. The honest fixes are to scope the slot per-test or to make installation explicit in the tests that need it — and the second is already the better-tested shape: the most recent cards drive `install_inline_with_ring` and `through_the_seam` deliberately, which is why their assertions are reliable while the recap test's are not.
+
+**It also explains why the recap test alone keeps surfacing:** T4-S6c introduced the foreground/recap path, which *reads* the slot to decide what the foreground produced. A test whose subject is "what was installed at the time" is maximally sensitive to a global that another thread can rewrite.
+
+**Not a card yet, deliberately** — it touches `tui_bridge.rs` and `main.rs`, which the prompts-in-the-ring work holds. Carded next, with the measurement above as its starting point rather than a fresh hunt.
+
+### A third global, found the same day, and this one has a test that panics on purpose
+
+`kitsu-tui`'s `ALTERNATE_SCREEN_TAKEN` (`lib.rs:215`) is a process-global `AtomicBool`, and the restore path does:
+
+```rust
+if alternate_screen_taken() { out.write_all(LEAVE_ALT_SCREEN)?; note_alternate_screen(false); }
+```
+
+Two tests in that module share it and **neither was serialised**:
+
+- `the_restore_stream_gives_the_alternate_screen_back_only_when_it_is_taken` sets the flag, then asserts the restore stream carries `ESC[?1049l`.
+- `install_panic_restore_chains_the_previous_hook` **panics deliberately** — that is its whole subject — and the installed hook **clears the flag**.
+
+So the panicking test clears the other's flag between its set and its assertion, and the count goes `1 -> 0`. **The failing test's own doc comment already noticed the hazard** (*"the flag is process-global, so it is put back before returning"*) **and guarded the wrong end of it**: restoring a global on the way out does nothing about a concurrent writer.
+
+**Proved latent rather than introduced**, by the right instrument: **3 sightings in ~145 runs** with new unrelated tests present, **0 in 120 runs at pristine HEAD** in a detached read-only worktree, **0 in 40 runs** single-threaded. New tests that touch no shared state perturbed the **scheduling** of a race that was already there.
+
+### What this does to the finding
+
+**Three process-globals, three flake families, one shape.** The pattern is not an unlucky static; it is that this binary keeps per-process state for things a test wants to own, and `cargo test`'s threads make every such static a shared mutable. A test-local mutex is going in on the two tests above as a **mitigation, named as one in a comment** — the production global remains the defect.
+
+**And a lesson about the fix, not the bug.** The obvious remedy, `#[serial]`, **would not compile**: `serial_test` is not a dependency of `kitsu-tui`, whose `[dev-dependencies]` is `vt100` alone. The belief that it was available came from grepping for the **word** `serial`, which matched a prose comment about a lock — **F74** applied to a word match. A fix proposed from a grep is a hypothesis about the build, and this one was false.
+
+## F108 — the end-to-end link no in-process test can see, proved by mutating a live binary
+
+**F102 is resolved** and the mechanics are in the cycle record. What belongs here is **how one claim got proved that nobody had been able to prove.**
+
+`an_injected_priority_command_is_never_marked_the_users_prompt` asserts that **no** retained line is marked. That is satisfied by *"retained unmarked"* **and** by *"not retained at all"* **and** — the problem — by *a feed that never fires*. The test author said so explicitly and declined to claim more: the `PromptOrigin` plumbing *could not* be mutation-proven before the feed existed, because the origin's journey from its capture point to the feed crosses a `match` that builds the line and is not observable from any seam a unit test can reach.
+
+**The implementer proved it in a live process, in two halves:**
+
+1. **Both arms are load-bearing, bidirectionally.** Making the `Injected` arm feed → exactly **one** failure, that test. Making the `User` arm inert → exactly **six**, the feed tests. So neither arm is dead and the two are not swapped.
+2. **The capture point really determines what arrives.** With a temporary probe, a real pty session logged `User /help`, `User /quit`. Then the single binding at the capture site was mutated to `= true`, the binary **rebuilt**, and the *identical* session logged `Injected /help`, `Injected /quit`. **The text was byte-identical across both runs**, so the origin demonstrably does not come from the text — it comes from the binding. Probe and mutation reverted; the file's diff is byte-identical to the author's.
+
+### Why this is a finding and not just diligence
+
+**A unit test can only prove what a seam exposes.** This project's strongest assertions have come from driving the real path rather than a predicate beside it (**F69**, **F105**) — but there are claims where *no* in-process seam exists, and the honest options are to under-claim or to leave the process. **Rebuilding the binary with one line changed and re-running an identical session is the cheapest instrument that spans a link a seam cannot**, and it produced a sharper result than any test on this card: a two-run comparison in which everything but one binding is held constant.
+
+**And the under-claiming was correct.** The author's *"I am not claiming more than I measured"* is what made the gap visible and handed it to someone who could close it. A report that had asserted the plumbing worked would have buried it.
+
+## F109 — a living document must be corrected; a cycle record must not
+
+Resolving F102 falsified claims I had written **one commit earlier**, and the sweep found them in six places. The useful part is that they split cleanly into two kinds:
+
+- **Living documents** — `CHANGELOG.md`'s `[Unreleased]` entry (*"your own prompts are absent from it"*), `docs/functionality.md` (*"It also does not hold your own prompts"*), R6's amendment, and the plan's R6-c row. **All corrected**, because they describe what the software does now and a reader has no way to date them.
+- **The cycle record** `docs/roadmap/cycles/e11/R6-a.md`, which says *"the ring holds no prompts at all -- the overlay shows one speaker"*. **Left exactly as written.** It is a point-in-time record of what was true and what was decided at that card; editing it would destroy the only honest account of why R6-a shipped a one-speaker overlay and why R6-c was blocked.
+
+**The distinction is the finding.** F101's rule — *after changing a document, grep for the claim the change falsifies* — is incomplete without it, because applied naively it would have rewritten history. **The test is not "is this sentence now false?" but "does this document claim to describe the present?"** A changelog entry in an unreleased section does; a dated cycle record does not, and its value is precisely that it still says what was believed then.

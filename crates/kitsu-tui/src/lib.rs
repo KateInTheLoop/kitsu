@@ -299,6 +299,61 @@ mod tests {
     use std::io::Write;
     use std::rc::Rc;
 
+    /// **The guard for the two tests that share
+    /// [`ALTERNATE_SCREEN_TAKEN`]** (finding **F107**).
+    ///
+    /// # The production global is the defect; this is a mitigation in the tests
+    ///
+    /// `ALTERNATE_SCREEN_TAKEN` is a process-global `AtomicBool`, and
+    /// [`write_restore_sequences`]'s own restore path **clears** it
+    /// (`if alternate_screen_taken() { .. note_alternate_screen(false) }`).
+    /// So `install_panic_restore_chains_the_previous_hook`, whose whole point
+    /// is to panic for real, runs that path and wipes the flag that
+    /// `the_restore_stream_gives_the_alternate_screen_back_only_when_it_is_taken`
+    /// set a moment earlier -- and the second test then measures zero
+    /// `ESC[?1049l` where it owes one. Measured: ~2% of parallel runs of this
+    /// binary, never under `--test-threads=1`.
+    ///
+    /// **This lock does not fix that.** It serialises the two readers so the
+    /// suite stops reporting a defect the suite itself creates; the global is
+    /// the thing that wants fixing, and F107 records it as the third
+    /// process-global implicated in a flake here rather than one unlucky
+    /// static. A lock, not `serial_test`: this crate's `[dev-dependencies]`
+    /// is `vt100` alone, and the only `serial` in `src/` is a word in a doc
+    /// comment -- which is **F74** on a word match, and is how this comment
+    /// came to be written.
+    static ALTERNATE_SCREEN_FLAG_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take [`ALTERNATE_SCREEN_FLAG_GUARD`], tolerating a poisoned mutex.
+    ///
+    /// # What is actually true, measured
+    ///
+    /// One holder **panics on purpose** -- which looks like it must poison
+    /// this mutex, and does not. Its `panic!("boom")` is inside
+    /// `std::panic::catch_unwind`, so the unwind stops in that closure and
+    /// never passes the guard in the frame above. Measured with
+    /// `lock().expect(..)` in place of the recovery below: **0 poisonings in
+    /// 150 runs** of this binary. The tolerance is therefore not load-bearing
+    /// today, and this comment says so rather than repeating a plausible
+    /// story about it (**F99/F100**, and **F77**: a comment is worth what its
+    /// claims are worth).
+    ///
+    /// # Why it is still written this way
+    ///
+    /// A panic that is *not* caught would poison it -- the
+    /// `assert!(flag.load(..))` at the end of that same test runs while this
+    /// guard is held, and so does every assertion in the other holder. Were
+    /// one of those to fail, a plain `unwrap()` here would turn one honestly
+    /// red test into two, the second failing on a poisoned mutex for no
+    /// reason of its own. Poisoning means "some invariant may be broken"; the
+    /// datum here is a `()` and the invariant is only "one of us at a time",
+    /// which a panic cannot break, so the guard is recovered instead.
+    fn alternate_screen_flag_guard() -> std::sync::MutexGuard<'static, ()> {
+        ALTERNATE_SCREEN_FLAG_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Title-stack push, written by `enter`.
     const PUSH: &[u8] = b"\x1b[22;2t";
     /// Title-stack pop, written by `leave`.
@@ -509,6 +564,15 @@ mod tests {
         /// DECSTBM reset: the whole screen scrolls again.
         const REGION_RESET: &[u8] = b"\x1b[r";
 
+        // **F107**: `write_restore_sequences` is a *mutating reader* -- it clears
+        // the process-global `ALTERNATE_SCREEN_TAKEN` when it writes the leave.
+        // This test calls it only to check sequence ordering and asserts nothing
+        // about `ESC[?1049l`, so it cannot see that it was clearing the flag a
+        // neighbouring test was mid-way through reading. Measured: 2 deviations
+        // in 250 parallel runs without this guard, 0 in 250 with it. Nothing
+        // this test asserts depends on holding it.
+        let _flag_guard = alternate_screen_flag_guard();
+
         let mut out: Vec<u8> = Vec::new();
         write_restore_sequences(&mut out).expect("a Vec never fails to write");
 
@@ -538,6 +602,11 @@ mod tests {
 
     #[test]
     fn install_panic_restore_chains_the_previous_hook() {
+        // **F107**: held for this test's whole body. The panic below runs
+        // `install_panic_restore`'s hook, which clears the process-global
+        // `ALTERNATE_SCREEN_TAKEN`; the other holder of this guard is reading
+        // that flag. Nothing this test asserts depends on the guard.
+        let _flag_guard = alternate_screen_flag_guard();
         // CAVEAT: the panic hook is process-global. This test replaces it and
         // must put the original back, or every other test in this binary runs
         // under a leaked hook.
@@ -585,6 +654,11 @@ mod tests {
     /// same reason the panic hook above is.
     #[test]
     fn the_restore_stream_gives_the_alternate_screen_back_only_when_it_is_taken() {
+        // **F107**: held across the whole body, because the flag is set here
+        // and read two statements later, and the deliberately-panicking test
+        // clears it in between. Putting the flag back on exit, as this test
+        // already does, does nothing about a concurrent writer.
+        let _flag_guard = alternate_screen_flag_guard();
         let was = alternate_screen_taken();
 
         note_alternate_screen(true);

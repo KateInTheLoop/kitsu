@@ -314,6 +314,22 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   Inferring prompts from `Fd` is refused -- `Stderr` is tools and diagnostics, not
   the user.
 
+  **F102 RESOLVED: the feed now marks prompts, and R6-c is unblocked.** `CellLine`
+  carries a `prompt` flag, set only through `CellRing::push_prompt`, which splits on
+  `\n` so a multi-line or pasted prompt keeps one cell per line -- both frames are
+  one `fit_row_to_width` per cell, so a single multi-line cell would have garbled
+  them. Prompts file as `Stdout`, the conversation, not `Stderr`, the tools. Three
+  feeds carry it: the foreground submission, the fullscreen tap (whose ring is the
+  **only** ring in that mode), and a **delivered** attached submission -- a refused
+  one is handed back to the composer and was never said. **Injected commands are not
+  marked**: the words are kitsu's, and a transcript marking them as the user's is
+  the same false claim as a doc that says a command works when it does not.
+
+  **The mark had to be preserved at `frame_ring` as well as stored**, because that
+  rebuild is the chokepoint both readers go through; a mark stored faithfully and
+  dropped there would have left **every** reader seeing one speaker, with the feed
+  perfectly correct.
+
   **`[`'s "fullscreen only" is a description, not a restriction, and nearly a
   contradiction (F103).** Native scrollback is the one thing the alternate screen
   does not have: bytes written while `ESC[?1049h` is in effect are discarded by the
@@ -322,6 +338,29 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   and the dump **leaves the alternate screen first**, or defers to the leave -- which
   makes `[` a terminal-state hand-off like `v`, not a write, and is why both land in
   one card.
+
+  **Amended again, before R6-d is carded: the two hand-offs MUST be gated, because
+  the ring now retains what the user pasted.** Once the feed marks prompts (the
+  card that unblocks R6-c), the ring holds the user's own lines, and a user may
+  paste a credential into the composer.
+
+  A submitted line **already** reaches `history` on disk and persisted `messages`,
+  so the ring itself is **strictly weaker** than what the session already keeps.
+  **`[` is not.** It moves that text out of kitsu's address space and into the
+  terminal emulator's scrollback -- a buffer kitsu **does not own, cannot bound and
+  cannot clear**, and which `tmux capture-pane`, `script` and terminal logging
+  routinely capture. Before this, `[` could only dump what the session itself
+  printed; after it, it dumps **what the user pasted**. That is a different
+  exposure class, not more of the same. `v` writes it to a `$EDITOR` temp file, and
+  `/` (R6-b) makes it findable by anyone at the keyboard.
+
+  **This is the exact reversal of F68**, which withholds a swallowed paste burst's
+  **count but never its text** precisely because the clipboard may hold a secret.
+  Retaining prompts contradicts that unless the hand-offs are gated, so: **R6-d
+  ships with an explicit confirmation, or with an opt-out that excludes prompt rows
+  from the dump -- and R6-d is not carded until which one is decided.** R6-b needs
+  no gate: searching in-process memory exposes nothing the overlay does not already
+  paint.
 - **R7** Approval prompts in TUI modes MUST render as a bottom-pane modal
   with the same `[y] allow once · [a] always (<dir>) · [n] deny` option line
   (command approvals keep their provenance rows) and the same `◉ permission —`
