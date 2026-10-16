@@ -14,6 +14,7 @@
     { "$ref": "#/$defs/usage" },
     { "$ref": "#/$defs/tool_started" },
     { "$ref": "#/$defs/tool_finished" },
+    { "$ref": "#/$defs/tool_results_dropped" },
     { "$ref": "#/$defs/background_result" },
     { "$ref": "#/$defs/assistant" },
     { "$ref": "#/$defs/assistant_disposition" },
@@ -545,6 +546,21 @@
         }
       ]
     },
+    "tool_results_dropped": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        { "$ref": "#/$defs/turn_identity" },
+        {
+          "type": "object",
+          "required": ["round", "dropped"],
+          "properties": {
+            "type": { "const": "tool_results_dropped" },
+            "round": { "type": "integer", "minimum": 1 },
+            "dropped": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
     "background_result": {
       "allOf": [
         { "$ref": "#/$defs/envelope" },
@@ -1018,6 +1034,7 @@
                   "usage",
                   "tool_started",
                   "tool_finished",
+                  "tool_results_dropped",
                   "background_result",
                   "assistant",
                   "assistant_disposition",
