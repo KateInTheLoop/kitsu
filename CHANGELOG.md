@@ -39,6 +39,18 @@ shapes may change in any minor release.
   reason.
 
 ### Added
+- **`/` searches the `Ctrl+O` transcript overlay, and `n`/`N` walk the matches.**
+  The search runs **when you press Enter**, not as you type: a full pass over a
+  10 000-line scrollback costs milliseconds and allocates a string per line, so
+  scanning on every keystroke would blow the interaction budget on a long query.
+  `n` walks toward newer matches and `N` toward older, and **neither wraps** --
+  running out of matches in one direction does nothing rather than teleporting
+  you to the other end. Submitting lands on the **newest** match, which is where
+  "when did this last happen?" starts. Matching ignores case, an empty query
+  cancels, `q` is query text while the line is open so you can search for it, and
+  `Esc` cancels the query without closing the overlay. **The search covers both
+  speakers** -- your own prompts are in the scrollback now -- and the query line
+  replaces the overlay's footer row, so it costs no transcript line.
 - **`{` and `}` jump between prompts in the `Ctrl+O` transcript overlay**, so you
   can walk back through what you asked instead of scrolling for it. A prompt that
   spans several lines is **one** stop rather than one per line; by the same rule,

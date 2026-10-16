@@ -373,8 +373,29 @@ back through what you asked rather than scrolling. A prompt that spans several
 lines is **one** stop, not one per line -- and so are two submissions with
 nothing printed between them, which is the same rule seen from the other side.
 A jump that cannot move the frame does nothing at all: it does not quietly stop
-the overlay following new output. Searching the transcript, dumping it to
-scrollback and opening it in `$EDITOR` are **not** wired yet.
+the overlay following new output.
+
+`/` searches it. The search runs when you press **Enter**, not as you type, and
+`n`/`N` then walk the matches -- `n` toward newer, `N` toward older -- without
+wrapping, so running out in one direction does nothing rather than throwing you
+to the other end. Submitting lands on the **newest** match, which is where "when
+did this last happen?" starts. Matching ignores case, an empty query cancels, `q`
+is query text while the line is open so the word itself can be searched for, and
+`Esc` cancels the query and leaves the overlay up. The query line replaces the
+footer row, so searching costs no transcript line. **The search covers both
+speakers**, since the scrollback retains your prompts.
+
+**What is searched is what the overlay paints** -- the same text, with only the
+escape bytes your terminal does not display removed. There is one divergence and
+it is width rather than styling: a row is fitted to your terminal's columns, so
+text past the right edge is searchable but not currently on screen. That is
+deliberate -- making matches depend on window width would mean one query finding
+different things in two terminal sizes. Note too that a line **kitsu** writes can
+contain an embedded newline and still be a single scrollback cell, where a prompt
+you submit is split one cell per line.
+
+Dumping the overlay to scrollback and opening it in `$EDITOR` are **not** wired
+yet.
 
 `Ctrl+Z` suspends from fullscreen through the same path the other renderers use,
 though the alternate screen's contents are the terminal's across the stop. `--tui
