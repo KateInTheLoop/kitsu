@@ -5170,3 +5170,42 @@ Probed by flipping each expected value so the assertion fires on the **success**
 ### A second tripwire, found by the inflation
 
 Under the inflated descriptor, **`test_no_artifacts_bounds_large_tool_result_and_saves_session_without_sidecar` also failed** — `assertion failed: tool_content.contains("bytes omitted by artifact-free policy")` — **the same blind-failure shape, outside this card's four sites.** Green again after revert. **Carded.** The inflation lever is now a known instrument for finding these: inflate a tool schema and see which tests fail without saying why.
+
+## F119 — the schema-regression exposure is two tests, not a family; and underneath it, a run that drops a tool result and reports success
+
+Swept systematically with the inflation lever rather than waiting for each tripwire to bite. **13 suites, both profiles, two inflation sizes, every run captured to its own file.**
+
+### The ratio, which is the card's deliverable
+
+| inflation | tests failing | blind |
+|---|---|---|
+| **large** (12 lorem copies, **+331 tokens** over target) | **2** | **1** (50%) |
+| **small** (2 copies, **+21 tokens** — the exact margin F117 tripped) | **1** | **0** |
+| union, after this card | **2** | **0** |
+
+**The exposure is smaller than feared, and that is a real result.** **No test outside `--test cli` fails under either inflation, in either profile.** The tripwire surface is two tests in one suite, not a family spread across the workspace — so the speculative sweep I was half-expecting to need is not needed.
+
+**F118's fix is working:** the context test, which was the original blind failure, now reports the preflight refusal verbatim at both inflation sizes.
+
+### The two tests fail by different mechanisms at different distances
+
+This is what the **small** inflation bought, and it is why asking for two sizes mattered:
+
+- **At +21 tokens**, the context test trips the **preflight** — an explicit refusal with an exit code.
+- **At +331**, the artifact-free test fails because the **history trimmer elides an entire tool message**, and the budget has to be squeezed much further before that happens.
+
+So they are not two instances of one defect. The realistic case — a normal tool, not lorem — hits only the first, which already explains itself.
+
+### The real finding, and it is production-side
+
+The artifact-free failure is the serious one, and the agent measured why a message was needed rather than stderr: that test **asserts `output.stderr.is_empty()`**, consumes stdout into its event vector, and — measured against the real failure — **there is no trim, budget or context event on stdout at all.** Every JSONL event reports `status: "ok"`, `turn_finished` and `final_summary` included.
+
+**So a run can silently drop an entire tool result and report success.** The tool ran, bounded its own output correctly (`artifact_status "suppressed_by_policy"`, `output_bytes 12030`, `output_retained_bytes 7936`), and then history trimming elided the message before the provider saw it — leaving `[older tool output elided]`, 26 bytes, and a run that claims it went fine.
+
+**The test now names it. A reader of the binary's output would see nothing.** That is observability in production code, out of this card's scope by its own constraint, and **carded**: a turn that drops a tool result should say so in its event stream, not only in a test's assertion message.
+
+### Two process notes worth keeping
+
+**The agent narrowed its own message after measuring the render.** Its first draft embedded the whole `tool_finished` event and produced **a 12 KB wall of filler that buried the finding**; it cut back to four policy fields and 300 characters of content *because the render was measured, not assumed*. A diagnostic that is too verbose to read is as useless as one that is empty — and only rendering it tells you which you have written.
+
+**The honest-failure clause earned its place a second time.** Carried from F118 into this brief, it correctly kept stderr **out** of the one message written here. Two cards running, that clause has been the difference between a diagnostic and a decoration.
