@@ -289,7 +289,18 @@ empty groups omitted. **In the inline viewport `/jobs view` opens an overlay
 instead of printing that deck** -- the same grouping, on the alternate screen,
 with `?` for the key list and `Esc` to close; `Ctrl+X a` (following
 `[tui] prefix`) and pressing left twice on an empty composer open it too, the
-first press only hinting so it cannot open by accident. Left on a non-empty
+first press only hinting so it cannot open by accident.
+
+`Ctrl+X 1` to `Ctrl+X 9` attach to an agent **by the position it is displayed
+at**, without opening the view: `Ctrl+X 3` is the third row you would see,
+whatever its `#id`, counted over the same grouping and filter the view shows. The
+nine digits reach the first nine rows and nothing below them -- for those, open
+the view and use the arrows. The chord switches agent when one is already
+attached, and re-attaching to the agent you are on does nothing rather than
+re-announcing it. `Ctrl+X 0`, and a digit past the last row, do nothing at all;
+the digit is not even typed into your line, and whatever you had typed is kept.
+Inside the view itself the digits are ordinary characters, since selecting there
+is `↑`/`↓`. Left on a non-empty
 draft still moves the cursor, and up-arrow history recall is untouched.
 `[tui] left_arrow_opens_agents = false` disables the left-arrow route alone.
 `Up`/`Down` move the selection, which follows the agent rather than the row

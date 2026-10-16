@@ -5699,3 +5699,39 @@ Three resolutions were offered and **I rejected two**:
 **It re-ran the mutation after switching discriminators**, *"since the guard is no longer the one I first tested."* Exactly right: the earlier mutation proved the **old** guard, and swapping the condition invalidates the proof. Nobody asked for that.
 
 **It declined to run the release profile** while the discriminator was still in question, rather than burning two minutes of pty suites on code that might change — and said so, which beats both quietly doing it and quietly skipping it.
+
+## F137 — T4-S6-ordinal shipped, and F106's defect recurred exactly
+
+**`Ctrl+X 1..9` attaches by displayed position, never by id.** The last fully-buildable plan row; everything else remaining is gated on a human decision, an external spec, or the live terminal matrix.
+
+### Rejected once, for the same reason as `Ctrl+O`
+
+The implementation was complete and green — and the chord was **advertised nowhere a user could see.** All three occurrences in `main.rs` were a code comment, a function doc comment, and a test's doc comment. **`/tui`'s `details` string had zero mentions**, confirmed by the new test's first failure echoing the entire pre-change string.
+
+**That is F106 verbatim**, and the second time this epic a working chord reached acceptance unannounced. **F82**'s rule — *a rule applied per-change is not a rule enforced* — was itself applied per-change and not enforced.
+
+**And the error was partly mine:** I told the agent I would write the advertisement. Wrong. **The string is production code, and when `Ctrl+O` shipped it came with a test**; an unguarded string drifts, which is the whole reason that test exists. Corrected by handing it back for test-then-string.
+
+**The new test asserts the negative too**, over `["wrap", "ctrl+x 10", "two digits", "modulo"]` — because *"a user who believed in either would address the wrong agent in silence."* Multi-digit and wrapping are both decided against, so the advertisement must not imply them.
+
+### The design decisions worth keeping
+
+**`nth_displayed(rows, ordinal)` rather than a public `display_order() -> Vec`.** Handing out the vector hands out **a second indexing convention**: every call site would decide for itself whether the user's `1` means `[0]`, and whether out-of-range clamps, wraps or does nothing. One function owns the 1-based convention and the bounds — `checked_sub` answers `0` *before* the subtraction, and `get` rather than an index makes past-the-end `None` instead of a clamp or a panic.
+
+**It is built over the existing private `display_order`, the same one `sync`/`move_by` walk** (4 call sites, verified). That is load-bearing: **the ordinal can never disagree with the row the selection mark sits on**, and a test drives `AgentSelection` itself to prove it rather than comparing against a copy of the order.
+
+**My brief said no display-order accessor existed. One did** — twenty-seventh wrong brief, and the correction improved the design.
+
+### The reasons behind the inert cases, which outlive the card
+
+- **`Ctrl+X 0` is inert and the digit stays undrafted.** Not an alias for the first row (a second spelling of one action wastes a key) and **not a prefix of `10`** — multi-digit entry would make `Ctrl+X 1`'s meaning **wait for the next keystroke**, which is **F75**'s invisible-at-the-keypress shape, the defect that got a card's answer overruled earlier this epic.
+- **Past the end is `None` and must not clamp:** *"acting on an agent the user did not count off the screen is worse than doing nothing."*
+- **Twelve agents get nine digits, with no wrap and no modulo**, both of which attach to the wrong agent in silence. **The cap lives in the key decoder, not the accessor** — my ruling: nine-wide is a property of *the chord*, there being nine digits, not of display order, and a future caller wanting position twelve should not work around a keyboard limit encoded in a data accessor.
+
+### Two things the author did unasked
+
+**It refined its own mutation claim downward.** A *partial* id-first-then-position mutation fails only **three** of the four tests, because the twelve-agent fixture uses ids `100..` so no id can equal an ordinal and it falls through to correct behaviour. **That exposes a real gap in that test's discriminating power**, and reporting it stops a future reader over-trusting the suite.
+
+**It made re-attaching idempotent**, by routing the switch through the existing `apply_agent_view_exit` seam, which acts only on a **change** of binding — so the chord typed on the already-attached agent is a no-op rather than a duplicate milestone. I asked only whether switching worked.
+
+**And the fixture is the anti-vacuity shape I asked for, exceeded:** ids `7, 3, 11, 2, 5, 9`, a filter leaving four, display order `#3, #7, #11, #5` — so **ordinal 1 selects id 3**, **id 2 exists but is filtered out**, and the test asserts *"no ordinal equals the id it selects"* **first**, with `assert_ne!`, before any behaviour.

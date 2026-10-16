@@ -106,6 +106,37 @@ fn display_order(rows: &[AgentRow]) -> Vec<u64> {
         .collect()
 }
 
+/// The agent at a **1-based ordinal over the display order** (card
+/// **T4-S6-ordinal**), or `None` when no row holds that position.
+///
+/// # Why an accessor and not a public `display_order`
+///
+/// Handing out the `Vec` would hand out a second indexing convention: every
+/// call site would choose for itself whether the user's `1` means `[0]` or
+/// `[1]`, and whether an out-of-range digit clamps, wraps or does nothing.
+/// One function owns the 1-based convention and the bounds, and it reads the
+/// **same** [`display_order`] the `↑`/`↓` walk reads, so the ordinal can never
+/// disagree with what the selection mark is sitting on.
+///
+/// `rows` is the **visible** row list -- A3's filter already applied by the
+/// caller -- because the ordinal the user types is counted off the screen in
+/// front of them. Resolving it against the unfiltered set would attach to an
+/// agent that is not on screen, which is **F68**'s family: a privileged action
+/// without visible intent.
+///
+/// `ordinal` is 1-based: **`0` is not a position and yields `None`.** The
+/// chord's restriction to the digits `1..9` belongs to the key decoder and not
+/// here; this function answers for any position it is asked about.
+pub fn nth_displayed(rows: &[AgentRow], ordinal: usize) -> Option<u64> {
+    // `0` is answered before the subtraction: it is not a position, so it is
+    // `None` rather than `display_order(rows)[usize::MAX]`'s panic.
+    let index = ordinal.checked_sub(1)?;
+    // `get`, not an index: an ordinal past the last displayed row is `None`
+    // and must never clamp onto the last one -- acting on an agent the user
+    // did not count off the screen is worse than doing nothing.
+    display_order(rows).get(index).copied()
+}
+
 /// What a press of the two-press stop key answered.
 ///
 /// `Confirmed` carries the id it is confirming, so the caller fires at the
@@ -2344,6 +2375,250 @@ mod tests {
             "F65: the key must not be in a CSI sequence's final-byte range, or \
              an arrow immediately before it swallows it: {:#x}",
             byte
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Card **T4-S6-ordinal**: `Ctrl+X 1..9` is a 1-based ordinal over A2's
+    // display order, never an id. Design §4.7 says "attach agent N"; the
+    // digit cannot be an id, because ids pass 9 after nine spawns and go
+    // *wrong* rather than dead once `#1` is pruned and `#11` exists.
+    //
+    // The whole hazard of this card is a fixture whose ids happen to equal
+    // their display positions: such a test is satisfied by the defect it
+    // exists to catch. `ordinal_fixture` below is built so that **no visible
+    // row's id equals its own ordinal**, and the first assertion of the
+    // headline test proves that property rather than trusting it.
+    // ------------------------------------------------------------------
+
+    /// A row with a stated profile, so A3's `p:` filter can cut the set.
+    fn profiled_row(id: u64, state: AgentViewState, profile: &str) -> AgentRow {
+        AgentRow {
+            profile: Some(profile.to_string()),
+            ..row(id, state)
+        }
+    }
+
+    /// The discriminating fixture. Six agents; two carry a different profile,
+    /// so A3's `p:review` leaves a **strict subset** visible; the ids are
+    /// **non-contiguous** and arrive in an order that is **not** the display
+    /// order, because grouping by state reorders them.
+    ///
+    /// Visible under `p:review`, grouped into A2's order:
+    ///
+    /// | ordinal | 1 | 2 | 3 | 4 |
+    /// |---|---|---|---|---|
+    /// | agent | `#3` | `#7` | `#11` | `#5` |
+    ///
+    /// Three things that fixture buys, and nothing cheaper buys all three:
+    /// the agent whose id is `3` sits at ordinal **1**, so reading the digit
+    /// as an id is visibly wrong; `#2` — the id a `Ctrl+X 2` would name —
+    /// is **filtered out**, so an id read would attach to an agent that is
+    /// not on screen; and **no ordinal equals the id it selects**, so neither
+    /// reading can pass by coincidence.
+    fn ordinal_fixture() -> Vec<AgentRow> {
+        vec![
+            profiled_row(7, AgentViewState::Working, "review"),
+            profiled_row(3, AgentViewState::NeedsInput, "review"),
+            profiled_row(11, AgentViewState::Working, "review"),
+            // Filtered out: the id a `Ctrl+X 2` would name if the digit were
+            // an id.
+            profiled_row(2, AgentViewState::Working, "other"),
+            profiled_row(5, AgentViewState::DoneUnviewed, "review"),
+            profiled_row(9, AgentViewState::NeedsInput, "other"),
+        ]
+    }
+
+    /// The visible rows of [`ordinal_fixture`] under A3's `p:review`, through
+    /// the one expression the overlay applies the filter with.
+    fn visible_fixture() -> Vec<AgentRow> {
+        let filter = super::parse_filter("p:review").expect("`p:review` is a filter A3 defines");
+        ordinal_fixture()
+            .into_iter()
+            .filter(|row| filter.matches(row))
+            .collect()
+    }
+
+    /// **The headline.** The digit is a position on screen, and the agent it
+    /// names is the one the user is looking at — not the one whose id happens
+    /// to be that digit.
+    #[test]
+    fn the_ordinal_names_the_nth_displayed_agent_and_never_the_agent_whose_id_it_is() {
+        let visible = visible_fixture();
+        let expected = [(1usize, 3u64), (2, 7), (3, 11), (4, 5)];
+
+        // The fixture's own precondition, asserted and not assumed: a fixture
+        // where an id equalled its ordinal would be satisfied by the very
+        // defect this test exists to catch.
+        assert_eq!(
+            visible.len(),
+            expected.len(),
+            "the filter must leave a strict subset of {} rows visible",
+            ordinal_fixture().len()
+        );
+        for (ordinal, id) in expected {
+            assert_ne!(
+                id, ordinal as u64,
+                "FIXTURE: ordinal {ordinal} must not select the agent whose id \
+                 is {ordinal}, or an id-keyed implementation passes"
+            );
+        }
+        assert!(
+            ordinal_fixture().iter().any(|row| row.id == 2),
+            "FIXTURE: agent #2 must exist and be filtered out, so an id read \
+             would reach an agent that is not on screen"
+        );
+        assert!(
+            !visible.iter().any(|row| row.id == 2),
+            "FIXTURE: agent #2 must not be visible under `p:review`"
+        );
+
+        for (ordinal, id) in expected {
+            assert_eq!(
+                super::nth_displayed(&visible, ordinal),
+                Some(id),
+                "`Ctrl+X {ordinal}` is the {ordinal}th *displayed* row, which \
+                 is agent #{id}"
+            );
+            assert_ne!(
+                super::nth_displayed(&visible, ordinal),
+                Some(ordinal as u64),
+                "`Ctrl+X {ordinal}` must not resolve to the agent whose id is \
+                 {ordinal}: the digit is a position, never an id"
+            );
+        }
+    }
+
+    /// The ordinal reads the **same** order the `↑`/`↓` walk reads, which is
+    /// the one property that keeps the digit agreeing with the selection mark
+    /// the user can see. Driven through [`AgentSelection`] itself rather than
+    /// through a second copy of the order (**F69**: the predicate beside the
+    /// decoder is not the decoder).
+    #[test]
+    fn the_ordinal_agrees_with_the_order_the_selection_keys_walk() {
+        let visible = visible_fixture();
+        let mut selection = super::AgentSelection::new();
+        selection.sync(&visible);
+        for ordinal in 1..=visible.len() {
+            assert_eq!(
+                selection.selected(),
+                super::nth_displayed(&visible, ordinal),
+                "after {} \u{2193} presses the selection is on the row \
+                 `Ctrl+X {ordinal}` names",
+                ordinal - 1
+            );
+            selection.move_down(&visible);
+        }
+    }
+
+    /// The cases an unenumerated key silently does nothing in (**F84**,
+    /// **F75**), each with its decided answer.
+    #[test]
+    fn the_ordinal_is_bounded_at_both_ends_and_on_an_empty_view() {
+        // **No agents**: nothing to select, for every digit the chord can
+        // produce. Not a panic and not a selection.
+        for ordinal in 0..=9 {
+            assert_eq!(
+                super::nth_displayed(&[], ordinal),
+                None,
+                "an empty view holds no row at ordinal {ordinal}"
+            );
+        }
+
+        // **One agent**: ordinal 1 is it, and nothing else is anything.
+        let one = vec![row(42, AgentViewState::Working)];
+        assert_eq!(
+            super::nth_displayed(&one, 1),
+            Some(42),
+            "the single displayed row is ordinal 1, whatever its id is"
+        );
+        for ordinal in [0usize, 2, 3, 9] {
+            assert_eq!(
+                super::nth_displayed(&one, ordinal),
+                None,
+                "a one-row view holds no row at ordinal {ordinal}"
+            );
+        }
+
+        // **`Ctrl+X 0`**: decided **inert**. The ordinal is 1-based, so `0`
+        // is not a position at all; it is neither an alias for the first row
+        // (that is `1`, and a second spelling of one action is a key wasted)
+        // nor for the tenth (a digit that means ten is a riddle, and
+        // `Ctrl+X 1` would then be ambiguous until the next keystroke --
+        // F75's shape: invisible at the keypress).
+        let visible = visible_fixture();
+        assert_eq!(
+            super::nth_displayed(&visible, 0),
+            None,
+            "`Ctrl+X 0` is inert: the ordinal is 1-based, so 0 is not a \
+             position"
+        );
+
+        // **An ordinal past the end**: inert and silent, exactly as
+        // `Ctrl+X d` with nothing attached is (design §4.7: a chord is a
+        // slip). It must not clamp onto the last row -- a chord that acts on
+        // an agent the user did not count off the screen is worse than one
+        // that does nothing.
+        for ordinal in [5usize, 6, 9] {
+            assert_eq!(
+                super::nth_displayed(&visible, ordinal),
+                None,
+                "{} rows are visible, so ordinal {ordinal} names none of \
+                 them and must not clamp onto the last",
+                visible.len()
+            );
+        }
+    }
+
+    /// **More than nine agents.** Decided: the digits `1..9` address the
+    /// first nine **displayed** rows and nothing addresses the rest. The
+    /// chord is a shortcut over what is on screen, not a complete index:
+    /// multi-digit entry would need a settle timeout, which makes the first
+    /// digit's meaning invisible at the keypress (**F75**'s worst form), and
+    /// a wrap or a modulo would attach to the wrong agent in silence.
+    ///
+    /// The accessor itself is **not** capped at nine -- the restriction
+    /// belongs to the key decoder, which produces no ordinal above nine -- so
+    /// this pins both halves: every digit the chord can carry resolves to the
+    /// row at that position, and the tenth row is simply not one of them.
+    #[test]
+    fn twelve_agents_are_addressed_by_the_first_nine_displayed_ordinals() {
+        // Ids run 100.. so that no id can be confused with any ordinal, and
+        // the states interleave so the display order is not the input order.
+        let rows: Vec<AgentRow> = (0u64..12)
+            .map(|index| {
+                let state = if index % 2 == 0 {
+                    AgentViewState::Working
+                } else {
+                    AgentViewState::NeedsInput
+                };
+                row(100 + index, state)
+            })
+            .collect();
+        // A2 puts `NeedsInput` before `Working`, so the odd ids come first:
+        // the display order is genuinely not the arrival order.
+        let displayed: Vec<u64> = (1..=rows.len())
+            .map(|ordinal| {
+                super::nth_displayed(&rows, ordinal)
+                    .unwrap_or_else(|| panic!("twelve rows hold a row at ordinal {ordinal}"))
+            })
+            .collect();
+        assert_eq!(
+            displayed,
+            vec![101, 103, 105, 107, 109, 111, 100, 102, 104, 106, 108, 110],
+            "the ordinals walk A2's groups in A2's order, not the arrival order"
+        );
+        // The chord's nine digits reach the first nine of those and no more.
+        assert_eq!(
+            super::nth_displayed(&rows, 9),
+            Some(104),
+            "with twelve agents `Ctrl+X 9` is the ninth *displayed* row"
+        );
+        assert_eq!(
+            displayed[9..],
+            [106, 108, 110],
+            "the three rows past the ninth are reachable only through the \
+             agent view's own keys: no chord digit names them"
         );
     }
 }
