@@ -497,7 +497,7 @@ one paint each; the newest value is never dropped.
 `/tui [classic|inline]` switches the renderer between turns and keeps the
 conversation: what was printed before the switch stays on screen exactly once,
 and the viewport's live status row returns with it. Bare `/tui` reports the
-renderer actually running. `fullscreen` is refused until that renderer exists,
+renderer actually running. A renderer kitsu does not have is refused,
 naming what is accepted, and `/tui` during a turn is refused rather than queued,
 because the mid-turn fall-through would otherwise send it to the model as a
 prompt. Switching into a terminal shorter than the viewport's minimum stays

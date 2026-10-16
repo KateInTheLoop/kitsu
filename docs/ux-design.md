@@ -320,8 +320,10 @@ rule that closed **F34**'s duplicate marker table.
   viewport, where the elapsed segment stops its periodic refresh while the
   queue and agent tags keep updating, together with a **60 fps paint cap
   enforced in the painter** (N3, N9); and the **bounded fd-tagged cell ring**
-  behind `[tui] cell_ring_lines`, not yet fed in production because R6's overlay
-  is its only reader (N4).
+  behind `[tui] cell_ring_lines`, fed in production by the inline surface and the
+  fullscreen tap, and read by the fullscreen frame as well as R6's `Ctrl+O`
+  overlay. It retains the user's submitted prompts, marked and split one cell per
+  line (N4).
 
   **Paste at the idle inline prompt** behaves as the during-turn row does: a
   bracketed-paste burst is kept as one draft. Measured at **10 KiB in
