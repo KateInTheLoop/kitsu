@@ -5629,3 +5629,42 @@ My brief's step count was right this time (18 exits / 16 steps) because the test
 **The mutation was sharper than I asked for:** remapping exit #2 to a neighbouring step made the *right* test fail *naming the wrong label*, while its sibling stayed green — so the two tests discriminate **per-exit**, not merely per-step.
 
 **And two distinctions the author drew that I had not:** the function's two `.expect(..)` sites are **panics, not error exits**, so they are neither counted nor wired; and the non-x86_64 stub returns a fixed `Unsupported` error and is outside the step vocabulary. Both correct, both unprompted.
+
+## F134 — F133's mechanism was wrong too, and I made the same mistake twice in two cards
+
+**RETRACTION.** F133 records that *"F133's test replaces an executable by name, which is precisely what `ETXTBSY` reports."* **False.** Verified against the capture:
+
+- The panic is at **`command.rs:3524:10`** — the `.unwrap()` on the **first** `execute_command` (the call spans 3515–3524).
+- `std::fs::rename` is at **3526**, two lines later.
+
+**At the moment of the ETXTBSY the executable had not been replaced at all.** I read the test's *name* — `replacing_an_approved_executable_forces_fresh_approval` — added the errno, and wrote down a mechanism. **That is the identical error I had corrected one card earlier on F130**, where I called a `memfd` path "path contention". Two flakes, two mechanism guesses, both wrong, both from the same habit: **the errno narrows, the test name suggests, and neither names.**
+
+### The real mechanism, which no amount of staring at the test would have produced
+
+1. `write_test_executable` opens the executable `O_WRONLY|O_CREAT|O_CLOEXEC`, writes, **closes**. Window: microseconds.
+2. Concurrently, one of the other 415 tests in the same binary **forks**. The child's fd table is a **copy of the parent's — including that write fd.**
+3. **`O_CLOEXEC` does not save you:** the kernel closes CLOEXEC descriptors *inside* `execve`, **after** `deny_write_access()` has already failed.
+4. Linux's `deny_write_access()` checks **`inode->i_writecount`, which is process-independent.** So between a sibling's `fork` and its child's `execve`, this inode has a writer — someone else's.
+5. The test's own `execve` → **ETXTBSY**, wrapped by `command_failed` into `ExecError("command failed: …")`.
+
+**So my ruled-out cause #3 was half right in the worst way:** the *fact* survives — `std::fs::write` does close the fd — but **the inference does not.** Closing it *in this process* is not enough. **The writer that defeats you is your own descriptor, surviving in somebody else's child.**
+
+**And cause #1 survives for a reason better than mine:** unique `tempfile::tempdir()` paths do not help because **the kernel check is on the inode, not the path.**
+
+### Evidence, labelled honestly
+
+**Reproduced outside the suite, not inside it.** A C harness with unique paths, `O_CLOEXEC`, the fd closed and `chmod`'d before exec, and sibling threads forking: **4/500** at zero linger, **84/500** with a 5 ms linger. A Rust harness in exactly the test's shape (`std::fs::write` + `set_permissions` + `Command::new`): **13/400**. **In-suite: 0 reproductions in 35 runs**, including 15 at `--test-threads=32` under eight CPU burners.
+
+So: **mechanism derived, independently reproduced in a harness, not reproduced in `kitsu-tools`.** One sighting in ~60 runs plus zero in 35 is consistent with the rate and is **not** evidence for the mechanism — the harness is.
+
+### A fix refuted by measurement before anyone proposed it
+
+`run_supervised_command` registers `pre_exec` **unconditionally**, even when `inherited_paths` is empty, which forces std off `posix_spawn` for every spawn. *"Make `pre_exec` conditional so std can use `posix_spawn`"* reads as a free win. **The harness says it would make this worse:** `posix_spawn` mode reproduced **13/400**, fork-plus-`pre_exec` **0/800**, at only 1.4× the spawn rate — so not a throughput artefact. **Do not take that fix.** And the agent declined to assert *why* `posix_spawn`'s window is wider, having not measured it — which is the right place to stop.
+
+### The finding that outranks the flake
+
+**This is a production defect, not a test defect.** A user replacing a tool between invocations hits exactly this, and so does a user whose editor or build is mid-write on it. Kitsu reports a flat `command failed: Text file busy (os error 26)` with **no indication that the condition is transient** — and `ETXTBSY` at `execve` is *definitionally* transient.
+
+**Carded, not fixed:** a bounded retry around the spawn in `run_supervised_command`. It is safe with respect to the security story — `cwd` revalidation, root revalidation and `observe_executable` all run before the spawn, so a retry around the spawn alone reopens no check-to-exec window that is not already documented. But it needs a bound, a backoff, a decision on re-running revalidation per attempt, and a test — **so it is a test-first card, and a defensible alternative is to keep failing and say the condition is transient.**
+
+**Test-side mitigation does not exist**, and that is worth recording: the F133 test's own hygiene is already correct, the writer comes from siblings it cannot control, no copy-or-rename trick changes the inode's writecount, and `#[serial]` would not help because the `rg`/`sh` spawners are not serial.
