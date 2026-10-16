@@ -16125,7 +16125,17 @@ async fn test_context_window_mismatch_warns_on_stderr() {
     })
     .await
     .unwrap();
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kitsu must exit 0; stderr: {}; stdout error events: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("\"type\":\"error\""))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.contains("context window mismatch suspected"),
@@ -16164,7 +16174,17 @@ async fn test_jsonl_context_window_mismatch_emits_typed_event() {
     })
     .await
     .unwrap();
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kitsu must exit 0; stderr: {}; stdout error events: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("\"type\":\"error\""))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
     assert!(output.stderr.is_empty());
     let events = String::from_utf8(output.stdout)
         .unwrap()
@@ -16215,7 +16235,17 @@ async fn test_context_command_surfaces_window_runtime_evidence() {
     })
     .await
     .unwrap();
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kitsu must exit 0; stderr: {}; stdout error events: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("\"type\":\"error\""))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
     let events = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
@@ -16289,7 +16319,17 @@ async fn test_piped_chat_system_prompt_names_cwd_and_granted_roots() {
     })
     .await
     .unwrap();
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kitsu must exit 0; stderr: {}; stdout error events: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("\"type\":\"error\""))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
 
     let requests = server.received_requests().await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
