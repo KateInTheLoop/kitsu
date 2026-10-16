@@ -20939,7 +20939,10 @@ fn human_channel_digest(human: &str) -> String {
     let mut kept: Vec<String> = Vec::new();
     for line in stripped.lines().map(str::trim).filter(|l| !l.is_empty()) {
         // A keystroke echo is a strict prefix of the next echo; keep the last.
-        while kept.last().is_some_and(|last| line.starts_with(last.as_str())) {
+        while kept
+            .last()
+            .is_some_and(|last| line.starts_with(last.as_str()))
+        {
             kept.pop();
         }
         if !kept.iter().any(|seen| seen == line) {
@@ -20975,11 +20978,7 @@ async fn run_dropped_tool_result(
     let mut tool_calls = Vec::new();
     for index in 0..calls {
         let input = work.path().join(format!("evidence-{index}.txt"));
-        fs::write(
-            &input,
-            format!("HEAD{}TAIL", "evidence-line\n".repeat(900)),
-        )
-        .unwrap();
+        fs::write(&input, format!("HEAD{}TAIL", "evidence-line\n".repeat(900))).unwrap();
         tool_calls.push(serde_json::json!({
             "id": format!("big_read_{index}"),
             "type": "function",
@@ -21213,7 +21212,6 @@ fn run_styled_chat_pty_turn(
     (status, String::from_utf8_lossy(&transcript).into_owned())
 }
 
-
 /// Every word the drop report could reasonably use, enumerated so an N1
 /// surface cannot stay "silent" merely because the implementer picked a
 /// synonym this file did not predict.
@@ -21271,9 +21269,13 @@ fn assert_styled_turn_completed(run: &DroppedResultRun) {
 #[tokio::test]
 #[serial]
 async fn test_a_styled_tty_run_tells_the_human_a_tool_result_was_dropped() {
-    let run =
-        run_dropped_tool_result(DroppedResultCarrier::StyledPty, "2048", 1, &["--no-artifacts"])
-            .await;
+    let run = run_dropped_tool_result(
+        DroppedResultCarrier::StyledPty,
+        "2048",
+        1,
+        &["--no-artifacts"],
+    )
+    .await;
     assert_styled_turn_completed(&run);
     assert_result_really_dropped(&run);
 
@@ -21304,9 +21306,13 @@ async fn test_a_styled_tty_run_tells_the_human_a_tool_result_was_dropped() {
 #[tokio::test]
 #[serial]
 async fn test_a_styled_tty_run_reports_one_line_per_round_naming_the_count() {
-    let run =
-        run_dropped_tool_result(DroppedResultCarrier::StyledPty, "2048", 2, &["--no-artifacts"])
-            .await;
+    let run = run_dropped_tool_result(
+        DroppedResultCarrier::StyledPty,
+        "2048",
+        2,
+        &["--no-artifacts"],
+    )
+    .await;
     assert_styled_turn_completed(&run);
     assert_result_really_dropped(&run);
 
@@ -21514,4 +21520,3 @@ async fn test_n1_jsonl_gains_nothing_from_the_human_report_of_a_dropped_result()
         "the human-facing report must leave F120's JSONL stream exactly as it is"
     );
 }
-
