@@ -5798,3 +5798,36 @@ Shipped as ruled: both doors refused, `auto`/`always` untouched. Two details wor
 **And it hit the consequence I had only recorded, then reasoned past it correctly.** Once nothing constructs `AlternateScreen::Never`, the compiler warns and `-D warnings` fails. The obvious fix is to delete the variant. **It kept the variant with a dead-code allowance instead**, on the grounds that deleting it would turn *"recognised, not yet available"* into *"not a value"* — **F90's inversion, applied unprompted to a type rather than to prose.** That is the difference between a user being told to wait and a user being told they imagined the feature.
 
 **The practice that made this card cheap** was the test author proving mutation A — *the intended refusal makes all five file-side tests green* — **before** hand-off. Eleven unsatisfiable assertions this epic were found in review or by an implementer hitting a wall; this is the first card where reachability was demonstrated in advance. **Worth making standard: a test author who has built the fix once knows the tests are satisfiable, and nobody else can know it as cheaply.**
+
+## F139 — a key with no consumer is not a diagnosis; whether its referent was specified is
+
+**My card was refuted and the refutation is worth more than the card would have been.** I took F62's sibling — `[tui] title`, the last key without a consumer — and briefed it as F62's twin: refuse the unbuildable value. **The premise was wrong in exactly the way my own brief told the agent to stop on.**
+
+### `title` is the window-title key, and one doc comment said otherwise
+
+**H2, a MUST:** *"Kitsu MUST set the terminal title (OSC 0/2) to `kitsu · working|blocked|idle|N agents` when `tui.title = true` (default on TTY), so herdr/tmux can classify by title."* Corroborated by the design's file map (`src/title.rs  OSC title + state file (H2)`), §4.8's sample config, the plan's T1-S4 (*"OSC title (`tui.title`…)"*) and **`README.md:1175`** (*"set and restore the terminal window title"*).
+
+**The single outlier in the entire repository was `config.rs`'s doc comment: *"Whether the viewport paints its title row."*** No viewport title row exists anywhere — I verified that myself, and it is what made the comment plausible. **That one sentence produced a brief that would have refused a MUST requirement's designed default.**
+
+### The two keys are opposite kinds, which corrects F62's own framing
+
+F62 recorded `title` and `alternate_screen` as the same defect — *"a key without a consumer"*. **They are not the same kind at all:**
+
+- **`alternate_screen = never`** had **no specified referent**. Nothing said what an in-viewport overlay should be, so refusing it was right: *"the value is a coherent thing to want"*, and the refusal told the user to wait.
+- **`title = true`** has a **fully specified referent in a MUST**, with **half its mechanism already running ungated in production**. It is an **unimplemented requirement wearing a config key** — and refusing it would be **F90's error in a third direction**: turning *"we promised this and have not built it"* into *"you may not ask for it."*
+
+**So: a key with no consumer is not a diagnosis. Whether its referent was ever specified is the diagnosis.** That distinction is the card's real output, and it is the one F62 was missing.
+
+### The mechanism, measured
+
+**H2 has two clauses and the key gates neither.** `tui_bridge` writes `PUSH_TITLE`/`POP_TITLE` in **production** without consulting `setup.tui.title`. And `TuiRuntime::enter(title)`, the only code that would write the **OSC 2 string**, **has no non-test caller** — verified. So the title *stack* is pushed and popped while the title is **never set**. A user who set `title = false` gets the stack pushed anyway, which is *"accidentally correct in effect but not honoured in mechanism"* — weaker than the analogy I drew.
+
+### And my proposed fix was independently unsatisfiable
+
+Flipping the default to `false` falsifies **three** assertions in three named tests — `tui_table_parses_all_six_keys` (where `assert!(default.title)` is the *stated* non-vacuity anchor), `tui_table_defaults_are_identical_absent_empty_and_through_unwrap_or_default`, and `tui_keys_default_independently_of_one_another`. The agent was forbidden to edit tests and **stopped on exactly the shape F62's author stopped on**. So option 1 was dead twice over: wrong premise *and* unsatisfiable.
+
+### What shipped, and what is carded
+
+**Shipped: the doc comment, corrected in place** — one line of source, no behaviour, **and no test, which is the honest answer rather than an invented assertion.** It records what the key is, that it was the repository's only dissenting voice, and that H2 is half-built.
+
+**Carded: H2 proper** — gate `tui_bridge`'s push/pop on the key and write the OSC 2 state title, fed from the registry. It has a written spec, a named file in the design's map, and `sanitize_title` already built and tested (including that it *"cannot escape its own OSC sequence"*). **To be scoped against T5-S4 and H2's state-file half before anyone is handed it** — the agent's own recommendation, and right.

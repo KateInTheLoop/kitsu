@@ -407,7 +407,22 @@ pub struct TuiConfig {
         deserialize_with = "deserialize_tui_prefix"
     )]
     pub prefix: String,
-    /// Whether the viewport paints its title row.
+    /// Whether kitsu sets and restores the **terminal window title** (H2).
+    ///
+    /// **Corrected in F139.** This said "whether the viewport paints its title
+    /// row", which is wrong and was the only artefact in the repository saying
+    /// so -- the design (H2), the plan (T1-S4), §4.8's sample config and
+    /// `README.md` all describe the window title, and **no viewport title row
+    /// exists anywhere**. That one sentence was enough to send a card off to
+    /// refuse this key's designed default; a doc comment that misnames its own
+    /// referent is worse than one that says nothing.
+    ///
+    /// **H2 is specified and half-built, and this key gates neither half.**
+    /// `tui_bridge` pushes and pops the title *stack* in production without
+    /// consulting this flag, and the OSC 2 title string -- `kitsu ·
+    /// working|blocked|idle|N agents` -- is never written at all, because
+    /// `TuiRuntime::enter` has no non-test caller. So the honest status is an
+    /// **unimplemented requirement**, not a value to refuse.
     #[serde(default = "default_true", deserialize_with = "deserialize_tui_title")]
     pub title: bool,
     /// Whether Left opens the agents pane.
