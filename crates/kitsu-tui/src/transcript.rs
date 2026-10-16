@@ -45,6 +45,21 @@ use crate::keys::Press;
 #[derive(Clone, Debug, Default)]
 pub struct TranscriptOverlay {
     view: FullscreenView,
+    /// The query being typed, or `None` when no query line is open. The
+    /// query line is a *mode*: while it is `Some`, the surface's own keys --
+    /// `q` included -- are text.
+    query: Option<String>,
+    /// The **absolute** ordinals the last submitted query matched, oldest
+    /// first: the snapshot `n`/`N` walk. Absolute, because the ring is a
+    /// sliding window and a stored index would address a different line after
+    /// the next eviction.
+    matches: Vec<usize>,
+    /// Which of [`Self::matches`] the walk is standing on, or `None` when no
+    /// query has matched.
+    cursor: Option<usize>,
+    /// The miss to report in the chrome row, kept after the query line closes
+    /// so the user is told their query found nothing (**F75**).
+    miss: Option<String>,
 }
 
 impl TranscriptOverlay {
@@ -57,18 +72,25 @@ impl TranscriptOverlay {
     /// sweep over the agent view's decoder (**F82**).
     ///
     /// It names the four paging presses [`Self::page`] forwards, the two
-    /// prompt jumps [`Self::jump`] answers and the two presses [`closes`]
-    /// answers, and nothing else: `/` search, `[` dump and `v` editor are
-    /// later pieces of **R6**, and a row that named one of them before
-    /// anything dispatched it would be finding **F89** painted onto the
-    /// screen.
+    /// prompt jumps [`Self::jump`] answers, the `/` search and `n`/`N` match
+    /// walk [`Self::submit_search`] and [`Self::repeat_search`] answer, and
+    /// the two presses [`closes`] answers -- and nothing else: the `[` dump
+    /// and the `v` editor are later pieces of **R6**, and a row that named
+    /// one of them before anything dispatched it would be finding **F89**
+    /// painted onto the screen.
+    /// Seventy-seven columns, which is the constraint that cost
+    /// `Ctrl+Home/End` its `oldest/newest` gloss: at eighty columns the fit
+    /// would have cut `q/Esc close` off the end, and a row that drops the key
+    /// the user needs to leave the surface is worse than one that leaves a
+    /// self-describing key pair to describe itself.
     const FOOTER: &'static str =
-        "PgUp/PgDn scroll  {/} prompt  Ctrl+Home/End oldest/newest  q/Esc close";
+        "PgUp/PgDn scroll  {/} prompt  / search  n/N match  Ctrl+Home/End  q/Esc close";
 
     /// An overlay that follows the newest line.
     pub fn new() -> Self {
         Self {
             view: FullscreenView::new(),
+            ..Self::default()
         }
     }
 
@@ -110,42 +132,159 @@ impl TranscriptOverlay {
     /// **R6-b: the query line and the match walk.**
     ///
     /// These are the *policy* over [`FullscreenView::pin_to`]; `{`/`}` is the
-    /// other one, and there is deliberately no second anchor concept. Stubs
-    /// for now: the tests below are the specification, and an implementation
-    /// that satisfies them replaces these bodies.
+    /// other one, and there is deliberately no second anchor concept.
     ///
-    /// Open the query line (`/`).
-    pub fn begin_search(&mut self) {}
+    /// Open the query line (`/`), which scrolls nothing: the scan is
+    /// [`Self::submit_search`]'s, and a per-keystroke scan is what this shape
+    /// exists to avoid -- a full `plain()` pass over a default 10 000-line
+    /// ring was measured at ~4 ms release / ~14 ms debug, and ~10 ms / ~45 ms
+    /// with one **F52** pasted megabyte in it, so a twenty-character query
+    /// would be most of a second of scanning for an answer the user has not
+    /// asked for yet.
+    pub fn begin_search(&mut self) {
+        self.query = Some(String::new());
+        // The previous query's miss is not this query's: the chrome row is
+        // the query line from here until the submit.
+        self.miss = None;
+    }
 
     /// The query being typed, or `None` when no query line is open.
+    ///
+    /// This is also the **mode** the byte loop reads: while it is `Some`, the
+    /// overlay's own keys are query text, or the word `query` could not be
+    /// searched for and `q` would take the surface away mid-typing.
     pub fn search_query(&self) -> Option<&str> {
-        None
+        self.query.as_deref()
     }
 
     /// Append one printable character to the open query line.
-    pub fn push_search_char(&mut self, _ch: char) {}
+    pub fn push_search_char(&mut self, ch: char) {
+        if let Some(query) = self.query.as_mut() {
+            query.push(ch);
+        }
+    }
 
     /// Delete the last character of the open query line.
-    pub fn backspace_search(&mut self) {}
+    ///
+    /// Inert on an empty query rather than closing the query line: deleting
+    /// past the start must not take the surface away behind the user.
+    pub fn backspace_search(&mut self) {
+        if let Some(query) = self.query.as_mut() {
+            query.pop();
+        }
+    }
 
     /// Abandon the query line, leaving the overlay open and unmoved.
-    pub fn cancel_search(&mut self) {}
+    pub fn cancel_search(&mut self) {
+        self.query = None;
+        self.miss = None;
+    }
 
     /// Run the typed query (`Enter`) and jump to its newest match, reporting
     /// whether the frame moved.
-    pub fn submit_search(&mut self, _ring: &CellRing, _rows: u16) -> bool {
-        false
+    ///
+    /// The **one** scan per query: the matching absolute ordinals are stored
+    /// and [`Self::repeat_search`] walks them, so `n`/`N` are O(1) per press
+    /// and allocate nothing. The consequence is that the match list is a
+    /// snapshot — a line appended after the submit joins the next query's
+    /// matches, not this walk's.
+    ///
+    /// The landing is the **newest** match, and the matching **line** rather
+    /// than its prompt block: `/` moves to the text the user asked for, and
+    /// the block start is a row their query may not appear in.
+    ///
+    /// An empty query is a **cancel**: `""` is a substring of every line in
+    /// the ring, so matching all of them and jumping would be a keypress the
+    /// user made by accident moving the frame.
+    pub fn submit_search(&mut self, ring: &CellRing, rows: u16) -> bool {
+        let Some(query) = self.query.take() else {
+            return false;
+        };
+        self.miss = None;
+        if query.is_empty() {
+            self.matches.clear();
+            self.cursor = None;
+            return false;
+        }
+        // Case-insensitive: a transcript is prose, and a case-sensitive
+        // default is the **F75** shape -- the user types what they remember
+        // seeing and the key appears to do nothing.
+        let needle = query.to_lowercase();
+        // `plain()` is exactly the glyphs of the painted row, so what is
+        // searched is what the overlay paints. The ordinals are **absolute**
+        // (`evicted() + index`), which is what lets them outlive an eviction.
+        let oldest = ring.evicted();
+        self.matches = ring
+            .lines()
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.plain().to_lowercase().contains(&needle))
+            .map(|(index, _)| oldest + index)
+            .collect();
+        let Some(newest) = self.matches.len().checked_sub(1) else {
+            self.cursor = None;
+            // On screen, because the user has just typed a whole query and
+            // "nothing happened" must not have to be inferred from a frame
+            // that did not move (**F75**).
+            self.miss = Some(format!("/{query}  no match"));
+            return false;
+        };
+        self.cursor = Some(newest);
+        self.pin_to_match(self.matches[newest], ring, rows)
     }
 
     /// Walk to the next match in `dir` (`n`/`N`), reporting whether the frame
     /// moved.
-    pub fn repeat_search(&mut self, _dir: Jump, _ring: &CellRing, _rows: u16) -> bool {
-        false
+    ///
+    /// `n` is **newer** and `N` is **older**, reusing R6-c's [`Jump`] rather
+    /// than growing a second direction concept. **Neither wraps**: `{`/`}`
+    /// already settled what "nothing in that direction" means on this surface
+    /// -- nothing happens and `false` comes back -- and a wrap would be
+    /// **F75** at its worst, with `n` at the newest match teleporting to the
+    /// oldest and nothing on screen saying which had happened.
+    pub fn repeat_search(&mut self, dir: Jump, ring: &CellRing, rows: u16) -> bool {
+        let Some(at) = self.cursor else {
+            return false;
+        };
+        let next = match dir {
+            Jump::Next if at + 1 < self.matches.len() => at + 1,
+            Jump::Prev if at > 0 => at - 1,
+            _ => return false,
+        };
+        if self.pin_to_match(self.matches[next], ring, rows) {
+            self.cursor = Some(next);
+            true
+        } else {
+            false
+        }
     }
 
     /// How many matches the last submitted query found.
     pub fn match_count(&self) -> usize {
-        0
+        self.matches.len()
+    }
+
+    /// Pin the frame's top row to `ordinal`, obeying **R6-c's** cannot-move
+    /// rule rather than inventing a second one for `/`.
+    ///
+    /// The clamp is [`FullscreenView::pin_to`]'s one home and the cursor is
+    /// [`FullscreenView::top`]'s, so there is no arithmetic here: the pin is
+    /// tried on a copy, and if the copy's top row is the one the frame is
+    /// already on then this is no transition at all -- the view is left
+    /// exactly as it was, follow state included, and `false` comes back.
+    /// Pinning there would break the follow while the frame did not change,
+    /// which is invisible at the keypress and visible later as output that
+    /// silently stopped arriving (**F75**).
+    fn pin_to_match(&mut self, ordinal: usize, ring: &CellRing, rows: u16) -> bool {
+        let content = Self::content_rows(rows);
+        let cursor = self.view.top(ring, content);
+        let mut pinned = self.view.clone();
+        pinned.pin_to(ordinal, ring, content);
+        if pinned.top(ring, content) == cursor {
+            return false;
+        }
+        self.view = pinned;
+        true
     }
 
     /// The rows to paint, oldest first, with the footer last.
@@ -158,13 +297,25 @@ impl TranscriptOverlay {
         rows_out
     }
 
-    /// The overlay's key row, fitted to `cols` columns.
+    /// The overlay's **chrome** row, fitted to `cols` columns: the key row,
+    /// or the open query line, or the last query's miss.
+    ///
+    /// The query line **replaces** this row rather than costing a second one:
+    /// the overlay has exactly one row of chrome, [`Self::content_rows`]
+    /// already takes exactly one row out of the window, and an invisible
+    /// query line is **F75** at its most basic -- the user cannot see what
+    /// they are about to search for, or that they are in a query at all.
     ///
     /// The fit is [`kitsu_render::fit_row_to_width`]'s, as every other row on
     /// these surfaces is: a footer that wrapped would cost the transcript row
     /// above it on a screen the frame fills.
     pub fn footer(&self, cols: usize) -> String {
-        kitsu_render::fit_row_to_width(Self::FOOTER, cols)
+        let row = match (self.query.as_deref(), self.miss.as_deref()) {
+            (Some(query), _) => format!("/{query}"),
+            (None, Some(miss)) => miss.to_owned(),
+            (None, None) => Self::FOOTER.to_owned(),
+        };
+        kitsu_render::fit_row_to_width(&row, cols)
     }
 }
 
@@ -653,6 +804,725 @@ mod tests {
             frame.first().map(String::as_str),
             Some("done tool"),
             "the stripped form is the `[` dump's, not the overlay's"
+        );
+    }
+
+    // ---- R6-b: `/` search, and the `n`/`N` match walk ----
+    //
+    // These are a **policy** over `FullscreenView::pin_to`, which R6-c built
+    // for this card and deliberately left prompt-unaware. `{`/`}` is the other
+    // policy over the same anchor; there is no second anchor concept here, and
+    // the cannot-move rule below is R6-c's rule obeyed rather than a second
+    // one invented.
+
+    /// **R6-b's fixture**: three occurrences of one needle, spread across both
+    /// speakers and with one of them inside the **second row** of a two-row
+    /// prompt block.
+    ///
+    /// The ordinals, done rather than assumed (**F61**), because every
+    /// assertion below is stated in them:
+    ///
+    /// | ordinal | row | |
+    /// |---|---|---|
+    /// | 0 | `alpha needle` | **prompt**, block 1, and a **match** |
+    /// | 1 | `answer a0` | |
+    /// | 2 | `answer a1 needle` | a **match**, on the session's side |
+    /// | 3 | `beta one` | **prompt**, block 2, not a match |
+    /// | 4 | `beta two needle` | block 2's **second row**, and a **match** |
+    /// | 5 | `answer b0` | |
+    /// | 6 | `answer b1` | |
+    /// | 7 | `gamma` | **prompt**, block 3 |
+    /// | 8 | `answer c0` | |
+    /// | 9 | `answer c1` | |
+    ///
+    /// Ten retained lines, nothing evicted. Every test below uses a **5**-row
+    /// overlay, so `content_rows` is 4, `follow_top` is `10 - 4 = 6`, the
+    /// opening content is ordinals `6..=9` and the jump cursor is 6.
+    fn search_ring() -> CellRing {
+        let mut ring = CellRing::new(100);
+        ring.push_prompt("alpha needle");
+        ring.push(Fd::Stdout, "answer a0");
+        ring.push(Fd::Stdout, "answer a1 needle");
+        ring.push_prompt("beta one\nbeta two needle");
+        ring.push(Fd::Stdout, "answer b0");
+        ring.push(Fd::Stdout, "answer b1");
+        ring.push_prompt("gamma");
+        ring.push(Fd::Stdout, "answer c0");
+        ring.push(Fd::Stdout, "answer c1");
+        ring
+    }
+
+    /// Type `query` into a fresh overlay's query line, one character at a
+    /// time, as the byte loop hands them over.
+    fn typed(overlay: &mut TranscriptOverlay, query: &str) {
+        overlay.begin_search();
+        for ch in query.chars() {
+            overlay.push_search_char(ch);
+        }
+    }
+
+    /// The content rows of a 5-row, 80-column overlay frame, footer dropped.
+    fn content(overlay: &TranscriptOverlay, ring: &CellRing) -> Vec<String> {
+        let mut frame = overlay.frame(ring, 5, 80);
+        frame.pop();
+        frame
+    }
+
+    /// **The fixture is the fixture** (**F99**/**F61**): the ordinals the
+    /// table above claims are asserted once, here, so every search test below
+    /// states a specification rather than describing whatever `search_ring`
+    /// happened to build.
+    #[test]
+    fn the_search_fixture_holds_the_matches_the_search_tests_assume() {
+        let ring = search_ring();
+        assert_eq!((ring.len(), ring.evicted()), (10, 0));
+        assert_eq!(
+            ring.prompt_blocks(),
+            vec![0, 3, 7],
+            "and the two-row prompt is one block starting at 3"
+        );
+        let needles: Vec<usize> = ring
+            .lines()
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.plain().contains("needle"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            needles,
+            vec![0, 2, 4],
+            "three matches: one the user typed, one the session wrote, and \
+             one in the second row of the two-row prompt"
+        );
+        assert!(
+            ring.lines()[0].is_prompt() && !ring.lines()[2].is_prompt(),
+            "so the fixture really spans both speakers"
+        );
+        assert_eq!(
+            content(&TranscriptOverlay::new(), &ring),
+            vec!["answer b1", "gamma", "answer c0", "answer c1"],
+            "so the opening content is ordinals 6..=9 and the cursor is 6"
+        );
+    }
+
+    /// **Test: a submitted query lands on the NEWEST match, and it lands on
+    /// the matching LINE even when that line is inside a prompt block.**
+    ///
+    /// The card's two decisions in one assertion. The newest match is the
+    /// entry point because the overlay itself opens on the newest lines: "find
+    /// this in the transcript" means the most recent occurrence, and a search
+    /// that landed on the oldest would make the user walk the whole history
+    /// back to where they already were.
+    ///
+    /// And `/` is **line**-granular where `{` is **block**-granular, which is
+    /// not an inconsistency but the difference between the two features: `{`
+    /// moves between prompts, so it must not stop inside one, while `/` moves
+    /// to the text the user asked for, which is on ordinal **4** — the second
+    /// row of block 2. A search that reported 3 would be showing the user a
+    /// row their query does not appear in.
+    ///
+    /// Not vacuous: the content rows are pinned **by value**, so a submit that
+    /// moved nowhere, moved to a constant, or moved to the block start fails;
+    /// and the frame is asserted to differ from the opening one, so a submit
+    /// that merely repainted fails too.
+    #[test]
+    fn a_submitted_query_lands_on_the_newest_matching_line_not_on_its_block() {
+        let ring = search_ring();
+        let mut overlay = TranscriptOverlay::new();
+        let opening = content(&overlay, &ring);
+
+        typed(&mut overlay, "needle");
+        assert_eq!(
+            overlay.search_query(),
+            Some("needle"),
+            "the typed characters are the query, in order"
+        );
+        assert!(
+            overlay.submit_search(&ring, 5),
+            "three matches, and the newest can be scrolled to the top, so the \
+             frame moves"
+        );
+        assert_eq!(
+            overlay.match_count(),
+            3,
+            "the submit found every occurrence, not just the one it jumped to"
+        );
+        assert_eq!(
+            overlay.search_query(),
+            None,
+            "the query line closes on submit; the matches outlive it"
+        );
+        assert!(
+            !overlay.is_following(),
+            "a successful search pins, which is transition 12: a search that \
+             left the view following would be scrolled off its own match by \
+             the next appended line"
+        );
+
+        let landed = content(&overlay, &ring);
+        assert_ne!(landed, opening, "the frame actually moved");
+        assert_eq!(
+            landed,
+            vec!["beta two needle", "answer b0", "answer b1", "gamma"],
+            "ordinals 4..=7: the newest match is at the TOP of the frame, and \
+             it is the prompt's second row, not the block start at 3"
+        );
+    }
+
+    /// **Test: a query that matches only the user's own prompt is found.**
+    ///
+    /// The ring retains the user's submitted lines now, so `/` searches both
+    /// speakers — the capability R6-a's version of this card could not have
+    /// offered, when "search the transcript" would have meant half a
+    /// transcript. `alpha` appears on ordinal 0 and nowhere else, and ordinal
+    /// 0 is a prompt, so a search that skipped the user's lines finds nothing
+    /// here and fails on the very first assertion.
+    #[test]
+    fn a_query_matching_only_the_users_own_prompt_is_still_found() {
+        let ring = search_ring();
+        let mut overlay = TranscriptOverlay::new();
+        typed(&mut overlay, "alpha");
+        assert!(
+            overlay.submit_search(&ring, 5),
+            "`alpha` is on the user's own prompt line, and `/` searches both \
+             speakers"
+        );
+        assert_eq!(overlay.match_count(), 1, "exactly the one prompt line");
+        assert_eq!(
+            content(&overlay, &ring),
+            vec!["alpha needle", "answer a0", "answer a1 needle", "beta one"],
+            "ordinals 0..=3, the prompt at the top of the frame"
+        );
+    }
+
+    /// **Test: matching ignores case.**
+    ///
+    /// A transcript is prose, and a case-sensitive default is the **F75**
+    /// shape: the user types what they remember seeing, the key appears to do
+    /// nothing, and nothing on screen explains why. Asserted against the same
+    /// fixture as the lowercase query, so the two must agree on both the
+    /// count and the landing — a search that lowercased the query but not the
+    /// line, or the other way round, fails.
+    #[test]
+    fn a_query_matches_without_regard_to_case() {
+        let ring = search_ring();
+        let mut lower = TranscriptOverlay::new();
+        typed(&mut lower, "needle");
+        assert!(lower.submit_search(&ring, 5));
+
+        let mut upper = TranscriptOverlay::new();
+        typed(&mut upper, "NeEdLe");
+        assert!(
+            upper.submit_search(&ring, 5),
+            "the same three lines match whatever case the user typed"
+        );
+        assert_eq!(upper.match_count(), lower.match_count());
+        assert_eq!(
+            content(&upper, &ring),
+            content(&lower, &ring),
+            "and the mixed-case query lands exactly where the lowercase one did"
+        );
+    }
+
+    /// **Test: a query with no match leaves the overlay exactly as it was, and
+    /// the overlay says so.**
+    ///
+    /// Both halves matter. Leaving the anchor alone is the R6-c rule: a search
+    /// that pinned on a miss would break the follow for nothing. Saying so is
+    /// **F75** — a key that silently does nothing is a defect, and here the
+    /// user has just typed a whole query, so "nothing happened" needs to be on
+    /// the screen rather than inferred from a frame that did not move.
+    ///
+    /// Bidirectional, because both failure modes are live: the frame is pinned
+    /// by value *and* the follow state is asserted, so a miss that scrolled
+    /// fails, and the report is asserted to be visible, so a miss that was
+    /// silent fails.
+    #[test]
+    fn a_query_with_no_match_moves_nothing_and_reports_the_miss_on_screen() {
+        let ring = search_ring();
+        let mut overlay = TranscriptOverlay::new();
+        let opening = overlay.frame(&ring, 5, 80);
+
+        typed(&mut overlay, "haystack");
+        assert!(
+            !overlay.submit_search(&ring, 5),
+            "nothing in the fixture says `haystack`"
+        );
+        assert_eq!(overlay.match_count(), 0);
+        assert!(
+            overlay.is_following(),
+            "a miss does not end the follow: the user would stop receiving \
+             output because of a typo"
+        );
+        assert_eq!(
+            content(&overlay, &ring),
+            vec!["answer b1", "gamma", "answer c0", "answer c1"],
+            "the content rows are byte-identical to the opening frame"
+        );
+
+        let chrome = overlay.frame(&ring, 5, 80).pop().expect("a footer row");
+        assert_ne!(
+            chrome, opening[4],
+            "the chrome row changed, because the miss is reported there: a \
+             frame identical to the opening one is a key that silently did \
+             nothing (**F75**)"
+        );
+        assert!(
+            chrome.to_ascii_lowercase().contains("no match"),
+            "and it says which way it failed; it reads {chrome:?}"
+        );
+    }
+
+    /// **Test: an empty query is not a match for everything.**
+    ///
+    /// `""` is a substring of every line, so the one-line implementation of
+    /// this feature matches all ten of them and jumps — on a key the user
+    /// pressed by accident. An empty submit is therefore a **cancel**: no
+    /// matches, no jump, no pin, and the query line closes.
+    #[test]
+    fn an_empty_query_matches_nothing_rather_than_everything() {
+        let ring = search_ring();
+        let mut overlay = TranscriptOverlay::new();
+        overlay.begin_search();
+        assert_eq!(
+            overlay.search_query(),
+            Some(""),
+            "the query line is open and empty"
+        );
+        assert!(
+            !overlay.submit_search(&ring, 5),
+            "an empty query is a cancel, not a match for every line"
+        );
+        assert_eq!(overlay.match_count(), 0, "and emphatically not ten");
+        assert!(overlay.is_following(), "so nothing pinned");
+        assert_eq!(
+            overlay.search_query(),
+            None,
+            "and the query line closed rather than staying open forever"
+        );
+        assert_eq!(
+            content(&overlay, &ring),
+            vec!["answer b1", "gamma", "answer c0", "answer c1"],
+            "the opening frame, unmoved"
+        );
+    }
+
+    /// **Test: `n` and `N` walk the matches, and NEITHER wraps.**
+    ///
+    /// The card's wrap decision, pinned. `N` walks towards the older matches
+    /// and `n` back towards the newer ones; at the oldest match `N` is inert
+    /// and at the newest `n` is inert, and both report it.
+    ///
+    /// No wrap, for two reasons. `{`/`}` already settled what "nothing in that
+    /// direction" means on this overlay — it does nothing and reports false —
+    /// and a second policy for the same situation on the same surface is this
+    /// epic's oldest failure mode. And a wrap is **F75** in its worst form:
+    /// `n` at the newest match would teleport the frame to the oldest one, the
+    /// user would read it as their place being lost rather than as the end of
+    /// the matches, and nothing would say which had happened.
+    ///
+    /// Not vacuous, and not satisfiable by a stub that always returns false:
+    /// every landing is pinned by value, and the inert presses at the two ends
+    /// are asserted to leave the frame **byte-identical** to the landing
+    /// before them, so a walk that moved on a false return fails too.
+    #[test]
+    fn n_and_shift_n_walk_the_matches_and_neither_one_wraps() {
+        let ring = search_ring();
+        let mut overlay = TranscriptOverlay::new();
+        typed(&mut overlay, "needle");
+        assert!(overlay.submit_search(&ring, 5), "lands on ordinal 4");
+
+        assert!(
+            overlay.repeat_search(Jump::Prev, &ring, 5),
+            "`N` walks to the next older match, ordinal 2"
+        );
+        assert_eq!(
+            content(&overlay, &ring),
+            vec![
+                "answer a1 needle",
+                "beta one",
+                "beta two needle",
+                "answer b0"
+            ],
+            "ordinals 2..=5"
+        );
+
+        assert!(
+            overlay.repeat_search(Jump::Prev, &ring, 5),
+            "`N` again, to the oldest match at ordinal 0"
+        );
+        let oldest = content(&overlay, &ring);
+        assert_eq!(
+            oldest,
+            vec!["alpha needle", "answer a0", "answer a1 needle", "beta one"],
+            "ordinals 0..=3"
+        );
+
+        assert!(
+            !overlay.repeat_search(Jump::Prev, &ring, 5),
+            "and there is no fourth match above: `N` at the oldest match does \
+             NOT wrap round to the newest"
+        );
+        assert_eq!(
+            content(&overlay, &ring),
+            oldest,
+            "the frame is byte-identical, so the inert press really was inert"
+        );
+
+        assert!(
+            overlay.repeat_search(Jump::Next, &ring, 5),
+            "`n` comes back down, to ordinal 2"
+        );
+        assert_eq!(
+            content(&overlay, &ring),
+            vec![
+                "answer a1 needle",
+                "beta one",
+                "beta two needle",
+                "answer b0"
+            ],
+            "the same ordinals 2..=5 the walk up passed through"
+        );
+        assert!(
+            overlay.repeat_search(Jump::Next, &ring, 5),
+            "`n` to the newest match, ordinal 4"
+        );
+        let newest = content(&overlay, &ring);
+        assert!(
+            !overlay.repeat_search(Jump::Next, &ring, 5),
+            "and `n` at the newest match does NOT wrap round to the oldest"
+        );
+        assert_eq!(
+            content(&overlay, &ring),
+            newest,
+            "byte-identical again, in the other direction"
+        );
+    }
+
+    /// **Test: `n` and `N` are inert until a query has been submitted.**
+    ///
+    /// The enumerated case the brief names, and the one a match walk gets
+    /// wrong by indexing an empty list: with no active query there is nothing
+    /// to repeat, so both report false and leave the follow alone. Asserted on
+    /// a ring that **does** contain matchable text, so this is "no query", not
+    /// "no match" wearing its clothes.
+    #[test]
+    fn n_and_shift_n_do_nothing_until_a_query_has_been_submitted() {
+        let ring = search_ring();
+        let mut overlay = TranscriptOverlay::new();
+        assert_eq!(overlay.search_query(), None, "no query line is open");
+        assert_eq!(overlay.match_count(), 0);
+        for dir in [Jump::Next, Jump::Prev] {
+            assert!(
+                !overlay.repeat_search(dir, &ring, 5),
+                "{dir:?} has no query to repeat"
+            );
+            assert!(overlay.is_following(), "so it did not pin either");
+            assert_eq!(
+                content(&overlay, &ring),
+                vec!["answer b1", "gamma", "answer c0", "answer c1"],
+                "and the frame is the opening one"
+            );
+        }
+    }
+
+    /// **Test: a search whose match cannot MOVE the frame obeys R6-c's rule
+    /// rather than inventing a second one.**
+    ///
+    /// The single match is ordinal 9, the newest line, and it is **already on
+    /// screen** — the opening frame is ordinals 6..=9. The ring cannot scroll
+    /// it to the top, so its clamped target is ordinal 6, which is the row the
+    /// frame is already on. R6-c settled what happens then: no transition at
+    /// all, the anchor is left exactly as it was, follow state included, and
+    /// the jump reports false. Pinning there would break the follow while the
+    /// frame did not change — invisible at the keypress and visible later as
+    /// output that silently stopped arriving (**F75**), which is the worse of
+    /// the two cases to get wrong and the one that overruled R6-c's first
+    /// answer.
+    ///
+    /// Non-vacuity is the point of the second half: a match that *can* move
+    /// the frame does, from a pinned start, so "returns false and stays
+    /// following" is not an implementation that never moves at all.
+    #[test]
+    fn a_match_that_cannot_move_the_frame_leaves_the_follow_exactly_as_it_was() {
+        let ring = ring_of(100, 10);
+        let mut overlay = TranscriptOverlay::new();
+        typed(&mut overlay, "line 9");
+        assert_eq!(
+            content(&overlay, &ring),
+            vec!["line 6", "line 7", "line 8", "line 9"],
+            "the match at ordinal 9 is already on screen, at the bottom"
+        );
+        assert!(
+            !overlay.submit_search(&ring, 5),
+            "the one match clamps back onto the cursor, so the frame cannot \
+             move and this is no transition at all"
+        );
+        assert_eq!(
+            overlay.match_count(),
+            1,
+            "the query did match: this is a jump that cannot move, not a miss"
+        );
+        assert!(
+            overlay.is_following(),
+            "and the follow survives, which is R6-c's rule obeyed rather than \
+             a second rule invented for `/`"
+        );
+        assert_eq!(
+            content(&overlay, &ring),
+            vec!["line 6", "line 7", "line 8", "line 9"],
+            "byte-identical"
+        );
+
+        // The other direction, so the rule above is not an implementation
+        // that simply never moves: from the oldest line, a match that IS on
+        // screen and CAN be scrolled to the top moves the frame.
+        let mut pinned = TranscriptOverlay::new();
+        pinned.page(Page::Oldest, &ring, 5);
+        assert_eq!(
+            content(&pinned, &ring),
+            vec!["line 0", "line 1", "line 2", "line 3"],
+            "ordinals 0..=3, and the cursor is 0"
+        );
+        typed(&mut pinned, "line 2");
+        assert!(
+            pinned.submit_search(&ring, 5),
+            "ordinal 2 is on screen and clamps to 2, which is not the cursor"
+        );
+        assert_eq!(
+            content(&pinned, &ring),
+            vec!["line 2", "line 3", "line 4", "line 5"],
+            "so the frame moves and puts the match on the top row"
+        );
+    }
+
+    /// **Test: the matches are a SNAPSHOT taken at submit, so `n` never
+    /// re-scans the ring.**
+    ///
+    /// This is the cost decision made observable instead of timed. A full
+    /// `plain()` pass over a default 10 000-line ring was **measured** at
+    /// ~4 ms in release and ~14 ms in debug, and ~10 ms / ~45 ms once one
+    /// **F52** pasted megabyte is in the ring, because `plain()` allocates a
+    /// fresh `String` per line and `CellRing::lines` clones every line first.
+    /// A search that re-scanned would therefore pay that on every `n`, so the
+    /// scan happens **once per submitted query** and `n`/`N` walk the stored
+    /// ordinals.
+    ///
+    /// The behavioural consequence is what is pinned here, because it is the
+    /// user-visible half of the same decision: a line appended *after* the
+    /// submit does not join the match list, and is picked up by the next `/`
+    /// rather than silently appearing mid-walk. An implementation that
+    /// re-scanned would report four matches here and fail.
+    #[test]
+    fn the_matches_are_a_snapshot_taken_at_submit_so_a_repeat_never_rescans() {
+        let mut ring = search_ring();
+        let mut overlay = TranscriptOverlay::new();
+        typed(&mut overlay, "needle");
+        assert!(overlay.submit_search(&ring, 5));
+        assert_eq!(overlay.match_count(), 3);
+
+        // Ordinal 10 is the appended match; the four fillers behind it are
+        // there so that the next query's newest match can actually be
+        // scrolled to the top (**F58**: without them `follow_top` is 11 and
+        // ordinal 10 clamps onto the cursor, so the assertion below would be
+        // unsatisfiable rather than true).
+        ring.push(Fd::Stdout, "a fourth needle, appended after the submit");
+        for n in 0..4 {
+            ring.push(Fd::Stdout, &format!("later {n}"));
+        }
+        assert_eq!((ring.len(), ring.evicted()), (15, 0));
+        assert_eq!(
+            overlay.match_count(),
+            3,
+            "the match list is the one the submit took: `n` walks stored \
+             ordinals and does not re-scan 10 000 lines per press"
+        );
+        assert!(
+            !overlay.repeat_search(Jump::Next, &ring, 5),
+            "and `n` still stops at the newest match the submit found: the \
+             line appended since is not in the walk"
+        );
+
+        let mut walked = TranscriptOverlay::new();
+        typed(&mut walked, "needle");
+        assert!(
+            walked.submit_search(&ring, 5),
+            "follow_top is 15 - 4 = 11 and the newest match is ordinal 10, so \
+             the frame can move"
+        );
+        assert_eq!(
+            walked.match_count(),
+            4,
+            "and the NEXT `/` does see the appended line, so the snapshot is \
+             per query and not a cache that goes stale forever"
+        );
+        assert_eq!(
+            content(&walked, &ring),
+            vec![
+                "a fourth needle, appended after the submit",
+                "later 0",
+                "later 1",
+                "later 2",
+            ],
+            "ordinals 10..=13, the appended match on the top row"
+        );
+    }
+
+    /// **Test: a stored match the ring has since EVICTED does not invent a
+    /// frame, and does not move one it cannot move.**
+    ///
+    /// The snapshot holds **absolute** ordinals, which is what makes this case
+    /// exist: the ring is a sliding window, so a match can stop existing
+    /// between the submit and the `N`. The ordinal is clamped by `pin_to`'s
+    /// one clamp — `top`'s — so the frame stays inside the ring, and the
+    /// cannot-move rule then applies exactly as it does to any other jump.
+    ///
+    /// The fixture, done rather than assumed: a 6-line ring with matches on
+    /// ordinals 0 and 1, then four more lines pushed, so ordinals 0..=3 are
+    /// evicted and the oldest retained line is 4.
+    #[test]
+    fn a_match_the_ring_has_evicted_clamps_instead_of_inventing_a_frame() {
+        let mut ring = CellRing::new(6);
+        ring.push(Fd::Stdout, "oldest needle");
+        ring.push(Fd::Stdout, "second needle");
+        for n in 0..4 {
+            ring.push(Fd::Stdout, &format!("filler {n}"));
+        }
+        let mut overlay = TranscriptOverlay::new();
+        typed(&mut overlay, "needle");
+        assert!(
+            overlay.submit_search(&ring, 5),
+            "six lines, content_rows 4, so follow_top is 2 and ordinal 1 \
+             clamps to 1: the frame moves"
+        );
+        assert_eq!(
+            content(&overlay, &ring),
+            vec!["second needle", "filler 0", "filler 1", "filler 2"],
+            "ordinals 1..=4"
+        );
+
+        for n in 4..8 {
+            ring.push(Fd::Stdout, &format!("filler {n}"));
+        }
+        assert_eq!(
+            (ring.len(), ring.evicted()),
+            (6, 4),
+            "both matched lines are gone from the process now"
+        );
+        assert_eq!(
+            content(&overlay, &ring),
+            vec!["filler 2", "filler 3", "filler 4", "filler 5"],
+            "the pinned frame clamped back into the ring, which is \
+             transition 11 and not this card's arithmetic"
+        );
+        assert!(
+            !overlay.repeat_search(Jump::Prev, &ring, 5),
+            "`N` onto an evicted ordinal clamps onto the cursor, so it cannot \
+             move the frame and does nothing at all"
+        );
+        assert_eq!(
+            content(&overlay, &ring),
+            vec!["filler 2", "filler 3", "filler 4", "filler 5"],
+            "byte-identical: no second clamp, no invented frame"
+        );
+    }
+
+    /// **Test: the query line is PAINTED, in the overlay's one chrome row.**
+    ///
+    /// Typing into an invisible query line is **F75** at its most basic: the
+    /// user cannot see what they are about to search for, or that they are in
+    /// a query at all. The overlay has exactly one row of chrome and
+    /// `content_rows` takes exactly one row out of the window, so the query
+    /// line replaces the footer rather than costing a second transcript row —
+    /// the footer's own reason for coming out of the window in the first
+    /// place.
+    ///
+    /// Not vacuous: the content rows are asserted unchanged across the whole
+    /// sequence, so a query line that stole a transcript row fails, and the
+    /// chrome row is pinned by value at three points, so a query line that
+    /// painted a constant fails.
+    #[test]
+    fn the_query_line_is_painted_in_the_footers_row_and_costs_no_transcript_row() {
+        let ring = search_ring();
+        let mut overlay = TranscriptOverlay::new();
+        let opening = overlay.frame(&ring, 5, 80);
+        assert_eq!(opening.len(), 5);
+
+        overlay.begin_search();
+        let open = overlay.frame(&ring, 5, 80);
+        assert_eq!(open.len(), 5, "still exactly the window, footer included");
+        assert_eq!(
+            &open[..4],
+            &opening[..4],
+            "and the transcript rows are untouched: `/` scrolls nothing"
+        );
+        assert_eq!(
+            open[4], "/",
+            "the empty query line is the prompt character alone, so the user \
+             can see they are in a query"
+        );
+
+        typed(&mut overlay, "needle");
+        let typing = overlay.frame(&ring, 5, 80);
+        assert_eq!(
+            typing[4], "/needle",
+            "and it shows what they have typed so far"
+        );
+        assert_eq!(
+            &typing[..4],
+            &opening[..4],
+            "still nothing scrolled: the search runs on submit, not on every \
+             keystroke"
+        );
+
+        overlay.cancel_search();
+        assert_eq!(
+            overlay.frame(&ring, 5, 80),
+            opening,
+            "and a cancelled query gives the footer row back, byte-identical \
+             to the frame before the `/`"
+        );
+    }
+
+    /// **Test: the query line's own editing keys.**
+    ///
+    /// Three enumerated cases that are each a silent dead end if missed.
+    /// Backspace, because a query line a typo cannot be corrected in is a
+    /// query line the user has to abandon; backspace on an **empty** query,
+    /// because deleting past the start must not close the query line or the
+    /// overlay; and `q`, because `q` closes this overlay and must be ordinary
+    /// text while a query is open — otherwise the word `query` cannot be
+    /// searched for, and the overlay vanishes mid-typing.
+    #[test]
+    fn the_query_line_takes_backspace_and_treats_the_close_keys_letter_as_text() {
+        let mut overlay = TranscriptOverlay::new();
+        typed(&mut overlay, "quer");
+        assert_eq!(
+            overlay.search_query(),
+            Some("quer"),
+            "`q` is text here, not the close key"
+        );
+        overlay.push_search_char('t');
+        overlay.backspace_search();
+        assert_eq!(
+            overlay.search_query(),
+            Some("quer"),
+            "backspace deletes the last character, and only the last one"
+        );
+        for _ in 0..4 {
+            overlay.backspace_search();
+        }
+        assert_eq!(
+            overlay.search_query(),
+            Some(""),
+            "down to empty, and the query line is still open"
+        );
+        overlay.backspace_search();
+        assert_eq!(
+            overlay.search_query(),
+            Some(""),
+            "backspace on an empty query is inert: it does not close the \
+             query line behind the user's back"
         );
     }
 }

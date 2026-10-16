@@ -370,6 +370,18 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   from the dump -- and R6-d is not carded until which one is decided.** R6-b needs
   no gate: searching in-process memory exposes nothing the overlay does not already
   paint.
+
+  **R6 is COMPLETE except R6-d.** R6-a (overlay, scroll, close), R6-prompts (the
+  feed, which resolved F102), R6-c (`{`/`}`) and R6-b (`/`, `n`/`N`) have shipped.
+  **R6-b measured two things the requirement had assumed away.** First, cost: a
+  full pass over a 10 000-line ring allocates a string per line and takes
+  **4.1 ms release / 13.7 ms debug** (9.8/45.4 with one 1 MB pasted cell), so
+  **search runs on submit, not per keystroke** — a per-keystroke search would blow
+  N2's 100 ms budget on a short query. Second, `plain()` is **exactly the glyphs of
+  the painted row**, so *searched is painted*; the only divergence is **width**,
+  because `fit_row_to_width` cuts at `cols` and a match past the right edge still
+  counts — width-dependent matches would mean one query finding different things
+  in two window sizes.
 - **R7** Approval prompts in TUI modes MUST render as a bottom-pane modal
   with the same `[y] allow once · [a] always (<dir>) · [n] deny` option line
   (command approvals keep their provenance rows) and the same `◉ permission —`

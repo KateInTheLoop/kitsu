@@ -5024,3 +5024,43 @@ So the literal string `/jobs prune` never appears, and a literal match on it is 
 **Refined:** grep the **bare subcommand word**, then read the row. Had I acted on the check's first answer I would have added a **duplicate row** for a documented command — which is worse than the gap it was hunting, because two rows for one command is drift that a reader cannot resolve.
 
 **Both of the mechanical checks I have built have now produced a false hit on an early run** — F101's reference sweep on a compound row name, and this one on a bracketed enumeration. Neither is a reason to drop them: each has also found a real defect (two dangling references; a wholly undocumented overlay). The rule they share is the one that matters: **the sweep nominates, the human adjudicates.** Every one of these must stay a command whose output is read, never a gate, and never a thing to act on without opening the file.
+
+## F115 — R6-b shipped; and markdown emphasis defeats my own sweep
+
+**R6-b is done.** `/` searches the overlay, `n`/`N` walk the matches. **R6 is now complete except R6-d, which stays gated.**
+
+### The measurement that chose the design, and why it is pinned behaviourally
+
+A full `plain()` pass over a 10 000-line ring: **4.1 ms release / 13.7 ms debug**, and **9.8 ms / 45.4 ms** with one 1 MB pasted cell (**F52**'s input). Scanning `styled()` without the stripper is **195 µs** — so the cost is **essentially all allocation**. A 20-character query typed at speed is ~0.9 s of scanning in debug; three pasted characters alone would blow **N2**'s 100 ms budget.
+
+**So search runs on submit.** `Enter` scans once and stores absolute ordinals; `n`/`N` are `cursor ± 1`, zero allocations. Pinned **behaviourally, not by timing** — a line appended after the submit must not join the walk — so there is no flaky timing test and **nothing was added to `paste_latency`**, because no latency claim is being made: the per-keystroke cost was removed instead.
+
+### My F113 worry was wrong, in the useful direction
+
+`plain()` is **exactly the glyphs of the painted row** — the only thing `sanitize_terminal_text` removes is what the terminal does not display. So searching it matches what the user sees **better** than searching the styled bytes would, and `ascii_structural_markers` staying unapplied is **correct**: it is a `--plain` tier transform, and applying it would make a character the user can see fail to match itself.
+
+**The real divergence is width, not styling.** `fit_row_to_width` cuts at `cols`, so text past the right edge is searched but off-screen. **A match there still counts**, deliberately: width-dependent matches would mean one query finding different things in two window sizes. And an unexpected find — **`push` does not split on newlines**, so a line kitsu writes can hold an embedded `\n` in one cell, where `push_prompt` splits. Both are now in the docs.
+
+### The paste fix, and the first draft that was rejected for the right reason
+
+`b"/find me\nq"` **closed the overlay** and searched nothing. The signal was already on the wire and being discarded: the alternate-screen route writes `ESC[?2004h`, and the loop **swallowed `ESC[200~`/`ESC[201~` whole** in its generic sequence arm. Fixed on the markers, so a newline inside a paste is **content**.
+
+**The rejected first draft matters more than the fix:** *discard the rest of the chunk after any newline* resolves the ambiguity from a **chunk boundary**, which this loop's own header calls wrong (**F65**), and would eat a `q` typed fast enough to share a read with the `Enter`. The test is bidirectional on exactly that — **outside** a paste, `b"/find me\rq"` must still close — and the implementer's mutation D2 proved the two rules are distinguishable.
+
+**Residue, left open deliberately:** a bare LF with **no** markers — an unbracketed paste, or the inline route, which never writes `?2004h`. That is **F72** proper.
+
+### The footer trade, measured
+
+`Ctrl+Home/End` **lost its `oldest/newest` gloss**. With it the row is 91 columns and **at 80 the fit cuts `q/Esc close` clean off the end**; without it the row is 77 and keeps the exit key with three columns spare. Verified both. **Losing the key that leaves the surface is worse than an unglossed key pair.**
+
+It does weaken something I required on T5-S1c-iii — that naming those keys without saying they move the *frame* advertises an ambiguity. Mitigated rather than ignored: inside the overlay the query line supports only character-insert and backspace, so **those keys have no competing caret meaning there**, and `/tui`'s details still carry the full explanation.
+
+### And my own sweep has a third quirk: markdown
+
+**F110**'s sweep greps for `not wired`. The docs now read:
+
+> Dumping the overlay to scrollback and opening it in `$EDITOR` are `**not** wired yet`
+
+**The literal pattern finds zero; a markdown-tolerant `not\*{0,2} wired` finds it.** The emphasis I add for readers defeats the search I rely on — and this sentence is one that *must* be found when R6-d finally ships.
+
+**Fixed in the sweep's pattern.** And this is the third false reading from my two mechanical checks (a compound row name, a bracketed enumeration, now markdown emphasis). The ratio is still worth it — between them they found a wholly undocumented overlay, two dangling references and three stale claims — but it confirms the rule: **these nominate, a human adjudicates, and a clean sweep is not evidence of a clean document.**

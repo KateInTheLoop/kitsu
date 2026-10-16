@@ -6670,10 +6670,26 @@ fn run_transcript_key_loop<R: std::io::Read>(
     more_input_waiting: &mut dyn FnMut() -> bool,
     paint: &mut dyn FnMut(&[String]),
 ) -> TranscriptExit {
+    // The bracketed-paste markers the alternate-screen route turns on with
+    // `ESC[?2004h`. They were already being consumed whole by the generic
+    // sequence arm below -- the arm runs to the first `0x40..=0x7e` byte and
+    // `~` is `0x7e` -- so the signal was on the wire and thrown away. R6-a's
+    // lesson is what it is used for here: a sequence, or a newline, **inside**
+    // a paste is content and not a keypress.
+    const PASTE_BEGIN: &[u8] = b"\x1b[200~";
+    const PASTE_END: &[u8] = b"\x1b[201~";
+
     let mut buffer = [0u8; 256];
     // A sequence split across reads is still one keystroke (**F65**), so the
     // tail of a chunk that ran out mid-sequence waits for the rest of itself.
     let mut held: Vec<u8> = Vec::new();
+    // Whether the bytes being decoded are inside a bracketed paste, and
+    // whether the query line has already taken its one line from it: a query
+    // line is one line, so the paste's first newline ends the query and the
+    // remainder of the **paste** -- not of the chunk, which would be the
+    // boundary rule **F65** calls wrong -- is discarded.
+    let mut pasting = false;
+    let mut paste_spent = false;
     loop {
         let (rows, cols) = geometry();
         paint(&overlay.frame(ring, rows, cols));
@@ -6684,6 +6700,16 @@ fn run_transcript_key_loop<R: std::io::Read>(
             let lone_escape = held == [0x1b];
             held.clear();
             if lone_escape {
+                // R6-b: `Esc` out of an open query line is the way out of the
+                // query, and leaves the overlay the user is still reading up.
+                // Closing here would put the surface one press away from
+                // vanishing on anyone who changed their mind mid-query. The
+                // grace is still the one mechanism (**F65**); only what the
+                // resolved `Esc` means depends on the mode.
+                if overlay.search_query().is_some() {
+                    overlay.cancel_search();
+                    continue;
+                }
                 return TranscriptExit::Closed;
             }
             // An incomplete sequence whose rest never came: dropped, never
@@ -6704,20 +6730,55 @@ fn run_transcript_key_loop<R: std::io::Read>(
         let mut index = 0usize;
         while index < data.len() {
             let rest = &data[index..];
-            // The four paging sequences first, and through the bridge's own
-            // table: a second copy is how two surfaces come to disagree about
-            // which bytes `Ctrl+End` is.
-            if let Some((press, length)) = tui_bridge::page_key(rest) {
-                overlay.page(press, ring, rows);
-                index += length;
+            // The paste markers first, and before the paging table: inside a
+            // paste every other sequence is content, so the markers are the
+            // one pair of sequences that still mean something there.
+            if rest.starts_with(PASTE_BEGIN) {
+                pasting = true;
+                paste_spent = false;
+                index += PASTE_BEGIN.len();
                 continue;
             }
-            if tui_bridge::partial_page_key(rest) {
-                held = rest.to_vec();
-                break;
+            if rest.starts_with(PASTE_END) {
+                pasting = false;
+                paste_spent = false;
+                index += PASTE_END.len();
+                continue;
+            }
+            // The remainder of a paste whose first newline has already closed
+            // the query line: discarded byte by byte, so nothing behind that
+            // newline is dispatched as a key.
+            if pasting && paste_spent {
+                index += 1;
+                continue;
+            }
+            if !pasting {
+                // The four paging sequences, through the bridge's own table:
+                // a second copy is how two surfaces come to disagree about
+                // which bytes `Ctrl+End` is.
+                if let Some((press, length)) = tui_bridge::page_key(rest) {
+                    overlay.page(press, ring, rows);
+                    index += length;
+                    continue;
+                }
+                if tui_bridge::partial_page_key(rest) {
+                    held = rest.to_vec();
+                    break;
+                }
             }
             let byte = data[index];
             index += 1;
+            // A newline inside a paste is query **content**, not a submit and
+            // not a keypress: it ends the one line the query line holds, and
+            // everything behind it in the paste goes above. Measured before
+            // this existed: `b"/find me\nq"` ended `Closed`, with the `0x0a`
+            // dropped as a control byte and the `q` behind it dispatched as
+            // the close key -- a multi-line paste taking the overlay away from
+            // under the user and searching nothing.
+            if pasting && matches!(byte, 0x0a | 0x0d) {
+                paste_spent = overlay.search_query().is_some();
+                continue;
+            }
             if byte == 0x1b {
                 // An `ESC` with bytes behind it that start some *other*
                 // sequence is that sequence and not a close: its bytes are
@@ -6738,6 +6799,32 @@ fn run_transcript_key_loop<R: std::io::Read>(
                     held = vec![0x1b];
                     break;
                 }
+            }
+            // R6-b: while the query line is open it is a **mode**, and the
+            // surface's own keys are text. `q` especially: without this the
+            // word `query` cannot be searched for and the overlay vanishes
+            // mid-typing. The scan is the submit's and only the submit's,
+            // which is why nothing here touches the ring.
+            //
+            // Outside a paste a bare `0x0a` is read as a submit, exactly as
+            // `0x0d` is: with no paste markers this loop cannot tell a pasted
+            // newline from a pressed `Enter` at all, which is **F72** proper
+            // and stays open -- the inline route never writes `?2004h`.
+            if overlay.search_query().is_some() {
+                match byte {
+                    0x0d | 0x0a => {
+                        overlay.submit_search(ring, rows);
+                    }
+                    0x7f | 0x08 => overlay.backspace_search(),
+                    0x1b => overlay.cancel_search(),
+                    byte if (0x20..=0x7e).contains(&byte) => {
+                        overlay.push_search_char(byte as char);
+                    }
+                    // Every other control byte is inert, as it is outside a
+                    // query: the query line holds what the user can see.
+                    _ => {}
+                }
+                continue;
             }
             let press = match byte {
                 0x1b => kitsu_tui::keys::Press::Esc,
@@ -6763,6 +6850,29 @@ fn run_transcript_key_loop<R: std::io::Read>(
             if let Some(jump) = jump {
                 overlay.jump(jump, ring, rows);
                 continue;
+            }
+            // R6-b: `/` opens the query line, and `n`/`N` walk the matches
+            // the last submitted query found -- `n` newer, `N` older, through
+            // R6-c's own `Jump` and not a second direction concept. All three
+            // bytes already fell inside the printable arm above, so before
+            // this they became a `Press::Char` that `closes` declined and the
+            // loop read again: inert keys the footer was about to advertise,
+            // which is **F75**. The repaint is the loop's own, at the top of
+            // the next pass, exactly as a paging press is repainted.
+            match press {
+                kitsu_tui::keys::Press::Char('/') => {
+                    overlay.begin_search();
+                    continue;
+                }
+                kitsu_tui::keys::Press::Char('n') => {
+                    overlay.repeat_search(kitsu_tui::fullscreen::Jump::Next, ring, rows);
+                    continue;
+                }
+                kitsu_tui::keys::Press::Char('N') => {
+                    overlay.repeat_search(kitsu_tui::fullscreen::Jump::Prev, ring, rows);
+                    continue;
+                }
+                _ => {}
             }
             if kitsu_tui::transcript::closes(press) {
                 return TranscriptExit::Closed;
@@ -25092,6 +25202,331 @@ mod tests {
             )
         };
         (exit, overlay.is_following(), frames)
+    }
+
+    // ---- R6-b: `/` search and the `n`/`N` match walk, in the byte loop ----
+    //
+    // Driven through `run_transcript_key_loop` and not through a predicate
+    // beside it (**F69**/**F105**): `kitsu_tui::transcript`'s own tests prove
+    // the overlay's search policy answers a submitted query, and prove nothing
+    // about whether any byte ever reaches it. `/`, `n` and `N` all already
+    // fall inside this loop's `0x20..=0x7e` printable arm, so their behaviour
+    // today was **measured before anything was asserted** (**F99**/**F100**):
+    // each becomes a `Press::Char`, `closes` declines it, the loop reads
+    // again, and the painted frames are **byte-identical** either side of the
+    // byte -- inert keys, exactly as `{`/`}` were on the previous card.
+
+    /// Run the real key loop over `chunks` on a ring that holds **matchable
+    /// text on both speakers**, for R6-b's `/`, and return the same triple
+    /// `drive_transcript` does.
+    ///
+    /// A third helper rather than a change to either existing one, for the
+    /// reason the second was added: those fixtures are about the close bytes,
+    /// the paging bytes and the prompt jumps, and their rings have no match in
+    /// them -- which is the "nothing to search for" case they should keep
+    /// exercising.
+    ///
+    /// The fixture and its arithmetic (**F61**), since the assertions below
+    /// are stated in ordinals:
+    ///
+    /// | ordinal | row | |
+    /// |---|---|---|
+    /// | 0 | `find me first` | **prompt**, and a **match** |
+    /// | 1 | `answer one` | |
+    /// | 2 | `find me second` | a **match**, on the session's side |
+    /// | 3..=8 | `answer two` .. `answer seven` | |
+    ///
+    /// Nine retained lines, nothing evicted; the geometry is 6 rows, so
+    /// `content_rows` is 5, `follow_top` is `9 - 5 = 4`, the opening content
+    /// is ordinals `4..=8` and the cursor is 4.
+    #[cfg(unix)]
+    fn drive_transcript_with_matches(chunks: &[&[u8]]) -> (TranscriptExit, bool, Vec<Vec<String>>) {
+        use kitsu_render::surface::Fd;
+
+        let mut ring = kitsu_tui::cells::CellRing::new(16);
+        ring.push_prompt("find me first");
+        ring.push(Fd::Stdout, "answer one");
+        ring.push(Fd::Stdout, "find me second");
+        for name in ["two", "three", "four", "five", "six", "seven"] {
+            ring.push(Fd::Stdout, &format!("answer {name}"));
+        }
+        assert_eq!((ring.len(), ring.evicted()), (9, 0));
+        let matches: Vec<usize> = ring
+            .lines()
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.plain().contains("find me"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            matches,
+            vec![0, 2],
+            "the fixture really holds two matches, one of them the user's own \
+             prompt"
+        );
+
+        let mut overlay = kitsu_tui::transcript::TranscriptOverlay::new();
+        let mut input = ChunkReader::new(chunks);
+        let remaining = std::rc::Rc::clone(&input.remaining);
+        let mut frames: Vec<Vec<String>> = Vec::new();
+        let exit = {
+            let mut geometry = || (6u16, 40usize);
+            let mut waiting = || remaining.get() > 0;
+            let mut paint = |frame: &[String]| frames.push(frame.to_vec());
+            run_transcript_key_loop(
+                &mut input,
+                &mut overlay,
+                &ring,
+                &mut geometry,
+                &mut waiting,
+                &mut paint,
+            )
+        };
+        (exit, overlay.is_following(), frames)
+    }
+
+    /// The opening content rows of `drive_transcript_with_matches`'s fixture,
+    /// ordinals 4..=8, stated once so every assertion below that means "the
+    /// frame did not move" is stated against the same five rows.
+    #[cfg(unix)]
+    const OPENING: [&str; 5] = [
+        "answer three",
+        "answer four",
+        "answer five",
+        "answer six",
+        "answer seven",
+    ];
+
+    /// **Test (R6-b): the `/` byte opens the overlay's query line, the typed
+    /// bytes become the query, and `Enter` runs the search.**
+    ///
+    /// The whole keystroke path in one pass, through the real decoder. `0x2f`,
+    /// the printable bytes behind it, `0x7f` and `0x0d` must each reach the
+    /// overlay; today every one of them is inert -- the printable bytes become
+    /// `Press::Char`s that `closes` declines, and `0x7f` and `0x0d` are
+    /// control bytes that the loop's `_ => continue` arm drops -- so the frame
+    /// is repainted unchanged, the view is still following and the loop ends
+    /// `Drained`. A key the footer will advertise and nothing dispatches is
+    /// **F75**.
+    ///
+    /// `0x7f` is in the payload deliberately: a query line a typo cannot be
+    /// corrected in is one the user has to abandon, and the byte is dropped by
+    /// the same arm.
+    ///
+    /// Not vacuous, and specifically not satisfiable by a loop that merely
+    /// repainted: the painted content rows are pinned **by value** on both
+    /// sides, so the opening frame pins what was painted before the bytes and
+    /// the landing pins where they took the frame.
+    #[cfg(unix)]
+    #[test]
+    fn the_slash_byte_opens_the_query_line_and_enter_runs_the_search() {
+        // `Z` then `0x7f`: the backspace byte has to reach the query line too,
+        // or the query submitted below is `find mZe` and matches nothing.
+        let (exit, following, frames) = drive_transcript_with_matches(&[b"/find mZ\x7fe\r"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "`/` searches; it is not a close key"
+        );
+        assert!(
+            !following,
+            "and the submitted search pinned the overlay, which is \
+             transition 12: a search that left the view following did nothing"
+        );
+        assert_eq!(frames.len(), 2, "painted before the bytes and after them");
+        assert_eq!(
+            &frames[0][..5],
+            OPENING,
+            "the opening frame, ordinals 4..=8"
+        );
+        assert_eq!(
+            &frames[1][..5],
+            [
+                "find me second",
+                "answer two",
+                "answer three",
+                "answer four",
+                "answer five",
+            ],
+            "ordinals 2..=6: the newest match is on the top row, so `/`, the \
+             query bytes, the backspace and the `Enter` all arrived"
+        );
+    }
+
+    /// **Test (R6-b): the `n` and `N` bytes walk the matches through the real
+    /// decoder, and neither wraps.**
+    ///
+    /// One chunk per keystroke, so each landing is its own painted frame
+    /// rather than only the final state. Bidirectional, because `N` walking
+    /// while `n` did nothing is a live failure mode, and the two inert presses
+    /// at the ends are asserted to leave the frame **byte-identical** --
+    /// which is also the no-wrap decision, reached through the bytes.
+    #[cfg(unix)]
+    #[test]
+    fn the_n_and_shift_n_bytes_walk_the_search_matches_without_wrapping() {
+        let (exit, following, frames) =
+            drive_transcript_with_matches(&[b"/find me\r", b"N", b"N", b"n", b"n"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "none of these is a close key"
+        );
+        assert!(!following, "the walk leaves the overlay pinned");
+        assert_eq!(
+            frames.len(),
+            6,
+            "the opening frame, one per keystroke, and the frame the drained \
+             read was painted against"
+        );
+
+        let oldest = [
+            "find me first",
+            "answer one",
+            "find me second",
+            "answer two",
+            "answer three",
+        ];
+        let newest = [
+            "find me second",
+            "answer two",
+            "answer three",
+            "answer four",
+            "answer five",
+        ];
+        assert_eq!(&frames[0][..5], OPENING, "ordinals 4..=8");
+        assert_eq!(&frames[1][..5], newest, "the submit lands on ordinal 2");
+        assert_eq!(&frames[2][..5], oldest, "`N` walks to ordinal 0");
+        assert_eq!(
+            &frames[3][..5],
+            oldest,
+            "`N` again does NOT wrap round to the newest match: there is no \
+             third match above, so the frame is byte-identical"
+        );
+        assert_eq!(&frames[4][..5], newest, "`n` comes back to ordinal 2");
+        assert_eq!(
+            &frames[5][..5],
+            newest,
+            "`n` again does NOT wrap round to the oldest match either"
+        );
+    }
+
+    /// **Test (R6-b): a NEWLINE inside a bracketed paste is query CONTENT,
+    /// not a submit and not a keypress.**
+    ///
+    /// **F72**'s shape, measured on this surface rather than assumed from the
+    /// agent view: the overlay has its own byte loop, so what a pasted newline
+    /// does here is this loop's answer. **Measured today**: `0x0a` is a
+    /// control byte this loop drops and the `q` behind it is read as the close
+    /// key, so `b"/find me\nq"` ends `Closed` -- the overlay gone, nothing
+    /// searched, and the bytes of a paste dispatched as commands.
+    ///
+    /// The signal needed to fix that is already on the wire and already being
+    /// thrown away: the alternate-screen route writes `ESC[?2004h`, so a paste
+    /// arrives wrapped in `ESC[200~` / `ESC[201~`, and this loop swallows both
+    /// markers whole in its generic sequence arm. R6-a's lesson is the rule --
+    /// a sequence inside a paste is **content**, not a keypress -- so between
+    /// the two markers a newline neither submits nor closes anything. A query
+    /// line is one line, so the pasted text up to its first newline is the
+    /// query and the remainder of the paste is **discarded**; the `Enter` that
+    /// runs it is the one the user then presses, outside the paste.
+    ///
+    /// Bidirectional, and the second half is what keeps the first from being a
+    /// rule about chunk boundaries -- which this loop's own header calls wrong
+    /// (**F65**): **outside** a paste the bytes after an `Enter` are still
+    /// keys, so a `q` typed straight after submitting really does close the
+    /// overlay. Discarding it would lose a keystroke to how the reads happened
+    /// to split.
+    #[cfg(unix)]
+    #[test]
+    fn a_newline_inside_a_bracketed_paste_is_query_text_and_closes_nothing() {
+        let (exit, following, frames) =
+            drive_transcript_with_matches(&[b"/\x1b[200~find me\nq\x1b[201~\r"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "the `q` is pasted CONTENT: a multi-line paste must not take the \
+             overlay away from under the user"
+        );
+        assert!(
+            !following,
+            "and the trailing `Enter`, which is outside the paste, ran the \
+             search"
+        );
+        assert_eq!(
+            &frames[frames.len() - 1][..5],
+            [
+                "find me second",
+                "answer two",
+                "answer three",
+                "answer four",
+                "answer five",
+            ],
+            "ordinals 2..=6: the query is the pasted text up to its newline, \
+             and everything after that newline was discarded rather than \
+             dispatched"
+        );
+
+        // The other half: outside a paste, an `Enter` submits and the bytes
+        // behind it are still keys. This is what makes the rule above a rule
+        // about the paste markers and not about where a read happened to end.
+        let (exit, following, _) = drive_transcript_with_matches(&[b"/find me\rq"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Closed,
+            "a `q` typed straight after submitting is the close key, and must \
+             not be lost to the chunk it shared with the `Enter`"
+        );
+        assert!(!following, "and the search still ran before the close");
+    }
+
+    /// **Test (R6-b): while the query line is open, `q` is text and `Esc`
+    /// cancels the query rather than closing the overlay.**
+    ///
+    /// Two enumerated cases that are each a disappearing surface if missed.
+    /// `q` closes this overlay, so unless it is ordinary text while a query is
+    /// open the word `query` cannot be searched for and the overlay vanishes
+    /// mid-typing. And `Esc` has to be the way out of a query line -- the only
+    /// other way out would be submitting one the user no longer wants -- so it
+    /// cancels the query **and leaves the overlay up**, which is one press
+    /// away from the surface closing under them.
+    ///
+    /// The `Esc` half is driven as its own chunk on purpose: a lone `0x1b`
+    /// with nothing queued behind it is exactly the ambiguous case this loop
+    /// resolves with the grace (**F65**), so this also pins that cancelling a
+    /// query does not go through a second `Esc` mechanism.
+    ///
+    /// Not vacuous: the frame is pinned by value, so a `q` that was swallowed
+    /// into a query *and* scrolled something fails, and the follow state is
+    /// asserted, so a cancel that pinned on its way out fails.
+    #[cfg(unix)]
+    #[test]
+    fn the_close_keys_are_query_text_and_an_escape_while_a_query_is_open() {
+        let (exit, following, frames) = drive_transcript_with_matches(&[b"/query"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "`q` inside an open query line is a character, not the close key"
+        );
+        assert!(following, "and nothing was submitted, so nothing pinned");
+        assert_eq!(
+            &frames[frames.len() - 1][..5],
+            OPENING,
+            "the transcript rows are untouched: typing a query scrolls nothing"
+        );
+
+        let (exit, following, frames) = drive_transcript_with_matches(&[b"/find me", b"\x1b"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "`Esc` cancels the query line; it does not also close the overlay \
+             the user is still reading"
+        );
+        assert!(following, "and the cancel did not pin on its way out");
+        assert_eq!(
+            &frames[frames.len() - 1][..5],
+            OPENING,
+            "the frame is the opening one, byte-identical"
+        );
     }
 
     /// **Test (R6-c): the byte `{` reaches the overlay's prompt jump, and
