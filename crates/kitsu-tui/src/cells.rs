@@ -34,6 +34,7 @@ use kitsu_render::surface::Fd;
 pub struct CellLine {
     fd: Fd,
     styled: String,
+    prompt: bool,
 }
 
 impl CellLine {
@@ -45,6 +46,19 @@ impl CellLine {
     /// The line's bytes exactly as the surface received them.
     pub fn styled(&self) -> &str {
         &self.styled
+    }
+
+    /// Whether this line is the **user's own submitted prompt** rather than
+    /// something the session wrote onto the transcript.
+    ///
+    /// The mark is set by [`CellRing::push_prompt`] and by nothing else, so
+    /// it is true for exactly the lines the composer's own feed handed over.
+    /// Deliberately **not** derived from [`Self::fd`]: a prompt files on
+    /// `Stdout` with the conversation, which `Stderr` is tools and
+    /// diagnostics, and a rule inferred from the sink selector would mark
+    /// every assistant row as well (**F70**).
+    pub fn is_prompt(&self) -> bool {
+        self.prompt
     }
 
     /// The line with terminal control sequences removed, for the `[` dump.
@@ -101,7 +115,20 @@ impl CellRing {
     }
 
     /// Append one line on `fd`, evicting the oldest if the ring is full.
+    ///
+    /// Never marked the user's prompt: this is the session's own feed, and
+    /// [`Self::push_prompt`] is the only door the mark comes through.
     pub fn push(&mut self, fd: Fd, text: &str) {
+        self.push_marked(fd, text, false);
+    }
+
+    /// Append one line on `fd`, carrying `prompt` onto the stored cell.
+    ///
+    /// The one place a [`CellLine`] is built, which is why adding the mark was
+    /// a one-site change: the fields are private and there is no public
+    /// constructor, so no caller outside this module can make an unmarked
+    /// line claim to be a prompt or the reverse.
+    fn push_marked(&mut self, fd: Fd, text: &str, prompt: bool) {
         // Evict first, so the retained count never exceeds the bound even
         // momentarily, and `while` rather than `if` so a ring somehow holding
         // more than its bound converges instead of staying over it forever.
@@ -120,7 +147,45 @@ impl CellRing {
             // stripped later (see `CellLine::plain`) but never reconstructed,
             // and N4 makes this the only copy.
             styled: text.to_string(),
+            prompt,
         });
+    }
+
+    /// Re-append an already retained line, mark included.
+    ///
+    /// For the frame rebuild (`tui_bridge::frame_ring`), which both ring
+    /// readers -- the fullscreen frame and the `Ctrl+O` overlay -- go through:
+    /// rebuilding from `(fd, styled)` alone silently drops the mark and the
+    /// overlay shows one speaker however faithfully the feed stored it
+    /// (**F79**). It takes a `CellLine` rather than a `(fd, text, bool)`
+    /// triple on purpose, so the only way to obtain the mark is to have been
+    /// handed a line that already carries it.
+    pub fn push_retained(&mut self, line: &CellLine) {
+        self.push_marked(line.fd, &line.styled, line.prompt);
+    }
+
+    /// Append the user's own submitted prompt, **one marked cell per line**.
+    ///
+    /// `fd` is [`Fd::Stdout`] deliberately: `Fd` is a sink selector, so the
+    /// question is which stream a prompt would be written on if it ever were,
+    /// and the answer makes the filter semantics come out right -- `Stdout` is
+    /// *the conversation*, the assistant's text and the user's lines together,
+    /// and `Stderr` is *tools and meta*.
+    ///
+    /// The split is [`str::lines`], exactly as `write_block` already splits
+    /// the bytes a block writes, because both `FullscreenView::frame` and
+    /// `TranscriptOverlay::frame` fit **one row per cell**: a cell holding an
+    /// embedded newline is painted as a single row that cannot fit. Every
+    /// resulting cell is marked, not only the first, so the overlay can style
+    /// a whole block as the user's and R6-c can coalesce it into one jump
+    /// target instead of stopping inside it.
+    ///
+    /// Separate from [`Self::push`] so the existing feed keeps its signature
+    /// and its four call sites.
+    pub fn push_prompt(&mut self, text: &str) {
+        for line in text.lines() {
+            self.push_marked(Fd::Stdout, line, true);
+        }
     }
 
     /// The retained lines, oldest first.
@@ -282,5 +347,149 @@ mod tests {
         assert_eq!(ring.len(), 1);
         assert_eq!(plain_texts(&ring), vec!["c"]);
         assert_eq!(ring.evicted(), 2);
+    }
+
+    /// The retained lines as `(is a prompt, stripped text)`, which is the pair
+    /// the three tests below compare: a mark with no text beside it would pass
+    /// for a ring that marked an entry it never stored.
+    fn marked_texts(ring: &CellRing) -> Vec<(bool, String)> {
+        ring.lines()
+            .iter()
+            .map(|line| (line.is_prompt(), line.plain()))
+            .collect()
+    }
+
+    /// **The user's submitted prompt is retained, and retained *as* a prompt**
+    /// (**F102**). The ring is **N4**'s sole source for the `Ctrl+O` overlay,
+    /// so a ring that cannot tell the user's line from the session's is a
+    /// transcript with one speaker, and `{`/`}` has nothing to jump between.
+    ///
+    /// The text is asserted beside the mark on purpose: a `push_prompt` that
+    /// marked an entry without storing the line, or stored it without the
+    /// mark, fails here rather than half-passing.
+    #[test]
+    fn the_ring_retains_the_users_submitted_prompt_as_a_prompt() {
+        let mut ring = CellRing::new(8);
+        ring.push_prompt("explain the ring");
+
+        assert_eq!(
+            marked_texts(&ring),
+            vec![(true, "explain the ring".to_string())],
+            "the submitted line is in the ring and is marked the user's"
+        );
+    }
+
+    /// **And nothing the session wrote is marked the user's** -- the opposite
+    /// failure, which is the one a role marker invites: a feed that marked
+    /// every line, or a reader that inferred the mark from
+    /// [`CellLine::fd`], would make every row a prompt boundary and `{`/`}`
+    /// would stop on each of them.
+    ///
+    /// Both descriptors are swept because `Stderr` is the tempting one to
+    /// mistake for the user: it carries tools, results and diagnostics, and a
+    /// rule is only as wide as the narrowest input path feeding it (**F70**).
+    #[test]
+    fn the_ring_marks_no_line_the_session_wrote_as_a_prompt() {
+        let mut ring = CellRing::new(8);
+        ring.push(Fd::Stdout, "assistant text");
+        ring.push(Fd::Stderr, "* tool ran");
+
+        assert_eq!(
+            marked_texts(&ring),
+            vec![
+                (false, "assistant text".to_string()),
+                (false, "* tool ran".to_string()),
+            ],
+            "only the composer's own feed may mark a line the user's"
+        );
+    }
+
+    /// **A prompt keeps its place among the lines it provoked.** The overlay
+    /// repaints the ring in order and `{`/`}` walks it, so a prompt stored out
+    /// of order -- appended last, or hoisted ahead of the previous turn --
+    /// would put the user's line beside the wrong answer.
+    ///
+    /// Interleaved rather than grouped: the marks and the texts are compared
+    /// as one sequence, so a ring that kept the texts in order while losing
+    /// which of them were prompts fails, and so does the reverse.
+    #[test]
+    fn the_ring_keeps_prompts_in_place_among_the_lines_they_provoked() {
+        let mut ring = CellRing::new(8);
+        ring.push_prompt("first question");
+        ring.push(Fd::Stdout, "first answer");
+        ring.push(Fd::Stderr, "* tool ran");
+        ring.push_prompt("second question");
+        ring.push(Fd::Stdout, "second answer");
+
+        assert_eq!(
+            marked_texts(&ring),
+            vec![
+                (true, "first question".to_string()),
+                (false, "first answer".to_string()),
+                (false, "* tool ran".to_string()),
+                (true, "second question".to_string()),
+                (false, "second answer".to_string()),
+            ],
+            "the ring's order is the order of arrival, prompts included"
+        );
+    }
+
+    /// **A prompt files with the conversation, not with the tools.**
+    ///
+    /// [`Fd`] is a **sink selector**, not a label, so the choice is which
+    /// stream a prompt would be written on if it ever were: the main output,
+    /// never the diagnostic one. That makes the filter semantics come out
+    /// right -- a reader taking `Stdout` gets *the conversation*, the
+    /// assistant's text and the user's lines together, and a reader taking
+    /// `Stderr` gets *tools and meta*.
+    ///
+    /// Deliberately **one** assertion. The grouping is cheap to get wrong and
+    /// expensive to notice, and an undocumented choice drifts into a reader
+    /// filing the user's words with tool output; everything else about a
+    /// prompt is pinned by the tests above, not here.
+    #[test]
+    fn a_prompt_files_with_the_conversation_and_not_with_the_tools() {
+        let mut ring = CellRing::new(4);
+        ring.push_prompt("explain the ring");
+
+        assert_eq!(
+            ring.lines()[0].fd(),
+            Fd::Stdout,
+            "a prompt belongs on the conversation's stream, not the \
+             diagnostic one"
+        );
+    }
+
+    /// **A multi-line prompt is one cell per line, and every one of them is
+    /// marked.**
+    ///
+    /// One line per cell is load-bearing: both `FullscreenView::frame` and
+    /// `TranscriptOverlay::frame` fit **one row per cell**, so a cell holding
+    /// an embedded newline is painted as a single row that cannot fit and the
+    /// frame is garbled. The split is `write_block`'s, which already does
+    /// exactly this to the bytes a block writes.
+    ///
+    /// Every cell is marked, not only the first: that is what lets the overlay
+    /// style a whole block as the user's, and what lets R6-c coalesce adjacent
+    /// prompt rows into one jump target instead of stopping inside a block.
+    ///
+    /// The count is asserted beside the marks so a split that produced the
+    /// right marks over the wrong number of cells fails here.
+    #[test]
+    fn a_multi_line_prompt_is_one_marked_cell_per_line() {
+        let mut ring = CellRing::new(8);
+        ring.push_prompt("first line\nsecond line\nthird line");
+
+        assert_eq!(ring.len(), 3, "one cell per line, as `write_block` splits");
+        assert_eq!(
+            marked_texts(&ring),
+            vec![
+                (true, "first line".to_string()),
+                (true, "second line".to_string()),
+                (true, "third line".to_string()),
+            ],
+            "every row of the block is the user's, so the overlay can style \
+             the block and R6-c can coalesce it"
+        );
     }
 }

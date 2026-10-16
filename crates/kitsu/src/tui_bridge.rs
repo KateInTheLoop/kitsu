@@ -359,6 +359,20 @@ impl Surface for FullscreenTap {
     fn queue(&self, rows: &[String]) {
         self.inner.queue(rows);
     }
+
+    /// **Recorded, never forwarded** -- the one method on this tap that does
+    /// not reach the displaced surface.
+    ///
+    /// The tap's ring is the *only* ring while a fullscreen segment holds the
+    /// screen (`install` is inert in that mode, so there is no inline surface
+    /// behind it), so the prompt must land here or the overlay shows one
+    /// speaker in fullscreen and two inline -- a key that quietly does nothing
+    /// on one surface (**F84**/**F89**). Forwarding would hand the prompt to
+    /// the displaced inline surface's ring, which no reader can see from here,
+    /// and nothing is written either way: `note_prompt` emits no bytes.
+    fn note_prompt(&self, text: &str) {
+        lock(&self.ring).push_prompt(text);
+    }
 }
 
 /// A writer that copies what it forwards, for [`FullscreenTap::write_block`].
@@ -714,6 +728,60 @@ pub(crate) fn enter_fullscreen(
     }
 }
 
+/// Whose words a submitted line is.
+///
+/// A transcript is a document, and a document is worth what its claims are
+/// worth (**F77**): `/resume` and `/retry` are **kitsu's** words, injected by
+/// `run_chat` as `priority_command`, and marking them the user's would be a
+/// false claim inside the one record the overlay reads. The distinction is a
+/// parameter rather than a guess at the text because it is not recoverable
+/// from the line -- the user can type `/retry` themselves, and that one *is*
+/// theirs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PromptOrigin {
+    /// The user typed it: at the idle prompt, during a turn (queued), or at an
+    /// attached agent.
+    User,
+    /// Kitsu synthesized it. Never marked the user's.
+    Injected,
+}
+
+/// Hand the **installed** surface the user's own submitted prompt, so a
+/// backend that keeps cells can retain it (**F102**, requirement **N4**).
+///
+/// # Why this is the one feed point
+///
+/// The three idle readers -- the inline composer, the fullscreen composer and
+/// rustyline (plus the assistive line reader) -- all return through
+/// `ChatReadline`, and a queued prompt and a priority command join the same
+/// `line` binding in `run_chat`. One call *there*, after the empty-line skip
+/// and beside `add_history_entry`, is reached by every route a submitted line
+/// can take, and by nothing else: `run_scripted_turn` and the one-shot `-p`
+/// route build a `SubmittedPrompt` without a terminal and have no ring.
+///
+/// # Ordering is structural, not hoped for
+///
+/// The call sits on the single-threaded path between the read and whatever the
+/// line provokes -- a slash command's report, a turn's streamed output -- so
+/// the prompt is in the ring before the first byte of its answer can be
+/// written. It is not sequenced against the stream; it precedes it.
+///
+/// Writes no bytes: see [`Surface::note_prompt`].
+pub(crate) fn note_submitted_prompt(text: &str, origin: PromptOrigin) {
+    match origin {
+        PromptOrigin::User => kitsu_render::surface::active_surface().note_prompt(text),
+        // Not handed over at all, which is the strongest reading of "never
+        // marked the user's": there is no byte-free seam for retaining an
+        // unmarked line, and inventing one to file kitsu's own synthesized
+        // command beside its output would be a second decision this card did
+        // not make (**F61**). The command's *output* is retained as it always
+        // was, through `transcript_line`. The exclusion has one home -- here --
+        // rather than being folded into the call sites, so there is one place
+        // to change if the ring should one day carry injected lines unmarked.
+        PromptOrigin::Injected => {}
+    }
+}
+
 /// The rows of one fullscreen frame over `lines`, oldest line first.
 ///
 /// The ring is rebuilt over the caller's copy because the ring the seed lines
@@ -733,7 +801,11 @@ fn fullscreen_frame(lines: &[kitsu_tui::cells::CellLine], rows: u16, cols: usize
 pub(crate) fn frame_ring(lines: &[kitsu_tui::cells::CellLine]) -> kitsu_tui::cells::CellRing {
     let mut ring = kitsu_tui::cells::CellRing::new(lines.len().max(1));
     for line in lines {
-        ring.push(line.fd(), line.styled());
+        // `push_retained`, never `push(fd, styled)`: this rebuild is the
+        // chokepoint *both* ring readers go through -- the fullscreen frame
+        // and the `Ctrl+O` overlay -- so a prompt mark dropped here is lost to
+        // every reader however faithfully the feed stored it (**F79**).
+        ring.push_retained(line);
     }
     ring
 }
@@ -2960,6 +3032,9 @@ mod tests {
     // `kitsu_tui::fullscreen`'s and are pinned there.
     use super::enter_fullscreen;
     use kitsu_tui::fullscreen::Page;
+    // Card R6-c's prerequisite (**F102**): the prompt feed, the rebuild both
+    // ring readers go through, and the second surface that keeps cells.
+    use super::{frame_ring, note_submitted_prompt, FullscreenTap, PromptOrigin};
 
     /// A sink whose buffer outlives the surface that owns it, so bytes written
     /// through a `Box<dyn Write + Send>` stay observable after the surface is
@@ -3982,6 +4057,346 @@ mod tests {
             submitted(&outcome),
             "xy",
             "and the paste's own characters still land in the draft"
+        );
+    }
+
+    /// The ring's retained lines as `(is a prompt, stripped text)`, which is
+    /// the pair the prompt-feed tests below compare: a mark with no text
+    /// beside it would pass for a feed that marked an entry it never stored.
+    fn marked(guard: &BridgeGuard) -> Vec<(bool, String)> {
+        guard
+            .cell_lines()
+            .expect("installing the inline viewport in production feeds a cell ring")
+            .iter()
+            .map(|line| (line.is_prompt(), line.plain()))
+            .collect()
+    }
+
+    /// A surface that only records what it is handed, for the tap test below:
+    /// the tap's job is to *see* bytes, so its inner surface must be one whose
+    /// writes are observable without a terminal.
+    #[derive(Clone, Default)]
+    struct SurfaceSpy(Arc<Mutex<Vec<(Fd, String)>>>);
+
+    impl SurfaceSpy {
+        fn written(&self) -> Vec<(Fd, String)> {
+            self.0.lock().expect("spy").clone()
+        }
+    }
+
+    impl Surface for SurfaceSpy {
+        fn transcript_line(&self, fd: Fd, text: &str) {
+            self.0.lock().expect("spy").push((fd, text.to_string()));
+        }
+    }
+
+    /// **Test: a submitted prompt reaches the installed surface's cell ring**
+    /// (**F102**). The storage half can work while nothing feeds it, so this
+    /// pins the *feed*: the ring is **N4**'s sole source for the `Ctrl+O`
+    /// overlay, and a prompt that never arrives there is a transcript with one
+    /// speaker no matter what `CellLine` can represent.
+    ///
+    /// Driven through `note_submitted_prompt` -- the function `run_chat` calls
+    /// at the one point every route a submitted line can take converges -- and
+    /// not through a hand-built surface, because the property is that the
+    /// *installed* surface answers it (**F69**: drive the real path, not a
+    /// predicate beside it).
+    ///
+    /// Not vacuous: a transcript line is written through the same seam first,
+    /// so the ring is being read after traffic it could have missed, and the
+    /// retained list is compared by value, so a ring that exists and retains
+    /// no prompt fails.
+    #[test]
+    #[serial]
+    fn a_submitted_prompt_reaches_the_installed_surfaces_cell_ring() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        through_the_seam(&[(Fd::Stderr, "* session ready")]);
+        note_submitted_prompt("explain the ring", PromptOrigin::User);
+
+        assert_eq!(
+            marked(&guard),
+            vec![
+                (false, "* session ready".to_string()),
+                (true, "explain the ring".to_string()),
+            ],
+            "the installed surface retains the user's line, marked the user's"
+        );
+    }
+
+    /// **Test: and it lands there before the answer it provoked.** The overlay
+    /// repaints the ring in order, so a prompt appended after the turn it
+    /// started would sit beside the wrong answer -- and the answer streams in
+    /// while nothing else is being read, which is precisely why the order must
+    /// be pinned rather than assumed.
+    ///
+    /// The pin is structural: `note_submitted_prompt` is called on the
+    /// single-threaded path between the read and the turn, so this asserts
+    /// that the prompt *precedes* the stream, not that it races it well.
+    #[test]
+    #[serial]
+    fn a_submitted_prompt_lands_in_the_ring_before_the_answer_it_provoked() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        note_submitted_prompt("what is N4?", PromptOrigin::User);
+        // The turn's own output, through the seam the whole transcript takes.
+        through_the_seam(&[
+            (Fd::Stderr, "* thinking"),
+            (Fd::Stdout, "N4 bounds the ring."),
+        ]);
+
+        assert_eq!(
+            marked(&guard),
+            vec![
+                (true, "what is N4?".to_string()),
+                (false, "* thinking".to_string()),
+                (false, "N4 bounds the ring.".to_string()),
+            ],
+            "the prompt is in the ring ahead of the first byte of its answer"
+        );
+    }
+
+    /// **Test: and noting it writes no bytes on either descriptor** -- the
+    /// opposite failure, and the expensive one. The composer erases the
+    /// submitted row, so feeding the prompt as a `transcript_line` would put a
+    /// line on the terminal that the inline renderer's contract says is not
+    /// there (**R3**: one write per transcript line) and change the byte stream
+    /// of every session, which is the shape **F92** was rejected for.
+    ///
+    /// **F71**: asserted on the painted bytes, both sinks, not on a flag.
+    #[test]
+    #[serial]
+    fn noting_a_submitted_prompt_writes_no_bytes_on_either_descriptor() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let _guard = guard.expect("inline mode installs a guard");
+        let out_before = out.bytes();
+        let err_before = err.bytes();
+
+        note_submitted_prompt("paste-looking secret: hunter2", PromptOrigin::User);
+
+        assert_eq!(
+            out.bytes(),
+            out_before,
+            "the prompt is recorded, never written: stdout is untouched"
+        );
+        assert_eq!(
+            err.bytes(),
+            err_before,
+            "and so is stderr, where the viewport's own bytes go"
+        );
+    }
+
+    /// **Test: a slash command is retained as the user's prompt.** A
+    /// transcript showing `/compact`'s report with no visible `/compact` is
+    /// the same half-feature this card exists to fix, and the command is
+    /// already kept in `history`. The feed must therefore **not** grow a
+    /// `starts_with('/')` exclusion -- which is the tempting one, and the one
+    /// this test forbids.
+    ///
+    /// The slash-dispatch arm in `run_chat` is downstream of the feed, so
+    /// retaining it costs nothing and changes no dispatch.
+    #[test]
+    #[serial]
+    fn a_slash_command_is_retained_as_the_users_own_prompt() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        note_submitted_prompt("/compact", PromptOrigin::User);
+        through_the_seam(&[(Fd::Stderr, "* compacted 12 messages")]);
+
+        assert_eq!(
+            marked(&guard),
+            vec![
+                (true, "/compact".to_string()),
+                (false, "* compacted 12 messages".to_string()),
+            ],
+            "the command the user typed is theirs, and sits above its report"
+        );
+    }
+
+    /// **Test: an injected priority command is never marked the user\'s.**
+    ///
+    /// `run_chat` synthesizes `/resume <id>` after a fork and `/retry` on its
+    /// own, and both join the same `line` binding a typed line does. Marking
+    /// them would put a false claim inside the one record the overlay reads,
+    /// and a transcript is a document: **F77**. That `add_history_entry` has
+    /// carried the same quirk for longer is not a licence to carry it onto a
+    /// new surface -- inherited is not justified.
+    ///
+    /// Asserted as "**no** retained line is the user\'s", which is true under
+    /// either reading of the exclusion -- the injected command left out of the
+    /// ring entirely, or retained unmarked beside its output. The decision was
+    /// "do not mark", so that is exactly what this pins and nothing more
+    /// (**F61**).
+    #[test]
+    #[serial]
+    fn an_injected_priority_command_is_never_marked_the_users_prompt() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        // Both of `run_chat`'s injections, and `/retry` is deliberately one a
+        // user could also type: the provenance is the parameter's, never the
+        // text's.
+        note_submitted_prompt("/resume 7f3a", PromptOrigin::Injected);
+        note_submitted_prompt("/retry", PromptOrigin::Injected);
+        through_the_seam(&[(Fd::Stderr, "* retrying the last turn")]);
+
+        let marks = marked(&guard);
+        assert!(
+            marks.iter().all(|(is_prompt, _)| !is_prompt),
+            "kitsu's own words are never the user's in the transcript: {marks:?}"
+        );
+    }
+
+    /// **Test: a prompt the user broke across lines with `Alt+Enter` is one
+    /// marked cell per line** -- driven from the **bytes**, through the real
+    /// decoder and the real feed, not from a string a test wrote (**F69**).
+    ///
+    /// `ESC CR` is `Alt+Enter`, which the editor inserts as a literal newline
+    /// (`kitsu-editor` lib.rs:336) rather than submitting; the trailing `CR`
+    /// submits. Measured before asserting (**F99/F100**): the reader returns
+    /// `"first line\nsecond line"` for these bytes today.
+    #[test]
+    #[serial]
+    fn an_alt_enter_prompt_reaches_the_ring_as_one_marked_cell_per_line() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        let outcome = read_bytes(b"first line\x1b\rsecond line\r").0;
+        assert_eq!(
+            submitted(&outcome),
+            "first line\nsecond line",
+            "precondition: Alt+Enter drafted one line with an embedded newline"
+        );
+        note_submitted_prompt(submitted(&outcome), PromptOrigin::User);
+
+        assert_eq!(
+            marked(&guard),
+            vec![
+                (true, "first line".to_string()),
+                (true, "second line".to_string()),
+            ],
+            "one cell per line, every one the user's: a cell with an embedded \
+             newline is painted as one row the frame cannot fit"
+        );
+    }
+
+    /// **Test: and so is a prompt pasted with newlines in it** -- the other
+    /// input path, because a rule is only as wide as the narrowest input that
+    /// feeds it (**F70**).
+    ///
+    /// Inside `ESC[200~` ... `ESC[201~` the payload is *text*, so its newlines
+    /// insert instead of submitting, and the editor collapses `CR LF` into one
+    /// newline (`kitsu-editor` lib.rs:126). Measured before asserting
+    /// (**F99/F100**): this paste and its `LF`-only twin both draft
+    /// `"first line\nsecond line"`, so the `\r` cannot reach a cell and no
+    /// assertion here depends on one.
+    #[test]
+    #[serial]
+    fn a_pasted_multi_line_prompt_reaches_the_ring_as_one_marked_cell_per_line() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        let outcome = read_bytes(b"\x1b[200~first line\r\nsecond line\x1b[201~\r").0;
+        assert_eq!(
+            submitted(&outcome),
+            "first line\nsecond line",
+            "precondition: the paste drafted one line with an embedded newline"
+        );
+        note_submitted_prompt(submitted(&outcome), PromptOrigin::User);
+
+        assert_eq!(
+            marked(&guard),
+            vec![
+                (true, "first line".to_string()),
+                (true, "second line".to_string()),
+            ],
+            "a pasted block is split and marked exactly as an Alt+Enter one is"
+        );
+    }
+
+    /// **Test: the frame's ring keeps the prompt marks of the lines it
+    /// repacks.** `frame_ring` is the chokepoint *both* readers go through --
+    /// the fullscreen frame and the `Ctrl+O` overlay -- and it rebuilds the
+    /// ring from `(fd, styled)` alone, so a mark stored faithfully by the feed
+    /// is dropped here and the overlay sees one speaker anyway.
+    ///
+    /// This is the half that a correct feed does not fix. It is asserted on
+    /// the repacked ring's own lines, which is what a reader is handed.
+    #[test]
+    fn frame_ring_keeps_the_prompt_marks_of_the_lines_it_repacks() {
+        let mut source = kitsu_tui::cells::CellRing::new(8);
+        source.push_prompt("explain the ring");
+        source.push(Fd::Stdout, "the ring is bounded");
+        source.push_prompt("by what?");
+
+        let repacked = frame_ring(&source.lines());
+
+        assert_eq!(
+            repacked
+                .lines()
+                .iter()
+                .map(|line| (line.is_prompt(), line.plain()))
+                .collect::<Vec<_>>(),
+            vec![
+                (true, "explain the ring".to_string()),
+                (false, "the ring is bounded".to_string()),
+                (true, "by what?".to_string()),
+            ],
+            "the frame and the overlay both read through this rebuild: a mark \
+             lost here is lost to every reader"
+        );
+    }
+
+    /// **Test: the fullscreen tap records a submitted prompt too, and
+    /// forwards no bytes for it.** The tap's ring is the *only* ring while a
+    /// fullscreen segment holds the screen -- `install` is inert in that mode,
+    /// so there is no inline surface behind it -- which makes this a second
+    /// surface the feed must reach, and `Surface::note_prompt`'s default is to
+    /// do nothing. An overlay that shows prompts inline and not in fullscreen
+    /// is **F89**/**F84** in the direction that bites: the key works on one
+    /// surface and quietly does nothing on the other.
+    ///
+    /// The displaced surface is asserted untouched as well, because the tap's
+    /// every other method forwards, and forwarding this one would write the
+    /// prompt onto the alternate screen the composer just cleared it from.
+    #[test]
+    fn the_fullscreen_tap_records_a_submitted_prompt_without_forwarding_bytes() {
+        let spy = SurfaceSpy::default();
+        let tap = FullscreenTap {
+            inner: Arc::new(spy.clone()),
+            ring: std::sync::Mutex::new(kitsu_tui::cells::CellRing::new(8)),
+        };
+
+        tap.transcript_line(Fd::Stdout, "a streamed row");
+        tap.note_prompt("what did that do?");
+
+        assert_eq!(
+            tap.lines()
+                .iter()
+                .map(|line| (line.is_prompt(), line.plain()))
+                .collect::<Vec<_>>(),
+            vec![
+                (false, "a streamed row".to_string()),
+                (true, "what did that do?".to_string()),
+            ],
+            "the tap's ring is the only ring in fullscreen, so the prompt must \
+             reach it"
+        );
+        assert_eq!(
+            spy.written(),
+            vec![(Fd::Stdout, "a streamed row".to_string())],
+            "and the prompt is recorded, not forwarded: the composer already \
+             cleared it from the screen"
         );
     }
 

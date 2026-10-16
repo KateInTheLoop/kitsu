@@ -6457,6 +6457,8 @@ fn read_chat_line_inline(
         // refused line is back in the composer on the next read.
         if let Ok(tui_bridge::InlineRead::Submitted(line)) = &outcome {
             if let Some(id) = attached_route_target(line, *attached) {
+                // The feed is inside `route_attached_submission`, which is the
+                // one place that knows whether the line was delivered.
                 carried = route_attached_submission(registry, id, line).draft;
                 continue;
             }
@@ -9108,6 +9110,22 @@ fn route_attached_submission(
             Err(error) => (error.to_string(), AttachedRoute::Refused, false),
         }
     };
+    // **F102**, the second feed point: this route `continue`s before the line
+    // can become a `ChatReadline::Line`, so the foreground feed at the `line`
+    // binding never sees it, and without this call `{`/`}` would skip
+    // everything typed during an attachment -- a key that quietly does nothing
+    // on one route (**F84**/**F75**). It lives here rather than at the caller
+    // because `delivered` is this function's own answer.
+    //
+    // **Before** the receipt below, for the reason the foreground feed sits
+    // before the turn: a prompt must be in the ring ahead of what it provoked.
+    //
+    // Nothing is fed on a refusal. `draft` hands the line back as the next
+    // read's draft (**F76**), so a refused line was never submitted -- it is
+    // still being edited, and a transcript must not claim it was said.
+    if delivered {
+        tui_bridge::note_submitted_prompt(line, tui_bridge::PromptOrigin::User);
+    }
     // Through the renderer's surface, where the eye already is (**F71**).
     kitsu_render::surface::active_surface()
         .transcript_line(kitsu_render::surface::Fd::Stderr, &line_painted);
@@ -21001,6 +21019,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             prompt.clone()
         };
         let prioritized = priority_command.take();
+        // **F77**, carried to the feed below: a priority command is kitsu's
+        // own words (`/resume` after a fork, `/retry`), and the ring is the
+        // transcript the overlay reads. Captured here because `prioritized` is
+        // consumed by the `match` that builds `line`, so by the feed point the
+        // provenance is no longer recoverable -- and it is not recoverable from
+        // the text either, since the user can type `/retry` themselves.
+        let line_is_injected = prioritized.is_some();
         let queued_line = if prioritized.is_none() {
             prompt_queue.lock().expect("prompt queue").dequeue()
         } else {
@@ -21110,6 +21135,25 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         if !no_session {
             let _ = rl.add_history_entry(&line);
         }
+        // **F102**: the composer paints the submitted line and erases it, so
+        // the cell ring -- N4's sole record of the transcript -- holds no
+        // prompts and the `Ctrl+O` overlay shows one speaker. This is the one
+        // place every route a submitted line can take converges: the three
+        // idle readers through `ChatReadline`, a queued prompt and a priority
+        // command through the `line` binding above. It is after the empty-line
+        // skip and beside `add_history_entry` deliberately -- what is worth
+        // remembering in history is what is worth retaining in the ring -- and
+        // before the slash dispatch and the turn, so a prompt is in the ring
+        // ahead of anything it provokes. It writes no bytes.
+        #[cfg(unix)]
+        tui_bridge::note_submitted_prompt(
+            &line,
+            if line_is_injected {
+                tui_bridge::PromptOrigin::Injected
+            } else {
+                tui_bridge::PromptOrigin::User
+            },
+        );
         let mut submitted = SubmittedPrompt::full(line);
 
         if let Some(rest) = submitted.text.strip_prefix('/') {
@@ -36876,6 +36920,153 @@ mod tests {
                  the surface -- not a second wording of it ({spelling:?})"
             );
         }
+    }
+
+    /// A ringed surface over the slot, put back on drop, with its retained
+    /// cells readable: the production `InlineSurface::with_cell_ring`, not a
+    /// double, because the claim is about what the surface the session
+    /// installs retains (**F69**).
+    ///
+    /// `SurfaceProbe` cannot serve here -- `PaintedLines` keeps no cells -- and
+    /// the sinks are swallowed because these tests assert on the ring, while
+    /// the byte stream is pinned in `tui_bridge`.
+    #[cfg(unix)]
+    struct RingProbe {
+        previous: Option<std::sync::Arc<dyn kitsu_render::surface::Surface>>,
+        surface: std::sync::Arc<kitsu_tui::viewport::InlineSurface>,
+    }
+
+    #[cfg(unix)]
+    impl RingProbe {
+        fn install() -> Self {
+            let surface = std::sync::Arc::new(kitsu_tui::viewport::InlineSurface::with_cell_ring(
+                Box::new(std::io::sink()),
+                Box::new(std::io::sink()),
+                16,
+            ));
+            let previous = kitsu_render::surface::set_surface(surface.clone());
+            Self {
+                previous: Some(previous),
+                surface,
+            }
+        }
+
+        /// The retained cells as `(is a prompt, stripped text)`.
+        fn marked(&self) -> Vec<(bool, String)> {
+            self.surface
+                .cells()
+                .expect("a surface built with a cell ring retains cells")
+                .iter()
+                .map(|line| (line.is_prompt(), line.plain()))
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RingProbe {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                kitsu_render::surface::set_surface(previous);
+            }
+        }
+    }
+
+    /// **Test: a line typed at an attached agent is retained as the user's
+    /// prompt** (**F102**, the second feed point).
+    ///
+    /// This route `continue`s before the line can become a
+    /// `ChatReadline::Line` -- the comment at its call site says so -- so the
+    /// foreground feed never sees it, and leaving it out would ship a key that
+    /// works at the idle prompt and quietly does nothing during an attachment
+    /// (**F84**/**F75**).
+    ///
+    /// Driven through `route_attached_submission`, the real route, over a real
+    /// `InlineSurface` with a real ring: nothing here mirrors the decision the
+    /// production path makes.
+    ///
+    /// **Ordering is asserted, not assumed:** the answer's receipt is painted
+    /// by this same function, so the prompt must precede it in the ring
+    /// exactly as the foreground feed precedes a turn. The `Steered` route is
+    /// the same `delivered` branch and is not re-swept here.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn a_line_typed_at_an_attached_agent_is_retained_as_the_users_prompt() {
+        let (registry, id, answer) = registry_with_one_blocked_agent().await;
+        let probe = RingProbe::install();
+
+        let submit = route_attached_submission(&registry, id, "y");
+
+        assert_eq!(
+            submit.draft, "",
+            "precondition: the line was delivered, not refused"
+        );
+        let marks = probe.marked();
+        assert_eq!(
+            marks
+                .first()
+                .map(|(is_prompt, text)| (*is_prompt, text.as_str())),
+            Some((true, "y")),
+            "the user's line is the first thing in the ring, ahead of the \
+             receipt it provoked: {marks:?}"
+        );
+        assert_eq!(
+            marks.len(),
+            2,
+            "and the receipt is the only other cell: {marks:?}"
+        );
+        assert!(
+            !marks[1].0,
+            "the receipt is the session's own words, not the user's: {marks:?}"
+        );
+        drop(probe);
+        // The receiver is dropped, never awaited: on a refusal the gate's
+        // oneshot is never resolved, so awaiting it would hang this test
+        // forever -- which it did, measured, before this line said so.
+        drop(answer);
+    }
+
+    /// **Test: and a refused one is not** -- the opposite failure, and the one
+    /// that would put a line in the transcript the user is still editing.
+    ///
+    /// On every refusal `AttachedSubmit::draft` hands the line back as the
+    /// next read's draft (**F76**), so it was never submitted. A transcript
+    /// claiming it was said is a false claim in the one record the overlay
+    /// reads (**F77**), and `{`/`}` would stop on a line that never ran.
+    ///
+    /// The fixture is the settled race: a correction typed while the agent
+    /// blocks is not an answer and cannot be steered, so nothing is sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn a_refused_attached_submission_is_not_retained_as_a_prompt() {
+        const CORRECTION: &str = "no, use the byte offsets from the lexer";
+        assert!(
+            parse_permission_answer(CORRECTION).is_none(),
+            "premise: the one parser does not read a correction as an answer"
+        );
+        let (registry, id, answer) = registry_with_one_blocked_agent().await;
+        let probe = RingProbe::install();
+
+        let submit = route_attached_submission(&registry, id, CORRECTION);
+
+        assert_eq!(
+            submit.route,
+            AttachedRoute::Refused,
+            "precondition: nothing was sent"
+        );
+        assert_eq!(
+            submit.draft, CORRECTION,
+            "precondition: the line is back in the composer (F76)"
+        );
+        let marks = probe.marked();
+        assert!(
+            marks.iter().all(|(is_prompt, _)| !is_prompt),
+            "a line still being edited was never said: {marks:?}"
+        );
+        drop(probe);
+        // Never awaited: nothing was sent, so this oneshot is never resolved.
+        drop(answer);
     }
 
     /// **The race, settled: a correction typed while the agent blocks.**

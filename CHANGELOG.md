@@ -48,10 +48,17 @@ shapes may change in any minor release.
   the screen; `Ctrl+O` itself is listed by `/help tui`, with the composer's
   other chords.
 
-  **It shows what the ring holds, which is not everything you saw.** The ring
-  records the streamed conversation, so kitsu's own diagnostics, an answer
-  buffered because tools were offered that round, and -- as of this release --
-  **your own prompts** are absent from it. `/export` remains the route to the
+  **The overlay shows both speakers.** The ring now retains the lines you submit,
+  marked as yours and split one cell per line, so a multi-line or pasted prompt
+  keeps its shape. Slash commands are retained too -- a report with no visible
+  command is half a transcript -- while commands kitsu injects on your behalf
+  (`/resume`, `/retry`) are **not** marked as yours, because they are not. A line
+  refused at an attached agent is not retained either: it was handed back to the
+  composer and never said.
+
+  **It still shows less than you saw.** The ring records the streamed
+  conversation, so kitsu's own diagnostics and an answer buffered because tools
+  were offered that round are absent from it. `/export` remains the route to the
   full conversation.
 #### Background agents that can ask
 
