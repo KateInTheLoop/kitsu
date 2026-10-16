@@ -39,6 +39,16 @@ shapes may change in any minor release.
   reason.
 
 ### Added
+- **A new `agent_wait(id, until, timeout_secs)` tool**, so a model can block on a
+  background agent instead of polling. `until` is `done` -- finished, failed or
+  cancelled -- or `blocked`, meaning parked on an approval answer. A state that
+  already holds, or that has become unreachable, returns **immediately** rather
+  than holding the turn open. The timeout defaults to 60 seconds, caps at 30
+  minutes, and **expiring is a normal result, not an error** -- the model is told
+  what it did not reach and what the agent is doing now. It starts no agent, so it
+  never consumes the per-turn spawn budget; a zero `--agent-spawn-cap` unregisters
+  it along with the other multi-agent tools, since there would be no agent to wait
+  on.
 - **`/` searches the `Ctrl+O` transcript overlay, and `n`/`N` walk the matches.**
   The search runs **when you press Enter**, not as you type: a full pass over a
   10 000-line scrollback costs milliseconds and allocates a string per line, so

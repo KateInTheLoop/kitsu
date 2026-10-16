@@ -5087,3 +5087,33 @@ That changes the card. The fix is not "enable bracketed paste on the route that 
 ### The pattern, and it is now the sixth
 
 I wrote a false attribution into a comment **while shipping the feature it described**, and it would have sent the next card at the wrong file — exactly what **F112**'s three errors did. The shape is the same every time: **a plausible mechanism, internally consistent, asserted without re-reading the line.** F91 named the rule (*an entry asserting "X already does Y" needs the line that shows it*), and this is the sixth instance of me breaking it. The comment is corrected **in place**, with the measurement, rather than deleted — **F90**: *"X is missing" and "X is refused" look identical from outside*, and so do *"the route lacks the enable"* and *"the route has it from its caller."*
+
+## F117 — a CLI test is a tool-schema tripwire, and registering `agent_wait` tripped it
+
+**T5-S6 shipped.** The part worth recording is not the tool but what registering it revealed.
+
+`cli::test_context_command_surfaces_window_runtime_evidence` (`tests/cli.rs:16218`) **failed deterministically** the moment the tool was registered — `left: Some(1) right: Some(0)`, i.e. the binary **exited 1**. The implementer confirmed it was theirs by stashing (passes at baseline) and reproduced the stderr by hand:
+
+> `context preflight stopped an oversized provider request: protected prompt needs about 6882 tokens, but the trim target is 6861 tokens (window 8192 …)`
+
+That test drives an **8192-token window with a ~23k-character prompt, and at baseline it clears the trim target by about 90 tokens.** The first `agent_wait` descriptor cost **217** tokens of schema, which put the protected prompt **21 tokens over**.
+
+### The fix was production code, not the test — correctly
+
+The descriptor was trimmed instead: shorter description, **no prose on `until`** (the closed `enum` already says everything), one-line `timeout_secs`. Cost fell to **148** tokens, clearing the target with ~48 to spare. **Every descriptor assertion still holds**, including the one requiring the description to contain *"does not count against"*. No test was touched.
+
+**That is the right instinct and worth naming:** the failing test was not wrong, and the tool's descriptor was genuinely verbose. A card that "fixed" the test's window or prompt would have destroyed a real budget guard to make room for prose a closed enum already conveys.
+
+### But the test is a tripwire, and that needs a card
+
+**Any next tool registered in the non-lean tier will break it again, at any size**, because the margin is ~48 tokens and the test asserts a **startup exit code**. So the failure says `left: Some(1) right: Some(0)` and **nothing about why** — the implementer only found the cause by reproducing the binary's stderr by hand.
+
+**Carded:** either the test should assert the preflight *message* rather than only the exit code, so the next breakage explains itself, or the margin should be made explicit and asserted, so that *"this change costs more schema than the window has"* is the failure a reader sees. The present shape makes a budget regression indistinguishable from any other startup failure.
+
+### H5's real cost is 151 tokens, not 148
+
+Registering the tool also moved the reported **base prompt** from 155 to 158 tokens — the tool's **name reaches the system prompt** as well as the schema list. Expected, but it means the honest figure for the requirement is **148 schema + 3 system prompt = 151**. Recorded because the next person to weigh a tool against a small window will want the whole number, not the schema half.
+
+### Two stale code comments fixed alongside
+
+`subagent/thread.rs:230` claimed *"No agent can enter this phase yet; a later story populates it"* — false since the park path landed. And the authorised test edit replaced a doc comment asserting `blocked` was unreachable, with the assertions left **byte-identical** and the test renamed from `blocked_is_always_zero_until_a_later_story_populates_it` to `blocked_is_zero_for_every_agent_this_test_never_parks`. **Both are F110's family** — a true statement that silently became false when a capability shipped, and neither was found by a sweep: one was found by the test author reading the state machine, the other by needing to use it.

@@ -19560,6 +19560,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             let (d, h) = subagent::agent_result_tool(agent_registry.clone());
             let registration = tools.register_with_descriptor(d, h);
             registration.expect("tool name must be unique");
+            // T5-S6 (H5): block on a background agent's state. It spawns
+            // nothing, so it consumes no `SpawnBudget` — but it lives inside
+            // the `spawn_cap > 0` gate on purpose, next to `agent_result`,
+            // which consumes none either: at a zero cap no background agent
+            // can exist for a wait to wait on, so a registered `agent_wait`
+            // would advertise a capability the session cannot deliver and the
+            // model would burn a round on "no background agent #N".
+            let (d, h) = subagent::agent_wait_tool(agent_registry.clone());
+            let registration = tools.register_with_descriptor(d, h);
+            registration.expect("tool name must be unique");
         }
     }
 
