@@ -623,10 +623,26 @@ One per-turn spawn budget covers synchronous `spawn_agent`, parallel
 `spawn_agents`, and detached `spawn_agent_bg` calls. It defaults to eight in
 interactive chat and two in scripted or piped automation, and can be overridden
 by `--agent-spawn-cap` or `agent_spawn_cap` in config. A zero cap unregisters
-all four multi-agent schemas, including `agent_result`, so `/tools`, the system
+all five multi-agent schemas, including `agent_result` and `agent_wait`, so
+`/tools`, the system
 prompt, `provider_request.tools_offered`, and the actual provider body agree
 that multi-agent work is disabled; unrelated filesystem, command, skill, and
 workspace-evidence tools remain available.
+
+`agent_wait(id, until, timeout_secs)` blocks the foreground model on one
+background agent's state. `until` is `done` -- the agent finished, **failed, or
+was cancelled** -- or `blocked`, meaning it is parked waiting on an approval
+answer, the state `/jobs` groups as `needs input`. A state that already holds
+returns immediately; so does a state that has become **unreachable**, such as
+waiting for `blocked` on an agent that has gone terminal, rather than holding the
+round open for a change that can never come. `timeout_secs` defaults to 60 and is
+capped at 30 minutes, and `0` polls once. **A timeout is a normal result, not an
+error:** the model is told the state it did not reach, the timeout actually used
+and the agent's current status, and is free to do other work. An unknown id is an
+error, returned at once rather than costing a whole timeout. The tool starts no
+agent, so it never consumes the per-turn spawn budget -- but each call is one
+round of the caller's turn, so a model that polls in a loop is bounded by
+`--max-rounds` as well as by its own timeout.
 
 ### `@file` attachments
 

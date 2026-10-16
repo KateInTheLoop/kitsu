@@ -1082,6 +1082,34 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   `agent wait --until`). It spawns nothing, so it does not consume the
   `SpawnBudget`; it is bounded by `--max-rounds` and its own timeout.
 
+  **Shipped in T5-S6, which settled two things H5 left open.**
+
+  **`done` is the registry's `terminal` predicate, not the `Done` variant** --
+  `!matches!(phase, Running | Blocked)`. Had it been the variant alone, a `done`
+  wait on an agent that **failed or was cancelled** would have burned the whole
+  timeout waiting for a state that can never arrive. By the same reasoning the
+  converse returns at once: waiting for `blocked` on an agent that has gone
+  terminal is unreachable, so the tool says so instead of holding the round open.
+  A `done` wait on a *parked* agent does run its timeout out, because `blocked` is
+  non-terminal and the agent is still live.
+
+  **"Bounded by `--max-rounds`" is a conjunction of two independent bounds, not
+  something the tool enforces.** `max_rounds` lives only on
+  `kitsu_core::AgentConfig` and is enforced only in the orchestrator loop; a tool
+  handler cannot see it. So the timeout bounds **one call** and `--max-rounds`
+  bounds **how many calls**, since each `agent_wait` is one round of the caller's
+  turn. Worst-case turn time is `max_rounds × 30 min`, which is why the clamp has
+  a ceiling. The round cap is already covered by `kitsu-core`'s own test, and
+  T5-S6 deliberately wrote **no** assertion for it: any test in the tool's file
+  would assert the **absence of a parameter**, which is structural and vacuous.
+
+  **A timeout is an `Ok` outcome, not an error**, naming the state not reached, the
+  timeout actually used, and the agent's current status. An unknown id *is* an
+  error and is returned immediately, because a typo must not cost a round. And a
+  **zero spawn cap unregisters it** -- not because it consumes budget (it does not)
+  but because at a zero cap no agent can exist to wait on, and a tool that cannot
+  succeed must not be advertised.
+
 ### 3.5 Non-functional and invariants (N)
 
 - **N1** Non-TTY, `--plain`/`NO_COLOR`, assistive (`--screen-reader`), and

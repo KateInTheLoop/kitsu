@@ -225,8 +225,9 @@ pub struct AgentTimelineSnapshot {
 pub enum AgentThreadPhase {
     Running,
     /// Parked on a user answer. Non-terminal: the thread's timeline stays
-    /// open, it offers no handoff, and steering remains answerable. No agent
-    /// can enter this phase yet; a later story populates it.
+    /// open, it offers no handoff, and steering remains answerable. An agent
+    /// enters this phase through `AgentRegistry::park_prompt`, which blocks
+    /// the thread when it parks a permission request.
     Blocked,
     Done,
     Failed,

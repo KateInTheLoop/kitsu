@@ -402,7 +402,7 @@ profiles.
 | ~~T5-S3~~ | Folded into **R6-d** above — it was always half of one requirement, which is why `v` appeared in this row *and* T4-S9's | superseded | — | (R6) |
 | T5-S4 | Windows Terminal fallback (inline → fullscreen when regions misbehave); `--no-alt-screen` forces inline; Windows liveness in `kitsu agents --json` | Failing decision-function test | `viewport.rs`, `agent_state_file.rs` | (N6, H1) |
 | T5-S5 | Mouse wheel in fullscreen (optional) | — | `fullscreen.rs` | Manual |
-| T5-S6 | `agent_wait(id, until, timeout)` tool; no `SpawnBudget` use | Failing until/timeout tests | `subagent.rs` | (H5) |
+| T5-S6 | **`agent_wait(id, until, timeout_secs)`.** `done` is the registry's **terminal** predicate, not the `Done` variant — else a wait on a *failed* agent burns the whole timeout (F84/F75). An unreachable state returns at once; a timeout is an **`Ok`** outcome naming what was not reached. Default 60s, **clamped to 30min** (unclamped, `i64::MAX` **panics in `std::time`** on deadline overflow — found by mutation). Unknown id errors **immediately**. **No `SpawnBudget` parameter at all**, and a **zero cap unregisters it**. `--max-rounds` is **not** enforced inside the tool: it bounds how many calls, the timeout bounds one | done, this commit | `subagent.rs`, `main.rs` | (H5) |
 | T5-S7 | herdr manifest under `integrations/herdr/` + README | — | `integrations/` | Manual (H4) |
 | T5-S8 | Decision records: default renderer flip (R1), JSONL `background_blocked` (open q. 7), socket API (open q. 6); traceability table appended to the design | — | docs | ADR-style records |
 
