@@ -4820,3 +4820,63 @@ Resolving F102 falsified claims I had written **one commit earlier**, and the sw
 - **The cycle record** `docs/roadmap/cycles/e11/R6-a.md`, which says *"the ring holds no prompts at all -- the overlay shows one speaker"*. **Left exactly as written.** It is a point-in-time record of what was true and what was decided at that card; editing it would destroy the only honest account of why R6-a shipped a one-speaker overlay and why R6-c was blocked.
 
 **The distinction is the finding.** F101's rule — *after changing a document, grep for the claim the change falsifies* — is incomplete without it, because applied naively it would have rewritten history. **The test is not "is this sentence now false?" but "does this document claim to describe the present?"** A changelog entry in an unreleased section does; a dated cycle record does not, and its value is precisely that it still says what was believed then.
+
+## F110 — F101's fifth instance: I fixed the sentence and not its twin in another file
+
+Last card I found `docs/functionality.md` still reading *"Paging is not wired, so the view shows the newest lines that fit"* ten lines below the paragraph I had just added describing paging working. I fixed it, recorded it as F101's third instance, and wrote down the rule: **after changing a document, grep it for the claim the change falsifies.**
+
+**I then did not apply that rule to the other document containing the same sentence.** `CHANGELOG.md` read, in the same entry, immediately after the paragraph describing the paging keys:
+
+> Paging keys are not wired yet, so it shows the most recent lines.
+
+Found three cards later, while pre-locating what R6-c would falsify — i.e. by a sweep run for a *different* purpose, not by the rule I had just written.
+
+### The rule was wrong, not just unapplied
+
+F101 said *grep **it***. Singular. **That is the bug.** The same claim is written in several documents because each audience needs it, so falsifying it falsifies every copy, and the file I happen to be editing is the one I am least likely to miss. The corrected rule:
+
+> **After changing behaviour, grep every live document for the claim the change falsifies — not the document you are editing.**
+
+Run as a family rather than a string: `not wired`, `is not wired`, `are not wired` across `CHANGELOG.md`, `README.md` and `docs/*.md` now returns nothing, where a sweep of only the file in hand would have returned nothing on the day I introduced this.
+
+### The tally, which is the argument for automating it
+
+Five instances in this epic, every one a *correction* that failed to reach a sibling:
+
+1. A struck-through plan row still asserting the alternate-screen claim F91 had just disproved.
+2. A fictional `overlay/` directory in four rows across three stories, one of which had been caught and documented as *"impossible"*.
+3. Two dangling map references created **by** my own corrections, minutes after writing the finding that predicts them.
+4. `functionality.md`'s *"paging is not wired"*, ten lines from its contradiction.
+5. **This one** — the same sentence as (4), in the file I did not grep.
+
+**The cost is not the wrong sentence; it is that a reader cannot tell which sentence to trust.** Two documents in this repo disagreed about whether paging existed, and both were committed by me, in the same release, for three cards.
+
+**Carded:** a check that greps the live documents for a small set of negative-capability phrases (`not wired`, `not yet`, `still missing`, `is refused`) and lists them with their line numbers, so each is re-read rather than assumed at every card. Not a test — a sweep whose output a human reads, like the reference check F101 already produced.
+
+## F111 — R6-c shipped; the limitation, and a third sighting of the recap flake
+
+**R6-c is done.** `{`/`}` jump between coalesced prompt blocks, through a new shared seam `pin_to(ordinal)` that **R6-b's `/` will reuse** with a match ordinal — one anchor, one clamp, no second anchor concept. The pinned transition table grew to **twelve** rows and its header says so.
+
+### The accepted limitation, with its two homes named
+
+**Two submissions with nothing printed between them are one jump stop.** Adjacency is the only rule a `bool` per cell affords; distinguishing them needs a block id. Impact is small — a submission that prints nothing at all is rare — and it has **exactly one home in the code** (`CellRing::prompt_blocks`) **and one in the tests** (`cells::tests::two_prompts_with_nothing_between_them_are_one_block`), so the docs point at both rather than restating the rule a third time.
+
+### The overrule, and why it generalises
+
+The author's first answer let `}` pin onto a block already at the frame's top: the block *is* below the cursor, so reporting "nowhere to go" looked like a lie. **Overruled on the author's own principle** — they had already decided that *a jump with no target leaves `is_following()` alone, because pinning before discovering it has no target breaks the follow for nothing.* A target that clamps onto the cursor **cannot move the frame either**, so it is the same trade with the same answer.
+
+**What makes it more than a preference:** the pinning answer is **invisible at the keypress and visible much later** — the user presses a key, sees nothing change, and new output silently stops arriving. **F75**'s second kind with a *delayed* symptom, which is harder to attribute than an immediate one. The author then wrote the assertion that catches it: after a declined jump, an appended line **must still appear**.
+
+And the accepted rule turned out to be **direction-symmetric by construction** — a `Prev` target is strictly below the cursor and block ordinals are never evicted, so `Prev` can never clamp onto the cursor and needs no arm of its own. A rule that needs no special case is usually the right rule.
+
+### Two implementation details worth keeping
+
+**`pin_to` clamps *through* `top`** rather than writing the arithmetic again, by constructing a throwaway view at the raw ordinal and asking it for its top. So the clamp has **one** home, and the stored ordinal is clamped at call time — a raw pin would be re-clamped against a moving `follow_top` on every repaint. The author had already routed `frame` through `top` for the same reason, **unprompted**, which is the first time this epic's oldest failure mode was prevented rather than repaired.
+
+**`prompt_blocks` gets partial eviction for free:** it emits `evicted() + index` for a marked cell whose predecessor is unmarked, and the first retained row is a head whenever it is marked — so a block whose head was evicted is reported at its oldest surviving row with **no special case**.
+
+### Third sighting of the recap flake, captured
+
+`tests::the_recap_holds_only_what_the_foreground_produced_while_attached` failed once in my verification run (`956 passed; 1 failed`), **passed in isolation**, and passed `957/0` on three consecutive full runs. Captured to its own file (**F39**).
+
+**That is the third independent sighting**, in a third card, by a third party — the author of the card did not see it, the implementer did not, and I did. It remains exactly consistent with **F107**: a test whose subject is *what was installed at the time* reading a process-global that another thread can rewrite. **Three globals, three flake families, and this one test has now cost four verification runs.** F107's production fix is the card I keep deferring, and its interest is compounding.

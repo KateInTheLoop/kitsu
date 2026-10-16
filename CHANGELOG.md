@@ -39,6 +39,13 @@ shapes may change in any minor release.
   reason.
 
 ### Added
+- **`{` and `}` jump between prompts in the `Ctrl+O` transcript overlay**, so you
+  can walk back through what you asked instead of scrolling for it. A prompt that
+  spans several lines is **one** stop rather than one per line; by the same rule,
+  two submissions with nothing printed between them are also one stop. A jump
+  that has nowhere to move does **nothing** -- in particular it does not silently
+  stop the overlay following new output. The keys are named on the overlay's own
+  footer, which still names nothing it cannot answer.
 - **A transcript overlay on `Ctrl+O`**, from the inline composer and from
   fullscreen alike. It opens over the transcript the cell ring retains;
   `PgUp`/`PgDn` scroll it, `Ctrl+Home`/`Ctrl+End` jump to the oldest retained
@@ -175,7 +182,6 @@ shapes may change in any minor release.
   output no longer drags it to the bottom until you page back down or press
   `Ctrl+End`. The keys are listed in `/help tui` rather than the agent view's key
   table, since they do nothing in the other renderers. Switching keeps the conversation, as the other modes do.
-  Paging keys are not wired yet, so it shows the most recent lines.
   **What the scrollback holds is worth knowing:** the streamed conversation --
   not kitsu's own messages and receipts, and not an answer that was buffered
   because tools were offered that round, which is the default. Run with
