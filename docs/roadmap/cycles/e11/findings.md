@@ -5951,3 +5951,31 @@ The sweep derives an unregistered sentinel and requires it to reach `unknown com
 **Satisfiability here means the opposite of usual:** green on unmutated HEAD, red and naming the command the instant an arm is deleted. One precision on the author's own claim: **`/help` *is* typed** — it is the mechanism by which the registry publishes itself for enumeration, since the table is private to the binary. No command is typed as a *subject*, which is the property that matters.
 
 **No user-visible surface changed**, so README, `functionality.md`, the CHANGELOG and `ux-design.md` correctly get nothing — recorded here so the absence is a checked result rather than a skipped step.
+
+## F144 — F67-print ships; **F67's parity premise was wrong too**; and a flagged trap that was only half shut
+
+`/jobs prune` now prints an unread result before discarding the record. Four things to keep.
+
+### The parity target I named in the brief would have preserved the bug
+
+**I told the test author to match what automation receives.** The author measured it and **I verified**: `terminal_agent_status_label` maps **`AgentStatus::Done(_) => "done"`**, so `terminal_job_payload`'s four fields carry **no body at all**.
+
+**So F67's "the result *survives* in the reply" is overstated** — what survives automation is the *fact* of a finished job, not its text. The body was lost on **both** paths; the interactive path merely lost the fact as well. Copying the payload onto stderr would have printed a receipt for data it had just discarded.
+
+The right target was the **exit guard's own printer**, `print_background_results` — *the very surface prune defeats*. It carries the id, task, status-as-rendering **and the body**. **Second recorded premise overstated in two cards** (F143 was the first), and both times the author measured rather than inheriting my framing. *When a card's justification is a claim about another path's behaviour, that claim is a measurement, not a given.*
+
+### The trap I flagged was real and only half shut
+
+I warned that a test asserting *"the result was printed"* would also pass an implementation that **refused to prune** — the option I had rejected. Correct, and **understated**: the author found the *print-then-quietly-refuse* mutation **survived the integration test by fabricating the empty-deck line.** A deck-count assertion now makes the cheat need **two** fabrications, and the in-crate control catches it unconditionally.
+
+The implementer then re-ran that mutation in **three** variants — kept-record-with-`changed: true`, kept-record-with-`changed: false`, and the fabricated-output cli case — and **all three bite**. *Confirmed shut from both sides, which is what "bidirectional" has to mean when the wrong implementation is a near-neighbour of the right one.*
+
+### One predicate, read once, before the remove
+
+The unviewed test is the `x` key's own expression, `handoff_state(id) == Some(Ready)`, **taken once before `close(id)`** — the remove makes it unanswerable afterwards. No `unacknowledged` count, no `thread_snapshot` re-read, no second `handoff_state` call. The F141/F142 shape was named in the brief and avoided.
+
+### A ruling and the gap it leaves
+
+These writes are **not** gated on `--jsonl`, so a scripted machine-readable run now gets the result body on stderr. **I ruled it ungated, following the receipt**: where the receipt goes, the result goes, because gating it would hand exactly those users the receipt **without** the result — the silent loss this card removes. The machine contract is **stdout**; stderr there is already human diagnostics, as the pre-existing receipt on that stream shows.
+
+**The measured gap:** no test covers a slash command in JSONL mode writing to stderr — the only `jsonl.stderr.is_empty()` assertion sits in a run with **no slash commands**. Recorded rather than closed, because asserting the new line would pin a stream contract this card did not decide.

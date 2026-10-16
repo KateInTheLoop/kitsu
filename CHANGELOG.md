@@ -10,6 +10,13 @@ shapes may change in any minor release.
 ## [Unreleased]
 
 ### Fixed
+
+- **`/jobs prune ID` no longer throws away a result nobody has read.** It prints
+  the finished agent's output first, then prunes as asked. Previously the record
+  was removed and the result went with it, unprinted -- and because the exit guard
+  reads the live registry, nothing downstream could tell it had existed. The prune
+  itself is unchanged: a typed id is the confirmation, which is why the `x` key
+  still refuses on an unread result where the command does not.
 - **`[tui] alternate_screen = never` and `--no-alt-screen` are now refused instead
   of silently ignored.** Neither was honoured by anything: all three values of that
   key did the same nothing, so `auto` was accidentally correct and **`never` did
