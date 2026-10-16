@@ -3558,6 +3558,38 @@ fn safe_provider_error_message(
     }
 }
 
+/// Human-mode notice for an unrecoverable tool-result loss, gated to an
+/// interactive styled terminal and nothing else.
+///
+/// This is deliberately NOT part of [`format_runtime_notice`]: all three
+/// runtime-notice sinks share that formatter and two of them are not
+/// terminals, so extending it would print this line on the piped and
+/// `--plain` surfaces that must stay byte-identical. `stderr_styled()` is
+/// `stderr_is_tty() && !plain_mode()`, which already excludes `--plain`,
+/// `--screen-reader`, `NO_COLOR`, `KITSU_PLAIN`, `KITSU_SCREEN_READER` and
+/// `TERM=dumb`; `is_tty()` adds the stdout half; the callers are already
+/// inside their `!jsonl` branch.
+///
+/// One line per round naming the count, matching the event: the trimmer
+/// aggregates within a round, so two bodies destroyed in one enforcement pass
+/// are one loss of context, not two.
+fn format_dropped_results_notice(event: &kitsu_core::AgentRuntimeEvent) -> Option<String> {
+    let kitsu_core::AgentRuntimeEvent::ToolResultsDropped { round, dropped } = event else {
+        return None;
+    };
+    if *dropped == 0 {
+        return None;
+    }
+    if !(kitsu_render::stderr_styled() && kitsu_render::is_tty()) {
+        return None;
+    }
+    Some(format!(
+        "context budget dropped {dropped} tool result{} in round {round}; the provider never saw {}",
+        if *dropped == 1 { "" } else { "s" },
+        if *dropped == 1 { "it" } else { "them" },
+    ))
+}
+
 /// Integration hook for human-mode runtime notices. The event log can call
 /// this beside its JSONL serializer; results contain only host-owned bounded
 /// facts, numeric status/timing fields, and no provider-controlled text.
@@ -14024,6 +14056,10 @@ fn live_agent_event_log_capturing(
             // The process-long emitter retains a terminal write failure. The
             // turn boundary below converts it into the required nonzero exit.
             emit_runtime_event(&turn_id, event).is_ok()
+        } else if let Some(notice) = format_dropped_results_notice(event) {
+            kitsu_render::finish_line();
+            eprintln!("~ {notice}");
+            true
         } else if let Some(notice) = format_runtime_notice(event) {
             // A mid-stream status must start on its own line, never fused onto
             // the last streamed stdout character.
@@ -14041,6 +14077,10 @@ fn live_command_event_log(jsonl: bool, line: usize, command: &str) -> kitsu_core
     kitsu_core::AgentEventLog::with_fallible_observer(move |event| {
         if jsonl {
             emit_command_runtime_event(line, &command, event).is_ok()
+        } else if let Some(notice) = format_dropped_results_notice(event) {
+            kitsu_render::finish_line();
+            eprintln!("~ {notice}");
+            true
         } else if let Some(notice) = format_runtime_notice(event) {
             kitsu_render::finish_line();
             eprintln!("~ {notice}");
@@ -14078,6 +14118,10 @@ fn finish_agent_trace(
         return emit_agent_trace(turn_id, log, assistant);
     }
     for event in log.take() {
+        if let Some(notice) = format_dropped_results_notice(&event) {
+            kitsu_render::finish_line();
+            eprintln!("~ {notice}");
+        }
         if let Some(notice) = format_runtime_notice(&event) {
             kitsu_render::finish_line();
             eprintln!("~ {notice}");

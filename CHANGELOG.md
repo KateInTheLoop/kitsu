@@ -39,6 +39,13 @@ shapes may change in any minor release.
   reason.
 
 ### Added
+- **An interactive session now says so too when a tool result is dropped**, not
+  just `--jsonl`. The line reads `~ context budget dropped 2 tool results in round
+  3; the provider never saw them`, naming the count first, once per round. It
+  appears **only on a terminal**: a run with either stdout or stderr redirected,
+  or `--plain`/`NO_COLOR`, `--screen-reader`, or `--jsonl`, is byte-identical to
+  before. The recallable case stays silent, since an evicted result that leaves a
+  re-readable pointer is not a loss.
 - **A `tool_results_dropped` JSONL event**, so a run that loses a tool result says
   so. When the context budget forces history trimming to replace a whole tool
   result with a dead placeholder, the stream now carries

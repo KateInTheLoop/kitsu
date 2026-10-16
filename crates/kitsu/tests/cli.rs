@@ -20798,3 +20798,720 @@ async fn test_jsonl_stays_silent_when_no_tool_result_is_trimmed_at_all() {
         second_round_tool_content.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// F122: tell a HUMAN when a tool result was dropped.
+//
+// F120 shipped the machine half: a `--jsonl` run now emits
+// `tool_results_dropped { round, dropped }` when history trimming replaced a
+// whole tool result with a dead `[older tool output elided]` stub. A human
+// running interactively still gets nothing — the tool ran, reported honestly,
+// and its result vanished before the provider saw it in total silence.
+//
+// WHERE THE LINE BELONGS, measured rather than assumed. The only mid-turn
+// human warning channel a plain `chat` run has is the runtime-notice sink in
+// `live_agent_event_log_capturing`:
+//
+//     } else if let Some(notice) = format_runtime_notice(event) {
+//         kitsu_render::finish_line();
+//         eprintln!("~ {notice}");
+//
+// (`main.rs:14027`, with the same two lines again at `:14044` for slash-command
+// runtimes and `:14081` for the buffered drain in `finish_agent_trace`.) A
+// plain interactive chat has no agent view at all, so the two `ToolResultsDropped`
+// no-op arms F120 left in `subagent.rs` / `subagent/thread.rs` mark where an
+// *agent timeline* line would go — not where this card's line goes.
+//
+// THE GATE. That sink is NOT TTY-gated: it fires on any non-`--jsonl` run,
+// piped included. N1 permits a line on an interactive TTY but requires all four
+// of non-TTY, `--plain`/`NO_COLOR`, assistive and JSONL to stay byte-identical,
+// so the new line needs a gate the existing `~` notices do not have. The four
+// surfaces below pin that, and the lossless case pins that a recallable
+// eviction stays silent on the human channel too.
+//
+// THE CONTRACT THESE TESTS PIN, kept as small as it can be so the wording stays
+// the implementer's: on a styled TTY run that dropped results, the human
+// channel carries EXACTLY ONE line per round naming the COUNT; on all four N1
+// surfaces, and on every lossless or loss-free run, it carries none.
+// ---------------------------------------------------------------------------
+
+/// Carrier for one eviction run: how the child's descriptors are wired, which
+/// is the whole variable this card turns on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DroppedResultCarrier {
+    /// `.output()`: stdout, stderr and stdin all pipes. N1's "non-TTY".
+    Piped,
+    /// stdout, stderr and stdin all on one PTY, styling live, driven through
+    /// the interactive REPL. This is the surface N1 does not cover.
+    StyledPty,
+}
+
+/// One eviction run, whatever its carrier: the human-visible text, the JSONL
+/// stream when there was one, and what the provider actually received for the
+/// evicted call.
+struct DroppedResultRun {
+    /// Everything a human would have seen. For [`DroppedResultCarrier::Piped`]
+    /// this is stderr; for the PTY it is the merged terminal transcript.
+    human: String,
+    /// stdout, parsed line-by-line, for `--jsonl` runs only.
+    events: Vec<serde_json::Value>,
+    /// Ground truth for whether the run lost anything. The human channel is
+    /// what is under test, so it cannot also be the evidence of the loss.
+    second_round_tool_content: String,
+    success: bool,
+    /// The fixture's temp working directory, so its path can be normalized out
+    /// of a byte-identical pin.
+    work_root: String,
+}
+
+/// Every line of the human channel that reports a drop, ENUMERATED rather than
+/// searched for a prefix: the marker and wording stay the implementer's choice,
+/// so the test keys on the one word the card is about.
+///
+/// Escape sequences are stripped first — on a styled PTY the line arrives
+/// coloured, and `~ \x1b[33mdropped\x1b[0m` must still count as one line.
+fn dropped_result_notices(human: &str) -> Vec<String> {
+    strip_terminal_escapes(human)
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.to_ascii_lowercase().contains("dropped"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Remove CSI/OSC escape sequences and carriage returns so a styled PTY
+/// transcript can be read as lines of text.
+fn strip_terminal_escapes(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i += 1;
+            match bytes.get(i) {
+                // CSI: parameters, then one final byte in 0x40..=0x7e.
+                Some(b'[') => {
+                    i += 1;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                // OSC: terminated by BEL or ST.
+                Some(b']') => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != 0x07 {
+                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                // Two-byte escapes.
+                Some(_) => i += 1,
+                None => {}
+            }
+            continue;
+        }
+        if bytes[i] == b'\r' {
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// The human channel reduced to the distinct lines a reader would actually
+/// have seen, for use in failure messages.
+///
+/// A styled PTY transcript is ~7 KB of prompt redraw for a turn this short, and
+/// a panic that dumps it buries its own finding. This keeps each distinct line
+/// once, drops the keystroke-echo prefixes a longer line supersedes, and caps
+/// the result - so the enumeration stays readable, which is the only form in
+/// which "nothing said X" is worth reading.
+fn human_channel_digest(human: &str) -> String {
+    let stripped = strip_terminal_escapes(human);
+    let mut kept: Vec<String> = Vec::new();
+    for line in stripped.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // A keystroke echo is a strict prefix of the next echo; keep the last.
+        while kept.last().is_some_and(|last| line.starts_with(last.as_str())) {
+            kept.pop();
+        }
+        if !kept.iter().any(|seen| seen == line) {
+            kept.push(line.to_string());
+        }
+    }
+    let total = kept.len();
+    if total > 40 {
+        kept.truncate(40);
+        kept.push(format!("... and {} further distinct line(s)", total - 40));
+    }
+    kept.join("\n")
+}
+
+/// Drive one run in which large `fs_read_file` results are evicted by the
+/// history trimmer before the second provider round, over either carrier.
+///
+/// `window` tunes the pressure; `calls` is how many large reads the first
+/// assistant message asks for (the per-round-vs-per-line question); `extra_args`
+/// selects the eviction's character — `--no-artifacts` suppresses the on-disk
+/// copy so the stub is dead, a low `--offload-cap` leaves a re-readable pointer.
+async fn run_dropped_tool_result(
+    carrier: DroppedResultCarrier,
+    window: &str,
+    calls: usize,
+    extra_args: &[&str],
+) -> DroppedResultRun {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let mut tool_calls = Vec::new();
+    for index in 0..calls {
+        let input = work.path().join(format!("evidence-{index}.txt"));
+        fs::write(
+            &input,
+            format!("HEAD{}TAIL", "evidence-line\n".repeat(900)),
+        )
+        .unwrap();
+        tool_calls.push(serde_json::json!({
+            "id": format!("big_read_{index}"),
+            "type": "function",
+            "function": {
+                "name": "fs_read_file",
+                "arguments": serde_json::json!({"path": input}).to_string()
+            }
+        }));
+    }
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"tool_call_id\":\"big_read_0\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "reported on the evidence"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": tool_calls
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let work_root = work.path().to_string_lossy().to_string();
+    let work_root_for_run = work_root.clone();
+    let mut args = vec![
+        "--gateway",
+        "example",
+        "--no-stream",
+        "--context-window",
+        window,
+    ];
+    args.extend_from_slice(extra_args);
+    args.extend_from_slice(&[
+        "--max-rounds",
+        "3",
+        "chat",
+        "--no-session",
+        "--allow-path",
+        &work_root,
+    ]);
+
+    let jsonl = extra_args.contains(&"--jsonl");
+    let (human, stdout, success) = match carrier {
+        DroppedResultCarrier::Piped => {
+            let mut piped = args.clone();
+            piped.push(PROMPT_READ_THE_EVIDENCE);
+            let output = base_cmd(home.path())
+                .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+                .current_dir(work.path())
+                .args(&piped)
+                .output()
+                .unwrap();
+            (
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                output.status.success(),
+            )
+        }
+        DroppedResultCarrier::StyledPty => {
+            let (status, transcript) = run_styled_chat_pty_turn(home.path(), work.path(), &args);
+            (transcript.clone(), transcript, status.success())
+        }
+    };
+
+    let events = if jsonl {
+        stdout
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let requests = server.received_requests().await.unwrap();
+    let second_round_tool_content = requests
+        .get(1)
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+        .and_then(|body| {
+            body["messages"].as_array().and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message["tool_call_id"] == "big_read_0")
+                    .and_then(|message| message["content"].as_str().map(str::to_string))
+            })
+        })
+        .expect("the second provider request must carry the first read's tool result");
+    server.verify().await;
+
+    DroppedResultRun {
+        human,
+        events,
+        second_round_tool_content,
+        success,
+        work_root: work_root_for_run,
+    }
+}
+
+/// The one prompt every run in this block submits.
+const PROMPT_READ_THE_EVIDENCE: &str = "read the evidence files and report on them";
+
+/// Run one chat turn with styling LIVE on a PTY: stdin, stdout and stderr all
+/// on the same terminal, no `--plain`, no `--jsonl`.
+///
+/// `tests/cli.rs`'s [`run_plain_interactive_chat_pty`] hardcodes `--plain`, so
+/// it cannot see anything gated on a styled TTY; `tests/tui.rs`'s styled
+/// harness points at an unreachable gateway and only ever submits slash
+/// commands, so it cannot drive a tool turn. This is the smallest harness that
+/// is both styled and backed by a real mock provider.
+///
+/// Driven on triggers found in the transcript, never on a sleep: the prompt
+/// goes in once `kitsu>` appears, `/quit` once the assistant's answer does.
+#[cfg(unix)]
+fn run_styled_chat_pty_turn(
+    home: &Path,
+    cwd: &Path,
+    args: &[&str],
+) -> (std::process::ExitStatus, String) {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::FromRawFd as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: both output pointers are valid; null termios and winsize request
+    // the platform defaults.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0,
+        "allocate styled drop-notice PTY"
+    );
+    let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    // SAFETY: each duplicated slave descriptor transfers to one Stdio owner.
+    let child_stdin = unsafe { libc::dup(slave) };
+    let child_stdout = unsafe { libc::dup(slave) };
+    assert!(child_stdin >= 0 && child_stdout >= 0);
+
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
+    command
+        .env("HOME", home)
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .env("KITSU_NO_PROJECT_CONTEXT", "1")
+        .env("TERM", "xterm-256color")
+        .env_remove("NO_COLOR")
+        .env_remove("KITSU_PLAIN")
+        .env_remove("KITSU_SCREEN_READER")
+        .env_remove("ANTHROPIC_TOKEN_EXPIRES")
+        .current_dir(cwd)
+        // SAFETY: all three live descriptors transfer exactly once.
+        .stdin(unsafe { Stdio::from_raw_fd(child_stdin) })
+        .stdout(unsafe { Stdio::from_raw_fd(child_stdout) })
+        .stderr(unsafe { Stdio::from_raw_fd(slave) })
+        .args(args);
+    let mut child = command.spawn().expect("spawn styled drop-notice chat");
+    // SAFETY: ownership of the remaining master descriptor transfers once.
+    let mut terminal = unsafe { fs::File::from_raw_fd(master) };
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut transcript = Vec::new();
+    let mut submitted = false;
+    let mut quit = false;
+
+    let status = loop {
+        let mut buffer = [0_u8; 4096];
+        match terminal.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(read) => transcript.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+            Err(error) => panic!("read styled drop-notice PTY: {error}"),
+        }
+        let text = String::from_utf8_lossy(&transcript).into_owned();
+        if !submitted && text.contains("kitsu>") {
+            let _ = terminal.write_all(format!("{PROMPT_READ_THE_EVIDENCE}\n").as_bytes());
+            let _ = terminal.flush();
+            submitted = true;
+        } else if submitted
+            && !quit
+            && (text.contains("reported on the evidence") || text.contains("! error:"))
+        {
+            let _ = terminal.write_all(b"/quit\n");
+            let _ = terminal.flush();
+            quit = true;
+        }
+        if let Some(status) = child.try_wait().expect("poll styled drop-notice chat") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "styled drop-notice chat timed out (submitted={submitted} quit={quit}): {}",
+                String::from_utf8_lossy(&transcript)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    (status, String::from_utf8_lossy(&transcript).into_owned())
+}
+
+
+/// Every word the drop report could reasonably use, enumerated so an N1
+/// surface cannot stay "silent" merely because the implementer picked a
+/// synonym this file did not predict.
+const DROP_VOCABULARY: [&str; 4] = ["dropped", "elided", "discarded", "lost"];
+
+/// Assert the human channel says nothing at all about a drop, over the whole
+/// enumerated vocabulary rather than one guessed marker.
+fn assert_human_channel_silent_about_drops(run: &DroppedResultRun, surface: &str) {
+    let text = strip_terminal_escapes(&run.human).to_ascii_lowercase();
+    for word in DROP_VOCABULARY {
+        assert!(
+            !text.contains(word),
+            "N1 requires the {surface} surface to stay byte-identical to today, and today it \
+             says nothing about a dropped tool result; it now contains {word:?}. The \
+             channel's distinct lines were:\n{}",
+            human_channel_digest(&run.human)
+        );
+    }
+}
+
+/// Assert the fixture really destroyed the result, from the provider's side.
+/// Without this every silence assertion above could pass on a run that trimmed
+/// nothing (F61).
+fn assert_result_really_dropped(run: &DroppedResultRun) {
+    assert_eq!(
+        run.second_round_tool_content, "[older tool output elided]",
+        "fixture must actually drop the result with nothing recallable left behind, or every \
+         assertion about reporting that drop is vacuous"
+    );
+}
+
+/// Assert the turn actually ran to completion on a PTY carrier: without this a
+/// harness that hung before the tool call would report a convincing silence.
+fn assert_styled_turn_completed(run: &DroppedResultRun) {
+    let digest = human_channel_digest(&run.human);
+    assert!(run.success, "styled turn must exit 0:\n{digest}");
+    let text = strip_terminal_escapes(&run.human);
+    assert!(
+        text.contains("reported on the evidence"),
+        "the assistant's answer must have reached the terminal, or the silence this test \
+         measures is the harness's and not the binary's:\n{digest}"
+    );
+    assert!(
+        text.contains("evidence-0.txt"),
+        "the large read must have run and been shown, or nothing was there to drop:\n{digest}"
+    );
+}
+
+/// **The card.** A human on an interactive styled TTY whose tool result was
+/// destroyed before the provider saw it is told so, once, with the count.
+///
+/// N1 permits this: its four byte-identical surfaces are non-TTY, `--plain`/
+/// `NO_COLOR`, assistive and JSONL, and an interactive TTY run is none of them.
+/// The three `test_n1_*` tests below hold that line.
+#[tokio::test]
+#[serial]
+async fn test_a_styled_tty_run_tells_the_human_a_tool_result_was_dropped() {
+    let run =
+        run_dropped_tool_result(DroppedResultCarrier::StyledPty, "2048", 1, &["--no-artifacts"])
+            .await;
+    assert_styled_turn_completed(&run);
+    assert_result_really_dropped(&run);
+
+    let notices = dropped_result_notices(&run.human);
+    assert_eq!(
+        notices.len(),
+        1,
+        "a styled interactive run that destroyed a tool result told the human nothing: the \
+         tool reported honestly, the result vanished before the provider saw it, and the \
+         session was silent. Expected exactly one line reporting the drop; the terminal \
+         carried {}. The channel's distinct lines were:\n{}",
+        notices.len(),
+        human_channel_digest(&run.human)
+    );
+    assert!(
+        notices[0].contains('1'),
+        "the line must name HOW MANY results were dropped - \"three results were dropped\" is \
+         a different story from \"something was trimmed\": {:?}",
+        notices[0]
+    );
+}
+
+/// Per ROUND, with the count - not per result. Measured from the machine half
+/// rather than chosen: two results destroyed in one round of budget
+/// enforcement produce exactly one `tool_results_dropped` event carrying
+/// `dropped: 2`, so one human line carrying 2 is the shape that matches it.
+/// Two lines would overstate the number of times context was lost.
+#[tokio::test]
+#[serial]
+async fn test_a_styled_tty_run_reports_one_line_per_round_naming_the_count() {
+    let run =
+        run_dropped_tool_result(DroppedResultCarrier::StyledPty, "2048", 2, &["--no-artifacts"])
+            .await;
+    assert_styled_turn_completed(&run);
+    assert_result_really_dropped(&run);
+
+    let notices = dropped_result_notices(&run.human);
+    assert_eq!(
+        notices.len(),
+        1,
+        "two results destroyed in ONE round of trimming must produce ONE line, not one per \
+         result; the terminal carried {:?}. The channel's distinct lines were:\n{}",
+        notices,
+        human_channel_digest(&run.human)
+    );
+    assert!(
+        notices[0].contains('2'),
+        "the single line must carry the count 2, or a reader cannot tell one loss from two: \
+         {:?}",
+        notices[0]
+    );
+}
+
+/// The documented GOOD case stays silent. A low `--offload-cap` evicts the
+/// preview and leaves an `fs_read_file` pointer the model can still recall, so
+/// nothing was lost; a warning here would be the noise that teaches a reader to
+/// ignore the real one. This test passes today and must keep passing.
+#[tokio::test]
+#[serial]
+async fn test_a_styled_tty_run_stays_silent_when_the_trimmed_result_is_recallable() {
+    // Measured on THIS carrier rather than borrowed from the piped fixture: an
+    // interactive turn's protected prompt is larger, so F120's 1536 trips the
+    // context preflight here and never reaches the trimmer at all. 2048 is the
+    // window at which the eviction happens and the pointer survives; 3072 and
+    // above do not trim at all.
+    let run = run_dropped_tool_result(
+        DroppedResultCarrier::StyledPty,
+        "2048",
+        1,
+        &["--offload-cap", "1024"],
+    )
+    .await;
+    assert_styled_turn_completed(&run);
+    // Non-vacuity, both halves: the eviction happened, and it left the pointer.
+    assert!(
+        run.second_round_tool_content.starts_with("[tool output "),
+        "a low offload cap must leave an fs_read_file pointer the model can recall: {:?}",
+        run.second_round_tool_content
+    );
+    assert!(
+        !run.second_round_tool_content.contains("Preview:"),
+        "the preview body must have been evicted, or this run trimmed nothing and the silence \
+         it asserts is vacuous: {:?}",
+        run.second_round_tool_content
+    );
+    assert_human_channel_silent_about_drops(&run, "lossless-eviction");
+}
+
+/// A run that drops nothing says nothing. Passes today and must keep passing.
+#[tokio::test]
+#[serial]
+async fn test_a_styled_tty_run_stays_silent_when_no_result_is_trimmed_at_all() {
+    let run = run_dropped_tool_result(DroppedResultCarrier::StyledPty, "8192", 1, &[]).await;
+    assert_styled_turn_completed(&run);
+    // Fences the 8192 threshold: if drift makes this window lossy, this fails
+    // loudly instead of turning the silence below into a tautology.
+    assert!(
+        run.second_round_tool_content.contains("evidence-line"),
+        "an 8192 window must carry the whole result through to the provider, or this test \
+         asserts silence about a loss it did not intend: {:?}",
+        run.second_round_tool_content
+    );
+    assert_human_channel_silent_about_drops(&run, "no-trim");
+}
+
+/// **N1, surface 1 of 4: non-TTY.** A piped run's stderr is empty today and
+/// must stay empty - 78 assertions in this file depend on exactly that.
+#[tokio::test]
+#[serial]
+async fn test_n1_non_tty_stays_byte_identical_when_a_tool_result_is_dropped() {
+    let run =
+        run_dropped_tool_result(DroppedResultCarrier::Piped, "2048", 1, &["--no-artifacts"]).await;
+    assert!(run.success, "piped run must exit 0: {:?}", run.human);
+    assert_result_really_dropped(&run);
+    // A piped run's stderr is NOT empty - it carries six lines today - so the
+    // pin is that text itself, with only the temp path, counts, ids and
+    // timings normalized. A new drop line anywhere in it fails here.
+    assert_eq!(
+        normalize_volatile(&run.human, &run.work_root),
+        NON_TTY_STDERR_TODAY,
+        "N1: a non-TTY run's stderr must stay byte-identical to today, ids and timings \
+         aside; it read:\n{}",
+        run.human
+    );
+}
+
+/// Every line a piped eviction run writes to stderr today, normalized. Written
+/// out in full rather than searched, so a new line cannot slip in beside the
+/// ones this test knows about.
+const NON_TTY_STDERR_TODAY: &str = concat!(
+    "~ artifacts disabled: commands keep bounded previews only; large tool results are not",
+    " offloaded; existing artifacts are unchanged\n",
+    "\u{25c6} Read(<WORK>/evidence-N.txt)\n",
+    "  \u{25c7} N lines \u{b7} Nms\n",
+    "kitsu-context: {\"used\":N,\"effective\":N,\"window\":N}\n",
+    "~ run summary: N successful operation, N file(s) read, N file(s) written",
+    " (N change(s)), session not saved\n",
+    "kitsu-timing: {\"run_id\":\"N-N\",\"duration_ms\":N,\"status\":\"ok\",",
+    "\"outcome\":\"succeeded\",\"assistant\":\"committed\"}\n",
+);
+
+/// Collapse the parts of a human channel that legitimately differ run to run -
+/// the temp working directory, and every run of digits (ids, counts, timings) -
+/// so the rest can be pinned exactly.
+fn normalize_volatile(text: &str, work_root: &str) -> String {
+    let replaced = text.replace(work_root, "<WORK>");
+    let mut out = String::with_capacity(replaced.len());
+    let mut in_digits = false;
+    for ch in replaced.chars() {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                out.push('N');
+                in_digits = true;
+            }
+            continue;
+        }
+        in_digits = false;
+        out.push(ch);
+    }
+    out
+}
+
+/// **N1, surface 2 of 4: `--plain`/`NO_COLOR`.** Driven on a real PTY, because
+/// `--plain` on a pipe is already surface 1: the only way to test the plain
+/// surface distinctly is a terminal with styling turned off.
+#[tokio::test]
+#[serial]
+async fn test_n1_plain_stays_byte_identical_when_a_tool_result_is_dropped() {
+    let run = run_dropped_tool_result(
+        DroppedResultCarrier::StyledPty,
+        "2048",
+        1,
+        &["--plain", "--no-artifacts"],
+    )
+    .await;
+    assert_styled_turn_completed(&run);
+    assert_result_really_dropped(&run);
+    assert_human_channel_silent_about_drops(&run, "--plain");
+}
+
+/// **N1, surface 3 of 4: assistive (`--screen-reader`).**
+#[tokio::test]
+#[serial]
+async fn test_n1_screen_reader_stays_byte_identical_when_a_tool_result_is_dropped() {
+    let run = run_dropped_tool_result(
+        DroppedResultCarrier::StyledPty,
+        "2048",
+        1,
+        &["--screen-reader", "--no-artifacts"],
+    )
+    .await;
+    assert_styled_turn_completed(&run);
+    assert_result_really_dropped(&run);
+    assert_human_channel_silent_about_drops(&run, "--screen-reader");
+}
+
+/// **N1, surface 4 of 4: JSONL.** This card must add nothing to the stream F120
+/// settled, and must not reach for stderr. The type sequence is enumerated, so
+/// an additive event anywhere in the run fails here rather than hiding.
+#[tokio::test]
+#[serial]
+async fn test_n1_jsonl_gains_nothing_from_the_human_report_of_a_dropped_result() {
+    let run = run_dropped_tool_result(
+        DroppedResultCarrier::Piped,
+        "2048",
+        1,
+        &["--jsonl", "--no-artifacts"],
+    )
+    .await;
+    assert!(run.success, "jsonl run must exit 0");
+    assert_result_really_dropped(&run);
+    assert_eq!(
+        run.human, "",
+        "N1: a --jsonl run's stderr is empty today and the human report must not reach for it"
+    );
+    let types = run
+        .events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        types,
+        [
+            "run_started",
+            "turn_started",
+            "provider_request",
+            "provider_attempt",
+            "tool_started",
+            "tool_finished",
+            "tool_results_dropped",
+            "provider_request",
+            "provider_attempt",
+            "assistant",
+            "assistant_disposition",
+            "turn_finished",
+            "final_summary",
+        ],
+        "the human-facing report must leave F120's JSONL stream exactly as it is"
+    );
+}
+
