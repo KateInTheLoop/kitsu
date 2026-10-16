@@ -7328,6 +7328,12 @@ mod tests {
     /// here fails immediately instead of leaving a signal exit that restores
     /// less than a panic does.
     #[test]
+    // **F107**: not optional. `#[serial]` excludes other `#[serial]` tests, not
+    // plain ones, and this test reaches the process-global surface slot through
+    // PRODUCTION code rather than `SurfaceProbe`, so it can install over a
+    // serialised test's probe mid-run. Measured: 3 failures in 421 unguarded
+    // runs of `--bins`, 0 in 400 with this guard.
+    #[serial_test::serial]
     fn the_handler_byte_string_equals_the_restore_helper_output() {
         let mut helper = Vec::new();
         kitsu_tui::write_restore_sequences(&mut helper).expect("writing into a Vec cannot fail");
