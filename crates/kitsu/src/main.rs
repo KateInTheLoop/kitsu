@@ -6746,6 +6746,24 @@ fn run_transcript_key_loop<R: std::io::Read>(
                 // the footer honest: it advertises the keys this loop answers.
                 _ => continue,
             };
+            // R6-c: the two prompt jumps the overlay's footer advertises.
+            // Both bytes already fell inside the printable arm above, so
+            // before this they became a `Press::Char` that `closes` declined
+            // and the loop read again -- inert while the footer named them,
+            // which is **F75**. Dispatched here rather than beside the loop,
+            // for `page`'s reason (**F69**): the capability has to be
+            // reachable from the real decoder. The repaint is the loop's own,
+            // at the top of the next pass, exactly as a paging press is
+            // repainted.
+            let jump = match press {
+                kitsu_tui::keys::Press::Char('{') => Some(kitsu_tui::fullscreen::Jump::Prev),
+                kitsu_tui::keys::Press::Char('}') => Some(kitsu_tui::fullscreen::Jump::Next),
+                _ => None,
+            };
+            if let Some(jump) = jump {
+                overlay.jump(jump, ring, rows);
+                continue;
+            }
             if kitsu_tui::transcript::closes(press) {
                 return TranscriptExit::Closed;
             }
@@ -25021,6 +25039,153 @@ mod tests {
             )
         };
         (exit, overlay.is_following(), frames)
+    }
+
+    /// Run the real key loop over `chunks` on a ring that holds **prompt
+    /// blocks**, for R6-c's `{`/`}`, and return the same triple
+    /// `drive_transcript` does.
+    ///
+    /// A separate helper rather than a change to that one: its four existing
+    /// tests are about the close and paging bytes and their fixture has no
+    /// prompts in it, which is exactly the "nothing to jump between" case
+    /// those tests should keep exercising.
+    ///
+    /// The fixture and its arithmetic (**F61**), since the assertions below
+    /// are stated in ordinals: prompts at 0, and at 3-4 as one two-row block;
+    /// eight retained lines, nothing evicted; the geometry is 6 rows, so the
+    /// overlay's `content_rows` is 5, `follow_top` is `8 - 5 = 3`, the opening
+    /// content is ordinals 3..=7 and the jump cursor is 3.
+    #[cfg(unix)]
+    fn drive_transcript_with_prompts(chunks: &[&[u8]]) -> (TranscriptExit, bool, Vec<Vec<String>>) {
+        use kitsu_render::surface::Fd;
+
+        let mut ring = kitsu_tui::cells::CellRing::new(16);
+        ring.push_prompt("first question");
+        ring.push(Fd::Stdout, "answer one");
+        ring.push(Fd::Stdout, "answer two");
+        ring.push_prompt("second question\nwith a tail");
+        ring.push(Fd::Stdout, "answer three");
+        ring.push(Fd::Stdout, "answer four");
+        ring.push(Fd::Stdout, "answer five");
+        assert_eq!((ring.len(), ring.evicted()), (8, 0));
+        assert_eq!(
+            ring.prompt_blocks(),
+            vec![0, 3],
+            "the fixture really holds two prompt blocks"
+        );
+
+        let mut overlay = kitsu_tui::transcript::TranscriptOverlay::new();
+        let mut input = ChunkReader::new(chunks);
+        let remaining = std::rc::Rc::clone(&input.remaining);
+        let mut frames: Vec<Vec<String>> = Vec::new();
+        let exit = {
+            let mut geometry = || (6u16, 40usize);
+            let mut waiting = || remaining.get() > 0;
+            let mut paint = |frame: &[String]| frames.push(frame.to_vec());
+            run_transcript_key_loop(
+                &mut input,
+                &mut overlay,
+                &ring,
+                &mut geometry,
+                &mut waiting,
+                &mut paint,
+            )
+        };
+        (exit, overlay.is_following(), frames)
+    }
+
+    /// **Test (R6-c): the byte `{` reaches the overlay's prompt jump, and
+    /// `}` comes back.**
+    ///
+    /// Driven through the real loop, not a predicate beside it (**F69**/
+    /// **F105**): `kitsu_tui`'s own tests prove `TranscriptOverlay::jump`
+    /// answers `Jump::Prev`, and prove nothing about whether any byte ever
+    /// becomes one. `0x7b` and `0x7d` both already fall inside this loop's
+    /// `0x20..=0x7e` printable arm, so **measured before asserting**
+    /// (**F99**/**F100**): today each becomes a `Press::Char`, `closes` says
+    /// no, and the loop reads again — the frame is repainted unchanged, the
+    /// view is still following and the loop ends `Drained`. The key is inert
+    /// while R6-c's footer advertises it, which is **F75** exactly.
+    ///
+    /// Not vacuous, and specifically not satisfiable by a loop that merely
+    /// repainted: the painted content rows are asserted **by value** on both
+    /// sides, so the pre-jump frame pins what the loop painted before the byte
+    /// and the post-jump frame pins where the byte took it. Bidirectional,
+    /// because `{` moving while `}` did nothing is a live failure mode.
+    #[cfg(unix)]
+    #[test]
+    fn the_open_brace_byte_jumps_the_overlay_to_the_previous_prompt_block() {
+        let (exit, following, frames) = drive_transcript_with_prompts(&[b"{"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "`{{` scrolls; it is not a close key"
+        );
+        assert!(
+            !following,
+            "and it pinned the overlay, which is transition 12: a `{{` that \
+             left the view following did nothing"
+        );
+        assert_eq!(frames.len(), 2, "painted before the byte and after it");
+        assert_eq!(
+            &frames[0][..5],
+            [
+                "second question",
+                "with a tail",
+                "answer three",
+                "answer four",
+                "answer five",
+            ],
+            "the opening frame, ordinals 3..=7"
+        );
+        assert_eq!(
+            &frames[1][..5],
+            [
+                "first question",
+                "answer one",
+                "answer two",
+                "second question",
+                "with a tail",
+            ],
+            "and `{{` took it to the oldest block's first row, ordinals 0..=4"
+        );
+    }
+
+    /// **Test (R6-c): `}` is reachable too, and a two-row prompt block is ONE
+    /// stop.**
+    ///
+    /// `{` then `}` in a single chunk is a round trip to the block the overlay
+    /// opened on; `{` then `}` then `}` must stay there, because the second
+    /// block's two rows are one stop and there is no third block to walk into.
+    /// A loop wired to a row-walking jump would land on `with a tail` as a top
+    /// row instead, which the by-value frame catches.
+    #[cfg(unix)]
+    #[test]
+    fn the_close_brace_byte_jumps_forward_and_a_two_row_block_is_one_stop() {
+        let opening = [
+            "second question".to_string(),
+            "with a tail".to_string(),
+            "answer three".to_string(),
+            "answer four".to_string(),
+            "answer five".to_string(),
+        ];
+
+        let (exit, following, frames) = drive_transcript_with_prompts(&[b"{}"]);
+        assert_eq!(exit, TranscriptExit::Drained, "neither brace closes");
+        assert!(!following, "and the jump pinned rather than re-latching");
+        assert_eq!(
+            &frames.last().expect("a frame was painted")[..5],
+            opening.as_slice(),
+            "`{{` then `}}` is a round trip to the block the overlay opened on"
+        );
+
+        let (_, _, frames) = drive_transcript_with_prompts(&[b"{}}"]);
+        assert_eq!(
+            &frames.last().expect("a frame was painted")[..5],
+            opening.as_slice(),
+            "and a second `}}` stays on it: the two-row prompt is one stop, \
+             not two, so there is nothing further to walk to"
+        );
     }
 
     /// **Test: a lone `Esc` closes the overlay.**

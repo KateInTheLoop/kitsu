@@ -188,6 +188,40 @@ impl CellRing {
         }
     }
 
+    /// The **absolute ordinal of the first row of each prompt block**, oldest
+    /// first (requirement **R6-c**).
+    ///
+    /// A *block* is a maximal run of **adjacent** prompt-marked cells, not one
+    /// cell: [`Self::push_prompt`] stores one marked cell per line because
+    /// both frames fit one row per cell, so a two-line prompt is two marked
+    /// cells and a jump that stepped cells would stop twice inside one thing
+    /// the user typed once. Coalescing is therefore done here, where the marks
+    /// are, rather than in each of the two views that walk them.
+    ///
+    /// The ordinals are **absolute** — counted over the ring's whole lifetime,
+    /// evicted lines included — because that is the unit
+    /// [`crate::fullscreen::FullscreenView`]'s anchor is in, and mixing the
+    /// two is transition 11 going unnoticed. Only retained rows are reported,
+    /// so a block whose first rows have been evicted is reported at its oldest
+    /// row that still exists.
+    pub fn prompt_blocks(&self) -> Vec<usize> {
+        // One pass over the retained marks, keeping the run's head: a block
+        // starts at a marked row whose predecessor in the ring is not marked.
+        // The first retained row is a head whenever it is marked, which is
+        // also the partial-eviction answer -- the row the block started on is
+        // gone from the process, so its oldest surviving row is the stop.
+        let oldest = self.evicted();
+        let mut blocks = Vec::new();
+        let mut previous_marked = false;
+        for (index, line) in self.lines.iter().enumerate() {
+            if line.prompt && !previous_marked {
+                blocks.push(oldest + index);
+            }
+            previous_marked = line.prompt;
+        }
+        blocks
+    }
+
     /// The retained lines, oldest first.
     pub fn lines(&self) -> Vec<CellLine> {
         self.lines.iter().cloned().collect()
@@ -457,6 +491,152 @@ mod tests {
             Fd::Stdout,
             "a prompt belongs on the conversation's stream, not the \
              diagnostic one"
+        );
+    }
+
+    /// **R6-c: a multi-line prompt is ONE jump stop, not one per line.**
+    ///
+    /// This is the decision the card turns on. `push_prompt` stores one marked
+    /// cell per line because both frames fit one row per cell, so a two-line
+    /// prompt is two marked cells; a `}` that walked marked *rows* would stop
+    /// twice inside one thing the user typed once, which is not what "the next
+    /// prompt" means. Adjacent marked rows therefore coalesce into one
+    /// **block**, and the block is reported at its **first** row.
+    ///
+    /// Not vacuous, and specifically not satisfiable by a row-walker: the
+    /// three-line prompt's rows are at ordinals 1, 2 and 3 and the asserted
+    /// answer names only 1, so an implementation that returned every marked
+    /// ordinal fails with 1, 2, 3, 5 against 1, 5; and the single-line prompt
+    /// at 5 is there so a coalescer that swallowed *all* prompts into one
+    /// block fails too. The marked ordinals are asserted alongside, so the
+    /// fixture is proved to really hold four marked rows before the
+    /// coalescing claim is made (**F99**).
+    #[test]
+    fn adjacent_prompt_rows_coalesce_into_one_jump_block() {
+        let mut ring = CellRing::new(16);
+        ring.push(Fd::Stdout, "a preamble line");
+        ring.push_prompt("first line\nsecond line\nthird line");
+        ring.push(Fd::Stdout, "an answer");
+        ring.push_prompt("a one line prompt");
+
+        let marked: Vec<usize> = ring
+            .lines()
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.is_prompt())
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            marked,
+            vec![1, 2, 3, 5],
+            "the fixture really holds four marked rows, three of them adjacent"
+        );
+
+        assert_eq!(
+            ring.prompt_blocks(),
+            vec![1, 5],
+            "two blocks, each at its first row: the three-line prompt is ONE \
+             stop, so a jump cannot land inside it"
+        );
+    }
+
+    /// **Two prompts submitted back to back are still one block**, because the
+    /// rule is adjacency of marked rows and nothing separates them.
+    ///
+    /// Deliberate and pinned rather than left to the implementation: it is the
+    /// one case where "a block" and "a submission" differ, and a
+    /// `prompt_blocks` that tracked submissions instead of adjacency would
+    /// answer `[0, 1]` here and stop twice on rows the user sees as one
+    /// run of their own text.
+    #[test]
+    fn two_prompts_with_nothing_between_them_are_one_block() {
+        let mut ring = CellRing::new(16);
+        ring.push_prompt("first submission");
+        ring.push_prompt("second submission");
+        ring.push(Fd::Stdout, "an answer");
+        ring.push_prompt("third submission");
+
+        assert_eq!(ring.len(), 4, "four rows, three of them marked");
+        assert_eq!(
+            ring.prompt_blocks(),
+            vec![0, 3],
+            "adjacency is the rule, so the two back-to-back submissions are \
+             one run of the user's text and one stop"
+        );
+    }
+
+    /// **A ring with no prompts offers nothing to jump between**, and neither
+    /// does an empty one — the two cases where `{`/`}` must report "nowhere to
+    /// go" rather than land somewhere arbitrary.
+    ///
+    /// Not vacuous: the no-prompt ring is asserted to be non-empty first, so
+    /// this is not an empty answer from an empty ring twice over.
+    #[test]
+    fn a_ring_with_no_prompts_has_no_jump_blocks() {
+        assert_eq!(
+            CellRing::new(8).prompt_blocks(),
+            Vec::<usize>::new(),
+            "an empty ring"
+        );
+
+        let mut ring = CellRing::new(8);
+        ring.push(Fd::Stdout, "assistant text");
+        ring.push(Fd::Stderr, "* tool ran");
+        assert_eq!(ring.len(), 2, "the ring really holds lines");
+        assert_eq!(
+            ring.prompt_blocks(),
+            Vec::<usize>::new(),
+            "none of which is the user's, so there is nothing to jump between"
+        );
+    }
+
+    /// **The ordinals are absolute, and a block whose head has been evicted is
+    /// reported at its oldest row that still exists.**
+    ///
+    /// Absolute because that is the unit `FullscreenView`'s anchor is in: a
+    /// retained-index answer would drift under eviction while looking
+    /// unchanged, which is transition 11 going unnoticed. The partial block is
+    /// the case the sliding window forces — the row the block *started* on is
+    /// gone from the process, so the stop has to be the oldest row of it that
+    /// is left, not an ordinal the frame can no longer paint.
+    ///
+    /// The arithmetic, done rather than assumed (**F61**): a 4-line ring fed a
+    /// three-line prompt at ordinals 0..2 plus one plain line at 3 is full;
+    /// one more push evicts ordinal 0, leaving marked rows at 1 and 2, so the
+    /// block is 1; a second push evicts ordinal 1, leaving one marked row at
+    /// 2, so the block is 2; a third leaves no marked row at all.
+    #[test]
+    fn prompt_block_ordinals_are_absolute_and_survive_a_partial_eviction() {
+        let mut ring = CellRing::new(4);
+        ring.push_prompt("l0\nl1\nl2");
+        ring.push(Fd::Stdout, "plain 3");
+        assert_eq!((ring.len(), ring.evicted()), (4, 0), "the ring is full");
+        assert_eq!(
+            ring.prompt_blocks(),
+            vec![0],
+            "one block, at the ring's very first line"
+        );
+
+        ring.push(Fd::Stdout, "plain 4");
+        assert_eq!(ring.evicted(), 1);
+        assert_eq!(
+            ring.prompt_blocks(),
+            vec![1],
+            "the block's first row is gone, so the stop is its oldest \
+             surviving row -- an absolute ordinal, not an index"
+        );
+
+        ring.push(Fd::Stdout, "plain 5");
+        assert_eq!(ring.evicted(), 2);
+        assert_eq!(ring.prompt_blocks(), vec![2], "one surviving row of it");
+
+        ring.push(Fd::Stdout, "plain 6");
+        assert_eq!(ring.evicted(), 3);
+        assert_eq!(
+            ring.prompt_blocks(),
+            Vec::<usize>::new(),
+            "and now the whole block is gone: `/export` is the route to it, \
+             not a jump"
         );
     }
 

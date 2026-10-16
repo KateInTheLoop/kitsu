@@ -368,8 +368,13 @@ and `q` or `Esc` closes it and leaves the frame behind it exactly where it was -
 paging the overlay never moves the view underneath. Its keys are listed on its
 own footer rather than in a global table, because they are live only while it
 holds the screen; `Ctrl+O` itself is listed by `/help tui`, with the composer's
-other chords. Searching it, jumping between prompts, dumping it to scrollback
-and opening it in `$EDITOR` are **not** wired yet.
+other chords. `{` and `}` jump to the previous and next prompt, so you can walk
+back through what you asked rather than scrolling. A prompt that spans several
+lines is **one** stop, not one per line -- and so are two submissions with
+nothing printed between them, which is the same rule seen from the other side.
+A jump that cannot move the frame does nothing at all: it does not quietly stop
+the overlay following new output. Searching the transcript, dumping it to
+scrollback and opening it in `$EDITOR` are **not** wired yet.
 
 `Ctrl+Z` suspends from fullscreen through the same path the other renderers use,
 though the alternate screen's contents are the terminal's across the stop. `--tui

@@ -37,7 +37,7 @@
 //! dispatch, which is finding **F89** in the direction that bites.
 
 use crate::cells::CellRing;
-use crate::fullscreen::{FullscreenView, Page};
+use crate::fullscreen::{FullscreenView, Jump, Page};
 use crate::keys::Press;
 
 /// The transcript overlay: a [`FullscreenView`] over the ring plus the
@@ -56,12 +56,14 @@ impl TranscriptOverlay {
     /// advertised **in situ** and not in `keys::BINDINGS`, whose guard is a
     /// sweep over the agent view's decoder (**F82**).
     ///
-    /// It names the four paging presses [`Self::page`] forwards and the two
-    /// presses [`closes`] answers, and nothing else: `/` search, `{`/`}`
-    /// prompt jumps, `[` dump and `v` editor are later pieces of **R6**, and
-    /// a row that named one of them before anything dispatched it would be
-    /// finding **F89** painted onto the screen.
-    const FOOTER: &'static str = "PgUp/PgDn scroll  Ctrl+Home/End oldest/newest  q/Esc close";
+    /// It names the four paging presses [`Self::page`] forwards, the two
+    /// prompt jumps [`Self::jump`] answers and the two presses [`closes`]
+    /// answers, and nothing else: `/` search, `[` dump and `v` editor are
+    /// later pieces of **R6**, and a row that named one of them before
+    /// anything dispatched it would be finding **F89** painted onto the
+    /// screen.
+    const FOOTER: &'static str =
+        "PgUp/PgDn scroll  {/} prompt  Ctrl+Home/End oldest/newest  q/Esc close";
 
     /// An overlay that follows the newest line.
     pub fn new() -> Self {
@@ -93,6 +95,16 @@ impl TranscriptOverlay {
     /// see.
     pub fn page(&mut self, press: Page, ring: &CellRing, rows: u16) {
         self.view.page(press, ring, Self::content_rows(rows));
+    }
+
+    /// Jump to the nearest prompt block in `jump`'s direction (requirement
+    /// **R6-c**), and report whether there was one.
+    ///
+    /// Delegated whole to the held [`FullscreenView`], against
+    /// [`Self::content_rows`] and not `rows`, for [`Self::page`]'s reason: the
+    /// window a jump clamps against is the one the frame paints.
+    pub fn jump(&mut self, jump: Jump, ring: &CellRing, rows: u16) -> bool {
+        self.view.jump(jump, ring, Self::content_rows(rows))
     }
 
     /// The rows to paint, oldest first, with the footer last.
@@ -127,7 +139,7 @@ pub fn closes(press: Press) -> bool {
 mod tests {
     use super::{closes, TranscriptOverlay};
     use crate::cells::CellRing;
-    use crate::fullscreen::{FullscreenView, Page};
+    use crate::fullscreen::{FullscreenView, Jump, Page};
     use crate::keys::Press;
     use kitsu_render::surface::Fd;
 
@@ -309,6 +321,116 @@ mod tests {
         );
     }
 
+    /// **R6-c in the overlay**: `{`/`}` jump between prompt blocks, and the
+    /// jump is **delegated** to the held [`FullscreenView`] against the
+    /// overlay's *content* rows, not its window.
+    ///
+    /// The fixture and its arithmetic (**F61**), since every row below is
+    /// stated in ordinals: prompts at 0, and at 3-4 as one two-row block;
+    /// eight retained lines; a 6-row window, so `content_rows` is 5 and
+    /// `follow_top` is `8 - 5 = 3`. The opening content is therefore ordinals
+    /// 3..=7 and the jump cursor is 3.
+    ///
+    /// Not vacuous, and specifically not satisfiable by an overlay that passed
+    /// its full height down: the `}` half is compared against a reference
+    /// `FullscreenView` at the content height, and at height 6 the reference's
+    /// `follow_top` would be 2 rather than 3, so the clamped landing differs.
+    /// The frames are also asserted to have moved, so a `jump` that returned
+    /// `true` without doing anything fails.
+    #[test]
+    fn the_overlay_jumps_between_prompt_blocks_over_its_content_rows() {
+        const ROWS: u16 = 6;
+        const CONTENT: u16 = 5;
+        let mut ring = CellRing::new(16);
+        ring.push_prompt("first question");
+        ring.push(Fd::Stdout, "answer one");
+        ring.push(Fd::Stdout, "answer two");
+        ring.push_prompt("second question\nwith a tail");
+        ring.push(Fd::Stdout, "answer three");
+        ring.push(Fd::Stdout, "answer four");
+        ring.push(Fd::Stdout, "answer five");
+        assert_eq!((ring.len(), ring.evicted()), (8, 0));
+        assert_eq!(ring.prompt_blocks(), vec![0, 3], "the fixture's two blocks");
+        assert_eq!(
+            TranscriptOverlay::content_rows(ROWS),
+            CONTENT,
+            "the footer takes one row, so the jump clamps over five"
+        );
+
+        let mut overlay = TranscriptOverlay::new();
+        let mut reference = FullscreenView::new();
+        let opened = overlay.frame(&ring, ROWS, 80);
+        assert_eq!(
+            &opened[..usize::from(CONTENT)],
+            [
+                "second question",
+                "with a tail",
+                "answer three",
+                "answer four",
+                "answer five",
+            ],
+            "ordinals 3..=7"
+        );
+
+        assert!(
+            overlay.jump(Jump::Prev, &ring, ROWS),
+            "there is a block above the cursor (ordinal 0, below ordinal 3)"
+        );
+        assert!(reference.jump(Jump::Prev, &ring, CONTENT));
+        let at_first = overlay.frame(&ring, ROWS, 80);
+        assert_ne!(at_first, opened, "the overlay's frame actually moved");
+        assert_eq!(
+            &at_first[..usize::from(CONTENT)],
+            [
+                "first question",
+                "answer one",
+                "answer two",
+                "second question",
+                "with a tail",
+            ],
+            "ordinals 0..=4: the oldest block, at its first row"
+        );
+        assert_eq!(
+            &at_first[..usize::from(CONTENT)],
+            reference.frame(&ring, CONTENT, 80).as_slice(),
+            "and it is the held view's own answer, not a second anchor"
+        );
+        assert_eq!(at_first[usize::from(CONTENT)], overlay.footer(80));
+        assert!(!overlay.is_following(), "a jump pins the overlay");
+        assert_eq!(overlay.is_following(), reference.is_following());
+
+        // The other direction, and the half that catches a jump handed the
+        // full window height instead of the content height.
+        assert!(overlay.jump(Jump::Next, &ring, ROWS));
+        assert!(reference.jump(Jump::Next, &ring, CONTENT));
+        let back = overlay.frame(&ring, ROWS, 80);
+        assert_eq!(
+            &back[..usize::from(CONTENT)],
+            &opened[..usize::from(CONTENT)],
+            "`}}` lands back on the second block, clamped to follow_top = 3"
+        );
+        assert_eq!(
+            &back[..usize::from(CONTENT)],
+            reference.frame(&ring, CONTENT, 80).as_slice(),
+            "delegated, at the content height and not the window's"
+        );
+        assert!(
+            !overlay.is_following(),
+            "and landing on the newest block pins rather than re-latching"
+        );
+
+        // Nowhere to go, in the overlay too: the keys report it rather than
+        // moving the frame to somewhere arbitrary.
+        let mut at_oldest = TranscriptOverlay::new();
+        assert!(at_oldest.jump(Jump::Prev, &ring, ROWS));
+        let oldest_frame = at_oldest.frame(&ring, ROWS, 80);
+        assert!(
+            !at_oldest.jump(Jump::Prev, &ring, ROWS),
+            "no block above the oldest one"
+        );
+        assert_eq!(at_oldest.frame(&ring, ROWS, 80), oldest_frame);
+    }
+
     /// `q` and `Esc` close the overlay, and **nothing else does**, asserted by
     /// a total sweep over the key space the overlay's decoder can produce.
     ///
@@ -342,6 +464,19 @@ mod tests {
     /// Asserted as painted bytes (**F71**) and in both directions, so a footer
     /// that advertised everything and a footer that advertised nothing both
     /// fail.
+    ///
+    /// **R6-c moved one word, and only one.** `{`/`}` were in the forbidden
+    /// set at R6-a because nothing dispatched them; R6-c dispatches them, so
+    /// the capability word `jump` leaves the forbidden set and the two
+    /// characters join the advertised one. `search`, `dump`, `editor`,
+    /// `scrollback` and the literal `[` **stay** forbidden: **R6-b** and
+    /// **R6-d** are still unbuilt, and this guard is what stops the footer
+    /// promising them.
+    ///
+    /// The two braces are checked by their **character**, unlike the words
+    /// above, and that is sound where `/`, `n` and `v` were not: no other
+    /// token in a key row contains a brace, so the assertion cannot be
+    /// satisfied only by its own fixture (**F58**).
     #[test]
     fn the_footer_advertises_the_overlays_keys_and_no_key_it_does_not_answer() {
         let overlay = TranscriptOverlay::new();
@@ -350,7 +485,7 @@ mod tests {
             !footer.is_empty(),
             "the overlay advertises its keys in situ"
         );
-        for advertised in ["q", "Esc", "PgUp", "PgDn"] {
+        for advertised in ["q", "Esc", "PgUp", "PgDn", "{", "}"] {
             assert!(
                 footer.contains(advertised),
                 "the footer names {advertised:?}, which this overlay \
@@ -365,7 +500,7 @@ mod tests {
         // only its own fixture can satisfy (**F58**). The capability words are
         // what an over-eager row would actually say.
         let lowered = footer.to_ascii_lowercase();
-        for unanswered in ["search", "dump", "editor", "scrollback", "jump"] {
+        for unanswered in ["search", "dump", "editor", "scrollback"] {
             assert!(
                 !lowered.contains(unanswered),
                 "the footer must not advertise {unanswered:?}: nothing \
