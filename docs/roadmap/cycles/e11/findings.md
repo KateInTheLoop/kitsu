@@ -5465,3 +5465,76 @@ Chosen: **one declarative macro whose single list expands into both a sample-val
 > *A contract has as many coverage dimensions as it has places a name must appear, and enumerating those is the same problem one level up.*
 
 That is the honest end of the thread that runs **F114 → F124 → F126**: a README row that no grep could reveal, a gate list curated from the crates one epic touched, and a contract check that pinned the parts someone thought of. Each was invisible because the check shared a mental model with the thing checked. **This card fixed the third and named the fourth** — the enumeration of the dimensions themselves — rather than pretending the regress had bottomed out.
+
+## F127 — T5-S7 is blocked on an external spec, and saying so is the deliverable
+
+Took T5-S7 (the herdr integration manifest) as the next numbered story and measured it before briefing. **It cannot be built verifiably here.**
+
+**H4 reads:** *"Kitsu SHOULD ship a herdr integration manifest (`herdr-plugin.toml` or screen manifest) under `integrations/herdr/` so kitsu is detected natively."* It names **two** alternatives and specifies **neither**.
+
+**And that sentence is the only description of the format in the entire repository.** Every other `herdr` occurrence — the design doc, the plan, nine cycle records — discusses the integration *conceptually*. There is no schema, no example, and no herdr installation to test detection against.
+
+**So a manifest written now would be guesswork asserting a third-party schema nobody in this repo can check** — an artifact that *looks* like an integration and may not be one. That is the shape this session has refused repeatedly: the unverifiable claim that reads as settled. And **H4 is a SHOULD**, so declining to ship it violates no requirement.
+
+**Recorded with what it actually needs** — herdr's plugin/manifest schema, from a human or from herdr's own documentation — after which it is a small card. That is the third item now explicitly blocked on external input, alongside **Q1**'s live terminal matrix and **R6-d**'s dump-exposure decision.
+
+**The general point, since this is the fourth time this epic:** *"this card needs information that does not exist in the repository"* is a finding, not a failure to deliver. Writing the artifact anyway would convert a known unknown into an unknown unknown — a file future readers would reasonably trust.
+
+## F128 — F107-b done: only two of four tests leaked, and both leaked two slots
+
+**The brief said four tests leak `FOREGROUND_RECAP`. Two do.** Captured, not reasoned:
+
+```
+BEFORE:  the_jobs_view_command_…              recap_is_some=false
+         the_status_row_and_the_prompt_label_… recap_is_some=true
+         the_detach_command_…                 recap_is_some=false
+         the_views_attach_…                   recap_is_some=true
+```
+
+The two clean ones end with `apply_detach_command`, which calls `replay_foreground_recap` — **they already detach through production, which is exactly the shape the card asked for.** The agent left them alone rather than "fixing" them to make the count four. **Twentieth wrong brief.**
+
+### A second leak the same two carried, which the brief did not mention
+
+Probing `Arc::ptr_eq` on `active_surface()` at entry versus exit showed both leaking tests also left **the surface slot itself** holding the `BufferedSurface` that `begin_foreground_buffering` installed. **Strictly worse than the recap slot alone**, and the same cleanup closes it.
+
+And `the_status_row…` needed **two** cleanup calls, not one: it attaches, clears the binding cell directly (*which production never does* — the real routes go through `replay_foreground_recap`), then **attaches again**. Two buffers, one overwrite, and the first becomes unreachable through the global — so the cleanup had to balance each attachment where it ends, not all at the end.
+
+### The hypothetical is constructible, and it reproduced the assessor's sentence verbatim
+
+A throwaway detach-first test, run against the leak:
+
+```
+assertion `left == right` failed: the detach-first test's own probe must still be installed
+  left: []
+ right: ["after the detach-first"]
+```
+
+`left: []` because the detach-first call took **the other test's leaked buffer** and `set_surface`'d its inner surface over the live probe — the line went to real stderr instead. With the cleanup: passes. **Then deleted** — evidence, not a deliverable.
+
+**Production paths only**, chosen per test with a measured reason: `apply_inline_detach` (the composer loop's own arm, where `←` and `Ctrl+X d` land) for one; `replay_foreground_recap` for the other, because its binding is already `None` and the keystroke routes would short-circuit on `take()` and replay nothing. **No test-only teardown, no `#[cfg(test)]` reset.**
+
+**Verification proportionate to the subject:** the card is about cross-test contamination, so a single green run proves little. **61 debug + 61 release `--bins` runs, zero failures.**
+
+## F129 — my own committed code was fmt-dirty for two cards, and my gate said clean
+
+`cargo fmt -p kitsu -- --check` reported **six deviations in `crates/kitsu/tests/cli.rs`** — a file **unmodified in the working tree**, so the dirt was **committed**, by me, in the two `tool_results_dropped` cards. Flagged by the F107-b agent as *"not mine, but the next card to run fmt will sweep it into its diff."*
+
+**Fixed in this commit**, and verified semantically inert before accepting: the token streams are **identical modulo trailing commas** (which rustfmt drops when joining a multi-line call onto one line, and which are meaningless in Rust), the suite is green at 256, and `--check` is now clean. A naive string-literal comparison initially flagged a difference; it was a regex artifact — a quote inside a doc comment ran the match on into code — and both files have identical literal counts.
+
+**Why the gate missed it:** my gate list carries `cargo fmt -p kitsu -- --check`, agents reported it clean, and it was not. **The most likely explanation is that it was run before the final test edits**, which is the one ordering a per-card checklist cannot express. Noted rather than solved: **a gate that runs before the last edit is not a gate**, and the fix is to run fmt last, after the suites, not alongside them.
+
+## F130 — a twelfth flake, captured whole this time: ETXTBSY staging an executable
+
+During my post-fmt re-run, `kitsu-tools --lib` failed **412 passed / 1 failed** on `external::backend::tests::dropping_live_supervisor_transfers_and_cleans_all_owned_workers`. **In a crate my change does not touch.** Three re-runs: 413, 413, 413. In isolation: passes.
+
+**Captured whole to its own file** (1 142 lines) — and the assertion is the diagnosis:
+
+```
+cannot stage immutable executable: Device or resource busy (os error 16)
+```
+
+**ETXTBSY**, not disk space (`/tmp` at 20%). A test tried to write an executable **another process has open for execution** — parallel tests contending for one staging path.
+
+**So it is the same shape as F107, in a different medium:** shared mutable state across parallel tests, where the shared thing is a **filesystem path** rather than a process-global. Not fixed here — different crate, and `kitsu-tools` holds the maintainer's uncommitted work — but **carded with its mechanism named**, which is more than the eleventh flake has after six sightings' worth of runs.
+
+**And this is why the capture rule exists.** My own truncated capture two cards ago left the eleventh flake unidentifiable to this day. This one took one `grep -o` to diagnose because the whole run was kept.

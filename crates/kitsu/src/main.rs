@@ -35802,6 +35802,19 @@ mod tests {
         // A view that was never shown is the same answer.
         apply_agent_view_exit(&AgentViewExit::declined(), &mut attached);
         assert_eq!(attached, Some(ids[0]));
+
+        // **F107-b**: end the attachment before returning, or this test
+        // leaves `FOREGROUND_RECAP` holding a buffer and the surface slot
+        // holding the `BufferedSurface` that displaced the real one. Harmless
+        // only while every later path attaches before it detaches; a
+        // detach-first test would `set_surface` this test's dead buffer.
+        // Driven through the composer loop's own detach arm -- the route both
+        // `\u{2190}` and `Ctrl+X d` land in -- rather than a test-only
+        // teardown, because the thing that must be exercised is the
+        // production end of an attachment. Measured: the slot is `Some(..)`
+        // here without this call and `None` with it, and the displaced
+        // surface is reinstalled.
+        let _ = apply_inline_detach(&mut attached, String::new());
     }
 
     /// Finding **F76**, end to end: **`Ctrl+X d` with a line typed detaches
@@ -36046,6 +36059,14 @@ mod tests {
             "A5: `\u{2190}` on an empty composer detaches while attached"
         );
         *binding.lock().expect("the binding") = None;
+        // **F107-b**: clearing the cell is the whole of the detach for the
+        // two derived surfaces, but it is not the whole of the attachment --
+        // `apply_agent_view_exit` also installed a recap buffer, and only
+        // `replay_foreground_recap` (the one function all four production
+        // transitions out of an attachment call) takes it back out. Without
+        // it the re-attach below nests a second buffer over the first and the
+        // test returns with both leaked.
+        replay_foreground_recap(ids[0]);
         assert_eq!(label(), BASE, "the label goes back to the session's own");
         assert!(
             !row().contains("attached"),
@@ -36068,6 +36089,10 @@ mod tests {
             "A5: `Ctrl+X d` detaches too"
         );
         *binding.lock().expect("the binding") = None;
+        // **F107-b**, as above: the second attachment's buffer, ended through
+        // the production function. Measured: `FOREGROUND_RECAP` is `None` and
+        // the surface this test started with is reinstalled.
+        replay_foreground_recap(ids[0]);
         assert!(!row().contains("attached"), "{:?}", row());
         assert_eq!(label(), BASE);
     }
