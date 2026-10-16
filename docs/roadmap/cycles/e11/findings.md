@@ -5764,3 +5764,37 @@ Derived by matching each requirement id the design **defines** (35) against ever
 **ADR-1** records a decision that is **accepted and unexecuted**: R1's renderer flip was never a question of *whether*, only *when*, and the answer is a release boundary. What blocks it is **Q1's live terminal matrix**, which no agent can produce. Worth stating plainly: **the flip is not blocked on engineering.**
 
 **ADR-3** records a **deferral with its reopening condition** — no socket API, because the state file and `agent_wait` already serve the integration, and **H4 is itself blocked on herdr's manifest spec**, so designing a socket against an unknown consumer is how a second control surface outlives its reason. *"Until one exists, the state file is the contract."*
+
+### F62's doc sweep: ten sites, not three — and two of them disagree about what the flag does
+
+The test author named three documentation sites for `--no-alt-screen` / `alternate_screen`. **Sweeping every live document found ten**, which is the F110 discipline paying off again: *fix the siblings, not the sites you were handed.*
+
+**User-facing:** `README.md:663` (the flag row), `README.md:1173` (the key row), `docs/functionality.md:573-574` (the prose), `CHANGELOG.md:380` (a key list).
+**Design:** `:132`, `:173`, `:480-481`, `:1408`, `:1561`, `:1896`, `:2041`.
+
+### Two of them describe the flag differently
+
+- **`README.md:663`** — *"Force `[tui] alternate_screen` to **`never`**"*
+- **`docs/tui-and-agent-view-design.md:1408`** — *"`--no-alt-screen` forces **`inline`**"*
+
+**One says the flag sets a screen value; the other says it sets a renderer mode.** Those are different claims about the same switch, and they have coexisted long enough that the flag's own doc comment (*"a one-way force: it beats any `[tui] alternate_screen` value"*) matches only the first. **Neither is currently true**, since the flag is honoured by nothing — but when the in-viewport path exists, somebody will have to pick, and the two sentences will not pick the same thing.
+
+**Worth noting which is more defensible:** `inline` is a **renderer**, and forcing it would also disable fullscreen, which is a much larger claim than *"do not take the alternate screen"*. The screen-value reading is the narrower and more likely intent. **Recorded, not resolved** — T5-S4 owns the fallback and should settle it.
+
+### And the design already recorded the gap honestly
+
+`:480-481` has said all along: *"`[tui] alternate_screen = never` does not yet get the in-viewport overlay this design describes elsewhere. That path is unexercised and `alternate_screen` remains a key without a consumer."*
+
+**So the design was honest and the README was not.** The gap was documented where implementers read and promised where users read — which is the worse direction, and exactly the asymmetry **F114** found with the undocumented overlay, inverted: there the capability existed and the README omitted it; here it does not exist and the README promises it.
+
+**The use case makes it sharper.** README:663 names the scenario: *"for multiplexers where the alternate screen misbehaves."* So the user most misled is the one the row was written for — in tmux, watching the alternate screen misbehave, passing the flag, and getting nothing. **A promise is most costly to the reader who needs it most.**
+
+### F62 closed by refusal — and the implementer kept the variant for F90's reason
+
+Shipped as ruled: both doors refused, `auto`/`always` untouched. Two details worth keeping.
+
+**It avoided a substring to keep an existing test honest.** The argv message deliberately does **not** contain `invalid value`, because `test_no_alt_screen_is_a_bare_switch_that_composes_with_tui` asserts stderr carries neither `unexpected argument` nor `invalid value` for that flag. So **the refusal fires and that test still passes untouched** — the flag still *parses*, it is then refused, which is exactly the distinction the older test was written to protect.
+
+**And it hit the consequence I had only recorded, then reasoned past it correctly.** Once nothing constructs `AlternateScreen::Never`, the compiler warns and `-D warnings` fails. The obvious fix is to delete the variant. **It kept the variant with a dead-code allowance instead**, on the grounds that deleting it would turn *"recognised, not yet available"* into *"not a value"* — **F90's inversion, applied unprompted to a type rather than to prose.** That is the difference between a user being told to wait and a user being told they imagined the feature.
+
+**The practice that made this card cheap** was the test author proving mutation A — *the intended refusal makes all five file-side tests green* — **before** hand-off. Eleven unsatisfiable assertions this epic were found in review or by an implementer hitting a wall; this is the first card where reachability was demonstrated in advance. **Worth making standard: a test author who has built the fix once knows the tests are satisfiable, and nobody else can know it as cheaply.**

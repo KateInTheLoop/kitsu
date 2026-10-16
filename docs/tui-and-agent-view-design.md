@@ -480,6 +480,29 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   `[tui] alternate_screen = never` does not yet get the in-viewport overlay this
   design describes elsewhere. That path is unexercised and `alternate_screen`
   remains a key without a consumer.
+
+  **Closed in F62 by refusal, not by implementation.** The key had **no consumer
+  at all** — all three values did the same nothing, so `auto` was accidentally
+  right and **`never` was a lie**. Both doors that produce it are now **refused by
+  name**: the config value at load, and `--no-alt-screen` in argv validation, which
+  fires for **every** subcommand including `doctor` — deliberately, because
+  `doctor` is where a user goes to learn whether their setup is sound, and a global
+  flag refused on some subcommands and accepted on others is a rule the user must
+  memorise. `auto` and `always` keep working: they describe today's behaviour.
+
+  The messages say **"not available yet"**, never "not valid" — the value is a
+  coherent thing to want and kitsu intends to honour it, and **F90** applies.
+  **Recognised spellings and accepted values are now different sets**: a typo still
+  gets all three in the vocabulary error, while the refusal lists the two accepted.
+  And `AlternateScreen::Never` **survives as a variant** with its dead-code
+  allowance, because deleting it would turn *"recognised, not yet available"* into
+  *"not a value"* — the same inversion F90 names.
+
+  **T5-S4 owns the implementation**, and it must also settle a disagreement this
+  sweep found: `:1408` says the flag forces **`inline`** while `README` said it
+  forces **`never`**. Those are different claims — a renderer versus a screen
+  value — and forcing a renderer would also disable fullscreen, a much larger
+  promise than *"do not take the alternate screen"*.
 - **A2** Rows MUST be grouped by state in this order: *Needs input*, *Working*,
   *Done (unviewed)*, *Done (viewed)*, *Failed*, *Cancelled*. Each row: state
   label, id, name or task head, model/profile, last activity + age, tokens.
@@ -1893,7 +1916,7 @@ guard on half of it.
 ```toml
 [tui]
 mode = "inline"             # classic | inline | fullscreen
-alternate_screen = "auto"   # auto | always | never
+alternate_screen = "auto"   # auto | always; `never` recognised but refused (F62)
 prefix = "ctrl+x"
 title = true
 left_arrow_opens_agents = true
