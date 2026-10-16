@@ -1077,6 +1077,42 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   `$XDG_RUNTIME_DIR/kitsu/<pid>.json` on every registry generation change,
   containing the process state plus the redacted thread DTO array (bounded by
   the existing timeline limits), removed on clean exit.
+
+  **Shipped in H2-title, with two deviations stated rather than hidden.** The
+  state-file clause was already built; the title clause had been specified since
+  this epic began and **never implemented** — `tui_bridge` pushed and popped the
+  title *stack* in production **without consulting `tui.title`**, and the OSC 2
+  string was written nowhere, because the only code that would write it has no
+  non-test caller (deliberately: **F93**, routing through it also enables raw mode
+  and would staircase several hundred direct writers). So `tui.title` gated
+  **neither** half — an **unimplemented requirement wearing a config key**, which
+  **F139** records as a different diagnosis from a key whose referent was never
+  specified.
+
+  **Rendering, which H2 left as alternation:** `kitsu · <state> · <N> agent[s]`.
+  The count is **never omitted at zero** — H2's audience is a parser, and a title
+  that changes shape at zero makes *"no agents"* and *"stale title"*
+  indistinguishable from outside; `1 agent` is singular because people read it
+  too. The state word comes from `agent_state_file::process_state` **verbatim**, so
+  the *blocked outranks working* precedence stays in one home.
+
+  **Deviation 1 — cadence.** H2 specifies the *state file* updates "on every
+  registry generation change". **The title does not**: the registry's watch channel
+  is subscribed only behind an off-by-default environment variable, so there is no
+  general change hook in a chat session. The title rides the three
+  `publish_agent_state` sites — session boundary, idle prompt, turn start — and is
+  therefore **accurate at the prompt and at the start of a turn, and can go stale
+  during one.** Closing that needs a change signal this design does not currently
+  provide.
+
+  **Deviation 2 — the title outlives the process outside fullscreen.** Only
+  `enter_fullscreen` pushes the title stack, so a title set in `classic` or
+  `inline` is never popped and **survives kitsu's exit** on every terminal, not
+  only under a multiplexer. The asymmetry predates this card in the opposite
+  direction: the dying-signal restore already contains the **pop**, so an inline
+  session writes a pop having never pushed. **Carded separately** — it is beyond
+  H2's text, and the fix (push at session start whenever the key is on, pop in the
+  inline exit path) is a decision this card deliberately did not take.
 - **H3** A `[hooks] on_agent_state = "<cmd>"` MUST run on agent state
   transitions, mirroring herdr's plugin events and Claude Code's
   `Notification` hook. Local command only (N7). Three decisions settled while
