@@ -10,6 +10,13 @@ shapes may change in any minor release.
 ## [Unreleased]
 
 ### Fixed
+- **A "Text file busy" command failure now says it is transient.** Running a tool
+  while something still has it open for writing -- an editor mid-save, a build
+  writing the binary, a tool being replaced -- failed with a bare
+  `command failed: Text file busy (os error 26)`, which reads like a broken tool.
+  The message now adds that the condition is transient and that retrying once the
+  writer has finished will work. The OS error is still reported verbatim, and no
+  other spawn failure is described as transient.
 - **A failed executable staging now names the step that failed.** When kitsu pins
   and hashes a contained command's executable, eighteen different operations could
   fail into one message -- `cannot stage immutable executable: <os error>` -- so an

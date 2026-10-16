@@ -5668,3 +5668,34 @@ So: **mechanism derived, independently reproduced in a harness, not reproduced i
 **Carded, not fixed:** a bounded retry around the spawn in `run_supervised_command`. It is safe with respect to the security story — `cwd` revalidation, root revalidation and `observe_executable` all run before the spawn, so a retry around the spawn alone reopens no check-to-exec window that is not already documented. But it needs a bound, a backoff, a decision on re-running revalidation per attempt, and a test — **so it is a test-first card, and a defensible alternative is to keep failing and say the condition is transient.**
 
 **Test-side mitigation does not exist**, and that is worth recording: the F133 test's own hygiene is already correct, the writer comes from siblings it cannot control, no copy-or-rename trick changes the inode's writecount, and `#[serial]` would not help because the `rg`/`sh` spawners are not serial.
+
+## F136 — F135 shipped as the message, not the retry; and a lint exception I refused
+
+**Design (B) chosen over a bounded retry, on measurement.** The test author read what each pre-spawn check pins, and **the answer decided the card**:
+
+- **`observe_executable` pins a path and a stat snapshot** — `canonical_path, length, readonly, mtime, dev, ino, mode, uid, gid, ctime` — **no descriptor, no content hash**, with `identity.pinned` hard-coded `false`. **Verified by me.**
+- `AuthorizedCwd::revalidate` and `BoundCommandRoot::revalidate` **are** descriptor-anchored: a held directory `File` compared against the path's `dev`/`ino`.
+
+**So F134's safety claim did not survive.** It held that a retry *"reopens no check-to-exec window that is not already documented"* — true in **kind**, false in **extent**. Without per-attempt revalidation, the exec's distance from its last validation becomes **the sum of all prior attempts plus the backoff**, strictly wider than the single documented stat-to-exec gap — and **externally inducible**, since ETXTBSY can be provoked by holding a write descriptor, making kitsu loop, and swapping the file. With per-attempt revalidation the window stays today's size, but the semantics invert: **the editor-mid-write case is exactly where the fingerprint differs**, so a later attempt turns a transient `ExecError` into a permanent `PolicyDenied` and a re-prompt.
+
+**And the measurement that settled it:** the real ETXTBSY windows are **microseconds to milliseconds**, while the user-facing cases the card names are **human-scale**. No defensible bound rescues them. **A retry would have spent a new security decision to fix the flake-shaped case and still printed a message for the user-shaped case.**
+
+### The MSRV blocker, and why I refused the obvious fix
+
+`std::io::ErrorKind::ExecutableFileBusy` is the natural discriminator and is **stable only since 1.83**; this workspace declares **`rust-version = "1.80"`**. It compiles on the local 1.93 toolchain, so **every test passed** — and `clippy::incompatible_msrv`, implied by `-D warnings`, rejected it. **My brief named a discriminator that could not satisfy my own gate.**
+
+Three resolutions were offered and **I rejected two**:
+
+- **Raising the workspace MSRV** is a promise to every consumer and a maintainer's policy decision. Taking it to improve one error string's discriminator is the tail wagging the dog.
+- **`#[allow(clippy::incompatible_msrv)]`** I rejected on substance, not taste: **the lint is correct** — that code genuinely would not compile on 1.80 — so silencing it would make the declared `rust-version` **false**. The repo would claim support it does not have, and this would have been the **first such allow in the tree**, establishing the precedent on cosmetic grounds. **A lint exception that makes a stated guarantee untrue costs more than a nicer type name is worth.**
+- **`libc::ETXTBSY`** costs nothing: `libc` is already a `kitsu-tools` dependency, used **190 times** in a sibling module of the very file being edited, and `ETXTBSY` is a **named POSIX constant**, not a magic `26`.
+
+**With a required comment naming the MSRV reason and the migration trigger**, because without it a future reader sees `libc` where `std` would do, "fixes" it, and walks straight back into the lint.
+
+### Three things the agent did that I am recording as right
+
+**It distinguished "unavailable on the toolchain" from "unavailable under MSRV".** My brief said to stop if the kind was unavailable on its toolchain — it **was** available, on 1.93. A letter-of-the-law reading would have shipped it green locally and broken the clippy gate for everyone.
+
+**It re-ran the mutation after switching discriminators**, *"since the guard is no longer the one I first tested."* Exactly right: the earlier mutation proved the **old** guard, and swapping the condition invalidates the proof. Nobody asked for that.
+
+**It declined to run the release profile** while the discriminator was still in question, rather than burning two minutes of pty suites on code that might change — and said so, which beats both quietly doing it and quietly skipping it.
