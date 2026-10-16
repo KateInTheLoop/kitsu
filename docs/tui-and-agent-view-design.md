@@ -1129,7 +1129,27 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   currently drops a tool result and reports success is not a shape N1 was written
   to protect**, and the alternative is preserving a lie for byte-stability. The
   conditional-field precedent (`final_summary` adds `output_last_message_state`
-  only when `Some`) remains the fallback if a field is ever preferred to an event. The TUI is entered only when
+  only when `Some`) remains the fallback if a field is ever preferred to an event.
+
+  **Clarified again in F122: which descriptor does "non-TTY" mean?** N1 did not say,
+  and it matters — the codebase distinguishes them with **separate functions**
+  (`is_tty()` is `io::stdout().is_terminal()`; `stderr_is_tty()` is its own), and
+  the three inline composites in the binary all key on **stdin** while N1's own
+  parenthetical says *"stdout is a TTY"*. Those differ for a real invocation such
+  as `kitsu chat <prompt> | tee`.
+
+  **The resolution follows from what N1 protects, which is consumers**, and a
+  consumer can redirect either descriptor independently. So **"non-TTY" means: for
+  each descriptor, when *that* descriptor is not a terminal, *its* bytes stay
+  identical.** It is not one global condition.
+
+  **Consequently a human-facing line, which goes to stderr, is gated on
+  `stderr_styled() && is_tty()`** — both descriptors being terminals. That is
+  **stricter than the minimum** the paragraph above requires (stderr alone would
+  do), and deliberately so: a run with stdout redirected is being consumed by
+  something, and a mid-turn human notice is noise to it. The looser gate can be
+  adopted later if a case appears; the stricter one cannot break a consumer that
+  exists today. The TUI is entered only when
   `stderr_styled() && stdout is a TTY && !plain_mode() && !assistive && !jsonl`.
 - **N2** Idle input latency MUST not regress: paste of 10 KiB into the
   composer completes in under 100 ms (the rustyline `ExternalPrinter` lesson).

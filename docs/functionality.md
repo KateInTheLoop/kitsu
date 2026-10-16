@@ -767,6 +767,14 @@ low `--offload-cap` an evicted result leaves a re-readable pointer the model can
 recall, which is not a loss and stays silent, so the warning does not become
 noise. A run that loses nothing emits nothing new.
 
+**An interactive session is told as well.** On a terminal the run prints
+`~ context budget dropped 2 tool results in round 3; the provider never saw them`
+-- the count first, one line per round. It appears **only** when both stdout and
+stderr are terminals and styling is on, so a redirected run, `--plain`,
+`NO_COLOR`, `--screen-reader` and `--jsonl` are all byte-identical to before. That
+gate is stricter than it strictly needs to be, deliberately: a run with stdout
+redirected is being consumed by something, and a mid-turn notice is noise to it.
+
 ## Context management
 
 The CLI always gives the orchestrator a token window. Resolution is:

@@ -5362,3 +5362,30 @@ cargo clippy --workspace -- -D warnings
 **It nearly cost something real.** F120 changed the history trimmer in `kitsu-core`, whose own test — `trim_tool_results_preserves_offload_pointer_but_drops_preview` — is *directly* about that behaviour and lives in a target my list never ran. The implementer ran it on initiative. **Had it not, the card would have shipped "fully verified" with the relevant test unexecuted.**
 
 **The same shape as F114**, one layer up: there I could not grep for a README row that was missing; here I could not notice a crate I had never listed. **Absence is the thing checklists cannot see, and the remedy is the same both times — derive the list from the system, do not curate it from memory.**
+
+## F125 — N1 never said which file descriptor, and three inline composites answered differently
+
+Flagged by F122's test author and verified: **N1 says "Non-TTY" without naming a descriptor**, and the system does not treat them as one thing.
+
+- `kitsu_render::is_tty()` is `io::stdout().is_terminal()` — **stdout**.
+- `stderr_is_tty()` is a **separate** function — **stderr**.
+- N1's own parenthetical says *"stdout is a TTY"*.
+- **The three inline composites in the binary all key on `stdin_is_tty()`** — verified, three occurrences, none of them stdout and none carrying a `jsonl` term.
+
+So the requirement, its own example, and the code each pick a different descriptor. **They differ for a real invocation**: `kitsu chat <prompt> | tee` has a terminal stdin and stderr but a piped stdout.
+
+### The resolution, now in the design doc
+
+**N1 protects consumers, and a consumer can redirect either descriptor independently.** So *"non-TTY"* means **per-descriptor**: when a given descriptor is not a terminal, *that* descriptor's bytes stay identical. It is not one global condition, which is why no single predicate was ever going to express it.
+
+F122's human line is therefore gated on **`stderr_styled() && is_tty()`** — both terminals — which is **stricter than the minimum** (stderr alone would satisfy the paragraph). Deliberate: a run with stdout redirected is being consumed by something, and a mid-turn notice is noise to it. **The stricter gate cannot break a consumer that exists today; the looser one might, and can be adopted later if a case appears.**
+
+### Why this is worth a finding rather than a quiet edit
+
+**I cited those three composites to the agent as *"possibly N1's predicate, measure it"*** — and the useful part is that the hedge was right for a reason I had not guessed. I expected "one predicate spelled three ways, so extract it". The answer was **four distinct conditions for four distinct jobs**, which is why the agent's recommendation was *do not extract* and why extraction would not have been behaviour-preserving.
+
+**An invariant that names a property without naming the thing it holds of is not yet an invariant.** N1 had been cited in a dozen cards and amended twice before anyone needed to know which descriptor it meant — and the moment a gate depended on it, three different answers were already in the tree.
+
+### Also now biting: F121's documentation gap
+
+`test_n1_jsonl_gains_nothing_from_the_human_report_of_a_dropped_result` is the **second** test hard-coding the full ordered JSONL `"type"` sequence, and there is still **no documented list** for either to reference. Two tests now encode a contract the documentation does not state — so a change to the stream breaks them with no doc to consult. Recorded under F121; still outside this epic's scope, but the cost is now concrete rather than hypothetical.
