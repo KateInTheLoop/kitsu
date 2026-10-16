@@ -4973,3 +4973,23 @@ Ten became **seven**, in both directions:
 - **Added:** `spawn_agent_runs_nested_loop_and_returns_only_the_child_answer` (new), and the latent `the_handler_byte_string_equals_the_restore_helper_output` (**guarded pre-emptively**, 0 sightings in 821 runs, derived by reading).
 
 **The ledger was wrong in both directions at once**, which is the argument for treating it as evidence rather than as a count: it carried three entries that were never flakes **and** missed one that had been failing all along.
+
+## F113 — R6-b's ground, measured before the card is briefed
+
+Read-only groundwork so the search card's brief is not another of the fifteen that were wrong.
+
+**What is ready.** `pin_to(ordinal, ring, rows)` exists and is deliberately **not** prompt-aware, exactly so `/` can call it with a match ordinal — built in R6-c for this purpose, so R6-b adds a *policy*, not an anchor. `CellLine::plain()` exists (`cells.rs:65`). **No search state exists anywhere** in `transcript.rs` or `fullscreen.rs`.
+
+**One authorised test edit will be needed, and it is the same shape as R6-c's.** The footer guard still forbids `["search", "dump", "editor", "scrollback"]`. R6-b removes **`search` only** and requires the footer to advertise its keys; `dump`, `editor`, `scrollback` and the literal `[` **stay forbidden** while R6-d is gated. That guard is what has kept the footer honest through two cards and must not be relaxed wholesale.
+
+**A performance question the card must measure rather than assume.** `plain()` is `sanitize_terminal_text(&self.styled)` — it **allocates a fresh `String` per call**. The ring holds **10 000 lines by default**, so a naive incremental search that re-scans on every keystroke is **10 000 allocations per keypress**, and **F52**'s unbounded pasted cell would be copied on each one. The honest options are to search lazily, to search the styled bytes with the stripper applied only to candidates, or to cache. **Measure the cost before choosing** — and note the project already has a `paste_latency` suite, which is where a latency claim belongs rather than in a unit test.
+
+**A correctness subtlety worth deciding deliberately.** `plain()`'s own comment records that `sanitize_terminal_text` is the crate's one stripper and that **`ascii_structural_markers` is deliberately not applied**. So search over `plain()` searches *sanitised* text, and a user searching for something they can see styled on screen may or may not match it. That is a **user-visible decision**, not an implementation detail: say what is searched, and make the answer the same thing the overlay paints, or say why not.
+
+**And the prompts are searchable now**, which R6-a's version of this card could not have offered — the ring retains the user's lines, so `/` searches both speakers. Worth saying in the docs, because *"search the transcript"* meant half a transcript two cards ago.
+
+### F112's release count, closed
+
+The guarded **release** count F107-a left open is done: **0 failures in 150 full `--bins` release runs**, against an unguarded release rate of roughly **1 in 200**. With the debug figures (0 in 150 of mine, 0 in 400 of the assessor's, against 3 in 421 unguarded), the five guards are confirmed in **both** profiles and the recap flake is closed.
+
+The capture was written properly this time — whole failing run to its own timestamped file — and **nothing was captured, because nothing failed.** Worth stating plainly: the eleventh flake (`spawn_agent_runs_nested_loop_and_returns_only_the_child_answer`) **did not appear in these 150 release runs either**, so its one debug sighting remains its only one, and it is still uncharacterised rather than closed. A single sighting is a rumour until it reproduces; it stays on the ledger as exactly that.
