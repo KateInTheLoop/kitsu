@@ -5538,3 +5538,94 @@ cannot stage immutable executable: Device or resource busy (os error 16)
 **So it is the same shape as F107, in a different medium:** shared mutable state across parallel tests, where the shared thing is a **filesystem path** rather than a process-global. Not fixed here — different crate, and `kitsu-tools` holds the maintainer's uncommitted work — but **carded with its mechanism named**, which is more than the eleventh flake has after six sightings' worth of runs.
 
 **And this is why the capture rule exists.** My own truncated capture two cards ago left the eleventh flake unidentifiable to this day. This one took one `grep -o` to diagnose because the whole run was kept.
+
+### F130 corrected — I named its mechanism from the errno, and the implementation refutes it
+
+I wrote that F130 was *"parallel tests contending for one staging path … a filesystem path rather than a process-global."* **That is wrong, and reading the implementation refutes it.**
+
+`stage_executable_image` (`kitsu-tools/src/external/backend.rs:1555`) stages through **`memfd_create`** — an **anonymous in-memory file with no filesystem path at all.** There is no path to contend for. I inferred "path contention" from `ETXTBSY` + the words *"stage immutable executable"*, which is **the same error I have now made four times this session: a mechanism asserted from a plausible reading instead of from the code.**
+
+### What is actually established, and what is not
+
+**Established:** the error is formatted in **production** code — `executable_sha256` wraps `stage_executable_image` — so this is not a test-only path; the errno is `16`; and it is not disk space (`/tmp` at 20%).
+
+**Not established:** *which operation failed.* The function has **six** fallible steps — `source.metadata()`, `source.seek()`, the `memfd_create` syscall, the header `read`, the `write_all` into the memfd, and the streaming `read` loop — and they all propagate through one `?` into one message:
+
+```rust
+format!("cannot stage immutable executable: {error}")
+```
+
+**The message names the activity and loses the operation.** `memfd_create` does not document `EBUSY`; a `read` returning it would be unusual. So I cannot say what happened, and the capture cannot tell me — there was no backtrace, and the wrapper discards the context.
+
+### Which makes the card a better one than "fix the flake"
+
+**This is F117's shape in production:** a failure that reports *that* something went wrong and not *what*. There, a bare exit-code assertion cost a card's worth of debugging until the message was made to name the refusal. Here, an `io::Error` from one of six syscalls is flattened into one string, so the **next** sighting will be exactly as undiagnosable as this one.
+
+**So the next card is diagnosis before repair: make the staging error name the operation that failed.** That is a small production change, it is testable (each failure mode should name its own step), and it converts a flake nobody can explain into one whose next occurrence explains itself. **Fixing the contention I guessed at would have been fixing something I had not shown to exist.**
+
+**And the ledger stays honest:** F130 remains **open with its mechanism unknown**, not "diagnosed". The eleventh flake is unidentifiable because I truncated its capture; the twelfth is unidentifiable because the *product* truncates its own error. Those are different failures and only the second is fixable in code.
+
+## F132 — the derived gate list needed `--no-fail-fast`, and its absence had already misled me once
+
+**F124** replaced a curated gate list with one derived from `cargo metadata`. **It was still wrong in a way that only shows up when something fails.**
+
+`cargo test --workspace --exclude kitsu` **halts at the first failing target** and never runs the rest. So a run with one failure reports a **partial** count, and the partial looks like a result.
+
+**It misled me the same day.** Verifying a formatting fix, I read *"18 ok-lines, failures: 2"* where the baseline is 28 targets, and my first thought was that my own change had broken ten targets in a crate it does not touch. It had not: one `kitsu-tools` test failed (**F130**), the run stopped there, and the remaining ten targets were never executed. **The number was not a smaller result; it was a truncated run** — and I nearly diagnosed a phantom regression from it.
+
+**Corrected in the gate list:** `cargo test --no-fail-fast --workspace --exclude kitsu`, so a failure costs one target's green and not the visibility of every target after it.
+
+### Why this belongs with F114, F124 and F126 rather than being a flag tip
+
+Those three were about **absence**: a README row that was missing, crates never listed, schema entries nothing required. **This is about a count that is present and means something other than what it appears to.** A gate that reports `18` when the baseline is `28` is not silent — it is *wrong in a way that invites a wrong diagnosis*, which is worse than silence, because silence prompts a question and a plausible number does not.
+
+**The generalisation for any gate I write from here:** a gate must report either the whole truth or an obvious failure, never a plausible fraction. `--no-fail-fast` buys that for cargo; the equivalent question is worth asking of every command on the list.
+
+### F101's sweep, this card's run: one real dangling reference, two false positives, both adjudicated
+
+Ran both doc sweeps as the discipline requires. **The reference sweep nominated three; exactly one was real.**
+
+- **`R6-d` — REAL.** The requirement map still cites it and **the row was gone.** I added it when splitting R6 four ways, then lost it in a later restructure of the same table. **Restored, with its gate and the reason intact.** Third time a correction of mine has created a dangling reference, and the third time this sweep has caught one.
+- **`F102` — false positive, and mine.** I widened the regex's prefix class to include `F` this run, so it now treats a **finding citation** (*"R6-c (blocked, F102)"*) as a missing story row. Findings are not plan rows. **The widening was a mistake**: it buys nothing and manufactures noise.
+- **`T5-S2` — the documented false positive**, from the compound row name `T5-S1b + T5-S2`. Unchanged, still known, still not worth a cleverer matcher.
+
+**The phrase sweep's five hits were all legitimate** — `@file` path completion and draft syntax highlighting really are unshipped, and the markdown-tolerant `not wired` pattern now returns **zero**, which is the first clean run since F110 made it tolerant.
+
+**So: 1 defect, 2 false positives, 5 correct negatives.** That ratio is the argument for keeping these as commands a person reads rather than gates — **and the argument against my own widening.** A sweep that nominates finding-numbers as missing rows trains its reader to skim, which is how the real `R6-d` hit would eventually be missed.
+
+## F133 — a thirteenth flake, and it is the mechanism I wrongly assigned to F130
+
+**F131 shipped** (below). During my acceptance run a **different** `kitsu-tools` test failed:
+
+```
+---- builtins::command::tests::replacing_an_approved_executable_forces_fresh_approval ----
+called `Result::unwrap()` on an `Err` value: ExecError("command failed: Text file busy (os error 26)")
+```
+
+**Captured whole to its own file** (1 374 lines) before anything else. Three re-runs: 416, 416, 416. The workspace re-ran at **1146 passed, 0 failed**.
+
+### The two flakes are different, and the errno is what separates them
+
+| | F130 | F133 |
+|---|---|---|
+| errno | **16** — `EBUSY`, *"Device or resource busy"* | **26** — `ETXTBSY`, *"Text file busy"* |
+| site | `stage_executable_image`, via `executable_sha256` | `replacing_an_approved_executable_forces_fresh_approval` |
+| mechanism | unknown; the **only** exit documenting `EBUSY` is `F_ADD_SEALS` | **`ETXTBSY` is definitionally "wrote a file being executed"** |
+
+**`ETXTBSY` is exactly the mechanism I guessed for F130 and was wrong about** — writing an executable that something currently has open for execution. The guess was not nonsense; it was **attached to the wrong flake.** F130 stages through `memfd_create`, which has no path to contend for; F133's test **replaces an executable by name**, which is precisely what `ETXTBSY` reports.
+
+**So the right conclusion is one I could not have reached by reasoning harder about F130:** there are two parallelism-sensitive executable flakes in this crate, one of which really is path contention. Distinguishing them took **reading the errno**, which is why F131's whole premise — *make the failure say which operation* — is worth the eighteen edits.
+
+**F133 is carded, not fixed.** Its mechanism is named, its capture is complete, and it is one re-run from being characterised — unlike the **eleventh** flake, which remains unidentifiable because I truncated its capture.
+
+## F131 — the staging failure names its step; 16 steps wired, 2 provable
+
+My brief's step count was right this time (18 exits / 16 steps) because the test author had **enumerated it from the function** after my first attempt listed eight and omitted the entire sealing tail.
+
+**The restructuring chosen, with its reason:** per-site `map_err` into one formatting helper, rather than an inner function returning `Result<_, (Step, io::Error)>`. The latter *"would have required wrapping the whole body in a nested function and threading the `PendingExecutableImageV1` construction through it — a real control-flow edit on a function that owns raw descriptors (`File::from_raw_fd` on two fds)."* The per-site form is pure expression substitution: **no new scope, no change to where the owned `File`s drop**, and the step is named at the exit that produced it rather than inferred by a caller. It keeps `error.kind()`, so the OS error text survives verbatim after the label — which is the entire point.
+
+**All 16 wired, including the 14 nothing can test** — notably `AddSeals`, the `EBUSY` exit that is F130's most plausible source. **A fix labelling only the two provable steps would have left F130 exactly as undiagnosable as before**, which is why "wire the untestable ones" was the brief's load-bearing instruction.
+
+**The mutation was sharper than I asked for:** remapping exit #2 to a neighbouring step made the *right* test fail *naming the wrong label*, while its sibling stayed green — so the two tests discriminate **per-exit**, not merely per-step.
+
+**And two distinctions the author drew that I had not:** the function's two `.expect(..)` sites are **panics, not error exits**, so they are neither counted nor wired; and the non-x86_64 stub returns a fixed `Unsupported` error and is outside the step vocabulary. Both correct, both unprompted.
