@@ -21294,10 +21294,24 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // opt-in and assistive-gated, which is why a default TUI session had no
     // subscriber at all. Held for the session; the task ends when the
     // registry's sender drops.
+    // Card **H2-cadence**: the same subscriber republishes requirement H2's
+    // terminal title, which the three `publish_title` sites leave stale
+    // mid-turn. The turn flag is the one the turn boundaries already set two
+    // lines from `publish_title(true)`/the turn's end, so the cadence's word
+    // is the word those sites would publish.
+    #[cfg(unix)]
+    let title_turn_active = foreground_typeahead_active.clone();
     #[cfg(unix)]
     let _idle_ambient_cadence = tui_bridge::spawn_idle_ambient_cadence(
         agent_registry.subscribe(),
         |snapshot: &subagent::AgentRegistrySnapshot| (snapshot.blocked, snapshot.running),
+        move |blocked, running| {
+            tui_bridge::publish_cadence_state_title(
+                blocked,
+                running,
+                title_turn_active.load(Ordering::Acquire),
+            );
+        },
     );
     let mut exit_after_queue = false;
     // Session transitions are control-plane actions, not user prompts. They

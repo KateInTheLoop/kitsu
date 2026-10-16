@@ -1096,14 +1096,43 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   too. The state word comes from `agent_state_file::process_state` **verbatim**, so
   the *blocked outranks working* precedence stays in one home.
 
-  **Deviation 1 — cadence.** H2 specifies the *state file* updates "on every
-  registry generation change". **The title does not**: the registry's watch channel
-  is subscribed only behind an off-by-default environment variable, so there is no
-  general change hook in a chat session. The title rides the three
-  `publish_agent_state` sites — session boundary, idle prompt, turn start — and is
-  therefore **accurate at the prompt and at the start of a turn, and can go stale
-  during one.** Closing that needs a change signal this design does not currently
-  provide.
+  **Deviation 1 — cadence — closed by H2-cadence, and the premise recorded here
+  was false.** This paragraph previously said *"the registry's watch channel is
+  subscribed only behind an off-by-default environment variable, so there is no
+  general change hook in a chat session."* **That was wrong**, and it was wrong in
+  shipped documentation across two cards. There **is** an ungated, session-long
+  registry change subscriber — the idle composer's ambient cadence, whose own
+  rustdoc says it is *deliberately* ungated, *unlike* the opt-in classic-mode
+  notifier that the false claim had generalised from. It already deduped on
+  `(blocked, running)`, the title's own count inputs, and carries **no turn gate**,
+  so it fires mid-turn.
+
+  **The error was a curated list standing in for an enumerated one**: one
+  subscription site was measured and generalised to *"no hook exists"*. Listing them
+  found four, and the one that mattered was marked ungated on purpose.
+
+  **So the title now follows the registry** and keeps up during a turn as agents
+  block and finish. Three decisions, each measured rather than assumed:
+
+  - **The turn flag has to be plumbed, and exactly one case forces it.** Mid-turn
+    the word reduces to *blocked → `blocked`, else `working`*. Of the three mid-turn
+    transitions, blocking and unblocking render correctly **even with a wrong
+    flag** — blocked outranks everything. Only an agent **finishing** into zero
+    agents renders `idle` where the truth is `working`. That single case is the
+    whole reason the flag is threaded through.
+  - **The title rides *beside* the repaint, never inside it.** The status-row
+    repaint is deliberately inert in classic mode and in any session without a live
+    row — which is what keeps classic's byte stream identical — so a title folded
+    into it would leave a **styled classic** session exactly as stale as before.
+  - **One title write per change, not two.** The cadence repaints twice per change
+    because a paint inside the 1/60 s window returns without recording its key; the
+    title has no coalescing window, so a second write would be pure duplicate bytes.
+
+  **Known and unclosed:** a *second* mid-turn cadence exists — the live-typeahead
+  poll repaints the row throughout every foreground turn — and publishes no title.
+  The registry hook was chosen over it because it is event-driven and reaches
+  classic sessions, but anyone wiring the title there too would be adding writes
+  that this design does not dedupe.
 
   **Deviation 2 — closed by H2-stack, with two residuals.** H2-title shipped with
   the title outliving the process outside fullscreen, because `enter_fullscreen` was

@@ -416,6 +416,75 @@ pub(crate) fn publish_state_title(state: &str, agents: usize) {
     write_state_title(&mut std::io::stderr(), enabled, state, agents);
 }
 
+/// The idle ambient cadence's title write: card **H2-cadence**, the last
+/// recorded deviation from requirement **H2**'s cadence clause.
+///
+/// The three `run_chat` publish sites are the session boundary, the top of
+/// the idle loop and the start of a turn, so the title is correct at the
+/// prompt and at turn start and **goes stale during a turn**. The registry's
+/// `watch` channel already has an ungated, session-long subscriber --
+/// [`spawn_idle_ambient_cadence`], which dedupes on `(blocked, running)`,
+/// *precisely the title's own count inputs*, and has no turn gate, so it
+/// fires mid-turn -- and this is the function it publishes through.
+///
+/// **Why the counts are not the whole story.** Mid-turn `turn_active` is
+/// `true`, so the word is `blocked > 0 ? "blocked" : "working"`. The one
+/// transition the three sites cannot cover and the counts alone cannot
+/// render is an agent **finishing** mid-turn into `(0, 0)`: the true word is
+/// `"working"` and a cadence that assumed `turn_active = false` would write
+/// `"idle"`. So the flag is plumbed rather than guessed, and the word still
+/// comes from [`crate::agent_state_file::process_state`] -- never a second
+/// computation of the precedence.
+///
+/// `enabled` is the whole gate, passed in exactly as [`write_state_title`]
+/// takes it, so this is testable against a buffer.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn write_cadence_state_title(
+    out: &mut dyn std::io::Write,
+    enabled: bool,
+    blocked: usize,
+    running: usize,
+    turn_active: bool,
+) {
+    // Through `cadence_title_parts` so the word and the count keep one
+    // derivation with the production publish point.
+    let (state, agents) = cadence_title_parts(blocked, running, turn_active);
+    write_state_title(out, enabled, state, agents);
+}
+
+/// The word and the count a cadence wake's `(blocked, running)` pair renders
+/// to: the state word from [`crate::agent_state_file::process_state`], so the
+/// precedence *"blocked outranks working"* keeps its single home, and the
+/// live count `blocked + running`, the two tallies that snapshot documents as
+/// disjoint.
+///
+/// Extracted so the buffer-testable writer above and the production publish
+/// point below share **one** derivation: the mismatch F141 is about -- a
+/// second path that a test cannot see -- has nowhere to appear.
+pub(crate) fn cadence_title_parts(
+    blocked: usize,
+    running: usize,
+    turn_active: bool,
+) -> (&'static str, usize) {
+    (
+        crate::agent_state_file::process_state(running, blocked, turn_active),
+        blocked + running,
+    )
+}
+
+/// Publish the cadence's title on the one sink the title's other bytes go to.
+///
+/// **Beside the repaint, not inside it.** [`repaint_status_row`] is inert in
+/// classic mode and in any session that never enabled a live status row --
+/// *"what keeps the classic byte stream identical"* -- so a title riding
+/// inside it would inherit that inertness and a styled `classic` session
+/// would still go stale. The title goes straight to stderr, under the same
+/// surface gate as the other three sites.
+pub(crate) fn publish_cadence_state_title(blocked: usize, running: usize, turn_active: bool) {
+    let (state, agents) = cadence_title_parts(blocked, running, turn_active);
+    publish_state_title(state, agents);
+}
+
 /// A live fullscreen segment: the alternate screen and the pushed title, given
 /// back when this is dropped.
 ///
@@ -1406,13 +1475,15 @@ const IDLE_AMBIENT_REFRESH_INTERVAL: std::time::Duration = STATUS_FRAME_INTERVAL
 /// Nothing in here touches stdin, the decoder or the editor's byte bypass
 /// (findings **F72**/**F68**): the composer stays blocked in `read()`, and
 /// the row is repainted around it from the pull the painter already does.
-pub(crate) async fn idle_ambient_cadence_step<T, F>(
+pub(crate) async fn idle_ambient_cadence_step<T, F, H>(
     changes: &mut tokio::sync::watch::Receiver<T>,
     counts: &F,
     seen: &mut (usize, usize),
+    title: &H,
 ) -> bool
 where
     F: Fn(&T) -> (usize, usize),
+    H: Fn(usize, usize),
 {
     if changes.changed().await.is_err() {
         return false;
@@ -1423,6 +1494,10 @@ where
         return true;
     }
     *seen = current;
+    // Card **H2-cadence**: the title is published here, beside the repaint
+    // rather than inside it, and **once**: the N3 retry below is the
+    // painter's, and the title has no coalescing window to retry past.
+    title(current.0, current.1);
     repaint_status_row();
     // Note **N3**: a paint inside the 1/60 s window returns *without*
     // recording the key, so the change would otherwise wait for the next
@@ -1446,17 +1521,19 @@ where
 /// keeps the classic byte stream identical.
 ///
 /// The task ends on its own when the registry's sender drops.
-pub(crate) fn spawn_idle_ambient_cadence<T, F>(
+pub(crate) fn spawn_idle_ambient_cadence<T, F, H>(
     mut changes: tokio::sync::watch::Receiver<T>,
     counts: F,
+    title: H,
 ) -> tokio::task::JoinHandle<()>
 where
     T: Send + Sync + 'static,
     F: Fn(&T) -> (usize, usize) + Send + Sync + 'static,
+    H: Fn(usize, usize) + Send + Sync + 'static,
 {
     tokio::spawn(async move {
         let mut seen = counts(&changes.borrow_and_update());
-        while idle_ambient_cadence_step(&mut changes, &counts, &mut seen).await {}
+        while idle_ambient_cadence_step(&mut changes, &counts, &mut seen, &title).await {}
     })
 }
 
@@ -8942,6 +9019,17 @@ mod tests {
         (guard, err, source, blocked)
     }
 
+    /// The inert title publisher the cadence's **pre-existing** tests pass:
+    /// they assert the painted row and nothing about the title, so the
+    /// publisher they hand the step must do nothing and their assertions are
+    /// unchanged. Card **H2-cadence** added the parameter; the publisher is a
+    /// generic so the compiler forces the one production caller to supply a
+    /// real one, which is what keeps `publish_cadence_state_title` from being
+    /// a function nothing drives (finding **F50**).
+    fn no_cadence_title() -> impl Fn(usize, usize) {
+        |_, _| {}
+    }
+
     /// **The acceptance test, and it is red.** The idle composer must have an
     /// ambient cadence, and that cadence must fit A8's 250 ms.
     ///
@@ -9113,7 +9201,8 @@ mod tests {
             runtime.block_on(super::idle_ambient_cadence_step(
                 &mut changes,
                 &counts,
-                &mut seen
+                &mut seen,
+                &no_cadence_title(),
             )),
             "the cadence keeps running while the registry is alive"
         );
@@ -9133,7 +9222,8 @@ mod tests {
         assert!(runtime.block_on(super::idle_ambient_cadence_step(
             &mut changes,
             &counts,
-            &mut seen
+            &mut seen,
+            &no_cadence_title(),
         )));
         let tail = err.text()[before..].to_string();
         assert_eq!(
@@ -9166,7 +9256,8 @@ mod tests {
             !runtime.block_on(super::idle_ambient_cadence_step(
                 &mut changes,
                 &counts,
-                &mut seen
+                &mut seen,
+                &no_cadence_title(),
             )),
             "a closed registry ends the cadence"
         );
@@ -9359,5 +9450,256 @@ mod tests {
                 text.escape_debug()
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Card **H2-cadence**: the state title goes stale mid-turn.
+    //
+    // FAILING-FIRST. `write_cadence_state_title` writes nothing and
+    // `idle_ambient_cadence_step` never calls the publisher it is handed, so
+    // both tests below fail on this commit.
+    //
+    // **The premise this card rests on, confirmed by name rather than
+    // assumed** (the shipped docs said the opposite, finding **F64**):
+    // `spawn_idle_ambient_cadence` is *"deliberately ungated"* per its own
+    // rustdoc, its one production caller sits beside the session's
+    // `StatusSource`, the step dedupes on `(blocked, running)` -- the title's
+    // own count inputs -- and nothing in it consults a turn flag, so it fires
+    // mid-turn. There **is** a general change hook in a chat session.
+    // -----------------------------------------------------------------------
+
+    /// **The word, and the one transition the three publish sites cannot
+    /// cover.**
+    ///
+    /// Measured rather than assumed. Mid-turn `turn_active` is `true`, so the
+    /// word is `blocked > 0 ? "blocked" : "working"` and the counts alone
+    /// determine it in every case **but one**: an agent finishing mid-turn
+    /// into `(0, 0)`, where the true word is `"working"` and a cadence that
+    /// assumed `turn_active = false` writes `"idle"`. That is the card's own
+    /// symptom, so the flag is plumbed and this test is what pins it -- the
+    /// first case below is red against a publisher that ignores the flag,
+    /// which is the bidirectional mutation for this decision.
+    ///
+    /// The word is never spelled out: each expectation is built **from**
+    /// `process_state`'s return, so a second computation of *"blocked
+    /// outranks working"* inside the cadence fails this rather than passing.
+    /// Note the argument order -- the cadence's pair is `(blocked, running)`,
+    /// `process_state` takes `(running, blocked, ..)`, and a transposition is
+    /// exactly what the asymmetric cases here catch.
+    #[test]
+    fn the_cadence_title_carries_the_turns_word_and_is_suppressed_by_the_gate() {
+        use super::{state_title, write_cadence_state_title};
+        use crate::agent_state_file::process_state;
+
+        // (blocked, running, turn_active)
+        let cases = [
+            // The transition the three sites miss: nothing live, turn active.
+            (0usize, 0usize, true),
+            // The same counts at the idle prompt, which must read `idle`.
+            (0, 0, false),
+            // An agent blocks mid-turn: `blocked` outranks the active turn.
+            (1, 0, true),
+            // Asymmetric, so a transposed pair cannot pass: one running.
+            (0, 1, true),
+            (0, 1, false),
+            (2, 1, true),
+        ];
+        for (blocked, running, turn_active) in cases {
+            let mut buffer: Vec<u8> = Vec::new();
+            write_cadence_state_title(&mut buffer, true, blocked, running, turn_active);
+            let word = process_state(running, blocked, turn_active);
+            assert_eq!(
+                String::from_utf8_lossy(&buffer),
+                format!("\x1b]2;{}\x1b\\", state_title(word, blocked + running)),
+                "the cadence writes the same OSC 2 title the three publish \
+                 sites do, with `process_state`'s word for (running {running}, \
+                 blocked {blocked}, turn_active {turn_active}) and the live \
+                 count `blocked + running`"
+            );
+        }
+
+        // NON-VACUOUS, and the half that fails a cadence which drops the turn
+        // flag: at `(0, 0)` the mid-turn title and the idle one must differ,
+        // and the difference is exactly `working` against `idle`.
+        assert_eq!(process_state(0, 0, true), "working");
+        assert_eq!(process_state(0, 0, false), "idle");
+        let mut mid: Vec<u8> = Vec::new();
+        let mut idle: Vec<u8> = Vec::new();
+        write_cadence_state_title(&mut mid, true, 0, 0, true);
+        write_cadence_state_title(&mut idle, true, 0, 0, false);
+        assert_ne!(
+            mid, idle,
+            "an agent finishing mid-turn must not leave the title reading \
+             `idle` while the turn is still running"
+        );
+
+        // The gate, the other direction: `[tui] title = false` or any surface
+        // the title may not touch writes **no bytes at all** from this new
+        // publish point either (requirement N1). The gate itself stays
+        // `title_enabled() && title_surface_allows_osc()` and is evaluated in
+        // `publish_cadence_state_title`; this pins that the writer honours it.
+        let mut off: Vec<u8> = Vec::new();
+        write_cadence_state_title(&mut off, false, 1, 2, true);
+        assert!(
+            off.is_empty(),
+            "a disallowed surface must receive nothing, but received {:?}",
+            String::from_utf8_lossy(&off)
+        );
+    }
+
+    /// **The cadence publishes the title once per real change, beside the
+    /// repaint.**
+    ///
+    /// Drives the real [`idle_ambient_cadence_step`], the same function the
+    /// session's one `spawn_idle_ambient_cadence` call runs for the life of
+    /// the session, and asserts three decisions this card had to pin:
+    ///
+    /// * **A bare wake publishes nothing.** The step's dedupe is on
+    ///   `(blocked, running)`, the title's own inputs, so a wake that moves
+    ///   the registry's generation and nothing the title shows must not write
+    ///   a title either.
+    /// * **Once per change, not twice.** The step repaints twice -- note
+    ///   **N3**'s retry, because a paint inside the 1/60 s window returns
+    ///   without recording the key. The title has no such window: it is an
+    ///   unconditional write, so a second one is pure duplicate bytes. The
+    ///   count is pinned at exactly one.
+    /// * **Beside the repaint, not inside it.** The painted row is asserted
+    ///   on the same wake, so the title cannot have been folded into
+    ///   `repaint_status_row` -- which is inert in classic mode and in any
+    ///   session that never enabled a live status row, and would therefore
+    ///   leave a styled `classic` session exactly as stale as before.
+    #[test]
+    #[serial]
+    fn the_idle_ambient_cadence_publishes_the_state_title_once_per_change() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, _source, blocked) = idle_ambient_fixture();
+        let cols = live::terminal_columns();
+
+        let published: Arc<std::sync::Mutex<Vec<(usize, usize)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = {
+            let published = published.clone();
+            move |blocked: usize, running: usize| {
+                published
+                    .lock()
+                    .expect("the recorded publishes")
+                    .push((blocked, running));
+            }
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a current-thread runtime for the cadence step");
+        let (sender, mut changes) = tokio::sync::watch::channel((0usize, 0usize));
+        let counts = |pair: &(usize, usize)| *pair;
+        let mut seen = *changes.borrow_and_update();
+        past_the_frame_budget();
+
+        // A bare wake: the registry published, the title's inputs did not
+        // move. No title, and no frame.
+        let before = err.text().len();
+        sender.send((0, 0)).expect("the cadence is subscribed");
+        assert!(runtime.block_on(super::idle_ambient_cadence_step(
+            &mut changes,
+            &counts,
+            &mut seen,
+            &recorder,
+        )));
+        assert!(
+            published.lock().expect("the recorded publishes").is_empty(),
+            "a bare wake must publish no title: {:?}",
+            published.lock().expect("the recorded publishes")
+        );
+        assert_eq!(
+            err.text().len(),
+            before,
+            "NON-VACUOUS control: a bare wake paints no frame either, so the \
+             step really did take its dedupe path"
+        );
+
+        // A real change: an agent blocks while a turn is running.
+        blocked.store(1, Ordering::Relaxed);
+        sender.send((1, 0)).expect("the cadence is subscribed");
+        let before = err.text().len();
+        assert!(runtime.block_on(super::idle_ambient_cadence_step(
+            &mut changes,
+            &counts,
+            &mut seen,
+            &recorder,
+        )));
+
+        assert_eq!(
+            *published.lock().expect("the recorded publishes"),
+            vec![(1usize, 0usize)],
+            "the cadence publishes the title **exactly once** for one change, \
+             carrying the `(blocked, running)` pair it deduped on -- not twice, \
+             although it repaints twice for note N3's retry"
+        );
+
+        // And beside the repaint, not inside it: the row the cadence paints
+        // is unchanged by the title riding along.
+        let tail = err.text()[before..].to_string();
+        assert_eq!(
+            tail,
+            expected_status_paint(
+                T3_S12_ROWS,
+                T3_S12_VIEWPORT_ROWS,
+                &live::compose_status_row(
+                    &live::StatusFields {
+                        model: "example-model-v1".to_string(),
+                        used: 1_000,
+                        effective: 100_000,
+                        elapsed: None,
+                        blocked: 1,
+                        ..Default::default()
+                    },
+                    cols,
+                ),
+            ),
+            "the cadence still paints the row the registry describes, so the \
+             title is published **beside** `repaint_status_row` and has not \
+             been folded into it -- which would be inert in classic mode"
+        );
+        assert!(
+            !tail.contains("\x1b]2;"),
+            "...and the title is not written onto the viewport's own surface, \
+             which a classic session never installs; it wrote:\n{}",
+            tail.escape_debug()
+        );
+
+        // **The inertness trap, pinned.** With the viewport released there is
+        // no installed status painter, which is the state a `classic` session
+        // is in for its whole life -- and `repaint_status_row` is inert there
+        // *"to keep the classic byte stream identical."* A title folded into
+        // the repaint would inherit that inertness and a styled `classic`
+        // session would still go stale mid-turn, which is the trap this
+        // section exists to catch: the publish must still happen, and the
+        // surface must still receive nothing.
+        drop(guard);
+        let before = err.text().len();
+        sender.send((2, 0)).expect("the cadence is subscribed");
+        assert!(runtime.block_on(super::idle_ambient_cadence_step(
+            &mut changes,
+            &counts,
+            &mut seen,
+            &recorder,
+        )));
+        assert_eq!(
+            *published.lock().expect("the recorded publishes"),
+            vec![(1usize, 0usize), (2usize, 0usize)],
+            "with no live status row -- a `classic` session -- the title is \
+             still published, because it rides beside the repaint and not \
+             inside it"
+        );
+        assert_eq!(
+            err.text().len(),
+            before,
+            "NON-VACUOUS: and the painter really was inert, so the publish \
+             above cannot have come from it"
+        );
+
+        drop(sender);
     }
 }

@@ -595,9 +595,10 @@ controls the push and pop of the terminal's title stack around fullscreen, so
 and `--jsonl` are byte-identical to before — the title is terminal decoration, and
 a consumer reading your output should never see it.
 
-**Two limits worth knowing.** The title is refreshed at the prompt and at the
-start of each turn, so it **can go stale during a long turn** if an agent blocks
-or finishes partway through. And the title is **restored on exit**, in every mode — but
+**The title keeps up during a turn.** It is refreshed at the prompt and at the
+start of each turn, and also whenever the agent registry changes — so an agent
+that blocks or finishes **mid-turn** moves the title then, rather than at the next
+prompt. And the title is **restored on exit**, in every mode — but
 with two gaps worth knowing. Under a **multiplexer** it is not: multiplexers drop
 the title-stack sequences outright, and there is no way to read a window title back
 to restore it by hand. And a **`classic` session killed by a signal** leaves its
