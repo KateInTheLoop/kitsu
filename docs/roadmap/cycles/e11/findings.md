@@ -4993,3 +4993,18 @@ Read-only groundwork so the search card's brief is not another of the fifteen th
 The guarded **release** count F107-a left open is done: **0 failures in 150 full `--bins` release runs**, against an unguarded release rate of roughly **1 in 200**. With the debug figures (0 in 150 of mine, 0 in 400 of the assessor's, against 3 in 421 unguarded), the five guards are confirmed in **both** profiles and the recap flake is closed.
 
 The capture was written properly this time — whole failing run to its own timestamped file — and **nothing was captured, because nothing failed.** Worth stating plainly: the eleventh flake (`spawn_agent_runs_nested_loop_and_returns_only_the_child_answer`) **did not appear in these 150 release runs either**, so its one debug sighting remains its only one, and it is still uncharacterised rather than closed. A single sighting is a rumour until it reproduces; it stays on the ledger as exactly that.
+
+## F114 — README went three cards without the feature I had been documenting everywhere else
+
+The standing requirement warns that README's tables *"drift silently, so re-read the affected row rather than assuming"*. I checked it for the first time since R6-a and found two things:
+
+1. **README did not mention the `Ctrl+O` transcript overlay at all** — not a row, not a clause — across the three commits that built it (`53be36b`, `e6c2255`, `0920e91`). Meanwhile the **older** agent-view overlay *is* documented, on `/jobs view`'s row. So the file documented one overlay and not the newer one, which is the worst shape for a reader: the omission looks like a statement that no such thing exists.
+2. **The `cell_ring_lines` row was stale in two ways.** It described the ring as *"scrollback the viewport retains and `fullscreen` paints"* — the overlay reads it too now — and it listed what the ring does **not** hold without mentioning that it **now holds the user's own prompts**, which the prompts card added two commits ago. A config row that enumerates exclusions is exactly where a new inclusion needs adding.
+
+### Why my own sweeps missed it
+
+**F110**'s sweep looks for negative-capability phrasing — *"not wired"*, *"still missing"*. **This was not a false claim; it was an absent one.** Nothing in README said anything wrong about the overlay, so no phrase search could flag it, and the `cell_ring_lines` row's staleness was a sentence that had quietly become **incomplete** rather than untrue.
+
+**So the two sweeps I built cover false statements and dangling references, and neither covers silence.** The standing requirement already names the remedy and I had not been applying it: *re-read the affected row*. The affected rows are findable mechanically — a card that touches a config key or a user-visible key should grep README for that key's name — but what is missing cannot be found by grepping for what is missing.
+
+**Added to the per-card checks:** for every user-visible key, command or config key a card touches, grep README for it **by name** and confirm a row exists and says the current thing. That is a positive check, not a phrase sweep, and it is the only one of the three that would have caught this.
