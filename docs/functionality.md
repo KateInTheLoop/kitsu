@@ -413,11 +413,11 @@ though the alternate screen's contents are the terminal's across the stop. `--tu
 fullscreen` and `[tui] mode = "fullscreen"` start there instead; a session that
 starts in fullscreen has nothing behind it to paint yet.
 
-The scrollback it paints holds the **streamed** conversation. It does not hold
-kitsu's own diagnostics and receipts, and it does not hold an answer that was
-buffered rather than streamed -- which happens whenever tools are advertised for
-that round, i.e. by default. With `--no-tools` the answer streams and the
-scrollback has it. `[tui] cell_ring_lines` bounds it in lines (default 10000).
+The scrollback it paints holds the **streamed** conversation -- which, since
+answers now stream with tools enabled, means ordinary answers too. It does not
+hold kitsu's own diagnostics and receipts. The one thing still absent is text
+withheld as a possible tool call and then released at the end of a round: the
+released tail reaches the scrollback, so a whole answer is there either way. `[tui] cell_ring_lines` bounds it in lines (default 10000).
 
 **It does hold your own prompts.** A submitted line is retained as yours, split
 one cell per line so a multi-line or pasted prompt keeps its shape on screen, and

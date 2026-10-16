@@ -11,6 +11,18 @@ shapes may change in any minor release.
 
 ### Fixed
 
+- **Answers stream again in the default configuration.** Streaming was suppressed
+  on any round that advertised tools -- which is every ordinary round -- so you
+  typed a question, watched a spinner, and got the whole answer in one burst. The
+  comment at that line reasoned that *"the final round withholds tools, so final
+  answers still stream live"*, which is true of a round that **follows** a tool
+  call and false of the common case: **the product streamed least when it mattered
+  most.** Text is now released as it arrives and withheld only while it could
+  still turn out to be a tool call -- so prose streams from its first character,
+  and nothing that becomes a tool call is ever shown. A consequence worth knowing:
+  because the fullscreen scrollback is fed from the streaming path, ordinary
+  answers now appear in it for the first time.
+
 - **`/jobs prune ID` no longer throws away a result nobody has read.** It prints
   the finished agent's output first, then prunes as asked. Previously the record
   was removed and the result went with it, unprinted -- and because the exit guard
@@ -279,9 +291,9 @@ shapes may change in any minor release.
   `Ctrl+End`. The keys are listed in `/help tui` rather than the agent view's key
   table, since they do nothing in the other renderers. Switching keeps the conversation, as the other modes do.
   **What the scrollback holds is worth knowing:** the streamed conversation --
-  not kitsu's own messages and receipts, and not an answer that was buffered
-  because tools were offered that round, which is the default. Run with
-  `--no-tools` and answers stream, and the scrollback has them.
+  not kitsu's own messages and receipts. Answers used to be missing from it
+  whenever tools were offered, which was the default; they stream now, so the
+  scrollback has them.
 - **`/help keys`** prints the agent view's key bindings without opening the view,
   and the view's own `?` help now prints the same rows from the same table — so
   the two can no longer disagree about what a key does.

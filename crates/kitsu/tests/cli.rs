@@ -21991,3 +21991,134 @@ fn every_registered_slash_command_reaches_a_dispatch_arm() {
         names.len()
     );
 }
+
+/// F51 byte contract: with tools enabled (`chat`'s default) a streamed prose answer
+/// must reach `--plain` stdout as exactly the answer plus one terminating
+/// newline — whether it is buffered to the end of the round or streamed
+/// fragment by fragment. This is the test that catches a fix which streams the
+/// fragments and then ALSO reprints the buffered text at the end of the round:
+/// the answer would appear twice.
+#[tokio::test]
+#[serial]
+async fn test_plain_streamed_answer_with_tools_enabled_is_printed_exactly_once() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"Here "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"is "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"the "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"answer."},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--plain", "chat", "stream me an ordinary answer"])
+            .output()
+            .expect("run a plain streamed chat")
+    })
+    .await
+    .expect("join the ask process");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    assert_eq!(
+        stdout, "Here is the answer.\n",
+        "the --plain byte contract for a streamed answer with tools offered"
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock gateway records requests");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(
+        body["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "F51's premise: this very round advertised tools: {body}"
+    );
+    server.verify().await;
+}
+
+/// F51's highest-risk case, and the realistic daily one:
+/// `test_text_protocol_ignores_prose`'s shape — prose, then a braced tail that
+/// could still have opened a text-protocol tool call, then more prose. The head
+/// is disqualified at once and streams; the `{` tail can only be released when
+/// the round ends. So this is the round where part of the text has streamed and
+/// part has not, and an end-of-round site that reprints the WHOLE buffered
+/// message instead of only the withheld tail duplicates the head. `print_message`
+/// writes straight to the process descriptor and bypasses the renderer's surface
+/// seam, so only a real `--plain` run can see that duplication.
+#[tokio::test]
+#[serial]
+async fn test_plain_stream_disqualified_midway_prints_each_part_exactly_once() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"Use a HashMap "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"{ key: value } "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"for this."},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--plain", "chat", "answer with a brace in the middle"])
+            .output()
+            .expect("run a plain streamed chat")
+    })
+    .await
+    .expect("join the chat process");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    assert_eq!(
+        stdout, "Use a HashMap { key: value } for this.\n",
+        "a round disqualified midway must print its streamed head and its \
+         withheld tail exactly once each"
+    );
+    assert_eq!(
+        stdout.matches("Use a HashMap").count(),
+        1,
+        "the streamed head must not be reprinted with the buffered tail: {stdout:?}"
+    );
+    server.verify().await;
+}
