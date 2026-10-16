@@ -32793,6 +32793,88 @@ mod tests {
         assert_eq!(result.captured, 1);
     }
 
+    /// Card **F57-reach**, the mid-turn half: the registry's *own* entries,
+    /// every one of them, driven through `TypeaheadDispatcher::dispatch`.
+    ///
+    /// The subjects are enumerated from `SLASH_COMMANDS`; no command name is
+    /// typed here, so an entry added without thought about the mid-turn path
+    /// is a subject of this test the moment it is registered.
+    ///
+    /// What it pins, and why this is the honest claim rather than "every
+    /// command is handled mid-turn": the mid-turn path handles a small set
+    /// immediately **by design** and queues the rest, and a queued line is
+    /// not a dead end — the idle loop dequeues it and, when it starts with
+    /// `/`, dispatches it through `handle_slash` (the `strip_prefix('/')`
+    /// route at the queue drain). So mid-turn reachability is the composition
+    /// of two properties: the leading slash survives the queue (here), and
+    /// the name has a dispatch arm (the CLI sweep
+    /// `every_registered_slash_command_reaches_a_dispatch_arm`). Either half
+    /// alone lets **F57**'s second failure mode through — a registered
+    /// command with no arm, silently banked as a future prompt.
+    ///
+    /// Deliberately **not** covered: arguments and subcommands (the subject
+    /// is the top-level word, which is what F57's instance was), and *which*
+    /// of the two legal shapes a given command takes — moving a command
+    /// between "handled now" and "queued for the turn boundary" is a design
+    /// decision each command's own test owns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_registered_command_typed_mid_turn_is_handled_or_queued_verbatim() {
+        let mut checked = 0usize;
+        for spec in SLASH_COMMANDS {
+            let line = format!("/{}", spec.name);
+            let queue = Arc::new(std::sync::Mutex::new(prompt_queue::PromptQueue::new(4)));
+            let dispatcher = TypeaheadDispatcher {
+                queue: queue.clone(),
+                steering: prompt_queue::SteeringChannel::new(8).expect("steering channel"),
+                registry: subagent::AgentRegistry::new(),
+                runtime: tokio::runtime::Handle::current(),
+                live: false,
+            };
+            let mut result = TypeaheadCaptureResult::default();
+            dispatcher.dispatch(&line, &mut result);
+
+            let queued: Vec<String> = queue
+                .lock()
+                .expect("prompt queue")
+                .iter()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(
+                result.captured,
+                queued.len(),
+                "{line:?}: the capture count and the queue must agree"
+            );
+            match queued.len() {
+                // Handled on the spot. Then it must have said so: a mid-turn
+                // command that acts and narrates nothing is **F71** (a
+                // message only the test can see) in the other direction.
+                0 => assert!(
+                    !result.outcomes.is_empty(),
+                    "{line:?} was neither queued nor narrated, so a user who \
+                     typed it mid-turn got silence"
+                ),
+                // Queued for the turn boundary. The leading slash is what
+                // makes the drain dispatch it as a command instead of sending
+                // its literal text to the model, so the queued entry must be
+                // the submitted line byte for byte.
+                1 => assert_eq!(
+                    queued[0], line,
+                    "{line:?} must reach the queue verbatim, slash intact, or \
+                     the drain will not route it to the slash dispatcher"
+                ),
+                _ => panic!("{line:?} produced {} queue entries", queued.len()),
+            }
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            SLASH_COMMANDS.len(),
+            "every registry entry is a subject of this sweep"
+        );
+        assert!(checked > 0, "the registry is not empty");
+    }
+
     // --- card T4-S3: peek (`Space`), and the exit guard ---
     //
     // The exit guard on unviewed results is
