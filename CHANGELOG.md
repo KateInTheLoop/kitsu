@@ -60,6 +60,14 @@ shapes may change in any minor release.
   reason.
 
 ### Added
+- **`Ctrl+X 1`…`Ctrl+X 9` attach to an agent by the position it is displayed at.**
+  `Ctrl+X 3` is the third row you can see -- **whatever its `#id`** -- so the
+  digits follow the agent view's own grouping and filter rather than agent
+  numbers. The nine digits reach the first nine rows; past that, open the view and
+  use the arrows. It switches agent when one is already attached, and re-attaching
+  to the agent you are on does nothing. `Ctrl+X 0` and a digit past the last row
+  do nothing at all, and the line you have typed is kept either way. Inside the
+  view the digits are ordinary characters.
 - **An interactive session now says so too when a tool result is dropped**, not
   just `--jsonl`. The line reads `~ context budget dropped 2 tool results in round
   3; the provider never saw them`, naming the count first, once per round. It

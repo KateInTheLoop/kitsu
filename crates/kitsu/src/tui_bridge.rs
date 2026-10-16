@@ -2138,6 +2138,19 @@ enum KeyItem {
     /// move the caret. Only produced when the reader was given a paging sink
     /// ([`KeyFilter::pages`]).
     Page(kitsu_tui::fullscreen::Page),
+    /// `<prefix> 1..9`: attach to the agent at that **1-based ordinal over
+    /// A2's display order** (card **T4-S6-ordinal**, design §4.7's
+    /// "attach agent N").
+    ///
+    /// The payload is the **ordinal**, never an id: ids pass 9 after nine
+    /// spawns and go *wrong* rather than dead once `#1` is pruned and `#11`
+    /// exists. Resolving the ordinal needs the registry, which this filter
+    /// does not have and must not grow -- so it is carried out to the caller
+    /// exactly as [`KeyItem::Open`] carries the decision about the overlay.
+    ///
+    /// `<prefix> 0` is **not** this item: the ordinal is 1-based, so `0` is
+    /// inert like any other chord letter.
+    Attach(usize),
     /// `Ctrl+O`: open the transcript overlay (requirement **R6**).
     ///
     /// Lifted out for [`KeyItem::Open`]'s reason, and a **literal** control
@@ -2237,6 +2250,16 @@ impl KeyFilter {
                 if let Some(item) = match data[index] {
                     AGENT_VIEW_CHORD_KEY => Some(KeyItem::Open),
                     DETACH_CHORD_KEY => Some(KeyItem::Detach),
+                    // Card **T4-S6-ordinal**: the nine digits, each the
+                    // **ordinal** it spells. `b'0'` is deliberately not in
+                    // the range: the ordinal is 1-based, so `0` names no
+                    // position, and it falls to the inert arm below rather
+                    // than becoming either an alias for the first row or the
+                    // first half of a multi-digit entry whose meaning would
+                    // be invisible until the next keystroke (**F75**).
+                    digit @ b'1'..=b'9' => {
+                        Some(KeyItem::Attach(usize::from(digit - b'0')))
+                    }
                     _ => None,
                 } {
                     if !bytes.is_empty() {
@@ -2405,6 +2428,23 @@ pub(crate) enum InlineRead {
     /// -- "only ever reached on an empty one" -- was true of `\u{2190}`
     /// alone and became wrong when the chord was given the same variant.
     Detached(String),
+
+    /// Card **T4-S6-ordinal**: `<prefix> 1..9`, the chord that attaches to
+    /// the agent at a **1-based ordinal over A2's display order**.
+    ///
+    /// Carries the ordinal and the draft. The reader stays **pure** for
+    /// [`InlineRead::OpenAgentView`]'s reason, and here it is not merely
+    /// tidiness: resolving an ordinal needs the **registry**, which the
+    /// reader has no business holding -- design §4.7 names exactly this
+    /// coupling as the card's difficulty. So the keystroke is reported, and
+    /// the caller resolves it against the rows the view would display
+    /// (`kitsu_tui::agents_view::nth_displayed` over the **filtered** set)
+    /// and attaches, or does nothing at all when no row holds that position.
+    ///
+    /// The draft is carried for **F76**'s reason: the chord has no
+    /// empty-composer precondition, so it must not cost the user the line
+    /// they typed.
+    AttachOrdinal(usize, String),
 
     /// `Ctrl+O`: open the transcript overlay over the cell ring (requirement
     /// **R6**).
@@ -2701,6 +2741,24 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
                     // only thing that can put the row back -- the same reason
                     // Ctrl+L's `Redraw` arm sets it.
                     changed = true;
+                }
+                // Card **T4-S6-ordinal**: `<prefix> 1..9`. The reader stays
+                // pure for `KeyItem::OpenTranscript`'s reason, and here it is
+                // not merely tidiness: resolving a position needs the
+                // registry, which this reader has no business holding. So the
+                // **ordinal** is reported and the draft handed back (**F76**:
+                // the chord has no empty-composer precondition), returning
+                // *at* this item so bytes typed after it belong to the next
+                // read. No disarm of the `\u{2190}\u{2190}` count, like the
+                // transcript arm: this returns, so the reader's state dies
+                // with it. There is no attachment precondition either --
+                // unlike `KeyItem::Detach` -- because while attached the
+                // chord *switches* agent.
+                KeyItem::Attach(ordinal) => {
+                    return Ok(InlineRead::AttachOrdinal(
+                        ordinal,
+                        editor.buffer_string(),
+                    ));
                 }
                 KeyItem::Detach => {
                     left_presses = 0;
@@ -8430,6 +8488,150 @@ mod tests {
             )),
             DRAFT,
             "NON-VACUOUS: the paste itself reaches the draft intact"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Card **T4-S6-ordinal**: `Ctrl+X 1..9`.
+    //
+    // **Measured first (F99/F100).** Today a digit after the prefix produces
+    // **no `KeyItem` at all**: `KeyFilter::feed(b"\x181")` is empty, and the
+    // reader's outcome for `\x181hi\r` is `Submitted("hi")` -- the digit is
+    // swallowed by the "any other letter is inert" arm, so it does not even
+    // reach the draft. The chord is therefore inert and silent today, and
+    // every assertion below is on behaviour that does not exist yet.
+    //
+    // **Scope.** The chord is the **composer's**, exactly as `Ctrl+X a` and
+    // `Ctrl+X d` are: this filter is where the prefix is a key at all. Inside
+    // the agent view the overlay's own decoder never sees `0x18` as a prefix
+    // (its `plain()` admits `0x20..=0x7e` only) and a bare digit falls into
+    // `handle_overlay_input`'s `OverlayKey::Char(_) => {}` catch-all, so the
+    // view keeps selecting with `↑`/`↓`. No third scope is invented.
+    // ------------------------------------------------------------------
+
+    /// **`Ctrl+X 1..9`.** Nine digits, each lifted out of the byte stream as
+    /// the **ordinal** it is, through the same filter that already lifts
+    /// `Ctrl+X a` and `Ctrl+X d` (**F69**: this is the real decoder, not a
+    /// predicate beside it).
+    ///
+    /// The controls are the rules the new digits must not break (**F68** and
+    /// T4-S2's): a bare digit is content, a chord split across two reads is
+    /// still one keystroke, a chord inside a bracketed paste is text, and the
+    /// two letters that already route still route.
+    #[test]
+    fn the_key_filter_lifts_the_ordinal_chord_digits_one_through_nine() {
+        for ordinal in 1usize..=9 {
+            let chord = format!("\x18{ordinal}");
+            assert_eq!(
+                KeyFilter::new(attach_keys()).feed(chord.as_bytes()),
+                vec![KeyItem::Attach(ordinal)],
+                "design \u{00a7}4.7: `Ctrl+X {ordinal}` carries the ordinal \
+                 {ordinal}, which is a position and never an id"
+            );
+        }
+        // Split across two reads, as two keystrokes routinely are.
+        let mut split = KeyFilter::new(attach_keys());
+        assert_eq!(
+            split.feed(b"\x18"),
+            Vec::new(),
+            "the prefix alone yields nothing"
+        );
+        assert_eq!(
+            split.feed(b"4"),
+            vec![KeyItem::Attach(4)],
+            "and the digit in the next read completes the chord"
+        );
+        // **`Ctrl+X 0`: decided inert.** The ordinal is 1-based, so `0` names
+        // no position; it is not an alias for the first row (that is `1`) and
+        // not a prefix of `10` (which would make `Ctrl+X 1` ambiguous until
+        // the next keystroke -- **F75**'s shape, invisible at the keypress).
+        // It is dropped exactly as any other non-chord letter is, so it does
+        // not reach the draft either.
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"\x180"),
+            Vec::new(),
+            "`Ctrl+X 0` is inert: 0 is not an ordinal, and the digit is \
+             dropped rather than typed"
+        );
+        // CONTROL: a bare digit is a character in the draft.
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"3"),
+            vec![KeyItem::Bytes(b"3".to_vec())],
+            "NON-VACUOUS: without the prefix, `3` is content"
+        );
+        // CONTROL: inside a bracketed paste the same two bytes are text.
+        let pasted = b"\x1b[200~\x183\x1b[201~";
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(pasted),
+            vec![KeyItem::Bytes(pasted.to_vec())],
+            "a pasted chord is pasted text, not a chord"
+        );
+        // CONTROL: the two letters that already route are unchanged.
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"\x18a"),
+            vec![KeyItem::Open],
+            "`Ctrl+X a` is unchanged by the digits"
+        );
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"\x18d"),
+            vec![KeyItem::Detach],
+            "`Ctrl+X d` is unchanged by the digits"
+        );
+    }
+
+    /// The reader reports the ordinal and **carries the draft** (**F76**: the
+    /// chord has no empty-composer precondition, so it must not cost the user
+    /// the line they typed), returning *at* the chord so bytes typed after it
+    /// belong to the next read.
+    ///
+    /// It reports the **ordinal** and not an agent, and that is the card's
+    /// whole shape: resolving a position needs the registry, and the reader
+    /// has none -- design §4.7 names exactly that coupling.
+    #[test]
+    fn the_ordinal_chord_reports_the_ordinal_and_carries_the_draft() {
+        assert_eq!(
+            read_attached(
+                Chunks::new([b"typed".as_slice(), b"\x183", b"later\r"]),
+                attach_keys(),
+                None,
+            ),
+            InlineRead::AttachOrdinal(3, "typed".to_string()),
+            "the chord reports ordinal 3 and hands the draft back, and the \
+             bytes after it belong to the next read"
+        );
+        // Attaching is reached from **both** states: with nothing attached it
+        // is how the user attaches, and while attached it is how they switch.
+        assert_eq!(
+            read_attached(
+                Chunks::new([b"\x187".as_slice(), b"\r"]),
+                attach_keys(),
+                Some(42),
+            ),
+            InlineRead::AttachOrdinal(7, String::new()),
+            "the chord has no attachment precondition: while attached it \
+             switches agent"
+        );
+        // CONTROL, and today's measured behaviour preserved: `Ctrl+X 0` is no
+        // route, and its digit does not reach the draft.
+        assert_eq!(
+            read_attached(
+                Chunks::new([b"\x180".as_slice(), b"\r"]),
+                attach_keys(),
+                Some(42),
+            ),
+            InlineRead::Submitted(String::new()),
+            "NON-VACUOUS: `Ctrl+X 0` is inert, and its digit is not typed \
+             into the draft"
+        );
+        // CONTROL: a bare digit is typed.
+        assert_eq!(
+            read_attached(
+                Chunks::new([b"3".as_slice(), b"\r"]),
+                attach_keys(),
+                Some(42),
+            ),
+            InlineRead::Submitted("3".to_string()),
+            "NON-VACUOUS: without the prefix the digit is just a character"
         );
     }
 
