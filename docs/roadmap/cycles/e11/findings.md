@@ -5389,3 +5389,79 @@ F122's human line is therefore gated on **`stderr_styled() && is_tty()`** — bo
 ### Also now biting: F121's documentation gap
 
 `test_n1_jsonl_gains_nothing_from_the_human_report_of_a_dropped_result` is the **second** test hard-coding the full ordered JSONL `"type"` sequence, and there is still **no documented list** for either to reference. Two tests now encode a contract the documentation does not state — so a change to the stream breaks them with no doc to consult. Recorded under F121; still outside this epic's scope, but the cost is now concrete rather than hypothetical.
+
+## F126 — F121 was wrong, and two commits ago I shipped a contract gap because of it
+
+**RETRACTION.** F121 recorded that *"the JSONL event vocabulary is enumerated nowhere in the docs"* and that *"an integrator cannot learn the stream's vocabulary from the documentation."* **Both are false.**
+
+**There is a published JSON Schema** — `docs/schemas/kitsu-chat-v1.schema.json`, 42 `$defs`, with an event-shaped definition for **every one** of the eleven types: `run_started`, `turn_started`, `turn_finished`, `final_summary`, `tool_started`, `tool_finished`, `assistant`, `assistant_disposition`, `provider_request`, `provider_attempt`, `error`. **And the code already pins against it**, via `include_str!("../../../docs/schemas/kitsu-chat-v1.schema.json")` in `kitsu-render/src/jsonl.rs`.
+
+**How I got it wrong: I searched `README.md` and `docs/functionality.md` for type names, found three absent, and concluded the vocabulary was undocumented.** The documentation exists in a different *form* — a formal schema, not prose. **That is the third time this session I have asserted absence from a search whose shape could not have found the thing** (F116's backwards paste attribution, F120's two wrong hypotheses, now this), and it is the error my own standing note warns about.
+
+### The consequence, which is a real defect in a commit I accepted
+
+**`tool_results_dropped` is NOT in the schema.** Commit `2d1785c` added a new JSONL event type and never updated the published contract, so **the schema no longer describes the stream it documents.** I accepted that card — twice over, since F122 extended the same feature and I checked the docs again without finding this.
+
+### Why the existing guard did not catch it, which is the fix worth building
+
+`published_schema_keeps_command_payload_and_event_definitions_distinct` asserts that **specific** `$defs` exist and that **specific** `$ref`s point where expected. **It never requires that every `AgentRuntimeEvent` variant has a definition.** The schema is pinned for **structure**, not for **coverage** — so a new event type slips through in silence, which is exactly what happened.
+
+**The card is therefore two things**, and the second matters more than the first:
+
+1. Add `tool_results_dropped` to the schema — the gap I shipped.
+2. **Add a coverage test: every `AgentRuntimeEvent` variant must have a schema definition.** That converts *"remember to update the schema"* into an enforced invariant, which is the only form that has held up in this session.
+
+**Where it must live, measured:** `kitsu-render` has **no `kitsu-*` dependency** — load-bearing, it is what makes "classic pays nothing" a compile-time property — so the existing schema test **cannot see the enum**. The coverage test belongs in **`kitsu-core`**, where `AgentRuntimeEvent` is defined, and can reach the schema at `../../docs/schemas/kitsu-chat-v1.schema.json`. Verified both.
+
+### The pattern, stated once more because it keeps recurring
+
+**F124** found a gate list curated from memory rather than derived from the workspace. **F114** found a README row that was missing, which no grep could reveal. **This** is the same shape a third time: a contract pinned by a test that checks *the parts someone thought of* rather than *the whole set*. **Every one was invisible precisely because the check was authored from the same mental model as the thing it checked.** The remedy is identical each time — enumerate the system, do not curate a list from what you remember of it.
+
+### F126's exposure, bounded before briefing the fix
+
+Applied this card's own lesson one level up: **are there other published contracts pinned for structure but not coverage?** Measured — `docs/schemas/` contains **exactly one** file, `kitsu-chat-v1.schema.json`, referenced from **one** source file.
+
+**So the exposure is one schema, not a family.** Same shape of result as F119's sweep: a measured *"smaller than feared"*, which is worth having explicitly rather than leaving as an open worry. The coverage test this card adds therefore closes the whole class, not a sample of it.
+
+### F126 corrected — the finding about curated lists contained a curated list, and it was wrong
+
+**F126, and the brief I wrote from it, both listed eleven event types as having schema definitions:** `run_started`, `turn_started`, `turn_finished`, `final_summary`, `tool_started`, `tool_finished`, `assistant`, `assistant_disposition`, `provider_request`, `provider_attempt`, `error`. **Measured by the test author and verified by me, that list is wrong in both directions.**
+
+**`AgentRuntimeEvent` has nine variants:** `ProviderRequest`, `StructuredFinalizationDeferred`, `ProviderAttempt`, `AssistantDelta`, `Usage`, `ToolStarted`, `ToolFinished`, `TurnFinished`, `ToolResultsDropped`.
+
+- **Six of my eleven are not variants at all** — `run_started`, `turn_started`, `final_summary`, `assistant`, `assistant_disposition` and `error` are **frontend-level** events emitted elsewhere, which is why the schema has defs for them.
+- **Three real variants were missing from my list**: `structured_finalization_deferred`, `assistant_delta`, `usage`.
+
+**I had assembled it from the event types I had seen in a captured stream**, not from the enum — the identical method whose failure F126 exists to record. **The finding about curating lists was itself curated.** The card's conclusion survives untouched: the coverage hole is real and is exactly `tool_results_dropped`, at **8 of 9**.
+
+### And a second half of the same gap, which nobody had reported
+
+`$defs/forward_compatible_event` carries a **hand-maintained `type.not.enum` of 26 names**, and **`tool_results_dropped` is absent from it too** — verified. So the published contract today says a `tool_results_dropped` line is an *unknown forward-compatible event*, and **a schema-validating consumer accepts it as something it need not understand.** Commit `2d1785c` missed **both** places, and the fix is two schema edits, not one.
+
+**That is the sharper version of the defect.** The missing definition means the contract is silent about the event; the missing exclusion means the contract **actively mis-describes** it. A consumer doing the right thing — validating against the published schema — is told to ignore a line reporting data loss.
+
+### The enumeration the author built, which is the part to keep
+
+Rejected: a literal name array (the failure this card exists to fix), `strum::EnumIter` (no non-unit variants, and a production derive), `mem::Discriminant` (not enumerable), and parsing the enum out of source (*"a reimplemented Rust parser is a worse oracle than the compiler"*).
+
+Chosen: **one declarative macro whose single list expands into both a sample-value function and an exhaustive `match`** — so an arm and its sample come from the same entry and cannot drift. A plain samples-list-plus-match can be satisfied by adding an arm and forgetting the sample; this cannot.
+
+**And the tripwire was verified, not asserted:** transiently adding a tenth variant produced `error[E0004]: non-exhaustive patterns`, whose only repair is a new macro entry, which supplies a sample, which the coverage test walks, which then demands the `$defs` entry. **No wire name is typed anywhere in the file** — every one is read back out of `serde_json::to_value(&sample)["event"]`.
+
+### F126 closed — and the closing line is the agent's, because it is better than mine
+
+**Three dimensions, and two were found after my brief.** A contract entry is not one place: `tool_results_dropped` needed a **`$defs` definition** pinning its `type` (my brief), **absence from `forward_compatible_event`'s exclusion list** (found by the test author), and **a branch of the closed root `oneOf`** (found by the implementer). Verified: the root's keys are exactly `$schema, $id, title, description, oneOf, $defs` — **nothing else**, so it is genuinely closed, and **the two edits I prescribed would have made the schema reject a line the tool emits.** Strictly worse than the defect.
+
+**The third edit was not test-driven and the implementer said so** rather than presenting three edits as if the tests demanded all three. It was then **made** test-driven: the branch was dropped from a scratch copy (28 → 27, anchored), `include_str!` repointed, and the assertion failed naming the variant — a structural mutation standing in for validation the host cannot run.
+
+**Folded into one test, for a reason worth keeping.** The three are **one question** — *does the contract accept this variant's line?* — and the folded message says **`defined and pinned 9/9`** *and then* names the branch, so a reader is told the definition is right and the root is the problem. Three separate tests would have reported the branch gap with no way to see that the other two were fine.
+
+**One invariant added that I would not have thought of:** exactly one root branch pins no `type` constant — `not_event_shaped == ["forward_compatible_event"]`. **A second catch-all branch would silently reopen the closed root and void the whole dimension.** Asserted from the measurement, not assumed.
+
+**And one surface deliberately left unpinned, with its reason:** every event def having a branch. *"The schema author's structural choice, not an invariant the enum can speak to"* — and its home is `kitsu-render`'s structural test, not a coverage test driven by the Rust enum. Declining to assert something the oracle cannot speak to is the same discipline as declining to write the `--max-rounds` assertion two cards ago.
+
+### The closing line, verbatim, because it generalises past this schema
+
+> *A contract has as many coverage dimensions as it has places a name must appear, and enumerating those is the same problem one level up.*
+
+That is the honest end of the thread that runs **F114 → F124 → F126**: a README row that no grep could reveal, a gate list curated from the crates one epic touched, and a contract check that pinned the parts someone thought of. Each was invisible because the check shared a mental model with the thing checked. **This card fixed the third and named the fourth** — the enumeration of the dimensions themselves — rather than pretending the regress had bottomed out.

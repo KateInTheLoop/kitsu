@@ -10,6 +10,14 @@ shapes may change in any minor release.
 ## [Unreleased]
 
 ### Fixed
+- **The published JSONL schema now covers `tool_results_dropped`.** When that
+  event shipped, `docs/schemas/kitsu-chat-v1.schema.json` was not updated, so a
+  consumer validating against the published contract was told a line reporting
+  **lost tool output** was an unknown event it need not understand. The schema now
+  defines the event, pins its `type`, gives it a branch of the closed root, and
+  excludes it from the forward-compatible catch-all. **A test now requires every
+  event the binary can emit to satisfy all three**, so the next one cannot ship
+  undocumented.
 - A session commit could fail with `session '<id>' is already active in this or
   another process` when nothing else held it. The session lock is advisory and
   kernel-held per open file description, and a descriptor marked close-on-exec
