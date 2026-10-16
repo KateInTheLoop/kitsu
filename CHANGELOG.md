@@ -10,6 +10,16 @@ shapes may change in any minor release.
 ## [Unreleased]
 
 ### Fixed
+- **`[tui] alternate_screen = never` and `--no-alt-screen` are now refused instead
+  of silently ignored.** Neither was honoured by anything: all three values of that
+  key did the same nothing, so `auto` was accidentally correct and **`never` did
+  not work** -- including for the case the flag was written for, a multiplexer
+  where the alternate screen misbehaves. Both now **fail with a message naming what
+  is accepted**, and the message says the value is *not available yet* rather than
+  invalid, because it is a coherent thing to want and will be honoured once an
+  in-viewport overlay path exists. `auto` and `always` are unaffected; a
+  misspelling such as `Never` still gets the vocabulary error listing all three
+  recognised spellings.
 - **A "Text file busy" command failure now says it is transient.** Running a tool
   while something still has it open for writing -- an editor mid-save, a build
   writing the binary, a tool being replaced -- failed with a bare

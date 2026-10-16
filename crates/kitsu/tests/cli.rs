@@ -20466,7 +20466,7 @@ fn test_doctor_accepts_a_well_spelled_tui_table() {
     fs::write(
         &config,
         format!(
-            "{contents}\n[tui]\nmode = \"inline\"\nalternate_screen = \"never\"\n\
+            "{contents}\n[tui]\nmode = \"inline\"\nalternate_screen = \"always\"\n\
              prefix = \"ctrl+b\"\ntitle = false\nleft_arrow_opens_agents = false\n\
              cell_ring_lines = 2000\n"
         ),
@@ -20481,6 +20481,120 @@ fn test_doctor_accepts_a_well_spelled_tui_table() {
     assert!(output.status.success(), "{output:?}");
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["config"]["status"], "parsed successfully");
+}
+
+/// **F62, file door, end to end.** `[tui] alternate_screen = "never"` is a
+/// documented, parsed, validated value that nothing can honour: there is no
+/// in-viewport overlay path, so the agent view takes the alternate screen
+/// whatever this key says. Before this card a user could set it, have it
+/// accepted, and watch the overlay take the alternate screen anyway.
+///
+/// So `doctor` must now FAIL on it and say what is accepted. This is the
+/// deliberate converse of `test_doctor_accepts_a_well_spelled_tui_table`
+/// above: that one proves a well-spelled table still parses, this one proves
+/// the refusal reaches the user through the real binary rather than only
+/// through a unit test -- the message has to survive the credential-hint
+/// allow-list to get here at all.
+#[test]
+fn test_doctor_refuses_alternate_screen_never_naming_what_is_accepted() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let config = home.path().join(".kitsu/config.toml");
+    let contents = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!("{contents}\n[tui]\nalternate_screen = \"never\"\n"),
+    )
+    .unwrap();
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["config"]["status"], "parse/read failed",
+        "a value nothing can honour must not be reported as parsed: {report}"
+    );
+    let issues = report["blocking_issues"]
+        .as_array()
+        .expect("doctor must report blocking issues")
+        .iter()
+        .map(|issue| issue.as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        issues.contains("`alternate_screen`"),
+        "doctor must name the key: {issues}"
+    );
+    assert!(
+        issues.contains("is not available yet"),
+        "doctor must say the value is not available yet, not that it is \
+         invalid -- the user should wait, not stop wanting it: {issues}"
+    );
+    assert!(
+        issues.contains("accepted: `auto`, `always`"),
+        "doctor must name the accepted set: {issues}"
+    );
+    // F48: the key and the permitted set, never the line the user wrote.
+    assert!(
+        !issues.contains("alternate_screen = "),
+        "F48: the refusal must not quote the offending config line: {issues}"
+    );
+}
+
+/// **F62, argv door, end to end.** `--no-alt-screen` is the same unimplemented
+/// capability by another name: a live global switch documented as *"a one-way
+/// force"* to `never`, which `README` promises will *"Force `[tui]
+/// alternate_screen` to `never`"*. Since `never` cannot be honoured, the flag
+/// cannot be honoured either.
+///
+/// Refusing the file and not the flag would MOVE the lie rather than close it,
+/// and would leave the promise lying exactly where it hurts most: a user
+/// passing this flag is in a multiplexer and believes they have disabled the
+/// alternate screen.
+///
+/// The argv message MAY name the flag -- F48 withholds values read from a
+/// config file, not a switch the user typed on the command line -- which is
+/// the one way the two messages differ.
+#[test]
+fn test_no_alt_screen_is_refused_until_the_in_viewport_path_exists() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["--no-alt-screen", "doctor"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !output.status.success(),
+        "a flag kitsu cannot honour must not exit 0: {output:?}"
+    );
+    assert!(
+        stderr.contains("--no-alt-screen"),
+        "the argv refusal must name the flag the user typed: {stderr}"
+    );
+    assert!(
+        stderr.contains("is not available yet"),
+        "the flag must be refused as unavailable, not as invalid: {stderr}"
+    );
+
+    // Bidirectional: the identical invocation WITHOUT the flag still works,
+    // so the refusal above is the flag's and not a broken fixture.
+    let without = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["doctor"])
+        .output()
+        .unwrap();
+    assert!(
+        without.status.success(),
+        "`doctor` without the flag must still succeed: {without:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -570,8 +570,11 @@ drives the inline host yet. A 10 KiB bracketed paste at the idle inline prompt
 stays a single draft and is accepted in single-digit milliseconds, measured by
 `crates/kitsu/tests/paste_latency.rs` against requirement N2's 100 ms budget.
 `--tui <classic|inline>` and the `[tui]` table select the renderer: `mode`
-(default `classic`), `alternate_screen` (`auto|always|never`, forced to `never`
-by `--no-alt-screen`), `prefix` (default `ctrl+x`), `title`,
+(default `classic`), `alternate_screen` (`auto` or `always`; **`never` is
+recognised but refused**, and `--no-alt-screen` with it — both need an
+in-viewport overlay path that does not exist yet, and accepting either would
+change nothing, which is worse than saying so), `prefix` (default `ctrl+x`),
+`title`,
 `left_arrow_opens_agents`, and `cell_ring_lines` (default 10000, range
 1-1000000). The flag wins over the config key, the config key over the default,
 and **no environment variable participates**. A misspelled key or an invalid

@@ -877,6 +877,27 @@ fn validate_output_last_message_surface(cli: &Cli) -> Result<(), CliError> {
     session::validate_output_file_target(destination).map_err(CliError::user)
 }
 
+/// Refuse `--no-alt-screen` while nothing can honour it (**F62**).
+///
+/// The flag is the argv door onto `[tui] alternate_screen = "never"`, which
+/// the config deserializer refuses for the same reason: there is no
+/// in-viewport overlay path, so the agent view takes the alternate screen
+/// whatever either door says. Refusing only the file would move the lie to
+/// the command line rather than close it.
+///
+/// It fires for every subcommand, `doctor` included, because the flag is
+/// `global = true`: a global flag refused on some subcommands and accepted on
+/// others is a rule the user has to memorise, and `doctor` is exactly where a
+/// silent lie is worst -- it is run to learn whether the setup is sound, and
+/// reporting "all good" while ignoring a flag the user passed is the defect
+/// this refusal exists to close.
+fn validate_no_alt_screen_flag(cli: &Cli) -> Result<(), CliError> {
+    crate::config::TuiConfig::default()
+        .effective_alternate_screen(cli.no_alt_screen)
+        .map(|_| ())
+        .map_err(CliError::user)
+}
+
 fn validate_output_schema_surface(cli: &Cli) -> Result<(), CliError> {
     let Some(path) = cli.output_schema.as_deref() else {
         return Ok(());
@@ -1908,6 +1929,7 @@ fn run() -> Result<(), CliError> {
             .expect("every inference command has an explicit carrier");
         activate_model_command(carrier)?;
     }
+    validate_no_alt_screen_flag(&cli)?;
     validate_output_last_message_surface(&cli)?;
     OUTPUT_LAST_MESSAGE_REQUESTED.store(cli.output_last_message.is_some(), Ordering::Release);
     validate_output_schema_surface(&cli)?;
@@ -20244,8 +20266,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // alternate-screen force (the agent view takes the alternate screen
         // unconditionally today) and the title row. The cell ring is no longer
         // parked here -- it is handed to `install` below.
+        // F62: the flag is already refused in argv validation
+        // (`validate_no_alt_screen_flag`), so reaching here means it was not
+        // passed and this resolves to the configured value -- which can only
+        // be `auto` or `always`, the deserializer having refused `never`.
         let _resolved_tui = (
-            setup.tui.effective_alternate_screen(cli.no_alt_screen),
+            setup
+                .tui
+                .effective_alternate_screen(cli.no_alt_screen)
+                .expect("--no-alt-screen is refused in argv validation (F62)"),
             setup.tui.title,
         );
         let mode = match setup.tui.effective_mode(cli.tui_mode()) {

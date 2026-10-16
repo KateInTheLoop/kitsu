@@ -187,7 +187,17 @@ pub enum AlternateScreen {
     Auto,
     /// Always take the alternate screen.
     Always,
-    /// Never take it; `--no-alt-screen` forces this.
+    /// Never take it. **F62**: no door reaches this today -- `[tui]
+    /// alternate_screen = "never"` is refused by the deserializer and
+    /// `--no-alt-screen` is refused in argv validation -- because nothing can
+    /// honour it until the in-viewport overlay path exists. The variant stays
+    /// because the value is recognised and intended, not withdrawn.
+    ///
+    /// Nothing constructs it while both doors refuse it, hence the allow: the
+    /// variant is the refusal's subject, and deleting it would turn `never`
+    /// from "recognised, not yet available" into "not a value", which is the
+    /// opposite fact (F90).
+    #[allow(dead_code)]
     Never,
 }
 
@@ -202,8 +212,30 @@ const TUI_VALUE_ERROR: &str = "invalid value for `[tui]` key ";
 
 /// The accepted `mode` spellings, as the error messages list them.
 const TUI_MODES: &str = "`classic`, `inline`, `fullscreen`";
-/// The accepted `alternate_screen` spellings.
+/// The RECOGNISED `alternate_screen` spellings, as the vocabulary error lists
+/// them. All three are recognised, so a typo is told the whole vocabulary --
+/// including the value kitsu intends to honour but cannot yet.
 const TUI_ALTERNATE_SCREENS: &str = "`auto`, `always`, `never`";
+/// The ACCEPTED `alternate_screen` values, as the F62 refusal lists them.
+///
+/// Deliberately a second const rather than a reuse of
+/// [`TUI_ALTERNATE_SCREENS`]: *recognised* and *accepted* are different sets
+/// while `never` waits for the in-viewport overlay path, and one string
+/// cannot answer both questions without lying to one of the two callers.
+const TUI_ALTERNATE_SCREENS_ACCEPTED: &str = "`auto`, `always`";
+
+/// The argv-door refusal for `--no-alt-screen` (**F62**).
+///
+/// The flag is documented as a one-way force of `[tui] alternate_screen` to
+/// `never`, and `never` is the one value nothing can honour. It therefore
+/// names the flag the user typed -- F48 withholds values read from a config
+/// file, not a switch from the command line -- and carries the same "is not
+/// available yet" verdict as the file door, because it is the same missing
+/// capability by another name.
+pub const NO_ALT_SCREEN_REFUSAL: &str = "`--no-alt-screen` forces `[tui]` key \
+     `alternate_screen` to `never`, which is not available yet: there is no \
+     in-viewport overlay path, so the agent view takes the alternate screen \
+     whatever this resolves to. Drop the flag; accepted: `auto`, `always`";
 
 /// Deserialize `mode` loudly.
 ///
@@ -258,7 +290,17 @@ where
     match raw.as_str() {
         "auto" => Ok(AlternateScreen::Auto),
         "always" => Ok(AlternateScreen::Always),
-        "never" => Ok(AlternateScreen::Never),
+        // F62: a RECOGNISED spelling that nothing can honour, so it is
+        // refused by name rather than coerced into `always`'s behaviour.
+        // "Not available yet", never "not valid" (F90): the value is a
+        // coherent thing to want and kitsu intends to honour it, so the
+        // message tells the user to wait rather than to stop wanting it. The
+        // match stays byte-exact, so `Never` and ` never ` are typos and get
+        // the vocabulary error above instead.
+        "never" => Err(D::Error::custom(format!(
+            "{TUI_VALUE_ERROR}`alternate_screen`: `never` is not available \
+             yet; accepted: {TUI_ALTERNATE_SCREENS_ACCEPTED}"
+        ))),
         _ => Err(invalid()),
     }
 }
@@ -429,14 +471,29 @@ impl TuiConfig {
         flag.unwrap_or(self.mode)
     }
 
-    /// The alternate-screen decision this run uses. `--no-alt-screen` is
-    /// one-way: it forces `never` over any configured value, and its absence
-    /// forces nothing.
-    pub fn effective_alternate_screen(&self, no_alt_screen_flag: bool) -> AlternateScreen {
+    /// The alternate-screen decision this run uses, or a refusal.
+    ///
+    /// **F62.** `never` is the one value nothing can honour -- there is no
+    /// in-viewport overlay path, so the agent view takes the alternate screen
+    /// whatever this resolves to. It is therefore refused rather than coerced,
+    /// at BOTH doors: `[tui] alternate_screen = "never"` is refused by the
+    /// deserializer, and `--no-alt-screen` -- which is documented as a one-way
+    /// force to `never` -- is refused here, because a flag that silently does
+    /// nothing is the identical defect to a config value that silently does
+    /// nothing, and refusing only the file would move the lie to argv rather
+    /// than close it.
+    ///
+    /// The `Err` is the ARGV-side message, which may name the flag: F48
+    /// withholds values read from a config file, not a switch the user typed.
+    ///
+    pub fn effective_alternate_screen(
+        &self,
+        no_alt_screen_flag: bool,
+    ) -> Result<AlternateScreen, String> {
         if no_alt_screen_flag {
-            AlternateScreen::Never
+            Err(NO_ALT_SCREEN_REFUSAL.to_string())
         } else {
-            self.alternate_screen
+            Ok(self.alternate_screen)
         }
     }
 }
@@ -1247,7 +1304,7 @@ mod tests {
         let parsed: Config = toml::from_str(
             "[tui]\n\
              mode = \"inline\"\n\
-             alternate_screen = \"never\"\n\
+             alternate_screen = \"always\"\n\
              prefix = \"ctrl+b\"\n\
              title = false\n\
              left_arrow_opens_agents = false\n\
@@ -1256,7 +1313,7 @@ mod tests {
         .expect("the full [tui] table must parse");
         let tui = parsed.tui.expect("[tui] must be present when written");
         assert_eq!(tui.mode, TuiMode::Inline);
-        assert_eq!(tui.alternate_screen, AlternateScreen::Never);
+        assert_eq!(tui.alternate_screen, AlternateScreen::Always);
         assert_eq!(tui.prefix, "ctrl+b");
         assert!(!tui.title);
         assert!(!tui.left_arrow_opens_agents);
@@ -1266,7 +1323,7 @@ mod tests {
         // makes the assertions non-vacuous.
         let default = TuiConfig::default();
         assert_ne!(default.mode, TuiMode::Inline);
-        assert_ne!(default.alternate_screen, AlternateScreen::Never);
+        assert_ne!(default.alternate_screen, AlternateScreen::Always);
         assert_ne!(default.prefix, "ctrl+b");
         assert!(default.title);
         assert!(default.left_arrow_opens_agents);
@@ -1366,27 +1423,53 @@ mod tests {
         );
     }
 
-    /// `--no-alt-screen` is a one-way flag: it forces `never` over any
-    /// configured value, and its absence never forces anything.
+    /// `--no-alt-screen` asks for `never`, and **F62 refuses `never`** -- so
+    /// the flag is refused too, and refused REGARDLESS of what the file says,
+    /// which is the "beats any configured value" property this test was
+    /// written for, now pointing the other way.
+    ///
+    /// Rewritten under the coordinator's ruling (option (a), both doors). The
+    /// flag was documented as a one-way force to `never`; refusing the file
+    /// and not the flag would have left `README`'s promise lying in the place
+    /// it hurts most -- a multiplexer, where a user passing the flag believes
+    /// they have disabled the alternate screen.
+    ///
+    /// Its ABSENCE still forces nothing, which is the property that keeps the
+    /// refusal from swallowing the two honourable values.
     #[test]
-    fn no_alt_screen_flag_forces_never_over_any_configured_value() {
-        for configured in [
-            AlternateScreen::Auto,
-            AlternateScreen::Always,
-            AlternateScreen::Never,
-        ] {
+    fn no_alt_screen_flag_is_refused_regardless_of_the_configured_value() {
+        for configured in [AlternateScreen::Auto, AlternateScreen::Always] {
             let tui = TuiConfig {
                 alternate_screen: configured,
                 ..TuiConfig::default()
             };
-            assert_eq!(
-                tui.effective_alternate_screen(true),
-                AlternateScreen::Never,
-                "--no-alt-screen must beat alternate_screen = {configured:?}"
+
+            let refusal = tui
+                .effective_alternate_screen(true)
+                .expect_err(&format!(
+                    "--no-alt-screen asks for `never`, which nothing can \
+                     honour, so it must be refused even when the file says \
+                     {configured:?}"
+                ));
+            // The argv-side message MAY name the flag -- F48 withholds values
+            // read from a config file, not a switch the user typed -- and it
+            // carries the same "not available yet" verdict as the file side,
+            // because it is the same missing capability.
+            assert!(
+                refusal.contains("--no-alt-screen"),
+                "the argv refusal must name the flag the user typed: {refusal}"
             );
+            assert!(
+                refusal.contains("is not available yet"),
+                "the flag must be refused as unavailable, not as invalid: {refusal}"
+            );
+
+            // Without the flag, the configured value stands untouched. This is
+            // the bidirectional half: a refusal that fired here would break
+            // every session that never passed the flag.
             assert_eq!(
                 tui.effective_alternate_screen(false),
-                configured,
+                Ok(configured),
                 "without the flag the configured value stands"
             );
         }
@@ -1540,6 +1623,7 @@ mod tests {
     /// error naming the key rather than a coercion.
     #[test]
     fn alternate_screen_is_a_tri_state_and_rejects_booleans() {
+        // The two values kitsu can honour today still parse to themselves.
         for (text, expected) in [
             (
                 "[tui]\nalternate_screen = \"auto\"\n",
@@ -1549,14 +1633,22 @@ mod tests {
                 "[tui]\nalternate_screen = \"always\"\n",
                 AlternateScreen::Always,
             ),
-            (
-                "[tui]\nalternate_screen = \"never\"\n",
-                AlternateScreen::Never,
-            ),
         ] {
             let parsed: Config = toml::from_str(text).expect(text);
             assert_eq!(parsed.tui.unwrap_or_default().alternate_screen, expected);
         }
+
+        // F62: `never` is still a RECOGNISED spelling -- it does not get the
+        // "expected one of" vocabulary error a typo gets -- but it is REFUSED
+        // until the in-viewport overlay path exists. Pinned in
+        // `alternate_screen_never_is_refused_until_the_in_viewport_path_exists`;
+        // asserted here only so this test cannot keep passing by accepting it.
+        let refused = toml::from_str::<Config>("[tui]\nalternate_screen = \"never\"\n")
+            .expect_err("`never` must be refused while nothing can honour it");
+        assert!(
+            refused.message().contains("is not available yet"),
+            "`never` must be refused as unavailable, not accepted: {refused}"
+        );
 
         let rendered = load_config_text("[tui]\nalternate_screen = true\n")
             .expect_err("a boolean must not be coerced to auto/always")
@@ -1578,6 +1670,149 @@ mod tests {
                 && error.message().contains("`auto`, `always`, `never`"),
             "{error}"
         );
+    }
+
+    /// **F62.** `[tui] alternate_screen = "never"` is refused at config load,
+    /// because nothing can honour it: the in-viewport overlay path does not
+    /// exist, so the agent view takes the alternate screen whatever this key
+    /// says. A value that parsed and silently behaved as `always` is the quiet
+    /// coercion this epic has refused everywhere else.
+    ///
+    /// The precedent is `fullscreen`, refused by name for two stages while
+    /// `classic` and `inline` worked, and the rule that outlived it: a thing
+    /// kitsu does not have is refused by name rather than coerced.
+    ///
+    /// **"Not available yet", not "not valid"** (F90): the value is a coherent
+    /// thing to want and kitsu intends to honour it, so the message tells the
+    /// user to wait rather than to stop wanting it. "X is missing" and "X is
+    /// refused" look identical from outside and are opposite facts.
+    ///
+    /// Asserted through `Config::load` rather than `toml::from_str`, because
+    /// the message only reaches a user if it survives the credential-hint
+    /// allow-list -- it does so by starting with `TUI_VALUE_ERROR`.
+    #[test]
+    fn alternate_screen_never_is_refused_until_the_in_viewport_path_exists() {
+        let rendered = load_config_text("[tui]\nalternate_screen = \"never\"\n")
+            .expect_err("`never` must be refused, not accepted and ignored")
+            .to_string();
+
+        // It names the KEY...
+        assert!(
+            rendered.contains("`alternate_screen`"),
+            "the refusal must name the key: {rendered}"
+        );
+        // ...says the value is NOT AVAILABLE YET rather than invalid...
+        assert!(
+            rendered.contains("is not available yet"),
+            "the refusal must say `never` is not available yet: {rendered}"
+        );
+        assert!(
+            !rendered.contains("expected one of"),
+            "a recognised-but-unhonourable value must not be reported as a \
+             misspelling: {rendered}"
+        );
+        // ...and names the ACCEPTED set, which is the two values that describe
+        // what kitsu actually does -- NOT the three recognised spellings.
+        assert!(
+            rendered.contains("accepted: `auto`, `always`"),
+            "the refusal must name what IS accepted: {rendered}"
+        );
+        assert!(
+            !rendered.contains("`auto`, `always`, `never`"),
+            "the refusal must not offer `never` as an accepted value: {rendered}"
+        );
+    }
+
+    /// **F48 governs this message**: a value from a CONFIG FILE is never
+    /// echoed, because the line it came from may sit beside a credential and
+    /// the rendered error is printed and pasted into issues.
+    ///
+    /// The `never` in the refusal is a literal written in this file, not
+    /// anything interpolated from the user's input -- which is what this test
+    /// distinguishes, by putting a token-shaped value in the same file and
+    /// proving the message carries nothing the user wrote.
+    #[test]
+    fn the_alternate_screen_refusal_echoes_nothing_from_the_config_file() {
+        const TOKEN: &str = "sk-ant-notarealtoken-f62";
+        let rendered = load_config_text(&format!(
+            "default_gateway = \"{TOKEN}\"\n[tui]\nalternate_screen = \"never\"\n"
+        ))
+        .expect_err("`never` must still be refused in a larger file")
+        .to_string();
+
+        assert!(
+            rendered.contains("is not available yet"),
+            "the refusal must still be the error raised: {rendered}"
+        );
+        assert!(
+            !rendered.contains(TOKEN),
+            "F48: the refusal must not echo anything from the file: {rendered}"
+        );
+        assert!(
+            !rendered.contains("alternate_screen = "),
+            "F48: the refusal must not quote the offending line: {rendered}"
+        );
+    }
+
+    /// The other side of the refusal, so it cannot be a blanket rejection of
+    /// the key: `auto`, `always` and an ABSENT key all still load, and all
+    /// three still mean what they meant before F62.
+    #[test]
+    fn alternate_screen_auto_always_and_absent_all_still_load() {
+        for (text, expected) in [
+            ("[tui]\nalternate_screen = \"auto\"\n", AlternateScreen::Auto),
+            (
+                "[tui]\nalternate_screen = \"always\"\n",
+                AlternateScreen::Always,
+            ),
+            // Absent key, present table, and absent table: all `auto`.
+            ("[tui]\nmode = \"inline\"\n", AlternateScreen::Auto),
+            ("[tui]\n", AlternateScreen::Auto),
+            ("default_gateway = \"example\"\n", AlternateScreen::Auto),
+        ] {
+            let parsed = load_config_text(text)
+                .unwrap_or_else(|error| panic!("{text:?} must still load: {error}"));
+            assert_eq!(
+                parsed.tui.unwrap_or_default().alternate_screen,
+                expected,
+                "{text:?}"
+            );
+        }
+
+        // Non-vacuity: `always` is not the default, so the first two rows
+        // above cannot be passing on a default-constructed table.
+        assert_ne!(
+            AlternateScreen::default(),
+            AlternateScreen::Always,
+            "if `always` were the default, this test would prove nothing"
+        );
+        assert_eq!(AlternateScreen::default(), AlternateScreen::Auto);
+    }
+
+    /// The refusal matches BYTE-EXACT `never`, and that is sound only because
+    /// the deserializer neither trims nor lowercases -- measured, not assumed
+    /// (F99/F100). Every case and whitespace variant is a TYPO and must get
+    /// the vocabulary error, not the refusal: a user who typed `Never` has
+    /// misspelled a value, and telling them it "is not available yet" would
+    /// send them away waiting for a feature they could have had.
+    #[test]
+    fn alternate_screen_case_and_whitespace_variants_are_typos_not_refusals() {
+        for variant in ["Never", "NEVER", "nEver", " never ", "never ", "\tnever"] {
+            let rendered =
+                load_config_text(&format!("[tui]\nalternate_screen = \"{variant}\"\n"))
+                    .expect_err(&format!("{variant:?} must not be accepted"))
+                    .to_string();
+            assert!(
+                rendered.contains("expected one of")
+                    && rendered.contains("`auto`, `always`, `never`"),
+                "{variant:?} is a misspelling and must get the vocabulary error, \
+                 which still lists all three RECOGNISED spellings: {rendered}"
+            );
+            assert!(
+                !rendered.contains("is not available yet"),
+                "{variant:?} must not be reported as an unavailable value: {rendered}"
+            );
+        }
     }
 
     /// `title` and `left_arrow_opens_agents` are booleans and stay booleans:

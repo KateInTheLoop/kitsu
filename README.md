@@ -660,7 +660,7 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--screen-reader` | off | Use escape-free, literal line-oriented input and plain rendering; `KITSU_SCREEN_READER` is the environment equivalent. |
 | `--reduced-motion` | off | Keep styled output but replace animated waiting indicators with a static status. |
 | `--tui <MODE>` | `classic` | Select the renderer: `classic` or `inline`. Overrides `[tui] mode`; `/tui` switches at runtime. |
-| `--no-alt-screen` | off | Force `[tui] alternate_screen` to `never`, for multiplexers where the alternate screen misbehaves. |
+| `--no-alt-screen` | off | **Refused, not available yet.** It was meant to force `[tui] alternate_screen` to `never` for multiplexers where the alternate screen misbehaves, but no in-viewport overlay path exists, so the agent view takes the alternate screen whatever this resolves to. Passing it now **fails with a message** instead of being silently ignored. |
 | `--temperature <f>` | unset | Sampling temperature. Omitted from the request unless set (some models reject it). |
 | `--reasoning-effort <level>` | unset | Forward `none`, `minimal`, `low`, `medium`, `high`, or `xhigh` to compatible gateways; omitted otherwise. `/reasoning` can change it between chat turns. |
 | `--max-rounds <n>` | `10` | Max agent tool-call rounds per turn (minimum `1`). Raise (e.g. `40`) for tool-heavy work. |
@@ -1170,7 +1170,7 @@ than quietly falling back to classic; `fullscreen` is named in the design but is
 | key | default | meaning |
 |---|---|---|
 | `mode` | `classic` | `classic` or `inline`; `--tui` overrides it |
-| `alternate_screen` | `auto` | `auto`, `always` or `never`; `--no-alt-screen` forces `never` |
+| `alternate_screen` | `auto` | `auto` or `always`. **`never` is recognised but refused** — it needs an in-viewport overlay path that does not exist yet, so accepting it would be a silent no-op. `--no-alt-screen` is refused for the same reason. |
 | `prefix` | `"ctrl+x"` | the chord prefix for viewport commands |
 | `title` | `true` | set and restore the terminal window title |
 | `left_arrow_opens_agents` | `true` | ← opens the agent pane when the composer is empty |
