@@ -10,6 +10,12 @@ shapes may change in any minor release.
 ## [Unreleased]
 
 ### Fixed
+- **A failed executable staging now names the step that failed.** When kitsu pins
+  and hashes a contained command's executable, eighteen different operations could
+  fail into one message -- `cannot stage immutable executable: <os error>` -- so an
+  `os error 16` told you nothing about which syscall produced it. The message now
+  reads `cannot stage immutable executable: add-seals: Device or resource busy (os
+  error 16)`, naming one of sixteen steps while preserving the OS error verbatim.
 - **The published JSONL schema now covers `tool_results_dropped`.** When that
   event shipped, `docs/schemas/kitsu-chat-v1.schema.json` was not updated, so a
   consumer validating against the published contract was told a line reporting
