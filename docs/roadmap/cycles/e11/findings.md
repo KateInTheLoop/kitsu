@@ -5915,3 +5915,39 @@ The duplication is pre-existing and legitimate — the stack push writes differe
 ### A flag whose name now understates it
 
 The turn flag threaded into the cadence is named for **typeahead**, not turns. It is set unconditionally at both turn boundaries, so it is *correct*, but a reader looking for the turn state will not find it by name. **Rename-only follow-up**, recorded rather than taken, since renaming it is not this card's subject.
+
+## F143 — F57-reach ships; **F57's own second failure mode is overstated**; and a card with no failing-first state
+
+Reachability is now structural: two guards drive **every** registry entry and fail by name the instant an arm goes missing. Six things to keep.
+
+### F57's prose is corrected, by measurement
+
+**F57 records that a registered-but-undispatched command typed mid-turn "becomes a future prompt sent to the model."** The author measured the drain and **I verified it**: `main.rs:21503-21512` does `submitted.text.strip_prefix('/')` and calls `handle_slash`. So mid-turn, an unarmed command is **banked as a queue entry that later prints `unknown command`** — it does **not** reach the model, on that drain route as it stands today.
+
+**The defect is real; its worst consequence was overstated.** F57's entry keeps its text (**F109** — point-in-time records are evidence), and this is the correction.
+
+### Reachability mid-turn is a *composition*, which is why one test cannot own it
+
+Two independent properties: **the slash survives the queue verbatim**, and **the name has an arm**. Either half alone lets F57's second mode through — and the author proved it rather than asserting it: under the removed-arm mutation the **mid-turn test still passes**, because the command is still enqueued correctly. So the two guards are not redundant, and neither claims to catch F57 alone. *A failure that needs two properties cannot be guarded by one test, however thorough.*
+
+### Recognition is not separable from execution — measured, and the honest workaround
+
+`handle_slash` is **one `async fn` with 17 live dependencies** and a single `match` whose arms **execute inline**; the mid-turn dispatcher is an if-chain with inline effects. There is no recognise/run split and no return value distinguishing *recognised* from *ran*. The only separable artifact is the fallback's own failure value.
+
+So rather than invent a dispatch path, the author used **process isolation**: the real binary, the real dispatcher, **one command per process in its own temp `HOME`**, through the existing script+JSONL harness. Side effects are real but contained and discarded, and `/quit` cannot hide a later command because no run has one. **49 runs in ~0.86 s.** *Where no in-process seam exists, the honest seam is a process* — the same move as **F108**, reached independently.
+
+### Fifth wrong curated count: 54 → **49**
+
+F57 says "all 54 commands". The registry holds **49**, and the test asserts **no count at all**, reporting the derived length only in its failure message. After **F124**, **F126**, **F131** and **F142**, the pattern is beyond doubt: **any number written in prose is a curated list of one number.**
+
+### A self-proving detector
+
+The sweep derives an unregistered sentinel and requires it to reach `unknown command` **inside each run**. So a green result can never be a harness that never looked — the detector proves itself per-run rather than relying on a mutation I remember to re-run. **This is the anti-vacuity pattern generalised**, and it is strictly better than a mutation ritual: it cannot be forgotten.
+
+### No failing-first state, and that is correct
+
+**Nothing is currently unreachable**, so there was no red state and no implementer step. This card adds a **guard**, not a behaviour. The author drove all 49 entries *before* writing a test, found none broken, and **said so instead of manufacturing a red state** — which a bogus registration would have done at the cost of testing a defect it had itself introduced.
+
+**Satisfiability here means the opposite of usual:** green on unmutated HEAD, red and naming the command the instant an arm is deleted. One precision on the author's own claim: **`/help` *is* typed** — it is the mechanism by which the registry publishes itself for enumeration, since the table is private to the binary. No command is typed as a *subject*, which is the property that matters.
+
+**No user-visible surface changed**, so README, `functionality.md`, the CHANGELOG and `ux-design.md` correctly get nothing — recorded here so the absence is a checked result rather than a skipped step.

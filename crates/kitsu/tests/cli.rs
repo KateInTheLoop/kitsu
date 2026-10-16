@@ -21705,3 +21705,120 @@ fn test_tui_title_is_not_written_to_a_non_tty_stderr() {
         stdout.escape_debug()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Card F57-reach: reachability, made structural.
+//
+// **F57** measured the defect this sweep exists for: a `SLASH_COMMANDS` entry
+// with no dispatch arm, with all 824 binary and 245 CLI tests passing. The
+// guard F57 itself wanted was unwritable in-process, because `handle_slash` is
+// one `match` whose recognition *is* its execution — there is no stage, flag
+// or return value that says "recognised" without also running `/quit`,
+// `/clear` or `/fork`. So this sweep separates them the only honest way: it
+// runs the real dispatcher, once per command, in its own process and its own
+// temp HOME, and asks the only observable that defines unreachability — the
+// unknown-command fallback.
+//
+// And it reads the registry exactly once, for its subjects. The check is
+// against the binary's behaviour, never against the table again (F57's trap:
+// `closest_slash_command` reads `SLASH_COMMANDS`, so any registry-vs-registry
+// sweep passes vacuously).
+// ---------------------------------------------------------------------------
+
+/// Every registry entry, driven through the idle dispatcher; none of them may
+/// reach `unknown command: /<name>`.
+///
+/// Subjects are enumerated from `SLASH_COMMANDS` at runtime, through the
+/// `commands` array `/help` publishes in its JSONL payload — the registry is
+/// private to the binary, and this is its own account of itself. **No command
+/// name is typed in this test**, so a new entry becomes a subject the moment
+/// it is registered, and no curated list can fall behind the table (F124,
+/// F126, F131, F142) and no count can be wrong.
+///
+/// Covered: the top-level word of every entry, aliases included, since an
+/// alias is a first-class registry entry and dispatches through the same
+/// `match`. Deliberately **not** covered: arguments and subcommands (a
+/// subcommand that falls through refuses inside its own arm and never reaches
+/// this fallback), and *what* each arm does — this asks only whether anything
+/// is listening. The mid-turn half is
+/// `every_registered_command_typed_mid_turn_is_handled_or_queued_verbatim`
+/// in the binary's own suite.
+#[test]
+fn every_registered_slash_command_reaches_a_dispatch_arm() {
+    /// Run one single-line script and return stdout and stderr joined.
+    fn run_one_command(line: &str) -> String {
+        let home = TempDir::new().expect("temp home");
+        write_config(home.path(), "http://127.0.0.1:1");
+        let script = home.path().join("one-command.txt");
+        fs::write(&script, format!("{line}\n")).expect("write script");
+        let output = base_cmd(home.path())
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--gateway",
+                "example",
+                "--jsonl",
+                "chat",
+                "--script",
+                &script.to_string_lossy(),
+            ])
+            .output()
+            .unwrap_or_else(|error| panic!("run {line:?}: {error}"));
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    // Subjects, from the registry's own publication of itself.
+    let names: Vec<String> = run_one_command("/help")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|event| {
+            let result = event.get("result")?.clone();
+            (result["kind"] == "help").then(|| result["commands"].clone())
+        })
+        .expect("/help publishes its registry in the JSONL command result")
+        .as_array()
+        .expect("`commands` is an array")
+        .iter()
+        .map(|command| {
+            command["name"]
+                .as_str()
+                .expect("every registry entry has a name")
+                .to_string()
+        })
+        .collect();
+    assert!(
+        names.len() > 1,
+        "the registry must have supplied the subjects: {names:?}"
+    );
+
+    // The detector, proven in this very run: a word no entry can hold must
+    // reach the fallback. Derived from a registered name so that not even the
+    // sentinel is a typed command name.
+    let sentinel = format!("{}-is-not-a-registered-command", names[0]);
+    let probe = run_one_command(&format!("/{sentinel}"));
+    assert!(
+        probe.contains(&format!("unknown command: /{sentinel}")),
+        "NON-VACUOUS: an unregistered word still reaches the unknown-command \
+         fallback, so the absence asserted below is a real dispatch and not a \
+         harness that never looked; output:\n{probe}"
+    );
+
+    let mut undispatched: Vec<String> = Vec::new();
+    for name in &names {
+        let output = run_one_command(&format!("/{name}"));
+        if output.contains(&format!("unknown command: /{name}")) {
+            undispatched.push(name.clone());
+        }
+    }
+    assert!(
+        undispatched.is_empty(),
+        "registered but undispatched (F57): {undispatched:?} — each is in \
+         SLASH_COMMANDS with no arm in `handle_slash`, so typing it prints \
+         `unknown command` between turns and, mid-turn, banks it as a future \
+         prompt for the model. All {} registry entries were driven.",
+        names.len()
+    );
+}
