@@ -77,9 +77,8 @@ shapes may change in any minor release.
   is the default and now actually controls it: setting it `false` suppresses both
   the title and the push/pop of the terminal's title stack. **Only a styled
   terminal receives it**; piped, `--plain`, `--screen-reader` and JSONL output are
-  byte-identical to before. Two honest limits: the title is refreshed at the
-  prompt and at the start of each turn, so it **can go stale mid-turn** if an agent
-  blocks or finishes; and the title is **restored when kitsu exits**, except
+  byte-identical to before. The title follows the agent registry, so it keeps
+  up **during** a turn as agents block and finish, not only at the prompt; and the title is **restored when kitsu exits**, except
   under a multiplexer (which drops the title-stack sequences) and except a
   `classic` session killed by a signal (which installs no restoring handler).
 - **`Ctrl+X 1`…`Ctrl+X 9` attach to an agent by the position it is displayed at.**

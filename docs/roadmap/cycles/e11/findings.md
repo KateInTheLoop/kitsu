@@ -5885,3 +5885,33 @@ H2-title shipped with *"a title set in `classic` or `inline` outlives the proces
 The author's answer on `SIGNAL_RESTORE`'s unconditional pop was **leave it**: after a session push it is correct for every session that sets a title, and for one that does not it is a pop against an empty stack with **no observable difference** — while making it conditional would break a byte-identity pin on the const and the prefix relationship with `SIGNAL_RESTORE_WITH_SCREEN`. A measured "do nothing" is a result, not an omission.
 
 **Also unpinned, and reported rather than hidden:** tuple bindings drop in reverse declaration order, so on a styled exit *from* fullscreen the session pop is written before the segment's leave-alt-screen. The segment's own pop is suppressed, so the counts hold, and **no test pins that interleaving.**
+
+## F142 — H2-cadence; **F140's cadence paragraph is retracted**; and a design that makes an undetectable mutation detectable
+
+**H2-cadence is done** — the title now follows the agent registry and keeps up during a turn. **H2 has no remaining deviations.** Four things to keep.
+
+### The retraction, and it was wrong in shipped documentation
+
+**F140 recorded, and H2's amendment shipped, that *"the registry's watch channel is subscribed only behind `KITSU_LIVE_NOTICES`, so there is no general change hook in a chat session."* That is false.** It was repeated across two cards, two cycle records and two commit messages.
+
+There **is** an ungated, session-long registry change subscriber — the idle composer's ambient cadence — whose own rustdoc says it is *deliberately* ungated, **explicitly contrasting itself with the opt-in notifier my claim had generalised from**. It already deduped on `(blocked, running)` — the title's own count inputs — and carries **no turn gate**. It even holds a comment about a change that would otherwise *"wait for the next registry event, which may never come while an agent sits blocked"*: the same staleness problem, already solved once, one layer down.
+
+**The mechanism of the error is the one my own rule names.** I measured **one** subscription site and generalised to *"no hook exists"*. Enumerating found **four**. *Enumerate, do not curate* — and the corollary this adds: **a negative claim derived from a single sample is a curated list of size one.** Sixth time an absence claim has been wrong this epic (F116, F120, F126, F114's inverse, F141's detector, this).
+
+**The living documents are corrected; this entry and the two cycle records keep their text.** A point-in-time record rewritten to match later knowledge stops being evidence (**F109**).
+
+### A design that converts an undetectable mutation into a detectable one
+
+The implementer ran **eight** mutations, and the two that escaped are the interesting ones. Dropping the turn flag **at the production closure**, and dropping the gate **inside `publish_state_title`**, are both **in-process-undetectable** — catching either needs a registry change in a non-tty session, and no harness can drive one, because the test gateway is deliberately an invalid host.
+
+But dropping the flag **in the shared derivation** and ignoring the gate **in the writer** are both **caught**. That is not luck: it is what funnelling buys. `cadence_title_parts` gives the buffer-testable writer and the production publish point **one** derivation of word and count, and the new publish point delegates to the **single** gate evaluation. **The mutations are detectable exactly where the design made the path single** — so the F141 response ("delete the second site rather than add a test that cannot fail") did not merely remove a risk, it **moved a whole mutation class inside the reach of the suite.**
+
+### One gate expression, two code sites — a latent F141 shape
+
+The implementer reported *"the only gate expression remains inside `publish_state_title`"*. **Imprecise:** there are **two** code evaluations of `title_enabled() && title_surface_allows_osc()` — the title write, and **H2-stack's stack-push guard** from the previous card. Its *action* was right (it added none), but the claim was not.
+
+The duplication is pre-existing and legitimate — the stack push writes different bytes and cannot delegate to the title's publisher — but it is a **latent F141 shape**: a change to the gate must reach both sites, and the trap mutation at **either** is undetectable in-process. **Worth a follow-up to share one predicate.**
+
+### A flag whose name now understates it
+
+The turn flag threaded into the cadence is named for **typeahead**, not turns. It is set unconditionally at both turn boundaries, so it is *correct*, but a reader looking for the turn state will not find it by name. **Rename-only follow-up**, recorded rather than taken, since renaming it is not this card's subject.
