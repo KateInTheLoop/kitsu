@@ -4880,3 +4880,17 @@ And the accepted rule turned out to be **direction-symmetric by construction** �
 `tests::the_recap_holds_only_what_the_foreground_produced_while_attached` failed once in my verification run (`956 passed; 1 failed`), **passed in isolation**, and passed `957/0` on three consecutive full runs. Captured to its own file (**F39**).
 
 **That is the third independent sighting**, in a third card, by a third party — the author of the card did not see it, the implementer did not, and I did. It remains exactly consistent with **F107**: a test whose subject is *what was installed at the time* reading a process-global that another thread can rewrite. **Three globals, three flake families, and this one test has now cost four verification runs.** F107's production fix is the card I keep deferring, and its interest is compounding.
+
+### F110's sweep, first run: three more stale claims, one an internal contradiction
+
+Built and ran as a command over the live documents — `not wired`, `not yet`, `still missing`, `is refused`, `cannot yet`, `does not yet`, `no support`. Most hits are legitimate descriptions of **deliberate** refusals, which is the point: the sweep lists candidates for a human to re-read, it does not decide. Three were genuinely false:
+
+1. **`docs/ux-design.md`** — *"the bounded fd-tagged cell ring … **not yet fed in production because R6's overlay is its only reader**"*. **Doubly false:** the ring has been fed in production since T5-S1b (inline surface and fullscreen tap), and the overlay is **not** its only reader — the fullscreen frame reads it too. This is in a file whose **own rule** is that code and it are fixed in the same change, and it had drifted across several cards.
+
+2. **`docs/functionality.md`** — *"`fullscreen` is refused until that renderer exists"*, **134 lines below the same file's own description of `--tui fullscreen` starting a session there.** An internal contradiction inside one document, which is the worst version of this: a reader comparing two files can at least date them, but two sentences in one file give no way to choose.
+
+3. **`docs/tui-and-agent-view-design.md`** — the refusal pin itself, *"`fullscreen` is refused until T5's renderer exists"*. **Amended, not deleted**, and **F90** is the reason: *"X is missing" and "X is refused" look identical from outside and are opposite facts.* Deleting the pin would erase the only trace that the absence was deliberate and multiply enforced; the amendment records that it was lifted and preserves the rule that outlived it — a renderer kitsu does not have is refused **by name** rather than coerced.
+
+**The sweep's value is not the hits, it is the ratio.** Of roughly twenty matches, three were wrong — so a human must still read each one, and any attempt to make this a failing test would be wrong, because *"is refused"* is usually the documentation of a correct decision. It belongs in the same family as F101's reference check: **a command whose output a person reads each card**, not a gate.
+
+**And it found drift in a file no card this epic had touched.** The negative-capability phrasing is where documentation rots, because it is written once as true and nothing about shipping the capability makes anyone revisit the sentence that denied it.

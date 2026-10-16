@@ -225,6 +225,15 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
     inline` — the same vocabulary `[tui] mode`'s error uses. A value that
     parsed and silently behaved as `inline` is the quiet coercion this epic has
     refused everywhere else.
+
+    **Lifted in T5-S1b+T5-S2: the renderer exists and `fullscreen` is accepted**
+    in all four spellings (`/tui fullscreen`, `--tui fullscreen`, `[tui] mode`,
+    and bare `/tui`'s report). The **rule** that outlived the refusal is the one
+    above it: a renderer kitsu does not have is refused by name rather than
+    coerced. **F90** is why this pin is amended rather than deleted — *"X is
+    missing" and "X is refused" look identical from outside and are opposite
+    facts*, and a deleted pin would leave no trace that the absence had been
+    deliberate and multiply enforced.
   - **Mid-turn `/tui` is refused**, not queued and not deferred to the turn
     boundary. The reason is specific: the mid-turn dispatcher's default
     fall-through **enqueues the line as a future prompt to the model**, so an
