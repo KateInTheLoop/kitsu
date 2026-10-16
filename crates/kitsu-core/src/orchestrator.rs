@@ -1719,6 +1719,10 @@ where
         let mut stream = stream_result?;
 
         let mut assistant_text = String::new();
+        // F51: how many bytes of `assistant_text` have already gone out to
+        // stdout this round. Zero means nothing streamed, so the end-of-round
+        // site still prints the whole message as it always did.
+        let mut streamed_len = 0usize;
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut finish = FinishReason::Stop;
 
@@ -1746,6 +1750,21 @@ where
                         abort_if_event_sink_failed(cfg)?;
                     }
                     assistant_text.push_str(&t);
+                    // F51: tools WERE offered this round, so this text may yet
+                    // turn out to be a text-protocol tool call — but holding
+                    // all of it means the default configuration never streams.
+                    // Release the prefix that can no longer open one and
+                    // withhold the rest until the round ends. Stdout only: the
+                    // event log must still receive this round's text once, at
+                    // end of round, so concatenated deltas reproduce the
+                    // committed answer.
+                    if cfg.stream && tools_were_offered && !cfg.quiet {
+                        let safe = text_protocol_safe_prefix(&assistant_text);
+                        if safe > streamed_len {
+                            kitsu_render::print_fragment(&assistant_text[streamed_len..safe]);
+                            streamed_len = safe;
+                        }
+                    }
                 }
                 ChatDelta::ToolCall(tc) => tool_calls.push(tc),
                 ChatDelta::Usage(u) => {
@@ -1876,7 +1895,14 @@ where
         // normally (previously over-suppressed, hiding read/grep output).
         if cfg.stream && tools_were_offered && !synthesized_call && !needs_structured_finalization {
             if !cfg.quiet {
-                kitsu_render::print_message(&assistant_text);
+                if streamed_len == 0 {
+                    kitsu_render::print_message(&assistant_text);
+                } else {
+                    // F51: the head already streamed. Printing the whole
+                    // message here would duplicate it in the default
+                    // configuration, so emit only the withheld tail.
+                    kitsu_render::print_fragment(&assistant_text[streamed_len..]);
+                }
             }
             // Text accompanying a structured tool call is intermediate
             // narration, not the committed answer returned by this turn. Keep
@@ -2304,6 +2330,60 @@ fn relax_json_escapes(candidate: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// How much of a round's accumulated text can be shown to the user without
+/// risking that a text-protocol tool call (ISSUE-001) leaks into the
+/// transcript. Returns a byte offset into `text`.
+///
+/// The safe prefix ends at the first byte that could still begin one of the
+/// three opening forms the text-protocol tests pin:
+/// - `{` — a bare call object (`test_text_protocol_bare_json`). It can always
+///   still complete into one, so everything from it is held to end of round.
+/// - `<` — held only while the remainder is a prefix of, or starts with,
+///   `"<tool_call>"` (`test_text_protocol_tagged`). Otherwise it is ordinary
+///   prose: skip it and keep scanning.
+/// - `` ` `` — the same against ```` "```" ```` (`test_text_protocol_fenced_json`).
+///
+/// This is a continuous rule over the whole accumulated text, not a one-shot
+/// latch, because the fenced form puts narration BEFORE the fence: that
+/// narration is released and the fence following it is still withheld. Any
+/// other byte is prose (`test_text_protocol_ignores_prose`, whose inline
+/// `{ key: value }` is not an opener to the parser but is still held here,
+/// because incrementally it cannot be distinguished from one).
+///
+/// Worst-case hold before the first byte reaches the user is 11 bytes
+/// (`"<tool_call>"`) and 3 for a fence; ordinary prose holds nothing, because
+/// its first character is none of the three. Only text opening with `{` is
+/// held unboundedly, and that text must be held anyway.
+fn text_protocol_safe_prefix(text: &str) -> usize {
+    const TAG: &str = "<tool_call>";
+    const FENCE: &str = "```";
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let marker = match bytes[i] {
+            b'{' => return i,
+            b'<' => TAG,
+            b'`' => FENCE,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // `{`, `<` and `` ` `` are ASCII, so `i` is a char boundary.
+        let rest = &text[i..];
+        if rest.len() < marker.len() {
+            // Still short: it is viable only while it matches so far.
+            if marker.as_bytes().starts_with(rest.as_bytes()) {
+                return i;
+            }
+        } else if rest.starts_with(marker) {
+            return i;
+        }
+        i += 1;
+    }
+    bytes.len()
 }
 
 fn parse_text_tool_calls(
