@@ -1113,7 +1113,23 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
 ### 3.5 Non-functional and invariants (N)
 
 - **N1** Non-TTY, `--plain`/`NO_COLOR`, assistive (`--screen-reader`), and
-  JSONL output MUST stay byte-identical to today. The TUI is entered only when
+  JSONL output MUST stay byte-identical to today.
+
+  **Clarified in F120, after I misread it as a blanket ban.** N1 lists four
+  surfaces; **an interactive TTY run is not among them**, so a human-facing line
+  on a TTY is not an N1 question at all. And for the four it does list, N1
+  constrains **the bytes of the shapes that exist today**, not the set of shapes:
+  **a new additive event `"type"`, emitted only on a path that is currently
+  wrong, leaves every existing event byte-identical.** That is how
+  `tool_results_dropped` ships without violating it, and it is strictly less
+  exposure than mutating `turn_finished`/`final_summary` or touching `status`.
+
+  The reading has a limit worth stating: a consumer asserting *"exactly these
+  types appear"* is affected. That is accepted deliberately — **a run that
+  currently drops a tool result and reports success is not a shape N1 was written
+  to protect**, and the alternative is preserving a lie for byte-stability. The
+  conditional-field precedent (`final_summary` adds `output_last_message_state`
+  only when `Some`) remains the fallback if a field is ever preferred to an event. The TUI is entered only when
   `stderr_styled() && stdout is a TTY && !plain_mode() && !assistive && !jsonl`.
 - **N2** Idle input latency MUST not regress: paste of 10 KiB into the
   composer completes in under 100 ms (the rustyline `ExternalPrinter` lesson).

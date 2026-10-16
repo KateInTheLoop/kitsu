@@ -20482,3 +20482,319 @@ fn test_doctor_accepts_a_well_spelled_tui_table() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["config"]["status"], "parsed successfully");
 }
+
+// ---------------------------------------------------------------------------
+// F120: a `--jsonl` run that drops a tool result must not report unqualified
+// success. The tool runs, bounds its own output correctly and reports the
+// truth; the history trimmer then replaces the whole message with a dead
+// `[older tool output elided]` stub before the provider ever sees it — and
+// today every event on stdout still says the run went fine.
+//
+// The distinction that shapes these tests: an eviction is only a LOSS when
+// nothing recallable survives it. With a low `--offload-cap` the same eviction
+// keeps the `fs_read_file` pointer line, which is the documented good case the
+// flag exists to produce, and must stay silent.
+// ---------------------------------------------------------------------------
+
+/// Drive one `--jsonl` run in which a single large `fs_read_file` result is
+/// evicted by the history trimmer before the second provider round.
+///
+/// `window` tunes the pressure: a small window forces the eviction, a large one
+/// leaves the result intact. `extra_args` selects the eviction's character —
+/// `--no-artifacts` suppresses the on-disk copy, so the stub is dead; a low
+/// `--offload-cap` leaves a re-readable pointer, so the stub is recoverable.
+async fn run_trimmed_tool_result_jsonl(window: &str, extra_args: &[&str]) -> TrimmedToolResultRun {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let input = work.path().join("evidence.txt");
+    // Large enough that its result dominates the small-window budget, and
+    // distinctive enough that the trimmer's stub is recognisable by absence.
+    fs::write(&input, format!("HEAD{}TAIL", "evidence-line\n".repeat(900))).unwrap();
+
+    let read_args = serde_json::json!({"path": input}).to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"tool_call_id\":\"big_read\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "reported on the evidence"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "big_read",
+                        "type": "function",
+                        "function": {"name": "fs_read_file", "arguments": read_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let work_root = work.path().to_string_lossy().to_string();
+    let mut args = vec![
+        "--gateway",
+        "example",
+        "--jsonl",
+        "--no-stream",
+        "--context-window",
+        window,
+    ];
+    args.extend_from_slice(extra_args);
+    args.extend_from_slice(&[
+        "--max-rounds",
+        "3",
+        "chat",
+        "--no-session",
+        "--allow-path",
+        &work_root,
+        "read the evidence file and report on it",
+    ]);
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(work.path())
+        .args(&args)
+        .output()
+        .unwrap();
+    let events = String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let requests = server.received_requests().await.unwrap();
+    // The content the SECOND request carried for the evicted call. This is the
+    // ground truth for whether the run lost anything: the event stream is what
+    // is under test, so it cannot also be the evidence that a loss occurred.
+    let second_round_tool_content = requests
+        .get(1)
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+        .and_then(|body| {
+            body["messages"].as_array().and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message["tool_call_id"] == "big_read")
+                    .and_then(|message| message["content"].as_str().map(str::to_string))
+            })
+        })
+        .expect("the second provider request must carry the read's tool result");
+    server.verify().await;
+    TrimmedToolResultRun {
+        output,
+        events,
+        second_round_tool_content,
+    }
+}
+
+/// One `--jsonl` run of the eviction fixture: the process result, its parsed
+/// event stream, and what the provider actually received for the evicted call.
+struct TrimmedToolResultRun {
+    output: std::process::Output,
+    events: Vec<serde_json::Value>,
+    second_round_tool_content: String,
+}
+
+/// The ordered `"type"` sequence a two-round tool run emits today. Enumerated
+/// from the stream rather than searched for, so an additive event anywhere in
+/// the run breaks this list instead of hiding behind a narrower assertion.
+fn jsonl_event_types(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn test_jsonl_reports_a_dropped_tool_result_with_a_count() {
+    let run = run_trimmed_tool_result_jsonl("2048", &["--no-artifacts"]).await;
+    let TrimmedToolResultRun {
+        output,
+        events,
+        second_round_tool_content,
+    } = run;
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // The fix must not reach for stderr: this run's silence there is the
+    // contract every other `--jsonl` test in this file already depends on.
+    assert!(output.stderr.is_empty(), "{output:?}");
+
+    // The loss really happened: the second request carried the dead stub, not
+    // the evidence. Without this the test could pass on a run that lost
+    // nothing, which is F61's failure mode.
+    assert_eq!(
+        second_round_tool_content, "[older tool output elided]",
+        "fixture must actually drop the result, with nothing recallable left behind"
+    );
+
+    let dropped = events
+        .iter()
+        .find(|event| event["type"] == "tool_results_dropped")
+        .unwrap_or_else(|| {
+            panic!(
+                "a run that replaced a tool result with `[older tool output elided]` reported \
+                 no loss on stdout; event types were {:?}",
+                jsonl_event_types(&events)
+            )
+        });
+    assert_eq!(
+        dropped["dropped"], 1,
+        "the event must say HOW MANY results were dropped — three is a different \
+         story from `something was trimmed`: {dropped}"
+    );
+
+    // The defect is a mismatch, not a silence: the tool told the truth and the
+    // turn did not. Both halves are asserted so a fix that merely adds an
+    // event while corrupting the tool receipt cannot pass.
+    let read = events
+        .iter()
+        .find(|event| event["type"] == "tool_finished" && event["name"] == "fs_read_file")
+        .expect("the large read's completion receipt");
+    assert_eq!(
+        read["success"], true,
+        "the tool succeeded and must keep saying so: {read}"
+    );
+    assert_eq!(
+        read["output_truncated"], true,
+        "the tool bounded its own output correctly: {read}"
+    );
+    assert!(
+        read["output_bytes"].as_u64().unwrap() > 11_000,
+        "fixture must be large enough to force the eviction: {read}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_jsonl_stays_silent_when_a_trimmed_tool_result_is_still_recallable() {
+    // A low `--offload-cap` is the documented *good* case: the evicted result
+    // leaves an `fs_read_file` pointer, so nothing is lost and a warning here
+    // would be noise that teaches readers to ignore the real one.
+    let run = run_trimmed_tool_result_jsonl("1536", &["--offload-cap", "1024"]).await;
+    let TrimmedToolResultRun {
+        output,
+        events,
+        second_round_tool_content,
+    } = run;
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+
+    let types = jsonl_event_types(&events);
+    assert_eq!(
+        types,
+        [
+            "run_started",
+            "turn_started",
+            "provider_request",
+            "provider_attempt",
+            "tool_started",
+            "tool_finished",
+            "provider_request",
+            "provider_attempt",
+            "assistant",
+            "assistant_disposition",
+            "turn_finished",
+            "final_summary",
+        ],
+        "a lossless eviction must leave the JSONL stream byte-identical to today"
+    );
+    let raw = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !raw.contains("tool_results_dropped") && !raw.contains("\"dropped\""),
+        "a recallable eviction must not be reported as a loss: {raw}"
+    );
+    // Non-vacuity: the eviction this run is asserted to be silent about must
+    // actually have happened, and must have left the pointer behind. A bare
+    // pointer line with no preview is exactly `elided_tool_stub`'s lossless
+    // branch — the body is gone, the recall path is not.
+    assert!(
+        second_round_tool_content.starts_with("[tool output "),
+        "a low offload cap must leave an fs_read_file pointer the model can recall: \
+         {second_round_tool_content}"
+    );
+    assert!(
+        !second_round_tool_content.contains("Preview:"),
+        "the preview body must have been evicted, or this run trimmed nothing and the \
+         silence it asserts is vacuous: {second_round_tool_content}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_jsonl_stays_silent_when_no_tool_result_is_trimmed_at_all() {
+    // N1 pinned rather than assumed: a run with no eviction is exactly the
+    // stream it is today, including after the lossy path gains an event.
+    let run = run_trimmed_tool_result_jsonl("262144", &[]).await;
+    let TrimmedToolResultRun {
+        output,
+        events,
+        second_round_tool_content,
+    } = run;
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        jsonl_event_types(&events),
+        [
+            "run_started",
+            "turn_started",
+            "provider_request",
+            "provider_attempt",
+            "tool_started",
+            "tool_finished",
+            "provider_request",
+            "provider_attempt",
+            "assistant",
+            "assistant_disposition",
+            "turn_finished",
+            "final_summary",
+        ],
+        "a run that lost nothing must stay byte-identical to today"
+    );
+    let raw = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !raw.contains("tool_results_dropped"),
+        "nothing was dropped, so nothing may be reported: {raw}"
+    );
+    // Non-vacuity in the other direction: this run must have trimmed nothing,
+    // so the silence above is the no-loss guarantee and not a missed eviction.
+    assert!(
+        second_round_tool_content.contains("evidence-line")
+            && !second_round_tool_content.contains("older tool output elided"),
+        "a 256K window must carry the whole result through to the provider: \
+         {} chars",
+        second_round_tool_content.len()
+    );
+}

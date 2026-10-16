@@ -757,6 +757,16 @@ lifecycle/export commands are outside this automatic-storage policy.
 `/status`, `/permissions`, `/artifacts`, doctor JSON, and JSONL
 `run_started.artifact_policy` disclose the effective mode and source.
 
+**When trimming loses a tool result, the run says so.** If the context budget
+forces history trimming to replace an entire tool result with a dead placeholder,
+a `--jsonl` run now emits `{"type":"tool_results_dropped","round":N,"dropped":N}`.
+Before this, the result was removed before the provider saw it and every event in
+the stream still reported success -- the tool's own receipt was honest and the
+turn's was not. The event fires **only when the loss is unrecoverable**: with a
+low `--offload-cap` an evicted result leaves a re-readable pointer the model can
+recall, which is not a loss and stays silent, so the warning does not become
+noise. A run that loses nothing emits nothing new.
+
 ## Context management
 
 The CLI always gives the orchestrator a token window. Resolution is:

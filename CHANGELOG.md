@@ -39,6 +39,14 @@ shapes may change in any minor release.
   reason.
 
 ### Added
+- **A `tool_results_dropped` JSONL event**, so a run that loses a tool result says
+  so. When the context budget forces history trimming to replace a whole tool
+  result with a dead placeholder, the stream now carries
+  `{"type":"tool_results_dropped","round":N,"dropped":N}` -- previously the result
+  vanished before the provider saw it and **every event still reported success**.
+  It fires **only when the loss is unrecoverable**: with a low `--offload-cap` an
+  evicted result leaves a re-readable pointer instead, which is not a loss and
+  stays silent. Runs that lose nothing are byte-identical to before.
 - **A new `agent_wait(id, until, timeout_secs)` tool**, so a model can block on a
   background agent instead of polling. `until` is `done` -- finished, failed or
   cancelled -- or `blocked`, meaning parked on an approval answer. A state that
