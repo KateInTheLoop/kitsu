@@ -1105,14 +1105,36 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   during one.** Closing that needs a change signal this design does not currently
   provide.
 
-  **Deviation 2 — the title outlives the process outside fullscreen.** Only
-  `enter_fullscreen` pushes the title stack, so a title set in `classic` or
-  `inline` is never popped and **survives kitsu's exit** on every terminal, not
-  only under a multiplexer. The asymmetry predates this card in the opposite
-  direction: the dying-signal restore already contains the **pop**, so an inline
-  session writes a pop having never pushed. **Carded separately** — it is beyond
-  H2's text, and the fix (push at session start whenever the key is on, pop in the
-  inline exit path) is a decision this card deliberately did not take.
+  **Deviation 2 — closed by H2-stack, with two residuals.** H2-title shipped with
+  the title outliving the process outside fullscreen, because `enter_fullscreen` was
+  the only thing that pushed the title stack. **H2-stack makes the push belong to
+  the session**: one push when the session first sets a title, one pop when it ends,
+  and `enter_fullscreen` pushes only when the session has not — which also makes the
+  dying-signal restore's long-unconditional **pop** the balancing one rather than a
+  pop against an empty stack.
+
+  **That design was forced, not chosen.** An existing test pins `PUSH == 1` **and**
+  `POP == 1` across a fullscreen→classic switch, so a session push plus an
+  unconditional fullscreen push is two and two and fails it. **And the session push
+  must carry the surface gate, not only the key gate** — the trap version, gated on
+  the key alone, **passes every pre-existing negative**, because on a plain
+  fullscreen surface a session push merely *replaces* the segment push and the count
+  stays one. It took a new classic-surface guard to make that visible at all.
+
+  **Residual 1:** under a **multiplexer** the title still outlives the process, in
+  every mode. The sequences are dropped, OSC 2 has no query form, and the old title
+  therefore cannot be read back and restored by hand. H2 names tmux as the audience,
+  so this is accepted rather than fixed.
+
+  **Residual 2:** a styled **`classic`** session killed by a **signal** still leaks
+  its title, because classic installs no dying-signal handler — deliberately, and
+  pinned by a test asserting that a classic session emits no viewport bytes.
+  Closing it would trade a guarantee for a cosmetic one.
+
+  **Unpinned byte-order consequence:** tuple bindings drop in reverse declaration
+  order, so on a styled exit *from* fullscreen the session pop is written before the
+  segment's leave-alt-screen. The segment's own pop is suppressed in that case, so
+  the counts hold at one and one, and **no test pins the interleaving.**
 - **H3** A `[hooks] on_agent_state = "<cmd>"` MUST run on agent state
   transitions, mirroring herdr's plugin events and Claude Code's
   `Notification` hook. Local command only (N7). Three decisions settled while
