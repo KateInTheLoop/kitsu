@@ -13280,7 +13280,24 @@ async fn test_no_artifacts_bounds_large_tool_result_and_saves_session_without_si
         .find(|message| message["role"] == "tool")
         .and_then(|message| message["content"].as_str())
         .expect("bounded tool result in second request");
-    assert!(tool_content.contains("bytes omitted by artifact-free policy"));
+    assert!(
+        tool_content.contains("bytes omitted by artifact-free policy"),
+        "the artifact-free bound marker must reach the provider in the second request, \
+         but the tool message there is {} bytes, beginning {:?}. An elided or shrunken \
+         tool message means history trimming dropped it before the provider saw it, which \
+         is what happens when the protected prompt (system instructions plus tool schemas) \
+         grows into the window budget - check whether a tool schema grew. The tool ran \
+         and bounded its own output (artifact_status {}, output_truncated {}, \
+         output_bytes {}, output_retained_bytes {}), so the loss is downstream of the \
+         policy. The second request carried {} messages.",
+        tool_content.len(),
+        tool_content.chars().take(300).collect::<String>(),
+        finished["artifact_status"],
+        finished["output_truncated"],
+        finished["output_bytes"],
+        finished["output_retained_bytes"],
+        second["messages"].as_array().unwrap().len(),
+    );
     assert!(!tool_content.contains("CENTER_MUST_BE_OMITTED"));
 
     let sessions = home.path().join(".kitsu/sessions");
