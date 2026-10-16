@@ -5117,3 +5117,56 @@ Registering the tool also moved the reported **base prompt** from 155 to 158 tok
 ### Two stale code comments fixed alongside
 
 `subagent/thread.rs:230` claimed *"No agent can enter this phase yet; a later story populates it"* — false since the park path landed. And the authorised test edit replaced a doc comment asserting `blocked` was unreachable, with the assertions left **byte-identical** and the test renamed from `blocked_is_always_zero_until_a_later_story_populates_it` to `blocked_is_zero_for_every_agent_this_test_never_parks`. **Both are F110's family** — a true statement that silently became false when a capability shipped, and neither was found by a sweep: one was found by the test author reading the state machine, the other by needing to use it.
+
+## F118 — my brief would have shipped a fix that printed nothing, and the agent measured instead of trusting me
+
+F117's tripwire is fixed: the four bare `assert_eq!(output.status.code(), Some(0));` sites in `tests/cli.rs` now carry a message naming the binary's own refusal. **Before and after, verbatim:**
+
+```
+left: Some(1)
+right: Some(0)
+```
+
+```
+assertion `left == right` failed: kitsu must exit 0; stderr: ; stdout error events:
+{"exit_code":1,...,"message":"context preflight stopped an oversized provider request:
+protected prompt needs about 7192 tokens, but the trim target is 6861 tokens (window 8192
+tokens, effective prompt budget 7680 tokens, trim target = effective minus a 819 tokens
+reserve); shorten the latest request or system instructions, disable large tool schemas,
+raise the window with --context-window <n>, ...","type":"error"}
+  left: Some(1)
+ right: Some(0)
+```
+
+A reader now gets required versus target, the window, the budget, the reserve and the remedies — **including *"disable large tool schemas"*, which is the actual cause** — without touching the binary.
+
+### The brief's central premise was wrong, and wrong in the way that matters
+
+I wrote: *"the preflight error already states the margin itself, so **surfacing stderr gives the diagnosis for free**."* **It does not.** The target test runs `--jsonl chat --script`, and **in JSONL mode the preflight failure is a JSONL `{"type":"error"}` event on stdout, not stderr.** A stderr-only message renders:
+
+```
+assertion `left == right` failed: kitsu must exit 0; stderr: 
+```
+
+**Empty.** The agent captured that intermediate state rather than reasoning about it, and widened the message to carry stderr **and** the stdout error events.
+
+**This is the sixteenth wrong brief, and the most consequential kind:** not an error that stops work, but one that would have shipped **a fix that looks like a fix and does nothing**. A card closed on it would have left the next tool's failure exactly as blind, with a message in the assertion making it look handled. **That is F75's shape — *a thing that appears to work is worse than one that plainly does not* — applied to my own tooling rather than to a key.**
+
+**What saved it was the instruction, not the instinct.** I had told the agent: *"if a site's stderr is empty or already consumed, say so instead of writing a message that would print nothing."* It hit exactly that case and did exactly that. **The guard worked because it was written down before the premise was tested** — which is the argument for putting the honest-failure clause in every brief, not just the ones where I suspect trouble.
+
+### The per-site answer, which only measurement could give
+
+Probed by flipping each expected value so the assertion fires on the **success** path:
+
+| site | stderr reachable? |
+|---|---|
+| `test_context_window_mismatch_warns_on_stderr` (non-JSONL) | **yes**, non-empty |
+| `test_jsonl_context_window_mismatch_emits_typed_event` | **no** — the very next line asserts `output.stderr.is_empty()`, **by design** |
+| `test_context_command_surfaces_window_runtime_evidence` | **no** — stdout carries it; proven under real failure |
+| `test_piped_chat_system_prompt_names_cwd_and_granted_roots` (non-JSONL) | **yes**, non-empty |
+
+**Two of four reach stderr; two are JSONL and reach the diagnosis only via stdout** — and one of those *asserts stderr is empty on the next line*, so a stderr-only message there was never going to work. One combined message covers both shapes, which is why all four got the same one.
+
+### A second tripwire, found by the inflation
+
+Under the inflated descriptor, **`test_no_artifacts_bounds_large_tool_result_and_saves_session_without_sidecar` also failed** — `assertion failed: tool_content.contains("bytes omitted by artifact-free policy")` — **the same blind-failure shape, outside this card's four sites.** Green again after revert. **Carded.** The inflation lever is now a known instrument for finding these: inflate a tool schema and see which tests fail without saying why.
