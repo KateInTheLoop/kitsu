@@ -8175,3 +8175,178 @@ fn fullscreen_start_sigterm_restores_termios_and_the_screen() {
         text.escape_debug()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Card H2-title: the OSC terminal title, and `[tui] title` gating it.
+//
+// Requirement **H2**: *"Kitsu MUST set the terminal title (OSC 0/2) to
+// `kitsu · working|blocked|idle|N agents` when `tui.title = true` (default on
+// TTY), so herdr/tmux can classify by title."* **F139** measured the half that
+// exists: the title *stack* is pushed and popped in production without
+// consulting the key, and nothing writes the OSC 2 string at all.
+//
+// FAILING-FIRST against this commit: no session writes `ESC]2;`, and
+// `title = false` pushes the stack anyway.
+// ---------------------------------------------------------------------------
+
+/// The OSC 2 set-window-title introducer, and its ST terminator.
+///
+/// Attributable in these sessions for the reason [`ALT_SCREEN_ON`] is: the
+/// only other writer of this sequence in the workspace is
+/// `kitsu_tui::TuiRuntime::enter`, which has no non-test caller (**F139**),
+/// and no script below reaches one.
+const OSC_TITLE_OPEN: &str = "\x1b]2;";
+
+/// The title a styled session with no background agents must be carrying: the
+/// state word is `agent_state_file::process_state`'s own, and the count is
+/// always present.
+const IDLE_TITLE: &str = "\x1b]2;kitsu · idle · 0 agents";
+
+/// **The title is actually set, in a real session, with the default key.**
+///
+/// The end-to-end half: a unit test over `state_title` pins the string, and
+/// this pins that a session *writes* it. One styled fullscreen session that
+/// reaches the idle prompt must carry the idle title at least once.
+#[test]
+#[serial]
+fn tui_title_sets_the_osc_state_title_in_a_styled_session() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("fullscreen"),
+        &fullscreen_start_then_classic(),
+    );
+    let text = session.raw_text();
+
+    assert!(
+        text.contains(IDLE_TITLE),
+        "requirement H2: a styled session with `[tui] title` at its default \
+         must set the terminal title to {IDLE_TITLE:?}; raw:\n{}",
+        text.escape_debug()
+    );
+    // NON-VACUOUS: the session genuinely reached the fullscreen segment and
+    // genuinely exited, so the title above was written by a live session and
+    // not by a startup probe that then failed.
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "one fullscreen segment; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "the session must still exit cleanly, but exited {:?}; raw:\n{}",
+        session.status,
+        text.escape_debug()
+    );
+}
+
+/// **`[tui] title = false` sets no title AND pushes no title stack.**
+///
+/// **F139**'s half-built mechanism, closed from the user's side: the key must
+/// gate both clauses. The alternate-screen counts are the non-vacuity anchor
+/// — the segment still runs, takes the screen and gives it back, so the three
+/// absent title sequences are the key's doing and not a session that never
+/// started.
+#[test]
+#[serial]
+fn tui_title_false_sets_no_title_and_pushes_no_title_stack() {
+    let home = TempDir::new().expect("temp home");
+    write_config_with_tui(home.path(), "title = false");
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("fullscreen"),
+        &fullscreen_start_then_classic(),
+    );
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "NON-VACUOUS: the fullscreen segment still takes the alternate \
+         screen; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_OFF),
+        1,
+        "NON-VACUOUS: ...and gives it back; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(OSC_TITLE_OPEN),
+        0,
+        "`title = false` must set no terminal title; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TITLE_PUSH),
+        0,
+        "`title = false` must not push the title stack either — the half \
+         F139 measured as ungated; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TITLE_POP),
+        0,
+        "...and must not pop a stack it never pushed; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "the session must still exit cleanly, but exited {:?}; raw:\n{}",
+        session.status,
+        text.escape_debug()
+    );
+}
+
+/// **Requirement N1: the title's control bytes reach neither the plain nor the
+/// assistive surface, and today's bytes are otherwise untouched.**
+///
+/// The title is control bytes on **stderr**, so N1 applies per descriptor
+/// (F120/F122): `--plain`, `NO_COLOR` and `--screen-reader` all fold into
+/// `kitsu_render::plain_mode`, and that surface must stay byte-identical to
+/// today.
+///
+/// Which makes the second half of each case the load-bearing one: the title
+/// **stack** is pushed and popped on these surfaces **today**, with the key at
+/// its default, so suppressing those two sequences here would be the N1
+/// violation rather than the fix. The negative is the OSC 2 string alone.
+#[test]
+#[serial]
+fn tui_title_is_not_set_on_the_plain_or_assistive_surfaces() {
+    for flag in ["--plain", "--screen-reader"] {
+        let home = TempDir::new().expect("temp home");
+        write_config(home.path());
+        let session = run_styled_chat_pty_core(
+            home.path(),
+            Some("fullscreen"),
+            &fullscreen_start_then_classic(),
+            Options::default(),
+            &[flag.to_string()],
+        );
+        let text = session.raw_text();
+
+        assert_eq!(
+            session.raw_count(OSC_TITLE_OPEN),
+            0,
+            "{flag} must receive no OSC title (N1, per descriptor); raw:\n{}",
+            text.escape_debug()
+        );
+        assert_eq!(
+            session.raw_count(TITLE_PUSH),
+            1,
+            "NON-VACUOUS, and N1 in the other direction: {flag} pushes the \
+             title stack today with the key at its default, and must keep \
+             doing so; raw:\n{}",
+            text.escape_debug()
+        );
+        assert_eq!(
+            session.raw_count(TITLE_POP),
+            1,
+            "...and pops it, exactly as today; raw:\n{}",
+            text.escape_debug()
+        );
+    }
+}

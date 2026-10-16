@@ -574,12 +574,33 @@ stays a single draft and is accepted in single-digit milliseconds, measured by
 recognised but refused**, and `--no-alt-screen` with it — both need an
 in-viewport overlay path that does not exist yet, and accepting either would
 change nothing, which is worse than saying so), `prefix` (default `ctrl+x`),
-`title`,
+`title` (see below),
 `left_arrow_opens_agents`, and `cell_ring_lines` (default 10000, range
 1-1000000). The flag wins over the config key, the config key over the default,
 and **no environment variable participates**. A misspelled key or an invalid
 value is a startup error that names the key and lists what it accepts -- never a
-silent fallback -- and `kitsu doctor` reports it as a blocking issue. The error
+silent fallback -- and `kitsu doctor` reports it as a blocking issue.
+
+**`[tui] title` sets the terminal window title**, to `kitsu · idle · 0 agents`,
+`kitsu · working · 1 agent`, `kitsu · blocked · 3 agents` and so on — the state
+word, then how many background agents are live — so a multiplexer or a herder can
+classify windows by title without asking kitsu anything. `blocked` outranks
+`working`, the same precedence the live status row uses, and the count is always
+present: a title that dropped the number at zero would make *"no agents"* and
+*"stale title"* indistinguishable from outside. It defaults to on and also
+controls the push and pop of the terminal's title stack around fullscreen, so
+`title = false` silences both.
+
+**Only a styled terminal receives it.** A piped run, `--plain`, `--screen-reader`
+and `--jsonl` are byte-identical to before — the title is terminal decoration, and
+a consumer reading your output should never see it.
+
+**Two limits worth knowing.** The title is refreshed at the prompt and at the
+start of each turn, so it **can go stale during a long turn** if an agent blocks
+or finishes partway through. And only fullscreen pushes the title stack, so a
+title set in `classic` or `inline` **stays after kitsu exits** — as it does under
+a multiplexer in any mode, because multiplexers drop the title-stack sequences and
+there is no way to read a window title back to restore it by hand. The error
 names the key and the permitted values but never echoes the offending value,
 because a config file can hold credentials. `fullscreen` appears in the design
 but is not accepted yet.

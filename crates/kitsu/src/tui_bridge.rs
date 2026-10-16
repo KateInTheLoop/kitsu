@@ -247,6 +247,97 @@ const PUSH_TITLE: &[u8] = b"\x1b[22;2t";
 /// See [`PUSH_TITLE`].
 const POP_TITLE: &[u8] = b"\x1b[23;2t";
 
+// ---------------------------------------------------------------------------
+// Requirement **H2**'s title clause (card H2-title).
+//
+// `run_chat` resolves `[tui] title` once into the global below, calls
+// `publish_state_title` at the three state-publishing boundaries, and the
+// fullscreen segment consults `title_enabled` before it touches the title
+// stack.
+// ---------------------------------------------------------------------------
+
+/// Whether `[tui] title` is honoured this run.
+///
+/// Process-global for the same reason [`INLINE_INSTALLED`] is: the title is a
+/// property of the terminal this process holds, and the writers that set it
+/// (the fullscreen segment, and the turn boundary in `run_chat`) hold no
+/// common handle. Defaults to `true`, matching `TuiConfig::default`, so a
+/// surface that never resolves the table behaves exactly as it does today.
+static TITLE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Publish `[tui] title` for this run. Called once, where the rest of the
+/// `[tui]` table is resolved.
+pub(crate) fn set_title_enabled(on: bool) {
+    TITLE_ENABLED.store(on, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether the terminal title — the OSC 2 string *and* the title stack — is
+/// this run's to touch.
+pub(crate) fn title_enabled() -> bool {
+    TITLE_ENABLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The title requirement **H2** names, rendered.
+///
+/// `state` is [`crate::agent_state_file::process_state`]'s own word — this
+/// function never recomputes it, so "blocked outranks working" has exactly
+/// one home — and `agents` is the live agent count (`running + blocked`,
+/// which that snapshot documents as disjoint).
+///
+/// The rendering H2 left open, decided here:
+///
+/// * **The count is always present**, `0 agents` included. A title a herder
+///   parses is worth more predictable than short.
+/// * **Singular at one**, `1 agent`, because the title is read by people too
+///   and `(\d+) agents?` is no harder to parse than `(\d+) agents`.
+/// * **Sanitised**, via `kitsu_tui::sanitize_title`, because the state word
+///   and the count are the only parts that are kitsu's own today and the
+///   boundary belongs here rather than at the next caller that is not.
+pub(crate) fn state_title(state: &str, agents: usize) -> String {
+    let unit = if agents == 1 { "agent" } else { "agents" };
+    kitsu_tui::sanitize_title(&format!("kitsu \u{b7} {state} \u{b7} {agents} {unit}"))
+}
+
+/// Write the OSC 2 title onto `out`, or nothing at all when `enabled` is
+/// false.
+///
+/// `enabled` is the *whole* decision — `[tui] title` and the surface gate
+/// below — passed in rather than read, so this is testable against a buffer
+/// and the gate has one evaluation point.
+pub(crate) fn write_state_title(
+    out: &mut dyn std::io::Write,
+    enabled: bool,
+    state: &str,
+    agents: usize,
+) {
+    if !enabled {
+        return;
+    }
+    let _ = write!(out, "\x1b]2;{}\x1b\\", state_title(state, agents));
+    let _ = out.flush();
+}
+
+/// Whether this surface may receive the title's control bytes at all
+/// (requirement **N1**, as F120/F122 settled it: per descriptor).
+///
+/// The same gate F122 shipped for its human line, and for its reason: the
+/// title goes to **stderr**, so a non-terminal stderr must not receive it,
+/// and `--plain`/`NO_COLOR`/`--screen-reader` all fold into `plain_mode`. A
+/// terminal stdout is required as well, which is stricter than the minimum:
+/// a run whose stdout is redirected is being consumed by something. JSONL is
+/// unaffected by construction — its stream is stdout and the title is never
+/// written there.
+pub(crate) fn title_surface_allows_osc() -> bool {
+    kitsu_render::stderr_styled() && kitsu_render::is_tty()
+}
+
+/// Set the terminal title from the state the state file publishes, on the one
+/// sink the title's other bytes already go to.
+pub(crate) fn publish_state_title(state: &str, agents: usize) {
+    let enabled = title_enabled() && title_surface_allows_osc();
+    write_state_title(&mut std::io::stderr(), enabled, state, agents);
+}
+
 /// A live fullscreen segment: the alternate screen and the pushed title, given
 /// back when this is dropped.
 ///
@@ -626,7 +717,11 @@ impl FullscreenSegment {
             set_surface(self.previous_surface.clone());
         }
         let _ = self.err.write_all(LEAVE_ALT_SCREEN);
-        let _ = self.err.write_all(POP_TITLE);
+        // The mirror of `enter_fullscreen`'s gate (card H2-title): a run that
+        // pushed no title stack must pop none.
+        if title_enabled() {
+            let _ = self.err.write_all(POP_TITLE);
+        }
         let _ = self.err.flush();
         // Card F94, and the mirror of `enter_fullscreen`'s store: after the
         // bytes, so no exit path can read "free" while the screen is still
@@ -694,7 +789,14 @@ pub(crate) fn enter_fullscreen(
     // window leaves the user on the alternate screen, which is the defect
     // itself.
     kitsu_tui::note_alternate_screen(true);
-    let _ = err.write_all(PUSH_TITLE);
+    // Card H2-title: `[tui] title = false` owns the title *stack* as well as
+    // the OSC 2 string (**F139** measured this half as ungated). The surface
+    // gate is deliberately not consulted here: these two sequences reach the
+    // plain and assistive surfaces today and requirement N1 is satisfied by
+    // leaving them byte-identical.
+    if title_enabled() {
+        let _ = err.write_all(PUSH_TITLE);
+    }
     let _ = err.write_all(ENTER_ALT_SCREEN);
     for row in &frame {
         let _ = err.write_all(row.as_bytes());
@@ -2257,9 +2359,7 @@ impl KeyFilter {
                     // than becoming either an alias for the first row or the
                     // first half of a multi-digit entry whose meaning would
                     // be invisible until the next keystroke (**F75**).
-                    digit @ b'1'..=b'9' => {
-                        Some(KeyItem::Attach(usize::from(digit - b'0')))
-                    }
+                    digit @ b'1'..=b'9' => Some(KeyItem::Attach(usize::from(digit - b'0'))),
                     _ => None,
                 } {
                     if !bytes.is_empty() {
@@ -2755,10 +2855,7 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
                 // unlike `KeyItem::Detach` -- because while attached the
                 // chord *switches* agent.
                 KeyItem::Attach(ordinal) => {
-                    return Ok(InlineRead::AttachOrdinal(
-                        ordinal,
-                        editor.buffer_string(),
-                    ));
+                    return Ok(InlineRead::AttachOrdinal(ordinal, editor.buffer_string()));
                 }
                 KeyItem::Detach => {
                     left_presses = 0;
@@ -8981,5 +9078,193 @@ mod tests {
             "a closed registry ends the cadence"
         );
         drop(guard);
+    }
+
+    // -----------------------------------------------------------------------
+    // Card H2-title: the OSC terminal title, and `[tui] title` gating it.
+    //
+    // FAILING-FIRST. `state_title` returns the empty string and
+    // `write_state_title` writes nothing, so every assertion below fails on
+    // this commit; the fullscreen pair fails in the `title = false`
+    // direction, where the stack is pushed and popped today regardless of the
+    // key (**F139**).
+    // -----------------------------------------------------------------------
+
+    /// Restores `[tui] title`'s process-global on the way out, so a test that
+    /// turns it off cannot leave it off for the next one. The same discipline
+    /// [`GlobalState`] applies to the surface slot, and the reason these two
+    /// tests are `#[serial]` as well.
+    struct TitleGate(bool);
+
+    impl TitleGate {
+        fn set(on: bool) -> Self {
+            let was = super::title_enabled();
+            super::set_title_enabled(on);
+            Self(was)
+        }
+    }
+
+    impl Drop for TitleGate {
+        fn drop(&mut self) {
+            super::set_title_enabled(self.0);
+        }
+    }
+
+    /// **The state word is the state file's, and the count is rendered the one
+    /// way H2 left open.**
+    ///
+    /// `process_state` already owns the precedence — *"blocked outranks
+    /// working"* — and it is already tested where it lives. So the state word
+    /// is never spelled out here: each expectation is built **from**
+    /// `process_state`'s own return, which is what makes a second, divergent
+    /// state computation in `state_title` fail this test rather than pass it.
+    ///
+    /// The rendering decisions, pinned because H2 specifies the alternation
+    /// and not the layout: the count is always present (`0 agents`, never
+    /// omitted), and it is singular at exactly one.
+    #[test]
+    fn the_state_title_takes_its_word_from_process_state_and_always_carries_a_count() {
+        use super::state_title;
+        use crate::agent_state_file::process_state;
+
+        // (running, blocked, turn_active, live agents, expected count text)
+        let cases = [
+            (0usize, 0usize, false, 0usize, "0 agents"),
+            (1, 0, false, 1, "1 agent"),
+            (0, 0, true, 0, "0 agents"),
+            (2, 1, true, 3, "3 agents"),
+            (0, 2, false, 2, "2 agents"),
+        ];
+        for (running, blocked, turn_active, agents, count) in cases {
+            let word = process_state(running, blocked, turn_active);
+            let title = state_title(word, agents);
+            assert_eq!(
+                title,
+                format!("kitsu · {word} · {count}"),
+                "the title is `kitsu · <state> · <N agent(s)>` with the state \
+                 word `process_state` returned for ({running}, {blocked}, \
+                 {turn_active}) and never a second computation of it"
+            );
+        }
+
+        // NON-VACUOUS, and the half that would survive a `state_title` that
+        // ignored its argument: the three words are distinguishable, and the
+        // blocked case above is one `process_state` only returns because
+        // blocked outranks a running agent and an active turn at once.
+        assert_eq!(process_state(2, 1, true), "blocked");
+        assert_ne!(
+            state_title(process_state(2, 1, true), 3),
+            state_title(process_state(2, 0, true), 3),
+            "a blocked process and a working one must not read the same"
+        );
+    }
+
+    /// **The OSC 2 sequence, and `[tui] title = false` writing no bytes at
+    /// all.**
+    ///
+    /// Bidirectional by mutation, because there are two failure modes: a
+    /// title that is never written, and a title written on a run that asked
+    /// for none.
+    ///
+    /// The hostile state word pins that `kitsu_tui::sanitize_title` is
+    /// **used** — it is already tested where it lives, including that it
+    /// cannot escape its own OSC sequence, so what is asserted here is that
+    /// the boundary is crossed on this path and not what the sanitiser does.
+    #[test]
+    fn the_osc_title_is_written_once_when_enabled_and_never_when_the_key_is_off() {
+        use super::{state_title, write_state_title};
+
+        let mut on: Vec<u8> = Vec::new();
+        write_state_title(&mut on, true, "working", 2);
+        assert_eq!(
+            String::from_utf8_lossy(&on),
+            format!("\x1b]2;{}\x1b\\", state_title("working", 2)),
+            "one OSC 2 sequence, ST-terminated, carrying exactly the title \
+             `state_title` renders"
+        );
+
+        let mut off: Vec<u8> = Vec::new();
+        write_state_title(&mut off, false, "working", 2);
+        assert!(
+            off.is_empty(),
+            "`[tui] title = false` writes no bytes at all, but wrote {:?}",
+            String::from_utf8_lossy(&off)
+        );
+
+        let mut hostile: Vec<u8> = Vec::new();
+        write_state_title(&mut hostile, true, "idle\x1b]0;pwned\x07", 0);
+        let text = String::from_utf8_lossy(&hostile).into_owned();
+        let payload = text
+            .strip_prefix("\x1b]2;")
+            .and_then(|rest| rest.strip_suffix("\x1b\\"))
+            .unwrap_or_else(|| panic!("one OSC 2 sequence, but wrote {:?}", text));
+        assert!(
+            !payload.contains('\x1b') && !payload.contains('\x07'),
+            "the title must go through `sanitize_title`, so no control byte \
+             can reach the terminal inside it; payload {:?}",
+            payload
+        );
+    }
+
+    /// **`[tui] title = false` suppresses the title *stack* too.**
+    ///
+    /// **F139**'s measurement: `enter_fullscreen` pushes `CSI 22;2t` and the
+    /// segment's `Drop` pops `CSI 23;2t` in production **without consulting
+    /// the key**, so a user who set `title = false` gets the stack pushed
+    /// anyway. Both directions are asserted over the same geometry, and the
+    /// alternate screen is checked in the off case as the non-vacuity anchor:
+    /// the segment must still have run and still have taken the screen, or
+    /// the absence of the title bytes would prove nothing.
+    #[test]
+    #[serial]
+    fn a_fullscreen_segment_pushes_the_title_stack_only_when_the_title_key_is_on() {
+        let _state = GlobalState::capture();
+
+        let push = String::from_utf8_lossy(super::PUSH_TITLE).into_owned();
+        let pop = String::from_utf8_lossy(super::POP_TITLE).into_owned();
+
+        {
+            let _gate = TitleGate::set(true);
+            let sink = SharedSink::new();
+            let segment = enter_fullscreen(Box::new(sink.clone()), &[], 24, 80, 16);
+            assert!(
+                sink.text().contains(&push),
+                "with `title = true` the segment pushes the title stack, as \
+                 it does today; it wrote:\n{}",
+                sink.text().escape_debug()
+            );
+            drop(segment);
+            assert!(
+                sink.text().contains(&pop),
+                "...and pops it on the way out; it wrote:\n{}",
+                sink.text().escape_debug()
+            );
+        }
+
+        {
+            let _gate = TitleGate::set(false);
+            let sink = SharedSink::new();
+            let segment = enter_fullscreen(Box::new(sink.clone()), &[], 24, 80, 16);
+            drop(segment);
+            let text = sink.text();
+            assert!(
+                text.contains("\x1b[?1049h") && text.contains("\x1b[?1049l"),
+                "NON-VACUOUS: the segment still ran and still took the \
+                 alternate screen, so the missing title bytes below are the \
+                 key's doing; it wrote:\n{}",
+                text.escape_debug()
+            );
+            assert!(
+                !text.contains(&push) && !text.contains(&pop),
+                "`title = false` must push and pop no title stack (F139); it \
+                 wrote:\n{}",
+                text.escape_debug()
+            );
+            assert!(
+                !text.contains("\x1b]2;"),
+                "...and set no title either; it wrote:\n{}",
+                text.escape_debug()
+            );
+        }
     }
 }

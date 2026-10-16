@@ -1172,7 +1172,7 @@ than quietly falling back to classic; `fullscreen` is named in the design but is
 | `mode` | `classic` | `classic` or `inline`; `--tui` overrides it |
 | `alternate_screen` | `auto` | `auto` or `always`. **`never` is recognised but refused** — it needs an in-viewport overlay path that does not exist yet, so accepting it would be a silent no-op. `--no-alt-screen` is refused for the same reason. |
 | `prefix` | `"ctrl+x"` | the chord prefix for viewport commands |
-| `title` | `true` | set and restore the terminal window title |
+| `title` | `true` | set the terminal window title to `kitsu · <state> · <N> agents` so a multiplexer can classify windows by it, and push/pop the title stack around fullscreen. **Only on a styled terminal** — piped, `--plain`, `--screen-reader` and JSONL runs are untouched. The title is accurate at the prompt and at the start of a turn, and **can go stale during one**; and because only fullscreen pushes the title stack, a title set in `classic` or `inline` **outlives the process**. |
 | `left_arrow_opens_agents` | `true` | ← opens the agent pane when the composer is empty |
 | `cell_ring_lines` | `10000` | scrollback the viewport retains, `fullscreen` paints and the `Ctrl+O` transcript overlay reads, `1`–`1000000`. Holds the **streamed** conversation and **your own submitted prompts** (marked, one cell per line) — not kitsu's own diagnostics, and not an answer that was buffered because tools were offered that round |
 

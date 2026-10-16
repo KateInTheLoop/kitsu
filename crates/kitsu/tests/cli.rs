@@ -2070,12 +2070,29 @@ fn test_terminal_mode_pty_matrix_decouples_rendering_and_input() {
             .windows(b"\x1b[38;2;255;140;0m".len())
             .any(|window| window == b"\x1b[38;2;255;140;0m");
         assert_eq!(fox_truecolor, styled, "{name}: {output:?}");
-        assert!(
-            !output
-                .windows(b"\x1b]".len())
-                .any(|window| window == b"\x1b]"),
-            "{name} emitted an OSC sequence: {output:?}"
-        );
+        // Card H2-title. A non-styled surface still emits no OSC at all;
+        // a styled TTY is exactly where requirement H2 demands the terminal
+        // title, so the assertion pins *which* OSC appears rather than
+        // flipping to a blanket allowance (**F41**): every OSC introducer on
+        // a styled surface must open the state title.
+        let osc_count = output
+            .windows(b"\x1b]".len())
+            .filter(|window| *window == b"\x1b]")
+            .count();
+        if styled {
+            let title_intro = "\x1b]2;kitsu \u{b7} ".as_bytes();
+            let title_count = output
+                .windows(title_intro.len())
+                .filter(|window| *window == title_intro)
+                .count();
+            assert_eq!(
+                osc_count, title_count,
+                "{name}: the only OSC a styled surface may emit is the H2 \
+                 terminal title: {output:?}"
+            );
+        } else {
+            assert_eq!(osc_count, 0, "{name} emitted an OSC sequence: {output:?}");
+        }
     }
 }
 
@@ -21632,5 +21649,59 @@ async fn test_n1_jsonl_gains_nothing_from_the_human_report_of_a_dropped_result()
             "final_summary",
         ],
         "the human-facing report must leave F120's JSONL stream exactly as it is"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Card H2-title, requirement N1's non-TTY descriptor: the OSC terminal title
+// is control bytes on **stderr**, so a run whose stderr is not a terminal must
+// not receive it.
+//
+// The positive surface and the plain/assistive negatives are PTY measurements
+// and live in `tests/tui.rs`; this is the piped one, which no PTY harness can
+// make.
+// ---------------------------------------------------------------------------
+
+/// **A piped run receives no terminal title, while the bytes it receives
+/// today are unchanged.**
+///
+/// Non-vacuous in both directions, and the second assertion is the
+/// load-bearing one: this run **does** take the alternate screen and **does**
+/// push the title stack today (`--tui fullscreen` reaches
+/// `tui_bridge::enter_fullscreen` whatever the descriptors are), so the
+/// sequences that must stay are asserted present and only the OSC 2 string is
+/// asserted absent. A gate that suppressed the push as well would be an N1
+/// violation rather than a fix.
+#[test]
+fn test_tui_title_is_not_written_to_a_non_tty_stderr() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "https://gateway.invalid");
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["--gateway", "example", "--tui", "fullscreen", "chat"])
+        .arg("--no-session")
+        .write_stdin("hello\n")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    assert!(
+        stderr.contains("\x1b[22;2t") && stderr.contains("\x1b[?1049h"),
+        "NON-VACUOUS: this run still enters a fullscreen segment on a piped \
+         stderr, exactly as it does today; stderr:\n{}",
+        stderr.escape_debug()
+    );
+    assert!(
+        !stderr.contains("\x1b]2;"),
+        "requirement N1, per descriptor: a non-terminal stderr must receive \
+         no OSC terminal title; stderr:\n{}",
+        stderr.escape_debug()
+    );
+    assert!(
+        !stdout.contains("\x1b]2;"),
+        "and the title is never written to stdout at all, which is why JSONL \
+         is unaffected by construction; stdout:\n{}",
+        stdout.escape_debug()
     );
 }

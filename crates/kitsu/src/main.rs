@@ -20264,19 +20264,21 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         });
         // Still resolved here and still without a consumer: the
         // alternate-screen force (the agent view takes the alternate screen
-        // unconditionally today) and the title row. The cell ring is no longer
-        // parked here -- it is handed to `install` below.
+        // unconditionally today). The cell ring is no longer parked here -- it
+        // is handed to `install` below.
         // F62: the flag is already refused in argv validation
         // (`validate_no_alt_screen_flag`), so reaching here means it was not
         // passed and this resolves to the configured value -- which can only
         // be `auto` or `always`, the deserializer having refused `never`.
-        let _resolved_tui = (
-            setup
-                .tui
-                .effective_alternate_screen(cli.no_alt_screen)
-                .expect("--no-alt-screen is refused in argv validation (F62)"),
-            setup.tui.title,
-        );
+        let _resolved_alternate_screen = setup
+            .tui
+            .effective_alternate_screen(cli.no_alt_screen)
+            .expect("--no-alt-screen is refused in argv validation (F62)");
+        // Card H2-title: `[tui] title`'s consumer, at last (**F139**). Stored
+        // before `enter_fullscreen` below, because the key gates the title
+        // *stack* that segment pushes as well as the OSC 2 string the turn
+        // boundaries write.
+        tui_bridge::set_title_enabled(setup.tui.title);
         let mode = match setup.tui.effective_mode(cli.tui_mode()) {
             crate::config::TuiMode::Classic => tui_bridge::TuiMode::Classic,
             crate::config::TuiMode::Inline => tui_bridge::TuiMode::Inline,
@@ -20346,6 +20348,30 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         );
         let _ = agent_state_file::write(&agent_state_dir, agent_state_pid, &payload);
     };
+    // Requirement **H2**'s title clause, at the same three boundaries as the
+    // state file above and deliberately not sharing its gate: `[tui] title`
+    // and the state file are independent keys, and a user may want either
+    // alone.
+    //
+    // `agent_state_file::process_state` is the one and only source of the
+    // state word -- the precedence *"blocked outranks working"* stays in its
+    // single home -- and the live count is `running + blocked`, which the
+    // snapshot documents as disjoint tallies; the terminal, failed and
+    // unacknowledged records are finished work and are not live agents.
+    //
+    // Cadence, and its honest limit: these three sites are the session
+    // boundary, the top of the idle loop and the start of a turn. The
+    // registry's `watch` channel is subscribed only behind
+    // `KITSU_LIVE_NOTICES`, so there is no general hook to republish from.
+    // The title is therefore correct at the idle prompt and at turn start,
+    // and goes stale mid-turn.
+    let publish_title = |turn_active: bool| {
+        let snapshot = agent_registry.snapshot();
+        tui_bridge::publish_state_title(
+            agent_state_file::process_state(snapshot.running, snapshot.blocked, turn_active),
+            snapshot.running + snapshot.blocked,
+        );
+    };
     // The agent state hook (`[hooks] on_agent_state`, requirement H3). It is
     // independent of the state file above: a user may want the notification
     // without the file, so this is gated only on a usable command. The
@@ -20369,6 +20395,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // runs. Scripted, piped and one-shot carriers never reach the interactive
     // turn boundaries below, so this is the one hint they publish.
     publish_agent_state(false);
+    publish_title(false);
     fire_agent_state_hooks();
 
     // Scripted mode: run turns from a file non-interactively, then exit. Works
@@ -21293,6 +21320,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // Turn boundary: the previous turn has ended and nothing is running, so
         // the hint is refreshed as idle before the next prompt is collected.
         publish_agent_state(false);
+        publish_title(false);
         fire_agent_state_hooks();
         let agent_snapshot = agent_registry.snapshot();
         if !agent_notifications_live {
@@ -22159,6 +22187,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // Turn boundary: a turn is now active, so the hint flips to working
         // before any inference begins.
         publish_agent_state(true);
+        publish_title(true);
         fire_agent_state_hooks();
         foreground_typeahead_active.store(true, Ordering::Release);
         // A styled interactive session gets the live raw-mode editor (visible

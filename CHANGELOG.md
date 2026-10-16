@@ -70,6 +70,17 @@ shapes may change in any minor release.
   reason.
 
 ### Added
+- **The terminal window title now says what kitsu is doing** -- `kitsu · idle · 0
+  agents`, `kitsu · working · 1 agent`, `kitsu · blocked · 3 agents` -- so a
+  multiplexer or herder can classify windows by title (requirement H2, which had
+  been specified since the epic began and never implemented). `[tui] title = true`
+  is the default and now actually controls it: setting it `false` suppresses both
+  the title and the push/pop of the terminal's title stack. **Only a styled
+  terminal receives it**; piped, `--plain`, `--screen-reader` and JSONL output are
+  byte-identical to before. Two honest limits: the title is refreshed at the
+  prompt and at the start of each turn, so it **can go stale mid-turn** if an agent
+  blocks or finishes; and because only fullscreen pushes the title stack, a title
+  set in `classic` or `inline` **outlives the process**.
 - **`Ctrl+X 1`…`Ctrl+X 9` attach to an agent by the position it is displayed at.**
   `Ctrl+X 3` is the third row you can see -- **whatever its `#id`** -- so the
   digits follow the agent view's own grouping and filter rather than agent
@@ -247,7 +258,9 @@ shapes may change in any minor release.
 - **A fullscreen renderer.** `/tui fullscreen` (also `--tui fullscreen` and
   `[tui] mode = "fullscreen"`) takes the terminal's alternate screen and paints
   the viewport's scrollback, **repainting as the conversation grows**, and gives
-  the screen and your window title back when you switch away.
+  the screen and your window title back when you switch away — and now that the
+  title is actually set, that restore means something rather than returning a
+  title nothing had changed.
   **It has its own prompt**, drawn on the bottom row, so the frame is no longer
   painted over between turns -- typing cannot scroll it at all. The slash-command
   palette is deliberately absent there (the only rows it could use are the

@@ -5831,3 +5831,31 @@ Flipping the default to `false` falsifies **three** assertions in three named te
 **Shipped: the doc comment, corrected in place** — one line of source, no behaviour, **and no test, which is the honest answer rather than an invented assertion.** It records what the key is, that it was the repository's only dissenting voice, and that H2 is half-built.
 
 **Carded: H2 proper** — gate `tui_bridge`'s push/pop on the key and write the OSC 2 state title, fed from the registry. It has a written spec, a named file in the design's map, and `sanitize_title` already built and tested (including that it *"cannot escape its own OSC sequence"*). **To be scoped against T5-S4 and H2's state-file half before anyone is handed it** — the agent's own recommendation, and right.
+
+## F140 — H2's title shipped; a doc claim that was *vacuous* rather than false; and a third fmt debt
+
+**H2-title is done** — the requirement had been specified since this epic began and never built. Three things are worth keeping.
+
+### A documentation failure mode I had not met: the idle claim
+
+Every drift this session has been a document that **became false** when behaviour changed. The CHANGELOG held the opposite: *"gives the screen and your window title back when you switch away."* The pop **did** run, so the sentence was **true** — and **meaningless**, because nothing had ever set a title. It restored something unchanged.
+
+**So a sweep for false claims cannot be the only check.** A claim can be **idle**: trivially satisfied because the feature it describes does not exist, and indistinguishable from a working one by inspection. This card made it true for the first time. **F110's phrase sweep would never have flagged it, and neither would F101's reference check** — only implementing the feature revealed that the sentence had been describing nothing.
+
+### An absence the positive check caught
+
+**`docs/functionality.md` described the title nowhere** — a `MUST` requirement with a user-facing config key had **no user prose at all**, only a README table row. That is **F114**'s shape exactly: absence is what phrase sweeps structurally cannot find, and the positive check (*for every key a card touches, grep the docs by name and confirm a description exists*) is what finds it. Now documented, including both limits.
+
+### The two deviations, stated rather than hidden
+
+**Cadence:** H2 says the *state file* updates on every registry generation change. The **title does not** — the registry's watch channel is subscribed only behind an off-by-default variable, so there is no general change hook in a chat session. The title rides three publish sites and is **accurate at the prompt and at turn start, stale during a long turn.** The author measured that before deciding, and reported it as a limit rather than quietly shipping a title that looks live.
+
+**Outliving the process:** only `enter_fullscreen` pushes the title stack, so a title set in `classic` or `inline` is **never popped and survives kitsu's exit on every terminal** — not just multiplexers, which is what the module note had said. And the asymmetry predates this card in the opposite direction: the dying-signal restore already contains the **pop**, so an inline session writes a pop having never pushed. **Carded as H2-stack, deliberately undecided** — the author declined to pin a decision I had not made, which is the third time this epic an agent has refused to decide for me and been right.
+
+### A third fmt debt, and the pattern is now clear
+
+`cargo fmt -p kitsu --check` reported **six** diffs at hand-off: one the author declined to fix **by rule** (it was in the *test author's* code, and implementers do not touch tests) and five from the two preceding cards. **F129 was exactly this, and I fixed it then.** It has recurred.
+
+Verified inert before accepting, as in F129: `config.rs` and `tests/cli.rs` are identical ignoring whitespace and commas; `tui_bridge.rs` differed, and inspecting every non-whitespace change found exactly three — **an import reorder, a match arm collapsed from a block to an expression, and a multi-line call joined.** All reflow, no logic. All suites green afterwards.
+
+**The structural cause, now that it has happened three times:** formatting is checked by whoever runs the gate **before** the last edit, and the last edit is often a test author's or a reviewer's. **The rule F129 derived still holds and still is not enough: fmt belongs after the suites, and it belongs to whoever commits** — which is me, every time.

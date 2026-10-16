@@ -1459,13 +1459,11 @@ mod tests {
                 ..TuiConfig::default()
             };
 
-            let refusal = tui
-                .effective_alternate_screen(true)
-                .expect_err(&format!(
-                    "--no-alt-screen asks for `never`, which nothing can \
+            let refusal = tui.effective_alternate_screen(true).expect_err(&format!(
+                "--no-alt-screen asks for `never`, which nothing can \
                      honour, so it must be refused even when the file says \
                      {configured:?}"
-                ));
+            ));
             // The argv-side message MAY name the flag -- F48 withholds values
             // read from a config file, not a switch the user typed -- and it
             // carries the same "not available yet" verdict as the file side,
@@ -1775,7 +1773,10 @@ mod tests {
     #[test]
     fn alternate_screen_auto_always_and_absent_all_still_load() {
         for (text, expected) in [
-            ("[tui]\nalternate_screen = \"auto\"\n", AlternateScreen::Auto),
+            (
+                "[tui]\nalternate_screen = \"auto\"\n",
+                AlternateScreen::Auto,
+            ),
             (
                 "[tui]\nalternate_screen = \"always\"\n",
                 AlternateScreen::Always,
@@ -1813,10 +1814,9 @@ mod tests {
     #[test]
     fn alternate_screen_case_and_whitespace_variants_are_typos_not_refusals() {
         for variant in ["Never", "NEVER", "nEver", " never ", "never ", "\tnever"] {
-            let rendered =
-                load_config_text(&format!("[tui]\nalternate_screen = \"{variant}\"\n"))
-                    .expect_err(&format!("{variant:?} must not be accepted"))
-                    .to_string();
+            let rendered = load_config_text(&format!("[tui]\nalternate_screen = \"{variant}\"\n"))
+                .expect_err(&format!("{variant:?} must not be accepted"))
+                .to_string();
             assert!(
                 rendered.contains("expected one of")
                     && rendered.contains("`auto`, `always`, `never`"),
