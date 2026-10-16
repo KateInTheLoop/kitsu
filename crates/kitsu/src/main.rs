@@ -20246,7 +20246,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // title back, on a renderer switch and on every exit path out of this
     // function alike.
     #[cfg(unix)]
-    let (mut tui_bridge_guard, mut fullscreen_segment) = {
+    let (mut tui_bridge_guard, mut fullscreen_segment, _title_stack_guard) = {
         // T3-S2 resolves the whole `[tui]` table here, at the one point where
         // the renderer is chosen. Only `mode` has a consumer today; the
         // remaining four are resolved and bound so that the alternate-screen
@@ -20279,6 +20279,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // *stack* that segment pushes as well as the OSC 2 string the turn
         // boundaries write.
         tui_bridge::set_title_enabled(setup.tui.title);
+        // Card **H2-stack** (**F140**): the title *stack* is the session's,
+        // not a renderer's. Before this card the one pusher was
+        // `enter_fullscreen`, so a title set in classic or inline was never
+        // pushed and outlived the process -- and the dying-signal restore
+        // popped a stack it had never pushed. Pushed here, under exactly the
+        // gate the OSC 2 string uses, and popped by this guard's `Drop` on
+        // every exit path out of `run_chat`. Created **before**
+        // `enter_fullscreen` below, which is what lets that segment see the
+        // session's push and add none of its own.
+        let title_stack_guard = tui_bridge::TitleStackGuard::new(Box::new(std::io::stderr()));
         let mode = match setup.tui.effective_mode(cli.tui_mode()) {
             crate::config::TuiMode::Classic => tui_bridge::TuiMode::Classic,
             crate::config::TuiMode::Inline => tui_bridge::TuiMode::Inline,
@@ -20332,7 +20342,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 setup.tui.cell_ring_lines,
             )
         });
-        (installed, fullscreen)
+        (installed, fullscreen, title_stack_guard)
     };
     let publish_agent_state = |turn_active: bool| {
         if !agent_state_enabled {

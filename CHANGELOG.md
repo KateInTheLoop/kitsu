@@ -79,8 +79,9 @@ shapes may change in any minor release.
   terminal receives it**; piped, `--plain`, `--screen-reader` and JSONL output are
   byte-identical to before. Two honest limits: the title is refreshed at the
   prompt and at the start of each turn, so it **can go stale mid-turn** if an agent
-  blocks or finishes; and because only fullscreen pushes the title stack, a title
-  set in `classic` or `inline` **outlives the process**.
+  blocks or finishes; and the title is **restored when kitsu exits**, except
+  under a multiplexer (which drops the title-stack sequences) and except a
+  `classic` session killed by a signal (which installs no restoring handler).
 - **`Ctrl+X 1`…`Ctrl+X 9` attach to an agent by the position it is displayed at.**
   `Ctrl+X 3` is the third row you can see -- **whatever its `#id`** -- so the
   digits follow the agent view's own grouping and filter rather than agent

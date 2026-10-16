@@ -277,6 +277,84 @@ pub(crate) fn title_enabled() -> bool {
     TITLE_ENABLED.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Whether **this session** has already pushed the terminal's title stack.
+///
+/// Process-global for the same reason [`TITLE_ENABLED`] is: the session's
+/// push and a fullscreen segment's push have no common handle, and the stack
+/// they would both push is a property of the terminal this process holds.
+///
+/// Card **H2-stack**, finding **F140**: before this card `PUSH_TITLE` had one
+/// production site, `enter_fullscreen`, so a title set in `classic` or
+/// `inline` was never pushed and never popped and **outlived kitsu's exit on
+/// every terminal** -- while the dying-signal restore wrote the pop
+/// unconditionally, so an inline session popped a stack it never pushed. The
+/// stack is therefore pushed **once per session**, by
+/// [`TitleStackGuard::new`], and a fullscreen segment pushes only when the
+/// session has not.
+static TITLE_STACK_PUSHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the session-start push has happened. See [`TITLE_STACK_PUSHED`].
+pub(crate) fn title_stack_pushed() -> bool {
+    TITLE_STACK_PUSHED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The session's one push of the terminal title stack, popped when this is
+/// dropped.
+///
+/// A guard rather than an enter/leave pair, for the reason [`BridgeGuard`]
+/// and [`FullscreenSegment`] are guards: every exit path out of `run_chat`
+/// drops it -- `/quit`, `Ctrl+D`, an error return, an unwinding panic -- and
+/// a second teardown path is how one of them comes to differ from the other.
+///
+/// The gate is `title_enabled() && title_surface_allows_osc()`: **exactly**
+/// the condition [`publish_state_title`] applies to the OSC 2 string itself.
+/// A session that writes no title must push no stack, so the plain and
+/// assistive surfaces and a non-TTY stderr keep today's byte stream
+/// (requirement **N1**). Gating on the key alone would push one on the plain
+/// classic surface, which is the mutation
+/// `tui_title_stack_is_not_pushed_on_the_plain_or_assistive_classic_surfaces`
+/// exists to catch.
+///
+/// The dying-signal restore's pop stays **unconditional** (`SIGNAL_RESTORE`
+/// is byte-pinned): after this push it is correct for every session that set
+/// a title, and for a session that set none it is a pop against an empty
+/// stack, which no terminal distinguishes.
+pub(crate) struct TitleStackGuard {
+    /// Where the push went, so the pop goes to the same sink.
+    err: Box<dyn std::io::Write + Send>,
+    /// Whether the gate was open and this guard really pushed, so `Drop` pops
+    /// exactly what was pushed and nothing else.
+    pushed: bool,
+}
+
+impl TitleStackGuard {
+    /// Push the title stack for this session, when the title is this run's to
+    /// touch at all.
+    pub(crate) fn new(err: Box<dyn std::io::Write + Send>) -> Self {
+        let mut err = err;
+        let pushed = title_enabled() && title_surface_allows_osc();
+        if pushed {
+            let _ = err.write_all(PUSH_TITLE);
+            let _ = err.flush();
+            TITLE_STACK_PUSHED.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Self { err, pushed }
+    }
+}
+
+impl Drop for TitleStackGuard {
+    fn drop(&mut self) {
+        if !self.pushed {
+            return;
+        }
+        self.pushed = false;
+        TITLE_STACK_PUSHED.store(false, std::sync::atomic::Ordering::Release);
+        let _ = self.err.write_all(POP_TITLE);
+        let _ = self.err.flush();
+    }
+}
+
 /// The title requirement **H2** names, rendered.
 ///
 /// `state` is [`crate::agent_state_file::process_state`]'s own word — this
@@ -368,6 +446,11 @@ pub(crate) struct FullscreenSegment {
     /// prompt that follows no new output repaints nothing and the byte stream
     /// of an idle fullscreen session is the one it was before this card.
     painted_tap_lines: usize,
+    /// Whether *this segment* pushed the title stack, and therefore owes a
+    /// pop (card **H2-stack**). False when `[tui] title = false`, and false
+    /// when the session already pushed its own at start -- the counts are one
+    /// push and one pop per session either way.
+    pushed_title: bool,
     /// Where the frame is anchored: the paging state, and the only state the
     /// four paging keys add.
     ///
@@ -717,9 +800,12 @@ impl FullscreenSegment {
             set_surface(self.previous_surface.clone());
         }
         let _ = self.err.write_all(LEAVE_ALT_SCREEN);
-        // The mirror of `enter_fullscreen`'s gate (card H2-title): a run that
-        // pushed no title stack must pop none.
-        if title_enabled() {
+        // The mirror of `enter_fullscreen`'s gate (cards H2-title and
+        // H2-stack): a segment pops exactly what *it* pushed. A run with
+        // `title = false` pushed none, and a session that pushed its own at
+        // start owns that one -- popping it here would underflow the stack by
+        // one per segment.
+        if self.pushed_title {
             let _ = self.err.write_all(POP_TITLE);
         }
         let _ = self.err.flush();
@@ -794,7 +880,13 @@ pub(crate) fn enter_fullscreen(
     // gate is deliberately not consulted here: these two sequences reach the
     // plain and assistive surfaces today and requirement N1 is satisfied by
     // leaving them byte-identical.
-    if title_enabled() {
+    //
+    // Card **H2-stack**: and only when the *session* has not pushed already.
+    // One push and one pop per session is not a free choice -- a styled
+    // fullscreen session's counts are pinned at exactly one each by
+    // `tui_switch_from_fullscreen_into_classic_restores_the_screen_and_the_title`.
+    let pushed_title = title_enabled() && !title_stack_pushed();
+    if pushed_title {
         let _ = err.write_all(PUSH_TITLE);
     }
     let _ = err.write_all(ENTER_ALT_SCREEN);
@@ -826,6 +918,7 @@ pub(crate) fn enter_fullscreen(
         tap,
         previous_surface,
         painted_tap_lines: 0,
+        pushed_title,
         view: kitsu_tui::fullscreen::FullscreenView::new(),
     }
 }

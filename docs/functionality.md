@@ -597,10 +597,13 @@ a consumer reading your output should never see it.
 
 **Two limits worth knowing.** The title is refreshed at the prompt and at the
 start of each turn, so it **can go stale during a long turn** if an agent blocks
-or finishes partway through. And only fullscreen pushes the title stack, so a
-title set in `classic` or `inline` **stays after kitsu exits** — as it does under
-a multiplexer in any mode, because multiplexers drop the title-stack sequences and
-there is no way to read a window title back to restore it by hand. The error
+or finishes partway through. And the title is **restored on exit**, in every mode — but
+with two gaps worth knowing. Under a **multiplexer** it is not: multiplexers drop
+the title-stack sequences outright, and there is no way to read a window title back
+to restore it by hand. And a **`classic` session killed by a signal** leaves its
+title behind, because classic deliberately installs no terminal-restoring signal
+handler — that is what keeps a classic session's output free of viewport bytes.
+Quitting normally restores the title in every mode. The error
 names the key and the permitted values but never echoes the offending value,
 because a config file can hold credentials. `fullscreen` appears in the design
 but is not accepted yet.

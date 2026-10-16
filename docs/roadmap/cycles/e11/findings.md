@@ -5859,3 +5859,29 @@ Every drift this session has been a document that **became false** when behaviou
 Verified inert before accepting, as in F129: `config.rs` and `tests/cli.rs` are identical ignoring whitespace and commas; `tui_bridge.rs` differed, and inspecting every non-whitespace change found exactly three — **an import reorder, a match arm collapsed from a block to an expression, and a multi-line call joined.** All reflow, no logic. All suites green afterwards.
 
 **The structural cause, now that it has happened three times:** formatting is checked by whoever runs the gate **before** the last edit, and the last edit is often a test author's or a reviewer's. **The rule F129 derived still holds and still is not enough: fmt belongs after the suites, and it belongs to whoever commits** — which is me, every time.
+
+## F141 — H2-stack; a trap every pre-existing test was blind to; and the fastest doc drift yet
+
+**H2-stack is done.** The title stack now belongs to the session: one push when a session first sets a title, one pop when it ends, `enter_fullscreen` pushing only when the session has not. Four things are worth keeping.
+
+### A correct warning that pointed at the wrong detector
+
+I flagged the N1 trap in the brief — a session-start push must not reach the plain and assistive surfaces — and **I pointed at the wrong tests to catch it.** The author ran the trap mutation (gating on the key alone, without the surface gate) and **every pre-existing negative passed.** The reason is worth stating exactly: on a plain *fullscreen* surface a session push merely **replaces** the segment push, so the count stays `1` and the trap is **invisible to a counting assertion**. It took a **new classic-surface guard** to make it visible at all.
+
+**So "I warned about the trap" and "the suite can detect the trap" are different claims**, and I conflated them. The warning was right, the detection did not exist, and the only reason it exists now is that the author built the guard and then **measured the mutation against the whole `tui_title*` family** rather than against the tests I named.
+
+### "Either is defensible" was wrong — the design was forced
+
+I offered the double-push question as a free choice. It was not: an existing test pins `PUSH == 1` **and** `POP == 1` across a fullscreen→classic switch, so a session push plus an unconditional fullscreen push is two and two and **fails a test the implementer may not edit.** The author found this by mutation and said so plainly. **Thirty-second brief error** (F64), and the second in two cards where the agent's measurement corrected my framing rather than just my facts.
+
+### My own text, falsified two commits later
+
+H2-title shipped with *"a title set in `classic` or `inline` outlives the process"* in **four live documents** — README's key row, `functionality.md`, the CHANGELOG, and H2's own amendment. This card falsified all four. **That is the fastest drift recorded this epic**: not stale documentation, but text I wrote two commits ago, falsified by the card that text itself opened.
+
+**And the correction could not be a deletion**, which is the part worth keeping. The fix is genuinely partial, so all four now carve out the two residuals: a **multiplexer** drops the title-stack sequences entirely (and OSC 2 has no query form, so the old title cannot be read back), and a styled **`classic` session killed by a signal** still leaks, because classic installs no dying-signal handler — deliberately, pinned by a test asserting a classic session emits no viewport bytes. **Closing that would trade a guarantee for a cosmetic one.**
+
+### Simpler was also right, and measured to be
+
+The author's answer on `SIGNAL_RESTORE`'s unconditional pop was **leave it**: after a session push it is correct for every session that sets a title, and for one that does not it is a pop against an empty stack with **no observable difference** — while making it conditional would break a byte-identity pin on the const and the prefix relationship with `SIGNAL_RESTORE_WITH_SCREEN`. A measured "do nothing" is a result, not an omission.
+
+**Also unpinned, and reported rather than hidden:** tuple bindings drop in reverse declaration order, so on a styled exit *from* fullscreen the session pop is written before the segment's leave-alt-screen. The segment's own pop is suppressed, so the counts hold, and **no test pins that interleaving.**
