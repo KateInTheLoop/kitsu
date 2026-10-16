@@ -475,6 +475,11 @@ twice; on an agent that has already finished, the second press prunes it), `n`
 renames it, and `p` marks its result collected. Every one of them names its
 outcome, names its refusals, and says so when nothing is selected.
 
+`/jobs prune ID` prints an unread result before discarding the record, so the
+only path by which a finished agent's answer could vanish unseen is closed. The
+prune still happens — a typed id is the confirmation, which is why the keystroke
+below refuses where the command does not.
+
 `x` will not prune an agent whose result nobody has read: it says the result is
 waiting, and the same keystroke prunes once you have peeked with `Space` or
 collected with `p`. This is deliberately stricter than `/jobs prune <id>`, which

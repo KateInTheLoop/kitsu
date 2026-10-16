@@ -15321,6 +15321,175 @@ async fn test_scripted_exit_surfaces_terminal_background_results_in_human_and_js
     server.verify().await;
 }
 
+/// Card **F67-print**: `/jobs prune <id>` prints an unviewed result before it
+/// discards the record, so the interactive path stops being the only one that
+/// loses the work.
+///
+/// The asymmetry F67 records: `kitsu agents --json` / automation gets
+/// `terminal_job_payload(&status)` in the reply, while an interactive human got
+/// only `~ pruned background job #1` on stderr -- and `AgentRegistry::prune`
+/// removes the record, which is the one thing
+/// `take_unobserved_terminal_results` cannot see, so the exit guard could not
+/// surface it afterwards either. The result was simply gone.
+///
+/// The decision is to print, **then** prune -- not to refuse. So this pins
+/// BOTH halves, and the second half is what keeps the card from being "fixed"
+/// by turning it into a refusal:
+///
+/// 1. the result body reaches stderr, once, before the prune receipt, and
+/// 2. the record is really gone afterwards -- `/jobs` shows an empty deck.
+///
+/// Driven end to end rather than at a seam because the loss is a property of
+/// what the human sees on stderr, and stderr is the surface F67 is about.
+#[tokio::test]
+#[serial]
+async fn test_script_jobs_prune_prints_an_unviewed_result_before_discarding_the_record() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains(
+            "\"content\":\"background audit task\"",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "PRUNE_RESULT_SENTINEL"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The foreground turn is held open long enough for the detached agent to
+    // finish, so `/jobs prune 1` on the next script line meets a terminal
+    // record whose handoff is still `Ready`. A still-running agent would be
+    // refused with "still running", which is asserted against below rather
+    // than passing silently.
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(500))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "foreground complete"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "background-call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "spawn_agent_bg",
+                            "arguments": "{\"task\":\"background audit task\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("prune-unviewed.script");
+    fs::write(&script, "start detached work\n/jobs prune 1\n/jobs\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).arg("--no-stream");
+        cmd.args([
+            "--gateway",
+            "example",
+            "chat",
+            "--no-session",
+            "--allow-path",
+            &home_path.to_string_lossy(),
+            "--script",
+            &script_path,
+        ]);
+        cmd.output().unwrap()
+    })
+    .await
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "stderr: {stderr}\nstdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // The precondition, loudly: the prune really met a finished record. If the
+    // detached agent were still running the prune would have been refused and
+    // every assertion below would be about the wrong thing.
+    assert!(
+        !stderr.contains("is still running; stop it first"),
+        "the detached agent must be terminal when /jobs prune runs: {stderr}"
+    );
+
+    let pruned_at = stderr
+        .find("~ pruned background job #1")
+        .unwrap_or_else(|| panic!("the prune receipt is still printed: {stderr}"));
+    let result_at = stderr.find("PRUNE_RESULT_SENTINEL").unwrap_or_else(|| {
+        panic!(
+            "F67: /jobs prune must print the unviewed result instead of \
+             destroying it, as `agents --json` already keeps it: {stderr}"
+        )
+    });
+    assert!(
+        result_at < pruned_at,
+        "the result is printed, then the prune is reported: {stderr}"
+    );
+    // The header `print_background_results` already gives an unobserved
+    // result, measured rather than invented: the id and the task, with the
+    // body beneath it.
+    assert!(
+        stderr.contains("background job #1 result"),
+        "the printed result is headed the way the exit guard heads one: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("PRUNE_RESULT_SENTINEL").count(),
+        1,
+        "printed exactly once -- the prune prints it and the record is then \
+         gone, so shutdown cannot print it again: {stderr}"
+    );
+
+    // And the prune still happened. This is the half that fails if the card is
+    // "fixed" by refusing to prune an unviewed result (option three), which is
+    // the `x` key's answer and deliberately not this command's.
+    assert!(
+        stderr[pruned_at..].contains("no background agents"),
+        "the record is really gone: /jobs after the prune shows an empty \
+         deck, so printing did not become a refusal: {stderr}"
+    );
+    assert!(
+        stderr[pruned_at..].contains("0 total"),
+        "and the deck counts agree -- the row is gone, not merely unlisted: \
+         {stderr}"
+    );
+    server.verify().await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[serial]

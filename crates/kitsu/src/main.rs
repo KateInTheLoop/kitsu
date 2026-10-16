@@ -15537,8 +15537,13 @@ async fn handle_jobs_command_attaching(
                 eprintln!("usage: /jobs prune <id|all>");
                 return Err(());
             };
+            let unviewed =
+                registry.handoff_state(id) == Some(subagent::thread::AgentHandoffState::Ready);
             match registry.close(id) {
                 subagent::AgentPruneOutcome::Pruned(status) => {
+                    if unviewed {
+                        print_background_results(std::slice::from_ref(&status));
+                    }
                     eprintln!("~ pruned background job #{id}");
                     Ok(serde_json::json!({
                         "kind": "jobs",
@@ -31943,6 +31948,67 @@ mod tests {
             .await,
             Err(()),
             "an unknown key is a usage error"
+        );
+    }
+
+    /// Card **F67-print**, the half a print must not buy: `/jobs prune <id>`
+    /// still **removes the record**.
+    ///
+    /// F67's decision is "print the result, then prune" -- option two, not
+    /// option three. The `x` key refuses, because *the second press of an
+    /// arming is not an explicit id*; a typed id **is** the confirmation, and
+    /// that asymmetry is the finding's own conclusion. So an implementation
+    /// that made this command refuse an unviewed result would delete the
+    /// finding, and this test is what fails when it does.
+    ///
+    /// It also pins what automation receives, which is the measured baseline
+    /// the interactive print is matched against: `terminal_job_payload` --
+    /// `id`, `task`, the status label, `joined` -- unchanged by the print.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn idle_prune_of_an_unviewed_result_still_removes_the_record() {
+        let registry = std::sync::Arc::new(subagent::AgentRegistry::new());
+        let journal = kitsu_tools::builtins::fs::WriteJournal::new();
+        let id = registry.start("nobody read this one".to_string()).unwrap();
+        registry.finish(id, Ok("the lost result".to_string()));
+        assert_eq!(
+            registry.handoff_state(id),
+            Some(subagent::thread::AgentHandoffState::Ready),
+            "NON-VACUOUS: the result really is unviewed when the prune is typed"
+        );
+
+        let payload = handle_jobs_command_attaching(
+            &registry,
+            &journal,
+            &format!("prune {id}"),
+            &mut None,
+            None,
+        )
+        .await
+        .expect("a typed id prunes");
+
+        assert_eq!(payload["action"], "prune");
+        assert_eq!(
+            payload["changed"], true,
+            "a typed id is the confirmation (F67): this command prunes, it \
+             does not refuse like `x`: {payload}"
+        );
+        assert!(
+            registry.thread_snapshot(id).is_none(),
+            "the record is gone, which is what `AgentRegistry::prune` is \
+             for and what printing must not have replaced: {payload}"
+        );
+        assert_eq!(
+            payload["job"]["id"], id,
+            "automation's payload is unchanged: {payload}"
+        );
+        assert_eq!(payload["job"]["task"], "nobody read this one");
+        assert_eq!(payload["job"]["status"], "done");
+        assert_eq!(payload["job"]["joined"], true);
+        assert!(
+            registry.take_unobserved_terminal_results().is_empty(),
+            "and nothing is left for the exit guard to surface -- which is \
+             exactly why the result had to be printed here"
         );
     }
 
