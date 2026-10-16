@@ -645,6 +645,11 @@ impl AgentThreadState {
                     &format!("tool {} {outcome}", safe_inline_label(name, 128)),
                 );
             }
+            // Deliberate no-op: the agents-view timeline is a TTY surface and
+            // F120 scopes the human-facing report of a dropped tool result to a
+            // separate card. Matched explicitly so a new timeline line cannot
+            // appear here by accident.
+            AgentRuntimeEvent::ToolResultsDropped { .. } => {}
             AgentRuntimeEvent::TurnFinished {
                 success,
                 tool_errors,

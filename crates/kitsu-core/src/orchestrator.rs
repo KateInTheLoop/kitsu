@@ -483,6 +483,14 @@ pub enum AgentRuntimeEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         command: Option<Box<CommandRuntimeResult>>,
     },
+    /// History trimming replaced one or more tool results with a dead
+    /// `[older tool output elided]` stub: the bodies are gone and nothing
+    /// recallable was left in their place, so the provider never saw them.
+    /// A lossless eviction (one that keeps an offload pointer the model can
+    /// still `fs_read_file`) is deliberately NOT reported here — that is the
+    /// documented good case `--offload-cap` exists to produce, and reporting
+    /// it would teach readers to ignore this event.
+    ToolResultsDropped { round: u32, dropped: u32 },
     TurnFinished {
         success: bool,
         completion: String,
@@ -3236,7 +3244,7 @@ where
         // still a checked invariant: elide, then drop whole exchanges, then fail
         // locally if protected content alone exceeds the configured cap.
         if initial.used > initial.target {
-            let (after_elide, elided) =
+            let (after_elide, elided, dropped) =
                 trim_tool_results_counted(messages, initial.used, initial.target, |m| {
                     m.byte_size() as u64
                 });
@@ -3245,6 +3253,7 @@ where
                 progress.tool_results_elided = elided;
                 progress.outcome = Some(CompactionOutcome::ToolResultsElided);
             }
+            report_dropped_tool_results(cfg, round, dropped);
             if after_elide > initial.target {
                 let mut current = after_elide;
                 let mut removed_total = 0u32;
@@ -3327,9 +3336,10 @@ where
     // deterministic below the threshold and does not damage protected recent
     // tool context merely to manufacture savings.
     if !force {
-        let (after_elide, elided) =
+        let (after_elide, elided, dropped) =
             trim_tool_results_counted(messages, running, target, message_tokens);
         running = after_elide;
+        report_dropped_tool_results(cfg, round, dropped);
         if elided > 0 {
             meter.invalidate();
             progress.tool_results_elided = elided;
@@ -3883,6 +3893,20 @@ async fn collect_text<P: Provider>(
     }
 }
 
+/// Report an unrecoverable tool-result loss on the runtime event stream, and
+/// only that: `dropped == 0` emits nothing, so every run that loses nothing
+/// (including a lossless offload-pointer eviction) keeps its stream exactly as
+/// it is today. Emitted at the elision site because that is the only place the
+/// lossy/lossless split is known.
+fn report_dropped_tool_results(cfg: &AgentConfig, round: u32, dropped: u32) {
+    if dropped == 0 {
+        return;
+    }
+    if let Some(log) = &cfg.event_log {
+        log.record(AgentRuntimeEvent::ToolResultsDropped { round, dropped });
+    }
+}
+
 /// Elide the oldest tool-result bodies (replacing each with a short stub) until
 /// the running `total` — measured by `size` — is at or under `limit`,
 /// decrementing by the amount each elision actually frees. Never touches the
@@ -3898,17 +3922,24 @@ fn trim_tool_results(
     trim_tool_results_counted(messages, total, limit, size).0
 }
 
+/// Returns `(total, elided, dropped)`. `elided` counts every eviction;
+/// `dropped` counts only the unrecoverable subset — an eviction whose stub is
+/// not an [`OFFLOAD_POINTER_PREFIX`] pointer, so the body is gone with no
+/// recall path. The two differ exactly when a low `--offload-cap` has already
+/// offloaded the result: `elided_tool_stub` then keeps the pointer line and
+/// drops only the preview, which is lossless and must not be reported as loss.
 fn trim_tool_results_counted(
     messages: &mut [ChatMessage],
     mut total: u64,
     limit: u64,
     size: impl Fn(&ChatMessage) -> u64,
-) -> (u64, u32) {
+) -> (u64, u32, u32) {
     if total <= limit {
-        return (total, 0);
+        return (total, 0, 0);
     }
     let last_user_idx = messages.iter().rposition(|m| m.role == Role::User);
     let mut elided = 0u32;
+    let mut dropped = 0u32;
     let mut i = 0;
     while total > limit && i < messages.len() {
         // Only elide tool results (never system / last-user / assistant turns).
@@ -3917,14 +3948,18 @@ fn trim_tool_results_counted(
             let stub = elided_tool_stub(&messages[i]);
             let after = size(&stub);
             if after < before {
+                let recallable = stub.content.starts_with(OFFLOAD_POINTER_PREFIX);
                 total = total.saturating_sub(before - after);
                 messages[i] = stub;
                 elided = elided.saturating_add(1);
+                if !recallable {
+                    dropped = dropped.saturating_add(1);
+                }
             }
         }
         i += 1;
     }
-    (total, elided)
+    (total, elided, dropped)
 }
 
 /// Build the elided replacement for a tool-result message. If the message is

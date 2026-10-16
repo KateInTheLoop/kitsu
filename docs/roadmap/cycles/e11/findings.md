@@ -5209,3 +5209,114 @@ The artifact-free failure is the serious one, and the agent measured why a messa
 **The agent narrowed its own message after measuring the render.** Its first draft embedded the whole `tool_finished` event and produced **a 12 KB wall of filler that buried the finding**; it cut back to four policy fields and 300 characters of content *because the render was measured, not assumed*. A diagnostic that is too verbose to read is as useless as one that is empty — and only rendering it tells you which you have written.
 
 **The honest-failure clause earned its place a second time.** Carried from F118 into this brief, it correctly kept stderr **out** of the one message written here. Two cards running, that clause has been the difference between a diagnostic and a decoration.
+
+### F120 refined, after nearly refuting it
+
+I went to card F120 and first tried to disprove it, because its evidence was *"no trim, budget or context event on stdout"* — **an assertion of absence from a narrow search**, which is the error pattern that has bitten this project repeatedly (and my own standing note says never to assert absence from one).
+
+**And the search was indeed too narrow: the vocabulary F120 says is missing already exists.**
+
+- `CompactionOutcome::ToolResultsElided` (`orchestrator.rs:931`), named `"tool_results_elided"` by `compaction_outcome_name` (`main.rs:4982`).
+- `compaction_report_payload` (`main.rs:5004`) emits `"outcome"`, `"tokens_before"/"after"`, `"messages_before"/"after"` **and a dedicated `"tool_results_elided"` count.**
+- `--offload-cap`'s own help documents the trade-off precisely: lowering it *"makes trimming lossless: an evicted result leaves an `fs_read_file` pointer the model can recall, instead of a dead `[older tool output elided]`."*
+
+**So the system knows about this loss, has a name for it, has a count for it, and has a flag to avoid it.**
+
+### But the absence is real, and I verified it the non-narrow way
+
+Instead of grepping for event names I suspected, I **enumerated every event type** in the agent's captured failing run. The complete set is: `run_started`, `turn_started`, `provider_request`, `provider_attempt`, `tool_started`, `tool_finished`, `assistant`, `assistant_disposition`, `turn_finished`, `final_summary`. **There is no compaction event, and `tool_results_elided` appears zero times.**
+
+**That is the honest shape of F120**, and it is a better finding than the original:
+
+> **The elision happened on a path that produced no compaction report at all.** The reporting vocabulary exists and did not fire — so the card is *"make the existing report fire on this path, or establish why it cannot"*, **not** *"design an event for an unreported loss"*.
+
+`elided_tool_stub` has exactly **one** call site (`orchestrator.rs:3917`), while the outcome is recorded at **3246** and **3336** — so the question is concrete: whether 3917's caller is inside a path that records a `CompactionRecord`, and if not, why.
+
+### The method note, which is the transferable part
+
+**Two absence claims about the same thing were made in two different ways, and only one is trustworthy.** Grepping for *"trim|budget|context"* and concluding "no event" is a guess about naming. **Enumerating every `"type"` in the stream and reading the list is a measurement** — it cannot miss an event whose name I failed to predict. When the claim is *"nothing reports X"*, **enumerate the channel, do not search it.**
+
+## F121 — F120's refined hypothesis was also wrong: the record is created, counted, and then thrown away
+
+I refined F120 once (the vocabulary exists, it just didn't fire) and the test agent **refuted that too, by probe rather than by reading.** It put a *file-backed* probe — deliberately not stderr, which would have tripped the target test's own `assert!(output.stderr.is_empty())` before reaching the real failure — at both outcome sites and inside `record_progress`. The failing run printed:
+
+```
+PROBE_WINDOW elided=1
+PROBE_RECORD outcome=ToolResultsElided elided=1
+```
+
+**So the record IS created.** `trim_tool_results_counted` (the only caller of `elided_tool_stub`) has exactly two non-test callers and **both** set `ToolResultsElided`; `record_progress` is reached, passes its `?`, and pushes a real `CompactionRecord` into the ledger. There is no third unrecorded path.
+
+### The actual defect: there is no transport
+
+Verified independently:
+
+- **`compaction_report_payload` has exactly one call site** — the `/compact` slash command. Nothing else in the binary renders it.
+- **`orchestrator.rs:1564` calls `enforce_context_budget_recording(...).await?;` and discards the returned `CompactionReport`** — the call ends unbound, confirmed to the semicolon.
+- **`AgentRuntimeEvent` has no compaction variant at all**, enumerated over the whole enum rather than searched: `ProviderRequest`, `StructuredFinalizationDeferred`, `ProviderAttempt`, `AssistantDelta`, `Usage`, `ToolStarted`, `ToolFinished`, `TurnFinished`.
+- `final_summary`'s payload carries no compaction or elision field.
+
+**The loss is detected, named, counted, recorded in a ledger — and reaches only two surfaces, both user-initiated after the fact (`/compact`'s result and `/context`'s ledger JSON).** A `--jsonl` run that drops a tool result mid-turn has no surface whatsoever.
+
+**So the card as I briefed it is not executable.** *"Make the existing report fire on this path"* requires a transport that does not exist, and the agent **stopped on exactly the condition I gave it** — add a new event type or a new outcome name and stop — rather than designing one unasked.
+
+### The catch that changes the fix's shape
+
+**The existing count does not distinguish lossy from lossless.** With a low `--offload-cap`, `elided_tool_stub` keeps the offload-pointer line and drops only the preview body — a **recallable** elision, which is the documented *good* case — and `trim_tool_results_counted` **still counts it** and still sets `ToolResultsElided`.
+
+So a naive *"warn when `tool_results_elided > 0`"* fix **warns on the lossless case** and becomes the noise I warned the brief against. The split has to be computed inside `trim_tool_results_counted`, i.e. **a second counter**. That is materially more than "fire the existing report", and it is the honest scope.
+
+### My ruling on the channel, which was mine to give
+
+**N1 is not a blanket ban, and reading it as one was my error.** Quoted: *"Non-TTY, `--plain`/`NO_COLOR`, assistive (`--screen-reader`), and JSONL output MUST stay byte-identical to today."* **An interactive TTY run is not in that list.** So:
+
+- **JSONL: one new additive event `"type"`, emitted only on the lossy path.** A new type leaves every existing event's bytes untouched — strictly less exposure than mutating `turn_finished` or `final_summary`, and far less than touching `status`. Only a consumer asserting *"exactly these types appear"* is affected, and a run that currently lies is not a shape N1 was written to protect.
+- **Interactive TTY: a human line is permissible**, because N1 does not cover it. Scoped as a follow-up, not this card.
+- **Non-TTY, `--plain`, assistive: nothing new**, to honour N1 exactly.
+
+The conditional-field precedent the agent found (`final_summary` adds `output_last_message_state` only when `Some`) is noted as the fallback if a field is ever preferred to an event.
+
+### And a brief error of my own, the seventeenth
+
+My brief pointed the agent at *"`scratchpad/f119/` … `run.sh` and `inflate.py`"* as prior captures. **Those are in *my* session scratchpad, not the agent's** — each has its own — so the path resolved to nothing. The agent rebuilt the instrument from the brief's prose and reproduced the documented failure exactly, so nothing was lost. **Lesson: never point a brief at a session-local artifact without an absolute path, and prefer describing the instrument to citing a file.** The prose was what actually transferred.
+
+### F120's doc prep: the JSONL event vocabulary is not enumerated anywhere in the docs
+
+Applied **F114**'s positive check ahead of the commit — *for every user-visible thing a card touches, grep the docs for it by name* — to see which list a new `"type"` should join. **There is no list.** Counted per type across `README.md` and `docs/functionality.md`:
+
+| event type | README | functionality.md |
+|---|---|---|
+| `final_summary` | 7 | 7 |
+| `run_started` | 4 | 4 |
+| `provider_attempt` | 2 | 1 |
+| `assistant_disposition` | 1 | 1 |
+| **`tool_started`** | **0** | **0** |
+| **`tool_finished`** | **0** | **0** |
+| **`turn_finished`** | **0** | **0** |
+
+So the types that appear do so **because some feature's prose happens to name them**, not because the stream is documented. **Three of the ten are absent entirely** — including `tool_finished`, which is the event F120's own test asserts the honesty of.
+
+**Consequences, both worth stating:**
+
+1. **For this card:** a new `"type"` has no enumeration to join, so the honest obligation is a CHANGELOG entry plus a sentence where the JSONL stream is described — not an edit to a list that does not exist. That is a smaller doc change than F114's rule would suggest, and the rule's *answer* here is "there is nowhere to add it", which is itself the finding.
+2. **Pre-existing and larger:** **an integrator cannot learn the stream's vocabulary from the documentation.** They must read `AgentRuntimeEvent`. Given **N1** promises JSONL output stays *byte-identical*, that promise is being made about a surface the docs never fully describe — the contract is stricter than the documentation of it. **Noted, not carded in this epic**, since it is squarely outside E11's TUI scope, but it belongs in whatever cycle owns the JSONL contract.
+
+## F123 — my gate list omitted the crate the change lived in, and the implementer added it unasked
+
+**F120 shipped.** The event is `tool_results_dropped { round, dropped }`, emitted at the elision site from `cfg.event_log` and `round` — so `CompactionReport`, `compaction_report_payload` and the discarded call are all untouched, and `crates/kitsu/src/main.rs` has **zero diff**.
+
+### The gate gap, which is mine
+
+**Every brief this epic has carried the same baseline gate list, and `kitsu-core` was never in it.** The F120 change lives in `crates/kitsu-core/src/orchestrator.rs`, and that crate's `orchestrator_tests` module — including `trim_tool_results_preserves_offload_pointer_but_drops_preview`, which is *directly* about the behaviour this card changed — **compiles into `kitsu-core --lib`, not into `kitsu --bins`.**
+
+So the gate list I have been pasting into briefs for a dozen cards **would have let a change to the trimmer ship without running the trimmer's own tests.** The implementer ran it **on its own initiative**, having noticed its change was in a crate the list omitted: **160 passed, 0 failed**, both profiles. I verified it independently.
+
+**New baseline, to carry forward: `kitsu-core` 160 (plus 9, 7, 3, 2, 2, 0 in its other targets).**
+
+**The lesson is not "add a crate to the list".** It is that **the list was assembled from the crates this epic's cards had touched** — a TUI epic, so TUI crates — and then reused as if it were the workspace. A gate list that is not derived from the workspace is a gate list that silently excludes whatever the next card reaches. **The honest form is to derive it: `cargo test --workspace`, or at minimum check that the crate you changed is in the list before trusting it.**
+
+### Two smaller things
+
+**The implementer corrected my arithmetic**: I called the pinned event sequence "13-element"; it is **12**, and the tests were right. Cosmetic, reported rather than silently followed — which is the behaviour I want, since the alternative is an agent quietly "fixing" a test to match a number in my brief.
+
+**The two no-op arms are the right shape and are commented as decisions**, not omissions: *"Matched explicitly rather than swept into a wildcard so adding an activity line here stays a decision, not an accident."* The TTY surface is now **F122**, open — because N1 does not cover interactive TTY runs (clarified in the design doc this commit), so a human line there is permissible but ought to be chosen deliberately.

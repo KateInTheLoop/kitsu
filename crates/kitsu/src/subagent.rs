@@ -1915,6 +1915,11 @@ fn record_telemetry_event(telemetry: &mut AgentTelemetry, event: AgentRuntimeEve
             telemetry.record_activity("usage updated".to_string());
         }
         AgentRuntimeEvent::AssistantDelta { .. } => {}
+        // Deliberate no-op: agent telemetry feeds the TTY agents view, and
+        // F120 scopes that human-facing surface to a separate card. Matched
+        // explicitly rather than swept into a wildcard so adding an activity
+        // line here stays a decision, not an accident.
+        AgentRuntimeEvent::ToolResultsDropped { .. } => {}
         AgentRuntimeEvent::ToolStarted { name, .. } => {
             telemetry.record_activity(format!("started tool {}", safe_activity_name(&name)))
         }
