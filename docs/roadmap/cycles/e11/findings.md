@@ -2864,6 +2864,22 @@ states a guarantee and a mechanism in one sentence can be wrong about the
 guarantee while being right about the mechanism**, and only someone implementing
 the mechanism notices.
 
+
+### Updated when prompts entered the ring: F52 now has an adversarial input
+
+Every line in the ring used to originate in **kitsu's own renderer**, so its width
+was bounded by what kitsu chose to print. Feeding the user's prompts changes the
+input class: **the ring accepts user paste, which is the one input nothing in the
+process limits.**
+
+Splitting a prompt on `\n` (required anyway, because both frames are one
+`fit_row_to_width` per cell) handles a many-line paste. It does **not** handle **a
+single multi-megabyte line with no newline**, which becomes one unbounded cell
+inside a ring whose bound is counted in **lines**.
+
+So F52's open question is no longer theoretical, and the counter-example is now
+reachable from the keyboard rather than requiring a pathological session. **Still
+needs a human**, but it should be decided before the bound is relied on.
 ## F53 — `--plain --tui inline` installs a viewport that plain output cannot use
 
 Found by the T3-S7a implementer, which asked rather than deciding for itself.
@@ -3952,6 +3968,12 @@ The implementer found my brief wrong again (the tenth mechanism correction in th
 
 ## F80 — a fourth flake: the approval modal paints nothing in release, once
 
+> **RETRACTED by F112. This was never a flake.** The capture is a misfiled
+> **failing-first run of T3-S7a**: `approval_modal` unconditionally pushes its
+> header, so `left: []` is unreachable for it; the three tests read **no**
+> global; and the capture's binary ran **127** tests where the clean runs ran
+> **130**. Do not count this as a flake or as evidence about the surface slot.
+
 Seen once by the F76 test author and **captured to its own file** rather than lost:
 `scratchpad/flake-kitsu-render-lib-release-approval_modal.txt`.
 
@@ -4139,3 +4161,929 @@ It is now pinned deliberately: `re_attaching_to_another_agent_replays_the_first_
 I argued from F52's units. The stronger argument is the dependency graph, verified: **`Surface` lives in `kitsu-render`; `CellRing` lives in `kitsu-tui`; and `kitsu-render` does not depend on `kitsu-tui`.** A buffer that decorates `Surface` must live beside the trait, so **the ring is unreachable from it regardless of how it is bounded.** The split that created this card feared a deferral past R6 if the implementer "reached for the ring" — it cannot be reached, so there is nothing to defer.
 
 **`cell_ring_lines` still has no reader.** This card does not become one, and **F52 stays open** for the overlay and the `[` dump; it is decided only for this buffer (byte-budgeted, oldest evicted, loss noted, clamped lines reset).
+
+## F85 — a plan row's named acceptance test already existed, and writing it again would have been a flake
+
+I challenged T5-S1's row on the grounds that a **"5 000-line RSS test"** would be flaky and would assert a property **F52** explicitly leaves open. The test author agreed and then produced a better objection I had missed.
+
+**The test already exists.** `crates/kitsu-tui/src/cells.rs:177`, `cell_ring_bound_holds_under_far_more_pushes_than_the_limit` — **5 000 pushes behind a bound of 64**, written in T3-S6. Verified.
+
+So the row's acceptance criterion had been **satisfied two milestones before the card ran**, and anyone following the row literally would have written a **duplicate** of a passing test — in the one form (RSS) that is both flaky and false, since one pathological line defeats a byte bound by design.
+
+**The lesson: a plan row's acceptance can be satisfied before its card runs, and the row will not say so.** The row is a plan written once; the suite moves every card. Checking whether the named test *already passes* is cheap and was not in anyone's routine, including mine — I questioned the test's *shape* and never asked whether it existed.
+
+### The byte assertion that is achievable, which I had written off
+
+I said the honest claim is structural — the ring's retained count is independent of conversation length — and that bytes were off the table while F52 is open. **Half right.** A byte assertion *is* available, just not from the allocator: **the sum of the retained lines' own byte lengths is identical after 10 000 pushes and after 5 000.** Computed from the ring's contents, so it is deterministic, allocator-independent and parallelism-independent, and it pins exactly what RSS was reaching for — *the evicted lines' bytes are not retained anywhere.*
+
+What remains untestable while F52 is open is only the form "retained bytes ≤ K for fixed K". **"No byte-level claim is testable" was my overcorrection**, and N4 should record the distinction so the next reader does not inherit it.
+
+## F86 — the feed must land after the reader, and N4 already said so
+
+T5-S1 splits three ways, and the ordering is the interesting part.
+
+**The ring going live is a separate card, and it is *not* first.** N4: the ring is *"not fed in production until R6's overlay reads it — feeding an unread ring would spend up to ten thousand styled lines of memory for no benefit."*
+
+**The precondition is a reader.** Shipping liveness first would spend that memory during the window before the renderer lands — **the exact expenditure the requirement forbids**. So the order is **reader → feed**, and I had it backwards in my brief: I suggested "the ring becomes live" might be the natural *first* piece because it is the bigger change. Bigger, but second.
+
+**CORRECTED IN T5-S2 — the sentence below was false, and it is the most damaging
+kind of error this file can hold.** `TuiRuntime::enter` writes `PUSH_TITLE`, the
+optional OSC 2 title and raw mode. **It does not write `ESC[?1049h`, and never
+has** — verified: `1049` appears only in `main.rs`, in `run_agent_view_overlay`,
+which has taken the alternate screen since T4-S2. So `enter`/`leave` deliver **one**
+of N5's two clauses (the title), and **the alternate screen is code someone must
+write.** The original claim, kept for the record:
+
+> **The alternate screen needs no code at all.** `TuiRuntime::enter`/`leave` already do the alt-screen, title and raw-mode lifecycle, panic restore and signal restore already cover **N5**, and all of it is tested. What is missing is a **caller** — and the only thing that can select fullscreen is **T5-S2's switch**, which owns that wiring. So **N5's "vacuous today" note is slightly wrong**: it says the clauses become real "when T5's fullscreen renderer uses that runtime", but the renderer is **pure by design** and never touches a terminal; it is the *switch* that calls `enter`.
+
+**How it got in:** I recorded it from an agent's report, which had read it off a doc
+comment's summary rather than the function body — the same shape as **F90**, where a
+deliberate refusal was read as an absence. It then travelled: into my brief, and from
+there into the next agent's own report (*"nothing emits `?1049h` today"* — it is
+emitted today, by the overlay).
+
+**The lesson, and it is about this file rather than the code: a findings entry is read
+by every later card as settled fact, so a false one is worse than a false brief.** A
+brief is questioned by the agent it is handed to; this file is quoted. Entries that
+assert *"X already does Y"* need the line that shows it, or they are hearsay with a
+number on it.
+
+Keeping the renderer pure is what lets follow and paging be asserted through painted rows rather than a pty (**F71**).
+
+## F84 applied before the bug, not after it
+
+**F84** (*enumerating the routes out of a state is not enumerating the transitions out of it*) was one card old, and the test author answered it structurally: an **eleven-row transition table** against four keys, with **three transitions no key triggers** — the auto-follow **re-latch** (paging down onto the newest line resumes following), **append while following**, and the one the ring forces: **eviction past the anchor**.
+
+That third one changed the design: `Anchor::Pinned` stores an **absolute** line ordinal (`evicted() + index`) rather than an index into the retained lines, because **an index would drift under eviction while the anchor looked unchanged.** That is the same class of bug as F84's silently-dropped buffer — state that moves underneath something that believes it is still pointing at the same thing — and it was designed out rather than discovered.
+
+**Auto-follow and the paging keys are one card, not two**, for the same reason: they are one state machine with two states, the re-latch is a transition belonging to *neither* half, and splitting them would put one `Anchor` under two cards and give the first a state it cannot reach.
+
+## F87 — `install` has two production callers, and I missed the one that mattered
+
+I corrected the previous card's claim that `tui_bridge::install` *"has dozens of call sites across `tui_bridge.rs`'s own test module"* — a **name-match count**, the same error class as my own **F74** (where I recorded "12 construction sites" for a struct by grepping its type name and the real number was two). I counted **three**: one production caller and two tests.
+
+**I was wrong. There are four, and the one I missed is a second production caller:** `main.rs:20650`, the **`/tui inline` re-install** inside the renderer switch, after a classic segment. Verified.
+
+**The consequence, had it stayed unthreaded:** `/tui classic` then `/tui inline` would reinstall a **ring-less** viewport, and the fullscreen overlay would go blind **for the rest of the session** — invisible until someone opened the overlay *after* a renderer switch, which is exactly the kind of state nobody tests by hand.
+
+### Why I made it, having just warned about the opposite error
+
+I grepped `install(` across the crate, filtered the obvious impostors (`SurfaceProbe::install`, `before_install`, `install_panic_restore`), and **read the surviving list** — which was correct as far as it went, but `main.rs:20650` appeared in my own output as a truncated line (`tui_bridge_gu…`) and I did not expand it. **I warned about counting name matches and then undercounted by trusting a truncated line.** This project already has a finding on exactly that: *never assert absence from a truncated search.*
+
+**The durable rule: a count is not finished until every match has been read in full.** Filtering a list is not reading it, and a column-truncated grep is a filtered list.
+
+### The obligation this creates
+
+**Any future parameter added to `install` has a two-site obligation**, and the second site is a re-install that only runs after a mode switch — so forgetting it produces a defect that is **silent until a specific sequence of user actions**. Worth a note wherever `install`'s signature is documented.
+
+### And a gap the author flagged rather than papered over
+
+**Nothing asserts that `main.rs` passes the *configured* value rather than a literal.** There is no seam in `run_chat` to observe it, so the install-level test proves the parameter is **honoured** and the two call sites are **eyeball-verified only**. That is the honest position, stated — not a test pretending to cover it.
+
+## F88 — a fifth flake, from a card of my own
+
+`tests::the_recap_holds_only_what_the_foreground_produced_while_attached` — from **T4-S6c**, two cards ago — failed **once** in a parallel debug `--bins` run, then passed alone and in four of four subsequent full runs. **Captured to its own file from occurrence one** (`scratchpad/flake-the_recap_holds_only_what_the_foreground_produced_while_attached.txt`), per the rule F39's eighth occurrence added.
+
+It is **not** one of the four already on the books. The shape is suggestive: T4-S6c's buffer lives behind a **process-global slot**, and **F84** records that a stale buffer in that same slot caused cross-test interference during that card's own development. So this is plausibly the same global, surfacing under parallelism rather than ordering — which would make it a **test-isolation** defect in the card I accepted, not a product defect.
+
+Not chased, per the rule. Recorded so occurrence two is the second and not the first.
+
+## F89 — REJECTED: the feed landed before a *reachable* reader, and the conflation was mine
+
+T5-S1b is correct code, fully tested, every gate green — and **rejected**, because it spends memory N4 forbids spending.
+
+### What N4 actually says
+
+> the ring is **not fed in production until R6's overlay reads it** — feeding an unread ring would spend up to ten thousand styled lines of memory for no benefit.
+
+**R6's overlay** is T4-S9's transcript overlay. **It does not exist.**
+
+### What I wrote in the brief
+
+> *"T5-S1a shipped the reader (`2cd3559`, the pure fullscreen view). **It is the reader N4 required before the feed.**"*
+
+**That sentence is wrong, and it is mine.** T5-S1a shipped a **pure view with no caller** — deliberately so, and I accepted it on that basis, noting in its own cycle record that *"no user-visible behaviour ships here — the view has no caller yet."* Verified now: `FullscreenView` is constructed **only inside test modules**, and every reader of the ring outside its own definition is a test.
+
+So after T5-S1b, every inline session retains up to **ten thousand styled lines** that **nothing in production can display** — N4's forbidden state, reached by a card whose brief cited N4 as its authority.
+
+### The distinction I lost
+
+**A reader that exists is not a reader that reads.** F86 argued the ordering correctly — reader before feed — and I turned "a reader exists" into "the precondition is met" without asking whether anything *reaches* it. The pure view's purity, which was its virtue in T5-S1a, is exactly what makes it not a reader: it holds no terminal, has no key, and nobody calls it.
+
+**This is the seventh variant in this epic of *the thing we checked was not the thing that matters*** — after F57 (a registered command nobody dispatched), F69 (a mirror that stopped reflecting), F70 (a rule no keystroke could satisfy), F71 (a message only the test could see), F75 (a state nobody read) and F79 (a caller nobody enumerated). **And it is the first where I was the one who wrote the false premise into the brief**, rather than inheriting or failing to catch it.
+
+It is also the same shape as two cards I **rejected**: a key that *appears* to work, and a state nobody reads. **Memory nobody can read is that again.** Accepting it would make the standard I enforce on agents one I do not apply to myself.
+
+### The rework
+
+**The feed must land with, or after, a reader a user can reach** — not merely a type that compiles. So T5-S1b merges with the wiring: the fullscreen view needs a production caller before the ring is fed. The implementation itself is sound and should be reused verbatim; only its **order** is wrong.
+
+Concretely, one of:
+- **wire the view** (T5-S2's `/tui fullscreen` switch, which also owns the alternate screen N5 needs) and feed the ring in the same card; or
+- **gate the feed** on the renderer actually being fullscreen, so inline-only sessions pay nothing — a product change, and the weaker option, since N4 names the ring as inline's scrollback.
+
+**N4 also needs amending** either way: it names "R6's overlay" as the reader, and there are now **two** candidate readers (the transcript overlay and the fullscreen view). Whichever lands first should be named, because this ambiguity is what let the conflation through.
+
+## F90 — `fullscreen` was never missing: it was a tested refusal, and my brief called it a gap
+
+The rework agent **stopped without writing a test** and was right to. Two things it found, both verified by me.
+
+### The premise was false, again, and in a new way
+
+My brief said: *"`fullscreen` is the one spelling it lacks."* **It is not lacked. It is present as a deliberate, multiply-pinned refusal.**
+
+`main.rs:22842` has a third `/tui` arm whose own comment reads *"`fullscreen` is a mode the design's grammar has, and it is inert here"*, printing `/tui fullscreen is not available yet; accepted: classic, inline`. Around it: twelve call sites of the accepted-modes literals, **four test functions** asserting the refusal, and a `/help` details string saying *"`fullscreen` is not available yet: it arrives with its own renderer"* — itself asserted.
+
+**So this card's cost is not "add a variant". It is retiring a boundary that four tests and a help string exist to hold.** That is a different card shape, and my brief priced it as the cheap one. Eleventh mechanism error in my briefs, and the first where the mistake was reading a **deliberate, documented state as an absence**.
+
+**The lesson: "X is missing" and "X is refused" look identical from the outside and are opposite facts.** A grep for the accepted list finds the former; only reading the arm finds the latter. I have now made the inverse error too (**F87**: reading a truncated line as the whole list).
+
+### A test that passes by luck
+
+`tui_mode_rejects_unknown_values_instead_of_falling_back_to_classic` requires the error message to contain `` "`classic`, `inline`" ``. Verified: `TUI_MODES` is exactly that string, and `"expected one of `classic`, `inline`, `fullscreen`"` **still contains it**. So that test survives this card **by luck, not by design.**
+
+**That is F41's hazard running backwards.** F41 banned substring *bans* because they constrain the product; this is a substring **require** that keeps passing after the thing it describes has changed. A requirement-shaped assertion that cannot fail when its subject changes is as empty as a ban that forbids the wrong things. **It should be strengthened in the same card**, not left to pass silently.
+
+### And one correction to the agent's framing
+
+It wrote that *"the tree is already in N4's forbidden state, so 'never feed an unread ring' is no longer achievable by ordering; only shortening the window is."* True of the **working tree** — and not of **HEAD**, which is why the rejection mattered. The feed is uncommitted, so **committed history never enters the forbidden state**, and ordering is still fully achievable: the feed and a reachable reader land in one commit, or neither does.
+
+**Worth stating because it is the point of rejecting rather than following up:** a follow-up card would have left a commit in history where the ring is fed and unreadable. The reject keeps that window from ever existing.
+
+## F91 — a false entry in this file is worse than a false brief
+
+**F86 contained a flatly false sentence for three cards**: *"The alternate screen needs no code at all. `TuiRuntime::enter`/`leave` already do the alt-screen, title and raw-mode lifecycle."*
+
+Verified false: `enter` writes `PUSH_TITLE`, the optional OSC 2 title and raw mode — **no `ESC[?1049h`**. That sequence appears **only** in `main.rs`, in `run_agent_view_overlay`, which has taken the alternate screen since **T4-S2**. So the runtime delivers **one** of N5's two clauses, and the alternate screen is code someone must write. Corrected in place at F86, with the original kept.
+
+### How it travelled, which is the point
+
+1. An agent read it off a **doc comment's summary** rather than the function body, and reported it.
+2. **I recorded it in this file without checking** — the one step where checking was cheapest and mattered most.
+3. It went into my next brief as established fact.
+4. The agent receiving that brief **repeated a corollary of it** in its own report (*"nothing emits `?1049h` today"* — it is emitted today, by the overlay), having taken it from the brief without grepping.
+
+Four hops, one unverified read, and at no point did anything fail. **The only thing that stopped it was an agent reading `lib.rs:109` while writing a test against bytes.**
+
+### The rule
+
+**A findings entry is read by every later card as settled fact, so a false one is worse than a false brief.** A brief is handed to an agent who questions it — that is what the eleven corrections to my briefs are. This file gets **quoted**, including by me, including into briefs.
+
+**So: an entry that asserts *"X already does Y"* needs the line that shows it, or it is hearsay with a number on it.** Every claim in this file about what the code *does* — as opposed to what a card *decided* — should carry a file and line, and the ones that already do are the ones that have never misled anyone.
+
+### Related, and why this one is not F90
+
+**F90** was reading a **deliberate refusal** as an absence — the code said one thing and I read another. **This** is reading a **summary** as the implementation: the doc comment was not wrong, it was a summary, and the summary was over-read. Both produce a confident false claim about existing code; the first is cured by reading the arm, the second by reading the body rather than the comment above it.
+
+The test author's response to finding it is the part worth copying: it had already written the assertions **against bytes rather than call sites**, so the error changed nothing it had to redo and left the implementer free to source the alternate screen from anywhere. **A test that pins an observable byte survives being wrong about which function emits it.**
+
+## F92 — the cell ring does not record the binary's diagnostics, and nothing had ever said so
+
+The implementer stopped on `tui_switch_from_inline_into_fullscreen_repaints_the_ring` and was right to. **The test's premise is false, and I specified it.**
+
+**Measured, not inferred.** It temporarily printed the retained count inside the alternate screen so it landed in the panic's tail:
+
+```
+DEBUGRING retained=0
+```
+
+**Why:** the binary's own `eprintln!` is a `macro_rules!` at `main.rs:221` that expands to **`std::eprintln!`** — straight to fd 2. The ring is fed **only** by surface-routed writers (`InlineSurface::transcript_line`/`write_block`, reached from `print_fragment`, `finish_line`, `tool_activity`, `tool_result_error`, `milestone`, `render_error`). `TUI_MARK_1` is `/theme zz1`'s error, printed through that macro, so **it never enters the ring in any mode.**
+
+The feed is live and the reader reads it. **They simply never meet on a session with no turn and no tool call** — which is every script in that test.
+
+### The requirements fact this exposes
+
+**N4 says the ring is "the sole source for the transcript overlay and the `[` dump" and never says what it is a record *of*.** It turns out to be **the rendered conversation** — model output, tool activity, milestones — and **not** the binary's diagnostics, receipts or command errors. That distinction was never written down, and it is load-bearing: it decides what a user sees when they scroll back in fullscreen.
+
+### The decision, and why the cheap option is the wrong one
+
+Two ways to make the assertion satisfiable:
+
+- **(a) Use a surface-routed marker** — a streamed turn, a tool result, or a `kitsu_render::milestone` call. **Taken.** The assertion keeps its full force: a second occurrence after the `?1049h` offset still can only come from a reader that read the ring.
+- **(b) Route the binary's diagnostics into the ring.** **Rejected.** It looks like a one-place change to the `eprintln!` macro, which is exactly what makes it dangerous: it would re-route several hundred call sites onto `transcript_line`/`write_block`, change **inline** line endings (`transcript_line` writes its own `\r\n` while `ONLCR` is on), change **classic** bytes too (`ClassicSurface::transcript_line` wraps writes in `with_live_row_suspended`), reorder diagnostics against `println!`, and make the ring far fuller than N4's sizing assumed. **309 tests pin those bytes.**
+
+**(b) is a requirements change about what the ring records, disguised as a wiring fix.** The implementer refused to take it and asked, which is the correct instinct: *a one-line change with a three-hundred-test blast radius is not a small change.*
+
+### Method worth copying
+
+**It settled the question by measuring rather than reasoning** — a temporary print inside the alternate screen, placed where the failure's own output would carry it out. Then removed, with `grep -c` to prove it. Three cards have now been decided by a disposable measurement rather than an argument.
+
+## F93 — why the alternate screen is not taken through `TuiRuntime`, which vindicates writing it directly
+
+**F91** corrected my false claim that `TuiRuntime::enter` already takes the alternate screen. It does not — but there is a second, stronger reason not to route fullscreen through it, which the implementer found and which belongs beside the correction:
+
+**`TuiRuntime::enter` also calls crossterm's `enable_raw_mode`, which clears `OPOST`.** This binary has **several hundred direct `println!`/`eprintln!` writers**, and `run_agent_view_overlay`'s own comment already records the consequence: *"Enabling a second, fuller raw mode here (crossterm's, which clears OPOST) would staircase all of them down the screen."* It would also nest a second raw mode under `RawStdinGuard`, whose dying-signal restore snapshots termios.
+
+So the fullscreen segment writes the four sequences itself (`?1049h`+clear+home, `?1049l`, `22;2t`, `23;2t`) and **leaves termios alone** — raw mode in this process stays `RawStdinGuard`'s. The tests assert bytes, so this was permitted, and it is the right answer rather than a workaround.
+
+**The general shape: a runtime that bundles two capabilities is unusable by a caller that wants one of them.** N5's title clause and its alt-screen clause looked like one lifecycle; they are separable, and one of them drags termios with it.
+
+## F94 — a signal or panic in fullscreen leaves the alternate screen taken
+
+Flagged by the implementer rather than widened into this card. **`install_exit_restore` gives back the inline region only**, and nothing restores the alternate screen on a dying signal or a panic while fullscreen is active.
+
+**N5 requires restore on every exit path including panics and signals.** The inline path has it; the new mode does not. It is a real hole and it is **not** what this card's tests pin — so it is carded, not quietly patched, and N5 should record that its signal clause is met for inline and open for fullscreen rather than reading as satisfied.
+
+### F92 sharpened — there are TWO bypasses, and what lands in the ring depends on whether tools were offered
+
+Option (a) was authorised and **its obvious form failed too.** Re-scripted onto a plain streamed answer, the ring held **one line, and it was empty**:
+
+```
+DEBUGRING n=1 lines=[""]
+```
+
+A **second** bypass, independent of `eprintln!`:
+
+- `orchestrator.rs:1727` — *when tools are advertised this round, text is **not** streamed live; it is buffered.* Interactive chat advertises six tools by default, so `print_fragment` is never called on a single-turn answer.
+- The buffered answer is printed by **`kitsu_render::print_message`**, which does `let mut out = io::stdout(); out.write_all(…)` **directly**, inside `with_live_row_suspended`, **never through the surface seam**. Verified at `kitsu-render/src/lib.rs:439`.
+- The one line the ring did get came from `finish_line`'s trailing newline: `"\n".lines()` is `[""]`.
+
+**So the ring carries the *streamed* conversation, not the rendered conversation** — and **what lands in it depends on whether tools were offered that round.** Nobody would guess that from N4, and it is the fact a user scrolling back in fullscreen will meet: *the same answer is in the ring or not depending on whether the model was offered tools.*
+
+This also explains **F51** from the other side: with tools enabled an ordinary answer does not stream, which was recorded as a product decision about *visible* behaviour. It turns out to decide what the scrollback **contains** as well.
+
+**The test ships with `--no-tools`**, which makes the answer stream through `print_fragment` → `write_block` → the ring, using harness machinery that already existed.
+
+**A third discovery, written into the script so nobody re-derives it:** triggering `/tui` on the turn-done marker is **not** enough. That summary line is printed *by* the turn, so a line sent the instant it appears still reaches the mid-turn collector and is refused with *"~ /tui is accepted only between turns"*. `/quit` is not gated that way, which is why every other streaming script can trigger on that marker and this one cannot; it uses the harness's own bounded pause instead.
+
+**Non-vacuity here is a measurement, not an argument.** This one assertion **failed twice today for two different reasons** — ring empty via `eprintln!`, ring empty via buffered `print_message` — and passes only with a surface-routed line present **and** a reader that pulls it out. A view that merely compiles fails it; a fed ring with no reader fails it.
+
+**And the discipline worth copying:** it passed once *with* the second debug print still in place, so the agent re-ran after removing it rather than trusting that green. **A pass obtained with instrumentation in the tree is not a pass.**
+
+## F95 — my own heredoc ate a word out of a cycle record
+
+Small, mine, and worth one line because it is a tooling trap I have been walking past for fifty commits.
+
+Cycle records are written with `cat > file <<EOF` — an **unquoted** delimiter, because the template interpolates a timestamp. That means **backticks inside the body are executed as command substitution**, and this project's prose is full of backticked identifiers. I have been escaping each one by hand; this time one escaped my escaping, and `` `fullscreen` `` was run as a command. Bash said `fullscreen: command not found`, the word was replaced with nothing, and the sentence shipped as *"brief said \" is the one spelling it lacks.\""* — in the very paragraph about reading code carefully.
+
+Repaired, and the commit amended (local and unpushed).
+
+**The fix for next time is not more care, it is a different tool:** compute the timestamp into the file afterwards, or use a quoted delimiter and substitute the one variable with `sed`/Python. **A hand-escaping discipline applied to dozens of occurrences per file will fail on one of them** — which is the same argument as **F82**'s (*a rule applied per-change is not a rule enforced*), in my own toolchain rather than the product's.
+
+Nothing else was affected: the cycle record's remaining backticks were escaped correctly, the findings file uses a **quoted** delimiter throughout, and no source file is written this way.
+
+### F94 corrected — the hole is not fullscreen's, it is the overlay's, and it is five cards old
+
+I recorded F94 as *"a dying signal or panic in **fullscreen** leaves the alternate screen taken"*. **The scope was wrong, and understating it made it look like a new mode's teething problem.**
+
+Verified: `ESC[?1049l` appears in exactly **three** places — the fullscreen `LEAVE_ALT_SCREEN` const, one doc comment, and the **agent-view overlay's normal-path restore** (`main.rs:8870`). The dying-signal handler writes `SIGNAL_RESTORE`:
+
+```
+b"\x1b[r\x1b[?25h\x1b[?2004l\x1b[23;2t"
+```
+
+— reset scroll region, show cursor, bracketed paste off, **pop title**. It gives back the title and **not the alternate screen.**
+
+**So a `SIGINT` or `SIGTERM` while the agent view is open has left users in the alternate screen since T4-S2** — five cards before fullscreen existed. Fullscreen did not introduce this hole; **it inherited it, and made it longer-lived**, because a fullscreen segment lasts until the user switches away while an overlay is usually seconds.
+
+**And my N5 amendment is therefore wrong too**: I wrote that the signal clause is *"met for inline, open for fullscreen"*. Correct reading: **met for inline** (inline never takes the alternate screen, so there is nothing to give back), **open for the overlay since T4-S2**, and **open for fullscreen since T5-S2**.
+
+### Why it went unnoticed, which is the useful part
+
+`SIGNAL_RESTORE` already pops the title — so the handler *looks* like it handles screen-level state, and it was written before anything in this binary took the alternate screen. **The overlay added a new terminal mode and did not revisit the one place that undoes terminal modes on the way out.** Nothing failed, because no test kills the process mid-overlay.
+
+**That is F79's rule in reverse.** F79: *when a function starts returning something new, every caller is a suspect.* Here: **when a surface starts taking new terminal state, every exit path is a suspect — and exit paths are enumerable too** (normal return, `/quit`, a dying signal, a panic). The overlay covered one of four.
+
+### The constraint any fix must respect
+
+The handler's body is **deliberately async-signal-safe**, and says so: an atomic load, one `write(2)` of a `const` buffer, a `tcsetattr`, no allocation and no locking — explicitly *not* reusing the panic helper because that one writes through a locked `Stderr`. **A fix may add bytes to a `const` and may read an `AtomicBool`** — the handler already loads two atomics — **and may not allocate, lock, or format.**
+
+## F96 — a session started in fullscreen installs no dying-signal handler at all
+
+Found by the F94 test author while deciding how to enter fullscreen in a script, and **it is strictly worse than F94.** Verified by me:
+
+- `install_exit_restore()` is called **only** inside `if installed.is_some()` (`main.rs:19478`).
+- `install` returns `None` for `TuiMode::Classic | TuiMode::Fullscreen` (`tui_bridge.rs:155`) — fullscreen pins no region, which is deliberate.
+- So **`--tui fullscreen` / `[tui] mode = "fullscreen"` never installs the handler.**
+
+A `SIGINT` or `SIGTERM` in that session therefore gets the **default disposition and no restore of any kind**: no scroll-region reset, **no `tcsetattr` back to canonical termios**, no title pop, no alternate-screen release.
+
+**The termios half is the serious part.** F94 leaves a user on the alternate screen — recoverable with `reset`, confusing until then. **This leaves the terminal in raw mode as well**: no echo, no line editing, `Ctrl+C` inert. The user's shell is effectively unusable until they type `reset` blind.
+
+**And it shipped in T5-S2, one card ago** — mine, accepted by me.
+
+### Why neither the card nor its review caught it
+
+T5-S2's four transition tests all **switch into** fullscreen from another mode, so the inline segment had already installed the handler. The two scripts that start in fullscreen (`--tui fullscreen`) assert the alternate screen is taken **before any input** — they exercise startup and then exit normally, which is the one exit path that does not need the handler.
+
+**The gap is the intersection of two correct decisions:** fullscreen pins no region (so `install` is inert, which is right), and the handler is installed where the region is (which was right when the region was the only thing needing restoring). **Nothing is wrong with either; the conjunction is wrong**, and conjunctions are what neither a per-card test nor a per-requirement review looks at.
+
+That is the same shape as **F94** — a surface took new terminal state without revisiting the exit paths — one level up: here a surface took new terminal state while **declining the mechanism that owns the exit paths.**
+
+### Scope decision
+
+**Folded into F94's card**, for the reasons that folded F79 into F77's: same mechanism (what the dying handler owes and when it exists), same files, and shipping a known "your terminal is left unusable" defect while fixing the lesser one beside it would be indefensible. The implementer is authorised one additional test for it.
+
+**Note the asymmetry it creates for the fix:** F94 needs the handler to *write more*; F96 needs the handler to *exist at all*. A gated flag solves the first and does nothing for the second.
+
+### F96's termios half had a second cause, found by the new test's first run
+
+My record said the terminal is left raw because the handler is never installed. **True, and insufficient.** Installing it was not enough, and the implementer's first run of the new test proved it: the handler ran and wrote the full restore — so F94's gating worked — while the pty still read `ICANON=false ECHO=false ISIG=false`.
+
+**Why:** `CANONICAL_TERMIOS` is published only by `RawStdinGuard::engage`, and a session started in fullscreen installs no inline viewport. **Its raw mode is rustyline's own**, so nothing in this process holds the modes rustyline displaced, and the handler's `valid` load is false. The handler had a snapshot to restore in every case anyone had tested, and **none** in the case F96 describes.
+
+The fix gained an `else` branch: `tcgetattr`, OR `ICANON|ECHO|ISIG` back on, `tcsetattr` — both on POSIX's async-signal-safe list, the struct a stack local, and a failing `tcgetattr` leaving the terminal exactly as the signal found it. **It is not the shell's full termios — nobody in this process knows that — but it is the difference between a usable shell and `reset` typed blind.**
+
+**The lesson: "the handler is missing" and "the handler has nothing to restore" are different defects with the same symptom**, and fixing the first leaves the second looking fixed. The only thing that separated them was a test that asserted the **terminal's observable state** rather than the bytes the handler wrote — the bytes were right and the terminal was still broken.
+
+### And two things the implementation got right that I had not specified
+
+**The flag's asymmetry is deliberate:** set **before** the take, cleared **after** the give, so no window can read "free" while the screen is held. The reverse window costs at most one stray leave on the primary screen; **the window it excludes is the defect itself.**
+
+**`SIGNAL_RESTORE_WITH_SCREEN` is composed at compile time** from the two existing constants rather than written out — so there is no third copy of either sequence and no new drift surface, and `SIGNAL_RESTORE` stays a **prefix**, which is what keeps an existing `contains` assertion and a byte-parity test green without being touched.
+
+**The double-restore case was handled too:** a main-thread panic in fullscreen would have had both `Drop` and the panic hook writing a leave, so `write_restore_sequences` **clears the flag after writing** — one take still yields one leave. The implementer also verified the overlay **cannot nest inside** fullscreen, so a single boolean has no nesting case to get wrong today.
+
+## F97 — fullscreen paints one frame and never repaints, and my docs oversold it
+
+Found while scoping the paging card, by asking where fullscreen reads input. **It does not read input, and it does not repaint.**
+
+Verified: `FullscreenView` is constructed in exactly **one** production place — inside `enter_fullscreen` (`tui_bridge.rs:334`) — which paints a single frame and **returns**. `FULLSCREEN_ACTIVE` is read only by `live_mode()` and the exit restore. There is no loop, no repaint, and no output routing.
+
+**So `/tui fullscreen` currently means: take the alternate screen, clear it, print the ring's tail once, and then carry on writing to that screen normally.** The frame is a **snapshot**, and the conversation scrolls over it from the moment the next line is printed.
+
+### What I wrote about it, which is true and incomplete
+
+The CHANGELOG says it *"takes the terminal's alternate screen and paints the viewport's scrollback"*. Accurate — **once**. `docs/functionality.md` says it *"paints the retained lines"* and that *"paging is not wired, so the view shows the newest lines that fit"* — which reads as *the view keeps showing the newest lines*, when in fact it shows the lines that fitted **at the moment you switched**.
+
+**I accepted "B without paging is coherent — it shows the tail, which is strictly more than today."** That was true of the frame at entry, and I did not ask what happened to it afterwards. **A one-shot paint and a live tail are different features, and "shows the tail" describes both.**
+
+### Why no test caught it
+
+T5-S2's four transition tests all assert what is on screen **around the switch** — the alternate screen is taken, the marker is repainted, the screen is given back. **Every one of them is satisfied by a single paint.** The repaint assertion I was most proud of — the marker appearing again after the alternate screen opens — is *also* satisfied by one frame. **A test that proves the ring was read does not prove the ring is being read.**
+
+### Scope consequence for T5-S1c
+
+The paging card is therefore **not** "decode four keys". Paging is meaningless without something that repaints on demand, and a mode that freezes is worth fixing whether or not paging lands. **And there is a prior architectural question I had not seen:** with no input loop, fullscreen leaves the composer reading underneath — so paging keys have nowhere to live yet.
+
+Two shapes, and the choice decides what fullscreen *is*:
+
+- **A modal viewer** with its own read loop, like the agent-view overlay. Paging is natural; but **R2 calls `/tui` a renderer switch that keeps the conversation**, and a modal viewer you cannot type into is a different thing.
+- **A live renderer**: the composer keeps reading, the frame repaints as the ring grows, and the paging keys are decoded in the composer's key filter beside the existing chords. This matches "renderer" — and note those chord keys are **deliberately outside** `keys::BINDINGS` because their labels are not static (§4.7), which may mean my instruction to build "a second table with its own sweep" was aimed at the wrong surface.
+
+**Not decided here.** The next card's test author should settle it with the requirement in hand, and the docs need qualifying either way.
+
+### F97 sharpened — the frame is not merely frozen, rustyline paints over it
+
+I recorded fullscreen as painting one frame that *"the conversation scrolls over"*. **Measured by the next test author, it is worse:** the failure dump shows **rustyline's own `ChatHelper`** painting `kitsu>`, the `╰ model … ╯` hint row and the **full `╭ slash commands ╮` palette** directly onto the frame.
+
+**Why:** `read_idle_chat_line` reaches the inline composer only inside `if let Some(bridge) = bridge`, and `install` returns `None` for `TuiMode::Fullscreen`. So **a fullscreen session's idle prompt is rustyline, in cooked mode** — no `RawStdinGuard`, no `KeyFilter`, no chord decoder. Verified structurally.
+
+**Two consequences.**
+
+**My own brief's second option was impossible.** I offered *"the paging keys are decoded in the composer's `KeyFilter` beside the existing `Ctrl+X` chords"* — **that surface does not exist in fullscreen.** Giving fullscreen a raw composer is a prerequisite card in its own right, and a terminal-state one: raw termios, bracketed paste, masked `ISIG`, `Ctrl+C`-as-byte, and a new exit path per **F94**/**F96**.
+
+**And the docs I wrote are not merely incomplete, they are wrong about the experience.** "Paints the viewport's scrollback" describes a frame a user never sees intact.
+
+### The decision, and what it kills
+
+**Live renderer, not modal viewer** — argued against the requirements rather than taste: R2 says the switch keeps *the conversation*, and `--tui fullscreen` **starts** a session, so *"a start mode you cannot talk to is not a renderer, it is a pager that must be dismissed before kitsu is usable"*. R1 already calls fullscreen a **"self-scrolled transcript"** — self-scrolled is the repaint, not a read loop. And the modal shape already exists as the agent view, which hard-declines unless the mode is inline.
+
+**So the plan row's "a second table with its own sweep" is not to be built**, which confirms what I suspected when I wrote it. §4.7 keeps the chords out of `keys::BINDINGS` because they never reach the swept dispatch and their labels are computed from a configurable prefix; paging keys on that surface inherit both, **plus a third reason — they are live only while fullscreen holds the screen, so a static row would advertise them in inline and classic where they do nothing.** The honest advertisement is `/tui`'s own `details` string, which R2 already pins across four spellings and T4-S10's test already asserts.
+
+### The assertion that catches F97, which is the shape to copy
+
+`raw_count(RING_ALPHA) >= 3`. **A single paint can produce exactly two** — the inline transcript's write, and the entry frame. Nothing else in the process holds that line. **A third occurrence is a repaint.** It is deliberately silent about *how* the new line arrives, so both plausible wirings pass and the implementation stays open.
+
+Paired with a guard that inline and classic paint each line **exactly once**, which refuses the tempting wiring: repainting at the **surface seam** would duplicate inline's transcript and break classic's byte-identity.
+
+**This is F97's own lesson turned on the test that missed it:** the existing assertion proves the ring **was** read; the count-of-three proves it **keeps** being read.
+
+## F98 — a third variant of the restore hole: the `/tui fullscreen` arm registers nothing
+
+Found by T5-S1c-ii's test author while enumerating exit paths, and verified by me: the `TuiRendererRequest::Fullscreen` arm is `enter_fullscreen` plus an `eprintln!` — **and nothing else.** It does not call `install_exit_restore`.
+
+So the **classic → fullscreen** route leaves the session holding the alternate screen on the **default signal disposition**. A `SIGTERM` there writes no restore of any kind.
+
+### Why three cards in a row each found one of these
+
+- **F94**: the dying handler wrote the title pop but not the alternate screen — open for the **agent view since T4-S2**.
+- **F96**: a session **started** in fullscreen installed no handler, because the handler was installed where the pinned region was and fullscreen pins none.
+- **F98**: the **`/tui` switch into** fullscreen installs no handler either, for the same reason one level along.
+
+**Every existing signal test enters fullscreen by a route that happens to have a handler already** — from inline (the inline segment installed it) or by starting in fullscreen (F96's fix installs it for the mode). **The one route nobody had taken is the one with the gap.**
+
+That is the enumeration lesson biting a third time, and the sharpest statement of it so far: **exit paths are enumerable, but so are the paths *into* a state — and a restore installed on entry is only as good as the entries that install it.** F94 taught me to enumerate exits. F98 is about enumerating **entrances**, because each one decides whether the exit machinery exists at all.
+
+### Kept in T5-S1c-ii rather than carded
+
+Three reasons: it is the **same mechanism** (exit-restore registration), it is **one test**, and **it becomes a termios hole as well** the moment that card gives fullscreen raw mode — which is precisely what it does. Splitting it would mean shipping a card that *creates* the second half of a defect it had already found.
+
+## F99 — an agent applied F97's lesson to its own tests, twice, before review
+
+Worth recording as a method observation rather than a defect.
+
+T5-S1c-ii's test author **stopped twice on its own work**, both times because a test would have been **green and proved nothing**:
+
+1. Its first frame assertion was *"a keystroke must not cost the frame a row."* **Measured:** rustyline costs **zero** rows for a plain draft, because it rewrites prompt and hint in place. The defect only bites when a **palette** opens — so the test gained a slash prefix, and asserts **after** dismissal.
+2. Its **decoder test passed on its first run.** Asserting only that a draft is painted under the frame is something **rustyline satisfies perfectly well**. It replaced that with a per-keystroke window assertion tying the paint to *not rustyline*.
+
+**Both were discarded rather than kept as green "failing tests"** — which is the trap **F97** named and which I only caught *after* accepting a card. This is the first time an agent caught it in its own tests before handing them over, and it did so by **measuring the current behaviour first** rather than reasoning about what ought to fail.
+
+**The generalisable practice: before writing a failing test, measure what the current code actually does to the thing you are about to assert.** A test derived from a description of the defect can be satisfied by the defect; a test derived from a measurement of it cannot.
+
+The discriminator it chose is the other half of the lesson: the `model … cwd` hint row has **exactly one producer**, whose only caller is rustyline's hinter, and the inline painter never writes it. **That row on the alternate screen *is* rustyline reading the surface** — a by-construction fact rather than a substring guess (**F41**).
+
+## F100 — `Ctrl+Home` is already `Home`, and that makes the inline negative load-bearing
+
+My brief for T5-S1c-iii warned that `Ctrl+Home`/`Ctrl+End` *could* collide with plain `Home`/`End`. **Measured, it is not a risk — they are already the same key.** Verified at `kitsu-editor/src/lib.rs`:
+
+```
+b'C' => match self.csi_params.as_slice() { b"1;5" | b"1;3" => move_word_right, … }
+b'D' => match self.csi_params.as_slice() { b"1;5" | b"1;3" => move_word_left,  … }
+b'H' => self.move_home(outcome),      // no parameter match
+b'F' => self.move_end(outcome),       // no parameter match
+```
+
+`C` and `D` **inspect the parameters** to distinguish a word jump from a plain arrow. `H` and `F` **do not**, so `ESC[1;5H` and `ESC[H` are indistinguishable to the editor: **`Ctrl+Home` moves the caret home today, in every mode.**
+
+And `ESC[5~`/`ESC[6~` are **swallowed** — the `b'~'` arm has no `5` or `6` parameter and falls through — so **`PgUp` currently does nothing at all.**
+
+### The consequence, which is the finding
+
+**An implementer who recognises these four sequences *unconditionally* in the shared reader would pass every positive test on this card and silently break `Ctrl+Home` for every inline user.** The inline negative — *these keys do nothing new in inline and classic, and `Ctrl+Home` still moves the caret* — is therefore **load-bearing rather than decorative**, which is not how a "nothing regresses" guard usually reads.
+
+**And "PgUp does not disturb the draft" is green today**, because the editor already ignores it. **F99**'s trap on this very card: the test author measured first, found that assertion vacuous, and made every red test pin *delivery* or the caret instead. A card that asserted only inertness would have shipped nothing and passed.
+
+### Two corrections to my brief
+
+- **The comments I cited** as the reader's keymap documentation are in the **test** `inline_read_delivers_the_editor_keymap`, not in the reader. Substance right, location wrong.
+- **"The view's anchor is already there" was false.** `FullscreenSegment` held **no** view, and `fullscreen_frame` constructs `FullscreenView::new()` **fresh on every paint**, so no anchor survived a repaint. Paging state is **new** state on the segment, not relocated state. Verified.
+
+**Fourteenth and fifteenth mechanism errors in my briefs.** Both reported rather than worked around, and neither invalidated the card — but the second one matters, because "relocate existing state" and "introduce state with a lifetime" are different jobs and I had described the harder one as the easier.
+
+### One design choice worth keeping
+
+Paging delivers through a **sink closure**, not a new reader outcome, and the reasoning was measured rather than argued: **an outcome ends the read**, and re-entry replays the draft as *bytes* through a cursor, which leaves the caret at the end. So paging-by-outcome would **jerk the caret to the end on every press**, and hand each press a fresh editor, a fresh key filter and a lost reverse-search. A sink keeps one read, one editor and one draft across a whole run — pinned as a **count**: ten keystrokes, ten presses, in order (**F97**'s shape).
+
+### F100's resolution — and the best non-vacuity proof this epic has produced
+
+The anchor test's middle assertion was **arithmetically unsatisfiable**: 60 lines in a 60-limit ring retains all 60, window 23, `follow_top = 37`, `page_step(23) = 22`, so one `Page::Up` lands on ROW_16..ROW_38. Reaching ROW_01 needs a **1.6-window jump** — `Page::Oldest`'s transition, not `Up`'s — and one-window-per-press is pinned **green** in `kitsu-tui`. **Satisfying it would have meant redefining the key and breaking two passing tests.** Reproduced independently by me. The implementer stopped rather than bend the product: the **ninth** unsatisfiable assertion in this epic.
+
+**I rejected both fixes it offered, and the reasons generalise.**
+
+- *Assert the row the step actually reaches* — it would **hard-code `page_step` into a second place** when `kitsu-tui` already pins it. Two homes for one arithmetic fact is this epic's oldest failure mode.
+- *Shrink the ring so one press does reach the oldest* — it makes the claim true **by fixture**, and the test would then read as *"one PgUp reaches the oldest line"*, which is false of the product at any realistic size. **A test that is only true for its fixture is worse than one that is wrong, because it looks like a specification.**
+
+**The authorised fix asserted the intent instead** — the anchor's *lifetime*, not the step's size: the press moved the frame off the newest line, the paged frame **differs from the entry frame by value**, and then the claim the test's own name promises and nothing else covered — **after a repaint, the same frame is painted again.**
+
+### The proof, which is the part worth copying
+
+The implementer made that assertion **non-vacuous by mutation**: it reverted `repaint_if_the_ring_grew` to the `FullscreenView::new()` form it had before the card, re-ran, and got
+
+```
+assertion `left == right` failed: a repaint must come from the segment's anchor
+and not from a fresh view: same anchor, same rows.
+```
+
+then restored it. **So the assertion demonstrably covers the one-line change it exists for** — a change that was previously untested, because the fresh-view construction had passed every earlier test.
+
+**And the seam it needed already existed.** I had said "if pinning this needs a seam you do not have, stop again rather than weakening it". It didn't: `through_the_seam` writes to `active_surface()`, which **while the segment lives *is* its own tap** — so the ring grows and the repaint fires through **production's own gate**, with no test-only hook. That let the assertion pin the **whole frame equal by value** rather than the top row I had asked for, which is stronger and still names no number.
+
+It also added an assertion nobody asked for: `!segment.is_following()` after the growth, pinning that **append-while-following is suppressed while pinned** — transition 10's negative, which the view's own table describes and nothing had checked from the production side.
+
+**Three design choices recorded as right:** the **sink** rather than a reader outcome (an outcome ends the read, and re-entry replays the draft as bytes, so paging-by-outcome would jerk the caret to the end on every press and hand each one a fresh editor and a lost reverse-search); **the gate being the sink's presence** rather than a flag — *a surface with nowhere to send a press has no business lifting one out of the stream*; and **matching the full byte string including parameters**, which is the only thing keeping `Ctrl+Home` separable from `Home` given that the editor cannot tell them apart.
+
+## F101 — the plan's "files" column named a directory that never existed, in four rows across three stories, and the one catch never propagated
+
+Nothing checks the plan's file column against the tree, so it drifted into fiction unnoticed:
+
+| Row | Named | Reality |
+|---|---|---|
+| T3-S7 | `kitsu-tui/src/overlay/approval.rs` | **caught at review**, recorded as *"impossible"* — `kitsu-tui` sees only `kitsu-render` and cannot name `PermissionRequest` |
+| T4-S4/S4b | `overlay/agents.rs` | **shipped as `agents_view.rs`** — flat, and never corrected |
+| T4-S9, T5-S3 | `overlay/transcript.rs` | unbuilt; **no `overlay/` directory has ever existed** |
+
+`crates/kitsu-tui/src/` is and always was flat: `agents_view.rs`, `cells.rs`, `composer.rs`, `fullscreen.rs`, `keys.rs`, `lib.rs`, `status.rs`, `viewport.rs`.
+
+### The finding is not the wrong path, it is that finding it once fixed one row
+
+T3-S7's review **did** catch this, in the strongest terms — *"the original row's `kitsu-tui/src/overlay/approval.rs` was **impossible**"* — and wrote the reason into the plan. **Then I shipped the agent view into a differently-named file and left its row saying `overlay/agents.rs`,** and briefed two later cards off rows naming the same fictional directory.
+
+**This is F91's shape from the other direction.** F91 was *a false entry travelling four hops*; this is **a true correction failing to travel at all**. The same cause: a document is corrected where the eye is, and its siblings keep the old claim. Two instances in two cards — the surviving `TuiRuntime::enter` claim in a struck-through row, and this.
+
+**Cheap guard, applied now:** every `` `dir/file.rs` `` in the plan, resolved against `find crates -path`. Two misses, both `overlay/`. It is one command and it had never been run.
+
+**And note which way the error cuts.** A plan that names a file which does not exist invites an implementer to *create* it — so a wrong path does not fail loudly, it **grows a directory the crate's convention does not use.** The agent view escaped only because whoever wrote it ignored the row.
+
+## F102 — the ring holds no prompts, so the transcript overlay would show one speaker
+
+Verified independently. `CellLine` carries **only** `fd: Fd` and `styled: String` — no role or kind marker — and production pushes into a `CellRing` from exactly two `transcript_line` paths (`viewport.rs` for inline, `FullscreenTap` for fullscreen); the remaining `push` sites are test fixtures or `frame_ring` rebuilding a ring from lines it already holds.
+
+**The user's submitted line never becomes a transcript line.** The composer paints it and then `clear_composer` erases it. So the ring contains assistant stream on `Stdout` and tools/diagnostics on `Stderr`, **and nothing the user typed.**
+
+### Why this is a requirement finding and not a card detail
+
+**N4** makes the ring *"the sole source for the transcript overlay and the `[` dump"*. So:
+
+- **`{`/`}` prompt jumps are unsatisfiable** — there are no prompt boundaries to find. R6-c is **blocked on a feed change**, on the surface T5-S1b owns, not on overlay work.
+- **The whole overlay shows half a conversation with one speaker missing.** That is a user-visible surprise, not a docs footnote, and it is **wider than F92 said**: F92 recorded that diagnostics and tool-deferred answers are absent; prompts are absent too, and they are the user's own words.
+- **Inferring prompts from `Fd` is refused.** `Stderr` is tools and diagnostics, not the user. A heuristic here would be a rule whose narrowest input path defeats it (**F70**'s shape).
+
+**The test author declined to write a `{`/`}` test**, on the grounds that the only way to make one pass today is to push a fake `"> prompt"` line in the fixture — *the "true only for its fixture, so it looks like a specification" failure*, which is now the second card running where that rule did work.
+
+## F103 — `[` dumps to the one thing the alternate screen does not have
+
+R6 says `[` dumps the ring *to native scrollback*, **fullscreen only**. Those two clauses are nearly contradictory: **bytes written while `ESC[?1049h` is in effect are discarded by the terminal on `ESC[?1049l`.** A dump performed while fullscreen holds the screen therefore goes **nowhere**.
+
+So "fullscreen only" cannot mean *performed while fullscreen holds the screen*. It can only mean the key is **offered** only there, and the dump **leaves the alternate screen first** or defers to the leave. **That makes `[` a terminal-state hand-off, not a write** — the same kind of thing as `v` spawning `$EDITOR`, which is why grouping them in one card is right rather than merely convenient.
+
+**And `[` is where the ring's gaps stop being a display matter.** A dump into native scrollback *looks* like a transcript the user can scroll back through and trust. With prompts absent (**F102**) and diagnostics absent (**F92**), its output should say what it is.
+
+## F104 — a tenth flake, named: the attach-recap test
+
+`tests::the_recap_holds_only_what_the_foreground_produced_while_attached` (`crates/kitsu/src/main.rs`, `--bins`) failed **once** in a full run and then passed **13 consecutive times**; it passes in isolation, so it is order/parallelism-sensitive — consistent with the **process-global active-surface slot** the recap/attach path reads.
+
+Proved not to belong to the card running at the time: **6 consecutive full `--bins` runs skipping that card's tests were 937/0**, and 8 runs with them were exactly 937 + the card's 2.
+
+This is **F88**'s test under a second, independent sighting, so it is now listed under its own name rather than folded into the earlier count. **Ten open flakes.** T4-S6c introduced the process-global slot this one touches, and two of the ten now point at it — the strongest signal yet that the slot, not the tests, is the defect.
+
+### F101 confirmed by its own guard, twice in one sitting
+
+Having recorded that *a true correction fails to travel*, I restructured R6 into four rows and then deliberately looked for the siblings. Both existed, in the requirement-to-story map at the foot of the plan:
+
+- `| R6 | T4-S9, T5-S3 |` — pointing at **both rows I had just retired**.
+- `| R2 | T3-S9, T5-S2 |` — pointing at a row I **deleted earlier the same session** as a stale duplicate.
+
+So the plan had a dangling reference for hours, created by my own correction, and a second one created minutes after writing the finding that predicts it. **The sweep is now a command and not an intention:** resolve every story reference in the map against the rows that actually exist. Its first run found one more thing — a reference I had just written myself, spelled `T5-S1b+T5-S2` where the row says `T5-S1b + T5-S2`.
+
+**The lesson sharpens.** F101 said a correction does not propagate. The sharper version: **a correction *creates* dangling references, so the act of fixing a document is itself the thing most likely to break its siblings.** Editing is not a safe operation on a cross-referenced document, and the only guard that holds is a reference check that runs after the edit.
+
+## F105 (REJECTION) — `Esc` did not close the overlay, and the sweep that should have caught it tested the wrong thing
+
+R6-a was rejected on a defect the implementer had flagged as a judgement call but described more mildly than it was: *"ESC resolves as close only when nothing follows it in the chunk."* The partial-hold runs **before** the ESC arm, and `KeyFilter::is_partial` is `data.len() < pattern.len() && pattern.starts_with(data)` — so a bare `ESC` is a strict prefix of all four paging sequences:
+
+1. `page_key(b"\x1b")` → `None`
+2. `partial_page_key(b"\x1b")` → **`true`** → `held = [0x1b]`, `break`
+3. the loop returns to `stdin.read(...)` and **blocks**
+
+**`Esc` closed nothing until a second keypress arrived**, and the footer advertised `q/Esc close`. **F75**'s second kind: *a key that appears to work is a defect* — and advertised by the very in-situ footer chosen over a global table.
+
+### Why the test that looked like it covered this did not
+
+`q_and_esc_close_the_overlay_and_no_other_press_does` sweeps the **entire** key space — and it tests `kitsu_tui::transcript::closes(press)`, the predicate in the view crate. **The byte loop that must hand it an `Esc` was never exercised.** A total enumeration of the keyboard, proving the predicate answers `Esc`, while the thing that produces an `Esc` never ran.
+
+**That is F69 verbatim**, and the strongest instance yet: F69's mirror diverged three times; here the test was not a mirror but a different *layer*, which looks even more like coverage. **A sweep over a key space is only as good as the layer it sweeps.**
+
+### The fix, and the proof shape worth copying
+
+The loop was extracted as `run_transcript_key_loop` returning `TranscriptExit { Closed, Drained }` (**F69**'s remedy: the test drives the real decoder), and the lone `ESC` is resolved by **the agent view's own `stdin_waiting(ESC_SEQUENCE_GRACE)`** — the existing function and the existing 50 ms constant, verified defined **once** in the tree. The honest signal for *"lone `ESC` or the first byte of a sequence?"* is time, not a chunk boundary; the chunk boundary is not a signal at all, as the trace shows.
+
+**Bidirectional non-vacuity, which is the thing to copy:**
+- pre-fix decoder restored → the two lone-`ESC` tests fail `left: Drained, right: Closed`
+- `ESC [` skip disabled → the split-arrow test fails `left: Closed, right: Drained`
+
+So one test fails if `Esc` does not close, another fails if an arrow *does*. **Asserting on the exit reason means the defect's own value cannot satisfy either** — the two failure modes are opposite and both are pinned, which a single-direction proof cannot do.
+
+## F106 (second rejection, same card) — the key that opens the overlay was advertised nowhere
+
+Every `Ctrl+O` in the tree was a comment or a test string. **F82** verbatim — its sweep found `q`, `Enter` and `→` dispatched and advertised nowhere, and its lesson was *a rule applied per-change is not a rule enforced*.
+
+**The footer does not cover this**, and the distinction is the finding: the footer advertises the keys live *inside* the overlay, so it is **only visible once the overlay is already open.** An in-situ advertisement cannot advertise its own entrance.
+
+The location needed no new decision, only reading: `agent_view_keys_help` prints *"the agent view's keys (/jobs view, or ctrl+x a):"* and closes with *"the composer's own chords are listed by /help tui."* **So composer chords already had an established home**, and `Ctrl+O` is a composer chord — read by the one inline reader both surfaces use, exactly like the four paging keys T5-S1c-iii put in `/tui`'s `details`. Not `keys::BINDINGS`, which is the agent view's table.
+
+The test restates the footer's own guard on the new string: the details must not contain `search`, `dump`, `editor`, `scrollback` or `jump`, so **the advertisement cannot promise R6-b/c/d either** — the failure mode of the three documents once committed saying `/detach` worked (**F77**).
+
+## F101, third instance — and this one was mine, in the file I had just edited
+
+`docs/functionality.md` still read **"Paging is not wired, so the view shows the newest lines that fit"** — ten lines below the paragraph I added last card describing paging working, in the same file, in the same edit session.
+
+So the count is: a false claim surviving in a struck-through plan row; a fictional directory in four rows with one catch that never travelled; two dangling map references created *by* my corrections; and now **a sentence contradicting its own neighbour because I added the new text instead of searching for what it falsified.**
+
+**The sharpened rule, now applied:** after changing a document, grep it for the claim the change makes false — not just the place the new text goes. Adding is not the same operation as correcting, and I keep performing the first while believing I have done the second.
+
+### F101's sweep has one known false positive — recorded so it is not re-chased
+
+The reference check reports `T5-S2` dangling. It is not: the row exists as the **compound** `| T5-S1b + T5-S2 |`, and the sweep extracts `T5-S2` from the map's `T5-S1b + T5-S2 (merged)` as if it were a standalone reference, then fails to match it against a row key that *contains* rather than *starts with* it.
+
+Left as-is rather than fixed: the sweep's job is to be run after every edit, and a known, documented false positive is cheaper than a cleverer matcher that might mask a real one. **Noted here so the next run does not spend a card on it.**
+
+## F107 — the flakes' shared cause, named: one process-global surface slot with sixteen readers
+
+> **CORRECTED by F112, in three places.** `tui_bridge.rs:966` is `fn invalidate`,
+> not the slot — the real one is `kitsu-render/src/surface.rs:162`, a different
+> crate and never a `Mutex<Option<..>>`; the "16 readers" figure counts **nine
+> test-module readers** and omits **twelve** in `kitsu-render/src/lib.rs`; and the
+> recap test **was already `#[serial]`** when this was written, so the fix
+> proposed here was already in the tree. **It is test-only** — no production
+> defect, and the refactors contemplated here are all unjustified.
+
+Read-only diagnosis, recorded for a future card rather than acted on, because the files are in flight.
+
+**Two of the ten open flakes point at the same thing**, and it now has a name: `tui_bridge.rs:966` holds the installed surface in a **`std::sync::Mutex<Option<..>>` process global**, read through `active_surface()` at **16 sites** (11 in `tui_bridge.rs`, 5 in `main.rs`).
+
+`cargo test` runs a crate's tests **in threads of one process**, so every test that installs a surface writes the **same slot** every other test reads. That is sufficient on its own to explain:
+
+- **F88/F104** — `the_recap_holds_only_what_the_foreground_produced_while_attached`, which fails under parallelism, passes in isolation, and has now been sighted **twice independently**, in two different cards' runs.
+- **F80** — three `approval_modal_*` tests in `kitsu-render --lib` release painting nothing (`left: []`), during a run **concurrent with another cargo test**.
+
+### Why this is worth a card and not a `--test-threads=1`
+
+The suite is already run single-threaded where it has to be (`--test tui`), and reaching for that flag more widely **hides the defect and costs wall-clock on every future run**. The honest fixes are to scope the slot per-test or to make installation explicit in the tests that need it — and the second is already the better-tested shape: the most recent cards drive `install_inline_with_ring` and `through_the_seam` deliberately, which is why their assertions are reliable while the recap test's are not.
+
+**It also explains why the recap test alone keeps surfacing:** T4-S6c introduced the foreground/recap path, which *reads* the slot to decide what the foreground produced. A test whose subject is "what was installed at the time" is maximally sensitive to a global that another thread can rewrite.
+
+**Not a card yet, deliberately** — it touches `tui_bridge.rs` and `main.rs`, which the prompts-in-the-ring work holds. Carded next, with the measurement above as its starting point rather than a fresh hunt.
+
+### A third global, found the same day, and this one has a test that panics on purpose
+
+`kitsu-tui`'s `ALTERNATE_SCREEN_TAKEN` (`lib.rs:215`) is a process-global `AtomicBool`, and the restore path does:
+
+```rust
+if alternate_screen_taken() { out.write_all(LEAVE_ALT_SCREEN)?; note_alternate_screen(false); }
+```
+
+Two tests in that module share it and **neither was serialised**:
+
+- `the_restore_stream_gives_the_alternate_screen_back_only_when_it_is_taken` sets the flag, then asserts the restore stream carries `ESC[?1049l`.
+- `install_panic_restore_chains_the_previous_hook` **panics deliberately** — that is its whole subject — and the installed hook **clears the flag**.
+
+So the panicking test clears the other's flag between its set and its assertion, and the count goes `1 -> 0`. **The failing test's own doc comment already noticed the hazard** (*"the flag is process-global, so it is put back before returning"*) **and guarded the wrong end of it**: restoring a global on the way out does nothing about a concurrent writer.
+
+**Proved latent rather than introduced**, by the right instrument: **3 sightings in ~145 runs** with new unrelated tests present, **0 in 120 runs at pristine HEAD** in a detached read-only worktree, **0 in 40 runs** single-threaded. New tests that touch no shared state perturbed the **scheduling** of a race that was already there.
+
+### What this does to the finding
+
+**Three process-globals, three flake families, one shape.** The pattern is not an unlucky static; it is that this binary keeps per-process state for things a test wants to own, and `cargo test`'s threads make every such static a shared mutable. A test-local mutex is going in on the two tests above as a **mitigation, named as one in a comment** — the production global remains the defect.
+
+**And a lesson about the fix, not the bug.** The obvious remedy, `#[serial]`, **would not compile**: `serial_test` is not a dependency of `kitsu-tui`, whose `[dev-dependencies]` is `vt100` alone. The belief that it was available came from grepping for the **word** `serial`, which matched a prose comment about a lock — **F74** applied to a word match. A fix proposed from a grep is a hypothesis about the build, and this one was false.
+
+## F108 — the end-to-end link no in-process test can see, proved by mutating a live binary
+
+**F102 is resolved** and the mechanics are in the cycle record. What belongs here is **how one claim got proved that nobody had been able to prove.**
+
+`an_injected_priority_command_is_never_marked_the_users_prompt` asserts that **no** retained line is marked. That is satisfied by *"retained unmarked"* **and** by *"not retained at all"* **and** — the problem — by *a feed that never fires*. The test author said so explicitly and declined to claim more: the `PromptOrigin` plumbing *could not* be mutation-proven before the feed existed, because the origin's journey from its capture point to the feed crosses a `match` that builds the line and is not observable from any seam a unit test can reach.
+
+**The implementer proved it in a live process, in two halves:**
+
+1. **Both arms are load-bearing, bidirectionally.** Making the `Injected` arm feed → exactly **one** failure, that test. Making the `User` arm inert → exactly **six**, the feed tests. So neither arm is dead and the two are not swapped.
+2. **The capture point really determines what arrives.** With a temporary probe, a real pty session logged `User /help`, `User /quit`. Then the single binding at the capture site was mutated to `= true`, the binary **rebuilt**, and the *identical* session logged `Injected /help`, `Injected /quit`. **The text was byte-identical across both runs**, so the origin demonstrably does not come from the text — it comes from the binding. Probe and mutation reverted; the file's diff is byte-identical to the author's.
+
+### Why this is a finding and not just diligence
+
+**A unit test can only prove what a seam exposes.** This project's strongest assertions have come from driving the real path rather than a predicate beside it (**F69**, **F105**) — but there are claims where *no* in-process seam exists, and the honest options are to under-claim or to leave the process. **Rebuilding the binary with one line changed and re-running an identical session is the cheapest instrument that spans a link a seam cannot**, and it produced a sharper result than any test on this card: a two-run comparison in which everything but one binding is held constant.
+
+**And the under-claiming was correct.** The author's *"I am not claiming more than I measured"* is what made the gap visible and handed it to someone who could close it. A report that had asserted the plumbing worked would have buried it.
+
+## F109 — a living document must be corrected; a cycle record must not
+
+Resolving F102 falsified claims I had written **one commit earlier**, and the sweep found them in six places. The useful part is that they split cleanly into two kinds:
+
+- **Living documents** — `CHANGELOG.md`'s `[Unreleased]` entry (*"your own prompts are absent from it"*), `docs/functionality.md` (*"It also does not hold your own prompts"*), R6's amendment, and the plan's R6-c row. **All corrected**, because they describe what the software does now and a reader has no way to date them.
+- **The cycle record** `docs/roadmap/cycles/e11/R6-a.md`, which says *"the ring holds no prompts at all -- the overlay shows one speaker"*. **Left exactly as written.** It is a point-in-time record of what was true and what was decided at that card; editing it would destroy the only honest account of why R6-a shipped a one-speaker overlay and why R6-c was blocked.
+
+**The distinction is the finding.** F101's rule — *after changing a document, grep for the claim the change falsifies* — is incomplete without it, because applied naively it would have rewritten history. **The test is not "is this sentence now false?" but "does this document claim to describe the present?"** A changelog entry in an unreleased section does; a dated cycle record does not, and its value is precisely that it still says what was believed then.
+
+## F110 — F101's fifth instance: I fixed the sentence and not its twin in another file
+
+Last card I found `docs/functionality.md` still reading *"Paging is not wired, so the view shows the newest lines that fit"* ten lines below the paragraph I had just added describing paging working. I fixed it, recorded it as F101's third instance, and wrote down the rule: **after changing a document, grep it for the claim the change falsifies.**
+
+**I then did not apply that rule to the other document containing the same sentence.** `CHANGELOG.md` read, in the same entry, immediately after the paragraph describing the paging keys:
+
+> Paging keys are not wired yet, so it shows the most recent lines.
+
+Found three cards later, while pre-locating what R6-c would falsify — i.e. by a sweep run for a *different* purpose, not by the rule I had just written.
+
+### The rule was wrong, not just unapplied
+
+F101 said *grep **it***. Singular. **That is the bug.** The same claim is written in several documents because each audience needs it, so falsifying it falsifies every copy, and the file I happen to be editing is the one I am least likely to miss. The corrected rule:
+
+> **After changing behaviour, grep every live document for the claim the change falsifies — not the document you are editing.**
+
+Run as a family rather than a string: `not wired`, `is not wired`, `are not wired` across `CHANGELOG.md`, `README.md` and `docs/*.md` now returns nothing, where a sweep of only the file in hand would have returned nothing on the day I introduced this.
+
+### The tally, which is the argument for automating it
+
+Five instances in this epic, every one a *correction* that failed to reach a sibling:
+
+1. A struck-through plan row still asserting the alternate-screen claim F91 had just disproved.
+2. A fictional `overlay/` directory in four rows across three stories, one of which had been caught and documented as *"impossible"*.
+3. Two dangling map references created **by** my own corrections, minutes after writing the finding that predicts them.
+4. `functionality.md`'s *"paging is not wired"*, ten lines from its contradiction.
+5. **This one** — the same sentence as (4), in the file I did not grep.
+
+**The cost is not the wrong sentence; it is that a reader cannot tell which sentence to trust.** Two documents in this repo disagreed about whether paging existed, and both were committed by me, in the same release, for three cards.
+
+**Carded:** a check that greps the live documents for a small set of negative-capability phrases (`not wired`, `not yet`, `still missing`, `is refused`) and lists them with their line numbers, so each is re-read rather than assumed at every card. Not a test — a sweep whose output a human reads, like the reference check F101 already produced.
+
+## F111 — R6-c shipped; the limitation, and a third sighting of the recap flake
+
+**R6-c is done.** `{`/`}` jump between coalesced prompt blocks, through a new shared seam `pin_to(ordinal)` that **R6-b's `/` will reuse** with a match ordinal — one anchor, one clamp, no second anchor concept. The pinned transition table grew to **twelve** rows and its header says so.
+
+### The accepted limitation, with its two homes named
+
+**Two submissions with nothing printed between them are one jump stop.** Adjacency is the only rule a `bool` per cell affords; distinguishing them needs a block id. Impact is small — a submission that prints nothing at all is rare — and it has **exactly one home in the code** (`CellRing::prompt_blocks`) **and one in the tests** (`cells::tests::two_prompts_with_nothing_between_them_are_one_block`), so the docs point at both rather than restating the rule a third time.
+
+### The overrule, and why it generalises
+
+The author's first answer let `}` pin onto a block already at the frame's top: the block *is* below the cursor, so reporting "nowhere to go" looked like a lie. **Overruled on the author's own principle** — they had already decided that *a jump with no target leaves `is_following()` alone, because pinning before discovering it has no target breaks the follow for nothing.* A target that clamps onto the cursor **cannot move the frame either**, so it is the same trade with the same answer.
+
+**What makes it more than a preference:** the pinning answer is **invisible at the keypress and visible much later** — the user presses a key, sees nothing change, and new output silently stops arriving. **F75**'s second kind with a *delayed* symptom, which is harder to attribute than an immediate one. The author then wrote the assertion that catches it: after a declined jump, an appended line **must still appear**.
+
+And the accepted rule turned out to be **direction-symmetric by construction** — a `Prev` target is strictly below the cursor and block ordinals are never evicted, so `Prev` can never clamp onto the cursor and needs no arm of its own. A rule that needs no special case is usually the right rule.
+
+### Two implementation details worth keeping
+
+**`pin_to` clamps *through* `top`** rather than writing the arithmetic again, by constructing a throwaway view at the raw ordinal and asking it for its top. So the clamp has **one** home, and the stored ordinal is clamped at call time — a raw pin would be re-clamped against a moving `follow_top` on every repaint. The author had already routed `frame` through `top` for the same reason, **unprompted**, which is the first time this epic's oldest failure mode was prevented rather than repaired.
+
+**`prompt_blocks` gets partial eviction for free:** it emits `evicted() + index` for a marked cell whose predecessor is unmarked, and the first retained row is a head whenever it is marked — so a block whose head was evicted is reported at its oldest surviving row with **no special case**.
+
+### Third sighting of the recap flake, captured
+
+`tests::the_recap_holds_only_what_the_foreground_produced_while_attached` failed once in my verification run (`956 passed; 1 failed`), **passed in isolation**, and passed `957/0` on three consecutive full runs. Captured to its own file (**F39**).
+
+**That is the third independent sighting**, in a third card, by a third party — the author of the card did not see it, the implementer did not, and I did. It remains exactly consistent with **F107**: a test whose subject is *what was installed at the time* reading a process-global that another thread can rewrite. **Three globals, three flake families, and this one test has now cost four verification runs.** F107's production fix is the card I keep deferring, and its interest is compounding.
+
+### F110's sweep, first run: three more stale claims, one an internal contradiction
+
+Built and ran as a command over the live documents — `not wired`, `not yet`, `still missing`, `is refused`, `cannot yet`, `does not yet`, `no support`. Most hits are legitimate descriptions of **deliberate** refusals, which is the point: the sweep lists candidates for a human to re-read, it does not decide. Three were genuinely false:
+
+1. **`docs/ux-design.md`** — *"the bounded fd-tagged cell ring … **not yet fed in production because R6's overlay is its only reader**"*. **Doubly false:** the ring has been fed in production since T5-S1b (inline surface and fullscreen tap), and the overlay is **not** its only reader — the fullscreen frame reads it too. This is in a file whose **own rule** is that code and it are fixed in the same change, and it had drifted across several cards.
+
+2. **`docs/functionality.md`** — *"`fullscreen` is refused until that renderer exists"*, **134 lines below the same file's own description of `--tui fullscreen` starting a session there.** An internal contradiction inside one document, which is the worst version of this: a reader comparing two files can at least date them, but two sentences in one file give no way to choose.
+
+3. **`docs/tui-and-agent-view-design.md`** — the refusal pin itself, *"`fullscreen` is refused until T5's renderer exists"*. **Amended, not deleted**, and **F90** is the reason: *"X is missing" and "X is refused" look identical from outside and are opposite facts.* Deleting the pin would erase the only trace that the absence was deliberate and multiply enforced; the amendment records that it was lifted and preserves the rule that outlived it — a renderer kitsu does not have is refused **by name** rather than coerced.
+
+**The sweep's value is not the hits, it is the ratio.** Of roughly twenty matches, three were wrong — so a human must still read each one, and any attempt to make this a failing test would be wrong, because *"is refused"* is usually the documentation of a correct decision. It belongs in the same family as F101's reference check: **a command whose output a person reads each card**, not a gate.
+
+**And it found drift in a file no card this epic had touched.** The negative-capability phrasing is where documentation rots, because it is written once as true and nothing about shipping the capability makes anyone revisit the sentence that denied it.
+
+## F112 — F107 was wrong in three places, one flake family never existed, and my "smaller fix" was already in the tree
+
+The F107 card was assessed and **correctly returned as "do not build it as scoped"**. Every claim below is one I verified myself before correcting the record.
+
+### 1. It is test-only. The globals are correct in production.
+
+The surface slot has **six production writers and all are on `run_chat`'s own thread** (`install`, `BridgeGuard::drop`, `enter_fullscreen`, `FullscreenSegment::leave`, and the two foreground-buffering calls). Everything on another thread — the cadence painter, the approval prompter, orchestrator tasks — **only reads**, through `active_surface()`, which clones the `Arc` and drops the guard before returning. One process, one terminal, one `run_chat`. `subagent.rs`'s two `set_surface` calls are **test-only**, which had to be checked because concurrent subagents would have made this a real defect.
+
+`ALTERNATE_SCREEN_TAKEN` is the same answer for a different reason: its two production restorers run **sequentially on the one panicking thread**, which is what the clearing read exists for.
+
+**So there is no production defect, no user-visible entry, and the three refactors F107 contemplated — scope per test, thread it through, restructure installation — are all refactors of a correct global justified by a bug that cannot happen.** Threading it would touch 19 call sites across three crates.
+
+### 2. Three factual errors in F107, which would have sent an implementer to the wrong file
+
+- **`tui_bridge.rs:966` is `fn invalidate`, not the slot.** The real slot is `crates/kitsu-render/src/surface.rs:162` — `static SLOT: OnceLock<RwLock<Arc<dyn Surface>>>`, **a different crate, and never a `Mutex<Option<..>>`.** The `Mutex<Option<..>>`s near that line are `STATUS_PAINTER` (990) and `MODAL_PANE` (1001) — **two other globals that I conflated into one.** It matters for blast radius: the real slot is shared by **four test binaries**, not one.
+- **"16 readers" is an exact count and a wrong claim.** **Nine of the sixteen are inside `mod tests`**; production readers are seven — and the figure omits **twelve more in `kitsu-render/src/lib.rs`**, which is the actual hot path. **F74 again, and this time in my own finding**: I counted name matches and reported them as call sites.
+- **"The recap test does not drive installation deliberately" is false.** It calls `SurfaceProbe::install()` and **has been `#[serial]` since the commit that introduced it** — nine commits before its third sighting. **So the "smaller fix" I proposed in the brief was already in the tree when the flake was sighted three times.** That is why the card as scoped would have fixed nothing.
+
+### 3. The actual cause: `#[serial]` excludes other `#[serial]` tests, not plain ones
+
+**Four `#[tokio::test]`s reach the slot through *production* code** rather than through `SurfaceProbe` — painting the attach row *and* installing a `BufferedSurface` over whatever is there — and **none was serialised.** All 87 `#[serial]` tests and every `SurfaceProbe` user were already mutually excluded; the gap was exclusion against tests that install **through production**.
+
+They reach it via module-local `one_read` helpers, **which is why a call-site grep misses them**. Found with **F108**'s instrument: one temporary line logging `std::thread::current().name()`, which under `cargo test` **is the test's name**. The failing run's log shows three different tests attaching concurrently, and the smoking gun is an id in the output that belongs to none of them — `agent 1`, where the test uses 7 and 9, is another test's fixture leaking through the shared slot.
+
+**`SurfaceProbe`'s own doc comment states the invariant as "Tests using it are `#[serial]`" — true and insufficient** (**F77**: a comment is worth what its claims are worth). `tui_bridge.rs:3090` has the same blind spot, reasoning about *"two bridge tests overlapping"*.
+
+### 4. F80 was never a flake. Remove it.
+
+The `approval_modal_*` capture is a **misfiled FAILING-FIRST run of T3-S7a**, and every step is checkable at HEAD:
+
+- `approval_modal` is a **pure function that unconditionally pushes the header**, verified — so `left: []` is **unreachable** for it.
+- Its three tests pass an explicit `false` and **read no global at all**, which is why they are the only slot-free tests in that file taking no `surface_slot_lock()`. *"A shared global not yet installed"* cannot explain a test that reads no global.
+- The capture shows `running 127 tests` with the three new tests failing **together**, every assertion empty — a stub. `git log -S"pub fn approval_modal"` returns **one** commit, which adds the function complete with its three tests. The "clean" comparison runs reported **130** tests: **a different binary.**
+
+**So: three globals, but two flake families — and one of the two I attributed to the surface slot never existed.** I filed a card's own red run as evidence of a race, and it sat in the findings for many cards being counted.
+
+### 5. A fifth guard, found by reading rather than by a sighting
+
+`tui_bridge.rs:7331 the_handler_byte_string_equals_the_restore_helper_output` is a **non-serial mutating reader of `ALTERNATE_SCREEN_TAKEN` in the `kitsu` bin binary**: it asserts the signal string equals `write_restore_sequences`' output, which holds only while the flag is `false` — and the serial fullscreen tests set it `true`. **Bidirectional**: it also *clears* the flag, so it can make a fullscreen test's `leave` skip its `ESC[?1049l`. **Zero sightings in 821 runs** because the window is one synchronous enter→leave. Guarded anyway: a latent race derived by reading is cheaper to close than to wait for.
+
+### The lesson, which is about findings files and not about mutexes
+
+**A findings file is read by every later card as settled fact, so a wrong entry in it is worse than a wrong brief** — that was **F91**, written about someone else's error travelling four hops. **F107 was mine, and it travelled further**: it set a card's scope, it was cited in four cycle records, it counted a non-existent flake family for ten cards, and I recommended it as "the most valuable card left" one commit ago.
+
+**What would have caught it: the same rule I apply to code.** F91 says an entry asserting *"X already does Y"* needs the line that shows it. **F107 asserted five such things and cited line numbers for none that I had re-read.** The figures were plausible, internally consistent, and three of them were wrong.
+
+### F112's verification: the recap flake is closed, and an eleventh flake surfaced
+
+**Measured after the five guards: 150 full `--bins` runs, debug, zero sightings of `the_recap_holds_only_what_the_foreground_produced_while_attached`** — against **3 failures in 421 unguarded runs** before. Combined with the assessor's 400 guarded runs, the recap flake is closed and **comes off the list**.
+
+**But one run of the 150 failed, on a test nobody had named:** `subagent::tests::spawn_agent_runs_nested_loop_and_returns_only_the_child_answer`. Not previously recorded, passes in isolation, `#[tokio::test]` with **no** guard, and **its body does not reach `set_surface` or the slot** — `subagent.rs`'s only two `set_surface` calls are in a different test. So it is probably **not** this family, and I am not claiming it is.
+
+**My capture was truncated and that is my error, not an agent's.** The loop appended `grep -A2 "^failures:" | head -3`, which caught the test's name and discarded its assertion — the one thing needed to classify it. **F39 exists because a flake without its output is a rumour**, and I wrote a capture that produced exactly that. The loop should have saved the whole failing run to its own file, as every agent-run capture this epic has done.
+
+Recorded as the **eleventh flake, mechanism unknown**, to be captured properly when next seen.
+
+### The corrected flake ledger
+
+Ten became **seven**, in both directions:
+
+- **Removed:** the three `approval_modal_*` entries (**never flakes** — F80 retracted), and the recap test (**fixed and measured**).
+- **Added:** `spawn_agent_runs_nested_loop_and_returns_only_the_child_answer` (new), and the latent `the_handler_byte_string_equals_the_restore_helper_output` (**guarded pre-emptively**, 0 sightings in 821 runs, derived by reading).
+
+**The ledger was wrong in both directions at once**, which is the argument for treating it as evidence rather than as a count: it carried three entries that were never flakes **and** missed one that had been failing all along.
+
+## F113 — R6-b's ground, measured before the card is briefed
+
+Read-only groundwork so the search card's brief is not another of the fifteen that were wrong.
+
+**What is ready.** `pin_to(ordinal, ring, rows)` exists and is deliberately **not** prompt-aware, exactly so `/` can call it with a match ordinal — built in R6-c for this purpose, so R6-b adds a *policy*, not an anchor. `CellLine::plain()` exists (`cells.rs:65`). **No search state exists anywhere** in `transcript.rs` or `fullscreen.rs`.
+
+**One authorised test edit will be needed, and it is the same shape as R6-c's.** The footer guard still forbids `["search", "dump", "editor", "scrollback"]`. R6-b removes **`search` only** and requires the footer to advertise its keys; `dump`, `editor`, `scrollback` and the literal `[` **stay forbidden** while R6-d is gated. That guard is what has kept the footer honest through two cards and must not be relaxed wholesale.
+
+**A performance question the card must measure rather than assume.** `plain()` is `sanitize_terminal_text(&self.styled)` — it **allocates a fresh `String` per call**. The ring holds **10 000 lines by default**, so a naive incremental search that re-scans on every keystroke is **10 000 allocations per keypress**, and **F52**'s unbounded pasted cell would be copied on each one. The honest options are to search lazily, to search the styled bytes with the stripper applied only to candidates, or to cache. **Measure the cost before choosing** — and note the project already has a `paste_latency` suite, which is where a latency claim belongs rather than in a unit test.
+
+**A correctness subtlety worth deciding deliberately.** `plain()`'s own comment records that `sanitize_terminal_text` is the crate's one stripper and that **`ascii_structural_markers` is deliberately not applied**. So search over `plain()` searches *sanitised* text, and a user searching for something they can see styled on screen may or may not match it. That is a **user-visible decision**, not an implementation detail: say what is searched, and make the answer the same thing the overlay paints, or say why not.
+
+**And the prompts are searchable now**, which R6-a's version of this card could not have offered — the ring retains the user's lines, so `/` searches both speakers. Worth saying in the docs, because *"search the transcript"* meant half a transcript two cards ago.
+
+### F112's release count, closed
+
+The guarded **release** count F107-a left open is done: **0 failures in 150 full `--bins` release runs**, against an unguarded release rate of roughly **1 in 200**. With the debug figures (0 in 150 of mine, 0 in 400 of the assessor's, against 3 in 421 unguarded), the five guards are confirmed in **both** profiles and the recap flake is closed.
+
+The capture was written properly this time — whole failing run to its own timestamped file — and **nothing was captured, because nothing failed.** Worth stating plainly: the eleventh flake (`spawn_agent_runs_nested_loop_and_returns_only_the_child_answer`) **did not appear in these 150 release runs either**, so its one debug sighting remains its only one, and it is still uncharacterised rather than closed. A single sighting is a rumour until it reproduces; it stays on the ledger as exactly that.
+
+## F114 — README went three cards without the feature I had been documenting everywhere else
+
+The standing requirement warns that README's tables *"drift silently, so re-read the affected row rather than assuming"*. I checked it for the first time since R6-a and found two things:
+
+1. **README did not mention the `Ctrl+O` transcript overlay at all** — not a row, not a clause — across the three commits that built it (`53be36b`, `e6c2255`, `0920e91`). Meanwhile the **older** agent-view overlay *is* documented, on `/jobs view`'s row. So the file documented one overlay and not the newer one, which is the worst shape for a reader: the omission looks like a statement that no such thing exists.
+2. **The `cell_ring_lines` row was stale in two ways.** It described the ring as *"scrollback the viewport retains and `fullscreen` paints"* — the overlay reads it too now — and it listed what the ring does **not** hold without mentioning that it **now holds the user's own prompts**, which the prompts card added two commits ago. A config row that enumerates exclusions is exactly where a new inclusion needs adding.
+
+### Why my own sweeps missed it
+
+**F110**'s sweep looks for negative-capability phrasing — *"not wired"*, *"still missing"*. **This was not a false claim; it was an absent one.** Nothing in README said anything wrong about the overlay, so no phrase search could flag it, and the `cell_ring_lines` row's staleness was a sentence that had quietly become **incomplete** rather than untrue.
+
+**So the two sweeps I built cover false statements and dangling references, and neither covers silence.** The standing requirement already names the remedy and I had not been applying it: *re-read the affected row*. The affected rows are findable mechanically — a card that touches a config key or a user-visible key should grep README for that key's name — but what is missing cannot be found by grepping for what is missing.
+
+**Added to the per-card checks:** for every user-visible key, command or config key a card touches, grep README for it **by name** and confirm a row exists and says the current thing. That is a positive check, not a phrase sweep, and it is the only one of the three that would have caught this.
+
+### F114's check, refined on its second use: grep the bare word, not the `/cmd subcmd` literal
+
+Applied the new positive check retroactively over everything this epic shipped — `/detach`, `/jobs view`, `/jobs show`, `/jobs prune`, `/tui`, `/help keys`, `/help tui`, `cell_ring_lines`, `Ctrl+O`. It reported **`/jobs prune` absent**.
+
+**It is not absent, and the check was wrong.** README writes subcommands inside a bracketed enumeration:
+
+```
+| `/jobs [list|view|explain ID|show ID|reply ID y|a|n|steer ID TEXT|close-steering ID|stop ID|stop-all|prune ID|prune all]` |
+```
+
+So the literal string `/jobs prune` never appears, and a literal match on it is a **false negative**. The bare word `prune` is there, twice in that row.
+
+**Refined:** grep the **bare subcommand word**, then read the row. Had I acted on the check's first answer I would have added a **duplicate row** for a documented command — which is worse than the gap it was hunting, because two rows for one command is drift that a reader cannot resolve.
+
+**Both of the mechanical checks I have built have now produced a false hit on an early run** — F101's reference sweep on a compound row name, and this one on a bracketed enumeration. Neither is a reason to drop them: each has also found a real defect (two dangling references; a wholly undocumented overlay). The rule they share is the one that matters: **the sweep nominates, the human adjudicates.** Every one of these must stay a command whose output is read, never a gate, and never a thing to act on without opening the file.
+
+## F115 — R6-b shipped; and markdown emphasis defeats my own sweep
+
+**R6-b is done.** `/` searches the overlay, `n`/`N` walk the matches. **R6 is now complete except R6-d, which stays gated.**
+
+### The measurement that chose the design, and why it is pinned behaviourally
+
+A full `plain()` pass over a 10 000-line ring: **4.1 ms release / 13.7 ms debug**, and **9.8 ms / 45.4 ms** with one 1 MB pasted cell (**F52**'s input). Scanning `styled()` without the stripper is **195 µs** — so the cost is **essentially all allocation**. A 20-character query typed at speed is ~0.9 s of scanning in debug; three pasted characters alone would blow **N2**'s 100 ms budget.
+
+**So search runs on submit.** `Enter` scans once and stores absolute ordinals; `n`/`N` are `cursor ± 1`, zero allocations. Pinned **behaviourally, not by timing** — a line appended after the submit must not join the walk — so there is no flaky timing test and **nothing was added to `paste_latency`**, because no latency claim is being made: the per-keystroke cost was removed instead.
+
+### My F113 worry was wrong, in the useful direction
+
+`plain()` is **exactly the glyphs of the painted row** — the only thing `sanitize_terminal_text` removes is what the terminal does not display. So searching it matches what the user sees **better** than searching the styled bytes would, and `ascii_structural_markers` staying unapplied is **correct**: it is a `--plain` tier transform, and applying it would make a character the user can see fail to match itself.
+
+**The real divergence is width, not styling.** `fit_row_to_width` cuts at `cols`, so text past the right edge is searched but off-screen. **A match there still counts**, deliberately: width-dependent matches would mean one query finding different things in two window sizes. And an unexpected find — **`push` does not split on newlines**, so a line kitsu writes can hold an embedded `\n` in one cell, where `push_prompt` splits. Both are now in the docs.
+
+### The paste fix, and the first draft that was rejected for the right reason
+
+`b"/find me\nq"` **closed the overlay** and searched nothing. The signal was already on the wire and being discarded: the alternate-screen route writes `ESC[?2004h`, and the loop **swallowed `ESC[200~`/`ESC[201~` whole** in its generic sequence arm. Fixed on the markers, so a newline inside a paste is **content**.
+
+**The rejected first draft matters more than the fix:** *discard the rest of the chunk after any newline* resolves the ambiguity from a **chunk boundary**, which this loop's own header calls wrong (**F65**), and would eat a `q` typed fast enough to share a read with the `Enter`. The test is bidirectional on exactly that — **outside** a paste, `b"/find me\rq"` must still close — and the implementer's mutation D2 proved the two rules are distinguishable.
+
+**Residue, left open deliberately:** a bare LF with **no** markers — an unbracketed paste, or the inline route, which never writes `?2004h`. That is **F72** proper.
+
+### The footer trade, measured
+
+`Ctrl+Home/End` **lost its `oldest/newest` gloss**. With it the row is 91 columns and **at 80 the fit cuts `q/Esc close` clean off the end**; without it the row is 77 and keeps the exit key with three columns spare. Verified both. **Losing the key that leaves the surface is worse than an unglossed key pair.**
+
+It does weaken something I required on T5-S1c-iii — that naming those keys without saying they move the *frame* advertises an ambiguity. Mitigated rather than ignored: inside the overlay the query line supports only character-insert and backspace, so **those keys have no competing caret meaning there**, and `/tui`'s details still carry the full explanation.
+
+### And my own sweep has a third quirk: markdown
+
+**F110**'s sweep greps for `not wired`. The docs now read:
+
+> Dumping the overlay to scrollback and opening it in `$EDITOR` are `**not** wired yet`
+
+**The literal pattern finds zero; a markdown-tolerant `not\*{0,2} wired` finds it.** The emphasis I add for readers defeats the search I rely on — and this sentence is one that *must* be found when R6-d finally ships.
+
+**Fixed in the sweep's pattern.** And this is the third false reading from my two mechanical checks (a compound row name, a bracketed enumeration, now markdown emphasis). The ratio is still worth it — between them they found a wholly undocumented overlay, two dangling references and three stale claims — but it confirms the rule: **these nominate, a human adjudicates, and a clean sweep is not evidence of a clean document.**
+
+## F116 — a comment I shipped one commit ago was backwards twice, and it shrinks F72
+
+Measured while scoping F72 as the next card. The comment, committed in `1f2af45`:
+
+> with no paste markers this loop cannot tell a pasted newline from a pressed `Enter` at all, which is **F72** proper and stays open — **the inline route never writes `?2004h`**
+
+**Both halves of that attribution are wrong.**
+
+1. **The enable sits in `run_transcript_overlay`'s `take_alternate_screen` branch**, which writes `ESC[?1049h ESC[2J ESC[H ESC[?25l ESC[?2004h`. The **inline** call site passes `true` — inline has no alternate screen, so the overlay takes it — and the **fullscreen** call site passes `false`, because its segment already holds the screen. **So the inline route is the only one that writes `?2004h`; the comment names it as the one that does not.**
+2. **It does not matter anyway, because a `RawStdinGuard` is held at both call sites.** `engage()` writes `?2004h` and its drop writes `?2004l`, with the stated reason *"so the editor can keep a paste as a single draft"*. There is even a comment at the inline site warning that the overlay **must not engage a second one**. So bracketed paste is on in both routes on any terminal that supports it.
+
+### What this does to F72
+
+**F72's residue on this surface is much narrower than my own comment claimed.** It is not "the inline route has no markers"; it is **"a terminal that *ignores* `ESC[?2004h` sends no markers"** — and then, and only then, the loop cannot distinguish a pasted newline from a pressed `Enter`.
+
+That changes the card. The fix is not "enable bracketed paste on the route that lacks it" (no such route) and not "add burst detection to this loop" as a default — it is a fallback for terminals without bracketed-paste support, which is a **much rarer** case and must be weighed against its cost. **`OverlayDecoder` already implements exactly that fallback** (**F68**: bracketed *plus* unbracketed-burst detection), and it is **deliberately excluded** from `SteerLine::feed`, whose own comment explains why: feeding unbracketed text to the editor *"would submit on that newline, which is F68 again one layer down."*
+
+**So F72 is a smaller and sharper card than its entry suggests**, and the thing to decide is whether terminals without bracketed paste are worth a burst heuristic on surfaces that currently rely on markers. **Q1's terminal matrix is the evidence that question needs, and it still needs a human.**
+
+### The pattern, and it is now the sixth
+
+I wrote a false attribution into a comment **while shipping the feature it described**, and it would have sent the next card at the wrong file — exactly what **F112**'s three errors did. The shape is the same every time: **a plausible mechanism, internally consistent, asserted without re-reading the line.** F91 named the rule (*an entry asserting "X already does Y" needs the line that shows it*), and this is the sixth instance of me breaking it. The comment is corrected **in place**, with the measurement, rather than deleted — **F90**: *"X is missing" and "X is refused" look identical from outside*, and so do *"the route lacks the enable"* and *"the route has it from its caller."*

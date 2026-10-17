@@ -5656,9 +5656,9 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "tui",
-        args: "[classic|inline]",
+        args: "[classic|inline|fullscreen]",
         description: "report or switch the live renderer",
-        details: "Switches the renderer in place: `classic` is the line renderer kitsu has always had, `inline` is the pinned bottom viewport. The conversation is unchanged by a switch — the transcript already on screen stays exactly where it is, and nothing is replayed. Bare /tui reports the renderer in use. Accepted only between turns; a /tui typed during a turn is refused rather than queued. `fullscreen` is not available yet: it arrives with its own renderer. Persist a choice with `mode = \"inline\"` under `[tui]` in the config or --tui.",
+        details: "Switches the renderer in place: `classic` is the line renderer kitsu has always had, `inline` is the pinned bottom viewport, `fullscreen` takes the terminal's alternate screen and repaints the tail of the transcript the inline viewport retained. The conversation is unchanged by a switch — the transcript already on screen stays exactly where it is, and nothing is replayed, except into fullscreen, where the alternate screen starts blank and the retained tail is painted onto it. In fullscreen, `PgUp` and `PgDn` move the frame back and forward by a window, `Ctrl+Home` moves it to the oldest line the transcript ring still retains and `Ctrl+End` brings it back to the newest and resumes following the output; all four move the frame rather than the caret, and only while fullscreen holds the screen. `Ctrl+O` opens the transcript overlay over the transcript the ring retains, from the inline composer and from fullscreen alike: the same four keys scroll it, and `q` or `Esc` closes it and leaves the frame behind it where it was. Leaving fullscreen gives the screen back untouched. Bare /tui reports the renderer in use. Accepted only between turns; a /tui typed during a turn is refused rather than queued. Persist a choice with `mode = \"inline\"` under `[tui]` in the config or --tui.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -6224,6 +6224,12 @@ fn read_chat_line(
 fn read_idle_chat_line(
     editor: &mut rustyline::Editor<ChatHelper, rustyline::history::DefaultHistory>,
     bridge: Option<&tui_bridge::BridgeGuard>,
+    // Finding **F97**: the live fullscreen segment, when this session holds
+    // the alternate screen. It is the third reader, and it is `Some` exactly
+    // when `bridge` is `None` for the fullscreen reason -- the two are
+    // mutually exclusive by construction, because every route into one
+    // renderer tears the other down first.
+    fullscreen: Option<&mut tui_bridge::FullscreenSegment>,
     registry: &subagent::AgentRegistry,
     prompt: &str,
     assistive: bool,
@@ -6233,10 +6239,20 @@ fn read_idle_chat_line(
     // the inline reader can open.
     view_dispatcher: Option<&subagent::ViewDispatcher>,
 ) -> ChatReadline {
+    // Assistive and non-TTY carriers keep their existing readers: neither can
+    // be painted into a viewport row or onto a frame's bottom row.
+    let interactive = !assistive && kitsu_render::stdin_is_tty() && kitsu_render::stderr_styled();
+    // Fullscreen first, because a session that holds the alternate screen has
+    // no `BridgeGuard` at all: `install` is inert for the mode, which is what
+    // left this surface on rustyline (finding **F97**).
+    if let Some(segment) = fullscreen {
+        if interactive {
+            let history: Vec<String> = editor.history().iter().cloned().collect();
+            return read_chat_line_fullscreen(segment, prompt, &history, initial);
+        }
+    }
     if let Some(bridge) = bridge {
-        // Assistive and non-TTY carriers keep their existing readers: neither
-        // can be painted into a viewport row.
-        if !assistive && kitsu_render::stdin_is_tty() && kitsu_render::stderr_styled() {
+        if interactive {
             let history: Vec<String> = editor.history().iter().cloned().collect();
             return read_chat_line_inline(
                 bridge,
@@ -6391,6 +6407,10 @@ fn read_chat_line_inline(
                 // same binding the prompt label above was derived from: a
                 // second carrier for it would be a second source of truth.
                 *attached,
+                // Inline pages nothing: the keys are live only while the
+                // fullscreen segment holds the screen, and a surface with no
+                // frame to move has nothing for a press to mean.
+                None,
             )
         };
         // Whatever happened, the row must not keep showing a draft that is
@@ -6422,6 +6442,20 @@ fn read_chat_line_inline(
             carried = draft;
             continue;
         }
+        // Requirement **R6**: `Ctrl+O`. Sequenced here for the agent view's
+        // reason -- the reader is pure and the overlay owns the screen, the
+        // alternate screen and its own key loop -- and the draft comes back
+        // through the same replay (**F76**), so the key cannot cost the user a
+        // character. The lines are the installed viewport's ring, read before
+        // the overlay paints anything: that ring is the streamed conversation
+        // and the only copy of it (**N4**).
+        if let Ok(tui_bridge::InlineRead::OpenTranscript(draft)) = outcome {
+            let lines = bridge.cell_lines().unwrap_or_default();
+            run_transcript_overlay(&lines, true);
+            bridge.reinstall_after_resume();
+            carried = draft;
+            continue;
+        }
         // Card **T4-S6a**, requirement A5: `\u{2190}` on an empty composer
         // and `Ctrl+X d` both report `Detached`, and detaching is this loop's
         // to perform: the reader is pure, exactly as it is for a suspend and
@@ -6446,6 +6480,8 @@ fn read_chat_line_inline(
         // refused line is back in the composer on the next read.
         if let Ok(tui_bridge::InlineRead::Submitted(line)) = &outcome {
             if let Some(id) = attached_route_target(line, *attached) {
+                // The feed is inside `route_attached_submission`, which is the
+                // one place that knows whether the line was delivered.
                 carried = route_attached_submission(registry, id, line).draft;
                 continue;
             }
@@ -6486,6 +6522,9 @@ fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead
         // the session's attachment, which re-labels the composer, and reads
         // again. Unreachable from there, like the two outcomes above it.
         Ok(tui_bridge::InlineRead::Detached(_)) => ChatReadline::Eof,
+        // Requirement **R6**: handled by the caller's loop, like the two
+        // outcomes above it. Unreachable from here.
+        Ok(tui_bridge::InlineRead::OpenTranscript(_)) => ChatReadline::Eof,
         Ok(tui_bridge::InlineRead::Interrupted) => {
             // Deliberately NOT re-raising SIGINT here, unlike the during-turn
             // collector. The collector raises because a turn is in flight and
@@ -6501,6 +6540,616 @@ fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead
             ChatReadline::Interrupted
         }
         Err(error) => ChatReadline::Error(error.to_string()),
+    }
+}
+
+/// Open the transcript overlay over the cell ring and run it until `q` or
+/// `Esc` closes it (requirement **R6**, first piece).
+///
+/// # Reachable from both surfaces, which is what `take_alternate_screen` says
+///
+/// `Ctrl+O` is read by the one inline reader both surfaces use, so the overlay
+/// has two call sites: the inline idle prompt, which is on the primary screen
+/// and must therefore **take** the alternate screen for the overlay, and the
+/// fullscreen idle prompt, which is already holding one and must not take a
+/// second (a second `ESC[?1049h` would have no counterpart in the leave).
+/// Finding **F89**: a capability that compiles is not one that is reachable,
+/// and one route is not two.
+///
+/// # The anchor is the overlay's own
+///
+/// [`kitsu_tui::transcript::TranscriptOverlay`] holds its own
+/// `FullscreenView`, so paging here moves nothing the fullscreen segment
+/// owns; on close the fullscreen caller repaints from the segment's anchor and
+/// the user is back on the frame they left.
+///
+/// # The dying-signal restore
+///
+/// On the inline route this is the one thing on screen when a signal arrives,
+/// so [`kitsu_tui::note_alternate_screen`] is stored **before** the enter
+/// bytes and cleared **after** the leave, exactly as the agent view's overlay
+/// orders the same pair (**F94**): the straight-line leave below never runs
+/// for a panic or a dying signal, and the handler installed by
+/// `tui_bridge::install_exit_restore` -- which the inline surface's own
+/// install site registers before any idle prompt can be reached -- gives the
+/// screen back instead. Raw mode is the caller's: both call sites already hold
+/// a `RawStdinGuard`, and nesting a second one would publish the *raw* modes
+/// as the canonical ones for that handler.
+#[cfg(unix)]
+fn run_transcript_overlay(lines: &[kitsu_tui::cells::CellLine], take_alternate_screen: bool) {
+    use std::io::Write as _;
+
+    // Nothing is drawn into a carrier that cannot be drawn into, and nothing
+    // is written before the decision, exactly as the agent view's overlay
+    // declines.
+    if !kitsu_render::stdin_is_tty() || !kitsu_render::stderr_styled() {
+        return;
+    }
+
+    let mut err = std::io::stderr();
+    if take_alternate_screen {
+        kitsu_tui::note_alternate_screen(true);
+        let _ = err.write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h");
+    } else {
+        // The screen is the fullscreen segment's and stays its; only the
+        // caret is the overlay's business, since the overlay has none.
+        let _ = err.write_all(b"\x1b[?25l");
+    }
+    let _ = err.flush();
+
+    // The key loop is its own function, and not for tidiness: it is the
+    // thing the byte-level tests drive (finding **F69**). A test that mirrored
+    // this loop instead of running it would be a second decoder agreeing with
+    // itself -- which is exactly how the `Esc` defect this seam was extracted
+    // for went unseen: the key-space sweep in `kitsu_tui::transcript` proves
+    // the *predicate* answers `Esc`, and proves nothing about whether anything
+    // ever hands it one.
+    let ring = tui_bridge::frame_ring(lines);
+    let mut overlay = kitsu_tui::transcript::TranscriptOverlay::new();
+    let mut stdin = std::io::stdin();
+    let _exit = run_transcript_key_loop(
+        &mut stdin,
+        &mut overlay,
+        &ring,
+        // Probed per frame, so a `SIGWINCH` that wakes the read is answered at
+        // the new geometry.
+        &mut || {
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            (rows, cols as usize)
+        },
+        // The agent view's own grace and its own `poll`, not a second copy:
+        // the only honest way to tell a lone `ESC` from the first byte of an
+        // arrow is time, and a second implementation of that is how two
+        // surfaces come to disagree about what `Esc` means.
+        &mut || stdin_waiting(ESC_SEQUENCE_GRACE),
+        &mut |frame: &[String]| {
+            // Absolute addressing and a cleared row each, for the agent
+            // view's reason: the overlay owns the whole screen while it is
+            // up, and a painted row that scrolled would cost a frame row.
+            let mut painted = String::from("\x1b[2J");
+            for (index, row) in frame.iter().enumerate() {
+                painted.push_str(&format!("\x1b[{};1H\x1b[2K{row}", index + 1));
+            }
+            let _ = err.write_all(painted.as_bytes());
+            let _ = err.flush();
+        },
+    );
+
+    let _ = err.write_all(b"\x1b[?25h");
+    if take_alternate_screen {
+        let _ = err.write_all(b"\x1b[?1049l");
+        let _ = err.flush();
+        // After the bytes (**F94**): a signal in this window writes a second
+        // leave onto a primary screen rather than none onto an alternate one.
+        kitsu_tui::note_alternate_screen(false);
+        // The region and the pinned status row, for the agent view overlay's
+        // reason: a terminal that keeps per-screen margins hands back an
+        // unpinned one.
+        tui_bridge::reinstall_pinned_region();
+    } else {
+        let _ = err.flush();
+    }
+}
+
+/// How the transcript overlay's key loop ended.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TranscriptExit {
+    /// A close key was pressed: `q`, or `Esc`.
+    Closed,
+    /// The descriptor was drained or errored. A descriptor that cannot deliver
+    /// the key which closes the overlay closes it rather than spinning.
+    Drained,
+}
+
+/// The transcript overlay's key loop: paint, read, decode, repeat until a
+/// close key or a drained descriptor.
+///
+/// Extracted from [`run_transcript_overlay`] so the **real** decoder is what
+/// the tests drive (finding **F69**): `input` is any reader, the geometry and
+/// the paint are closures, and `more_input_waiting` is the lone-`ESC` grace --
+/// production passes the agent view's own `stdin_waiting(ESC_SEQUENCE_GRACE)`.
+/// Nothing in here touches a terminal, which is what makes a byte-level
+/// assertion possible at all.
+///
+/// # Why a lone `ESC` needs the grace rather than a chunk boundary
+///
+/// `ESC` is the first byte of every sequence this loop drops and of the two
+/// `PgUp`/`PgDn` presses it answers, so a chunk that ends on one is ambiguous
+/// (**F65**: a multi-byte key is not one byte). Resolving it by "nothing
+/// followed it in this chunk" is **wrong**, and measurably so: a lone `Esc`
+/// keypress delivers exactly `[0x1b]`, which is a strict prefix of all four
+/// paging sequences, so the partial-hold took it and the loop went back to a
+/// blocking read -- `Esc` did nothing until the user pressed something else,
+/// while the footer advertised it (**F75**: a key that appears to work is a
+/// defect, not a missing feature). The grace is the agent view's answer to the
+/// same ambiguity and this is the same mechanism, not a second one.
+#[cfg(unix)]
+fn run_transcript_key_loop<R: std::io::Read>(
+    input: &mut R,
+    overlay: &mut kitsu_tui::transcript::TranscriptOverlay,
+    ring: &kitsu_tui::cells::CellRing,
+    geometry: &mut dyn FnMut() -> (u16, usize),
+    more_input_waiting: &mut dyn FnMut() -> bool,
+    paint: &mut dyn FnMut(&[String]),
+) -> TranscriptExit {
+    // The bracketed-paste markers the alternate-screen route turns on with
+    // `ESC[?2004h`. They were already being consumed whole by the generic
+    // sequence arm below -- the arm runs to the first `0x40..=0x7e` byte and
+    // `~` is `0x7e` -- so the signal was on the wire and thrown away. R6-a's
+    // lesson is what it is used for here: a sequence, or a newline, **inside**
+    // a paste is content and not a keypress.
+    const PASTE_BEGIN: &[u8] = b"\x1b[200~";
+    const PASTE_END: &[u8] = b"\x1b[201~";
+
+    let mut buffer = [0u8; 256];
+    // A sequence split across reads is still one keystroke (**F65**), so the
+    // tail of a chunk that ran out mid-sequence waits for the rest of itself.
+    let mut held: Vec<u8> = Vec::new();
+    // Whether the bytes being decoded are inside a bracketed paste, and
+    // whether the query line has already taken its one line from it: a query
+    // line is one line, so the paste's first newline ends the query and the
+    // remainder of the **paste** -- not of the chunk, which would be the
+    // boundary rule **F65** calls wrong -- is discarded.
+    let mut pasting = false;
+    let mut paste_spent = false;
+    loop {
+        let (rows, cols) = geometry();
+        paint(&overlay.frame(ring, rows, cols));
+
+        // The grace, before the next read can block on a key the user has
+        // already pressed.
+        if !held.is_empty() && !more_input_waiting() {
+            let lone_escape = held == [0x1b];
+            held.clear();
+            if lone_escape {
+                // R6-b: `Esc` out of an open query line is the way out of the
+                // query, and leaves the overlay the user is still reading up.
+                // Closing here would put the surface one press away from
+                // vanishing on anyone who changed their mind mid-query. The
+                // grace is still the one mechanism (**F65**); only what the
+                // resolved `Esc` means depends on the mode.
+                if overlay.search_query().is_some() {
+                    overlay.cancel_search();
+                    continue;
+                }
+                return TranscriptExit::Closed;
+            }
+            // An incomplete sequence whose rest never came: dropped, never
+            // read as the keys its bytes spell.
+            continue;
+        }
+
+        let count = match input.read(&mut buffer) {
+            Ok(0) => return TranscriptExit::Drained,
+            Ok(count) => count,
+            // A signal woke the read (a `SIGWINCH`, typically): repaint and
+            // carry on, which also re-probes the geometry.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return TranscriptExit::Drained,
+        };
+        let mut data = std::mem::take(&mut held);
+        data.extend_from_slice(&buffer[..count]);
+        let mut index = 0usize;
+        while index < data.len() {
+            let rest = &data[index..];
+            // The paste markers first, and before the paging table: inside a
+            // paste every other sequence is content, so the markers are the
+            // one pair of sequences that still mean something there.
+            if rest.starts_with(PASTE_BEGIN) {
+                pasting = true;
+                paste_spent = false;
+                index += PASTE_BEGIN.len();
+                continue;
+            }
+            if rest.starts_with(PASTE_END) {
+                pasting = false;
+                paste_spent = false;
+                index += PASTE_END.len();
+                continue;
+            }
+            // The remainder of a paste whose first newline has already closed
+            // the query line: discarded byte by byte, so nothing behind that
+            // newline is dispatched as a key.
+            if pasting && paste_spent {
+                index += 1;
+                continue;
+            }
+            if !pasting {
+                // The four paging sequences, through the bridge's own table:
+                // a second copy is how two surfaces come to disagree about
+                // which bytes `Ctrl+End` is.
+                if let Some((press, length)) = tui_bridge::page_key(rest) {
+                    overlay.page(press, ring, rows);
+                    index += length;
+                    continue;
+                }
+                if tui_bridge::partial_page_key(rest) {
+                    held = rest.to_vec();
+                    break;
+                }
+            }
+            let byte = data[index];
+            index += 1;
+            // A newline inside a paste is query **content**, not a submit and
+            // not a keypress: it ends the one line the query line holds, and
+            // everything behind it in the paste goes above. Measured before
+            // this existed: `b"/find me\nq"` ended `Closed`, with the `0x0a`
+            // dropped as a control byte and the `q` behind it dispatched as
+            // the close key -- a multi-line paste taking the overlay away from
+            // under the user and searching nothing.
+            if pasting && matches!(byte, 0x0a | 0x0d) {
+                paste_spent = overlay.search_query().is_some();
+                continue;
+            }
+            if byte == 0x1b {
+                // An `ESC` with bytes behind it that start some *other*
+                // sequence is that sequence and not a close: its bytes are
+                // dropped rather than read as keys.
+                if data.get(index) == Some(&b'[') || data.get(index) == Some(&b'O') {
+                    index += 1;
+                    while let Some(byte) = data.get(index) {
+                        index += 1;
+                        if (0x40..=0x7e).contains(byte) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                // An `ESC` that ends the chunk is still ambiguous: hold it for
+                // the grace above rather than guessing from the boundary.
+                if index == data.len() {
+                    held = vec![0x1b];
+                    break;
+                }
+            }
+            // R6-b: while the query line is open it is a **mode**, and the
+            // surface's own keys are text. `q` especially: without this the
+            // word `query` cannot be searched for and the overlay vanishes
+            // mid-typing. The scan is the submit's and only the submit's,
+            // which is why nothing here touches the ring.
+            //
+            // Outside a paste a bare `0x0a` is read as a submit, exactly as
+            // `0x0d` is: with no paste markers this loop cannot tell a pasted
+            // newline from a pressed `Enter` at all, which is **F72** proper
+            // and stays open.
+            //
+            // **Corrected (F116).** An earlier version of this comment blamed
+            // "the inline route never writes `?2004h`", which is backwards
+            // twice over. The enable sits in the `take_alternate_screen`
+            // branch above, and it is the *inline* route that passes `true`
+            // (inline has no alternate screen, so the overlay takes it); the
+            // *fullscreen* route passes `false` because its segment already
+            // holds the screen. And either way a `RawStdinGuard` is held at
+            // both call sites -- it writes `?2004h` on engage and `?2004l` on
+            // drop -- so markers are present on any terminal that supports
+            // them. What is left of F72 here is narrower than that comment
+            // claimed: a terminal that *ignores* `?2004h` sends no markers,
+            // and then this loop genuinely cannot tell paste from typing.
+            if overlay.search_query().is_some() {
+                match byte {
+                    0x0d | 0x0a => {
+                        overlay.submit_search(ring, rows);
+                    }
+                    0x7f | 0x08 => overlay.backspace_search(),
+                    0x1b => overlay.cancel_search(),
+                    byte if (0x20..=0x7e).contains(&byte) => {
+                        overlay.push_search_char(byte as char);
+                    }
+                    // Every other control byte is inert, as it is outside a
+                    // query: the query line holds what the user can see.
+                    _ => {}
+                }
+                continue;
+            }
+            let press = match byte {
+                0x1b => kitsu_tui::keys::Press::Esc,
+                byte if (0x20..=0x7e).contains(&byte) => kitsu_tui::keys::Press::Char(byte as char),
+                // Every other control byte is inert here, which is what keeps
+                // the footer honest: it advertises the keys this loop answers.
+                _ => continue,
+            };
+            // R6-c: the two prompt jumps the overlay's footer advertises.
+            // Both bytes already fell inside the printable arm above, so
+            // before this they became a `Press::Char` that `closes` declined
+            // and the loop read again -- inert while the footer named them,
+            // which is **F75**. Dispatched here rather than beside the loop,
+            // for `page`'s reason (**F69**): the capability has to be
+            // reachable from the real decoder. The repaint is the loop's own,
+            // at the top of the next pass, exactly as a paging press is
+            // repainted.
+            let jump = match press {
+                kitsu_tui::keys::Press::Char('{') => Some(kitsu_tui::fullscreen::Jump::Prev),
+                kitsu_tui::keys::Press::Char('}') => Some(kitsu_tui::fullscreen::Jump::Next),
+                _ => None,
+            };
+            if let Some(jump) = jump {
+                overlay.jump(jump, ring, rows);
+                continue;
+            }
+            // R6-b: `/` opens the query line, and `n`/`N` walk the matches
+            // the last submitted query found -- `n` newer, `N` older, through
+            // R6-c's own `Jump` and not a second direction concept. All three
+            // bytes already fell inside the printable arm above, so before
+            // this they became a `Press::Char` that `closes` declined and the
+            // loop read again: inert keys the footer was about to advertise,
+            // which is **F75**. The repaint is the loop's own, at the top of
+            // the next pass, exactly as a paging press is repainted.
+            match press {
+                kitsu_tui::keys::Press::Char('/') => {
+                    overlay.begin_search();
+                    continue;
+                }
+                kitsu_tui::keys::Press::Char('n') => {
+                    overlay.repeat_search(kitsu_tui::fullscreen::Jump::Next, ring, rows);
+                    continue;
+                }
+                kitsu_tui::keys::Press::Char('N') => {
+                    overlay.repeat_search(kitsu_tui::fullscreen::Jump::Prev, ring, rows);
+                    continue;
+                }
+                _ => {}
+            }
+            if kitsu_tui::transcript::closes(press) {
+                return TranscriptExit::Closed;
+            }
+        }
+    }
+}
+
+/// The fullscreen renderer's own idle prompt: one line read through
+/// [`tui_bridge::read_line_inline_with_keys`] with the draft painted onto the
+/// bottom row of the alternate screen.
+///
+/// # Why this surface needs a reader at all (finding **F97**)
+///
+/// `tui_bridge::install` is inert in fullscreen -- the mode pins no DECSTBM
+/// region and installs no surface -- so there is no `BridgeGuard` here and
+/// [`read_idle_chat_line`] used to fall through to rustyline. Rustyline runs
+/// in **cooked** mode and its `ChatHelper` paints a prompt, a hint deck and
+/// the whole slash palette as ordinary lines at the cursor, which on a screen
+/// the frame fills means scrolling frame rows off the top: measured on a pty,
+/// a single `/c` cost eleven of them, and backspacing brought none of them
+/// back. So the keystrokes on this surface are read here, by the same editor
+/// and the same key decoder the inline composer uses, and painted by
+/// [`tui_bridge::FullscreenSegment::paint_composer`], which addresses the
+/// bottom row absolutely and never feeds a line.
+///
+/// # What is shared with the inline reader, and what differs
+///
+/// Shared: the whole keystroke-to-draft path. `read_line_inline_with_keys` is
+/// generic over the reader and takes its painter as a closure, it touches no
+/// guard, pane or surface, and raw mode is the caller's -- so the only thing
+/// this function supplies that the inline caller does not is a different
+/// `paint`. History is rustyline's, exactly as it is for inline: the caller
+/// hands over the same list and `add_history_entry` still runs on the
+/// submitted line.
+///
+/// Differs, and deliberately:
+///
+/// * **The key routes are off** ([`tui_bridge::InlineKeys::disabled`]). Both
+///   of them lead to the agent view, which takes the alternate screen this
+///   segment is already holding, and `/jobs` is where that view has an answer
+///   that does not need the screen. With the routes off, the reader's
+///   `OpenAgentView` and `Detached` outcomes cannot arrive on this surface.
+/// * **There is no palette row**, for the reason
+///   `FullscreenSegment::paint_composer` gives: the only rows it could use
+///   are the frame's.
+/// * **`on_resize` paints nothing.** The geometry is probed inside `paint`,
+///   per paint, so the frame that answers a `SIGWINCH` wake is already at the
+///   new size and there is nothing for a resize hook to re-latch -- unlike
+///   the inline reader, whose viewport owns a latched region.
+///
+/// # Raw mode is new terminal state on this surface
+///
+/// `RawStdinGuard::engage` clears `ICANON`, `ECHO` and `ISIG`, publishes the
+/// displaced termios for the dying-signal handler and enables bracketed
+/// paste; its `Drop` puts all three back. The guard lives in an `Option`
+/// owned by this frame for the reason the inline reader's does: every
+/// `return` below drops it, and the suspend path takes it out before the
+/// process stops. A dying signal is the exit path no `Drop` runs on, and it
+/// is covered by `tui_bridge::install_exit_restore`, which every route into
+/// fullscreen now registers.
+#[cfg(unix)]
+fn read_chat_line_fullscreen(
+    segment: &mut tui_bridge::FullscreenSegment,
+    prompt: &str,
+    history: &[String],
+    initial: &str,
+) -> ChatReadline {
+    use std::io::Read as _;
+
+    // Finding F16, exactly as the inline reader installs it: the handler is
+    // process-wide and `Once`-gated, and a `SIGWINCH` is delivered by
+    // interrupting the blocking `read` the reader below sits in.
+    static SIGWINCH: std::sync::Once = std::sync::Once::new();
+    SIGWINCH.call_once(tui_bridge::install_sigwinch_handler);
+
+    let mut carried = initial.to_string();
+    let mut raw: Option<RawStdinGuard> = None;
+    let outcome = loop {
+        if raw.is_none() {
+            match RawStdinGuard::engage() {
+                Some(guard) => raw = Some(guard),
+                None => {
+                    return ChatReadline::Error("failed to switch stdin to raw mode".to_string())
+                }
+            }
+        }
+        let mut input = std::io::Cursor::new(carried.clone().into_bytes()).chain(std::io::stdin());
+        let read = {
+            // `paint` and `page` both need the segment mutably, and the reader
+            // holds both for the whole read, so the segment is shared through
+            // a `RefCell` rather than borrowed twice: the two are called from
+            // the same loop and never from inside one another, so no borrow
+            // of it overlaps another at run time. The cell dies with this
+            // block, which is what lets the outcome arms below take the
+            // segment back.
+            let shared = std::cell::RefCell::new(&mut *segment);
+            let mut paint = |draft: &str, cursor: usize, hint: &str, hint_reserved: bool| {
+                // Probed per paint rather than captured: see the resize note
+                // above. The fallback is the conventional 80x24 every other
+                // geometry probe in this binary falls back to.
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                // The renderer's own composition value, so this row and the
+                // inline composer's are told the same things about a draft
+                // (the ordering `read_line_inline_with_keys` documents).
+                let composed = kitsu_render::live::LiveDraft {
+                    prompt: prompt.to_string(),
+                    buffer: draft.to_string(),
+                    cursor,
+                    hint: hint.to_string(),
+                    hint_reserved,
+                };
+                shared
+                    .borrow_mut()
+                    .paint_composer(&composed, rows, cols as usize);
+            };
+            // One press, one repaint, and the geometry probed per press for
+            // `paint`'s reason. The frame follows the ring only when the ring
+            // grows, so the press's own repaint is the only thing that can
+            // answer the key.
+            let mut page = |press: kitsu_tui::fullscreen::Page| {
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                shared.borrow_mut().page(press, rows, cols as usize);
+            };
+            let mut on_resize = || {};
+            tui_bridge::read_line_inline_with_keys(
+                &mut input,
+                &mut paint,
+                history,
+                &mut on_resize,
+                tui_bridge::InlineKeys::disabled(),
+                None,
+                // The paging sink: this is the surface that has a frame for a
+                // press to move, so this is the only call site that passes
+                // one. The sink *is* the gate -- the inline reader's `None`
+                // leaves all four sequences to the editor.
+                Some(&mut page),
+            )
+        };
+        match read {
+            // Finding F21: the reader is pure, so the suspend is sequenced
+            // here, through the same seam the inline reader uses -- which is
+            // what keeps "termios is canonical before the process stops" one
+            // property with one implementation rather than two.
+            Ok(tui_bridge::InlineRead::Suspended(draft)) => {
+                let (_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                let mut effects = FullscreenSuspendEffects {
+                    segment,
+                    raw: &mut raw,
+                    rows,
+                };
+                if !tui_bridge::suspend_and_resume(&mut effects) {
+                    return ChatReadline::Error(
+                        "failed to switch stdin back to raw mode after a suspend".to_string(),
+                    );
+                }
+                carried = draft;
+                continue;
+            }
+            // Requirement **R6**: `Ctrl+O` is a literal control byte and not
+            // one of the two chord routes, so it *is* reachable here with
+            // `InlineKeys::disabled()` -- which is the point: the overlay is
+            // reachable from both surfaces (**F89**). The alternate screen is
+            // already this segment's, so the overlay does not take a second
+            // one, and the close repaints the frame from the **segment's**
+            // anchor: the overlay paged its own, so this is what puts back the
+            // frame the user left.
+            Ok(tui_bridge::InlineRead::OpenTranscript(draft)) => {
+                let lines = segment.transcript_lines();
+                run_transcript_overlay(&lines, false);
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                segment.repaint_frame(rows, cols as usize);
+                carried = draft;
+                continue;
+            }
+            // Unreachable with both key routes off, and the draft is replayed
+            // rather than dropped because that is what a key which did
+            // nothing owes the user (finding F76's replay, same mechanism).
+            Ok(tui_bridge::InlineRead::OpenAgentView(draft))
+            | Ok(tui_bridge::InlineRead::Detached(draft)) => {
+                carried = draft;
+                continue;
+            }
+            other => break other,
+        }
+    };
+    // The composer row is taken back *before* this returns, and the cursor
+    // homed on it: whatever the submitted line starts -- a turn's streamed
+    // output, a slash command's report -- is written at the cursor, and a
+    // caret left in the middle of a drafted row would start the transcript
+    // there.
+    let (_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    segment.clear_composer(rows);
+    read_chat_line_inline_outcome(outcome)
+}
+
+/// The fullscreen segment's [`tui_bridge::SuspendEffects`]: the composer row
+/// for the screen and this frame's `RawStdinGuard` slot for termios.
+///
+/// The screen halves are small because a fullscreen segment pins no region:
+/// there is nothing latched to release, only a composer row that must not be
+/// left on the screen the shell is about to write on, and the alternate
+/// screen's contents are the terminal's to keep across the stop. The termios
+/// halves are the inline effects' verbatim, because the obligation is: the
+/// shell must not inherit a raw terminal.
+#[cfg(unix)]
+struct FullscreenSuspendEffects<'a> {
+    segment: &'a mut tui_bridge::FullscreenSegment,
+    raw: &'a mut Option<RawStdinGuard>,
+    /// The terminal height as it was probed when the Ctrl+Z arrived.
+    rows: u16,
+}
+
+#[cfg(unix)]
+impl tui_bridge::SuspendEffects for FullscreenSuspendEffects<'_> {
+    fn release_viewport(&mut self) {
+        self.segment.clear_composer(self.rows);
+    }
+
+    fn restore_terminal_modes(&mut self) {
+        // Dropping the guard is the restore, and it must precede the stop.
+        self.raw.take();
+    }
+
+    fn stop_process(&mut self) {
+        // SAFETY: raising a default-disposition job-control signal
+        // in-process, exactly as the inline effects do. Blocks here until the
+        // job is foregrounded again.
+        unsafe {
+            libc::raise(libc::SIGTSTP);
+        }
+    }
+
+    fn reengage_terminal_modes(&mut self) -> bool {
+        *self.raw = RawStdinGuard::engage();
+        self.raw.is_some()
+    }
+
+    fn reinstall_viewport(&mut self) {
+        // Nothing to re-latch, and nothing to paint: the next read repaints
+        // the composer row as its first frame.
     }
 }
 
@@ -8625,6 +9274,22 @@ fn route_attached_submission(
             Err(error) => (error.to_string(), AttachedRoute::Refused, false),
         }
     };
+    // **F102**, the second feed point: this route `continue`s before the line
+    // can become a `ChatReadline::Line`, so the foreground feed at the `line`
+    // binding never sees it, and without this call `{`/`}` would skip
+    // everything typed during an attachment -- a key that quietly does nothing
+    // on one route (**F84**/**F75**). It lives here rather than at the caller
+    // because `delivered` is this function's own answer.
+    //
+    // **Before** the receipt below, for the reason the foreground feed sits
+    // before the turn: a prompt must be in the ring ahead of what it provoked.
+    //
+    // Nothing is fed on a refusal. `draft` hands the line back as the next
+    // read's draft (**F76**), so a refused line was never submitted -- it is
+    // still being edited, and a transcript must not claim it was said.
+    if delivered {
+        tui_bridge::note_submitted_prompt(line, tui_bridge::PromptOrigin::User);
+    }
     // Through the renderer's surface, where the eye already is (**F71**).
     kitsu_render::surface::active_surface()
         .transcript_line(kitsu_render::surface::Fd::Stderr, &line_painted);
@@ -8811,6 +9476,13 @@ fn run_agent_view_overlay(
     // It is deliberately **not** disabled on the way out: the composer
     // underneath needs it on, and whichever `RawStdinGuard` owns the terminal
     // turns it off in its `Drop` when stdin goes back to rustyline.
+    // Card **F94**, and before the bytes: this is the overlay's half of the
+    // flag every dying exit path reads (`kitsu_tui::alternate_screen_taken`).
+    // The leave below is straight-line code after the read loop, so a panic
+    // or a signal in the overlay never reaches it -- the handler and the
+    // panic hook give the screen back instead, and this store is what tells
+    // them they owe it.
+    kitsu_tui::note_alternate_screen(true);
     let _ = err.write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h");
     let _ = err.flush();
 
@@ -8892,6 +9564,11 @@ fn run_agent_view_overlay(
 
     let _ = err.write_all(b"\x1b[?25h\x1b[?1049l");
     let _ = err.flush();
+    // Card **F94**: after the bytes, so a signal in this window writes a
+    // second leave onto a primary screen rather than none onto an alternate
+    // one. The normal path has now given the screen back, so a dying signal
+    // arriving afterwards owes nothing.
+    kitsu_tui::note_alternate_screen(false);
     // The region and the pinned row, after the terminal has given the primary
     // screen back: control bytes and the bottom row only, so the restored
     // transcript is not disturbed.
@@ -19529,8 +20206,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // renderer at the idle-prompt seam by dropping this guard (which runs the
     // established teardown in its established order) or by installing a fresh
     // one. There is deliberately no second teardown path.
+    // Card **T5-S2**: the fullscreen segment is the second half of the same
+    // decision, so it is resolved in the same block and from the same mode.
+    // `None` in classic and inline; `Some` for as long as this session holds
+    // the terminal's alternate screen, which is what `/tui`'s report and the
+    // switch arm below both key on. Dropping it gives the screen and the
+    // title back, on a renderer switch and on every exit path out of this
+    // function alike.
     #[cfg(unix)]
-    let mut tui_bridge_guard = {
+    let (mut tui_bridge_guard, mut fullscreen_segment) = {
         // T3-S2 resolves the whole `[tui]` table here, at the one point where
         // the renderer is chosen. Only `mode` has a consumer today; the
         // remaining four are resolved and bound so that the alternate-screen
@@ -19548,15 +20232,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         });
         // Still resolved here and still without a consumer: the
         // alternate-screen force (the agent view takes the alternate screen
-        // unconditionally today), the title row and the cell ring.
+        // unconditionally today) and the title row. The cell ring is no longer
+        // parked here -- it is handed to `install` below.
         let _resolved_tui = (
             setup.tui.effective_alternate_screen(cli.no_alt_screen),
             setup.tui.title,
-            setup.tui.cell_ring_lines,
         );
         let mode = match setup.tui.effective_mode(cli.tui_mode()) {
             crate::config::TuiMode::Classic => tui_bridge::TuiMode::Classic,
             crate::config::TuiMode::Inline => tui_bridge::TuiMode::Inline,
+            crate::config::TuiMode::Fullscreen => tui_bridge::TuiMode::Fullscreen,
         };
         // A failed geometry probe (not a terminal, or an ioctl refusal) falls
         // back to the conventional 80x24, the same fallback the renderer's own
@@ -19566,20 +20251,47 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             mode,
             rows,
             1,
+            setup.tui.cell_ring_lines,
             "kitsu",
             Box::new(std::io::stdout()),
             Box::new(std::io::stderr()),
         );
-        if installed.is_some() {
-            // Requirement N5, and only here: the restore exists to give back
-            // what the *inline* viewport took (a pinned DECSTBM region, raw
-            // termios, bracketed paste). Classic mode pins no region and
-            // holds raw mode only inside rustyline's own readline, so it
-            // keeps the signal dispositions it was started with and its byte
-            // stream is unchanged, signal or no signal.
+        if installed.is_some() || mode == tui_bridge::TuiMode::Fullscreen {
+            // Requirement N5. The restore exists to give back what a surface
+            // took, and there are two takers at startup, not one.
+            //
+            // The *inline* viewport takes a pinned DECSTBM region, raw
+            // termios and bracketed paste, and `installed.is_some()` is how
+            // that is recognised. Classic mode pins no region and holds raw
+            // mode only inside rustyline's own readline, so it keeps the
+            // signal dispositions it was started with and its byte stream is
+            // unchanged, signal or no signal.
+            //
+            // Card **F96**: fullscreen is the third case and it was missing.
+            // `install` is inert in fullscreen -- it pins no region, which is
+            // right -- so gating the handler on the *region* left a session
+            // started with `--tui fullscreen` with the default disposition
+            // and no restore of any kind: no title pop, no alternate-screen
+            // release, and no `tcsetattr` back to canonical termios, which is
+            // a shell with no echo and no line editing until the user types
+            // `reset` blind. The handler is owed wherever terminal state is
+            // taken, so the condition names the mode as well as the region.
             tui_bridge::install_exit_restore();
         }
-        installed
+        // `install` is inert in fullscreen -- it pins no region and installs
+        // no surface -- so the alternate screen is taken here instead, with
+        // an empty frame: a session that starts in fullscreen has no inline
+        // segment behind it and therefore no ring to repaint.
+        let fullscreen = (mode == tui_bridge::TuiMode::Fullscreen).then(|| {
+            tui_bridge::enter_fullscreen(
+                Box::new(std::io::stderr()),
+                &[],
+                rows,
+                kitsu_render::live::terminal_columns(),
+                setup.tui.cell_ring_lines,
+            )
+        });
+        (installed, fullscreen)
     };
     let publish_agent_state = |turn_active: bool| {
         if !agent_state_enabled {
@@ -20559,6 +21271,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             prompt.clone()
         };
         let prioritized = priority_command.take();
+        // **F77**, carried to the feed below: a priority command is kitsu's
+        // own words (`/resume` after a fork, `/retry`), and the ring is the
+        // transcript the overlay reads. Captured here because `prioritized` is
+        // consumed by the `match` that builds `line`, so by the feed point the
+        // provenance is no longer recoverable -- and it is not recoverable from
+        // the text either, since the user can type `/retry` themselves.
+        let line_is_injected = prioritized.is_some();
         let queued_line = if prioritized.is_none() {
             prompt_queue.lock().expect("prompt queue").dequeue()
         } else {
@@ -20595,6 +21314,19 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             }
             (None, None) => {
                 let initial = std::mem::take(&mut pending_draft);
+                // Finding **F97**: the fullscreen frame follows the ring, and
+                // the idle prompt is where it catches up. A fullscreen session
+                // writes its transcript onto the alternate screen as it
+                // streams, so the frame is stale by exactly the lines that
+                // arrived since the last paint; repainting here -- no turn
+                // running, nothing else writing -- puts the retained lines
+                // back above them. A prompt that follows no new output
+                // repaints nothing.
+                #[cfg(unix)]
+                if let Some(segment) = fullscreen_segment.as_mut() {
+                    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                    segment.repaint_if_the_ring_grew(rows, cols as usize);
+                }
                 // The idle row's meter reflects the history as it stands now,
                 // after the previous turn committed or rolled back.
                 #[cfg(unix)]
@@ -20613,6 +21345,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 let read = read_idle_chat_line(
                     &mut rl,
                     tui_bridge_guard.as_ref(),
+                    fullscreen_segment.as_mut(),
                     &agent_registry,
                     &visible_prompt,
                     assistive_input,
@@ -20654,6 +21387,25 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         if !no_session {
             let _ = rl.add_history_entry(&line);
         }
+        // **F102**: the composer paints the submitted line and erases it, so
+        // the cell ring -- N4's sole record of the transcript -- holds no
+        // prompts and the `Ctrl+O` overlay shows one speaker. This is the one
+        // place every route a submitted line can take converges: the three
+        // idle readers through `ChatReadline`, a queued prompt and a priority
+        // command through the `line` binding above. It is after the empty-line
+        // skip and beside `add_history_entry` deliberately -- what is worth
+        // remembering in history is what is worth retaining in the ring -- and
+        // before the slash dispatch and the turn, so a prompt is in the ring
+        // ahead of anything it provokes. It writes no bytes.
+        #[cfg(unix)]
+        tui_bridge::note_submitted_prompt(
+            &line,
+            if line_is_injected {
+                tui_bridge::PromptOrigin::Injected
+            } else {
+                tui_bridge::PromptOrigin::User
+            },
+        );
         let mut submitted = SubmittedPrompt::full(line);
 
         if let Some(rest) = submitted.text.strip_prefix('/') {
@@ -20725,7 +21477,22 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     {
                         match request {
                             TuiRendererRequest::Classic => {
-                                if tui_bridge_guard.is_some() {
+                                if fullscreen_segment.is_some() {
+                                    // Dropping the segment **is** the
+                                    // teardown here too: the alternate screen
+                                    // is given back and the title popped, in
+                                    // that order, by the one `Drop` every
+                                    // other exit path runs as well. The
+                                    // terminal is then whole -- this session
+                                    // owns no pinned row, no scroll region,
+                                    // no alternate screen and no title of its
+                                    // own.
+                                    fullscreen_segment = None;
+                                    eprintln!(
+                                        "~ switched to the {} renderer; the conversation is unchanged",
+                                        request.label()
+                                    );
+                                } else if tui_bridge_guard.is_some() {
                                     // Dropping the guard **is** the teardown,
                                     // in the order earlier cards established:
                                     // the status painter is unpublished, then
@@ -20752,6 +21519,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                         request.label()
                                     );
                                 } else {
+                                    // Out of fullscreen first, when that is
+                                    // where this session was: the alternate
+                                    // screen has to be given back *before*
+                                    // the viewport pins a region and writes
+                                    // its pinned row, or the user's
+                                    // transcript lands on a screen that is
+                                    // about to be discarded. A terminal too
+                                    // short for a region then leaves the
+                                    // session on classic, which the message
+                                    // below says -- the screen is given back
+                                    // either way.
+                                    fullscreen_segment = None;
                                     // The geometry is probed again rather than
                                     // remembered: the terminal may have been
                                     // resized during the classic segment, when
@@ -20762,6 +21541,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                         tui_bridge::TuiMode::Inline,
                                         rows,
                                         1,
+                                        setup.tui.cell_ring_lines,
                                         "kitsu",
                                         Box::new(std::io::stdout()),
                                         Box::new(std::io::stderr()),
@@ -20808,6 +21588,66 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                             "the inline renderer needs a terminal at least 3 rows tall; staying on the classic renderer"
                                         ),
                                     }
+                                }
+                            }
+                            TuiRendererRequest::Fullscreen => {
+                                if fullscreen_segment.is_some() {
+                                    eprintln!(
+                                        "~ already using the {} renderer; nothing changed",
+                                        request.label()
+                                    );
+                                } else {
+                                    // Requirement **N4**: the ring is the
+                                    // inline viewport's scrollback, and it
+                                    // belongs to the surface the teardown is
+                                    // about to put back -- so it is read
+                                    // *before* the guard is dropped. Out of
+                                    // classic there is no guard and therefore
+                                    // no ring, and the frame is empty: classic
+                                    // feeds nothing, so there is nothing to
+                                    // repaint and nothing is painted.
+                                    let retained = tui_bridge_guard
+                                        .as_ref()
+                                        .and_then(tui_bridge::BridgeGuard::cell_lines)
+                                        .unwrap_or_default();
+                                    // The inline teardown, in its established
+                                    // order and through the one path that
+                                    // runs it, before any byte reaches the
+                                    // alternate screen.
+                                    tui_bridge_guard = None;
+                                    // Probed again, for the reason the inline
+                                    // arm gives: the terminal may have been
+                                    // resized while no viewport was listening
+                                    // for SIGWINCH.
+                                    let (cols, rows) =
+                                        crossterm::terminal::size().unwrap_or((80, 24));
+                                    fullscreen_segment = Some(tui_bridge::enter_fullscreen(
+                                        Box::new(std::io::stderr()),
+                                        &retained,
+                                        rows,
+                                        cols as usize,
+                                        setup.tui.cell_ring_lines,
+                                    ));
+                                    // Finding **F94**'s third variant, found
+                                    // by this card: *this* route into
+                                    // fullscreen registered no dying-signal
+                                    // restore at all. The two that did are
+                                    // the inline segment's `install` (a
+                                    // switch out of inline) and the startup
+                                    // block's mode check (`--tui fullscreen`,
+                                    // card **F96**) -- so a session that
+                                    // reached fullscreen out of **classic**
+                                    // held the alternate screen on the
+                                    // default disposition, and now holds raw
+                                    // termios on it too, because this
+                                    // renderer has a composer of its own.
+                                    // `Once`-gated, so this is a no-op in the
+                                    // sessions that already registered it.
+                                    tui_bridge::install_exit_restore();
+                                    eprintln!(
+                                        "~ switched to the {} renderer; the conversation is unchanged",
+                                        request.label()
+                                    );
                                 }
                             }
                         }
@@ -21690,7 +22530,8 @@ enum SlashResult {
     ArchiveSession(String),
     RestoreSession(String),
     DeleteSession(String),
-    /// `/tui classic|inline`: swap the live renderer between turns.
+    /// `/tui classic|inline|fullscreen`: swap the live renderer between
+    /// turns.
     ///
     /// Carried out of the dispatcher rather than performed in it, because the
     /// swap is the `BridgeGuard`'s business and the guard is a `run_chat`
@@ -21707,6 +22548,7 @@ enum SlashResult {
 enum TuiRendererRequest {
     Classic,
     Inline,
+    Fullscreen,
 }
 
 impl TuiRendererRequest {
@@ -21714,14 +22556,15 @@ impl TuiRendererRequest {
         match self {
             TuiRendererRequest::Classic => "classic",
             TuiRendererRequest::Inline => "inline",
+            TuiRendererRequest::Fullscreen => "fullscreen",
         }
     }
 }
 
 /// The modes `/tui` accepts, named in every message it prints so a user who
-/// reads any one of them learns the whole grammar. `fullscreen` is T5's
-/// renderer and is deliberately absent.
-const TUI_ACCEPTED_MODES: &str = "accepted: classic, inline";
+/// reads any one of them learns the whole grammar, `fullscreen` among them
+/// now that a session can both start in it and switch into it.
+const TUI_ACCEPTED_MODES: &str = "accepted: classic, inline, fullscreen";
 
 /// The refusal a `/tui` typed **during a turn** gets.
 ///
@@ -22945,13 +23788,11 @@ async fn handle_slash(
                 }
                 "classic" => SlashResult::SwitchTui(TuiRendererRequest::Classic),
                 "inline" => SlashResult::SwitchTui(TuiRendererRequest::Inline),
-                // Refused **by name**, not as a typo and not as an unknown
-                // command: `fullscreen` is a mode the design's grammar has,
-                // and it is inert here — nothing is torn down or pinned.
-                "fullscreen" => {
-                    eprintln!("/tui fullscreen is not available yet; {TUI_ACCEPTED_MODES}");
-                    SlashResult::Error
-                }
+                // The third renderer, answered exactly like the other two.
+                // This arm used to refuse the name by hand, while the mode had
+                // no renderer to select; it has one now, so the refusal is
+                // retired rather than left to tell the user something untrue.
+                "fullscreen" => SlashResult::SwitchTui(TuiRendererRequest::Fullscreen),
                 other => {
                     eprintln!(
                         "unknown tui mode '{}'; {TUI_ACCEPTED_MODES}",
@@ -24355,6 +25196,642 @@ fn map_provider_error_with_diagnostics(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    // ---- R6-a: the transcript overlay's byte loop ----
+    //
+    // These drive `run_transcript_key_loop` itself, which is the point
+    // (**F69**): `kitsu_tui::transcript`'s key-space sweep proves the
+    // *predicate* `closes(Esc)` is true and proves nothing about whether any
+    // byte ever becomes a `Press::Esc`. It did not, and the footer advertised
+    // `Esc` anyway (**F75**).
+
+    /// A reader that hands over one scripted chunk per `read`, as a terminal
+    /// in `VMIN=1` raw mode does: a keystroke is a read and an escape
+    /// sequence can be split across two of them (**F65**).
+    ///
+    /// The remaining-chunk count is shared so the loop's grace closure can be
+    /// the honest question "is there another chunk already waiting?", which is
+    /// what `stdin_waiting` asks `poll` in production.
+    #[cfg(unix)]
+    struct ChunkReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        remaining: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    #[cfg(unix)]
+    impl ChunkReader {
+        fn new(chunks: &[&[u8]]) -> Self {
+            let chunks: std::collections::VecDeque<Vec<u8>> =
+                chunks.iter().map(|chunk| chunk.to_vec()).collect();
+            let remaining = std::rc::Rc::new(std::cell::Cell::new(chunks.len()));
+            Self { chunks, remaining }
+        }
+    }
+
+    #[cfg(unix)]
+    impl std::io::Read for ChunkReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            match self.chunks.pop_front() {
+                Some(chunk) => {
+                    self.remaining.set(self.chunks.len());
+                    out[..chunk.len()].copy_from_slice(&chunk);
+                    Ok(chunk.len())
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    /// Run the real key loop over `chunks` on an 8-line ring and a 6-row
+    /// window, returning how it ended, the overlay's follow state and every
+    /// painted frame.
+    #[cfg(unix)]
+    fn drive_transcript(chunks: &[&[u8]]) -> (TranscriptExit, bool, Vec<Vec<String>>) {
+        let mut ring = kitsu_tui::cells::CellRing::new(16);
+        for n in 0..16 {
+            ring.push(kitsu_render::surface::Fd::Stdout, &format!("line {n}"));
+        }
+        let mut overlay = kitsu_tui::transcript::TranscriptOverlay::new();
+        let mut input = ChunkReader::new(chunks);
+        let remaining = std::rc::Rc::clone(&input.remaining);
+        let mut frames: Vec<Vec<String>> = Vec::new();
+        let exit = {
+            let mut geometry = || (6u16, 40usize);
+            // The grace, answered honestly rather than always-false: a chunk
+            // already queued is exactly what `poll` reports as waiting, so a
+            // sequence split across two reads is resolved as a sequence and a
+            // lone `ESC` with nothing behind it is resolved as the press.
+            let mut waiting = || remaining.get() > 0;
+            let mut paint = |frame: &[String]| frames.push(frame.to_vec());
+            run_transcript_key_loop(
+                &mut input,
+                &mut overlay,
+                &ring,
+                &mut geometry,
+                &mut waiting,
+                &mut paint,
+            )
+        };
+        (exit, overlay.is_following(), frames)
+    }
+
+    /// Run the real key loop over `chunks` on a ring that holds **prompt
+    /// blocks**, for R6-c's `{`/`}`, and return the same triple
+    /// `drive_transcript` does.
+    ///
+    /// A separate helper rather than a change to that one: its four existing
+    /// tests are about the close and paging bytes and their fixture has no
+    /// prompts in it, which is exactly the "nothing to jump between" case
+    /// those tests should keep exercising.
+    ///
+    /// The fixture and its arithmetic (**F61**), since the assertions below
+    /// are stated in ordinals: prompts at 0, and at 3-4 as one two-row block;
+    /// eight retained lines, nothing evicted; the geometry is 6 rows, so the
+    /// overlay's `content_rows` is 5, `follow_top` is `8 - 5 = 3`, the opening
+    /// content is ordinals 3..=7 and the jump cursor is 3.
+    #[cfg(unix)]
+    fn drive_transcript_with_prompts(chunks: &[&[u8]]) -> (TranscriptExit, bool, Vec<Vec<String>>) {
+        use kitsu_render::surface::Fd;
+
+        let mut ring = kitsu_tui::cells::CellRing::new(16);
+        ring.push_prompt("first question");
+        ring.push(Fd::Stdout, "answer one");
+        ring.push(Fd::Stdout, "answer two");
+        ring.push_prompt("second question\nwith a tail");
+        ring.push(Fd::Stdout, "answer three");
+        ring.push(Fd::Stdout, "answer four");
+        ring.push(Fd::Stdout, "answer five");
+        assert_eq!((ring.len(), ring.evicted()), (8, 0));
+        assert_eq!(
+            ring.prompt_blocks(),
+            vec![0, 3],
+            "the fixture really holds two prompt blocks"
+        );
+
+        let mut overlay = kitsu_tui::transcript::TranscriptOverlay::new();
+        let mut input = ChunkReader::new(chunks);
+        let remaining = std::rc::Rc::clone(&input.remaining);
+        let mut frames: Vec<Vec<String>> = Vec::new();
+        let exit = {
+            let mut geometry = || (6u16, 40usize);
+            let mut waiting = || remaining.get() > 0;
+            let mut paint = |frame: &[String]| frames.push(frame.to_vec());
+            run_transcript_key_loop(
+                &mut input,
+                &mut overlay,
+                &ring,
+                &mut geometry,
+                &mut waiting,
+                &mut paint,
+            )
+        };
+        (exit, overlay.is_following(), frames)
+    }
+
+    // ---- R6-b: `/` search and the `n`/`N` match walk, in the byte loop ----
+    //
+    // Driven through `run_transcript_key_loop` and not through a predicate
+    // beside it (**F69**/**F105**): `kitsu_tui::transcript`'s own tests prove
+    // the overlay's search policy answers a submitted query, and prove nothing
+    // about whether any byte ever reaches it. `/`, `n` and `N` all already
+    // fall inside this loop's `0x20..=0x7e` printable arm, so their behaviour
+    // today was **measured before anything was asserted** (**F99**/**F100**):
+    // each becomes a `Press::Char`, `closes` declines it, the loop reads
+    // again, and the painted frames are **byte-identical** either side of the
+    // byte -- inert keys, exactly as `{`/`}` were on the previous card.
+
+    /// Run the real key loop over `chunks` on a ring that holds **matchable
+    /// text on both speakers**, for R6-b's `/`, and return the same triple
+    /// `drive_transcript` does.
+    ///
+    /// A third helper rather than a change to either existing one, for the
+    /// reason the second was added: those fixtures are about the close bytes,
+    /// the paging bytes and the prompt jumps, and their rings have no match in
+    /// them -- which is the "nothing to search for" case they should keep
+    /// exercising.
+    ///
+    /// The fixture and its arithmetic (**F61**), since the assertions below
+    /// are stated in ordinals:
+    ///
+    /// | ordinal | row | |
+    /// |---|---|---|
+    /// | 0 | `find me first` | **prompt**, and a **match** |
+    /// | 1 | `answer one` | |
+    /// | 2 | `find me second` | a **match**, on the session's side |
+    /// | 3..=8 | `answer two` .. `answer seven` | |
+    ///
+    /// Nine retained lines, nothing evicted; the geometry is 6 rows, so
+    /// `content_rows` is 5, `follow_top` is `9 - 5 = 4`, the opening content
+    /// is ordinals `4..=8` and the cursor is 4.
+    #[cfg(unix)]
+    fn drive_transcript_with_matches(chunks: &[&[u8]]) -> (TranscriptExit, bool, Vec<Vec<String>>) {
+        use kitsu_render::surface::Fd;
+
+        let mut ring = kitsu_tui::cells::CellRing::new(16);
+        ring.push_prompt("find me first");
+        ring.push(Fd::Stdout, "answer one");
+        ring.push(Fd::Stdout, "find me second");
+        for name in ["two", "three", "four", "five", "six", "seven"] {
+            ring.push(Fd::Stdout, &format!("answer {name}"));
+        }
+        assert_eq!((ring.len(), ring.evicted()), (9, 0));
+        let matches: Vec<usize> = ring
+            .lines()
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.plain().contains("find me"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            matches,
+            vec![0, 2],
+            "the fixture really holds two matches, one of them the user's own \
+             prompt"
+        );
+
+        let mut overlay = kitsu_tui::transcript::TranscriptOverlay::new();
+        let mut input = ChunkReader::new(chunks);
+        let remaining = std::rc::Rc::clone(&input.remaining);
+        let mut frames: Vec<Vec<String>> = Vec::new();
+        let exit = {
+            let mut geometry = || (6u16, 40usize);
+            let mut waiting = || remaining.get() > 0;
+            let mut paint = |frame: &[String]| frames.push(frame.to_vec());
+            run_transcript_key_loop(
+                &mut input,
+                &mut overlay,
+                &ring,
+                &mut geometry,
+                &mut waiting,
+                &mut paint,
+            )
+        };
+        (exit, overlay.is_following(), frames)
+    }
+
+    /// The opening content rows of `drive_transcript_with_matches`'s fixture,
+    /// ordinals 4..=8, stated once so every assertion below that means "the
+    /// frame did not move" is stated against the same five rows.
+    #[cfg(unix)]
+    const OPENING: [&str; 5] = [
+        "answer three",
+        "answer four",
+        "answer five",
+        "answer six",
+        "answer seven",
+    ];
+
+    /// **Test (R6-b): the `/` byte opens the overlay's query line, the typed
+    /// bytes become the query, and `Enter` runs the search.**
+    ///
+    /// The whole keystroke path in one pass, through the real decoder. `0x2f`,
+    /// the printable bytes behind it, `0x7f` and `0x0d` must each reach the
+    /// overlay; today every one of them is inert -- the printable bytes become
+    /// `Press::Char`s that `closes` declines, and `0x7f` and `0x0d` are
+    /// control bytes that the loop's `_ => continue` arm drops -- so the frame
+    /// is repainted unchanged, the view is still following and the loop ends
+    /// `Drained`. A key the footer will advertise and nothing dispatches is
+    /// **F75**.
+    ///
+    /// `0x7f` is in the payload deliberately: a query line a typo cannot be
+    /// corrected in is one the user has to abandon, and the byte is dropped by
+    /// the same arm.
+    ///
+    /// Not vacuous, and specifically not satisfiable by a loop that merely
+    /// repainted: the painted content rows are pinned **by value** on both
+    /// sides, so the opening frame pins what was painted before the bytes and
+    /// the landing pins where they took the frame.
+    #[cfg(unix)]
+    #[test]
+    fn the_slash_byte_opens_the_query_line_and_enter_runs_the_search() {
+        // `Z` then `0x7f`: the backspace byte has to reach the query line too,
+        // or the query submitted below is `find mZe` and matches nothing.
+        let (exit, following, frames) = drive_transcript_with_matches(&[b"/find mZ\x7fe\r"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "`/` searches; it is not a close key"
+        );
+        assert!(
+            !following,
+            "and the submitted search pinned the overlay, which is \
+             transition 12: a search that left the view following did nothing"
+        );
+        assert_eq!(frames.len(), 2, "painted before the bytes and after them");
+        assert_eq!(
+            &frames[0][..5],
+            OPENING,
+            "the opening frame, ordinals 4..=8"
+        );
+        assert_eq!(
+            &frames[1][..5],
+            [
+                "find me second",
+                "answer two",
+                "answer three",
+                "answer four",
+                "answer five",
+            ],
+            "ordinals 2..=6: the newest match is on the top row, so `/`, the \
+             query bytes, the backspace and the `Enter` all arrived"
+        );
+    }
+
+    /// **Test (R6-b): the `n` and `N` bytes walk the matches through the real
+    /// decoder, and neither wraps.**
+    ///
+    /// One chunk per keystroke, so each landing is its own painted frame
+    /// rather than only the final state. Bidirectional, because `N` walking
+    /// while `n` did nothing is a live failure mode, and the two inert presses
+    /// at the ends are asserted to leave the frame **byte-identical** --
+    /// which is also the no-wrap decision, reached through the bytes.
+    #[cfg(unix)]
+    #[test]
+    fn the_n_and_shift_n_bytes_walk_the_search_matches_without_wrapping() {
+        let (exit, following, frames) =
+            drive_transcript_with_matches(&[b"/find me\r", b"N", b"N", b"n", b"n"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "none of these is a close key"
+        );
+        assert!(!following, "the walk leaves the overlay pinned");
+        assert_eq!(
+            frames.len(),
+            6,
+            "the opening frame, one per keystroke, and the frame the drained \
+             read was painted against"
+        );
+
+        let oldest = [
+            "find me first",
+            "answer one",
+            "find me second",
+            "answer two",
+            "answer three",
+        ];
+        let newest = [
+            "find me second",
+            "answer two",
+            "answer three",
+            "answer four",
+            "answer five",
+        ];
+        assert_eq!(&frames[0][..5], OPENING, "ordinals 4..=8");
+        assert_eq!(&frames[1][..5], newest, "the submit lands on ordinal 2");
+        assert_eq!(&frames[2][..5], oldest, "`N` walks to ordinal 0");
+        assert_eq!(
+            &frames[3][..5],
+            oldest,
+            "`N` again does NOT wrap round to the newest match: there is no \
+             third match above, so the frame is byte-identical"
+        );
+        assert_eq!(&frames[4][..5], newest, "`n` comes back to ordinal 2");
+        assert_eq!(
+            &frames[5][..5],
+            newest,
+            "`n` again does NOT wrap round to the oldest match either"
+        );
+    }
+
+    /// **Test (R6-b): a NEWLINE inside a bracketed paste is query CONTENT,
+    /// not a submit and not a keypress.**
+    ///
+    /// **F72**'s shape, measured on this surface rather than assumed from the
+    /// agent view: the overlay has its own byte loop, so what a pasted newline
+    /// does here is this loop's answer. **Measured today**: `0x0a` is a
+    /// control byte this loop drops and the `q` behind it is read as the close
+    /// key, so `b"/find me\nq"` ends `Closed` -- the overlay gone, nothing
+    /// searched, and the bytes of a paste dispatched as commands.
+    ///
+    /// The signal needed to fix that is already on the wire and already being
+    /// thrown away: the alternate-screen route writes `ESC[?2004h`, so a paste
+    /// arrives wrapped in `ESC[200~` / `ESC[201~`, and this loop swallows both
+    /// markers whole in its generic sequence arm. R6-a's lesson is the rule --
+    /// a sequence inside a paste is **content**, not a keypress -- so between
+    /// the two markers a newline neither submits nor closes anything. A query
+    /// line is one line, so the pasted text up to its first newline is the
+    /// query and the remainder of the paste is **discarded**; the `Enter` that
+    /// runs it is the one the user then presses, outside the paste.
+    ///
+    /// Bidirectional, and the second half is what keeps the first from being a
+    /// rule about chunk boundaries -- which this loop's own header calls wrong
+    /// (**F65**): **outside** a paste the bytes after an `Enter` are still
+    /// keys, so a `q` typed straight after submitting really does close the
+    /// overlay. Discarding it would lose a keystroke to how the reads happened
+    /// to split.
+    #[cfg(unix)]
+    #[test]
+    fn a_newline_inside_a_bracketed_paste_is_query_text_and_closes_nothing() {
+        let (exit, following, frames) =
+            drive_transcript_with_matches(&[b"/\x1b[200~find me\nq\x1b[201~\r"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "the `q` is pasted CONTENT: a multi-line paste must not take the \
+             overlay away from under the user"
+        );
+        assert!(
+            !following,
+            "and the trailing `Enter`, which is outside the paste, ran the \
+             search"
+        );
+        assert_eq!(
+            &frames[frames.len() - 1][..5],
+            [
+                "find me second",
+                "answer two",
+                "answer three",
+                "answer four",
+                "answer five",
+            ],
+            "ordinals 2..=6: the query is the pasted text up to its newline, \
+             and everything after that newline was discarded rather than \
+             dispatched"
+        );
+
+        // The other half: outside a paste, an `Enter` submits and the bytes
+        // behind it are still keys. This is what makes the rule above a rule
+        // about the paste markers and not about where a read happened to end.
+        let (exit, following, _) = drive_transcript_with_matches(&[b"/find me\rq"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Closed,
+            "a `q` typed straight after submitting is the close key, and must \
+             not be lost to the chunk it shared with the `Enter`"
+        );
+        assert!(!following, "and the search still ran before the close");
+    }
+
+    /// **Test (R6-b): while the query line is open, `q` is text and `Esc`
+    /// cancels the query rather than closing the overlay.**
+    ///
+    /// Two enumerated cases that are each a disappearing surface if missed.
+    /// `q` closes this overlay, so unless it is ordinary text while a query is
+    /// open the word `query` cannot be searched for and the overlay vanishes
+    /// mid-typing. And `Esc` has to be the way out of a query line -- the only
+    /// other way out would be submitting one the user no longer wants -- so it
+    /// cancels the query **and leaves the overlay up**, which is one press
+    /// away from the surface closing under them.
+    ///
+    /// The `Esc` half is driven as its own chunk on purpose: a lone `0x1b`
+    /// with nothing queued behind it is exactly the ambiguous case this loop
+    /// resolves with the grace (**F65**), so this also pins that cancelling a
+    /// query does not go through a second `Esc` mechanism.
+    ///
+    /// Not vacuous: the frame is pinned by value, so a `q` that was swallowed
+    /// into a query *and* scrolled something fails, and the follow state is
+    /// asserted, so a cancel that pinned on its way out fails.
+    #[cfg(unix)]
+    #[test]
+    fn the_close_keys_are_query_text_and_an_escape_while_a_query_is_open() {
+        let (exit, following, frames) = drive_transcript_with_matches(&[b"/query"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "`q` inside an open query line is a character, not the close key"
+        );
+        assert!(following, "and nothing was submitted, so nothing pinned");
+        assert_eq!(
+            &frames[frames.len() - 1][..5],
+            OPENING,
+            "the transcript rows are untouched: typing a query scrolls nothing"
+        );
+
+        let (exit, following, frames) = drive_transcript_with_matches(&[b"/find me", b"\x1b"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "`Esc` cancels the query line; it does not also close the overlay \
+             the user is still reading"
+        );
+        assert!(following, "and the cancel did not pin on its way out");
+        assert_eq!(
+            &frames[frames.len() - 1][..5],
+            OPENING,
+            "the frame is the opening one, byte-identical"
+        );
+    }
+
+    /// **Test (R6-c): the byte `{` reaches the overlay's prompt jump, and
+    /// `}` comes back.**
+    ///
+    /// Driven through the real loop, not a predicate beside it (**F69**/
+    /// **F105**): `kitsu_tui`'s own tests prove `TranscriptOverlay::jump`
+    /// answers `Jump::Prev`, and prove nothing about whether any byte ever
+    /// becomes one. `0x7b` and `0x7d` both already fall inside this loop's
+    /// `0x20..=0x7e` printable arm, so **measured before asserting**
+    /// (**F99**/**F100**): today each becomes a `Press::Char`, `closes` says
+    /// no, and the loop reads again — the frame is repainted unchanged, the
+    /// view is still following and the loop ends `Drained`. The key is inert
+    /// while R6-c's footer advertises it, which is **F75** exactly.
+    ///
+    /// Not vacuous, and specifically not satisfiable by a loop that merely
+    /// repainted: the painted content rows are asserted **by value** on both
+    /// sides, so the pre-jump frame pins what the loop painted before the byte
+    /// and the post-jump frame pins where the byte took it. Bidirectional,
+    /// because `{` moving while `}` did nothing is a live failure mode.
+    #[cfg(unix)]
+    #[test]
+    fn the_open_brace_byte_jumps_the_overlay_to_the_previous_prompt_block() {
+        let (exit, following, frames) = drive_transcript_with_prompts(&[b"{"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "`{{` scrolls; it is not a close key"
+        );
+        assert!(
+            !following,
+            "and it pinned the overlay, which is transition 12: a `{{` that \
+             left the view following did nothing"
+        );
+        assert_eq!(frames.len(), 2, "painted before the byte and after it");
+        assert_eq!(
+            &frames[0][..5],
+            [
+                "second question",
+                "with a tail",
+                "answer three",
+                "answer four",
+                "answer five",
+            ],
+            "the opening frame, ordinals 3..=7"
+        );
+        assert_eq!(
+            &frames[1][..5],
+            [
+                "first question",
+                "answer one",
+                "answer two",
+                "second question",
+                "with a tail",
+            ],
+            "and `{{` took it to the oldest block's first row, ordinals 0..=4"
+        );
+    }
+
+    /// **Test (R6-c): `}` is reachable too, and a two-row prompt block is ONE
+    /// stop.**
+    ///
+    /// `{` then `}` in a single chunk is a round trip to the block the overlay
+    /// opened on; `{` then `}` then `}` must stay there, because the second
+    /// block's two rows are one stop and there is no third block to walk into.
+    /// A loop wired to a row-walking jump would land on `with a tail` as a top
+    /// row instead, which the by-value frame catches.
+    #[cfg(unix)]
+    #[test]
+    fn the_close_brace_byte_jumps_forward_and_a_two_row_block_is_one_stop() {
+        let opening = [
+            "second question".to_string(),
+            "with a tail".to_string(),
+            "answer three".to_string(),
+            "answer four".to_string(),
+            "answer five".to_string(),
+        ];
+
+        let (exit, following, frames) = drive_transcript_with_prompts(&[b"{}"]);
+        assert_eq!(exit, TranscriptExit::Drained, "neither brace closes");
+        assert!(!following, "and the jump pinned rather than re-latching");
+        assert_eq!(
+            &frames.last().expect("a frame was painted")[..5],
+            opening.as_slice(),
+            "`{{` then `}}` is a round trip to the block the overlay opened on"
+        );
+
+        let (_, _, frames) = drive_transcript_with_prompts(&[b"{}}"]);
+        assert_eq!(
+            &frames.last().expect("a frame was painted")[..5],
+            opening.as_slice(),
+            "and a second `}}` stays on it: the two-row prompt is one stop, \
+             not two, so there is nothing further to walk to"
+        );
+    }
+
+    /// **Test: a lone `Esc` closes the overlay.**
+    ///
+    /// Measured before it was asserted (**F99**), and it was red for a reason
+    /// no mirror-test could have found: `[0x1b]` is a strict prefix of all
+    /// four paging sequences, so the partial-hold took it and the loop went
+    /// back to a blocking read. The overlay stayed up until the user pressed
+    /// something else, and the footer said `q/Esc close`.
+    ///
+    /// Not vacuous: the exit **reason** is asserted, not merely that the loop
+    /// returned. A drained descriptor also ends the loop, and that is the
+    /// value the defect produced here.
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_esc_closes_the_transcript_overlay() {
+        let (exit, following, frames) = drive_transcript(&[b"\x1b"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Closed,
+            "a lone Esc is the close press the footer advertises, not the \
+             first byte of a sequence that never came"
+        );
+        assert!(following, "and nothing paged");
+        assert!(!frames.is_empty(), "the overlay painted before it read");
+    }
+
+    /// **Test: a lone `Esc` after another key, alone in its own chunk, closes
+    /// the overlay.**
+    ///
+    /// The chunk-boundary case: `PgUp` arrives and is answered, and the `Esc`
+    /// that follows is a read of its own with nothing behind it.
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_esc_at_a_chunk_boundary_closes_the_overlay() {
+        let (exit, following, _) = drive_transcript(&[b"\x1b[5~", b"\x1b"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Closed,
+            "the Esc in its own read is the press"
+        );
+        assert!(
+            !following,
+            "and the PgUp before it was answered, so this is not a loop that \
+             dropped both bytes"
+        );
+    }
+
+    /// **Test: `ESC [ B` split across two reads is one keystroke, is dropped,
+    /// and does not close the overlay (F65).**
+    ///
+    /// The regression the grace must not buy at the expense of: an arrow key
+    /// whose first byte lands at the end of a chunk must not be read as a
+    /// close.
+    #[cfg(unix)]
+    #[test]
+    fn a_split_arrow_sequence_is_dropped_and_does_not_close_the_overlay() {
+        let (exit, following, _) = drive_transcript(&[b"\x1b", b"[B"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "the down arrow is not a close key, so the loop ran out of input \
+             instead of closing"
+        );
+        assert!(
+            following,
+            "and the arrow moved nothing: this overlay has no \
+             selection for it"
+        );
+    }
+
+    /// **Test: `q` closes the overlay, and the paging keys do not.**
+    #[cfg(unix)]
+    #[test]
+    fn q_closes_the_transcript_overlay_and_a_paging_key_does_not() {
+        let (exit, following, _) = drive_transcript(&[b"q"]);
+        assert_eq!(exit, TranscriptExit::Closed, "q closes");
+        assert!(following);
+
+        let (exit, following, _) = drive_transcript(&[b"\x1b[5~\x1b[1;5H"]);
+        assert_eq!(
+            exit,
+            TranscriptExit::Drained,
+            "PgUp and Ctrl+Home scroll; neither closes"
+        );
+        assert!(!following, "and both were answered");
+    }
 
     #[test]
     fn system_prompt_names_git_only_when_the_tool_is_available() {
@@ -30911,8 +32388,8 @@ mod tests {
             .iter()
             .find(|spec| spec.name == "tui")
             .expect("/tui is registered");
-        assert_eq!(tui.args, "[classic|inline]");
-        assert_eq!(tui.syntax(), "/tui [classic|inline]");
+        assert_eq!(tui.args, "[classic|inline|fullscreen]");
+        assert_eq!(tui.syntax(), "/tui [classic|inline|fullscreen]");
         assert_eq!(
             tui.alias_of, None,
             "/tui is a command in its own right, not an alias"
@@ -30922,18 +32399,32 @@ mod tests {
             CommandGroup::Session,
             "the renderer is session state, which is where /theme lives too"
         );
-        // The advertised vocabulary is exactly `[tui] mode`'s: `fullscreen` is
-        // T5's renderer and must not be advertised by a surface that would
-        // then refuse it.
+        // The advertised vocabulary is exactly `[tui] mode`'s, and **T5-S2
+        // inverts this clause**: until this card the assertion here was
+        // `!tui.args.contains("fullscreen")`, on the ground that "the args row
+        // must not advertise a mode that is refused". `fullscreen` is no
+        // longer refused — it has its renderer, its switch arm and its
+        // alternate screen — so the same rule now obliges the opposite. The
+        // rule did not change; its subject did.
         assert!(
-            !tui.args.contains("fullscreen"),
-            "the args row must not advertise a mode that is refused: {}",
+            tui.args.contains("fullscreen"),
+            "the args row must advertise every mode the switch accepts, and \
+             `fullscreen` is now one of them: {}",
             tui.args
         );
         assert!(
             tui.details.contains("fullscreen"),
-            "the details, however, must say where `fullscreen` went, because \
-             the design's grammar has it: {}",
+            "the details must still describe `fullscreen`, because the \
+             design's grammar has it: {}",
+            tui.details
+        );
+        // ...and must no longer describe it as absent. This is the assertion
+        // that catches the half-done card: a renderer that ships behind a
+        // help string still telling the user it has not shipped.
+        assert!(
+            !tui.details.contains("not available yet"),
+            "the details must not still announce `fullscreen` as unavailable \
+             once the renderer is reachable: {}",
             tui.details
         );
         assert!(
@@ -30941,6 +32432,140 @@ mod tests {
             "and must state R2's gate — a switch keeps the conversation: {}",
             tui.details
         );
+    }
+
+    /// **T5-S1c-iii.** The four paging keys' only advertisement.
+    ///
+    /// Design §4.7 keeps a computed-label chord out of `keys::BINDINGS`
+    /// because it never reaches the swept dispatch, and these keys add a
+    /// third reason: they are live **only while fullscreen holds the
+    /// screen**, so a static row would advertise them at the inline and
+    /// classic composers, where they do nothing. There is therefore no row
+    /// and no second table, and the honest place left is `/tui`'s own
+    /// `details` -- the string requirement R2 already pins across four
+    /// spellings and `the_command_registry_advertises_the_tui_switch`
+    /// already asserts.
+    ///
+    /// A capability a user cannot find is not one they have, so this asserts
+    /// the sentence is there **and** that it says what the keys do: the key
+    /// names, and the fact that they scroll the frame rather than the caret.
+    #[test]
+    fn the_tui_details_advertise_the_fullscreen_paging_keys() {
+        let tui = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "tui")
+            .expect("/tui is registered");
+
+        for key in ["PgUp", "PgDn", "Ctrl+Home", "Ctrl+End"] {
+            assert!(
+                tui.details.contains(key),
+                "the details are where the paging keys are advertised, and \
+                 `{key}` is one of the four: there is no `keys::BINDINGS` row \
+                 for them, so a user who is not told here is not told at all \
+                 (F89: a capability that is unreachable is not one). The \
+                 details read: {}",
+                tui.details
+            );
+        }
+        assert!(
+            tui.details.contains("frame"),
+            "...and the sentence must say what they move. `Ctrl+Home` is \
+             also plain `Home`'s modified form, and plain `Home` still moves \
+             the caret, so naming the keys without naming the frame \
+             advertises an ambiguity rather than a capability: {}",
+            tui.details
+        );
+    }
+
+    /// **R6-a.** `Ctrl+O`'s only advertisement.
+    ///
+    /// The transcript overlay's own footer advertises the keys that are live
+    /// **inside** it; nothing in it can tell a user that the overlay exists
+    /// or how to open it. And `Ctrl+O` cannot go in `keys::BINDINGS` for the
+    /// four paging keys' reason above: that table is the agent view's,
+    /// guarded by a sweep over *that* decoder's key space (**F82**), and this
+    /// key is read by the inline reader on the composer's surfaces. So its
+    /// home is the same one T5-S1c-iii gave the paging keys, and this test is
+    /// that test's shape deliberately rather than a second one.
+    ///
+    /// **F82** is also why this test exists at all: its sweep found `q`,
+    /// `Enter` and `\u{2192}` dispatched and advertised nowhere, and the
+    /// lesson recorded was that a rule applied per-change is not a rule
+    /// enforced. An unadvertised key is that finding verbatim.
+    ///
+    /// The second half is the footer's guard restated on this string: the
+    /// details must not promise the R6 clauses that are **not** built, for
+    /// exactly the reason the footer may not name them (**F75**: a key that
+    /// appears to work is worse than one that is missing).
+    #[test]
+    fn the_tui_details_advertise_the_transcript_overlay_key() {
+        let tui = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "tui")
+            .expect("/tui is registered");
+
+        assert!(
+            tui.details.contains("Ctrl+O"),
+            "the details are where `Ctrl+O` is advertised: there is no \
+             `keys::BINDINGS` row for it and the overlay's own footer is only \
+             visible once it is already open, so a user who is not told here \
+             is not told at all. The details read: {}",
+            tui.details
+        );
+        assert!(
+            tui.details.contains("overlay"),
+            "...and the sentence must say what the key opens, not merely \
+             that the key exists: {}",
+            tui.details
+        );
+        let lowered = tui.details.to_ascii_lowercase();
+        for unbuilt in ["search", "dump", "editor", "scrollback", "jump"] {
+            assert!(
+                !lowered.contains(unbuilt),
+                "the details must not promise {unbuilt:?}: it is a later \
+                 piece of R6 and nothing dispatches it, which is the same \
+                 rule the overlay's footer is guarded by: {}",
+                tui.details
+            );
+        }
+    }
+
+    /// **T5-S2.** The two literals `/tui`'s own messages are built from, and
+    /// the third renderer request.
+    ///
+    /// Pinned as equalities rather than `contains` for the reason F90 gives:
+    /// `TUI_ACCEPTED_MODES` was `"accepted: classic, inline"` and every
+    /// message that interpolates it keeps containing that string after a
+    /// third mode is appended, so a `contains` here would survive this card
+    /// without noticing it. What is asserted is what the constant **is**.
+    ///
+    /// This is a vocabulary test, not a reachability one. That a `/tui
+    /// fullscreen` typed at a prompt actually reaches
+    /// `TuiRendererRequest::Fullscreen`, enters the alternate screen and
+    /// paints the ring is **F89**'s question, and no unit test can answer it:
+    /// it is answered in `tests/tui.rs` on the raw byte stream.
+    ///
+    /// The third variant's own label is **deliberately not named here.**
+    /// `TuiRendererRequest::Fullscreen` does not exist yet, and a unit test
+    /// that named it would not fail — it would fail to **compile**, taking
+    /// all 927 `--bins` tests with it and hiding every other result in this
+    /// card. A failing-first test has to leave the suite legible. The label
+    /// is pinned where it is user-visible instead:
+    /// `TUI_SWITCHED_TO_FULLSCREEN` in `tests/tui.rs` is the receipt
+    /// `run_chat` builds from `label()`, so a variant labelled anything but
+    /// `"fullscreen"` fails there.
+    #[test]
+    fn the_tui_vocabulary_names_all_three_renderers() {
+        assert_eq!(TUI_ACCEPTED_MODES, "accepted: classic, inline, fullscreen");
+        assert_eq!(TuiRendererRequest::Classic.label(), "classic");
+        assert_eq!(TuiRendererRequest::Inline.label(), "inline");
+        // Tightened once the variant existed. The doc above states where the
+        // third label is pinned *instead* (`TUI_SWITCHED_TO_FULLSCREEN`, in
+        // the pty suite, because naming the variant here before it existed
+        // would have been a compile failure rather than a test failure). The
+        // two pins are not redundant now that both can be had: one fails in
+        // three seconds, the other in forty-seven.
+        assert_eq!(TuiRendererRequest::Fullscreen.label(), "fullscreen");
     }
 
     /// The remaining registry-fed sites, in one test, because one entry is
@@ -30958,14 +32583,20 @@ mod tests {
     #[test]
     fn every_registry_fed_surface_shows_the_tui_switch() {
         let help = slash_help("test-model", false);
+        // T5-S2 re-quotes both literals, mechanically. This test holds no
+        // opinion about the mode vocabulary — its subject is registry drift,
+        // "no unchecked string literal of its own on these four surfaces" —
+        // so when `SlashCommandSpec::args` gains a mode, the string these
+        // traversals must equal gains it too. The claim is unchanged; the
+        // quotation of the registry's own output is what moved.
         assert!(
-            help.contains("/tui [classic|inline]"),
+            help.contains("/tui [classic|inline|fullscreen]"),
             "/help lists the command: {help}"
         );
 
         let detail = slash_command_help("tui");
         assert!(
-            detail.starts_with("/tui [classic|inline]"),
+            detail.starts_with("/tui [classic|inline|fullscreen]"),
             "/help tui leads with the syntax: {detail}"
         );
 
@@ -34190,6 +35821,12 @@ mod tests {
     /// uses.
     #[cfg(unix)]
     #[tokio::test]
+    // **F107**: not optional. `#[serial]` excludes other `#[serial]` tests, not
+    // plain ones, and this test reaches the process-global surface slot through
+    // PRODUCTION code rather than `SurfaceProbe`, so it can install over a
+    // serialised test's probe mid-run. Measured: 3 failures in 421 unguarded
+    // runs of `--bins`, 0 in 400 with this guard.
+    #[serial_test::serial]
     async fn the_views_attach_reaches_the_composer_and_makes_the_detach_keys_live() {
         /// One read of the inline composer, with `[tui]` resolved the way a
         /// configured session resolves it: the chord prefix bound and the
@@ -34210,6 +35847,7 @@ mod tests {
                 &mut || {},
                 keys,
                 attached,
+                None,
             )
             .expect("a cursor cannot fail to read")
         }
@@ -34339,6 +35977,7 @@ mod tests {
                 &mut || {},
                 keys,
                 attached,
+                None,
             )
             .expect("a cursor cannot fail to read")
         }
@@ -34437,6 +36076,12 @@ mod tests {
     /// `the_views_attach_reaches_the_composer_and_makes_the_detach_keys_live`.
     #[cfg(unix)]
     #[tokio::test]
+    // **F107**: not optional. `#[serial]` excludes other `#[serial]` tests, not
+    // plain ones, and this test reaches the process-global surface slot through
+    // PRODUCTION code rather than `SurfaceProbe`, so it can install over a
+    // serialised test's probe mid-run. Measured: 3 failures in 421 unguarded
+    // runs of `--bins`, 0 in 400 with this guard.
+    #[serial_test::serial]
     async fn the_status_row_and_the_prompt_label_read_the_one_attachment_binding() {
         /// One read of the inline composer with a configured keymap, as the
         /// F75 test drives it.
@@ -34454,6 +36099,7 @@ mod tests {
                 &mut || {},
                 keys,
                 attached,
+                None,
             )
             .expect("a cursor cannot fail to read")
         }
@@ -34699,6 +36345,12 @@ mod tests {
     /// across widths, so this test says nothing about other widths.
     #[cfg(unix)]
     #[tokio::test]
+    // **F107**: not optional. `#[serial]` excludes other `#[serial]` tests, not
+    // plain ones, and this test reaches the process-global surface slot through
+    // PRODUCTION code rather than `SurfaceProbe`, so it can install over a
+    // serialised test's probe mid-run. Measured: 3 failures in 421 unguarded
+    // runs of `--bins`, 0 in 400 with this guard.
+    #[serial_test::serial]
     async fn the_detach_command_clears_the_binding_the_row_and_the_label_read() {
         const BASE: &str = "kitsu> ";
         const COLS: usize = 120;
@@ -34884,6 +36536,12 @@ mod tests {
     /// fallback depends on, and it must survive the fix that adds the second.
     #[cfg(unix)]
     #[tokio::test]
+    // **F107**: not optional. `#[serial]` excludes other `#[serial]` tests, not
+    // plain ones, and this test reaches the process-global surface slot through
+    // PRODUCTION code rather than `SurfaceProbe`, so it can install over a
+    // serialised test's probe mid-run. Measured: 3 failures in 421 unguarded
+    // runs of `--bins`, 0 in 400 with this guard.
+    #[serial_test::serial]
     async fn the_jobs_view_command_attaches_to_the_binding_the_row_and_the_label_read() {
         const BASE: &str = "kitsu> ";
         const COLS: usize = 120;
@@ -36096,6 +37754,153 @@ mod tests {
         }
     }
 
+    /// A ringed surface over the slot, put back on drop, with its retained
+    /// cells readable: the production `InlineSurface::with_cell_ring`, not a
+    /// double, because the claim is about what the surface the session
+    /// installs retains (**F69**).
+    ///
+    /// `SurfaceProbe` cannot serve here -- `PaintedLines` keeps no cells -- and
+    /// the sinks are swallowed because these tests assert on the ring, while
+    /// the byte stream is pinned in `tui_bridge`.
+    #[cfg(unix)]
+    struct RingProbe {
+        previous: Option<std::sync::Arc<dyn kitsu_render::surface::Surface>>,
+        surface: std::sync::Arc<kitsu_tui::viewport::InlineSurface>,
+    }
+
+    #[cfg(unix)]
+    impl RingProbe {
+        fn install() -> Self {
+            let surface = std::sync::Arc::new(kitsu_tui::viewport::InlineSurface::with_cell_ring(
+                Box::new(std::io::sink()),
+                Box::new(std::io::sink()),
+                16,
+            ));
+            let previous = kitsu_render::surface::set_surface(surface.clone());
+            Self {
+                previous: Some(previous),
+                surface,
+            }
+        }
+
+        /// The retained cells as `(is a prompt, stripped text)`.
+        fn marked(&self) -> Vec<(bool, String)> {
+            self.surface
+                .cells()
+                .expect("a surface built with a cell ring retains cells")
+                .iter()
+                .map(|line| (line.is_prompt(), line.plain()))
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RingProbe {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                kitsu_render::surface::set_surface(previous);
+            }
+        }
+    }
+
+    /// **Test: a line typed at an attached agent is retained as the user's
+    /// prompt** (**F102**, the second feed point).
+    ///
+    /// This route `continue`s before the line can become a
+    /// `ChatReadline::Line` -- the comment at its call site says so -- so the
+    /// foreground feed never sees it, and leaving it out would ship a key that
+    /// works at the idle prompt and quietly does nothing during an attachment
+    /// (**F84**/**F75**).
+    ///
+    /// Driven through `route_attached_submission`, the real route, over a real
+    /// `InlineSurface` with a real ring: nothing here mirrors the decision the
+    /// production path makes.
+    ///
+    /// **Ordering is asserted, not assumed:** the answer's receipt is painted
+    /// by this same function, so the prompt must precede it in the ring
+    /// exactly as the foreground feed precedes a turn. The `Steered` route is
+    /// the same `delivered` branch and is not re-swept here.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn a_line_typed_at_an_attached_agent_is_retained_as_the_users_prompt() {
+        let (registry, id, answer) = registry_with_one_blocked_agent().await;
+        let probe = RingProbe::install();
+
+        let submit = route_attached_submission(&registry, id, "y");
+
+        assert_eq!(
+            submit.draft, "",
+            "precondition: the line was delivered, not refused"
+        );
+        let marks = probe.marked();
+        assert_eq!(
+            marks
+                .first()
+                .map(|(is_prompt, text)| (*is_prompt, text.as_str())),
+            Some((true, "y")),
+            "the user's line is the first thing in the ring, ahead of the \
+             receipt it provoked: {marks:?}"
+        );
+        assert_eq!(
+            marks.len(),
+            2,
+            "and the receipt is the only other cell: {marks:?}"
+        );
+        assert!(
+            !marks[1].0,
+            "the receipt is the session's own words, not the user's: {marks:?}"
+        );
+        drop(probe);
+        // The receiver is dropped, never awaited: on a refusal the gate's
+        // oneshot is never resolved, so awaiting it would hang this test
+        // forever -- which it did, measured, before this line said so.
+        drop(answer);
+    }
+
+    /// **Test: and a refused one is not** -- the opposite failure, and the one
+    /// that would put a line in the transcript the user is still editing.
+    ///
+    /// On every refusal `AttachedSubmit::draft` hands the line back as the
+    /// next read's draft (**F76**), so it was never submitted. A transcript
+    /// claiming it was said is a false claim in the one record the overlay
+    /// reads (**F77**), and `{`/`}` would stop on a line that never ran.
+    ///
+    /// The fixture is the settled race: a correction typed while the agent
+    /// blocks is not an answer and cannot be steered, so nothing is sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn a_refused_attached_submission_is_not_retained_as_a_prompt() {
+        const CORRECTION: &str = "no, use the byte offsets from the lexer";
+        assert!(
+            parse_permission_answer(CORRECTION).is_none(),
+            "premise: the one parser does not read a correction as an answer"
+        );
+        let (registry, id, answer) = registry_with_one_blocked_agent().await;
+        let probe = RingProbe::install();
+
+        let submit = route_attached_submission(&registry, id, CORRECTION);
+
+        assert_eq!(
+            submit.route,
+            AttachedRoute::Refused,
+            "precondition: nothing was sent"
+        );
+        assert_eq!(
+            submit.draft, CORRECTION,
+            "precondition: the line is back in the composer (F76)"
+        );
+        let marks = probe.marked();
+        assert!(
+            marks.iter().all(|(is_prompt, _)| !is_prompt),
+            "a line still being edited was never said: {marks:?}"
+        );
+        drop(probe);
+        // Never awaited: nothing was sent, so this oneshot is never resolved.
+        drop(answer);
+    }
+
     /// **The race, settled: a correction typed while the agent blocks.**
     ///
     /// The line is not `y`, `a` or `n`, so it is not an answer; the agent is
@@ -36262,6 +38067,7 @@ mod tests {
             &mut || {},
             keys,
             attached,
+            None,
         )
         .expect("a cursor cannot fail to read")
     }

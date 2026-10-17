@@ -340,6 +340,84 @@ nothing is sent, the agent's own refusal is printed, and **your line stays in th
 composer**. Slash commands are still commands while attached, so `/detach` always
 works.
 
+`/tui fullscreen` switches the renderer to a fullscreen view over the viewport's
+scrollback: it takes the terminal's alternate screen, paints the retained lines,
+**repaints them as new output arrives**, and gives the screen and the window
+title back when you leave it. A prompt that follows no new output repaints
+nothing, so an idle session is still.
+
+Fullscreen draws its own prompt on the bottom row, so the frame is not painted
+over between turns: the composer writes only to that row and never a line feed,
+so typing cannot scroll the frame at all. Two differences from the inline
+composer, both deliberate: there is **no slash-command palette** (the only rows it
+could use are the frame's), and the agent-view keys are **off** while fullscreen
+holds the screen, since the agent view wants that same alternate screen.
+
+`PgUp` and `PgDn` page the retained transcript; `Ctrl+Home` jumps to the oldest
+line the ring still holds and `Ctrl+End` returns to following the newest. They
+move the **frame**, not the caret, and only while fullscreen holds the screen --
+in the other renderers those sequences keep the meanings they always had, so
+`Ctrl+Home` still moves your cursor to the start of the line. Paging pins the
+view: new output stops dragging it to the bottom until you page back down or
+press `Ctrl+End`. A paged sequence arriving inside a paste is content, not a
+keypress.
+
+`Ctrl+O` opens a **transcript overlay** over the transcript the ring retains,
+from the inline composer and from fullscreen alike. The same four keys scroll it,
+and `q` or `Esc` closes it and leaves the frame behind it exactly where it was --
+paging the overlay never moves the view underneath. Its keys are listed on its
+own footer rather than in a global table, because they are live only while it
+holds the screen; `Ctrl+O` itself is listed by `/help tui`, with the composer's
+other chords. `{` and `}` jump to the previous and next prompt, so you can walk
+back through what you asked rather than scrolling. A prompt that spans several
+lines is **one** stop, not one per line -- and so are two submissions with
+nothing printed between them, which is the same rule seen from the other side.
+A jump that cannot move the frame does nothing at all: it does not quietly stop
+the overlay following new output.
+
+`/` searches it. The search runs when you press **Enter**, not as you type, and
+`n`/`N` then walk the matches -- `n` toward newer, `N` toward older -- without
+wrapping, so running out in one direction does nothing rather than throwing you
+to the other end. Submitting lands on the **newest** match, which is where "when
+did this last happen?" starts. Matching ignores case, an empty query cancels, `q`
+is query text while the line is open so the word itself can be searched for, and
+`Esc` cancels the query and leaves the overlay up. The query line replaces the
+footer row, so searching costs no transcript line. **The search covers both
+speakers**, since the scrollback retains your prompts.
+
+**What is searched is what the overlay paints** -- the same text, with only the
+escape bytes your terminal does not display removed. There is one divergence and
+it is width rather than styling: a row is fitted to your terminal's columns, so
+text past the right edge is searchable but not currently on screen. That is
+deliberate -- making matches depend on window width would mean one query finding
+different things in two terminal sizes. Note too that a line **kitsu** writes can
+contain an embedded newline and still be a single scrollback cell, where a prompt
+you submit is split one cell per line.
+
+Dumping the overlay to scrollback and opening it in `$EDITOR` are **not** wired
+yet.
+
+`Ctrl+Z` suspends from fullscreen through the same path the other renderers use,
+though the alternate screen's contents are the terminal's across the stop. `--tui
+fullscreen` and `[tui] mode = "fullscreen"` start there instead; a session that
+starts in fullscreen has nothing behind it to paint yet.
+
+The scrollback it paints holds the **streamed** conversation. It does not hold
+kitsu's own diagnostics and receipts, and it does not hold an answer that was
+buffered rather than streamed -- which happens whenever tools are advertised for
+that round, i.e. by default. With `--no-tools` the answer streams and the
+scrollback has it. `[tui] cell_ring_lines` bounds it in lines (default 10000).
+
+**It does hold your own prompts.** A submitted line is retained as yours, split
+one cell per line so a multi-line or pasted prompt keeps its shape on screen, and
+filed with the conversation rather than with the tool output. Slash commands are
+retained as yours as well, since a report with no visible command is half a
+transcript. Two things are deliberately not marked as yours: a command **kitsu**
+injects on your behalf (`/resume` after a restart, `/retry`), because it is not
+your line even though you may type the same words yourself; and a line **refused**
+at an attached agent, which is handed back to your composer and was therefore
+never said. `/export` remains the route to the full conversation.
+
 `?` lists every key the view binds, and `/help keys` prints the same list
 without opening the view -- both render one table, so neither can drift from the
 other or from what the keys actually do. `Enter` or `→` attaches to the selected
@@ -440,7 +518,7 @@ one paint each; the newest value is never dropped.
 `/tui [classic|inline]` switches the renderer between turns and keeps the
 conversation: what was printed before the switch stays on screen exactly once,
 and the viewport's live status row returns with it. Bare `/tui` reports the
-renderer actually running. `fullscreen` is refused until that renderer exists,
+renderer actually running. A renderer kitsu does not have is refused,
 naming what is accepted, and `/tui` during a turn is refused rather than queued,
 because the mid-turn fall-through would otherwise send it to the model as a
 prompt. Switching into a terminal shorter than the viewport's minimum stays

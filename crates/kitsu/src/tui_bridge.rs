@@ -62,6 +62,11 @@ pub(crate) enum TuiMode {
     Classic,
     /// The pinned inline viewport from `kitsu-tui`.
     Inline,
+    /// The fullscreen transcript renderer: the terminal's alternate screen,
+    /// painted from the cell ring inline mode retains. It pins no DECSTBM
+    /// region and installs no surface, so [`install`] is inert for it and
+    /// [`enter_fullscreen`] is what takes the terminal.
+    Fullscreen,
 }
 
 impl TuiMode {
@@ -70,6 +75,7 @@ impl TuiMode {
         match self {
             TuiMode::Classic => "classic",
             TuiMode::Inline => "inline",
+            TuiMode::Fullscreen => "fullscreen",
         }
     }
 }
@@ -84,9 +90,22 @@ impl TuiMode {
 /// caller remembering to update it.
 static INLINE_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether a fullscreen segment holds the terminal's alternate screen **right
+/// now**.
+///
+/// The fullscreen counterpart of [`INLINE_INSTALLED`], and global for the same
+/// reason: `/tui`'s dispatch arm reports the live renderer and cannot see the
+/// `run_chat` local that holds the segment. Maintained by exactly two writers
+/// — [`enter_fullscreen`] on the way in and [`FullscreenSegment::leave`] on
+/// the way out — and the two flags are mutually exclusive by construction,
+/// because every route into one renderer tears the other down first.
+static FULLSCREEN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The renderer this process is painting through at this instant.
 pub(crate) fn live_mode() -> TuiMode {
-    if INLINE_INSTALLED.load(std::sync::atomic::Ordering::Acquire) {
+    if FULLSCREEN_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+        TuiMode::Fullscreen
+    } else if INLINE_INSTALLED.load(std::sync::atomic::Ordering::Acquire) {
         TuiMode::Inline
     } else {
         TuiMode::Classic
@@ -130,13 +149,18 @@ pub(crate) fn install(
     mode: TuiMode,
     rows: u16,
     viewport_rows: u16,
+    cell_ring_lines: usize,
     status: &str,
     out: Box<dyn std::io::Write + Send>,
     err: Box<dyn std::io::Write + Send>,
 ) -> Option<BridgeGuard> {
     match mode {
-        // Inert: no bytes, no surface swap, and the live-row setting untouched.
-        TuiMode::Classic => return None,
+        // Inert: no bytes, no surface swap, and the live-row setting
+        // untouched. Fullscreen shares the arm because it pins no region and
+        // installs no surface of its own -- it takes the alternate screen
+        // through `enter_fullscreen`, which taps the displaced surface and
+        // leaves it printing the transcript onto that screen.
+        TuiMode::Classic | TuiMode::Fullscreen => return None,
         TuiMode::Inline => {}
     }
 
@@ -155,7 +179,10 @@ pub(crate) fn install(
         return None;
     }
 
-    let viewport = Arc::new(InlineSurface::new(out, err));
+    // Requirement N4: inline mode always carries a ring, bounded by the
+    // configured line count. There is no off switch -- the bound's minimum is
+    // one line -- so the newest line is always retained.
+    let viewport = Arc::new(InlineSurface::with_cell_ring(out, err, cell_ring_lines));
     viewport.show(rows, viewport_rows);
     viewport.paint(&[status.to_string()], live::terminal_columns());
 
@@ -182,6 +209,622 @@ pub(crate) fn install(
         previous_live_rows,
         live_status: std::cell::RefCell::new(None),
     })
+}
+
+impl BridgeGuard {
+    /// The lines the installed viewport's cell ring retains, oldest first, or
+    /// `None` when the viewport was built without a ring.
+    ///
+    /// The one window onto requirement **N4**'s ring from outside
+    /// `kitsu-tui`: the surface itself stays private to the pane, so this is
+    /// how the fullscreen renderer — and these tests — read what the surface
+    /// wrote.
+    ///
+    /// The production reader is the `/tui fullscreen` switch, which calls
+    /// this **before** dropping the guard (the ring belongs to the surface the
+    /// teardown puts back) and hands the lines to [`enter_fullscreen`].
+    pub(crate) fn cell_lines(&self) -> Option<Vec<kitsu_tui::cells::CellLine>> {
+        self.pane.viewport.cells()
+    }
+}
+
+/// Take the terminal's alternate screen, and push the window title onto the
+/// terminal's title stack. Requirement **N5**'s two clauses, as bytes.
+///
+/// The clear and the home cursor ride along with the enable, exactly as the
+/// agent view's own enter does: the alternate screen a terminal hands back is
+/// not guaranteed to be blank.
+const ENTER_ALT_SCREEN: &[u8] = b"\x1b[?1049h\x1b[2J\x1b[H";
+/// Give the alternate screen back. The restore is then the *terminal's* own:
+/// the transcript the user had is still on the primary screen, untouched.
+const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
+/// Push the window title (`CSI 22;2t`), and pop it (`CSI 23;2t`).
+///
+/// These are the same two sequences `kitsu_tui::TuiRuntime` writes, and they
+/// are written here rather than by borrowing that runtime for one reason,
+/// which is the same one `run_agent_view_overlay` states for the alternate
+/// screen: `TuiRuntime::enter` also enables **crossterm's** raw mode, which
+/// clears `OPOST`, and this binary's several hundred direct
+/// `println!`/`eprintln!` writers would staircase down the screen. Raw mode
+/// in this process belongs to `RawStdinGuard` and to nothing else, so a
+/// fullscreen segment states the screen and the title and leaves termios
+/// alone. Under tmux and GNU screen both sequences are silently ignored and a
+/// title kitsu set would stay; an ignored sequence is inert rather than
+/// broken.
+const PUSH_TITLE: &[u8] = b"\x1b[22;2t";
+/// See [`PUSH_TITLE`].
+const POP_TITLE: &[u8] = b"\x1b[23;2t";
+
+/// A live fullscreen segment: the alternate screen and the pushed title, given
+/// back when this is dropped.
+///
+/// A guard rather than an enter/leave pair of calls, for the reason
+/// [`BridgeGuard`] is one: `/tui` swaps renderers by dropping the outgoing
+/// one, every exit path out of `run_chat` drops it too, and a second teardown
+/// path is how one of them comes to differ from the other.
+pub(crate) struct FullscreenSegment {
+    /// The sink the enter bytes went to, kept so the leave bytes go to the
+    /// same one.
+    err: Box<dyn std::io::Write + Send>,
+    /// Whether the terminal has already been given back, so the restore bytes
+    /// are written at most once per segment.
+    left: bool,
+    /// The lines the entry frame was painted from, oldest first: the outgoing
+    /// inline viewport's ring, or empty out of classic and at startup.
+    ///
+    /// Kept because the ring they came from belongs to the surface the inline
+    /// teardown has already put back, so there is nowhere else to read them
+    /// from once the segment is live.
+    seed: Vec<kitsu_tui::cells::CellLine>,
+    /// The seam tap, which records what the session writes onto the alternate
+    /// screen so the frame can be painted again from it.
+    tap: Arc<FullscreenTap>,
+    /// The surface the tap displaced, put back by [`Self::leave`].
+    previous_surface: Arc<dyn Surface>,
+    /// How many of the tap's lines the last frame was painted from, so a
+    /// prompt that follows no new output repaints nothing and the byte stream
+    /// of an idle fullscreen session is the one it was before this card.
+    painted_tap_lines: usize,
+    /// Where the frame is anchored: the paging state, and the only state the
+    /// four paging keys add.
+    ///
+    /// Findings **F94/F96/F98**: the paths into a state are enumerable, and
+    /// this one lives here because this type's single [`Drop`] is already the
+    /// one clearer on every path out of fullscreen -- a `/tui` swap, a
+    /// `run_chat` return, a panic. An anchor kept anywhere else would be a
+    /// second thing to put back, and a second teardown path is how the two
+    /// come to differ.
+    view: kitsu_tui::fullscreen::FullscreenView,
+}
+
+/// The seam tap a live fullscreen segment installs: every transcript line the
+/// session writes while the alternate screen is held is forwarded verbatim to
+/// the surface fullscreen displaced, and a copy is kept in a line-bounded
+/// ring so the frame can be painted again from it (requirement **N4**'s bound,
+/// and **F52**'s: lines, never bytes).
+///
+/// The tap **only records.** The repaint is driven by
+/// [`FullscreenSegment::repaint_if_the_ring_grew`] at the idle prompt, never
+/// from inside a write: a repaint at the seam would reach the inline and
+/// classic renderers as well, whose contracts are one write per transcript
+/// line (**R3**) and a byte stream identical to the unrouted writers'.
+struct FullscreenTap {
+    /// The surface fullscreen displaced. It still owns every byte: this type
+    /// adds no output of its own.
+    inner: Arc<dyn Surface>,
+    /// What the session has written since the segment took the screen, oldest
+    /// first.
+    ring: std::sync::Mutex<kitsu_tui::cells::CellRing>,
+}
+
+impl FullscreenTap {
+    /// The recorded lines, oldest first.
+    fn lines(&self) -> Vec<kitsu_tui::cells::CellLine> {
+        lock(&self.ring).lines()
+    }
+}
+
+impl Surface for FullscreenTap {
+    /// Forward first, record after: the bytes reach the terminal before any
+    /// bookkeeping, exactly as `InlineSurface` orders the same pair, and the
+    /// recorded order is the written order by construction.
+    fn transcript_line(&self, fd: kitsu_render::surface::Fd, text: &str) {
+        self.inner.transcript_line(fd, text);
+        lock(&self.ring).push(fd, text);
+    }
+
+    /// The block runs against the displaced surface's own writer, so its
+    /// single-suspension property and its descriptor are the displaced
+    /// surface's: this override exists to *see* the bytes, not to buffer them.
+    ///
+    /// A block whose bytes end without a newline is recorded as a short line,
+    /// for the reason `InlineSurface::write_block` states: text that is on the
+    /// terminal and absent from the ring would be lost from the frame for
+    /// good.
+    fn write_block(
+        &self,
+        fd: kitsu_render::surface::Fd,
+        block: &mut dyn FnMut(&mut dyn std::io::Write),
+    ) {
+        let mut seen: Vec<u8> = Vec::new();
+        self.inner.write_block(fd, &mut |writer| {
+            let mut tee = Tee {
+                inner: writer,
+                seen: &mut seen,
+            };
+            block(&mut tee);
+        });
+        let text = String::from_utf8_lossy(&seen);
+        let mut ring = lock(&self.ring);
+        for line in text.lines() {
+            ring.push(fd, line);
+        }
+    }
+
+    /// Forwarded whole: the queued-prompt rows belong to a backend with pinned
+    /// bottom rows, and a fullscreen segment pins none, so this is the
+    /// displaced surface's answer and never a ring entry.
+    fn queue(&self, rows: &[String]) {
+        self.inner.queue(rows);
+    }
+
+    /// **Recorded, never forwarded** -- the one method on this tap that does
+    /// not reach the displaced surface.
+    ///
+    /// The tap's ring is the *only* ring while a fullscreen segment holds the
+    /// screen (`install` is inert in that mode, so there is no inline surface
+    /// behind it), so the prompt must land here or the overlay shows one
+    /// speaker in fullscreen and two inline -- a key that quietly does nothing
+    /// on one surface (**F84**/**F89**). Forwarding would hand the prompt to
+    /// the displaced inline surface's ring, which no reader can see from here,
+    /// and nothing is written either way: `note_prompt` emits no bytes.
+    fn note_prompt(&self, text: &str) {
+        lock(&self.ring).push_prompt(text);
+    }
+}
+
+/// A writer that copies what it forwards, for [`FullscreenTap::write_block`].
+struct Tee<'a> {
+    inner: &'a mut dyn std::io::Write,
+    seen: &'a mut Vec<u8>,
+}
+
+impl std::io::Write for Tee<'_> {
+    /// Only the bytes the inner writer accepted are recorded, so a short write
+    /// cannot put a line in the ring that never reached the terminal.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.seen.extend_from_slice(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl FullscreenSegment {
+    /// Paint the frame again when the session has written something since the
+    /// last one, and write nothing at all when it has not (**F97**).
+    ///
+    /// Called from the idle prompt, which is the one place in a fullscreen
+    /// session where no turn is streaming and the screen is therefore not
+    /// being written by anything else. The frame is the seed lines the entry
+    /// paint used followed by everything the tap recorded, so the line that
+    /// was retained from the inline segment stays above the ones the
+    /// fullscreen segment added.
+    ///
+    /// The gate is what keeps an idle session's byte stream unchanged: a
+    /// prompt that follows no output repaints nothing, so the frame is written
+    /// once per growth of the ring rather than once per prompt.
+    pub(crate) fn repaint_if_the_ring_grew(&mut self, rows: u16, cols: usize) {
+        if self.left {
+            return;
+        }
+        let recorded = self.tap.lines();
+        if recorded.len() <= self.painted_tap_lines {
+            return;
+        }
+        self.painted_tap_lines = recorded.len();
+        // From the segment's **own** anchor, not a fresh one: a view
+        // constructed per paint would un-pin the frame on the next line the
+        // session writes, which is paging that lasts until the next output.
+        let frame = {
+            let ring = frame_ring(&self.lines_now());
+            self.view.frame(&ring, window_rows(rows), cols)
+        };
+        self.paint_frame(&frame);
+    }
+
+    /// The lines one frame is painted from: the seed the entry paint used,
+    /// then everything the tap has recorded since, oldest first.
+    fn lines_now(&self) -> Vec<kitsu_tui::cells::CellLine> {
+        let mut lines = self.seed.clone();
+        lines.extend(self.tap.lines());
+        lines
+    }
+
+    /// Write one frame onto the screen the segment already holds.
+    ///
+    /// The clear and the home cursor are the entry paint's, minus the
+    /// alternate-screen enable: this is a repaint of a screen already held,
+    /// so re-enabling it would be a second `ESC[?1049h` the leave has no
+    /// counterpart for.
+    fn paint_frame(&mut self, frame: &[String]) {
+        let _ = self.err.write_all(b"\x1b[2J\x1b[H");
+        for row in frame {
+            let _ = self.err.write_all(row.as_bytes());
+            let _ = self.err.write_all(b"\r\n");
+        }
+        let _ = self.err.flush();
+    }
+
+    /// The lines the frame is painted from, oldest first: the seed plus
+    /// everything the tap has recorded.
+    ///
+    /// Requirement **R6**: the transcript overlay opens over the same lines
+    /// this segment's frame is painted from, and reads them through this
+    /// rather than through a ring of its own.
+    pub(crate) fn transcript_lines(&self) -> Vec<kitsu_tui::cells::CellLine> {
+        self.lines_now()
+    }
+
+    /// Paint the frame again from this segment's **own** anchor, whatever the
+    /// ring has done.
+    ///
+    /// Requirement **R6**'s close: the transcript overlay painted over this
+    /// screen and scrolled its own anchor, so `q` must put back the frame the
+    /// user left -- which is this segment's anchor, untouched by the overlay's
+    /// separate instance. Unlike [`Self::repaint_if_the_ring_grew`] this is
+    /// unconditional, because nothing about the ring changed and the screen is
+    /// nevertheless not the one the segment painted.
+    pub(crate) fn repaint_frame(&mut self, rows: u16, cols: usize) {
+        if self.left {
+            return;
+        }
+        let frame = {
+            let ring = frame_ring(&self.lines_now());
+            self.view.frame(&ring, window_rows(rows), cols)
+        };
+        self.paint_frame(&frame);
+    }
+
+    /// Whether this segment's frame is still following the newest line.
+    ///
+    /// The anchor's own transitions are [`kitsu_tui::fullscreen`]'s and are
+    /// pinned there; what this exposes is which segment the anchor belongs
+    /// to.
+    // Production's caller arrives with the sink this card leaves unwired.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_following(&self) -> bool {
+        self.view.is_following()
+    }
+
+    /// Apply one paging press to this segment's anchor and repaint the frame
+    /// from it.
+    ///
+    /// The repaint is **the press's own**, and that is the whole reason this
+    /// method writes bytes: the frame follows the ring only when the ring
+    /// *grew* ([`Self::repaint_if_the_ring_grew`]) and the reader paints only
+    /// the composer row, so a press that left the painting to someone else
+    /// would move the anchor and leave the screen exactly as it was -- a dead
+    /// key with state behind it.
+    ///
+    /// `rows`/`cols` are the caller's geometry probe, taken per press for
+    /// [`Self::paint_composer`]'s reason: the bottom row is the composer's, so
+    /// the frame's window is one row shorter than the screen, exactly as the
+    /// entry paint's is.
+    pub(crate) fn page(&mut self, press: kitsu_tui::fullscreen::Page, rows: u16, cols: usize) {
+        if self.left {
+            return;
+        }
+        let frame = {
+            let ring = frame_ring(&self.lines_now());
+            self.view.page(press, &ring, window_rows(rows));
+            self.view.frame(&ring, window_rows(rows), cols)
+        };
+        self.paint_frame(&frame);
+    }
+
+    /// Paint the composer onto the **bottom row** of the alternate screen,
+    /// at an absolute address and without a line feed.
+    ///
+    /// This is fullscreen's own composer row, and it is the counterpart of
+    /// `BridgeGuard::paint_composer` rather than a second renderer: the row
+    /// itself is composed by `kitsu_render::live::compose_input_row`, the
+    /// same function the inline composer and the classic live row compose
+    /// theirs with, so the three cannot drift in what a draft looks like.
+    ///
+    /// # Why an absolute address and no newline
+    ///
+    /// A fullscreen segment pins no DECSTBM region -- the frame fills the
+    /// screen and the cursor is parked on the one row the frame held back
+    /// (see [`enter_fullscreen`]). So the one thing this paint must never do
+    /// is **scroll**: every row it scrolls off the top is a frame row the
+    /// user loses for good, which is finding **F97**'s second half as
+    /// measured on a pty (a cooked-mode editor's palette cost eleven of
+    /// them, and backspacing did not bring them back). Addressing the bottom
+    /// row, erasing it and writing the row with no trailing `\n` leaves
+    /// every other cell of the screen exactly as the frame left it, so the
+    /// frame survives being typed at by construction rather than by being
+    /// repainted afterwards.
+    ///
+    /// `rows` and `cols` are the caller's geometry probe, taken per paint, so
+    /// a `SIGWINCH` that wakes the reader lands the next row on the new
+    /// bottom row without this type latching a geometry of its own.
+    ///
+    /// The caret is left in the draft, which is what makes the row a composer
+    /// and not a status line: `compose_input_row` returns the column it
+    /// belongs in, windowed with the draft.
+    ///
+    /// The draft arrives as the `LiveDraft` the renderer's own composition
+    /// takes, rather than as its five fields: this method's business is
+    /// *where* the row goes, and the row's content is the shared value type
+    /// the inline composer and the classic live row are already built from.
+    ///
+    /// There is no slash palette on this surface. A palette is several rows
+    /// tall and the only space for it is the frame's, and the frame is what
+    /// this card exists to stop losing; the one-row composer is what the
+    /// alternate screen has room for.
+    pub(crate) fn paint_composer(&mut self, draft: &live::LiveDraft, rows: u16, cols: usize) {
+        if self.left {
+            return;
+        }
+        let (row, caret) = live::compose_input_row(draft, cols);
+        let bottom = rows.max(1);
+        let _ = self
+            .err
+            .write_all(format!("\x1b[{bottom};1H\x1b[2K").as_bytes());
+        let _ = self.err.write_all(row.as_bytes());
+        // Columns are 1-based on the wire; `caret` is a 0-based display
+        // column within the row, and a row with no caret parks at the start.
+        let column = caret.unwrap_or(0).saturating_add(1);
+        let _ = self
+            .err
+            .write_all(format!("\x1b[{bottom};{column}H").as_bytes());
+        let _ = self.err.flush();
+    }
+
+    /// Take the composer row back once the read is over, leaving the cursor at
+    /// the start of it.
+    ///
+    /// The mirror of [`paint_composer`](Self::paint_composer), and the reason
+    /// it exists is the cursor rather than the row: a submitted line is
+    /// followed by the turn's own output, written at wherever the cursor was
+    /// left, and a caret parked in the middle of a drafted row would start
+    /// the transcript there. Erasing the row and homing the column puts the
+    /// screen back exactly as the frame's last `\r\n` left it, which is where
+    /// every writer in this process expects to continue.
+    pub(crate) fn clear_composer(&mut self, rows: u16) {
+        if self.left {
+            return;
+        }
+        let bottom = rows.max(1);
+        let _ = self
+            .err
+            .write_all(format!("\x1b[{bottom};1H\x1b[2K").as_bytes());
+        let _ = self.err.flush();
+    }
+
+    /// Give the terminal back: the alternate screen first, then the title.
+    ///
+    /// Idempotent, and every I/O result is dropped: this is the body of
+    /// [`Drop`], there is nothing useful to do about a terminal that will not
+    /// take its own escape sequences, and the only place left to report it to
+    /// is that terminal.
+    fn leave(&mut self) {
+        if self.left {
+            return;
+        }
+        self.left = true;
+        // Before the bytes, so `/tui`'s report cannot observe a renderer the
+        // terminal has already been taken back from.
+        FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        // And before them for a second reason: the next transcript line must
+        // not be recorded into a frame that no longer has a screen. The
+        // put-back is conditional on the tap still being the installed
+        // surface, because the switch into inline installs its viewport
+        // *after* dropping this segment on one path and could not be relied
+        // on to stay in that order; an unconditional `set_surface` here would
+        // then displace the incoming renderer.
+        if Arc::ptr_eq(
+            &kitsu_render::surface::active_surface(),
+            &(self.tap.clone() as Arc<dyn Surface>),
+        ) {
+            set_surface(self.previous_surface.clone());
+        }
+        let _ = self.err.write_all(LEAVE_ALT_SCREEN);
+        let _ = self.err.write_all(POP_TITLE);
+        let _ = self.err.flush();
+        // Card F94, and the mirror of `enter_fullscreen`'s store: after the
+        // bytes, so no exit path can read "free" while the screen is still
+        // held. A signal in this window writes a second leave onto a primary
+        // screen; a signal in the opposite window would write none at all.
+        kitsu_tui::note_alternate_screen(false);
+    }
+}
+
+impl Drop for FullscreenSegment {
+    fn drop(&mut self) {
+        self.leave();
+    }
+}
+
+/// Enter fullscreen: take the alternate screen and paint the **tail** of
+/// `lines` into it through `kitsu_tui::fullscreen::FullscreenView`.
+///
+/// `lines` is the inline viewport's cell ring as [`BridgeGuard::cell_lines`]
+/// returned it, oldest first, and empty when the outgoing renderer was
+/// classic — classic feeds no ring, so a switch out of it has nothing to
+/// repaint and paints nothing. That is the honest frame for an empty ring
+/// rather than a reason to conjure one.
+///
+/// The ring is rebuilt here over the copy `cell_lines` already handed out,
+/// because the ring itself belongs to the surface the teardown has just put
+/// back. Its limit is the line count, so nothing is evicted and the view's
+/// follow anchor resolves to the newest `rows - 1` lines.
+///
+/// One row is held back from the window on purpose: the switch receipt and
+/// the prompt are written to the same screen straight afterwards, so a frame
+/// that filled every row would scroll its own oldest line off before the user
+/// saw it. Paging back through the rest of the ring needs a key decoder and a
+/// view that outlives the paint; this segment shows the tail, which is
+/// strictly more than the classic renderer shows of a transcript that has
+/// scrolled away.
+///
+/// Finding **F97**: the entry frame is not the only frame. The segment
+/// installs a [`FullscreenTap`] over the surface fullscreen displaced, so
+/// what the session writes onto the alternate screen is recorded as well as
+/// printed, and [`FullscreenSegment::repaint_if_the_ring_grew`] paints the
+/// seed lines and the recorded ones again at the idle prompt. The frame
+/// therefore follows the ring instead of freezing at the moment of the
+/// switch.
+///
+/// The rows are written as lines rather than at absolute addresses, with this
+/// backend's own CRLF: the cursor is then left under the frame, where the
+/// receipt and everything the session prints next belong.
+pub(crate) fn enter_fullscreen(
+    err: Box<dyn std::io::Write + Send>,
+    lines: &[kitsu_tui::cells::CellLine],
+    rows: u16,
+    cols: usize,
+    ring_lines: usize,
+) -> FullscreenSegment {
+    let frame = fullscreen_frame(lines, rows, cols);
+
+    let mut err = err;
+    // Card F94: **before** the bytes, and the opposite order to
+    // `FULLSCREEN_ACTIVE` below on purpose. This flag is read by the exit
+    // paths `Drop` does not run on -- the dying-signal handler and the panic
+    // hook -- so a signal landing between the store and the write must find
+    // the screen claimed rather than free: a restore of a screen not yet
+    // taken costs one `ESC[?1049l` on the primary screen, while the reverse
+    // window leaves the user on the alternate screen, which is the defect
+    // itself.
+    kitsu_tui::note_alternate_screen(true);
+    let _ = err.write_all(PUSH_TITLE);
+    let _ = err.write_all(ENTER_ALT_SCREEN);
+    for row in &frame {
+        let _ = err.write_all(row.as_bytes());
+        let _ = err.write_all(b"\r\n");
+    }
+    let _ = err.flush();
+    // After the bytes: the terminal is held by the time anything can report
+    // that it is.
+    FULLSCREEN_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+    // Last, and after the entry frame's bytes: the tap records what the
+    // session writes *onto the alternate screen*, so installing it before the
+    // frame would put the frame's own rows in the ring if a writer reached the
+    // seam in between.
+    //
+    // The bound is the caller's configured cell-ring line count, the same one
+    // `install` hands the inline viewport, and it is a count of lines --
+    // **F52**'s bound is never bytes.
+    let tap = Arc::new(FullscreenTap {
+        inner: kitsu_render::surface::active_surface(),
+        ring: std::sync::Mutex::new(kitsu_tui::cells::CellRing::new(ring_lines.max(1))),
+    });
+    let previous_surface = set_surface(tap.clone());
+    FullscreenSegment {
+        err,
+        left: false,
+        seed: lines.to_vec(),
+        tap,
+        previous_surface,
+        painted_tap_lines: 0,
+        view: kitsu_tui::fullscreen::FullscreenView::new(),
+    }
+}
+
+/// Whose words a submitted line is.
+///
+/// A transcript is a document, and a document is worth what its claims are
+/// worth (**F77**): `/resume` and `/retry` are **kitsu's** words, injected by
+/// `run_chat` as `priority_command`, and marking them the user's would be a
+/// false claim inside the one record the overlay reads. The distinction is a
+/// parameter rather than a guess at the text because it is not recoverable
+/// from the line -- the user can type `/retry` themselves, and that one *is*
+/// theirs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PromptOrigin {
+    /// The user typed it: at the idle prompt, during a turn (queued), or at an
+    /// attached agent.
+    User,
+    /// Kitsu synthesized it. Never marked the user's.
+    Injected,
+}
+
+/// Hand the **installed** surface the user's own submitted prompt, so a
+/// backend that keeps cells can retain it (**F102**, requirement **N4**).
+///
+/// # Why this is the one feed point
+///
+/// The three idle readers -- the inline composer, the fullscreen composer and
+/// rustyline (plus the assistive line reader) -- all return through
+/// `ChatReadline`, and a queued prompt and a priority command join the same
+/// `line` binding in `run_chat`. One call *there*, after the empty-line skip
+/// and beside `add_history_entry`, is reached by every route a submitted line
+/// can take, and by nothing else: `run_scripted_turn` and the one-shot `-p`
+/// route build a `SubmittedPrompt` without a terminal and have no ring.
+///
+/// # Ordering is structural, not hoped for
+///
+/// The call sits on the single-threaded path between the read and whatever the
+/// line provokes -- a slash command's report, a turn's streamed output -- so
+/// the prompt is in the ring before the first byte of its answer can be
+/// written. It is not sequenced against the stream; it precedes it.
+///
+/// Writes no bytes: see [`Surface::note_prompt`].
+pub(crate) fn note_submitted_prompt(text: &str, origin: PromptOrigin) {
+    match origin {
+        PromptOrigin::User => kitsu_render::surface::active_surface().note_prompt(text),
+        // Not handed over at all, which is the strongest reading of "never
+        // marked the user's": there is no byte-free seam for retaining an
+        // unmarked line, and inventing one to file kitsu's own synthesized
+        // command beside its output would be a second decision this card did
+        // not make (**F61**). The command's *output* is retained as it always
+        // was, through `transcript_line`. The exclusion has one home -- here --
+        // rather than being folded into the call sites, so there is one place
+        // to change if the ring should one day carry injected lines unmarked.
+        PromptOrigin::Injected => {}
+    }
+}
+
+/// The rows of one fullscreen frame over `lines`, oldest line first.
+///
+/// The ring is rebuilt over the caller's copy because the ring the seed lines
+/// came from belongs to the surface the inline teardown already put back. Its
+/// limit is the line count, so nothing is evicted and the view's follow anchor
+/// resolves to the newest `rows - 1` lines.
+fn fullscreen_frame(lines: &[kitsu_tui::cells::CellLine], rows: u16, cols: usize) -> Vec<String> {
+    let ring = frame_ring(lines);
+    kitsu_tui::fullscreen::FullscreenView::new().frame(&ring, window_rows(rows), cols)
+}
+
+/// The ring one frame is read through, rebuilt over the caller's copy of the
+/// lines for [`fullscreen_frame`]'s reason.
+///
+/// The limit is the line count, so nothing is evicted and a paging anchor is
+/// an ordinal into exactly the lines the segment holds.
+pub(crate) fn frame_ring(lines: &[kitsu_tui::cells::CellLine]) -> kitsu_tui::cells::CellRing {
+    let mut ring = kitsu_tui::cells::CellRing::new(lines.len().max(1));
+    for line in lines {
+        // `push_retained`, never `push(fd, styled)`: this rebuild is the
+        // chokepoint *both* ring readers go through -- the fullscreen frame
+        // and the `Ctrl+O` overlay -- so a prompt mark dropped here is lost to
+        // every reader however faithfully the feed stored it (**F79**).
+        ring.push_retained(line);
+    }
+    ring
+}
+
+/// The frame's window: the screen minus the composer's bottom row.
+///
+/// One row is the composer's on every paint -- the entry frame's, the
+/// ring-grew repaint's and a page press's -- so the subtraction lives in one
+/// place rather than at each of the three.
+fn window_rows(rows: u16) -> u16 {
+    rows.saturating_sub(1)
 }
 
 /// The pinned pane: the inline viewport plus the geometry currently latched
@@ -1111,6 +1754,36 @@ pub(crate) fn install_sigwinch_handler() {
 /// on `Stderr` takes a lock.
 const SIGNAL_RESTORE: &[u8] = b"\x1b[r\x1b[?25h\x1b[?2004l\x1b[23;2t";
 
+/// The same stream with the alternate screen's leave **appended**, for a
+/// signal taken while a surface is holding it (card **F94**).
+///
+/// Two `const`s and a choice between them, rather than one `const` plus a
+/// second `write(2)`: the handler's one write is what keeps the restore
+/// atomic against a terminal that may be read by the shell the instant the
+/// process dies. Composed from the two existing `const`s at compile time, so
+/// this is not a third copy of either sequence -- `LEAVE_ALT_SCREEN` is the
+/// one `FullscreenSegment::leave` writes.
+///
+/// **Appended, never interleaved.** The four sequences in `SIGNAL_RESTORE`
+/// are global to the terminal rather than per-screen-buffer, so the order
+/// relative to the screen switch does not change what the user is left with,
+/// and keeping `SIGNAL_RESTORE` a prefix is what lets every existing
+/// assertion about the handler's bytes go on holding.
+const SIGNAL_RESTORE_WITH_SCREEN: [u8; SIGNAL_RESTORE.len() + LEAVE_ALT_SCREEN.len()] = {
+    let mut out = [0u8; SIGNAL_RESTORE.len() + LEAVE_ALT_SCREEN.len()];
+    let mut i = 0;
+    while i < SIGNAL_RESTORE.len() {
+        out[i] = SIGNAL_RESTORE[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < LEAVE_ALT_SCREEN.len() {
+        out[SIGNAL_RESTORE.len() + j] = LEAVE_ALT_SCREEN[j];
+        j += 1;
+    }
+    out
+};
+
 /// The signal kitsu is raising **on itself** right now, or `0`.
 ///
 /// Set by [`raise_in_process`] around its `raise(2)` and read by the dying
@@ -1233,14 +1906,22 @@ pub(crate) fn install_exit_restore() {
         if SELF_RAISED.load(std::sync::atomic::Ordering::SeqCst) == signal {
             return;
         }
+        // Card **F94**: which of the two precomposed streams this terminal
+        // is owed. One more atomic load and a choice between two `const`s --
+        // no allocation, no locking, no formatting, and still one `write(2)`.
+        let restore: &[u8] = if kitsu_tui::alternate_screen_taken() {
+            &SIGNAL_RESTORE_WITH_SCREEN
+        } else {
+            SIGNAL_RESTORE
+        };
         // SAFETY: a single `write` of a `'static` buffer to a descriptor this
         // process owns; a short write or an error is not worth handling while
         // the process is dying.
         unsafe {
             libc::write(
                 libc::STDERR_FILENO,
-                SIGNAL_RESTORE.as_ptr().cast::<libc::c_void>(),
-                SIGNAL_RESTORE.len(),
+                restore.as_ptr().cast::<libc::c_void>(),
+                restore.len(),
             );
         }
         if CANONICAL_TERMIOS
@@ -1255,6 +1936,36 @@ pub(crate) fn install_exit_restore() {
                     libc::TCSANOW,
                     (*CANONICAL_TERMIOS.modes.get()).as_ptr(),
                 );
+            }
+        } else {
+            // Card **F96**: there is no snapshot, and the terminal may still
+            // be raw -- which is exactly the state a session started in
+            // fullscreen dies in. `RawStdinGuard` is the only publisher, and
+            // fullscreen installs no inline viewport, so its raw mode is
+            // **rustyline's own** and nothing in this process holds the modes
+            // it displaced.
+            //
+            // So the three line flags a user needs are turned back on in
+            // place rather than restored from a copy: canonical reads, kernel
+            // echo, and job-control signals. It is not the full termios the
+            // shell had -- nobody in this process knows that -- but it is the
+            // difference between a shell the user can type into and one they
+            // have to run `reset` on blind.
+            //
+            // Still async-signal-safe: `tcgetattr` and `tcsetattr` are both
+            // on POSIX's list, the struct is a stack local, and there is no
+            // allocation, no lock and no formatting. A failing `tcgetattr`
+            // leaves the terminal as the signal found it, which is the state
+            // this branch is trying to improve on and never worse.
+            //
+            // SAFETY: both calls write through a valid pointer to one
+            // `termios` on a descriptor this process owns.
+            unsafe {
+                let mut modes: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(libc::STDIN_FILENO, &mut modes) == 0 {
+                    modes.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG;
+                    libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &modes);
+                }
             }
         }
         // And now die as the signal says. Putting the default disposition
@@ -1401,6 +2112,27 @@ const DETACH_CHORD_KEY: u8 = b'd';
 /// `ESC [ D`, the left arrow as every terminal sends it, and what the editor
 /// reads as backward-char.
 const LEFT_ARROW: &[u8] = b"\x1b[D";
+/// The four paging keys as a terminal sends them, and the press each one
+/// means to [`kitsu_tui::fullscreen::FullscreenView`].
+///
+/// `PgUp`/`PgDn` are the `~`-terminated family; `Ctrl+Home`/`Ctrl+End` are the
+/// **modified** forms of the finals plain `Home`/`End` send, and the
+/// parameters are the only thing that tells the two pairs apart -- the editor's
+/// own `b'H'`/`b'F'` arms ignore them, which is why the modified forms are
+/// `Home`/`End` everywhere this table is not consulted.
+const PAGE_KEYS: [(&[u8], kitsu_tui::fullscreen::Page); 4] = [
+    (b"\x1b[5~", kitsu_tui::fullscreen::Page::Up),
+    (b"\x1b[6~", kitsu_tui::fullscreen::Page::Down),
+    (b"\x1b[1;5H", kitsu_tui::fullscreen::Page::Oldest),
+    (b"\x1b[1;5F", kitsu_tui::fullscreen::Page::Newest),
+];
+
+/// `Ctrl+O`: the transcript overlay's key (requirement **R6**).
+///
+/// One literal control byte, so unlike the four paging sequences it has no
+/// partial-sequence case and is not behind the configurable `[tui] prefix`.
+const TRANSCRIPT_KEY: u8 = 0x0f;
+
 /// The bracketed-paste opening delimiter.
 const PASTE_START: &[u8] = b"\x1b[200~";
 /// The bracketed-paste closing delimiter.
@@ -1422,6 +2154,20 @@ enum KeyItem {
     /// reach the draft, and the *decision* about whether anything is attached
     /// belongs to the reader and not to this filter.
     Detach,
+    /// One paging press, lifted out of the stream so none of its bytes reach
+    /// the editor: `Ctrl+Home` would otherwise be read as plain `Home` and
+    /// move the caret. Only produced when the reader was given a paging sink
+    /// ([`KeyFilter::pages`]).
+    Page(kitsu_tui::fullscreen::Page),
+    /// `Ctrl+O`: open the transcript overlay (requirement **R6**).
+    ///
+    /// Lifted out for [`KeyItem::Open`]'s reason, and a **literal** control
+    /// byte rather than a chord letter: R6 spells the key, so it is not
+    /// behind the configurable `[tui] prefix`. Measured before it was a key
+    /// here: `0x0f` reached the editor, whose `0x00..=0x1f` arm dropped it,
+    /// so the draft and the caret were untouched and nothing repainted.
+    ///
+    OpenTranscript,
 }
 
 /// Splits a read chunk into [`KeyItem`]s: the chord prefix and its letter are
@@ -1451,6 +2197,13 @@ struct KeyFilter {
     in_paste: bool,
     /// A partial sequence held back from the end of the previous chunk.
     held: Vec<u8>,
+    /// Whether the four paging sequences are keys here at all.
+    ///
+    /// Off unless the reader was handed a paging sink: a surface with nowhere
+    /// to send a press has no business lifting one out of the stream, and with
+    /// this off every byte of all four sequences reaches the editor, which is
+    /// inline's and classic's behaviour unchanged.
+    pages: bool,
 }
 
 impl KeyFilter {
@@ -1460,7 +2213,16 @@ impl KeyFilter {
             pending_prefix: false,
             in_paste: false,
             held: Vec::new(),
+            pages: false,
         }
+    }
+
+    /// The press `data` starts with, and its length in bytes.
+    fn page_press(data: &[u8]) -> Option<(kitsu_tui::fullscreen::Page, usize)> {
+        PAGE_KEYS
+            .iter()
+            .find(|(sequence, _)| data.starts_with(sequence))
+            .map(|(sequence, press)| (*press, sequence.len()))
     }
 
     /// Whether `data` is a strict, non-empty prefix of `pattern`: the chunk
@@ -1514,6 +2276,19 @@ impl KeyFilter {
                 index += 1;
                 continue;
             }
+            // Requirement **R6**. After the prefix check, so a session that
+            // configured this byte as its chord prefix keeps the chord, and
+            // inside the non-paste branch only: in a paste the payload is
+            // *text*, and a control byte in pasted content is never a key
+            // (the editor's in-paste arm drops it rather than drafting it).
+            if data[index] == TRANSCRIPT_KEY {
+                if !bytes.is_empty() {
+                    items.push(KeyItem::Bytes(std::mem::take(&mut bytes)));
+                }
+                items.push(KeyItem::OpenTranscript);
+                index += 1;
+                continue;
+            }
             if data[index] == 0x1b {
                 if rest.starts_with(PASTE_START) {
                     self.in_paste = true;
@@ -1529,7 +2304,26 @@ impl KeyFilter {
                     index += LEFT_ARROW.len();
                     continue;
                 }
-                if Self::is_partial(rest, PASTE_START) || Self::is_partial(rest, LEFT_ARROW) {
+                // Before the partial check below, for `LEFT_ARROW`'s reason:
+                // a complete sequence is a press, and only an incomplete one
+                // waits for the rest of itself.
+                if self.pages {
+                    if let Some((press, length)) = Self::page_press(rest) {
+                        if !bytes.is_empty() {
+                            items.push(KeyItem::Bytes(std::mem::take(&mut bytes)));
+                        }
+                        items.push(KeyItem::Page(press));
+                        index += length;
+                        continue;
+                    }
+                }
+                if Self::is_partial(rest, PASTE_START)
+                    || Self::is_partial(rest, LEFT_ARROW)
+                    || (self.pages
+                        && PAGE_KEYS
+                            .iter()
+                            .any(|(sequence, _)| Self::is_partial(rest, sequence)))
+                {
                     self.held = rest.to_vec();
                     break;
                 }
@@ -1542,6 +2336,26 @@ impl KeyFilter {
         }
         items
     }
+}
+
+/// The paging press `data` starts with, and its length in bytes.
+///
+/// Requirement **R6**: the transcript overlay runs its own key loop over the
+/// raw bytes, exactly as the agent view's overlay does, and it reads the same
+/// four sequences this module already decodes for the inline reader. Exposed
+/// rather than re-tabulated: a second copy of [`PAGE_KEYS`] is how the two
+/// surfaces come to disagree about which byte string `Ctrl+End` is.
+pub(crate) fn page_key(data: &[u8]) -> Option<(kitsu_tui::fullscreen::Page, usize)> {
+    KeyFilter::page_press(data)
+}
+
+/// Whether `data` ends part-way through one of the four paging sequences, so
+/// the overlay's key loop holds it for the next read rather than resolving the
+/// `ESC` as a close (finding **F65**: a multi-byte key is not one byte).
+pub(crate) fn partial_page_key(data: &[u8]) -> bool {
+    PAGE_KEYS
+        .iter()
+        .any(|(sequence, _)| KeyFilter::is_partial(data, sequence))
 }
 
 /// Re-pin the DECSTBM region and repaint the status row, for a full-screen
@@ -1612,6 +2426,16 @@ pub(crate) enum InlineRead {
     /// -- "only ever reached on an empty one" -- was true of `\u{2190}`
     /// alone and became wrong when the chord was given the same variant.
     Detached(String),
+
+    /// `Ctrl+O`: open the transcript overlay over the cell ring (requirement
+    /// **R6**).
+    ///
+    /// Carries the draft for [`InlineRead::OpenAgentView`]'s reason: the
+    /// overlay takes the screen this reader is painting on, so the whole
+    /// sequencing is the caller's, and the draft comes back through the same
+    /// replay a suspend uses so the key cannot cost the user a character.
+    ///
+    OpenTranscript(String),
 }
 
 /// Read one line from `input` through the shared editor, repainting through
@@ -1647,6 +2471,7 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
         history,
         on_resize,
         InlineKeys::disabled(),
+        None,
         None,
     )
 }
@@ -1700,6 +2525,25 @@ pub(crate) fn composer_prompt(base: &str, attached: Option<u64>) -> String {
 /// belongs to an uninterrupted run of `\u{2190}`s on an untouched empty
 /// composer. Arming until the view opens would make a keystroke's meaning
 /// depend on something the user did minutes ago and can no longer see.
+///
+/// # `pages`: the fullscreen paging sink, and why it is not an [`InlineRead`]
+///
+/// `Some(sink)` turns the four paging keys on and is where each press is
+/// delivered; `None` leaves every byte of them to the editor, which is what
+/// inline and classic pass. The gate is the sink's own presence rather than a
+/// field on [`InlineKeys`] because the two are the same fact: a surface with
+/// nowhere to send a press has no business lifting one out of the stream.
+///
+/// A press is **not** an [`InlineRead`] variant, although
+/// [`InlineRead::Suspended`] and friends are, and the difference is that
+/// those keystrokes hand the terminal to something else while a page press
+/// does not. An outcome ends the read, and `read_chat_line_fullscreen`
+/// re-enters with the draft as `initial`, which is replayed as *bytes*
+/// through a `Cursor` — so the caret lands at the end of the draft, the
+/// editor is new, the `KeyFilter` is new and any reverse search is gone.
+/// Paging with the caret mid-draft would then move the caret on every press.
+/// A sink keeps one read, one editor and one draft across a whole run of
+/// presses.
 pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
     input: &mut R,
     paint: &mut dyn FnMut(&str, usize, &str, bool),
@@ -1707,8 +2551,11 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
     on_resize: &mut dyn FnMut(),
     keys: InlineKeys,
     attached: Option<u64>,
+    pages: Option<&mut dyn FnMut(kitsu_tui::fullscreen::Page)>,
 ) -> std::io::Result<InlineRead> {
     use kitsu_editor::{EditorAction, FeedOutcome, TypeaheadEditor};
+
+    let mut pages = pages;
 
     /// The hint slot, derived exactly as `main.rs`'s `update_live_row`
     /// derives it for the classic row: the reverse-search status while Ctrl+R
@@ -1732,6 +2579,10 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
 
     let mut editor = TypeaheadEditor::new(history.to_vec());
     let mut filter = KeyFilter::new(keys);
+    // The sink is the gate: with one, the four paging sequences are keys and
+    // are lifted out of the stream; without one they are bytes like any
+    // other.
+    filter.pages = pages.is_some();
     // How many `\u{2190}`s of the current uninterrupted run have been seen. A
     // fresh read starts disarmed, so a press that opened the view cannot leak
     // into the next line.
@@ -1838,11 +2689,40 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
                     open_agent_view = true;
                     break;
                 }
+                // Requirement **R6**: the transcript overlay's route. The
+                // reader stays pure for `KeyItem::Open`'s reason -- the
+                // overlay takes the screen this reader paints on -- so the
+                // keystroke is reported and the draft handed back, returning
+                // *at* this item so bytes typed after it belong to the next
+                // read. The draft is carried rather than dropped, which is
+                // **F76**'s replay: the key must not cost the user a
+                // character.
+                KeyItem::OpenTranscript => {
+                    // No disarm of the `\u{2190}\u{2190}` count, unlike every
+                    // other arm: this one returns, so the whole reader state
+                    // dies with it.
+                    return Ok(InlineRead::OpenTranscript(editor.buffer_string()));
+                }
                 // Card **T4-S6a**: `<prefix> d`. With an agent attached this
                 // is the detach route (`InlineRead::Detached`); with nothing
                 // attached it is **inert and silent**, exactly as every other
                 // chord letter is today -- a chord is a slip, and `/detach` is
                 // where a deliberate detach gets an answer.
+                // One paging press. It does **not** end the read: the draft,
+                // its editor, its key filter and any reverse search have to
+                // survive a whole run of presses, which is what a sink buys
+                // over an outcome.
+                KeyItem::Page(press) => {
+                    left_presses = 0;
+                    if let Some(sink) = pages.as_mut() {
+                        sink(press);
+                    }
+                    // The frame the sink just repainted covered the composer
+                    // row, and nothing about the draft changed, so this is the
+                    // only thing that can put the row back -- the same reason
+                    // Ctrl+L's `Redraw` arm sets it.
+                    changed = true;
+                }
                 KeyItem::Detach => {
                     left_presses = 0;
                     if attached.is_some() {
@@ -2168,6 +3048,14 @@ mod tests {
     use super::{
         composer_prompt, read_line_inline_with_keys, InlineKeys, KeyFilter, KeyItem, LEFT_ARROW,
     };
+    // Card T5-S1c-iii: the view's own press type. The decoder's side is what
+    // this crate pins; the anchor's eleven transitions are
+    // `kitsu_tui::fullscreen`'s and are pinned there.
+    use super::enter_fullscreen;
+    use kitsu_tui::fullscreen::Page;
+    // Card R6-c's prerequisite (**F102**): the prompt feed, the rebuild both
+    // ring readers go through, and the second surface that keeps cells.
+    use super::{frame_ring, note_submitted_prompt, FullscreenTap, PromptOrigin};
 
     /// A sink whose buffer outlives the surface that owns it, so bytes written
     /// through a `Box<dyn Write + Send>` stay observable after the surface is
@@ -2271,12 +3159,28 @@ mod tests {
         viewport_rows: u16,
         status: &str,
     ) -> (Option<BridgeGuard>, SharedSink, SharedSink) {
+        install_inline_with_ring(rows, viewport_rows, DEFAULT_TEST_RING, status)
+    }
+
+    /// The cell-ring bound the helper above installs with: a bound every
+    /// existing test is indifferent to, so only the tests that name a bound
+    /// of their own depend on one.
+    const DEFAULT_TEST_RING: usize = 64;
+
+    /// As [`install_inline`], with the cell-ring bound spelled out.
+    fn install_inline_with_ring(
+        rows: u16,
+        viewport_rows: u16,
+        cell_ring_lines: usize,
+        status: &str,
+    ) -> (Option<BridgeGuard>, SharedSink, SharedSink) {
         let out = SharedSink::new();
         let err = SharedSink::new();
         let guard = install(
             TuiMode::Inline,
             rows,
             viewport_rows,
+            cell_ring_lines,
             status,
             Box::new(out.clone()),
             Box::new(err.clone()),
@@ -2421,6 +3325,8 @@ mod tests {
             TuiMode::Classic,
             24,
             3,
+            // A bound classic must not spend: it constructs no surface at all.
+            DEFAULT_TEST_RING,
             "status: idle",
             Box::new(out.clone()),
             Box::new(err.clone()),
@@ -2439,6 +3345,240 @@ mod tests {
         assert!(
             out.is_empty() && err.is_empty(),
             "and write no bytes at all"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // T5-S1b: the cell ring goes live.
+    //
+    // Requirement **N4**. The ring is an opt-in field on the inline surface,
+    // so making it live is one decision in one place: `install` builds the
+    // viewport, and it is the only production constructor of one. These tests
+    // therefore read the ring back through the guard that `install` returned,
+    // which is the same window the overlay will use -- never from the
+    // configuration, and never from the surface's bytes (finding **F71**).
+    //
+    // Classic is not re-pinned here: `install_classic_is_inert` above already
+    // asserts that classic mode constructs no surface at all, and it now does
+    // so while being handed a bound. That classic *cannot* construct a ring is
+    // stronger than any of this and is not a test: `kitsu-render` has no
+    // dependency on `kitsu-tui`, so the ring is unnameable from the classic
+    // renderer at compile time.
+    // ---------------------------------------------------------------------
+
+    use kitsu_render::surface::Fd;
+    use kitsu_tui::cells::CellRing;
+    use kitsu_tui::fullscreen::FullscreenView;
+
+    /// Write `lines` through whatever surface is installed right now, which is
+    /// the seam the whole transcript takes: `kitsu-render`'s writers reach the
+    /// surface slot, never the viewport directly.
+    fn through_the_seam(lines: &[(Fd, &str)]) {
+        let surface = active_surface();
+        for (fd, text) in lines {
+            surface.transcript_line(*fd, text);
+        }
+    }
+
+    /// The ring's retained lines as `(fd, styled bytes)`, which is what every
+    /// assertion below compares.
+    fn retained(guard: &BridgeGuard) -> Vec<(Fd, String)> {
+        guard
+            .cell_lines()
+            .expect("installing the inline viewport in production feeds a cell ring")
+            .iter()
+            .map(|line| (line.fd(), line.styled().to_string()))
+            .collect()
+    }
+
+    /// **The ring is fed in production.** Installing the inline viewport --
+    /// the one production construction of a surface -- builds a ring, and the
+    /// lines that cross the seam afterwards are in it.
+    ///
+    /// Not vacuous twice over: the injected sink is asserted to have received
+    /// both lines, so the writes really happened and the ring is being read
+    /// after a transcript it could have missed; and the retained list is
+    /// compared by value, so a ring that exists and retains nothing fails.
+    #[test]
+    #[serial]
+    fn installing_the_inline_viewport_feeds_a_cell_ring() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let err_before = err.bytes().len();
+
+        through_the_seam(&[(Fd::Stdout, "assistant"), (Fd::Stderr, "tool")]);
+
+        // Each line on its own descriptor, which is also why the ring is
+        // fd-tagged: the two sinks are what the surface actually split.
+        let err_tail = err.text()[err_before..].to_string();
+        assert!(
+            out.text().contains("assistant"),
+            "precondition: the stdout line crossed the seam: {:?}",
+            out.text()
+        );
+        assert!(
+            err_tail.contains("tool"),
+            "precondition: the stderr line crossed the seam: {err_tail:?}"
+        );
+        assert_eq!(
+            retained(&guard),
+            vec![
+                (Fd::Stdout, "assistant".to_string()),
+                (Fd::Stderr, "tool".to_string()),
+            ],
+            "the installed viewport's ring is N4's sole record of the transcript"
+        );
+    }
+
+    /// **The configured bound reaches the ring.** A non-default
+    /// `cell_ring_lines` produces a ring that evicts at exactly that bound, so
+    /// the configuration key has a reader in fact and not only in name.
+    ///
+    /// Two different bounds in one test on purpose: a single bound is
+    /// satisfied by any constant the install might hardcode, including
+    /// `TuiConfig::DEFAULT_CELL_RING_LINES`, whereas two are satisfied only by
+    /// a value that travelled from the caller.
+    #[test]
+    #[serial]
+    fn the_configured_bound_is_the_bound_the_installed_ring_evicts_at() {
+        let _state = GlobalState::capture();
+        for bound in [2_usize, 3] {
+            let (guard, _out, _err) = install_inline_with_ring(24, 1, bound, "status: idle");
+            let guard = guard.expect("inline mode installs a guard");
+            through_the_seam(&[
+                (Fd::Stdout, "one"),
+                (Fd::Stdout, "two"),
+                (Fd::Stdout, "three"),
+                (Fd::Stdout, "four"),
+            ]);
+            let kept = retained(&guard)
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>();
+            let expected = ["one", "two", "three", "four"][4 - bound..]
+                .iter()
+                .map(|text| (*text).to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kept, expected,
+                "a ring installed with a bound of {bound} retains the newest {bound} lines"
+            );
+            drop(guard);
+        }
+    }
+
+    /// **The evicted lines' bytes are retained nowhere.** The achievable
+    /// byte-level claim of **F52**/**F84b**, computed from the ring's contents
+    /// and never from the allocator: the retained bytes are the retained
+    /// lines' and no others, so the sum is the same however many lines were
+    /// pushed past the bound.
+    #[test]
+    #[serial]
+    fn the_live_rings_retained_bytes_are_the_retained_lines_and_no_others() {
+        let _state = GlobalState::capture();
+        let mut sums = Vec::new();
+        for pushes in [8_usize, 40] {
+            let (guard, _out, _err) = install_inline_with_ring(24, 1, 4, "status: idle");
+            let guard = guard.expect("inline mode installs a guard");
+            let lines = (0..pushes)
+                .map(|n| format!("line {n:04}"))
+                .collect::<Vec<_>>();
+            through_the_seam(
+                &lines
+                    .iter()
+                    .map(|text| (Fd::Stdout, text.as_str()))
+                    .collect::<Vec<_>>(),
+            );
+            let kept = retained(&guard);
+            assert_eq!(kept.len(), 4, "the bound holds at {pushes} pushes");
+            sums.push(kept.iter().map(|(_, text)| text.len()).sum::<usize>());
+            drop(guard);
+        }
+        assert_eq!(
+            sums[0], sums[1],
+            "five times the traffic retains the same bytes: the evicted lines' \
+             bytes are held nowhere"
+        );
+    }
+
+    /// **A stored line is the surface's bytes verbatim, styling included**
+    /// (N4, explicitly) -- on the *live* path, not only on the unit one. The
+    /// overlay repaints these rows and the ring is the only copy, so a feed
+    /// that stored the stripped form would decolour the transcript
+    /// irreversibly.
+    #[test]
+    #[serial]
+    fn the_live_cell_ring_stores_the_surfaces_styled_bytes_verbatim() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        through_the_seam(&[(Fd::Stderr, "\x1b[1mtool\x1b[0m")]);
+
+        let lines = guard
+            .cell_lines()
+            .expect("installing the inline viewport in production feeds a cell ring");
+        let line = lines.last().expect("the styled line was retained");
+        assert_eq!(
+            line.styled(),
+            "\x1b[1mtool\x1b[0m",
+            "the SGR bytes are stored as written: they can be stripped later \
+             and never reconstructed"
+        );
+        assert_eq!(
+            line.plain(),
+            "tool",
+            "and the stripped form is derived on demand, not stored"
+        );
+    }
+
+    /// **The reader and the feed, together.** Each half can work while the
+    /// pair does not, so this pins the composition: what the fullscreen view
+    /// paints is the bytes the *installed* surface wrote, styling intact, in
+    /// order.
+    ///
+    /// The view takes a `CellRing`, and the guard hands out the retained
+    /// lines, so the ring the view reads is rebuilt here through
+    /// `CellRing::push` -- the same call the surface's own feed makes, with the
+    /// same `(fd, styled bytes)` the surface produced. Nothing in the
+    /// round-trip can invent styling that the feed did not store, which is the
+    /// property under test.
+    #[test]
+    #[serial]
+    fn the_fullscreen_frame_paints_what_the_installed_surface_wrote() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        let written = [
+            (Fd::Stdout, "plain row"),
+            (Fd::Stderr, "\x1b[31mred row\x1b[0m"),
+            (Fd::Stdout, "last row"),
+        ];
+        through_the_seam(&written);
+
+        let lines = guard
+            .cell_lines()
+            .expect("installing the inline viewport in production feeds a cell ring");
+        let mut ring = CellRing::new(16);
+        for line in &lines {
+            ring.push(line.fd(), line.styled());
+        }
+        let frame = FullscreenView::new().frame(&ring, 3, 80);
+        assert_eq!(
+            frame,
+            written
+                .iter()
+                .map(|(_, text)| kitsu_render::fit_row_to_width(text, 80))
+                .collect::<Vec<_>>(),
+            "the view over the live ring shows the surface's own rows, styling \
+             included, oldest first"
+        );
+        assert!(
+            frame.iter().any(|row| row.contains("\x1b[31m")),
+            "precondition: the frame really carries SGR bytes, so the equality \
+             above is not between two stripped forms: {frame:?}"
         );
     }
 
@@ -2599,6 +3739,871 @@ mod tests {
         assert_eq!(submitted(&read_bytes(b"abc\x15xyz\r").0), "xyz");
         assert_eq!(submitted(&read_bytes(b"abcdef\x1b[H\x1b[C\x0b\r").0), "a");
         assert_eq!(submitted(&read_bytes(b"one two\x17\r").0), "one ");
+    }
+
+    // ---- T5-S1c-iii: the four paging keys ----
+
+    /// The bytes the four paging keys send, named once so no test below
+    /// spells one of them twice.
+    ///
+    /// `PgUp`/`PgDn` are the `~`-terminated family (`ESC[5~`, `ESC[6~`);
+    /// `Ctrl+Home`/`Ctrl+End` are the **modified** forms of the same finals
+    /// plain `Home`/`End` send, which is the collision this card settles.
+    const PG_UP: &[u8] = b"\x1b[5~";
+    const PG_DN: &[u8] = b"\x1b[6~";
+    const CTRL_HOME: &[u8] = b"\x1b[1;5H";
+    const CTRL_END: &[u8] = b"\x1b[1;5F";
+    /// Plain `Home` and `End`, which the editor's `dispatch_csi` reads as
+    /// `move_home`/`move_end` on the bare final byte -- and reads *the same
+    /// way* for the `1;5` parameter today, because its `b'H'`/`b'F'` arms
+    /// ignore the parameters its `b'C'`/`b'D'` arms inspect. Measured: a
+    /// `TypeaheadEditor` fed `"abc"` then `ESC[1;5H` reports
+    /// `(buffer "abc", cursor 0, changed true)`.
+    const PLAIN_HOME: &[u8] = b"\x1b[H";
+    const PLAIN_END: &[u8] = b"\x1b[F";
+
+    /// Drive the reader over `input` **with** a paging sink, returning the
+    /// outcome, every press the sink was handed in order, and every frame.
+    fn read_paging(input: Chunks) -> (InlineRead, Vec<Page>, Vec<Frame>) {
+        let mut input = input;
+        let mut presses: Vec<Page> = Vec::new();
+        let mut frames: Vec<Frame> = Vec::new();
+        let outcome = {
+            let mut paint = |draft: &str, cursor: usize, hint: &str, hint_reserved: bool| {
+                frames.push((draft.to_string(), cursor, hint.to_string(), hint_reserved));
+            };
+            let mut sink = |press: Page| presses.push(press);
+            read_line_inline_with_keys(
+                &mut input,
+                &mut paint,
+                &[],
+                &mut || {},
+                InlineKeys::disabled(),
+                None,
+                Some(&mut sink),
+            )
+            .expect("inline read")
+        };
+        (outcome, presses, frames)
+    }
+
+    /// The same, bytewise: `RawStdinGuard` writes `VMIN = 1`, so a keystroke
+    /// is a read and an escape sequence is four or six of them.
+    fn read_paging_bytewise(bytes: &[u8]) -> (InlineRead, Vec<Page>, Vec<Frame>) {
+        read_paging(Chunks::bytewise(bytes))
+    }
+
+    /// Everything after a submission, as one byte string, for the tests that
+    /// script several sequences in a row.
+    fn script(parts: &[&[u8]]) -> Vec<u8> {
+        parts.iter().flat_map(|part| part.iter().copied()).collect()
+    }
+
+    // ---- R6: Ctrl+O, the transcript overlay's route ----
+
+    /// `Ctrl+O`, as a terminal sends it: one literal control byte, which is
+    /// why it has no partial-sequence case the way the paging keys do.
+    const CTRL_O: &[u8] = b"\x0f";
+
+    /// **Test: `Ctrl+O` ends the read as `OpenTranscript` and carries the
+    /// draft.**
+    ///
+    /// Measured first (**F99**), because the obvious assertion is green
+    /// today and proves nothing: fed `abc` then `0x0f`, the reader reports
+    /// `Eof` with frames `[("",0),("a",1),("ab",2),("abc",3)]` -- the byte
+    /// reaches the editor, whose `0x00..=0x1f` arm drops it, so there is **no
+    /// fourth frame** and the draft and caret are already untouched. "Ctrl+O
+    /// leaves the draft alone" is therefore satisfied by the key not
+    /// existing.
+    ///
+    /// What is red is the pair: the outcome, and the draft *carried on it*.
+    /// Asserting them together is also what pins the replay -- an
+    /// `OpenTranscript(String::new())` would lose the user's three
+    /// characters, which is the **F76** shape the agent-view chord already
+    /// pays for.
+    ///
+    /// The route runs under `InlineKeys::disabled()`, which is the design
+    /// claim: R6 spells `Ctrl+O`, so unlike the agent view's `<prefix> a`
+    /// this key is **not** behind the configurable chord prefix and is not
+    /// switchable off with it.
+    #[test]
+    fn ctrl_o_ends_the_read_as_open_transcript_and_carries_the_draft() {
+        let typed = script(&[b"abc", CTRL_O]);
+        let (outcome, frames) = read_bytes(&typed);
+        assert_eq!(
+            outcome,
+            InlineRead::OpenTranscript("abc".to_string()),
+            "Ctrl+O opens the transcript overlay and hands the draft back for \
+             the caller to replay"
+        );
+        assert_eq!(
+            frames.last(),
+            Some(&("abc".to_string(), 3)),
+            "and the key put nothing in the draft and moved no caret: the \
+             last frame is still the three typed characters"
+        );
+    }
+
+    /// **Test: `Ctrl+O` inside a bracketed paste does not open the overlay.**
+    ///
+    /// The hazard the paging keys have a test for: inside a paste the payload
+    /// is *text*, and a control byte in pasted content must not be read as a
+    /// key.
+    ///
+    /// Measured, and it corrected this test: the editor does **not** take a
+    /// pasted `0x0f` as content either -- fed `ESC[200~ a 0x0f b ESC[201~`
+    /// it reports frames `[("",0),("a",1),("ab",2)]`, because its in-paste
+    /// arm drops `0x00..=0x1f` to keep C1 controls out of the draft. So the
+    /// claim is not "a pasted Ctrl+O is content"; that is a thing this system
+    /// never does, and asserting it would be a specification of a fixture
+    /// (**F61**). The claim is that it is **not a key**: the paste is still a
+    /// paste, and `ab` is still the draft.
+    ///
+    /// Not vacuous, and specifically not green today: the paste half alone is
+    /// satisfied by `Ctrl+O` not existing, so the same byte is fed again
+    /// **outside** the paste in the same read, where it must open the
+    /// overlay. A filter that recognised `Ctrl+O` everywhere fails the first
+    /// assertion; one that recognised it nowhere fails the second.
+    #[test]
+    fn ctrl_o_is_not_a_key_inside_a_bracketed_paste() {
+        let pasted = script(&[b"\x1b[200~", b"a", CTRL_O, b"b", b"\x1b[201~"]);
+        let (outcome, frames) = read_bytes(&pasted);
+        assert_ne!(
+            outcome,
+            InlineRead::OpenTranscript("ab".to_string()),
+            "a pasted Ctrl+O must not open the overlay"
+        );
+        assert_eq!(
+            frames.last(),
+            Some(&("ab".to_string(), 2)),
+            "and the paste is still the paste it was"
+        );
+
+        let then_typed = script(&[b"\x1b[200~", b"a", CTRL_O, b"b", b"\x1b[201~", CTRL_O]);
+        let (outcome, _) = read_bytes(&then_typed);
+        assert_eq!(
+            outcome,
+            InlineRead::OpenTranscript("ab".to_string()),
+            "the same byte after the paste ends is the key again, carrying \
+             the pasted draft"
+        );
+    }
+
+    /// **Test: the four presses reach the sink, and none of them touches the
+    /// draft.**
+    ///
+    /// The card's core. Measured first, because a test derived from a
+    /// description of the defect can be satisfied by the defect (**F99**):
+    /// `ESC[5~` and `ESC[6~` are *already* inert in the editor -- its
+    /// `dispatch_csi` `b'~'` arm has no `5` or `6` parameter and falls through
+    /// to `_ => {}` -- so "`PgUp` leaves the draft alone" is green today and
+    /// proves nothing on its own. What is red today is both halves together:
+    /// the sink is handed nothing at all, and `Ctrl+Home`/`Ctrl+End` *do*
+    /// move the caret, to 0 and back to 3.
+    ///
+    /// So the assertion is the pair -- the exact press list **and** the draft
+    /// with its caret where the user left it.
+    #[test]
+    fn fullscreen_paging_keys_reach_the_sink_and_leave_the_draft_alone() {
+        // `abc` then one left arrow: the caret sits at column 2, which is
+        // where a `Ctrl+Home` that leaked to the editor would not leave it.
+        let typed = script(&[b"abc\x1b[D", PG_UP, PG_DN, CTRL_HOME, CTRL_END]);
+        let (outcome, presses, frames) = read_paging_bytewise(&typed);
+
+        assert_eq!(
+            presses,
+            vec![Page::Up, Page::Down, Page::Oldest, Page::Newest],
+            "each of the four sequences must be lifted out of the byte stream \
+             and delivered to the view's own press type, in the order typed"
+        );
+
+        let (draft, cursor, _, _) = frames.last().expect("at least one paint").clone();
+        assert_eq!(
+            (draft.as_str(), cursor),
+            ("abc", 2),
+            "and none of them may reach the editor: a paging key moves the \
+             frame, never the caret. `Ctrl+Home` is `ESC[1;5H` and plain \
+             `Home` is `ESC[H`, and the editor's `b'H'` arm ignores the \
+             parameters -- so today the press lands on column 0. Frames: \
+             {frames:?}"
+        );
+        assert!(
+            matches!(outcome, InlineRead::Eof),
+            "a press must not end the read: the draft and its editor have to \
+             survive a whole run of them, got {outcome:?}"
+        );
+    }
+
+    /// **Test: the plain forms still move the caret.**
+    ///
+    /// The other half of the collision, and the half a decoder that matched
+    /// on the final byte alone would break. **F65**'s family: an arrow key is
+    /// not one byte, and `ESC[1;5H` and `ESC[H` differ only in the
+    /// parameters. This is the existing keymap test's `Home`/`End` line
+    /// asserted again *with paging switched on*, which is the configuration
+    /// it was never asserted under.
+    #[test]
+    fn fullscreen_paging_leaves_plain_home_and_end_as_cursor_movement() {
+        let typed = script(&[b"bc", PLAIN_HOME, b"a", PLAIN_END, b"d\r"]);
+        let (outcome, presses, _) = read_paging_bytewise(&typed);
+
+        assert_eq!(
+            submitted(&outcome),
+            "abcd",
+            "plain `Home` (`ESC[H`) and plain `End` (`ESC[F`) are cursor \
+             movement on this surface too: only the **modified** form pages"
+        );
+        assert!(
+            presses.is_empty(),
+            "and neither of them is a press: a decoder that keyed on the \
+             final byte `H`/`F` would page here and lose the caret, got \
+             {presses:?}"
+        );
+    }
+
+    /// **Test: the modified forms do not reach the editor.**
+    ///
+    /// The collision's red half, asserted on its own so it does not hide
+    /// behind the press list: this one fails today at the *caret* and would
+    /// still fail for an implementation that delivered the press and let the
+    /// bytes through as well. Measured: `ESC[1;5H` on `"abc"` leaves
+    /// `(buffer "abc", cursor 0, changed true)`, because `dispatch_csi`'s
+    /// `b'H'` arm takes no parameters -- unlike its `b'C'`/`b'D'` arms, which
+    /// match `1;5` for the word jumps.
+    #[test]
+    fn ctrl_home_and_ctrl_end_must_not_reach_the_editor_in_fullscreen() {
+        for sequence in [CTRL_HOME, CTRL_END] {
+            // `abc` then one left arrow parks the caret at column 2, which is
+            // neither end: a leak to `move_home` lands on 0 and a leak to
+            // `move_end` lands on 3.
+            let typed = script(&[b"abc\x1b[D", sequence]);
+            let (_, _, frames) = read_paging_bytewise(&typed);
+            let (draft, cursor, _, _) = frames.last().expect("at least one paint").clone();
+            assert_eq!(
+                (draft.as_str(), cursor),
+                ("abc", 2),
+                "{} must move the frame and not the caret; frames: {frames:?}",
+                String::from_utf8_lossy(sequence).escape_debug()
+            );
+        }
+    }
+
+    /// **Test: every press in a run is delivered, once each.**
+    ///
+    /// **F97**: a test that proves a press happened does not prove presses
+    /// keep happening, and the winning assertion there was a **count**. A
+    /// one-shot latch, a press coalesced with its neighbour, or a sink armed
+    /// only on the first key of a chunk all satisfy "`PgUp` pages" and fail
+    /// here.
+    ///
+    /// Five `PgUp`s then five `PgDn`s, bytewise, so each is its own `read`
+    /// and the `KeyFilter` has to hold four partial sequences per press.
+    #[test]
+    fn a_run_of_page_presses_reaches_the_sink_once_each() {
+        let mut typed: Vec<u8> = Vec::new();
+        for _ in 0..5 {
+            typed.extend_from_slice(PG_UP);
+        }
+        for _ in 0..5 {
+            typed.extend_from_slice(PG_DN);
+        }
+        let (_, presses, _) = read_paging_bytewise(&typed);
+
+        assert_eq!(
+            presses.len(),
+            10,
+            "ten keystrokes are ten presses: {presses:?}"
+        );
+        assert_eq!(
+            presses,
+            [Page::Up; 5]
+                .into_iter()
+                .chain([Page::Down; 5])
+                .collect::<Vec<_>>(),
+            "in order, and with no press standing in for the one before it"
+        );
+    }
+
+    /// **Test: a press split across reads is still one press.**
+    ///
+    /// **F65** by name: an arrow key is not one byte, and the overlay's close
+    /// key ate the first arrow for exactly this reason. `ESC[1;5H` is six
+    /// bytes and a terminal is free to deliver them in any grouping, so the
+    /// chunking the `read` happens to see must not change the meaning --
+    /// which is the discipline `KeyFilter::is_partial` already applies to
+    /// `ESC[D` and to the paste delimiters.
+    ///
+    /// The payload bytes must also not leak: a filter that gave up on a
+    /// partial would hand `5~` or `1;5H` to the editor as **text**.
+    #[test]
+    fn a_page_press_split_across_reads_is_still_one_press() {
+        let (outcome, presses, frames) = read_paging(Chunks::new([
+            b"a", b"\x1b", b"[5", b"~", b"\x1b[1", b";5H", b"\r",
+        ]));
+
+        assert_eq!(
+            presses,
+            vec![Page::Up, Page::Oldest],
+            "two keystrokes split four ways are still two presses"
+        );
+        assert_eq!(
+            submitted(&outcome),
+            "a",
+            "and not one byte of either sequence may reach the draft as text: \
+             a filter that abandoned a partial would type `5~` or `1;5H` into \
+             the user's line. Frames: {frames:?}"
+        );
+    }
+
+    /// **Test: a paging sequence inside a bracketed paste is content.**
+    ///
+    /// The rule `KeyFilter` already states for the chord byte and for
+    /// `ESC[D`, applied to the new sequences: inside a paste the payload is
+    /// *text*, so a pasted transcript carrying `ESC[5~` must not page the
+    /// frame. The editor's own `dispatch_csi` honours only the paste
+    /// terminator while `in_paste`, so the sequences are dropped there
+    /// rather than inserted -- what is asserted here is the press count,
+    /// which is the thing a paste could wrongly produce.
+    #[test]
+    fn a_paged_sequence_inside_a_paste_is_content_and_not_a_press() {
+        let typed = script(&[b"\x1b[200~x", PG_UP, CTRL_END, b"y\x1b[201~\r"]);
+        let (outcome, presses, _) = read_paging_bytewise(&typed);
+
+        assert!(
+            presses.is_empty(),
+            "a paste's payload is text: pasting a captured transcript must \
+             not move the frame, got {presses:?}"
+        );
+        assert_eq!(
+            submitted(&outcome),
+            "xy",
+            "and the paste's own characters still land in the draft"
+        );
+    }
+
+    /// The ring's retained lines as `(is a prompt, stripped text)`, which is
+    /// the pair the prompt-feed tests below compare: a mark with no text
+    /// beside it would pass for a feed that marked an entry it never stored.
+    fn marked(guard: &BridgeGuard) -> Vec<(bool, String)> {
+        guard
+            .cell_lines()
+            .expect("installing the inline viewport in production feeds a cell ring")
+            .iter()
+            .map(|line| (line.is_prompt(), line.plain()))
+            .collect()
+    }
+
+    /// A surface that only records what it is handed, for the tap test below:
+    /// the tap's job is to *see* bytes, so its inner surface must be one whose
+    /// writes are observable without a terminal.
+    #[derive(Clone, Default)]
+    struct SurfaceSpy(Arc<Mutex<Vec<(Fd, String)>>>);
+
+    impl SurfaceSpy {
+        fn written(&self) -> Vec<(Fd, String)> {
+            self.0.lock().expect("spy").clone()
+        }
+    }
+
+    impl Surface for SurfaceSpy {
+        fn transcript_line(&self, fd: Fd, text: &str) {
+            self.0.lock().expect("spy").push((fd, text.to_string()));
+        }
+    }
+
+    /// **Test: a submitted prompt reaches the installed surface's cell ring**
+    /// (**F102**). The storage half can work while nothing feeds it, so this
+    /// pins the *feed*: the ring is **N4**'s sole source for the `Ctrl+O`
+    /// overlay, and a prompt that never arrives there is a transcript with one
+    /// speaker no matter what `CellLine` can represent.
+    ///
+    /// Driven through `note_submitted_prompt` -- the function `run_chat` calls
+    /// at the one point every route a submitted line can take converges -- and
+    /// not through a hand-built surface, because the property is that the
+    /// *installed* surface answers it (**F69**: drive the real path, not a
+    /// predicate beside it).
+    ///
+    /// Not vacuous: a transcript line is written through the same seam first,
+    /// so the ring is being read after traffic it could have missed, and the
+    /// retained list is compared by value, so a ring that exists and retains
+    /// no prompt fails.
+    #[test]
+    #[serial]
+    fn a_submitted_prompt_reaches_the_installed_surfaces_cell_ring() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        through_the_seam(&[(Fd::Stderr, "* session ready")]);
+        note_submitted_prompt("explain the ring", PromptOrigin::User);
+
+        assert_eq!(
+            marked(&guard),
+            vec![
+                (false, "* session ready".to_string()),
+                (true, "explain the ring".to_string()),
+            ],
+            "the installed surface retains the user's line, marked the user's"
+        );
+    }
+
+    /// **Test: and it lands there before the answer it provoked.** The overlay
+    /// repaints the ring in order, so a prompt appended after the turn it
+    /// started would sit beside the wrong answer -- and the answer streams in
+    /// while nothing else is being read, which is precisely why the order must
+    /// be pinned rather than assumed.
+    ///
+    /// The pin is structural: `note_submitted_prompt` is called on the
+    /// single-threaded path between the read and the turn, so this asserts
+    /// that the prompt *precedes* the stream, not that it races it well.
+    #[test]
+    #[serial]
+    fn a_submitted_prompt_lands_in_the_ring_before_the_answer_it_provoked() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        note_submitted_prompt("what is N4?", PromptOrigin::User);
+        // The turn's own output, through the seam the whole transcript takes.
+        through_the_seam(&[
+            (Fd::Stderr, "* thinking"),
+            (Fd::Stdout, "N4 bounds the ring."),
+        ]);
+
+        assert_eq!(
+            marked(&guard),
+            vec![
+                (true, "what is N4?".to_string()),
+                (false, "* thinking".to_string()),
+                (false, "N4 bounds the ring.".to_string()),
+            ],
+            "the prompt is in the ring ahead of the first byte of its answer"
+        );
+    }
+
+    /// **Test: and noting it writes no bytes on either descriptor** -- the
+    /// opposite failure, and the expensive one. The composer erases the
+    /// submitted row, so feeding the prompt as a `transcript_line` would put a
+    /// line on the terminal that the inline renderer's contract says is not
+    /// there (**R3**: one write per transcript line) and change the byte stream
+    /// of every session, which is the shape **F92** was rejected for.
+    ///
+    /// **F71**: asserted on the painted bytes, both sinks, not on a flag.
+    #[test]
+    #[serial]
+    fn noting_a_submitted_prompt_writes_no_bytes_on_either_descriptor() {
+        let _state = GlobalState::capture();
+        let (guard, out, err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let _guard = guard.expect("inline mode installs a guard");
+        let out_before = out.bytes();
+        let err_before = err.bytes();
+
+        note_submitted_prompt("paste-looking secret: hunter2", PromptOrigin::User);
+
+        assert_eq!(
+            out.bytes(),
+            out_before,
+            "the prompt is recorded, never written: stdout is untouched"
+        );
+        assert_eq!(
+            err.bytes(),
+            err_before,
+            "and so is stderr, where the viewport's own bytes go"
+        );
+    }
+
+    /// **Test: a slash command is retained as the user's prompt.** A
+    /// transcript showing `/compact`'s report with no visible `/compact` is
+    /// the same half-feature this card exists to fix, and the command is
+    /// already kept in `history`. The feed must therefore **not** grow a
+    /// `starts_with('/')` exclusion -- which is the tempting one, and the one
+    /// this test forbids.
+    ///
+    /// The slash-dispatch arm in `run_chat` is downstream of the feed, so
+    /// retaining it costs nothing and changes no dispatch.
+    #[test]
+    #[serial]
+    fn a_slash_command_is_retained_as_the_users_own_prompt() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        note_submitted_prompt("/compact", PromptOrigin::User);
+        through_the_seam(&[(Fd::Stderr, "* compacted 12 messages")]);
+
+        assert_eq!(
+            marked(&guard),
+            vec![
+                (true, "/compact".to_string()),
+                (false, "* compacted 12 messages".to_string()),
+            ],
+            "the command the user typed is theirs, and sits above its report"
+        );
+    }
+
+    /// **Test: an injected priority command is never marked the user\'s.**
+    ///
+    /// `run_chat` synthesizes `/resume <id>` after a fork and `/retry` on its
+    /// own, and both join the same `line` binding a typed line does. Marking
+    /// them would put a false claim inside the one record the overlay reads,
+    /// and a transcript is a document: **F77**. That `add_history_entry` has
+    /// carried the same quirk for longer is not a licence to carry it onto a
+    /// new surface -- inherited is not justified.
+    ///
+    /// Asserted as "**no** retained line is the user\'s", which is true under
+    /// either reading of the exclusion -- the injected command left out of the
+    /// ring entirely, or retained unmarked beside its output. The decision was
+    /// "do not mark", so that is exactly what this pins and nothing more
+    /// (**F61**).
+    #[test]
+    #[serial]
+    fn an_injected_priority_command_is_never_marked_the_users_prompt() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        // Both of `run_chat`'s injections, and `/retry` is deliberately one a
+        // user could also type: the provenance is the parameter's, never the
+        // text's.
+        note_submitted_prompt("/resume 7f3a", PromptOrigin::Injected);
+        note_submitted_prompt("/retry", PromptOrigin::Injected);
+        through_the_seam(&[(Fd::Stderr, "* retrying the last turn")]);
+
+        let marks = marked(&guard);
+        assert!(
+            marks.iter().all(|(is_prompt, _)| !is_prompt),
+            "kitsu's own words are never the user's in the transcript: {marks:?}"
+        );
+    }
+
+    /// **Test: a prompt the user broke across lines with `Alt+Enter` is one
+    /// marked cell per line** -- driven from the **bytes**, through the real
+    /// decoder and the real feed, not from a string a test wrote (**F69**).
+    ///
+    /// `ESC CR` is `Alt+Enter`, which the editor inserts as a literal newline
+    /// (`kitsu-editor` lib.rs:336) rather than submitting; the trailing `CR`
+    /// submits. Measured before asserting (**F99/F100**): the reader returns
+    /// `"first line\nsecond line"` for these bytes today.
+    #[test]
+    #[serial]
+    fn an_alt_enter_prompt_reaches_the_ring_as_one_marked_cell_per_line() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        let outcome = read_bytes(b"first line\x1b\rsecond line\r").0;
+        assert_eq!(
+            submitted(&outcome),
+            "first line\nsecond line",
+            "precondition: Alt+Enter drafted one line with an embedded newline"
+        );
+        note_submitted_prompt(submitted(&outcome), PromptOrigin::User);
+
+        assert_eq!(
+            marked(&guard),
+            vec![
+                (true, "first line".to_string()),
+                (true, "second line".to_string()),
+            ],
+            "one cell per line, every one the user's: a cell with an embedded \
+             newline is painted as one row the frame cannot fit"
+        );
+    }
+
+    /// **Test: and so is a prompt pasted with newlines in it** -- the other
+    /// input path, because a rule is only as wide as the narrowest input that
+    /// feeds it (**F70**).
+    ///
+    /// Inside `ESC[200~` ... `ESC[201~` the payload is *text*, so its newlines
+    /// insert instead of submitting, and the editor collapses `CR LF` into one
+    /// newline (`kitsu-editor` lib.rs:126). Measured before asserting
+    /// (**F99/F100**): this paste and its `LF`-only twin both draft
+    /// `"first line\nsecond line"`, so the `\r` cannot reach a cell and no
+    /// assertion here depends on one.
+    #[test]
+    #[serial]
+    fn a_pasted_multi_line_prompt_reaches_the_ring_as_one_marked_cell_per_line() {
+        let _state = GlobalState::capture();
+        let (guard, _out, _err) = install_inline_with_ring(24, 1, 16, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+
+        let outcome = read_bytes(b"\x1b[200~first line\r\nsecond line\x1b[201~\r").0;
+        assert_eq!(
+            submitted(&outcome),
+            "first line\nsecond line",
+            "precondition: the paste drafted one line with an embedded newline"
+        );
+        note_submitted_prompt(submitted(&outcome), PromptOrigin::User);
+
+        assert_eq!(
+            marked(&guard),
+            vec![
+                (true, "first line".to_string()),
+                (true, "second line".to_string()),
+            ],
+            "a pasted block is split and marked exactly as an Alt+Enter one is"
+        );
+    }
+
+    /// **Test: the frame's ring keeps the prompt marks of the lines it
+    /// repacks.** `frame_ring` is the chokepoint *both* readers go through --
+    /// the fullscreen frame and the `Ctrl+O` overlay -- and it rebuilds the
+    /// ring from `(fd, styled)` alone, so a mark stored faithfully by the feed
+    /// is dropped here and the overlay sees one speaker anyway.
+    ///
+    /// This is the half that a correct feed does not fix. It is asserted on
+    /// the repacked ring's own lines, which is what a reader is handed.
+    #[test]
+    fn frame_ring_keeps_the_prompt_marks_of_the_lines_it_repacks() {
+        let mut source = kitsu_tui::cells::CellRing::new(8);
+        source.push_prompt("explain the ring");
+        source.push(Fd::Stdout, "the ring is bounded");
+        source.push_prompt("by what?");
+
+        let repacked = frame_ring(&source.lines());
+
+        assert_eq!(
+            repacked
+                .lines()
+                .iter()
+                .map(|line| (line.is_prompt(), line.plain()))
+                .collect::<Vec<_>>(),
+            vec![
+                (true, "explain the ring".to_string()),
+                (false, "the ring is bounded".to_string()),
+                (true, "by what?".to_string()),
+            ],
+            "the frame and the overlay both read through this rebuild: a mark \
+             lost here is lost to every reader"
+        );
+    }
+
+    /// **Test: the fullscreen tap records a submitted prompt too, and
+    /// forwards no bytes for it.** The tap's ring is the *only* ring while a
+    /// fullscreen segment holds the screen -- `install` is inert in that mode,
+    /// so there is no inline surface behind it -- which makes this a second
+    /// surface the feed must reach, and `Surface::note_prompt`'s default is to
+    /// do nothing. An overlay that shows prompts inline and not in fullscreen
+    /// is **F89**/**F84** in the direction that bites: the key works on one
+    /// surface and quietly does nothing on the other.
+    ///
+    /// The displaced surface is asserted untouched as well, because the tap's
+    /// every other method forwards, and forwarding this one would write the
+    /// prompt onto the alternate screen the composer just cleared it from.
+    #[test]
+    fn the_fullscreen_tap_records_a_submitted_prompt_without_forwarding_bytes() {
+        let spy = SurfaceSpy::default();
+        let tap = FullscreenTap {
+            inner: Arc::new(spy.clone()),
+            ring: std::sync::Mutex::new(kitsu_tui::cells::CellRing::new(8)),
+        };
+
+        tap.transcript_line(Fd::Stdout, "a streamed row");
+        tap.note_prompt("what did that do?");
+
+        assert_eq!(
+            tap.lines()
+                .iter()
+                .map(|line| (line.is_prompt(), line.plain()))
+                .collect::<Vec<_>>(),
+            vec![
+                (false, "a streamed row".to_string()),
+                (true, "what did that do?".to_string()),
+            ],
+            "the tap's ring is the only ring in fullscreen, so the prompt must \
+             reach it"
+        );
+        assert_eq!(
+            spy.written(),
+            vec![(Fd::Stdout, "a streamed row".to_string())],
+            "and the prompt is recorded, not forwarded: the composer already \
+             cleared it from the screen"
+        );
+    }
+
+    /// **Test: the paging anchor lives on the segment, and the segment's own
+    /// `Drop` is the only thing that clears it.**
+    ///
+    /// Findings **F94/F96/F98**: the paths out of fullscreen are enumerable
+    /// and every one of them goes through this type's single [`Drop`] -- a
+    /// `/tui` swap, a `run_chat` return, a panic. An anchor kept in a static
+    /// or beside the segment would be a second thing to put back, so this
+    /// pins the anchor's *home* rather than its arithmetic: the eleven
+    /// transitions are `kitsu_tui::fullscreen`'s and are pinned there.
+    ///
+    /// **F71**: the press is checked on the painted bytes as well as on the
+    /// flag, because a flag that flips while the frame stands still is the
+    /// defect this card exists to prevent.
+    #[test]
+    #[serial]
+    fn the_paging_anchor_lives_on_the_segment_and_its_drop_is_the_clearer() {
+        /// The frame rows in one chunk of painted bytes, in order.
+        ///
+        /// Every frame this type writes is `ESC[2J ESC[H` (the entry paint
+        /// adds the screen and title enables in front) followed by one row per
+        /// CRLF, so the rows are what follows the last cursor home.
+        fn frame_rows(painted: &str) -> Vec<String> {
+            painted
+                .rsplit("\x1b[H")
+                .next()
+                .unwrap_or(painted)
+                .split("\r\n")
+                .filter(|row| !row.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+
+        let _state = GlobalState::capture();
+
+        // Sixty lines into a 24-row window: the entry frame is `rows - 1` of
+        // them, so there are thirty-seven lines above it for a press to
+        // reveal. NON-VACUOUS, and the reason the oldest and newest line
+        // texts below are distinguishable.
+        let mut ring = CellRing::new(60);
+        for row in 1..=60 {
+            ring.push(Fd::Stdout, &format!("ROW_{row:02}"));
+        }
+        let lines = ring.lines();
+
+        let sink = SharedSink::new();
+        let mut segment = enter_fullscreen(Box::new(sink.clone()), &lines, 24, 80, 10_000);
+        assert!(
+            segment.is_following(),
+            "NON-VACUOUS: a fresh segment follows the newest line, or a press \
+             has nothing to change"
+        );
+        let entry = sink.text();
+        assert!(
+            entry.contains("ROW_60"),
+            "NON-VACUOUS: the entry frame must be the newest lines; the \
+             segment wrote:\n{}",
+            entry.escape_debug()
+        );
+
+        let before = sink.bytes().len();
+        segment.page(Page::Up, 24, 80);
+        assert!(
+            !segment.is_following(),
+            "one `PgUp` with thirty-seven lines above the window pins the \
+             anchor (transition 1), and the anchor it pins is this segment's"
+        );
+        let painted = String::from_utf8_lossy(&sink.bytes()[before..]).into_owned();
+        let paged_frame = frame_rows(&painted);
+        assert!(
+            !paged_frame.is_empty() && !painted.contains("ROW_60"),
+            "and the press must repaint the frame from the new anchor: the \
+             frame does not follow the ring here, so nothing else will ever \
+             paint it, and the newest line has to leave the screen. The \
+             segment wrote, in answer to the press:\n{}",
+            painted.escape_debug()
+        );
+        assert_ne!(
+            paged_frame,
+            frame_rows(&entry),
+            "by value, so a press that flipped the anchor and repainted the \
+             same rows fails. How far one press moves is `page_step`'s, and it \
+             is pinned in `kitsu_tui::fullscreen` -- naming a row number here \
+             would be a second home for one piece of arithmetic."
+        );
+
+        // **And the anchor survives a repaint.** The frame is constructed per
+        // paint, so an anchor read from a fresh view would silently un-pin on
+        // the next line the session writes -- paging that lasts until the next
+        // output. One line through the seam, one `repaint_if_the_ring_grew`,
+        // and the *same rows* have to come back: a snap to following would
+        // show the newest line instead, which is what this test's name
+        // promises and what nothing else covers.
+        let before_growth = sink.bytes().len();
+        through_the_seam(&[(Fd::Stdout, "APPENDED_WHILE_PINNED")]);
+        segment.repaint_if_the_ring_grew(24, 80);
+        let repainted = String::from_utf8_lossy(&sink.bytes()[before_growth..]).into_owned();
+        assert_eq!(
+            frame_rows(&repainted),
+            paged_frame,
+            "a repaint must come from the segment's anchor and not from a \
+             fresh view: same anchor, same rows. The segment wrote:\n{}",
+            repainted.escape_debug()
+        );
+        assert!(
+            !segment.is_following(),
+            "and the growth must not have re-latched following (transition 10 \
+             is suppressed while pinned)"
+        );
+
+        let after_press = sink.bytes().len();
+        segment.page(Page::Newest, 24, 80);
+        assert!(
+            segment.is_following(),
+            "`Ctrl+End` re-latches following (transition 9)"
+        );
+        let relatched = String::from_utf8_lossy(&sink.bytes()[after_press..]).into_owned();
+        assert!(
+            relatched.contains("ROW_60"),
+            "and repaints the newest line back onto the screen:\n{}",
+            relatched.escape_debug()
+        );
+
+        // The anchor does not outlive the segment: pin one, drop it, and the
+        // next segment over the same ring follows again. A static or a
+        // process-global anchor passes every assertion above and fails here.
+        segment.page(Page::Oldest, 24, 80);
+        assert!(!segment.is_following(), "pinned at the oldest line");
+        drop(segment);
+
+        let second = SharedSink::new();
+        let next = enter_fullscreen(Box::new(second.clone()), &lines, 24, 80, 10_000);
+        assert!(
+            next.is_following(),
+            "the paging state is the segment's: a new one must start at the \
+             newest line and not inherit the last segment's anchor"
+        );
+        assert!(
+            second.text().contains("ROW_60"),
+            "...which its entry frame shows; it wrote:\n{}",
+            second.text().escape_debug()
+        );
+        drop(next);
+    }
+
+    /// **Test: inline and classic page nothing, and the four sequences keep
+    /// today's meaning there.**
+    ///
+    /// The scope negative, and it is pinned by what the *absence* of a sink
+    /// does rather than by a source read: production's inline call site
+    /// passes `None`, so the reader with `None` is inline's reader.
+    ///
+    /// Measured, so the assertions are today's behaviour and not a guess at
+    /// it: `ESC[5~` and `ESC[6~` are swallowed by the editor with
+    /// `changed: false` and no action, and `ESC[1;5H`/`ESC[1;5F` move the
+    /// caret to the start and to the end. The second pair is what makes this
+    /// test bite: a decoder that recognised the paging keys in the reader
+    /// *unconditionally* would pass every other test on this card and break
+    /// `Ctrl+Home` for every inline user.
+    #[test]
+    fn inline_pages_nothing_and_keeps_todays_meaning_for_the_four_sequences() {
+        // `PgUp`/`PgDn` are inert: the draft and the caret are untouched and
+        // the read continues.
+        let typed = script(&[b"abc", PG_UP, PG_DN, b"\r"]);
+        let (outcome, frames) = drive_frames(Chunks::bytewise(&typed), &[]);
+        assert_eq!(
+            submitted(&outcome),
+            "abc",
+            "`PgUp`/`PgDn` are inert at the inline composer, as they are \
+             today: frames {frames:?}"
+        );
+
+        // `Ctrl+Home`/`Ctrl+End` are `Home`/`End` there, which is what the
+        // editor's parameter-blind `b'H'`/`b'F'` arms make them.
+        let typed = script(&[b"bc", CTRL_HOME, b"a", CTRL_END, b"d\r"]);
+        let (outcome, _) = drive_frames(Chunks::bytewise(&typed), &[]);
+        assert_eq!(
+            submitted(&outcome),
+            "abcd",
+            "and `Ctrl+Home`/`Ctrl+End` still reach the editor in inline, \
+             where there is no frame for them to move: these keys are live \
+             only while fullscreen holds the screen, which is also why §4.7 \
+             keeps them out of `keys::BINDINGS`"
+        );
     }
 
     /// Test 10. ↑/↓ walk the `history` argument, and the paint callback shows
@@ -5344,6 +7349,12 @@ mod tests {
     /// here fails immediately instead of leaving a signal exit that restores
     /// less than a panic does.
     #[test]
+    // **F107**: not optional. `#[serial]` excludes other `#[serial]` tests, not
+    // plain ones, and this test reaches the process-global surface slot through
+    // PRODUCTION code rather than `SurfaceProbe`, so it can install over a
+    // serialised test's probe mid-run. Measured: 3 failures in 421 unguarded
+    // runs of `--bins`, 0 in 400 with this guard.
+    #[serial_test::serial]
     fn the_handler_byte_string_equals_the_restore_helper_output() {
         let mut helper = Vec::new();
         kitsu_tui::write_restore_sequences(&mut helper).expect("writing into a Vec cannot fail");
@@ -6269,8 +8280,16 @@ mod tests {
     fn read_attached(input: Chunks, keys: InlineKeys, attached: Option<u64>) -> InlineRead {
         let mut input = input;
         let mut paint = |_: &str, _: usize, _: &str, _: bool| {};
-        read_line_inline_with_keys(&mut input, &mut paint, &[], &mut || {}, keys, attached)
-            .expect("inline read")
+        read_line_inline_with_keys(
+            &mut input,
+            &mut paint,
+            &[],
+            &mut || {},
+            keys,
+            attached,
+            None,
+        )
+        .expect("inline read")
     }
 
     /// **The `←` rule, positive half.** One `←` on an empty composer while
