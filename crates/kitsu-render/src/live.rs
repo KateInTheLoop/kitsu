@@ -83,6 +83,34 @@ fn state() -> &'static Mutex<LiveRowState> {
 /// outermost suspension owns the terminal row.
 static SUSPEND_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
+/// Does the terminal cursor stand part way along a row that already holds
+/// assistant text?
+///
+/// The region is painted with no absolute positioning — `render_region`'s fast
+/// path writes `\r\x1b[2K{status}` and `clear_region_locked` walks upward
+/// clearing rows — so it always acts on whatever row the cursor occupies. Every
+/// transcript writer but one leaves the cursor at column 0 of a fresh row,
+/// which is what makes that safe. A message or streamed answer whose last line
+/// carries no terminating newline does not: the row under the cursor is the
+/// answer's last line, and painting the region there erases it. Writers that
+/// can leave such a row set this flag (see `set_partial_line`); the next paint
+/// steps down onto a fresh row first and clears it.
+static PARTIAL_LINE: AtomicBool = AtomicBool::new(false);
+
+/// Record whether the last stdout transcript write left an unterminated line
+/// on the live row's terminal. Only writers that share the row's terminal need
+/// call this; a stdout that is redirected away cannot move the row's cursor.
+pub fn set_partial_line(partial: bool) {
+    PARTIAL_LINE.store(partial, Ordering::Release);
+}
+
+/// Whether a partial line is still unprotected. Consumes the flag: the caller
+/// is about to step the cursor onto a fresh row, after which the text row is
+/// out of the region's reach.
+fn take_partial_line() -> bool {
+    PARTIAL_LINE.swap(false, Ordering::AcqRel)
+}
+
 /// Finding F15's off switch: whether a live status row may be painted at all.
 ///
 /// Default `true`, so a session without the inline viewport is byte-identical
@@ -211,7 +239,7 @@ fn fit_draft_window(buffer: &str, cursor: usize, avail: usize) -> (String, usize
 /// The ambient background-agent tag (trailing space included), or `None`
 /// when no detached agent is blocked or running. Blocked outranks running:
 /// an agent waiting on the user is the thing the user must act on. Pure.
-fn agents_tag(blocked: usize, running: usize) -> Option<String> {
+pub fn agents_tag(blocked: usize, running: usize) -> Option<String> {
     if blocked > 0 {
         Some(format!("[{blocked} blocked] "))
     } else if running == 1 {
@@ -221,6 +249,213 @@ fn agents_tag(blocked: usize, running: usize) -> Option<String> {
     } else {
         None
     }
+}
+
+/// The pending-stack tag (trailing space included), or `None` when nothing is
+/// queued. Named rather than inlined so the classic live row and R5's status
+/// row cannot drift apart on the literal (finding F38). Pure.
+pub fn queued_tag(queued: usize) -> Option<String> {
+    (queued > 0).then(|| format!("[{queued} queued] "))
+}
+
+/// Everything requirement **R5**'s persistent status row shows, as data:
+/// pure input to [`compose_status_row`].
+///
+/// It lives here, beside [`LiveDraft`], because the row's *content* is shared
+/// by both renderers — the inline viewport paints it as a pinned bottom row,
+/// the classic renderer can reach the same composer later — and `kitsu-tui`
+/// depends on `kitsu-render`, never the reverse.
+#[derive(Clone, Debug, Default)]
+pub struct StatusFields {
+    /// The live model id.
+    pub model: String,
+    /// Context tokens used and the effective window, for the meter.
+    pub used: u64,
+    pub effective: u64,
+    /// Elapsed time in the current turn, or `None` between turns.
+    pub elapsed: Option<std::time::Duration>,
+    /// Depth of the prompt queue, behind `[N queued]`.
+    pub queued: usize,
+    /// Detached agents needing input, and running, behind the ambient tag.
+    pub blocked: usize,
+    pub running: usize,
+    /// The background agent this composer is attached to, behind
+    /// `attached \u{b7} agent N`, or `None` when the composer is the
+    /// session's own (card **T4-S6-status**, design \u{a7}4.5).
+    ///
+    /// Derived from the composer loop's one session binding on every read --
+    /// the same binding `composer_prompt` takes its label from (**F75**) --
+    /// so the row and the prompt label cannot disagree about what the user is
+    /// attached to.
+    pub attached: Option<u64>,
+}
+
+/// Cells in the status row's meter. `/context` renders sixteen in a block it
+/// owns three lines of; a one-line row shared with four other segments gets
+/// half that, so the meter costs the row twelve columns rather than twenty.
+const STATUS_METER_CELLS: u64 = 8;
+
+/// The shortest model segment worth keeping. Below this the model is dropped
+/// outright instead of truncated to an unreadable stub.
+const STATUS_MODEL_MIN_COLS: usize = 7;
+
+/// The separator between the row's content segments, and the width charged
+/// for joining any two pieces (the tags join with one space, so charging the
+/// widest separator can only leave the row narrower than its budget).
+const STATUS_SEP: &str = " · ";
+
+/// The compact context meter: filled/empty cells and the utilisation
+/// percentage. `None` when no window is known, since a meter with no
+/// denominator would read as an empty context rather than an unknown one.
+fn status_meter(used: u64, effective: u64) -> Option<String> {
+    if effective == 0 {
+        return None;
+    }
+    let pct = (used.saturating_mul(100) / effective).min(999);
+    let filled = {
+        let cells = (used.saturating_mul(STATUS_METER_CELLS) / effective).min(STATUS_METER_CELLS);
+        // A non-empty context never reads as wholly empty, as in `/context`.
+        if used > 0 && cells == 0 {
+            1
+        } else {
+            cells
+        }
+    };
+    let cells: String = (0..STATUS_METER_CELLS)
+        .map(|index| if index < filled { '■' } else { '□' })
+        .collect();
+    Some(format!("{cells} {pct}%"))
+}
+
+/// Keep a `budget`-wide prefix of `text`, marking the cut with `…`.
+fn clip_to(text: &str, budget: usize) -> String {
+    if display_width(text) <= budget {
+        return text.to_string();
+    }
+    let room = budget.saturating_sub(1);
+    let mut used = 0usize;
+    let mut clipped: String = text
+        .chars()
+        .take_while(|&ch| {
+            used += crate::char_display_width(ch);
+            used <= room
+        })
+        .collect();
+    clipped.push('…');
+    clipped
+}
+
+/// Compose requirement **R5**'s one-line status row: model, context meter,
+/// elapsed turn time, `[N queued]` and the ambient background-agent tag,
+/// clamped to `cols` so it can never wrap. Pure.
+///
+/// # Drop order
+///
+/// First dropped to last kept: **meter, elapsed, model, `[N queued]`,
+/// `attached · agent N`, ambient tag**. Decoration yields to content,
+/// exactly as the classic row's spinner yields to the draft: the meter goes first because `/context` renders it on
+/// demand, elapsed next because the spinner already carries elapsed past five
+/// seconds, the model is truncated before it is dropped (long and static),
+/// and the ambient tag is last standing because a blocked agent is the thing
+/// the user must act on.
+///
+/// Segments are considered in reverse drop order, each against what the
+/// higher-priority ones left, so a narrower terminal can only ever lose
+/// segments — a dropped segment never reappears as the row shrinks.
+///
+/// The ambient tag is [`agents_tag`]'s own text and the queue tag is
+/// [`queued_tag`]'s: R5's `← N agents` form is forbidden until A1's
+/// left-arrow affordance exists, so there is exactly one source for each.
+pub fn compose_status_row(fields: &StatusFields, cols: usize) -> String {
+    let sep_width = display_width(STATUS_SEP);
+    let mut used = 0usize;
+    // Charge the join for every piece after the first.
+    let fits = |width: usize, used: &mut usize| -> bool {
+        let cost = width + if *used == 0 { 0 } else { sep_width };
+        if *used + cost <= cols {
+            *used += cost;
+            true
+        } else {
+            false
+        }
+    };
+
+    // 1. The ambient tag, last in the drop order and so first to claim room.
+    let agents = agents_tag(fields.blocked, fields.running)
+        .map(|tag| tag.trim_end().to_string())
+        .filter(|tag| fits(display_width(tag), &mut used));
+    // 2. The attachment label (card **T4-S6-status**, design §4.5). It claims
+    //    room right after the ambient tag: §4.5's amendment rests the
+    //    `←`-detaches-on-the-first-press rule on the attachment being legible
+    //    at the moment of the press, so it outranks `[N queued]`, the model,
+    //    elapsed and the meter; it still yields to the ambient tag, because a
+    //    blocked agent is the thing the user must act on while losing this
+    //    label costs one keystroke.
+    //
+    //    Derived from `fields.attached` on every call and never remembered,
+    //    so a repaint composes it again from the one session binding the
+    //    composer prompt label reads (**F75**).
+    let attached = fields
+        .attached
+        .map(|id| format!("attached · agent {id}"))
+        .filter(|label| fits(display_width(label), &mut used));
+    // 3. The queue tag.
+    let queue = queued_tag(fields.queued)
+        .map(|tag| tag.trim_end().to_string())
+        .filter(|tag| fits(display_width(tag), &mut used));
+    // 4. The model: truncated before it is dropped.
+    let model_width = display_width(&fields.model);
+    let (model, model_whole) = if fields.model.is_empty() {
+        (None, true)
+    } else if fits(model_width, &mut used) {
+        (Some(fields.model.clone()), true)
+    } else {
+        let room = cols
+            .saturating_sub(used + if used == 0 { 0 } else { sep_width })
+            .min(model_width);
+        if room >= STATUS_MODEL_MIN_COLS {
+            let clipped = clip_to(&fields.model, room);
+            used += display_width(&clipped) + if used == 0 { 0 } else { sep_width };
+            (Some(clipped), false)
+        } else {
+            (None, false)
+        }
+    };
+    // 5. Elapsed, only once the model is whole: the model outranks it, so a
+    //    truncated model means elapsed is already gone.
+    let elapsed = fields
+        .elapsed
+        .filter(|_| model_whole)
+        .map(crate::format_wait_elapsed)
+        .filter(|text| fits(display_width(text), &mut used));
+    // 6. The meter, first to go, so last to be offered room. It needs the
+    //    model whole and elapsed either absent from the data or still kept.
+    let elapsed_intact = fields.elapsed.is_none() || elapsed.is_some();
+    let meter = status_meter(fields.used, fields.effective)
+        .filter(|_| model_whole && elapsed_intact)
+        .filter(|text| fits(display_width(text), &mut used));
+
+    let mut content: Vec<String> = Vec::new();
+    if let Some(attached) = attached {
+        content.push(attached);
+    }
+    if let Some(model) = model {
+        content.push(model);
+    }
+    if let Some(meter) = meter {
+        content.push(format!("{}", meter.dimmed()));
+    }
+    if let Some(elapsed) = elapsed {
+        content.push(format!("{}", elapsed.dimmed()));
+    }
+    let mut row = content.join(STATUS_SEP);
+    for tag in [queue, agents].into_iter().flatten() {
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        row.push_str(&format!("{}", tag.dimmed()));
+    }
+    row
 }
 
 fn compose_row(
@@ -237,7 +472,7 @@ fn compose_row(
     };
     // The pending-stack tag sits between the spinner and the prompt; its
     // trailing space is part of its width.
-    let queue_tag = (queued > 0).then(|| format!("[{queued} queued] "));
+    let queue_tag = queued_tag(queued);
     let queue_tag_width = queue_tag.as_deref().map(display_width).unwrap_or(0);
     // The background-agent tag sits leftmost of the tags, before the queue
     // tag; its trailing space is part of its width too.
@@ -585,7 +820,7 @@ fn compose_draft_context_rows(
 /// Compose the dimmed queued-prompt stack rows shown above the status row:
 /// up to three upcoming prompts in execution order, then a `+N more` row.
 /// Pure for unit testing. Rows are pre-truncated to `cols`.
-fn compose_stack_rows(previews: &[String], queued: usize, cols: usize) -> Vec<String> {
+pub fn compose_stack_rows(previews: &[String], queued: usize, cols: usize) -> Vec<String> {
     if queued == 0 || previews.is_empty() {
         return Vec::new();
     }
@@ -676,6 +911,14 @@ fn render_region(err: &mut impl Write, row_state: &mut LiveRowState, cols: usize
             row_state.drawn_rows = 0;
         }
         return;
+    }
+    // The region is about to be painted on the row the cursor occupies. When
+    // that row holds the unterminated last line of an answer, step down onto a
+    // fresh row first: otherwise the paint (or the clear that precedes the
+    // next one) erases text the user is meant to keep. Only reachable with no
+    // region drawn — a drawn region already owns the cursor's row.
+    if row_state.drawn_rows == 0 && take_partial_line() {
+        let _ = write!(err, "\r\n");
     }
     // A resize invalidates the painted stack rows (they hold the old
     // width); force the full-repaint path (sonnet review, cycle 9).
@@ -1774,7 +2017,7 @@ mod tests {
     // ------------------------------------------------------------------
     // The inline viewport's shared composition surface.
     //
-    // The inline renderer (`KITSU_TUI=inline`) paints its own pinned row and
+    // The inline renderer (`--tui inline`) paints its own pinned row and
     // has no spinner, queue tag or agent tag to place, but it needs exactly
     // the hint handling this module already implements: a reserved
     // reverse-search status that claims its columns before the draft is

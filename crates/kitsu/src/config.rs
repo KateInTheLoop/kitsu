@@ -66,6 +66,12 @@ pub struct Config {
     /// handed a silently materialized table.
     #[serde(default)]
     pub hooks: Option<HooksConfig>,
+    /// Optional `[tui]` table (design §4.8). Absent is the same as every key
+    /// at its default, which is why callers read it as
+    /// `tui.unwrap_or_default()` rather than being handed a silently
+    /// materialized table.
+    #[serde(default)]
+    pub tui: Option<TuiConfig>,
 }
 
 /// When the per-process agent state file is written (docs/architecture.md).
@@ -80,14 +86,43 @@ pub enum StateFileMode {
     Off,
 }
 
+/// How a background agent's ungranted permission request is handled
+/// (design B1). `FailClosed` is today's behaviour and the default everywhere:
+/// a detached agent's gate returns an error instead of waiting for a human, so
+/// a headless run cannot stall. `Ask` parks the agent in the registry so the
+/// user can answer it.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBlockingMode {
+    /// Park the request and mark the agent blocked until it is answered or
+    /// `block_timeout_secs` elapses.
+    Ask,
+    /// Return the fail-closed error immediately; nothing is ever parked.
+    #[default]
+    FailClosed,
+}
+
+/// B3's default blocking timeout in seconds (30 minutes). The unit lives in
+/// the key name deliberately: a bare `block_timeout = 30` is exactly where a
+/// reader guesses wrong between seconds and minutes.
+fn default_block_timeout_secs() -> u64 {
+    crate::subagent::DEFAULT_AGENT_BLOCK_TIMEOUT.as_secs()
+}
+
 /// The `[agents]` table. Unknown keys are rejected loudly: `agent_spawn_cap`
 /// deliberately stays a flat top-level key, so a copy of it in here is a
 /// mistake and must not be silently ignored.
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentsConfig {
     #[serde(default)]
     pub state_file: StateFileMode,
+    /// How an ungranted permission request from a background agent is handled.
+    #[serde(default)]
+    pub blocking: AgentBlockingMode,
+    /// How long a parked request waits before it resolves `Interrupt` (B3).
+    #[serde(default = "default_block_timeout_secs")]
+    pub block_timeout_secs: u64,
 }
 
 /// Well-known loopback ports of OpenAI-compatible local runtimes, probed in
@@ -98,6 +133,28 @@ const LOCAL_SERVERS: &[(u16, &str)] = &[
     (8080, "llama.cpp"),
     (8000, "vLLM"),
 ];
+
+// Hand-written rather than derived: every caller reads the table as
+// `agents.unwrap_or_default()`, so a derived `Default` would hand a config with
+// no `[agents]` table a ZERO-second block timeout while `#[serde(default =
+// ...)]` only covers the key's absence inside a table that is present.
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            state_file: StateFileMode::default(),
+            blocking: AgentBlockingMode::default(),
+            block_timeout_secs: default_block_timeout_secs(),
+        }
+    }
+}
+
+impl AgentsConfig {
+    /// The configured blocking timeout as a `Duration`.
+    pub fn block_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.block_timeout_secs)
+    }
+}
+
 /// The `[hooks]` table. Unknown keys are rejected loudly, so a typo in a hook
 /// name is an error rather than a hook that silently never runs.
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
@@ -108,6 +165,370 @@ pub struct HooksConfig {
     /// `agent_hook`'s job. An empty or whitespace-only string means no hook.
     #[serde(default)]
     pub on_agent_state: Option<String>,
+}
+
+/// Which renderer a chat session runs (`[tui] mode`, design §4.8).
+///
+/// All three spellings of the design's grammar parse. `fullscreen` was held
+/// back while there was nothing to select — a value that parsed and silently
+/// behaved as `inline` is the quiet coercion this table exists to prevent —
+/// and it became a variant when its renderer became reachable: the switch
+/// takes the terminal's alternate screen and paints the inline cell ring's
+/// tail through `kitsu_tui::fullscreen::FullscreenView`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TuiMode {
+    /// The line renderer kitsu has always had, and the default: the inline
+    /// viewport is a preview until the terminal matrix
+    /// (docs/roadmap/cycles/e11/terminal-matrix.md) has been run by a human.
+    #[default]
+    Classic,
+    /// The pinned inline viewport from `kitsu-tui`.
+    Inline,
+    /// The fullscreen transcript renderer: the terminal's alternate screen,
+    /// painted from the cell ring the inline viewport retains. A session can
+    /// start in it (`--tui fullscreen`, `mode = "fullscreen"`) and `/tui
+    /// fullscreen` switches into it, because a mode a user can switch to but
+    /// cannot start in is incoherent.
+    Fullscreen,
+}
+
+/// Whether a session takes the terminal's alternate screen (`[tui]
+/// alternate_screen`).
+///
+/// A tri-state rather than a boolean, because `auto` ("whatever this terminal
+/// and this renderer can do") is not expressible as one, and a boolean would
+/// make the two explicit answers indistinguishable from the inferred one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AlternateScreen {
+    /// Let the renderer decide. The default.
+    #[default]
+    Auto,
+    /// Always take the alternate screen.
+    Always,
+    /// Never take it. **F62**: no door reaches this today -- `[tui]
+    /// alternate_screen = "never"` is refused by the deserializer and
+    /// `--no-alt-screen` is refused in argv validation -- because nothing can
+    /// honour it until the in-viewport overlay path exists. The variant stays
+    /// because the value is recognised and intended, not withdrawn.
+    ///
+    /// Nothing constructs it while both doors refuse it, hence the allow: the
+    /// variant is the refusal's subject, and deleting it would turn `never`
+    /// from "recognised, not yet available" into "not a value", which is the
+    /// opposite fact (F90).
+    #[allow(dead_code)]
+    Never,
+}
+
+/// The prefix every `[tui]` value error carries.
+///
+/// It is also the credential boundary: each message bearing this prefix is
+/// written in this file and interpolates the KEY NAME and the permitted values
+/// only — never the offending value. That is what lets `Config::load` surface
+/// these while it still withholds serde's own `invalid type` message, which
+/// quotes the input and so could echo a token out of a mistyped line.
+const TUI_VALUE_ERROR: &str = "invalid value for `[tui]` key ";
+
+/// The accepted `mode` spellings, as the error messages list them.
+const TUI_MODES: &str = "`classic`, `inline`, `fullscreen`";
+/// The RECOGNISED `alternate_screen` spellings, as the vocabulary error lists
+/// them. All three are recognised, so a typo is told the whole vocabulary --
+/// including the value kitsu intends to honour but cannot yet.
+const TUI_ALTERNATE_SCREENS: &str = "`auto`, `always`, `never`";
+/// The ACCEPTED `alternate_screen` values, as the F62 refusal lists them.
+///
+/// Deliberately a second const rather than a reuse of
+/// [`TUI_ALTERNATE_SCREENS`]: *recognised* and *accepted* are different sets
+/// while `never` waits for the in-viewport overlay path, and one string
+/// cannot answer both questions without lying to one of the two callers.
+const TUI_ALTERNATE_SCREENS_ACCEPTED: &str = "`auto`, `always`";
+
+/// The argv-door refusal for `--no-alt-screen` (**F62**).
+///
+/// The flag is documented as a one-way force of `[tui] alternate_screen` to
+/// `never`, and `never` is the one value nothing can honour. It therefore
+/// names the flag the user typed -- F48 withholds values read from a config
+/// file, not a switch from the command line -- and carries the same "is not
+/// available yet" verdict as the file door, because it is the same missing
+/// capability by another name.
+pub const NO_ALT_SCREEN_REFUSAL: &str = "`--no-alt-screen` forces `[tui]` key \
+     `alternate_screen` to `never`, which is not available yet: there is no \
+     in-viewport overlay path, so the agent view takes the alternate screen \
+     whatever this resolves to. Drop the flag; accepted: `auto`, `always`";
+
+/// Deserialize `mode` loudly.
+///
+/// Both failures — a wrong type and an unknown spelling — become the same
+/// `TUI_VALUE_ERROR` message, which names the key and lists the permitted
+/// values and interpolates **nothing the user wrote**. That is deliberate and
+/// it is the reason this key gets the same help as `title` or `prefix`:
+/// serde's own `unknown variant` message would echo the offending value, so
+/// it could not cross the credential boundary in `Config::load` and a
+/// misspelled `mode` would reach `kitsu doctor` as nothing but a line number.
+///
+/// The match is byte-exact: `"Inline"`, `"INLINE"` and `"inline "` are typos,
+/// and a typo in a key the user wrote on purpose must be a loud error rather
+/// than the fail-closed fallback the retired `KITSU_TUI` gate used.
+fn deserialize_tui_mode<'de, D>(deserializer: D) -> Result<TuiMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let invalid = || {
+        D::Error::custom(format!(
+            "{TUI_VALUE_ERROR}`mode`: expected one of {TUI_MODES}"
+        ))
+    };
+    let raw = String::deserialize(deserializer).map_err(|_| invalid())?;
+    match raw.as_str() {
+        "classic" => Ok(TuiMode::Classic),
+        "inline" => Ok(TuiMode::Inline),
+        "fullscreen" => Ok(TuiMode::Fullscreen),
+        _ => Err(invalid()),
+    }
+}
+
+/// Deserialize `alternate_screen` loudly.
+///
+/// A boolean is the mistake the key's name invites, and `"sometimes"` is the
+/// mistake its meaning invites; both fail with the one `TUI_VALUE_ERROR`
+/// message naming the key and the tri-state, for the same reason as
+/// [`deserialize_tui_mode`] — the message must be safe to print, so it never
+/// repeats the value.
+fn deserialize_alternate_screen<'de, D>(deserializer: D) -> Result<AlternateScreen, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let invalid = || {
+        D::Error::custom(format!(
+            "{TUI_VALUE_ERROR}`alternate_screen`: expected one of {TUI_ALTERNATE_SCREENS}"
+        ))
+    };
+    let raw = String::deserialize(deserializer).map_err(|_| invalid())?;
+    match raw.as_str() {
+        "auto" => Ok(AlternateScreen::Auto),
+        "always" => Ok(AlternateScreen::Always),
+        // F62: a RECOGNISED spelling that nothing can honour, so it is
+        // refused by name rather than coerced into `always`'s behaviour.
+        // "Not available yet", never "not valid" (F90): the value is a
+        // coherent thing to want and kitsu intends to honour it, so the
+        // message tells the user to wait rather than to stop wanting it. The
+        // match stays byte-exact, so `Never` and ` never ` are typos and get
+        // the vocabulary error above instead.
+        "never" => Err(D::Error::custom(format!(
+            "{TUI_VALUE_ERROR}`alternate_screen`: `never` is not available \
+             yet; accepted: {TUI_ALTERNATE_SCREENS_ACCEPTED}"
+        ))),
+        _ => Err(invalid()),
+    }
+}
+
+/// Deserialize one `[tui]` boolean, naming the key and nothing else.
+///
+/// serde's own message for `title = "true"` is `invalid type: string "true",
+/// expected a boolean` — it quotes the value, so it cannot cross the
+/// suppression boundary in `Config::load`. This one is value-free by
+/// construction.
+fn deserialize_tui_bool<'de, D>(deserializer: D, key: &str) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    bool::deserialize(deserializer).map_err(|_| {
+        D::Error::custom(format!(
+            "{TUI_VALUE_ERROR}`{key}`: expected a boolean (true or false)"
+        ))
+    })
+}
+
+fn deserialize_tui_title<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_tui_bool(deserializer, "title")
+}
+
+fn deserialize_tui_left_arrow<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_tui_bool(deserializer, "left_arrow_opens_agents")
+}
+
+/// Deserialize `prefix`, rejecting a blank value.
+///
+/// An empty prefix is not a prefix: the chord model needs a key to hang the
+/// chords on, and a blank value would otherwise buy a silently chord-less
+/// session. The message names the key and shows the default spelling; it never
+/// echoes what was written.
+fn deserialize_tui_prefix<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let invalid = || {
+        D::Error::custom(format!(
+            "{TUI_VALUE_ERROR}`prefix`: expected a non-empty key name such as `{}`",
+            TuiConfig::DEFAULT_PREFIX
+        ))
+    };
+    let raw = String::deserialize(deserializer).map_err(|_| invalid())?;
+    if raw.trim().is_empty() {
+        return Err(invalid());
+    }
+    Ok(raw)
+}
+
+/// Deserialize `cell_ring_lines` inside its bound.
+///
+/// The bound is checked at the parse, not where the ring is built: `0` is not
+/// "disabled" and `u64::MAX` is not "unbounded", and a memory bound the user
+/// cannot read is one they trip over at runtime instead. The message states
+/// the key and the range, and never the rejected number — the range is the
+/// fix, and a value echoed back out of a config file is how a token leaks.
+fn deserialize_cell_ring_lines<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let invalid = || {
+        D::Error::custom(format!(
+            "{TUI_VALUE_ERROR}`cell_ring_lines`: expected an integer between {} and {}",
+            TuiConfig::MIN_CELL_RING_LINES,
+            TuiConfig::MAX_CELL_RING_LINES
+        ))
+    };
+    let lines = usize::try_from(u64::deserialize(deserializer).map_err(|_| invalid())?)
+        .map_err(|_| invalid())?;
+    if !(TuiConfig::MIN_CELL_RING_LINES..=TuiConfig::MAX_CELL_RING_LINES).contains(&lines) {
+        return Err(invalid());
+    }
+    Ok(lines)
+}
+
+/// The `[tui]` table (design §4.8). Unknown keys are rejected loudly, so a
+/// misspelled key is an error naming the key rather than a setting that
+/// silently never applies.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TuiConfig {
+    /// Which renderer the session runs. `--tui <MODE>` overrides.
+    #[serde(default, deserialize_with = "deserialize_tui_mode")]
+    pub mode: TuiMode,
+    /// Whether the session takes the alternate screen. `--no-alt-screen`
+    /// forces `never`.
+    #[serde(default, deserialize_with = "deserialize_alternate_screen")]
+    pub alternate_screen: AlternateScreen,
+    /// The chord prefix key.
+    #[serde(
+        default = "default_tui_prefix",
+        deserialize_with = "deserialize_tui_prefix"
+    )]
+    pub prefix: String,
+    /// Whether kitsu sets and restores the **terminal window title** (H2).
+    ///
+    /// **Corrected in F139.** This said "whether the viewport paints its title
+    /// row", which is wrong and was the only artefact in the repository saying
+    /// so -- the design (H2), the plan (T1-S4), §4.8's sample config and
+    /// `README.md` all describe the window title, and **no viewport title row
+    /// exists anywhere**. That one sentence was enough to send a card off to
+    /// refuse this key's designed default; a doc comment that misnames its own
+    /// referent is worse than one that says nothing.
+    ///
+    /// **H2 is specified and half-built, and this key gates neither half.**
+    /// `tui_bridge` pushes and pops the title *stack* in production without
+    /// consulting this flag, and the OSC 2 title string -- `kitsu ·
+    /// working|blocked|idle|N agents` -- is never written at all, because
+    /// `TuiRuntime::enter` has no non-test caller. So the honest status is an
+    /// **unimplemented requirement**, not a value to refuse.
+    #[serde(default = "default_true", deserialize_with = "deserialize_tui_title")]
+    pub title: bool,
+    /// Whether Left opens the agents pane.
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_tui_left_arrow"
+    )]
+    pub left_arrow_opens_agents: bool,
+    /// How many lines of cell scrollback the viewport retains.
+    #[serde(
+        default = "default_cell_ring_lines",
+        deserialize_with = "deserialize_cell_ring_lines"
+    )]
+    pub cell_ring_lines: usize,
+}
+
+fn default_tui_prefix() -> String {
+    TuiConfig::DEFAULT_PREFIX.to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_cell_ring_lines() -> usize {
+    TuiConfig::DEFAULT_CELL_RING_LINES
+}
+
+// Hand-written rather than derived, for the reason `AgentsConfig` carries the
+// same note: every caller reads the table as `tui.unwrap_or_default()`, which
+// goes through *this* impl and never through serde, so a derived `Default`
+// would hand a config with no `[tui]` table an empty chord prefix and a
+// ZERO-line cell ring while the `#[serde(default = "...")]` attributes above
+// only cover a key's absence from a table that is present.
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            mode: TuiMode::default(),
+            alternate_screen: AlternateScreen::default(),
+            prefix: default_tui_prefix(),
+            title: true,
+            left_arrow_opens_agents: true,
+            cell_ring_lines: default_cell_ring_lines(),
+        }
+    }
+}
+
+impl TuiConfig {
+    /// The default chord prefix.
+    pub const DEFAULT_PREFIX: &'static str = "ctrl+x";
+    /// The default cell scrollback depth in lines.
+    pub const DEFAULT_CELL_RING_LINES: usize = 10_000;
+    /// The smallest accepted `cell_ring_lines`. One line, not zero: zero would
+    /// make "no scrollback" indistinguishable from a typo.
+    pub const MIN_CELL_RING_LINES: usize = 1;
+    /// The largest accepted `cell_ring_lines`.
+    pub const MAX_CELL_RING_LINES: usize = 1_000_000;
+
+    /// The renderer this run uses: `--tui` beats `[tui] mode` beats the
+    /// default. There is no fourth source — the `KITSU_TUI` preview gate was
+    /// retired with this card, so nothing here reads the environment.
+    pub fn effective_mode(&self, flag: Option<TuiMode>) -> TuiMode {
+        flag.unwrap_or(self.mode)
+    }
+
+    /// The alternate-screen decision this run uses, or a refusal.
+    ///
+    /// **F62.** `never` is the one value nothing can honour -- there is no
+    /// in-viewport overlay path, so the agent view takes the alternate screen
+    /// whatever this resolves to. It is therefore refused rather than coerced,
+    /// at BOTH doors: `[tui] alternate_screen = "never"` is refused by the
+    /// deserializer, and `--no-alt-screen` -- which is documented as a one-way
+    /// force to `never` -- is refused here, because a flag that silently does
+    /// nothing is the identical defect to a config value that silently does
+    /// nothing, and refusing only the file would move the lie to argv rather
+    /// than close it.
+    ///
+    /// The `Err` is the ARGV-side message, which may name the flag: F48
+    /// withholds values read from a config file, not a switch the user typed.
+    ///
+    pub fn effective_alternate_screen(
+        &self,
+        no_alt_screen_flag: bool,
+    ) -> Result<AlternateScreen, String> {
+        if no_alt_screen_flag {
+            Err(NO_ALT_SCREEN_REFUSAL.to_string())
+        } else {
+            Ok(self.alternate_screen)
+        }
+    }
 }
 
 /// A single named gateway profile. Unknown keys are rejected loudly: a typo
@@ -388,7 +809,23 @@ impl Config {
                 // serde's unknown-field message enumerates key NAMES only —
                 // safe to surface, and exactly what a typo'd key needs.
                 let message = error.message().to_string();
-                let hint = message.starts_with("unknown field").then_some(message);
+                // Two safe classes, and nothing else:
+                //   * serde's unknown-field message enumerates key NAMES only
+                //     — safe to surface, and exactly what a typo'd key needs.
+                //   * `[tui]` value errors written in this file, which
+                //     interpolate the key name and the permitted values and
+                //     never the offending value (see `TUI_VALUE_ERROR`).
+                // Everything else stays withheld — serde's `invalid type`
+                // above all, which quotes the input, and its `unknown
+                // variant`, which echoes the word the user wrote. A config
+                // file holds gateway tokens, and a mistyped line can put one
+                // where the parser would quote it back. No `[tui]` key relies
+                // on either: every one of the six fails with a message written
+                // above, so the table names the key the user got wrong
+                // without the allow-list ever having to admit a value.
+                let hint = (message.starts_with("unknown field")
+                    || message.starts_with(TUI_VALUE_ERROR))
+                .then_some(message);
                 ConfigError::Parse {
                     line: location.map(|(line, _)| line),
                     column: location.map(|(_, column)| column),
@@ -838,6 +1275,123 @@ mod tests {
             .expect_err("the spawn cap must not be accepted inside [agents]");
     }
 
+    // -----------------------------------------------------------------
+    // T2-S5a: `agents.blocking` and `agents.block_timeout_secs`
+    // (design B1/B3, plan row T2-S5). FAILING-FIRST: neither key exists
+    // yet, so these do not compile until the implementer adds
+    // `AgentBlockingMode`, `AgentsConfig::blocking` and
+    // `AgentsConfig::block_timeout_secs` / `block_timeout()`.
+    // -----------------------------------------------------------------
+
+    /// B1 + plan row T2-S5: the key exists, follows the `StateFileMode`
+    /// enum-key precedent, and its default is `fail_closed` EVERYWHERE.
+    /// Nothing about the surface, the mode or the tier moves it in this card,
+    /// so an absent `[agents]`, an empty one, the struct default and an
+    /// explicit `fail_closed` must all be the same value.
+    #[test]
+    fn agents_blocking_defaults_to_fail_closed_everywhere() {
+        for text in [
+            "default_gateway = \"example\"\n",
+            "[agents]\n",
+            "[agents]\nstate_file = \"on\"\n",
+            "[agents]\nblocking = \"fail_closed\"\n",
+        ] {
+            let parsed: Config = toml::from_str(text).expect(text);
+            assert_eq!(
+                parsed.agents.unwrap_or_default().blocking,
+                AgentBlockingMode::FailClosed,
+                "the default must stay fail_closed until T3 flips the TUI default: {text:?}"
+            );
+        }
+        assert_eq!(
+            AgentsConfig::default().blocking,
+            AgentBlockingMode::FailClosed
+        );
+
+        let parsed: Config = toml::from_str("[agents]\nblocking = \"ask\"\n").unwrap();
+        assert_eq!(
+            parsed.agents.unwrap_or_default().blocking,
+            AgentBlockingMode::Ask,
+            "explicit `ask` is T2's standalone value and must parse"
+        );
+    }
+
+    /// The `StateFileMode` precedent again: an unknown mode or a typo'd key
+    /// must fail loudly rather than silently leave the run fail-closed.
+    #[test]
+    fn agents_blocking_rejects_unknown_modes_and_typos() {
+        let error = toml::from_str::<Config>("[agents]\nblocking = \"sometimes\"\n")
+            .expect_err("an unknown blocking mode must fail closed loudly");
+        assert!(error.message().contains("unknown variant"), "{error}");
+        assert!(error.message().contains("sometimes"), "{error}");
+
+        let error = toml::from_str::<Config>("[agents]\nblockign = \"ask\"\n")
+            .expect_err("a typo inside [agents] must be rejected, not defaulted");
+        assert!(error.message().contains("unknown field"), "{error}");
+        assert!(error.message().contains("blockign"), "{error}");
+
+        // `ask`/`fail_closed` are the only two spellings: the dash and the
+        // camel spelling are typos, not aliases.
+        toml::from_str::<Config>("[agents]\nblocking = \"fail-closed\"\n")
+            .expect_err("only the snake_case spelling is accepted");
+    }
+
+    /// B3: the 30-minute default survives the move out of
+    /// `DEFAULT_AGENT_BLOCK_TIMEOUT` and into config, and a short value
+    /// parses (which is what makes an end-to-end block test possible).
+    ///
+    /// Spelling: `block_timeout_secs`. There is no duration key in this
+    /// config today — no humantime, no `*_secs` precedent — and the card
+    /// forbids a new dependency, so the unit goes in the name where it
+    /// cannot be misread as milliseconds or as "30" meaning 30 seconds.
+    #[test]
+    fn agents_block_timeout_secs_defaults_to_thirty_minutes() {
+        for text in [
+            "default_gateway = \"example\"\n",
+            "[agents]\n",
+            "[agents]\nblocking = \"ask\"\n",
+        ] {
+            let parsed: Config = toml::from_str(text).expect(text);
+            let agents = parsed.agents.unwrap_or_default();
+            assert_eq!(
+                agents.block_timeout_secs, 1_800,
+                "B3's 30-minute default must survive becoming a config key: {text:?}"
+            );
+            assert_eq!(
+                agents.block_timeout(),
+                std::time::Duration::from_secs(30 * 60),
+                "the typed accessor and the raw key agree: {text:?}"
+            );
+        }
+        assert_eq!(AgentsConfig::default().block_timeout_secs, 1_800);
+
+        let parsed: Config =
+            toml::from_str("[agents]\nblocking = \"ask\"\nblock_timeout_secs = 2\n").unwrap();
+        let agents = parsed.agents.unwrap_or_default();
+        assert_eq!(agents.block_timeout_secs, 2);
+        assert_eq!(
+            agents.block_timeout(),
+            std::time::Duration::from_secs(2),
+            "a short timeout is what lets a test observe the whole gate->registry->timer path"
+        );
+    }
+
+    /// A duration key is a place where a wrong type silently becomes a
+    /// default. It must not: a string, a float and a negative number are all
+    /// errors, and the unit must be in the name rather than in the value.
+    #[test]
+    fn agents_block_timeout_secs_rejects_non_integer_and_negative_values() {
+        for text in [
+            "[agents]\nblock_timeout_secs = \"30m\"\n",
+            "[agents]\nblock_timeout_secs = 1.5\n",
+            "[agents]\nblock_timeout_secs = -1\n",
+            "[agents]\nblock_timeout = 30\n",
+        ] {
+            toml::from_str::<Config>(text)
+                .expect_err(&format!("{text:?} must be an error, not a silent default"));
+        }
+    }
+
     #[test]
     fn parse_error_retains_location_but_never_source_excerpt() {
         const SECRET: &str = "hf_parse_error_secret_value";
@@ -934,6 +1488,707 @@ mod tests {
             "[agents]\nstate_file = \"on\"\n\n[hooks]\non_agent_state = \"notify\"\n",
         )
         .unwrap();
+        assert_eq!(
+            parsed.agents.unwrap_or_default().state_file,
+            StateFileMode::On
+        );
+        assert_eq!(
+            parsed.hooks.unwrap_or_default().on_agent_state.as_deref(),
+            Some("notify")
+        );
+    }
+    // -----------------------------------------------------------------
+    // T3-S2: the `[tui]` table (design §4.8, plan row T3-S2).
+    // FAILING-FIRST: none of `Config::tui`, `TuiConfig`, `TuiMode`,
+    // `AlternateScreen` exists yet, so this block does not compile until the
+    // implementer adds them.
+    //
+    // Scope decisions pinned here, with their reasons:
+    //
+    // * `mode` accepted `classic` and `inline` only, while the design's
+    //   grammar also listed `fullscreen`: a name that parsed and silently
+    //   behaved as `inline` is exactly the kind of quiet coercion this card's
+    //   risk gate exists to forbid. **That boundary has since been retired**,
+    //   deliberately and in the card that made the third renderer reachable.
+    //   All three spellings parse, and
+    //   `tui_mode_accepts_fullscreen_now_that_the_t5_renderer_exists` is
+    //   where the third one is pinned. (The test this note used to name,
+    //   `tui_mode_rejects_fullscreen_until_the_t5_renderer_exists`, is the
+    //   one it replaced and no longer exists.)
+    // * `cell_ring_lines` is range-checked HERE, not in T3-S6. The ring is
+    //   built in T3-S6; if the parser admits `0` or `4_000_000_000`, T3-S6 has
+    //   to invent a silent fallback, and a memory bound you cannot state is
+    //   not a bound. The checked range is
+    //   `MIN_CELL_RING_LINES..=MAX_CELL_RING_LINES`.
+    // * The range error must reach the USER. `ConfigError::Parse` only keeps
+    //   its hint when the serde message starts with "unknown field", so a
+    //   custom serde range message would be withheld as a possible credential
+    //   excerpt. The tests below therefore assert on `Config::load`'s
+    //   rendered error, which forces either a dedicated `ConfigError` variant
+    //   or a widened hint allow-list.
+    // -----------------------------------------------------------------
+
+    /// Parse a config from text the way the product does: through a real file
+    /// and `Config::load`, so `ConfigError`'s own rendering is what is pinned
+    /// rather than the raw serde message.
+    fn load_config_text(text: &str) -> Result<Config, ConfigError> {
+        let directory = tempfile::tempdir().expect("temp config directory");
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, text).expect("write config text");
+        Config::load(&path)
+    }
+
+    /// All six keys, every one of them set away from its default, so a test
+    /// that passed by accident on a default cannot pass here.
+    #[test]
+    fn tui_table_parses_all_six_keys() {
+        let parsed: Config = toml::from_str(
+            "[tui]\n\
+             mode = \"inline\"\n\
+             alternate_screen = \"always\"\n\
+             prefix = \"ctrl+b\"\n\
+             title = false\n\
+             left_arrow_opens_agents = false\n\
+             cell_ring_lines = 250\n",
+        )
+        .expect("the full [tui] table must parse");
+        let tui = parsed.tui.expect("[tui] must be present when written");
+        assert_eq!(tui.mode, TuiMode::Inline);
+        assert_eq!(tui.alternate_screen, AlternateScreen::Always);
+        assert_eq!(tui.prefix, "ctrl+b");
+        assert!(!tui.title);
+        assert!(!tui.left_arrow_opens_agents);
+        assert_eq!(tui.cell_ring_lines, 250);
+
+        // ...and each value above differs from the default, which is what
+        // makes the assertions non-vacuous.
+        let default = TuiConfig::default();
+        assert_ne!(default.mode, TuiMode::Inline);
+        assert_ne!(default.alternate_screen, AlternateScreen::Always);
+        assert_ne!(default.prefix, "ctrl+b");
+        assert!(default.title);
+        assert!(default.left_arrow_opens_agents);
+        assert_ne!(default.cell_ring_lines, 250);
+    }
+
+    /// The defaults, read the way every caller reads them.
+    ///
+    /// This is the T2-S5a trap restated: callers reach the table through
+    /// `tui.unwrap_or_default()`, which goes through the **derived** `Default`
+    /// and never through serde, so `#[serde(default = "...")]` alone would
+    /// hand a config with no `[tui]` table an empty prefix and a ZERO-line
+    /// cell ring. Absent table, empty table and `TuiConfig::default()` must
+    /// all be the same six values.
+    #[test]
+    fn tui_table_defaults_are_identical_absent_empty_and_through_unwrap_or_default() {
+        let absent: Config = toml::from_str("default_gateway = \"example\"\n").unwrap();
+        let empty: Config = toml::from_str("[tui]\n").unwrap();
+        let tables = [
+            ("absent", absent.tui.unwrap_or_default()),
+            ("empty", empty.tui.unwrap_or_default()),
+            ("struct default", TuiConfig::default()),
+        ];
+        for (label, tui) in tables {
+            // `mode` is classic until a human has run the Q1 terminal matrix
+            // (docs/roadmap/cycles/e11/terminal-matrix.md). Nothing in this
+            // card may make the preview renderer the default.
+            assert_eq!(tui.mode, TuiMode::Classic, "{label}: mode");
+            assert_eq!(
+                tui.alternate_screen,
+                AlternateScreen::Auto,
+                "{label}: alternate_screen"
+            );
+            assert_eq!(tui.prefix, TuiConfig::DEFAULT_PREFIX, "{label}: prefix");
+            assert_eq!(tui.prefix, "ctrl+x", "{label}: prefix spelling");
+            assert!(tui.title, "{label}: title");
+            assert!(
+                tui.left_arrow_opens_agents,
+                "{label}: left_arrow_opens_agents"
+            );
+            assert_eq!(
+                tui.cell_ring_lines,
+                TuiConfig::DEFAULT_CELL_RING_LINES,
+                "{label}: cell_ring_lines"
+            );
+            assert_eq!(
+                tui.cell_ring_lines, 10_000,
+                "{label}: cell_ring_lines value"
+            );
+        }
+    }
+
+    /// Every key defaults independently: one key set must not drag the other
+    /// five off their defaults (the failure mode of a `#[serde(default)]` on
+    /// the struct rather than on each field).
+    #[test]
+    fn tui_keys_default_independently_of_one_another() {
+        let parsed: Config = toml::from_str("[tui]\nmode = \"inline\"\n").unwrap();
+        let tui = parsed.tui.unwrap_or_default();
+        assert_eq!(tui.mode, TuiMode::Inline);
+        assert_eq!(tui.alternate_screen, AlternateScreen::Auto);
+        assert_eq!(tui.prefix, "ctrl+x");
+        assert!(tui.title);
+        assert!(tui.left_arrow_opens_agents);
+        assert_eq!(tui.cell_ring_lines, 10_000);
+    }
+
+    /// Precedence, written down once: `--tui` beats `[tui] mode` beats the
+    /// default, and there is no fourth source — `KITSU_TUI` is gone (plan row
+    /// T3-S2, "env gate removed"), so nothing reads the environment here.
+    #[test]
+    fn tui_mode_precedence_is_flag_then_config_then_default() {
+        let classic = TuiConfig::default();
+        let inline = TuiConfig {
+            mode: TuiMode::Inline,
+            ..TuiConfig::default()
+        };
+
+        // Flag wins, in both directions, so "the flag wins" is not just
+        // "inline wins".
+        assert_eq!(
+            classic.effective_mode(Some(TuiMode::Inline)),
+            TuiMode::Inline
+        );
+        assert_eq!(
+            inline.effective_mode(Some(TuiMode::Classic)),
+            TuiMode::Classic
+        );
+        // No flag: the config decides.
+        assert_eq!(inline.effective_mode(None), TuiMode::Inline);
+        // Neither: the default.
+        assert_eq!(classic.effective_mode(None), TuiMode::Classic);
+        assert_eq!(
+            TuiConfig::default().effective_mode(None),
+            TuiMode::Classic,
+            "a config with no [tui] table must still be classic"
+        );
+    }
+
+    /// `--no-alt-screen` asks for `never`, and **F62 refuses `never`** -- so
+    /// the flag is refused too, and refused REGARDLESS of what the file says,
+    /// which is the "beats any configured value" property this test was
+    /// written for, now pointing the other way.
+    ///
+    /// Rewritten under the coordinator's ruling (option (a), both doors). The
+    /// flag was documented as a one-way force to `never`; refusing the file
+    /// and not the flag would have left `README`'s promise lying in the place
+    /// it hurts most -- a multiplexer, where a user passing the flag believes
+    /// they have disabled the alternate screen.
+    ///
+    /// Its ABSENCE still forces nothing, which is the property that keeps the
+    /// refusal from swallowing the two honourable values.
+    #[test]
+    fn no_alt_screen_flag_is_refused_regardless_of_the_configured_value() {
+        for configured in [AlternateScreen::Auto, AlternateScreen::Always] {
+            let tui = TuiConfig {
+                alternate_screen: configured,
+                ..TuiConfig::default()
+            };
+
+            let refusal = tui.effective_alternate_screen(true).expect_err(&format!(
+                "--no-alt-screen asks for `never`, which nothing can \
+                     honour, so it must be refused even when the file says \
+                     {configured:?}"
+            ));
+            // The argv-side message MAY name the flag -- F48 withholds values
+            // read from a config file, not a switch the user typed -- and it
+            // carries the same "not available yet" verdict as the file side,
+            // because it is the same missing capability.
+            assert!(
+                refusal.contains("--no-alt-screen"),
+                "the argv refusal must name the flag the user typed: {refusal}"
+            );
+            assert!(
+                refusal.contains("is not available yet"),
+                "the flag must be refused as unavailable, not as invalid: {refusal}"
+            );
+
+            // Without the flag, the configured value stands untouched. This is
+            // the bidirectional half: a refusal that fired here would break
+            // every session that never passed the flag.
+            assert_eq!(
+                tui.effective_alternate_screen(false),
+                Ok(configured),
+                "without the flag the configured value stands"
+            );
+        }
+    }
+
+    /// The risk gate (design §4.8): a misspelled key inside `[tui]` is an
+    /// error that NAMES the key. Today `[tui]` is itself an unknown field on
+    /// `Config`, so the message names `tui` and the user is told nothing about
+    /// their typo — which is why the assertion is on the inner key's name and
+    /// on the enumeration that proves the table is known.
+    #[test]
+    fn tui_table_rejects_unknown_keys_and_names_the_key() {
+        let error = toml::from_str::<Config>("[tui]\ncell_ring_line = 500\n")
+            .expect_err("a typo inside [tui] must be rejected, not ignored");
+        let message = error.message();
+        assert!(
+            message.starts_with("unknown field `cell_ring_line`"),
+            "the message must name the misspelled key first: {message}"
+        );
+        assert!(
+            message.contains("cell_ring_lines"),
+            "and enumerate the real keys, which is the user's fix: {message}"
+        );
+
+        // The same typo through the product's own loader, which is what
+        // `kitsu doctor` prints.
+        let rendered = load_config_text("[tui]\ncell_ring_line = 500\n")
+            .expect_err("Config::load must reject it too")
+            .to_string();
+        assert!(
+            rendered.contains("unknown field `cell_ring_line`"),
+            "ConfigError must carry the key name, not withhold it: {rendered}"
+        );
+    }
+
+    /// A `[tui]` key copied to the top level is a mistake, not a synonym.
+    #[test]
+    fn tui_keys_are_not_accepted_at_the_top_level() {
+        let error = toml::from_str::<Config>("mode = \"inline\"\n")
+            .expect_err("`mode` is a [tui] key and must not be accepted flat");
+        assert!(
+            error.message().starts_with("unknown field `mode`"),
+            "{error}"
+        );
+    }
+
+    /// An unknown `mode` fails loudly with the offending value named — the
+    /// `StateFileMode` precedent. It must NOT fail closed to classic the way
+    /// the retired `KITSU_TUI` parser did: an env preview gate can swallow a
+    /// typo, a config key the user wrote on purpose cannot.
+    #[test]
+    fn tui_mode_rejects_unknown_values_instead_of_falling_back_to_classic() {
+        for value in ["Inline", "INLINE", "inline ", "1", "true", "", "viewport"] {
+            let text = format!("[tui]\nmode = \"{value}\"\n");
+            let error = toml::from_str::<Config>(&text)
+                .expect_err(&format!("mode = {value:?} must be rejected, not defaulted"));
+            let message = error.message().to_string();
+            // Authorised change (coordinator, T3-S2): the message is this
+            // file's own key-naming one rather than serde's `unknown
+            // variant`, which would echo `value` back and so could not be
+            // surfaced by `Config::load` at all. The assertion is still that
+            // the value is REJECTED, loudly and by name.
+            //
+            // **Strengthened in T5-S2 (finding F90).** This was two
+            // `contains` checks, one of them for `` `classic`, `inline` ``.
+            // That substring is still present once a third mode is appended,
+            // so the assertion could not fail when its own subject changed —
+            // it survived this card by luck. F41 banned substring *bans* for
+            // over-constraining the product; this is the inverse hazard, a
+            // substring *require* that under-constrains it to nothing. So the
+            // whole message is pinned: what is asserted is what the user
+            // reads, and appending, removing or reordering a mode fails here.
+            assert_eq!(
+                message,
+                "invalid value for `[tui]` key `mode`: expected one of \
+                 `classic`, `inline`, `fullscreen`",
+                "mode = {value:?} must fail with the one key-naming message, \
+                 listing exactly the modes that parse"
+            );
+            // And the credential boundary this file exists to hold: the
+            // rejected value is never echoed back. Kept as a ban because
+            // here the product claim *is* an absence.
+            assert!(
+                value.is_empty() || !message.contains(value),
+                "the message must never repeat what the user wrote: {message}"
+            );
+        }
+
+        // The accepted spelling, so the loop above is not rejecting everything.
+        let parsed: Config = toml::from_str("[tui]\nmode = \"inline\"\n").unwrap();
+        assert_eq!(parsed.tui.unwrap_or_default().mode, TuiMode::Inline);
+    }
+
+    /// Fullscreen is T5's renderer, and **T5-S2 is where it arrives**, so
+    /// `[tui] mode = "fullscreen"` parses.
+    ///
+    /// **This is the deliberate change the test asked for.** Its own comment
+    /// said "**Change this test deliberately in T5**, not incidentally", and
+    /// this card is that T5: the switch, the renderer request, the alternate
+    /// screen and the ring reader land together. The intent that survives is
+    /// the one it was written for — **no silent coercion**: before, a third
+    /// name must not quietly parse as `inline`; now it must parse as itself,
+    /// `TuiMode::Fullscreen`, and the test still fails if `fullscreen` is
+    /// mapped onto either of the other two.
+    ///
+    /// Decision 1 of this card is why a config test changes at all: `/tui`,
+    /// `--tui` and `[tui] mode` cross together, because a mode a user can
+    /// switch to but cannot start in is incoherent.
+    #[test]
+    fn tui_mode_accepts_fullscreen_now_that_the_t5_renderer_exists() {
+        let parsed: Config = toml::from_str("[tui]\nmode = \"fullscreen\"\n")
+            .expect("fullscreen parses now that the T5 renderer is reachable");
+        let mode = parsed.tui.unwrap_or_default().mode;
+        // **Tightened as the test author instructed.** This was an
+        // `assert_ne!(mode, TuiMode::Inline)` / `assert_ne!(mode,
+        // TuiMode::Classic)` pair, which the author wrote only because
+        // `TuiMode::Fullscreen` did not exist yet: naming it would have been
+        // a **compile** failure and every other test in the crate would have
+        // stopped reporting. The variant exists now, so the pair is replaced
+        // by the equality it was standing in for. "Neither classic nor
+        // inline" is "fullscreen" only while there are exactly three modes —
+        // a fourth would let it pass for the wrong mode, which is the F41
+        // shape. Both of the intents it carried survive here: no coercion
+        // onto either of the other two renderers, and `fullscreen` parsing as
+        // itself.
+        assert_eq!(
+            mode,
+            TuiMode::Fullscreen,
+            "`fullscreen` must parse as itself and must not be coerced onto \
+             the inline viewport or onto classic — the silent fallback this \
+             test has guarded since T3-S2"
+        );
+
+        // The byte-exact discipline is unchanged by the new variant: a near
+        // miss on the new name is still a loud error, not a third coercion.
+        for typo in [
+            "Fullscreen",
+            "FULLSCREEN",
+            "fullscreen ",
+            "full-screen",
+            "full",
+        ] {
+            let text = format!("[tui]\nmode = \"{typo}\"\n");
+            toml::from_str::<Config>(&text)
+                .expect_err(&format!("mode = {typo:?} must be rejected, not defaulted"));
+        }
+    }
+
+    /// `alternate_screen` is the tri-state of design §4.8, not a boolean. A
+    /// boolean is the mistake a reader makes from the key's name, so it is an
+    /// error naming the key rather than a coercion.
+    #[test]
+    fn alternate_screen_is_a_tri_state_and_rejects_booleans() {
+        // The two values kitsu can honour today still parse to themselves.
+        for (text, expected) in [
+            (
+                "[tui]\nalternate_screen = \"auto\"\n",
+                AlternateScreen::Auto,
+            ),
+            (
+                "[tui]\nalternate_screen = \"always\"\n",
+                AlternateScreen::Always,
+            ),
+        ] {
+            let parsed: Config = toml::from_str(text).expect(text);
+            assert_eq!(parsed.tui.unwrap_or_default().alternate_screen, expected);
+        }
+
+        // F62: `never` is still a RECOGNISED spelling -- it does not get the
+        // "expected one of" vocabulary error a typo gets -- but it is REFUSED
+        // until the in-viewport overlay path exists. Pinned in
+        // `alternate_screen_never_is_refused_until_the_in_viewport_path_exists`;
+        // asserted here only so this test cannot keep passing by accepting it.
+        let refused = toml::from_str::<Config>("[tui]\nalternate_screen = \"never\"\n")
+            .expect_err("`never` must be refused while nothing can honour it");
+        assert!(
+            refused.message().contains("is not available yet"),
+            "`never` must be refused as unavailable, not accepted: {refused}"
+        );
+
+        let rendered = load_config_text("[tui]\nalternate_screen = true\n")
+            .expect_err("a boolean must not be coerced to auto/always")
+            .to_string();
+        assert!(
+            rendered.contains("alternate_screen"),
+            "the error must name the key the user got wrong: {rendered}"
+        );
+
+        let error = toml::from_str::<Config>("[tui]\nalternate_screen = \"sometimes\"\n")
+            .expect_err("an unknown tri-state value must fail closed loudly");
+        // Authorised change (coordinator, T3-S2): same message as the boolean
+        // above, naming the key and the tri-state and never the value, so all
+        // six keys of this table fail with one vocabulary.
+        assert!(
+            error
+                .message()
+                .contains("invalid value for `[tui]` key `alternate_screen`")
+                && error.message().contains("`auto`, `always`, `never`"),
+            "{error}"
+        );
+    }
+
+    /// **F62.** `[tui] alternate_screen = "never"` is refused at config load,
+    /// because nothing can honour it: the in-viewport overlay path does not
+    /// exist, so the agent view takes the alternate screen whatever this key
+    /// says. A value that parsed and silently behaved as `always` is the quiet
+    /// coercion this epic has refused everywhere else.
+    ///
+    /// The precedent is `fullscreen`, refused by name for two stages while
+    /// `classic` and `inline` worked, and the rule that outlived it: a thing
+    /// kitsu does not have is refused by name rather than coerced.
+    ///
+    /// **"Not available yet", not "not valid"** (F90): the value is a coherent
+    /// thing to want and kitsu intends to honour it, so the message tells the
+    /// user to wait rather than to stop wanting it. "X is missing" and "X is
+    /// refused" look identical from outside and are opposite facts.
+    ///
+    /// Asserted through `Config::load` rather than `toml::from_str`, because
+    /// the message only reaches a user if it survives the credential-hint
+    /// allow-list -- it does so by starting with `TUI_VALUE_ERROR`.
+    #[test]
+    fn alternate_screen_never_is_refused_until_the_in_viewport_path_exists() {
+        let rendered = load_config_text("[tui]\nalternate_screen = \"never\"\n")
+            .expect_err("`never` must be refused, not accepted and ignored")
+            .to_string();
+
+        // It names the KEY...
+        assert!(
+            rendered.contains("`alternate_screen`"),
+            "the refusal must name the key: {rendered}"
+        );
+        // ...says the value is NOT AVAILABLE YET rather than invalid...
+        assert!(
+            rendered.contains("is not available yet"),
+            "the refusal must say `never` is not available yet: {rendered}"
+        );
+        assert!(
+            !rendered.contains("expected one of"),
+            "a recognised-but-unhonourable value must not be reported as a \
+             misspelling: {rendered}"
+        );
+        // ...and names the ACCEPTED set, which is the two values that describe
+        // what kitsu actually does -- NOT the three recognised spellings.
+        assert!(
+            rendered.contains("accepted: `auto`, `always`"),
+            "the refusal must name what IS accepted: {rendered}"
+        );
+        assert!(
+            !rendered.contains("`auto`, `always`, `never`"),
+            "the refusal must not offer `never` as an accepted value: {rendered}"
+        );
+    }
+
+    /// **F48 governs this message**: a value from a CONFIG FILE is never
+    /// echoed, because the line it came from may sit beside a credential and
+    /// the rendered error is printed and pasted into issues.
+    ///
+    /// The `never` in the refusal is a literal written in this file, not
+    /// anything interpolated from the user's input -- which is what this test
+    /// distinguishes, by putting a token-shaped value in the same file and
+    /// proving the message carries nothing the user wrote.
+    #[test]
+    fn the_alternate_screen_refusal_echoes_nothing_from_the_config_file() {
+        const TOKEN: &str = "sk-ant-notarealtoken-f62";
+        let rendered = load_config_text(&format!(
+            "default_gateway = \"{TOKEN}\"\n[tui]\nalternate_screen = \"never\"\n"
+        ))
+        .expect_err("`never` must still be refused in a larger file")
+        .to_string();
+
+        assert!(
+            rendered.contains("is not available yet"),
+            "the refusal must still be the error raised: {rendered}"
+        );
+        assert!(
+            !rendered.contains(TOKEN),
+            "F48: the refusal must not echo anything from the file: {rendered}"
+        );
+        assert!(
+            !rendered.contains("alternate_screen = "),
+            "F48: the refusal must not quote the offending line: {rendered}"
+        );
+    }
+
+    /// The other side of the refusal, so it cannot be a blanket rejection of
+    /// the key: `auto`, `always` and an ABSENT key all still load, and all
+    /// three still mean what they meant before F62.
+    #[test]
+    fn alternate_screen_auto_always_and_absent_all_still_load() {
+        for (text, expected) in [
+            (
+                "[tui]\nalternate_screen = \"auto\"\n",
+                AlternateScreen::Auto,
+            ),
+            (
+                "[tui]\nalternate_screen = \"always\"\n",
+                AlternateScreen::Always,
+            ),
+            // Absent key, present table, and absent table: all `auto`.
+            ("[tui]\nmode = \"inline\"\n", AlternateScreen::Auto),
+            ("[tui]\n", AlternateScreen::Auto),
+            ("default_gateway = \"example\"\n", AlternateScreen::Auto),
+        ] {
+            let parsed = load_config_text(text)
+                .unwrap_or_else(|error| panic!("{text:?} must still load: {error}"));
+            assert_eq!(
+                parsed.tui.unwrap_or_default().alternate_screen,
+                expected,
+                "{text:?}"
+            );
+        }
+
+        // Non-vacuity: `always` is not the default, so the first two rows
+        // above cannot be passing on a default-constructed table.
+        assert_ne!(
+            AlternateScreen::default(),
+            AlternateScreen::Always,
+            "if `always` were the default, this test would prove nothing"
+        );
+        assert_eq!(AlternateScreen::default(), AlternateScreen::Auto);
+    }
+
+    /// The refusal matches BYTE-EXACT `never`, and that is sound only because
+    /// the deserializer neither trims nor lowercases -- measured, not assumed
+    /// (F99/F100). Every case and whitespace variant is a TYPO and must get
+    /// the vocabulary error, not the refusal: a user who typed `Never` has
+    /// misspelled a value, and telling them it "is not available yet" would
+    /// send them away waiting for a feature they could have had.
+    #[test]
+    fn alternate_screen_case_and_whitespace_variants_are_typos_not_refusals() {
+        for variant in ["Never", "NEVER", "nEver", " never ", "never ", "\tnever"] {
+            let rendered = load_config_text(&format!("[tui]\nalternate_screen = \"{variant}\"\n"))
+                .expect_err(&format!("{variant:?} must not be accepted"))
+                .to_string();
+            assert!(
+                rendered.contains("expected one of")
+                    && rendered.contains("`auto`, `always`, `never`"),
+                "{variant:?} is a misspelling and must get the vocabulary error, \
+                 which still lists all three RECOGNISED spellings: {rendered}"
+            );
+            assert!(
+                !rendered.contains("is not available yet"),
+                "{variant:?} must not be reported as an unavailable value: {rendered}"
+            );
+        }
+    }
+
+    /// `title` and `left_arrow_opens_agents` are booleans and stay booleans:
+    /// a string `"true"` is a typo, not a value.
+    #[test]
+    fn tui_boolean_keys_reject_strings_naming_the_key() {
+        for key in ["title", "left_arrow_opens_agents"] {
+            let rendered = load_config_text(&format!("[tui]\n{key} = \"true\"\n"))
+                .expect_err(&format!("{key} = \"true\" must be rejected"))
+                .to_string();
+            assert!(
+                rendered.contains(key),
+                "the error must name the key the user got wrong: {rendered}"
+            );
+        }
+
+        // Real booleans still parse, both ways round.
+        let off: Config =
+            toml::from_str("[tui]\ntitle = false\nleft_arrow_opens_agents = false\n").unwrap();
+        let off = off.tui.unwrap_or_default();
+        assert!(!off.title);
+        assert!(!off.left_arrow_opens_agents);
+    }
+
+    /// The memory bound (T3-S6's risk gate N4) is stated at the parse. Zero is
+    /// not "disabled" and `u64::MAX` is not "unbounded": both are rejected
+    /// with the key named and the accepted range shown, because a bound the
+    /// user cannot read is a bound they will trip over at runtime instead.
+    #[test]
+    fn cell_ring_lines_rejects_zero_and_absurd_values_naming_the_key() {
+        assert_eq!(TuiConfig::MIN_CELL_RING_LINES, 1);
+        assert_eq!(TuiConfig::MAX_CELL_RING_LINES, 1_000_000);
+
+        for value in ["0", "1000001", "4000000000", "-1", "1.5", "\"10000\""] {
+            let text = format!("[tui]\ncell_ring_lines = {value}\n");
+            let rendered = load_config_text(&text)
+                .expect_err(&format!(
+                    "cell_ring_lines = {value} must be rejected, not clamped"
+                ))
+                .to_string();
+            assert!(
+                rendered.contains("cell_ring_lines"),
+                "the error must name the key for {value}: {rendered}"
+            );
+        }
+
+        // ...and the bounds themselves are accepted, so the range check is
+        // not simply rejecting everything.
+        for value in [
+            TuiConfig::MIN_CELL_RING_LINES,
+            TuiConfig::DEFAULT_CELL_RING_LINES,
+            TuiConfig::MAX_CELL_RING_LINES,
+        ] {
+            let parsed = load_config_text(&format!("[tui]\ncell_ring_lines = {value}\n"))
+                .unwrap_or_else(|error| panic!("{value} must be accepted: {error}"));
+            assert_eq!(parsed.tui.unwrap_or_default().cell_ring_lines, value);
+        }
+    }
+
+    /// The configured bound reaches the ring, at each documented edge, with
+    /// the constants read from [`TuiConfig`] so the test and the config cannot
+    /// drift (plan row T3-S6, requirement **N4**).
+    ///
+    /// `MIN` (1) retains exactly one line; `DEFAULT` (10 000) and `MAX`
+    /// (1 000 000) are above any plausible push count here, so the ring keeps
+    /// everything pushed and evicts nothing — which is what proves the bound
+    /// is the *configured* number and not a hardcoded one.
+    ///
+    /// Not vacuous: at each bound the retained contents are asserted, not just
+    /// a count, and the `MIN` case evicts while the others do not, so a ring
+    /// that ignored its argument fails one half or the other.
+    #[test]
+    fn the_configured_cell_ring_bound_reaches_the_ring_at_its_edges() {
+        use kitsu_render::surface::Fd;
+        use kitsu_tui::cells::CellRing;
+
+        let mut minimum = CellRing::new(TuiConfig::MIN_CELL_RING_LINES);
+        for text in ["a", "b", "c"] {
+            minimum.push(Fd::Stdout, text);
+        }
+        assert_eq!(minimum.limit(), TuiConfig::MIN_CELL_RING_LINES);
+        assert_eq!(minimum.len(), 1);
+        assert_eq!(
+            minimum
+                .lines()
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>(),
+            vec!["c".to_string()]
+        );
+        assert_eq!(minimum.evicted(), 2);
+
+        for limit in [
+            TuiConfig::DEFAULT_CELL_RING_LINES,
+            TuiConfig::MAX_CELL_RING_LINES,
+        ] {
+            let mut ring = CellRing::new(limit);
+            for n in 0..256 {
+                ring.push(Fd::Stderr, &format!("line {n}"));
+            }
+            assert_eq!(ring.limit(), limit);
+            assert_eq!(ring.len(), 256, "a bound of {limit} evicts nothing here");
+            assert_eq!(ring.evicted(), 0);
+            assert_eq!(
+                ring.lines().last().expect("a line").plain(),
+                "line 255",
+                "the newest line is last"
+            );
+        }
+    }
+
+    /// An empty prefix is not a prefix. The chord model (design §642) needs a
+    /// key to hang the chords on, so a blank value is an error naming the key
+    /// rather than a silently chord-less session.
+    #[test]
+    fn tui_prefix_rejects_an_empty_value_naming_the_key() {
+        let rendered = load_config_text("[tui]\nprefix = \"\"\n")
+            .expect_err("an empty prefix must be rejected")
+            .to_string();
+        assert!(rendered.contains("prefix"), "{rendered}");
+    }
+
+    /// The three optional tables are independent: `[tui]` must not disturb
+    /// `[agents]` or `[hooks]`, and the flat keys keep working beside it.
+    #[test]
+    fn tui_agents_and_hooks_tables_coexist() {
+        let parsed: Config = toml::from_str(
+            "agent_spawn_cap = 3\n\n\
+             [tui]\nmode = \"inline\"\n\n\
+             [agents]\nstate_file = \"on\"\n\n\
+             [hooks]\non_agent_state = \"notify\"\n",
+        )
+        .expect("all three tables must coexist");
+        assert_eq!(parsed.agent_spawn_cap, Some(3));
+        assert_eq!(parsed.tui.unwrap_or_default().mode, TuiMode::Inline);
         assert_eq!(
             parsed.agents.unwrap_or_default().state_file,
             StateFileMode::On

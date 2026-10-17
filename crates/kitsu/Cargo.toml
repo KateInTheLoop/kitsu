@@ -45,7 +45,9 @@ assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
-tokio = { workspace = true }
+# `test-util` (paused time) is not in tokio's `full`; no new dependency, only
+# the feature the T2-S4 timeout tests need.
+tokio = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
 futures = { workspace = true }
 # Pinned to the same 0.15 `kitsu-tui` uses: 0.16 bumps `unicode-width` past
