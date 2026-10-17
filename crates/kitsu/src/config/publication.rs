@@ -513,9 +513,12 @@ impl PinnedConfigTarget {
             // Advisory serialization covers Kitsu config publishers that use
             // this adapter. It cannot exclude non-cooperating or privileged
             // same-UID writers from the directory namespace.
-            let result = unsafe { libc::flock(parent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if result != 0 {
-                let error = std::io::Error::last_os_error();
+            // A plain `flock` would be wrong here: a sibling thread between
+            // `fork` and `execve` holds a duplicate of this descriptor, so the
+            // first `EWOULDBLOCK` does not mean another publisher is pinning.
+            // See `crate::session::flock_exclusive_with_fork_retry`.
+            if let Err(error) = crate::session::flock_exclusive_with_fork_retry(parent.as_raw_fd())
+            {
                 return Err(if error.kind() == std::io::ErrorKind::WouldBlock {
                     PinTargetError::Busy
                 } else {
@@ -3188,5 +3191,69 @@ mod tests {
         assert_eq!(recovery.effect_ids(), vec![7]);
         assert_eq!(recovery.rollback(7).unwrap(), ConfigRollbackResult::Removed);
         assert!(!target.exists());
+    }
+
+    /// `flock` locks live on the open file description and `O_CLOEXEC` closes
+    /// only at `exec`, so a sibling thread between `fork` and `execve` holds a
+    /// duplicate of the pinned parent directory's descriptor. Trusting the
+    /// first `EWOULDBLOCK` fails a config publication that nothing is
+    /// contending.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinning_a_target_is_not_spuriously_busy_while_another_thread_forks() {
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const SPAWNERS: usize = 4;
+        const ATTEMPTS: usize = 2000;
+
+        let directory = tempfile::tempdir().unwrap();
+        let preview = preview(directory.path().join("kitsu.toml"), "model-v1");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..SPAWNERS)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let Ok(mut child) = Command::new("/bin/true")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                        else {
+                            return;
+                        };
+                        let _ = child.wait();
+                    }
+                })
+            })
+            .collect();
+
+        let mut failure = None;
+        for attempt in 0..ATTEMPTS {
+            match PinnedConfigTarget::pin(preview.target()) {
+                // Dropping the pin closes the parent descriptor and releases
+                // the lock, so every attempt is uncontended.
+                Ok(pinned) => drop(pinned),
+                Err(error) => {
+                    failure = Some((attempt, error));
+                    break;
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+
+        if let Some((attempt, error)) = failure {
+            panic!(
+                "pinning an uncontended config target failed with {error:?} on attempt \
+                 {attempt} of {ATTEMPTS} while another thread was forking"
+            );
+        }
     }
 }

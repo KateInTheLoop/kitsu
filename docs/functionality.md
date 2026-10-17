@@ -174,7 +174,27 @@ invocation roots and drops runtime grants. Exact command grants are numbered,
 labeled invocation/runtime, and revocable with `/revoke-command <number>`.
 Detached agents share active grants but cannot invoke either interactive
 prompter; ungranted background work fails closed without racing foreground
-stdin.
+stdin. `[agents] blocking` chooses between that and parking: `fail_closed`
+(the default, and the behaviour just described) refuses the operation and lets
+the agent carry on, while `ask` makes the agent report as `blocked` and wait
+for a human answer, which then applies through the same grant code the
+foreground prompter uses — `allow always` installs the identical minimal root
+or exact argv/cwd grant, so no second permission path exists.
+`/jobs reply <id> <y|a|n>` answers a parked agent — allow once, allow always,
+or deny — and works from an idle prompt, during a running turn, and through the
+`/agent` and `/agents` spellings, which forward every `/jobs` subcommand
+verbatim. It accepts exactly the keys the foreground approval prompt accepts
+(`y|yes`, `a|always`, `n|no`, case-insensitively) because it calls that same
+parser, so the two cannot drift. A denial releases the agent to continue with
+the refusal rather than interrupting it, and replying to an agent that is not
+waiting reports that instead of silently succeeding.
+`[agents] block_timeout_secs` bounds that wait at 1800 seconds by default,
+after which the agent ends failed-interrupted rather than waiting forever. The
+unit is in the key name deliberately and a bare `block_timeout` is rejected,
+never interpreted. `ask` cannot affect scripted, piped or JSONL runs: those
+resolve permissions in a mode that returns before the prompt route is
+consulted, so the question is never reached — a structural property, not a
+default.
 
 - `fs_read_file`, `fs_list_dir`, and `repo_grep` inspect granted paths.
   On Unix, `repo_grep` is an always-available in-process UTF-8 content search:
@@ -265,14 +285,239 @@ oldest verified artifact. `/artifacts` lists usage and prunes by ID or all.
 usage, tool/write counts, safe recent activity, failure class, terminal result
 handoff, targeted steering, joined cancellation, and pruning. `/jobs view`
 presents the same deck grouped by state, with agents needing input first and
-empty groups omitted. `/jobs explain <id>` answers why one agent is in its
+empty groups omitted. **In the inline viewport `/jobs view` opens an overlay
+instead of printing that deck** -- the same grouping, on the alternate screen,
+with `?` for the key list and `Esc` to close; `Ctrl+X a` (following
+`[tui] prefix`) and pressing left twice on an empty composer open it too, the
+first press only hinting so it cannot open by accident.
+
+`Ctrl+X 1` to `Ctrl+X 9` attach to an agent **by the position it is displayed
+at**, without opening the view: `Ctrl+X 3` is the third row you would see,
+whatever its `#id`, counted over the same grouping and filter the view shows. The
+nine digits reach the first nine rows and nothing below them -- for those, open
+the view and use the arrows. The chord switches agent when one is already
+attached, and re-attaching to the agent you are on does nothing rather than
+re-announcing it. `Ctrl+X 0`, and a digit past the last row, do nothing at all;
+the digit is not even typed into your line, and whatever you had typed is kept.
+Inside the view itself the digits are ordinary characters, since selecting there
+is `↑`/`↓`. Left on a non-empty
+draft still moves the cursor, and up-arrow history recall is untouched.
+`[tui] left_arrow_opens_agents = false` disables the left-arrow route alone.
+`Up`/`Down` move the selection, which follows the agent rather than the row
+position -- an agent finishing re-groups the rows, and a position-keyed cursor
+would silently move your next keystroke onto a different agent. The selection
+clamps at the ends instead of wrapping, moving it never collects a result, and
+if the selected agent is pruned the selection falls to the row that took its
+place.
+
+`Enter` or `→` attaches the selected agent and closes the view. While attached
+the composer prompt names the agent (`agent 3>`), so the line you are typing has
+a visible destination. `←` on an empty composer detaches on the first press --
+it does not wait for the two-press agent-view chord, and it is not affected by
+`[tui] left_arrow_opens_agents`; with text typed, `←` is still cursor movement.
+`Ctrl+X d` and `/detach` also detach. **`Ctrl+X d` works with a line in
+progress and keeps what you typed** -- that is the case it exists for, because
+with text typed `←` is cursor movement rather than a detach, so the chord is the
+only route a half-written line has. The two keys are silent, because the
+prompt label changing back under your caret is the feedback; `/detach` answers
+`detached from agent N; it keeps running` and records
+`{"kind":"detach","agent":N}` for automation, because a submitted line has
+somewhere to put a reply and it is the last moment to tell a user who read
+`/detach` as "cancel the agent" otherwise. With nothing attached it answers
+`not attached to a background agent`. Detaching stops nothing: stopping is `x`
+in the view or `/jobs stop <id>`. Attaching a finished agent collects its result
+just as `Space` does, and closing the view with `q` or `Esc` does not detach.
+
+`n` opens a rename line that accepts any name the registry does -- including
+non-ASCII, which it previously dropped without saying so. A refused name (empty,
+longer than the limit, or carrying control characters) is reported on the rename
+line itself and leaves what you typed in place to be corrected; `Esc` cancels
+without renaming.
+
+While you are attached, the foreground turn keeps running and its output is held
+back rather than interleaved, then replayed when you detach under a
+`⛩ detached from agent N — recap:` header. The buffer holds 64 KiB; if it has
+to drop anything it says how many lines, at the top of the recap, so a gap is
+never silent. A detach with nothing buffered prints nothing at all. Attaching
+straight to another agent replays the first one's recap before announcing the
+new attachment.
+
+While you are attached, a line you submit belongs to that agent: it steers the
+agent, or -- if the agent is blocked waiting on a permission -- answers it with
+`y`, `a` or `n` (the same spellings `/jobs reply` takes). Which one happens is
+decided when you press `Enter`, not when you started typing, and the registry has
+the last word: if the agent finished, stopped, or blocked while you were typing,
+nothing is sent, the agent's own refusal is printed, and **your line stays in the
+composer**. Slash commands are still commands while attached, so `/detach` always
+works.
+
+`/tui fullscreen` switches the renderer to a fullscreen view over the viewport's
+scrollback: it takes the terminal's alternate screen, paints the retained lines,
+**repaints them as new output arrives**, and gives the screen and the window
+title back when you leave it. A prompt that follows no new output repaints
+nothing, so an idle session is still.
+
+Fullscreen draws its own prompt on the bottom row, so the frame is not painted
+over between turns: the composer writes only to that row and never a line feed,
+so typing cannot scroll the frame at all. Two differences from the inline
+composer, both deliberate: there is **no slash-command palette** (the only rows it
+could use are the frame's), and the agent-view keys are **off** while fullscreen
+holds the screen, since the agent view wants that same alternate screen.
+
+`PgUp` and `PgDn` page the retained transcript; `Ctrl+Home` jumps to the oldest
+line the ring still holds and `Ctrl+End` returns to following the newest. They
+move the **frame**, not the caret, and only while fullscreen holds the screen --
+in the other renderers those sequences keep the meanings they always had, so
+`Ctrl+Home` still moves your cursor to the start of the line. Paging pins the
+view: new output stops dragging it to the bottom until you page back down or
+press `Ctrl+End`. A paged sequence arriving inside a paste is content, not a
+keypress.
+
+`Ctrl+O` opens a **transcript overlay** over the transcript the ring retains,
+from the inline composer and from fullscreen alike. The same four keys scroll it,
+and `q` or `Esc` closes it and leaves the frame behind it exactly where it was --
+paging the overlay never moves the view underneath. Its keys are listed on its
+own footer rather than in a global table, because they are live only while it
+holds the screen; `Ctrl+O` itself is listed by `/help tui`, with the composer's
+other chords. `{` and `}` jump to the previous and next prompt, so you can walk
+back through what you asked rather than scrolling. A prompt that spans several
+lines is **one** stop, not one per line -- and so are two submissions with
+nothing printed between them, which is the same rule seen from the other side.
+A jump that cannot move the frame does nothing at all: it does not quietly stop
+the overlay following new output.
+
+`/` searches it. The search runs when you press **Enter**, not as you type, and
+`n`/`N` then walk the matches -- `n` toward newer, `N` toward older -- without
+wrapping, so running out in one direction does nothing rather than throwing you
+to the other end. Submitting lands on the **newest** match, which is where "when
+did this last happen?" starts. Matching ignores case, an empty query cancels, `q`
+is query text while the line is open so the word itself can be searched for, and
+`Esc` cancels the query and leaves the overlay up. The query line replaces the
+footer row, so searching costs no transcript line. **The search covers both
+speakers**, since the scrollback retains your prompts.
+
+**What is searched is what the overlay paints** -- the same text, with only the
+escape bytes your terminal does not display removed. There is one divergence and
+it is width rather than styling: a row is fitted to your terminal's columns, so
+text past the right edge is searchable but not currently on screen. That is
+deliberate -- making matches depend on window width would mean one query finding
+different things in two terminal sizes. Note too that a line **kitsu** writes can
+contain an embedded newline and still be a single scrollback cell, where a prompt
+you submit is split one cell per line.
+
+Dumping the overlay to scrollback and opening it in `$EDITOR` are **not** wired
+yet.
+
+`Ctrl+Z` suspends from fullscreen through the same path the other renderers use,
+though the alternate screen's contents are the terminal's across the stop. `--tui
+fullscreen` and `[tui] mode = "fullscreen"` start there instead; a session that
+starts in fullscreen has nothing behind it to paint yet.
+
+The scrollback it paints holds the **streamed** conversation -- which, since
+answers now stream with tools enabled, means ordinary answers too. It does not
+hold kitsu's own diagnostics and receipts. The one thing still absent is text
+withheld as a possible tool call and then released at the end of a round: the
+released tail reaches the scrollback, so a whole answer is there either way. `[tui] cell_ring_lines` bounds it in lines (default 10000).
+
+**It does hold your own prompts.** A submitted line is retained as yours, split
+one cell per line so a multi-line or pasted prompt keeps its shape on screen, and
+filed with the conversation rather than with the tool output. Slash commands are
+retained as yours as well, since a report with no visible command is half a
+transcript. Two things are deliberately not marked as yours: a command **kitsu**
+injects on your behalf (`/resume` after a restart, `/retry`), because it is not
+your line even though you may type the same words yourself; and a line **refused**
+at an attached agent, which is handed back to your composer and was therefore
+never said. `/export` remains the route to the full conversation.
+
+`?` lists every key the view binds, and `/help keys` prints the same list
+without opening the view -- both render one table, so neither can drift from the
+other or from what the keys actually do. `Enter` or `→` attaches to the selected
+agent, `q` closes the view, and `Esc` leaves whatever line or panel is open
+before closing it.
+
+The status row's background-agent counter follows the registry while you are at
+the prompt, not only while a turn is running -- so an agent that parks on a
+permission shows up without you having to touch the keyboard. A registry change
+with nothing new to show paints nothing, so the row stays still when the state
+does.
+
+`+` opens a dispatch line: type a task to start a background agent on the
+default profile, or `@<profile> <task>` to choose one. `Enter` starts it, `Esc`
+cancels and starts nothing. Refusals -- a line it cannot read, an unknown
+profile, or the registry already at `max_running` or `max_records` -- are
+reported on the dispatch line and leave what you typed in place. Dispatches from
+the view are admitted by the registry's own ceilings, **not** by the model's
+per-turn spawn cap, which exists to stop a model storming agents within one turn.
+Starting an agent leaves the selection where it was.
+
+`/` opens a filter line: `s:<state> n:<text> o:<text> p:<profile>`, each term
+confined to its own field, so a name filter cannot match a task. A term it
+cannot read is refused with the key it did not recognise, and what you typed
+stays in the line so one wrong character can be corrected rather than retyped;
+an empty filter clears it. `Esc` abandons a half-typed term without clearing the
+filter already in force.
+
+The filter decides which agents the keys act on, not just what you see: if it
+hides the selected agent the selection moves to a visible row, and if it matches
+nothing there is no selection for `x`, `r`, `n` or `p` to act on. The filter
+survives an agent finishing and the rows re-grouping, and closing the view
+clears it -- the view always opens showing everything.
+
+`s` steers the selected agent, opening an editable line with a caret that
+windows around the cursor so a correction longer than the terminal still shows
+where you are typing. `Enter` sends it; `Esc` cancels and sends nothing; an
+empty correction is refused. A pasted multi-line correction is content, not a
+submission -- the line waits for your own `Enter`.
+
+`r` replies to a blocked agent (a single key -- `y`, `a` or `n` -- read through
+the same parser `/jobs reply` uses, not a line of text), `x` stops it (press
+twice; on an agent that has already finished, the second press prunes it), `n`
+renames it, and `p` marks its result collected. Every one of them names its
+outcome, names its refusals, and says so when nothing is selected.
+
+`/jobs prune ID` prints an unread result before discarding the record, so the
+only path by which a finished agent's answer could vanish unseen is closed. The
+prune still happens — a typed id is the confirmation, which is why the keystroke
+below refuses where the command does not.
+
+`x` will not prune an agent whose result nobody has read: it says the result is
+waiting, and the same keystroke prunes once you have peeked with `Space` or
+collected with `p`. This is deliberately stricter than `/jobs prune <id>`, which
+names an id explicitly and whose JSON reply carries the result; the second press
+of a keystroke is neither.
+
+Pasted text is never keystrokes here. In a name or correction line a paste is
+content, newlines included, and the line stays open for you to submit it.
+Anywhere else it is ignored with a line saying how many characters were skipped
+-- the text is never echoed back, because a clipboard may hold a secret.
+
+`Space` peeks the selected agent -- the same bounded redacted timeline
+`/jobs show` prints, the permission kind it waits on if blocked, and its result
+or failure if finished. Peeking takes custody of the result exactly as
+`/jobs show` does, so a peeked result is not surfaced again at exit while an
+unviewed one is; peeking a blocked agent takes custody of nothing, and opening
+the view takes custody of nothing. The
+deck is not also printed in inline mode, since it would scroll the transcript
+beneath the overlay unseen. A blocked agent carries its own marker -- `◉`, or `[blk]`
+under `--plain` -- in every agent surface, so the one waiting on an answer is
+distinguishable from the ones merely working; the marker vocabulary is shared
+with the deck rather than duplicated. `/jobs explain <id>` answers why one agent is in its
 state, since when, and what it is waiting on, drawn from the phase, elapsed
 time, last activity, failure class, steering and handoff already recorded; it
 is read-only and, unlike `/jobs show`, never acknowledges a ready result, so
 diagnosing an agent cannot quietly satisfy the unobserved-result exit guard.
 `/agent show`
 adds a bounded redacted event timeline; tool arguments/output and partial model
-bodies are never copied into that inspection record. Built-in `/profiles`
+bodies are never copied into that inspection record. That timeline also records
+each permission a background agent asked for and how it was decided -- allowed
+once, allowed always, denied, timed out, or cancelled -- so an answered agent
+still shows that it asked, and a cancelled one shows that its request was never
+answered. Those entries name the **kind** of permission and nothing else
+("approval to write a file"), never the path, URL or command line: the request's
+payload is converted to a kind at the boundary and no argument travels to the
+recording site, which is how the sentence above stays true of them. A blocked
+agent's `/jobs explain` reports the pending permission on its `waiting on:`
+line in preference to its last tool activity. Built-in `/profiles`
 select a read-only reviewer or a tool-free reasoning worker, and background
 spawns can name a profile without inheriting broader capabilities. `/agents`
 remains a compatibility alias: a bare call lists, a numeric argument shows
@@ -280,10 +525,104 @@ that thread, and any other argument is forwarded verbatim to `/jobs`, so every
 subcommand is reachable through either name.
 
 Background agents run in-process, so nothing outside kitsu can observe them.
+Under `--reduced-motion` the viewport's status row no longer repaints because
+time passed -- the elapsed segment stops ticking -- while the queue and
+background-agent tags keep updating, since those are state changes rather than
+animation. The row is also coalesced to at most 60 repaints per second in the
+painter, so a burst of field changes collapses to the newest value instead of
+one paint each; the newest value is never dropped.
+`/tui [classic|inline]` switches the renderer between turns and keeps the
+conversation: what was printed before the switch stays on screen exactly once,
+and the viewport's live status row returns with it. Bare `/tui` reports the
+renderer actually running. A renderer kitsu does not have is refused,
+naming what is accepted, and `/tui` during a turn is refused rather than queued,
+because the mid-turn fall-through would otherwise send it to the model as a
+prompt. Switching into a terminal shorter than the viewport's minimum stays
+classic and says so.
+`Ctrl+L` repaints the viewport's pinned row. Every exit path from the viewport
+releases the scroll region and restores the terminal: a normal quit, a panic,
+`SIGINT` and `SIGTERM`. The signal path writes one precomposed escape sequence
+and restores the line settings captured when raw mode was entered, then re-raises
+the signal with its default disposition, so the process still dies by the signal
+and in-turn Ctrl+C cancellation keeps working. `kill -9` cannot be restored from.
+In the viewport the answer is read on the keypress while the input collector
+still holds raw mode, so nothing is echoed and the transcript keeps only the
+receipt; the cue is a row of the modal. Classic reads the answer canonically and
+still echoes it, which is what keeps line editing and the `yes`/`always`/`no`
+long forms working there. One parser serves the filesystem approval, the command
+approval and `/jobs reply`, so the accepted answers cannot drift apart.
+In the inline viewport a permission prompt renders as a bottom-pane modal
+rather than scrolling past: the same option line the classic prompt shows, from
+the same composer, and for a command approval the same provenance rows. Because
+the modal is transient, the viewport writes the `◉ permission —` receipt into the
+transcript once you answer, which is the line classic leaves in place by virtue
+of printing it there; the sanitized text is identical either way. `--plain`
+keeps its own unstyled prompt and no modal.
+In the inline viewport the pinned bottom row carries the model, a compact
+context meter, the elapsed time in the current turn, `[N queued]` and the
+background-agent tag, refreshed on the same 50 ms input tick that keeps the
+ambient counter current, and deduplicated so an unchanged row writes no bytes.
+The meter reads the same session usage and effective budget `/context` reports,
+so the two cannot disagree. It never wraps between 40 and 200 columns and sheds
+segments in the order R5 documents.
+In the inline viewport, slash completion works: Tab accepts the showing hint,
+and typing a slash prefix opens the bordered command palette above the composer.
+**`@file` path completion is not yet wired there** -- the shared completion
+source and its parity test exist, and a sweep over every prefix of every
+registered command requires the classic prompt, the shared source and the inline
+host to agree, so they cannot drift once connected; but nothing in production
+drives the inline host yet. A 10 KiB bracketed paste at the idle inline prompt
+stays a single draft and is accepted in single-digit milliseconds, measured by
+`crates/kitsu/tests/paste_latency.rs` against requirement N2's 100 ms budget.
+`--tui <classic|inline>` and the `[tui]` table select the renderer: `mode`
+(default `classic`), `alternate_screen` (`auto` or `always`; **`never` is
+recognised but refused**, and `--no-alt-screen` with it — both need an
+in-viewport overlay path that does not exist yet, and accepting either would
+change nothing, which is worse than saying so), `prefix` (default `ctrl+x`),
+`title` (see below),
+`left_arrow_opens_agents`, and `cell_ring_lines` (default 10000, range
+1-1000000). The flag wins over the config key, the config key over the default,
+and **no environment variable participates**. A misspelled key or an invalid
+value is a startup error that names the key and lists what it accepts -- never a
+silent fallback -- and `kitsu doctor` reports it as a blocking issue.
+
+**`[tui] title` sets the terminal window title**, to `kitsu · idle · 0 agents`,
+`kitsu · working · 1 agent`, `kitsu · blocked · 3 agents` and so on — the state
+word, then how many background agents are live — so a multiplexer or a herder can
+classify windows by title without asking kitsu anything. `blocked` outranks
+`working`, the same precedence the live status row uses, and the count is always
+present: a title that dropped the number at zero would make *"no agents"* and
+*"stale title"* indistinguishable from outside. It defaults to on and also
+controls the push and pop of the terminal's title stack around fullscreen, so
+`title = false` silences both.
+
+**Only a styled terminal receives it.** A piped run, `--plain`, `--screen-reader`
+and `--jsonl` are byte-identical to before — the title is terminal decoration, and
+a consumer reading your output should never see it.
+
+**The title keeps up during a turn.** It is refreshed at the prompt and at the
+start of each turn, and also whenever the agent registry changes — so an agent
+that blocks or finishes **mid-turn** moves the title then, rather than at the next
+prompt. And the title is **restored on exit**, in every mode — but
+with two gaps worth knowing. Under a **multiplexer** it is not: multiplexers drop
+the title-stack sequences outright, and there is no way to read a window title back
+to restore it by hand. And a **`classic` session killed by a signal** leaves its
+title behind, because classic deliberately installs no terminal-restoring signal
+handler — that is what keeps a classic session's output free of viewport bytes.
+Quitting normally restores the title in every mode. The error
+names the key and the permitted values but never echoes the offending value,
+because a config file can hold credentials. `fullscreen` appears in the design
+but is not accepted yet.
 `[agents] state_file` publishes a small advisory JSON hint, one file per running
 process, that an outside tool such as a terminal multiplexer can read to tell
 whether this kitsu is `idle`, `working`, or `blocked`, alongside the same
-redacted thread records `/jobs` shows. `auto` (the default) writes only in an
+redacted thread records `/jobs` shows. A background agent parked on a permission
+raises the process state to `blocked`, is counted in `counts.blocked`, and
+carries a `waiting_for` naming the **kind** of permission it needs --
+`read_file`, `write_file` or `run_command`, the same vocabulary the
+`on_agent_state` hook and `kitsu agents --json` use, and never the path or
+command line. Answering the agent removes the key rather than leaving a stale
+reason for a poller to read. `auto` (the default) writes only in an
 interactive terminal session, so scripted, piped, `ask` and JSONL runs write
 nothing at all; `on` writes regardless of how kitsu was invoked, and `off`
 never writes. The file lives at `$XDG_RUNTIME_DIR/kitsu/<pid>.json`, falling
@@ -297,7 +636,14 @@ that died, and writing it never affects a turn — every failure is silent.
 
 `[hooks] on_agent_state` runs a local command when a background agent changes
 state, with `KITSU_AGENT_ID`, `KITSU_AGENT_STATE` and `KITSU_AGENT_WAITING_FOR`
-added to the inherited environment. The command is split into arguments and
+added to the inherited environment. An agent that parks on a permission reports
+`KITSU_AGENT_STATE=blocked` with `KITSU_AGENT_WAITING_FOR` naming the **kind**
+of permission -- `read_file`, `write_file` or `run_command` -- and never the
+path, URL or command line it asked about; a hook runs an external program, so
+the reason travels as a fixed vocabulary that cannot carry an argument. The same
+three words appear in the state file and in `kitsu agents --json`, so a tool can
+match on one spelling across all three. Releasing the agent fires a second
+transition with its running state and no waiting reason. The command is split into arguments and
 executed **directly — never through a shell, and with no variable expansion**,
 so a stray metacharacter in the config cannot become execution and the
 behaviour does not depend on which shell is installed; point it at a script, or
@@ -321,10 +667,26 @@ One per-turn spawn budget covers synchronous `spawn_agent`, parallel
 `spawn_agents`, and detached `spawn_agent_bg` calls. It defaults to eight in
 interactive chat and two in scripted or piped automation, and can be overridden
 by `--agent-spawn-cap` or `agent_spawn_cap` in config. A zero cap unregisters
-all four multi-agent schemas, including `agent_result`, so `/tools`, the system
+all five multi-agent schemas, including `agent_result` and `agent_wait`, so
+`/tools`, the system
 prompt, `provider_request.tools_offered`, and the actual provider body agree
 that multi-agent work is disabled; unrelated filesystem, command, skill, and
 workspace-evidence tools remain available.
+
+`agent_wait(id, until, timeout_secs)` blocks the foreground model on one
+background agent's state. `until` is `done` -- the agent finished, **failed, or
+was cancelled** -- or `blocked`, meaning it is parked waiting on an approval
+answer, the state `/jobs` groups as `needs input`. A state that already holds
+returns immediately; so does a state that has become **unreachable**, such as
+waiting for `blocked` on an agent that has gone terminal, rather than holding the
+round open for a change that can never come. `timeout_secs` defaults to 60 and is
+capped at 30 minutes, and `0` polls once. **A timeout is a normal result, not an
+error:** the model is told the state it did not reach, the timeout actually used
+and the agent's current status, and is free to do other work. An unknown id is an
+error, returned at once rather than costing a whole timeout. The tool starts no
+agent, so it never consumes the per-turn spawn budget -- but each call is one
+round of the caller's turn, so a model that polls in a loop is bounded by
+`--max-rounds` as well as by its own timeout.
 
 ### `@file` attachments
 
@@ -438,6 +800,24 @@ schema inputs, required-write files, explicit model writes, and explicit
 lifecycle/export commands are outside this automatic-storage policy.
 `/status`, `/permissions`, `/artifacts`, doctor JSON, and JSONL
 `run_started.artifact_policy` disclose the effective mode and source.
+
+**When trimming loses a tool result, the run says so.** If the context budget
+forces history trimming to replace an entire tool result with a dead placeholder,
+a `--jsonl` run now emits `{"type":"tool_results_dropped","round":N,"dropped":N}`.
+Before this, the result was removed before the provider saw it and every event in
+the stream still reported success -- the tool's own receipt was honest and the
+turn's was not. The event fires **only when the loss is unrecoverable**: with a
+low `--offload-cap` an evicted result leaves a re-readable pointer the model can
+recall, which is not a loss and stays silent, so the warning does not become
+noise. A run that loses nothing emits nothing new.
+
+**An interactive session is told as well.** On a terminal the run prints
+`~ context budget dropped 2 tool results in round 3; the provider never saw them`
+-- the count first, one line per round. It appears **only** when both stdout and
+stderr are terminals and styling is on, so a redirected run, `--plain`,
+`NO_COLOR`, `--screen-reader` and `--jsonl` are all byte-identical to before. That
+gate is stricter than it strictly needs to be, deliberately: a run with stdout
+redirected is being consumed by something, and a mid-turn notice is noise to it.
 
 ## Context management
 

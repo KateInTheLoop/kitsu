@@ -71,6 +71,24 @@ fn run_plain_interactive_chat_pty<F>(
     home: &Path,
     cwd: &Path,
     extra_chat_args: &[&str],
+    drive: F,
+) -> (std::process::ExitStatus, String)
+where
+    F: FnMut(&[u8], &mut fs::File),
+{
+    run_plain_interactive_chat_pty_with_env(home, cwd, extra_chat_args, &[], drive)
+}
+
+/// [`run_plain_interactive_chat_pty`] with extra environment for the child
+/// only. T2-S7 needs it to point the carrier's agent state file at a private
+/// `XDG_RUNTIME_DIR`; the parent's environment is never touched, which is the
+/// same rule every other state-file test follows.
+#[cfg(unix)]
+fn run_plain_interactive_chat_pty_with_env<F>(
+    home: &Path,
+    cwd: &Path,
+    extra_chat_args: &[&str],
+    extra_env: &[(&str, &Path)],
     mut drive: F,
 ) -> (std::process::ExitStatus, String)
 where
@@ -131,6 +149,9 @@ where
             "--no-session",
         ])
         .args(extra_chat_args);
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
     let mut child = command.spawn().expect("spawn interactive carrier chat");
     // SAFETY: ownership of the remaining master descriptor transfers once.
     let mut terminal = unsafe { fs::File::from_raw_fd(master) };
@@ -2049,12 +2070,29 @@ fn test_terminal_mode_pty_matrix_decouples_rendering_and_input() {
             .windows(b"\x1b[38;2;255;140;0m".len())
             .any(|window| window == b"\x1b[38;2;255;140;0m");
         assert_eq!(fox_truecolor, styled, "{name}: {output:?}");
-        assert!(
-            !output
-                .windows(b"\x1b]".len())
-                .any(|window| window == b"\x1b]"),
-            "{name} emitted an OSC sequence: {output:?}"
-        );
+        // Card H2-title. A non-styled surface still emits no OSC at all;
+        // a styled TTY is exactly where requirement H2 demands the terminal
+        // title, so the assertion pins *which* OSC appears rather than
+        // flipping to a blanket allowance (**F41**): every OSC introducer on
+        // a styled surface must open the state title.
+        let osc_count = output
+            .windows(b"\x1b]".len())
+            .filter(|window| *window == b"\x1b]")
+            .count();
+        if styled {
+            let title_intro = "\x1b]2;kitsu \u{b7} ".as_bytes();
+            let title_count = output
+                .windows(title_intro.len())
+                .filter(|window| *window == title_intro)
+                .count();
+            assert_eq!(
+                osc_count, title_count,
+                "{name}: the only OSC a styled surface may emit is the H2 \
+                 terminal title: {output:?}"
+            );
+        } else {
+            assert_eq!(osc_count, 0, "{name} emitted an OSC sequence: {output:?}");
+        }
     }
 }
 
@@ -13259,7 +13297,24 @@ async fn test_no_artifacts_bounds_large_tool_result_and_saves_session_without_si
         .find(|message| message["role"] == "tool")
         .and_then(|message| message["content"].as_str())
         .expect("bounded tool result in second request");
-    assert!(tool_content.contains("bytes omitted by artifact-free policy"));
+    assert!(
+        tool_content.contains("bytes omitted by artifact-free policy"),
+        "the artifact-free bound marker must reach the provider in the second request, \
+         but the tool message there is {} bytes, beginning {:?}. An elided or shrunken \
+         tool message means history trimming dropped it before the provider saw it, which \
+         is what happens when the protected prompt (system instructions plus tool schemas) \
+         grows into the window budget - check whether a tool schema grew. The tool ran \
+         and bounded its own output (artifact_status {}, output_truncated {}, \
+         output_bytes {}, output_retained_bytes {}), so the loss is downstream of the \
+         policy. The second request carried {} messages.",
+        tool_content.len(),
+        tool_content.chars().take(300).collect::<String>(),
+        finished["artifact_status"],
+        finished["output_truncated"],
+        finished["output_bytes"],
+        finished["output_retained_bytes"],
+        second["messages"].as_array().unwrap().len(),
+    );
     assert!(!tool_content.contains("CENTER_MUST_BE_OMITTED"));
 
     let sessions = home.path().join(".kitsu/sessions");
@@ -15266,6 +15321,175 @@ async fn test_scripted_exit_surfaces_terminal_background_results_in_human_and_js
     server.verify().await;
 }
 
+/// Card **F67-print**: `/jobs prune <id>` prints an unviewed result before it
+/// discards the record, so the interactive path stops being the only one that
+/// loses the work.
+///
+/// The asymmetry F67 records: `kitsu agents --json` / automation gets
+/// `terminal_job_payload(&status)` in the reply, while an interactive human got
+/// only `~ pruned background job #1` on stderr -- and `AgentRegistry::prune`
+/// removes the record, which is the one thing
+/// `take_unobserved_terminal_results` cannot see, so the exit guard could not
+/// surface it afterwards either. The result was simply gone.
+///
+/// The decision is to print, **then** prune -- not to refuse. So this pins
+/// BOTH halves, and the second half is what keeps the card from being "fixed"
+/// by turning it into a refusal:
+///
+/// 1. the result body reaches stderr, once, before the prune receipt, and
+/// 2. the record is really gone afterwards -- `/jobs` shows an empty deck.
+///
+/// Driven end to end rather than at a seam because the loss is a property of
+/// what the human sees on stderr, and stderr is the surface F67 is about.
+#[tokio::test]
+#[serial]
+async fn test_script_jobs_prune_prints_an_unviewed_result_before_discarding_the_record() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains(
+            "\"content\":\"background audit task\"",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "PRUNE_RESULT_SENTINEL"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The foreground turn is held open long enough for the detached agent to
+    // finish, so `/jobs prune 1` on the next script line meets a terminal
+    // record whose handoff is still `Ready`. A still-running agent would be
+    // refused with "still running", which is asserted against below rather
+    // than passing silently.
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(500))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "foreground complete"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "background-call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "spawn_agent_bg",
+                            "arguments": "{\"task\":\"background audit task\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("prune-unviewed.script");
+    fs::write(&script, "start detached work\n/jobs prune 1\n/jobs\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).arg("--no-stream");
+        cmd.args([
+            "--gateway",
+            "example",
+            "chat",
+            "--no-session",
+            "--allow-path",
+            &home_path.to_string_lossy(),
+            "--script",
+            &script_path,
+        ]);
+        cmd.output().unwrap()
+    })
+    .await
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "stderr: {stderr}\nstdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // The precondition, loudly: the prune really met a finished record. If the
+    // detached agent were still running the prune would have been refused and
+    // every assertion below would be about the wrong thing.
+    assert!(
+        !stderr.contains("is still running; stop it first"),
+        "the detached agent must be terminal when /jobs prune runs: {stderr}"
+    );
+
+    let pruned_at = stderr
+        .find("~ pruned background job #1")
+        .unwrap_or_else(|| panic!("the prune receipt is still printed: {stderr}"));
+    let result_at = stderr.find("PRUNE_RESULT_SENTINEL").unwrap_or_else(|| {
+        panic!(
+            "F67: /jobs prune must print the unviewed result instead of \
+             destroying it, as `agents --json` already keeps it: {stderr}"
+        )
+    });
+    assert!(
+        result_at < pruned_at,
+        "the result is printed, then the prune is reported: {stderr}"
+    );
+    // The header `print_background_results` already gives an unobserved
+    // result, measured rather than invented: the id and the task, with the
+    // body beneath it.
+    assert!(
+        stderr.contains("background job #1 result"),
+        "the printed result is headed the way the exit guard heads one: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("PRUNE_RESULT_SENTINEL").count(),
+        1,
+        "printed exactly once -- the prune prints it and the record is then \
+         gone, so shutdown cannot print it again: {stderr}"
+    );
+
+    // And the prune still happened. This is the half that fails if the card is
+    // "fixed" by refusing to prune an unviewed result (option three), which is
+    // the `x` key's answer and deliberately not this command's.
+    assert!(
+        stderr[pruned_at..].contains("no background agents"),
+        "the record is really gone: /jobs after the prune shows an empty \
+         deck, so printing did not become a refusal: {stderr}"
+    );
+    assert!(
+        stderr[pruned_at..].contains("0 total"),
+        "and the deck counts agree -- the row is gone, not merely unlisted: \
+         {stderr}"
+    );
+    server.verify().await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
@@ -16104,7 +16328,17 @@ async fn test_context_window_mismatch_warns_on_stderr() {
     })
     .await
     .unwrap();
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kitsu must exit 0; stderr: {}; stdout error events: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("\"type\":\"error\""))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.contains("context window mismatch suspected"),
@@ -16143,7 +16377,17 @@ async fn test_jsonl_context_window_mismatch_emits_typed_event() {
     })
     .await
     .unwrap();
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kitsu must exit 0; stderr: {}; stdout error events: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("\"type\":\"error\""))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
     assert!(output.stderr.is_empty());
     let events = String::from_utf8(output.stdout)
         .unwrap()
@@ -16181,7 +16425,7 @@ async fn test_context_command_surfaces_window_runtime_evidence() {
     let home = TempDir::new().unwrap();
     write_config(home.path(), &server.uri());
     let script = home.path().join("mismatch.script");
-    let big_prompt = "review this attachment ".repeat(1000).replace('\n', " ");
+    let big_prompt = "review this attachment ".repeat(900).replace('\n', " ");
     fs::write(&script, format!("{big_prompt}\n/context\n")).unwrap();
     let home_path = home.path().to_path_buf();
     let script_path = script.to_string_lossy().to_string();
@@ -16194,7 +16438,17 @@ async fn test_context_command_surfaces_window_runtime_evidence() {
     })
     .await
     .unwrap();
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kitsu must exit 0; stderr: {}; stdout error events: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("\"type\":\"error\""))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
     let events = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
@@ -16268,7 +16522,17 @@ async fn test_piped_chat_system_prompt_names_cwd_and_granted_roots() {
     })
     .await
     .unwrap();
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kitsu must exit 0; stderr: {}; stdout error events: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("\"type\":\"error\""))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
 
     let requests = server.received_requests().await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
@@ -16535,6 +16799,497 @@ async fn test_script_exit_joins_live_background_agents_and_never_claims_a_rollba
     assert_eq!(facts.provider_attempts, 2);
     assert_eq!(facts.tool_started, facts.tool_finished);
     server.verify().await;
+}
+
+// --- T2-S5a: agents.blocking / agents.block_timeout_secs -------------------
+//
+// FAILING-FIRST. `[agents] blocking` and `[agents] block_timeout_secs` do not
+// exist yet, and `AgentsConfig` is `deny_unknown_fields`, so every run below
+// that writes them currently exits 1 with `unknown field`.
+//
+// These are the only tests in the tree that drive the WHOLE blocked path --
+// real gate, real prompt route, real registry, real timer -- because
+// `kitsu_tools::ask_registry` is `pub(crate)` and `Mode::Ask` is reached only
+// by an interactive (PTY) run. A `--script` run is non-interactive and gets
+// `Mode::Deny`, which never consults the prompt route at all.
+
+/// Like `write_config`, plus an `[agents]` table written verbatim.
+fn write_config_with_agents_table(home: &Path, base_url: &str, agents: &str) {
+    write_config(home, base_url);
+    let path = home.join(".kitsu").join("config.toml");
+    let mut config = fs::read_to_string(&path).expect("read config.toml");
+    config.push_str("\n[agents]\n");
+    config.push_str(agents);
+    fs::write(&path, config).expect("write config.toml");
+}
+
+/// One mock gateway that drives: parent spawns a detached agent, the detached
+/// agent reads a path outside every allow root, and whatever the gate hands
+/// back ends the child's turn.
+#[cfg(unix)]
+async fn mount_gated_detached_agent_gateway(server: &wiremock::MockServer, forbidden: &Path) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let forbidden = forbidden.to_string_lossy().into_owned();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body).into_owned();
+            // Only the parent is offered the spawn tools (a detached agent is
+            // depth-1), so the advertised tool name -- not the task text,
+            // which the parent's own tool_call echoes -- tells them apart.
+            let is_child = !body.contains("spawn_agent_bg");
+            let after_tool = body.contains("\"role\":\"tool\"");
+            // What the gate handed the child, so the child's answer carries it
+            // into the registry where `/agents` can print it.
+            let gate_answer = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("messages")?
+                        .as_array()?
+                        .iter()
+                        .rev()
+                        .find(|message| message.get("role").and_then(|r| r.as_str()) == Some("tool"))?
+                        .get("content")?
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            let json = match (is_child, after_tool) {
+                // The detached agent's first round: touch the gate.
+                (true, false) => serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "gated-read-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "fs_read_file",
+                                    "arguments": format!(
+                                        "{{\"path\":{}}}",
+                                        serde_json::Value::String(forbidden.clone())
+                                    )
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+                // The detached agent got an answer from the gate.
+                (true, true) => serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": format!("CHILD_SAW: {gate_answer}")
+                        },
+                        "finish_reason": "stop"
+                    }]
+                }),
+                // The parent, after its spawn tool returned.
+                (false, true) => serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "PARENT_DELEGATED"},
+                        "finish_reason": "stop"
+                    }]
+                }),
+                // The parent's first round: delegate.
+                (false, false) => serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "parent-spawn-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "spawn_agent_bg",
+                                    "arguments": "{\"task\":\"GATED_CHILD_TASK: read the file you were given\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+            };
+            ResponseTemplate::new(200).set_body_json(json)
+        })
+        .mount(server)
+        .await;
+}
+
+/// Drive the interactive PTY: delegate once, then poll `/jobs` until both
+/// `wanted` substrings have been seen (or the harness deadline fires), then
+/// quit. Polling `/jobs` from the idle prompt is the only synchronization
+/// used, so there is no sleep-and-hope anywhere.
+#[cfg(unix)]
+fn run_gated_delegation_pty(
+    home: &Path,
+    cwd: &Path,
+    extra_chat_args: &[&str],
+) -> (std::process::ExitStatus, String) {
+    use std::io::Write as _;
+
+    let mut delegated = false;
+    let mut quit = false;
+    let mut polls = 0_u32;
+    let mut last_poll = std::time::Instant::now();
+    run_plain_interactive_chat_pty(home, cwd, extra_chat_args, move |output, terminal| {
+        let text = String::from_utf8_lossy(output);
+        let prompts = text.matches("kitsu>").count();
+        if !delegated && prompts >= 1 {
+            terminal
+                .write_all(b"delegate the read\n")
+                .expect("delegate");
+            terminal.flush().unwrap();
+            delegated = true;
+            last_poll = std::time::Instant::now();
+            return;
+        }
+        if !delegated || quit {
+            return;
+        }
+        if !text.contains("PARENT_DELEGATED") {
+            return;
+        }
+        // Stop as soon as the detached agent's outcome is observable, or after
+        // a bounded number of polls, so a missing outcome fails on its own
+        // assertion rather than on the harness deadline.
+        let settled = text.contains("CHILD_SAW") || text.contains("interrupted");
+        if settled || polls >= 20 {
+            terminal.write_all(b"/quit\n").expect("quit");
+            terminal.flush().unwrap();
+            quit = true;
+            return;
+        }
+        if last_poll.elapsed() >= std::time::Duration::from_millis(150) {
+            // `/jobs view` -- NOT bare `/jobs`. The `needs input` heading is
+            // produced only by `format_jobs_view`; the bare command prints the
+            // agent deck, which never contains that string. Polling the deck
+            // made the positive assertion unreachable at any timeout and made
+            // the two negative `!contains("needs input")` guards pass
+            // vacuously. `/agents` prints finished results.
+            terminal.write_all(b"/jobs view\n/agents\n").expect("poll");
+            terminal.flush().unwrap();
+            polls += 1;
+            last_poll = std::time::Instant::now();
+        }
+    })
+}
+
+/// THE DEFAULT (B1, N1, plan row T2-S5): with no `[agents]` table at all, an
+/// interactive run is unchanged -- the detached agent's gate still fails
+/// closed with today's message, nothing is ever parked, and `/jobs` never
+/// grows a `needs input` group.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_default_blocking_fails_a_gated_detached_agent_closed() {
+    let server = wiremock::MockServer::start().await;
+    let home = TempDir::new().expect("temp home");
+    let repo = TempDir::new().expect("temp repo");
+    let outside = TempDir::new().expect("a directory no allow root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").unwrap();
+    mount_gated_detached_agent_gateway(&server, &forbidden).await;
+    write_config(home.path(), &server.uri());
+
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let allow = repo_path.to_string_lossy().into_owned();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        run_gated_delegation_pty(&home_path, &repo_path, &["--allow-path", &allow])
+    })
+    .await
+    .expect("interactive gated-delegation fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("CHILD_SAW"),
+        "the detached agent must have reached the gate and reported back: {transcript}"
+    );
+    assert!(
+        transcript.contains("background agents cannot open interactive permission prompts"),
+        "the default must keep today's exact fail-closed message: {transcript}"
+    );
+    assert!(
+        !transcript.contains("needs input"),
+        "nothing may park under the default: {transcript}"
+    );
+}
+
+/// Explicitly `fail_closed` must be indistinguishable from an absent table.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_explicit_fail_closed_is_indistinguishable_from_an_absent_agents_table() {
+    let server = wiremock::MockServer::start().await;
+    let home = TempDir::new().expect("temp home");
+    let repo = TempDir::new().expect("temp repo");
+    let outside = TempDir::new().expect("a directory no allow root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").unwrap();
+    mount_gated_detached_agent_gateway(&server, &forbidden).await;
+    write_config_with_agents_table(home.path(), &server.uri(), "blocking = \"fail_closed\"\n");
+
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let allow = repo_path.to_string_lossy().into_owned();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        run_gated_delegation_pty(&home_path, &repo_path, &["--allow-path", &allow])
+    })
+    .await
+    .expect("interactive gated-delegation fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        !transcript.contains("unknown field"),
+        "`blocking` must be an accepted key: {transcript}"
+    );
+    assert!(
+        transcript.contains("background agents cannot open interactive permission prompts"),
+        "explicit fail_closed is today's behaviour: {transcript}"
+    );
+    assert!(!transcript.contains("needs input"), "{transcript}");
+}
+
+/// Scripted and JSONL runs must be byte-identical under the default. Both
+/// configurations are run twice; the two configurations' transcripts must
+/// match each other exactly, which also proves the scenario is deterministic.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_scripted_and_jsonl_runs_are_byte_identical_under_the_default() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"content\":\"BYTE_IDENTICAL_TASK\""))
+        // THE DETERMINISM OF THIS TEST LIVES HERE (F39, eight occurrences).
+        // Without this delay the detached agent and the foreground turn race:
+        // the agent needs one round trip to this very mock, the foreground
+        // needs one more, and whichever lands first decides whether
+        // `registry.running()` is still non-zero when input ends. On the
+        // running side the run narrates `input ended with 1 background
+        // agent(s) running; joining them` and `joined 1 background agent(s)
+        // before exit`; on the finished side it narrates neither -- and the
+        // byte comparison below then fails on two lines of correct product
+        // output. The delay does not replace the wait: it only puts the
+        // detached completion behind end-of-input, so the exit join is always
+        // entered and then WAITS on the agent registry's watch channel until
+        // the agent is terminal (`join_background_agents_at_exit`). That is
+        // the synchronisation; one second against an end-of-input that
+        // arrives in single-digit milliseconds is the ordering, and it is far
+        // under the 15s first join heartbeat, which would otherwise add a
+        // `still waiting` line of its own.
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(1))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "DETACHED_DONE"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "FOREGROUND_DONE"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "byte-identical-1",
+                        "type": "function",
+                        "function": {
+                            "name": "spawn_agent_bg",
+                            "arguments": "{\"task\":\"BYTE_IDENTICAL_TASK\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let transcripts = tokio::task::spawn_blocking(move || {
+        let run = |agents: Option<&str>, jsonl: bool| {
+            let home = TempDir::new().expect("temp home");
+            match agents {
+                None => write_config(home.path(), &uri),
+                Some(table) => write_config_with_agents_table(home.path(), &uri, table),
+            }
+            let script = home.path().join("byte-identical.script");
+            fs::write(&script, "delegate\n").unwrap();
+            let mut cmd = base_cmd(home.path());
+            cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).arg("--no-stream");
+            if jsonl {
+                cmd.arg("--jsonl");
+            }
+            cmd.args([
+                "--gateway",
+                "example",
+                "chat",
+                "--no-session",
+                "--script",
+                &script.to_string_lossy(),
+            ]);
+            let output = cmd.output().unwrap();
+            // The temp home is the only per-run varying token.
+            let home_token = home.path().to_string_lossy().into_owned();
+            // Per-run ids and millisecond timings are the only legitimately
+            // varying tokens, so every digit run collapses to `N`. A single
+            // changed word, line, order or event still fails the comparison.
+            let clean = |bytes: &[u8]| {
+                // The JSONL `run_started` event carries
+                // `provider_route.route.profile`, a `profile-v1-` + 32 hex
+                // digest of the CANONICALISED CONFIG PATH. Each run here uses
+                // a fresh temp home, so that field differs by construction --
+                // and the digit-collapsing below cannot hide it, because a
+                // hex digest's `a`-`f` survive. It is environmental like
+                // `run_id` and `duration_ms`, not behaviour, so it is
+                // normalised rather than compared.
+                let text = String::from_utf8_lossy(bytes).replace(&home_token, "<HOME>");
+                let text = {
+                    let mut out = String::with_capacity(text.len());
+                    let mut rest = text.as_str();
+                    while let Some(at) = rest.find("profile-v1-") {
+                        out.push_str(&rest[..at]);
+                        out.push_str("profile-v1-<DIGEST>");
+                        let after = &rest[at + "profile-v1-".len()..];
+                        let skip = after
+                            .char_indices()
+                            .take_while(|(i, c)| *i < 32 && c.is_ascii_hexdigit())
+                            .count();
+                        rest = &after[skip..];
+                    }
+                    out.push_str(rest);
+                    out
+                };
+                let mut out = String::with_capacity(text.len());
+                let mut in_digits = false;
+                for ch in text.chars() {
+                    if ch.is_ascii_digit() {
+                        if !in_digits {
+                            out.push('N');
+                            in_digits = true;
+                        }
+                    } else {
+                        in_digits = false;
+                        out.push(ch);
+                    }
+                }
+                out
+            };
+            (clean(&output.stdout), clean(&output.stderr))
+        };
+        [
+            run(None, false),
+            run(Some("blocking = \"fail_closed\"\n"), false),
+            run(None, true),
+            run(
+                Some("blocking = \"fail_closed\"\nblock_timeout_secs = 1800\n"),
+                true,
+            ),
+        ]
+    })
+    .await
+    .expect("byte-identical fixture joins");
+
+    // The determinate state the delay above buys: in BOTH scripted runs the
+    // agent is still live when input ends, so the exit join is entered and its
+    // two narration lines are compared rather than coin-flipped. If this ever
+    // trips, the ordering has inverted and the byte comparison below has
+    // quietly stopped covering the join path.
+    for (index, (_, stderr)) in transcripts.iter().take(2).enumerate() {
+        assert!(
+            stderr.contains("input ended with N background agent(s) running; joining them")
+                && stderr.contains("joined N background agent(s) before exit"),
+            "scripted run {index} must reach end-of-input with the agent still joining: {stderr}"
+        );
+    }
+    assert_eq!(
+        transcripts[0], transcripts[1],
+        "an explicit fail_closed must not change one byte of a scripted run"
+    );
+    assert_eq!(
+        transcripts[2], transcripts[3],
+        "nor one byte of a JSONL run (N1: background_result unchanged)"
+    );
+}
+
+/// The end-to-end test this milestone has owed since T2-S2: `blocking = ask`
+/// with a one-second `block_timeout_secs`. A detached agent hits a REAL
+/// permission gate, the REAL prompt route parks it in the REAL registry,
+/// `/jobs` shows it under `needs input`, and the REAL timer ends it as
+/// failed/interrupted -- no `/jobs reply` required (that is T2-S5b).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_blocking_ask_parks_a_gated_detached_agent_and_times_it_out() {
+    let server = wiremock::MockServer::start().await;
+    let home = TempDir::new().expect("temp home");
+    let repo = TempDir::new().expect("temp repo");
+    let outside = TempDir::new().expect("a directory no allow root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").unwrap();
+    mount_gated_detached_agent_gateway(&server, &forbidden).await;
+    write_config_with_agents_table(
+        home.path(),
+        &server.uri(),
+        "blocking = \"ask\"\nblock_timeout_secs = 1\n",
+    );
+
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let allow = repo_path.to_string_lossy().into_owned();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        run_gated_delegation_pty(&home_path, &repo_path, &["--allow-path", &allow])
+    })
+    .await
+    .expect("interactive gated-delegation fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        !transcript.contains("unknown field"),
+        "`blocking`/`block_timeout_secs` must be accepted keys: {transcript}"
+    );
+    assert!(
+        transcript.contains("needs input"),
+        "under `ask` the parked agent must appear in /jobs under `needs input`: {transcript}"
+    );
+    assert!(
+        !transcript.contains("background agents cannot open interactive permission prompts"),
+        "under `ask` the gate parks instead of returning the fail-closed error: {transcript}"
+    );
+    assert!(
+        transcript.contains("interrupted"),
+        "the configured one-second timeout must end the agent as failed/interrupted: {transcript}"
+    );
 }
 
 /// When the bounded join really is exceeded, the cancellation names the policy
@@ -18945,6 +19700,2445 @@ fn test_agents_rejects_the_global_jsonl_flag_and_names_its_replacement() {
 
     let facts = jsonl_fixture::inspect_jsonl(&events, 1).expect("inspect the rejection JSONL");
     assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::UserFault);
+}
+
+// --- T2-S7 end to end: the blocked state as an outside tool sees it -------
+//
+// The only test in the tree that observes a blocked agent from OUTSIDE the
+// process that owns it: a real PTY carrier parks a real detached agent on a
+// real permission gate, and while it is parked this test reads the state file
+// the carrier wrote to disk and runs `kitsu agents --json` as a SEPARATE
+// process against it. The unit tests beside the writer pin the content; this
+// one pins that the bytes actually travel, and that the two machine surfaces
+// spell the same thing.
+
+/// The one `<pid>.json` state file under `runtime/kitsu`, decoded.
+///
+/// `None` while the carrier has not published yet, which is what lets the
+/// driver synchronize on the file rather than sleep for it.
+#[cfg(unix)]
+fn read_only_agent_state_file(runtime: &Path) -> Option<(u32, serde_json::Value)> {
+    let dir = runtime.join("kitsu");
+    let mut found = None;
+    for item in fs::read_dir(&dir).ok()?.flatten() {
+        let name = item.file_name();
+        let name = name.to_str()?;
+        let Some(digits) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let Ok(pid) = digits.parse::<u32>() else {
+            continue;
+        };
+        let bytes = fs::read(item.path()).ok()?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        assert!(
+            found.is_none(),
+            "exactly one carrier publishes into a private runtime dir, found a second: {name}"
+        );
+        found = Some((pid, value));
+    }
+    found
+}
+
+/// Plan row T2-S7's acceptance over the whole real stack. `blocking = "ask"`
+/// with a 600s timeout, so only the typed answer can release the agent, and
+/// `state_file = "on"` so the hint is published whatever the carrier is
+/// inferred to be.
+///
+/// Why this is not vacuous, and what would break it: every assertion is a
+/// positive one about a surface outside the process. Reverting
+/// `AgentApprovalKind::wire()` to the empty string, or `AgentThreadState`'s
+/// typed `waiting_for` back to an unconditional `None`, fails step 2 and 3
+/// immediately; leaving `waiting_for` set after `unblock()` fails step 5. The
+/// leak sweeps are the only negative assertions, and they are backed by the
+/// positive `read_file` equality in the same test -- an empty or absent record
+/// cannot pass them by carrying nothing at all -- plus the probe assertions in
+/// the unit tests proving both surfaces print an argument when given one.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_a_parked_agent_is_visible_in_the_state_file_and_to_kitsu_agents_json() {
+    let server = wiremock::MockServer::start().await;
+    let home = TempDir::new().expect("temp home");
+    let repo = TempDir::new().expect("temp repo");
+    let runtime = TempDir::new().expect("temp runtime dir");
+    let outside = TempDir::new().expect("a directory no allow root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "GATED_BYTES").unwrap();
+    mount_gated_detached_agent_gateway(&server, &forbidden).await;
+    // `state_file = "on"`, spelled as README's `[agents] state_file` and
+    // `config.rs` accept it: `on` publishes regardless of the inferred
+    // carrier, so this test does not depend on carrier inference at all.
+    write_config_with_agents_table(
+        home.path(),
+        &server.uri(),
+        "blocking = \"ask\"\nblock_timeout_secs = 600\nstate_file = \"on\"\n",
+    );
+
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let runtime_path = runtime.path().to_path_buf();
+    let allow = repo_path.to_string_lossy().into_owned();
+    // The tokens a leak would carry. The gated request is a READ of
+    // `secret.txt` outside every allow root, so these are this fixture's real
+    // arguments rather than invented ones. None is a bare common word: `rm`
+    // alone would also forbid "permission", "format" and "confirm" and would
+    // constrain the product by accident (F41).
+    let forbidden_path = forbidden.to_string_lossy().into_owned();
+    let outside_dir = outside.path().to_string_lossy().into_owned();
+
+    let (status, transcript, observed) = tokio::task::spawn_blocking({
+        let (home_path, repo_path, runtime_path) =
+            (home_path.clone(), repo_path.clone(), runtime_path.clone());
+        move || {
+            // What the driver captured while the agent was parked, and once
+            // more after it was released.
+            let mut blocked_state: Option<serde_json::Value> = None;
+            let mut blocked_listing: Option<serde_json::Value> = None;
+            let mut released_state: Option<serde_json::Value> = None;
+
+            let mut delegated = false;
+            let mut replied = false;
+            let mut quit = false;
+            let mut polls = 0_u32;
+            let mut last_poll = std::time::Instant::now();
+            let driver_runtime = runtime_path.clone();
+            let driver_home = home_path.clone();
+            let (status, transcript) = run_plain_interactive_chat_pty_with_env(
+                &home_path,
+                &repo_path,
+                &["--allow-path", &allow],
+                &[("XDG_RUNTIME_DIR", runtime_path.as_path())],
+                |output, terminal| {
+                    use std::io::Write as _;
+                    let text = String::from_utf8_lossy(output);
+                    if !delegated && text.matches("kitsu>").count() >= 1 {
+                        terminal
+                            .write_all(b"delegate the read\n")
+                            .expect("delegate");
+                        terminal.flush().unwrap();
+                        delegated = true;
+                        last_poll = std::time::Instant::now();
+                        return;
+                    }
+                    if !delegated || quit || !text.contains("PARENT_DELEGATED") {
+                        return;
+                    }
+                    if !replied {
+                        // `/jobs view` -- NOT bare `/jobs`: only
+                        // `format_jobs_view` emits the `needs input` heading.
+                        let Some(id) = jobs_view_needs_input_id(&text) else {
+                            if last_poll.elapsed() >= std::time::Duration::from_millis(150) {
+                                terminal.write_all(b"/jobs view\n").expect("poll");
+                                terminal.flush().unwrap();
+                                polls += 1;
+                                last_poll = std::time::Instant::now();
+                            }
+                            if polls >= 40 {
+                                terminal
+                                    .write_all(b"/jobs stop-all\n/quit\n")
+                                    .expect("quit");
+                                terminal.flush().unwrap();
+                                quit = true;
+                            }
+                            return;
+                        };
+                        // The agent is parked AND the carrier has been round
+                        // the interactive loop at least once since, so the
+                        // state file it republishes each iteration is current.
+                        let Some((pid, state)) = read_only_agent_state_file(&driver_runtime) else {
+                            if polls >= 40 {
+                                terminal
+                                    .write_all(b"/jobs stop-all\n/quit\n")
+                                    .expect("quit");
+                                terminal.flush().unwrap();
+                                quit = true;
+                            }
+                            if last_poll.elapsed() >= std::time::Duration::from_millis(150) {
+                                terminal.write_all(b"/jobs view\n").expect("poll");
+                                terminal.flush().unwrap();
+                                polls += 1;
+                                last_poll = std::time::Instant::now();
+                            }
+                            return;
+                        };
+                        if state["counts"]["blocked"] != 1 {
+                            // Published before the park landed; poll again.
+                            if last_poll.elapsed() >= std::time::Duration::from_millis(150) {
+                                terminal.write_all(b"/jobs view\n").expect("poll");
+                                terminal.flush().unwrap();
+                                polls += 1;
+                                last_poll = std::time::Instant::now();
+                            }
+                            if polls >= 40 {
+                                terminal
+                                    .write_all(b"/jobs stop-all\n/quit\n")
+                                    .expect("quit");
+                                terminal.flush().unwrap();
+                                quit = true;
+                            }
+                            return;
+                        }
+                        // Surface 3, from a SEPARATE process, against the live
+                        // file this carrier is still holding open.
+                        let mut cmd = base_cmd(&driver_home);
+                        let listing = cmd
+                            .env("XDG_RUNTIME_DIR", driver_runtime.as_path())
+                            .args(["agents", "--json"])
+                            .output()
+                            .expect("kitsu agents --json against a live carrier");
+                        assert!(
+                            listing.status.success(),
+                            "kitsu agents --json failed: {}",
+                            String::from_utf8_lossy(&listing.stderr)
+                        );
+                        let listed: serde_json::Value =
+                            serde_json::from_slice(&listing.stdout).expect("one JSON value");
+                        assert_eq!(
+                            listed[0]["pid"], pid,
+                            "the listing must describe the carrier that wrote the file: {listed}"
+                        );
+                        blocked_state = Some(state);
+                        blocked_listing = Some(listed);
+
+                        terminal
+                            .write_all(format!("/jobs reply {id} y\n").as_bytes())
+                            .expect("reply");
+                        terminal.flush().unwrap();
+                        replied = true;
+                        polls = 0;
+                        last_poll = std::time::Instant::now();
+                        return;
+                    }
+                    let settled = text.contains("CHILD_SAW") || text.contains("interrupted");
+                    if settled || polls >= 40 {
+                        // `stop-all` BEFORE `/quit`: a still-parked agent would
+                        // make `/quit` hit the exit guard and the run would die
+                        // on the harness deadline instead of its own assertion.
+                        released_state =
+                            read_only_agent_state_file(&driver_runtime).map(|(_, value)| value);
+                        terminal
+                            .write_all(b"/jobs stop-all\n/quit\n")
+                            .expect("quit");
+                        terminal.flush().unwrap();
+                        quit = true;
+                        return;
+                    }
+                    if last_poll.elapsed() >= std::time::Duration::from_millis(150) {
+                        // `/agents` too, from here on: only the deck prints a
+                        // finished agent's result, so `CHILD_SAW` -- the
+                        // settle signal -- can reach the transcript at all.
+                        terminal.write_all(b"/jobs view\n/agents\n").expect("poll");
+                        terminal.flush().unwrap();
+                        polls += 1;
+                        last_poll = std::time::Instant::now();
+                    }
+                },
+            );
+            (
+                status,
+                transcript,
+                (blocked_state, blocked_listing, released_state),
+            )
+        }
+    })
+    .await
+    .expect("the interactive state-file fixture joins");
+
+    let (blocked_state, blocked_listing, released_state) = observed;
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("needs input"),
+        "the agent must park first: {transcript}"
+    );
+    assert!(
+        transcript.contains("CHILD_SAW"),
+        "the typed answer must release the agent: {transcript}"
+    );
+    assert!(
+        !transcript.contains("interrupted"),
+        "a 600s block timeout cannot be what released it: {transcript}"
+    );
+
+    // 2. The state file on disk, written by a real process while parked.
+    let state = blocked_state.unwrap_or_else(|| {
+        panic!("no state file was observed while the agent was parked: {transcript}")
+    });
+    assert_eq!(state["schema"], "kitsu.agents.v1", "{state}");
+    assert_eq!(
+        state["state"], "blocked",
+        "a process holding a parked agent publishes `blocked`: {state}"
+    );
+    assert_eq!(state["counts"]["blocked"], 1, "{state}");
+    let threads = state["threads"].as_array().expect("an array of threads");
+    assert_eq!(threads.len(), 1, "{state}");
+    assert_eq!(threads[0]["thread"]["phase"], "blocked", "{state}");
+    assert_eq!(
+        threads[0]["thread"]["waiting_for"], "read_file",
+        "the gated request is a READ, so the published kind is read_file: {state}"
+    );
+
+    // 3. The same thing seen by a separate process through `kitsu agents`.
+    let listing = blocked_listing.expect("the listing is captured with the state file");
+    let entries = listing.as_array().expect("a bare JSON array of entries");
+    assert_eq!(entries.len(), 1, "{listing}");
+    assert_eq!(entries[0]["status"], "ok", "{listing}");
+    assert_eq!(entries[0]["alive"], true, "{listing}");
+    assert_eq!(
+        entries[0]["state"], "blocked",
+        "`kitsu agents --json` must report the blocked process: {listing}"
+    );
+    assert_eq!(entries[0]["counts"]["blocked"], 1, "{listing}");
+    assert_eq!(
+        entries[0]["unsupported_threads"], 0,
+        "the carrier's own thread record must be understood: {listing}"
+    );
+    let listed_threads = entries[0]["threads"]
+        .as_array()
+        .expect("an array of threads");
+    assert_eq!(listed_threads.len(), 1, "{listing}");
+    assert_eq!(listed_threads[0]["thread"]["phase"], "blocked", "{listing}");
+    // The point of the whole test: the two machine surfaces agree byte for
+    // byte about what the agent waits on.
+    assert_eq!(
+        listed_threads[0]["thread"]["waiting_for"], "read_file",
+        "`kitsu agents --json` must report what the agent waits for: {listing}"
+    );
+    assert_eq!(
+        listed_threads[0]["thread"]["waiting_for"], threads[0]["thread"]["waiting_for"],
+        "the state file and `kitsu agents --json` must not disagree"
+    );
+
+    // 4. The leak sweep, on both outputs.
+    let state_bytes = serde_json::to_string(&state).unwrap();
+    let listing_bytes = serde_json::to_string(&listing).unwrap();
+    for token in [
+        forbidden_path.as_str(),
+        outside_dir.as_str(),
+        "secret.txt",
+        "GATED_BYTES",
+    ] {
+        assert!(
+            !state_bytes.contains(token),
+            "the state file leaked the parked request's argument ({token}): {state_bytes}"
+        );
+        assert!(
+            !listing_bytes.contains(token),
+            "`kitsu agents --json` leaked the parked request's argument ({token}): {listing_bytes}"
+        );
+    }
+    // The transcript legitimately carries the bytes (the child's own answer
+    // does), which is exactly why the two surfaces above having none of them
+    // is a statement about those surfaces and not about the fixture.
+    assert!(
+        transcript.contains("GATED_BYTES"),
+        "`y` is AllowOnce, so the gated read succeeds and the fixture really \
+         did handle these bytes: {transcript}"
+    );
+
+    // 5. Released: no stale reason left behind for a poller.
+    let released = released_state
+        .unwrap_or_else(|| panic!("no state file was observed after the answer: {transcript}"));
+    assert_eq!(
+        released["counts"]["blocked"], 0,
+        "the answered agent is no longer counted blocked: {released}"
+    );
+    assert_ne!(
+        released["state"], "blocked",
+        "the process is no longer blocked: {released}"
+    );
+    for dto in released["threads"].as_array().expect("threads") {
+        assert!(
+            dto["thread"].get("waiting_for").is_none(),
+            "a released agent must leave no waiting_for key at all: {released}"
+        );
+    }
+}
+
+// --- T2-S7: `kitsu agents --json` reports the blocked state ---------------
+//
+// The third surface of T2-S7. Unlike the other two it is a pure *reader*: the
+// bytes it prints are the state file surface 1 writes, so the content of
+// `waiting_for` is pinned in the unit tests beside the writer and what is
+// pinned here is the pass-through and the refusal.
+
+/// A `kitsu.agents.v1` state file whose single thread record is `thread`,
+/// written by hand so the bytes under test are foreign to the writer.
+fn write_agent_state_fixture_with_thread(
+    runtime: &Path,
+    pid: u32,
+    state: &str,
+    thread: serde_json::Value,
+) {
+    let dir = runtime.join("kitsu");
+    fs::create_dir_all(&dir).expect("create the agent state directory");
+    let body = serde_json::to_string_pretty(&serde_json::json!({
+        "schema": "kitsu.agents.v1",
+        "pid": pid,
+        "cwd": "/workspace/kitsu",
+        "session_id": "sess-7",
+        "state": state,
+        "counts": {
+            "running": 0,
+            "blocked": 1,
+            "unacknowledged": 0,
+            "terminal": 0,
+            "failed": 0,
+        },
+        "threads": [thread],
+        "updated_at": "2026-10-14T12:00:00Z",
+    }))
+    .unwrap();
+    fs::write(dir.join(format!("{pid}.json")), body).expect("write the state fixture");
+}
+
+/// A valid non-terminal `blocked` thread record whose `waiting_for` is
+/// `waiting_for`. An empty, open timeline keeps the DTO's accounting trivially
+/// consistent, so only the field under test can decide the outcome.
+fn blocked_thread_fixture(waiting_for: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 2,
+        "thread": {
+            "id": 1,
+            "task": "summarize the crate",
+            "model": "qwen2.5-coder",
+            "phase": "blocked",
+            "waiting_for": waiting_for,
+            "handoff": "unavailable",
+            "elapsed_ms": 12_500,
+            "steering_open": true,
+            "pending_steering": 0,
+            "timeline": {
+                "entries": [],
+                "dropped_entries": 0,
+                "retained_bytes": 0,
+                "closed": false,
+            },
+        },
+    })
+}
+
+/// `kitsu agents --json` reports the blocked state and what the agent waits
+/// for, passing the permission kind through unchanged.
+#[test]
+fn test_agents_json_reports_the_blocked_state_and_the_kind_it_waits_for() {
+    let home = TempDir::new().expect("temp home");
+    let runtime = TempDir::new().expect("temp runtime dir");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let pid = std::process::id();
+    write_agent_state_fixture_with_thread(
+        runtime.path(),
+        pid,
+        "blocked",
+        blocked_thread_fixture(serde_json::json!("write_file")),
+    );
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .args(["agents", "--json"])
+        .output()
+        .expect("kitsu agents --json");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let listed: serde_json::Value = serde_json::from_slice(&output.stdout).expect("one JSON value");
+    let entries = listed.as_array().expect("a bare JSON array of entries");
+    assert_eq!(entries.len(), 1, "{listed}");
+    let entry = &entries[0];
+    assert_eq!(entry["status"], "ok");
+    assert_eq!(entry["state"], "blocked");
+    assert_eq!(
+        entry["unsupported_threads"], 0,
+        "a blocked thread record must be understood, not counted as unsupported: {entry}"
+    );
+    let threads = entry["threads"].as_array().expect("an array of threads");
+    assert_eq!(threads.len(), 1, "{entry}");
+    assert_eq!(threads[0]["thread"]["phase"], "blocked", "{entry}");
+    assert_eq!(
+        threads[0]["thread"]["waiting_for"], "write_file",
+        "the permission kind reaches the reader unchanged: {entry}"
+    );
+}
+
+/// The leak test for the reader. A foreign writer -- a newer kitsu, a
+/// hand-edited file, a future field misuse -- that put a path or an argv
+/// string in `waiting_for` must not have it printed: the field is a closed
+/// unit enum, so such a record is refused as unsupported and costs only
+/// itself.
+///
+/// Not vacuous: the preceding test proves this exact slot, in this exact
+/// fixture, is accepted and printed when it holds a real kind. The refusals
+/// below are therefore about the value, not about the fixture. Each assertion
+/// also pins what the output *is* (`unsupported_threads == 1`, no threads)
+/// rather than relying on the substring sweep alone, and the swept tokens are
+/// full paths and `rm -rf`, not the bare word `rm` (F41).
+#[test]
+fn test_agents_json_refuses_a_waiting_for_that_carries_a_path_or_an_argv_word() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let pid = std::process::id();
+
+    for (leak, tokens) in [
+        (
+            serde_json::json!("/work/notes.txt"),
+            &["/work/notes.txt", "notes.txt"][..],
+        ),
+        (
+            serde_json::json!("rm -rf /work/tmp"),
+            &["rm -rf", "/work/tmp"][..],
+        ),
+        (
+            serde_json::json!({"write_file": "/work/notes.txt"}),
+            &["/work/notes.txt"][..],
+        ),
+    ] {
+        let runtime = TempDir::new().expect("temp runtime dir");
+        write_agent_state_fixture_with_thread(
+            runtime.path(),
+            pid,
+            "blocked",
+            blocked_thread_fixture(leak.clone()),
+        );
+
+        let mut cmd = base_cmd(home.path());
+        let output = cmd
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .args(["agents", "--json"])
+            .output()
+            .expect("kitsu agents --json");
+        assert!(
+            output.status.success(),
+            "an unusable thread record must not fail the listing ({leak}), stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let listed: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON value");
+        let entries = listed.as_array().expect("a bare JSON array of entries");
+        assert_eq!(entries.len(), 1, "the process row survives: {listed}");
+        assert_eq!(
+            entries[0]["threads"],
+            serde_json::json!([]),
+            "{leak} must not be printed as a thread record: {listed}"
+        );
+        assert_eq!(
+            entries[0]["unsupported_threads"], 1,
+            "the record costs itself and nothing else: {listed}"
+        );
+        for token in tokens {
+            assert!(
+                !stdout.contains(token),
+                "`kitsu agents --json` printed a parked argument ({token}) for {leak}: {stdout}"
+            );
+        }
+    }
+}
+
+// --- T2-S5b: `/jobs reply <id> <y|a|n>` ------------------------------------
+//
+// FAILING-FIRST. No dispatcher has a `reply` arm yet, so the scripted runs
+// below currently print the did-you-mean nudge and the usage line instead of
+// reaching an id lookup.
+
+/// The idle dispatcher's wording, read from stderr because that is the only
+/// place the three outcomes and the usage line differ. With no background
+/// agents the unknown-id rejection is the only reachable outcome, and the
+/// `/agents` alias must reach the same arm (T1-S3 forwards verbatim).
+#[test]
+#[serial]
+fn test_script_jobs_reply_is_served_by_both_the_command_and_its_alias() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("jobs-reply.txt");
+    fs::write(
+        &script,
+        "/jobs reply 7 y\n/agents reply 7 y\n/agent reply 7 y\n/quit\n",
+    )
+    .unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("jobs reply script");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // All three spellings reached the `reply` arm and were rejected by the id
+    // lookup, not by the subcommand table or by the alias.
+    assert_eq!(
+        stderr.matches("no background job #7").count(),
+        3,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("unknown action 'reply'"), "{stderr}");
+    assert!(!stderr.contains("usage: /jobs ["), "{stderr}");
+    assert!(!stderr.contains("usage: /jobs reply"), "{stderr}");
+}
+
+/// Bad input is a usage error on the idle path too, and the usage line names
+/// the three keys. Site 7: the unknown-subcommand line must list `reply`.
+#[test]
+#[serial]
+fn test_script_jobs_reply_rejects_bad_input_with_a_usage_line() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("jobs-reply-bad.txt");
+    fs::write(
+        &script,
+        "/jobs reply\n/jobs reply notanumber y\n/jobs reply 7\n/jobs reply 7 maybe\n/jobs nosuchthing\n/quit\n",
+    )
+    .unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("jobs reply bad-input script");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert_eq!(
+        stderr.matches("usage: /jobs reply <id> <y|a|n>").count(),
+        4,
+        "each of the four bad forms prints the reply usage line: {stderr}"
+    );
+    // A bad key is never silently treated as a denial.
+    assert!(!stderr.contains("no background job #7"), "{stderr}");
+    // Site 7: the unknown-subcommand usage line advertises reply.
+    assert!(stderr.contains("unknown action 'nosuchthing'"), "{stderr}");
+    assert!(
+        stderr.contains("reply <id> <y|a|n>]"),
+        "the /jobs usage line must advertise reply: {stderr}"
+    );
+}
+
+/// Drive the interactive PTY the way `run_gated_delegation_pty` does, but
+/// answer the parked agent instead of waiting for the timer: poll `/jobs view`
+/// until `needs input` appears, send `/jobs reply <id> <key>`, then keep
+/// polling `/agents` until the released child's answer is printed.
+///
+/// `/jobs view` -- NOT bare `/jobs`. The `needs input` heading is produced only
+/// by `format_jobs_view`; the bare command prints the agent deck, which never
+/// contains that string. Polling the deck would make the positive assertion
+/// unreachable at any timeout and the negative guards pass vacuously.
+#[cfg(unix)]
+fn run_gated_delegation_pty_answering(
+    home: &Path,
+    cwd: &Path,
+    extra_chat_args: &[&str],
+    key: &'static str,
+) -> (std::process::ExitStatus, String) {
+    use std::io::Write as _;
+
+    let mut delegated = false;
+    let mut replied = false;
+    let mut quit = false;
+    let mut polls = 0_u32;
+    let mut last_poll = std::time::Instant::now();
+    run_plain_interactive_chat_pty(home, cwd, extra_chat_args, move |output, terminal| {
+        let text = String::from_utf8_lossy(output);
+        let prompts = text.matches("kitsu>").count();
+        if !delegated && prompts >= 1 {
+            terminal
+                .write_all(b"delegate the read\n")
+                .expect("delegate");
+            terminal.flush().unwrap();
+            delegated = true;
+            last_poll = std::time::Instant::now();
+            return;
+        }
+        if !delegated || quit {
+            return;
+        }
+        if !text.contains("PARENT_DELEGATED") {
+            return;
+        }
+        if !replied {
+            // Synchronize on the heading only `format_jobs_view` emits, then
+            // answer the id the `needs input` group names.
+            if let Some(id) = jobs_view_needs_input_id(&text) {
+                terminal
+                    .write_all(format!("/jobs reply {id} {key}\n").as_bytes())
+                    .expect("reply");
+                terminal.flush().unwrap();
+                replied = true;
+                last_poll = std::time::Instant::now();
+                return;
+            }
+        }
+        let settled = text.contains("CHILD_SAW") || text.contains("interrupted");
+        if settled || polls >= 40 {
+            // `stop-all` first: the block timeout is deliberately longer than
+            // this test, so a still-parked agent would otherwise make `/quit`
+            // hang on the exit guard and the run would die on the harness
+            // deadline instead of on this test's own assertion.
+            terminal
+                .write_all(b"/jobs stop-all\n/quit\n")
+                .expect("quit");
+            terminal.flush().unwrap();
+            quit = true;
+            return;
+        }
+        if last_poll.elapsed() >= std::time::Duration::from_millis(150) {
+            terminal.write_all(b"/jobs view\n/agents\n").expect("poll");
+            terminal.flush().unwrap();
+            polls += 1;
+            last_poll = std::time::Instant::now();
+        }
+    })
+}
+
+/// The first `#<digits>` printed under the `needs input` heading of a
+/// `/jobs view` render. `None` until that heading has actually been emitted,
+/// which is what makes the driver above synchronize rather than sleep.
+#[cfg(unix)]
+fn jobs_view_needs_input_id(transcript: &str) -> Option<u64> {
+    let after = transcript.rsplit_once("needs input")?.1;
+    let digits = after.split_once('#')?.1;
+    let id: String = digits.chars().take_while(char::is_ascii_digit).collect();
+    id.parse().ok()
+}
+
+/// Plan row T2-S5's acceptance over the whole real stack: `blocking = "ask"`
+/// with a block timeout far longer than the test, so the ONLY thing that can
+/// release the parked agent is the typed answer. `y` lets the gated read
+/// through, so the child's own answer carries the file's bytes back.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_jobs_reply_allow_releases_a_parked_detached_agent() {
+    let server = wiremock::MockServer::start().await;
+    let home = TempDir::new().expect("temp home");
+    let repo = TempDir::new().expect("temp repo");
+    let outside = TempDir::new().expect("a directory no allow root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "GATED_BYTES").unwrap();
+    mount_gated_detached_agent_gateway(&server, &forbidden).await;
+    write_config_with_agents_table(
+        home.path(),
+        &server.uri(),
+        "blocking = \"ask\"\nblock_timeout_secs = 600\n",
+    );
+
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let allow = repo_path.to_string_lossy().into_owned();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        run_gated_delegation_pty_answering(&home_path, &repo_path, &["--allow-path", &allow], "y")
+    })
+    .await
+    .expect("interactive gated-delegation fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("needs input"),
+        "the agent must park first: {transcript}"
+    );
+    assert!(
+        transcript.contains("CHILD_SAW"),
+        "the typed answer must release the agent and let its turn finish: {transcript}"
+    );
+    assert!(
+        transcript.contains("GATED_BYTES"),
+        "`y` is AllowOnce, so the gated read succeeds: {transcript}"
+    );
+    assert!(
+        !transcript.contains("interrupted"),
+        "a 600s block timeout cannot be what released it: {transcript}"
+    );
+}
+
+/// `n` is an answer too: the gate turns it into a policy denial and the agent
+/// resumes with that error rather than being interrupted.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_jobs_reply_deny_releases_a_parked_detached_agent_with_a_denial() {
+    let server = wiremock::MockServer::start().await;
+    let home = TempDir::new().expect("temp home");
+    let repo = TempDir::new().expect("temp repo");
+    let outside = TempDir::new().expect("a directory no allow root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "GATED_BYTES").unwrap();
+    mount_gated_detached_agent_gateway(&server, &forbidden).await;
+    write_config_with_agents_table(
+        home.path(),
+        &server.uri(),
+        "blocking = \"ask\"\nblock_timeout_secs = 600\n",
+    );
+
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let allow = repo_path.to_string_lossy().into_owned();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        run_gated_delegation_pty_answering(&home_path, &repo_path, &["--allow-path", &allow], "n")
+    })
+    .await
+    .expect("interactive gated-delegation fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("needs input"),
+        "the agent must park first: {transcript}"
+    );
+    assert!(
+        transcript.contains("CHILD_SAW"),
+        "a denial releases the agent rather than interrupting it: {transcript}"
+    );
+    assert!(
+        !transcript.contains("GATED_BYTES"),
+        "`n` must not let the gated read through: {transcript}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T3-S2: `--tui <MODE>`, `--no-alt-screen`, and the `[tui]` table reaching the
+// product (design §4.8, plan row T3-S2).
+//
+// FAILING-FIRST: neither flag exists and `[tui]` is an unknown field on
+// `Config` today, so every test below fails against this commit. The
+// precedence and default assertions live in `config.rs`'s unit tests; these
+// pin the user-visible surface: help text, argument rejection, and what
+// `kitsu doctor` says about a misspelled key.
+// ---------------------------------------------------------------------------
+
+/// The flags are discoverable, with their accepted values, and `--tui` takes a
+/// value while `--no-alt-screen` does not.
+#[test]
+fn test_help_exposes_the_tui_mode_flag_and_no_alt_screen() {
+    let home = TempDir::new().unwrap();
+    let mut cmd = base_cmd(home.path());
+    cmd.arg("--help");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        stdout.contains("--tui <MODE>"),
+        "--tui must appear with its value name: {stdout}"
+    );
+    assert!(
+        stdout.contains("--no-alt-screen"),
+        "--no-alt-screen must appear: {stdout}"
+    );
+    // T5-S2: `fullscreen` has its renderer, so `--tui` advertises it. The
+    // intent is unchanged — every mode the flag accepts is discoverable from
+    // `--help` and no accepted mode is hidden — and the list is pinned whole
+    // rather than by a `contains` per mode, so appending a fourth mode
+    // without saying so here fails.
+    assert!(
+        stdout.contains("[possible values: classic, inline, fullscreen]"),
+        "the accepted modes must be listed, fullscreen among them: {stdout}"
+    );
+}
+
+/// An unknown mode on the command line is clap's own loud error, not a
+/// fail-closed fallback to classic. The retired `KITSU_TUI` gate swallowed
+/// `Inline` and `1`; a flag the user typed on purpose must not.
+#[test]
+fn test_tui_flag_rejects_an_unknown_mode_naming_the_value() {
+    let home = TempDir::new().unwrap();
+    // `fullscreen` left this list in T5-S2 and joined the accepted one
+    // below: the mode now has a renderer, so the flag must take it. The
+    // intent survives intact — a value typed on purpose is clap's own loud
+    // error and never a silent fallback to classic — and the case typos stay
+    // here, which is what keeps the move from being a relaxation.
+    for value in [
+        "Inline",
+        "INLINE",
+        "viewport",
+        "Fullscreen",
+        "FULLSCREEN",
+        "1",
+        "",
+    ] {
+        let output = base_cmd(home.path())
+            .args(["--tui", value, "doctor"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "--tui {value:?} must be rejected, not defaulted: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            stderr.contains("invalid value") && stderr.contains("--tui"),
+            "the error must name the flag and the bad value for {value:?}: {stderr}"
+        );
+    }
+
+    // ...and the accepted values are accepted, so the loop above is not
+    // rejecting every invocation. `fullscreen` is one of them now, and this
+    // is the surface Decision 1 of T5-S2 is about: a mode a session can
+    // switch to must be a mode it can *start* in.
+    for value in ["classic", "inline", "fullscreen"] {
+        let output = base_cmd(home.path())
+            .args(["--tui", value, "doctor"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            !stderr.contains("invalid value"),
+            "--tui {value} must parse: {stderr}"
+        );
+    }
+}
+
+/// `--no-alt-screen` is a bare switch and composes with `--tui`.
+#[test]
+fn test_no_alt_screen_is_a_bare_switch_that_composes_with_tui() {
+    let home = TempDir::new().unwrap();
+    let output = base_cmd(home.path())
+        .args(["--tui", "inline", "--no-alt-screen", "doctor"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("invalid value"),
+        "both flags must parse together: {stderr}"
+    );
+}
+
+/// The risk gate of design §4.8, end to end: `kitsu doctor` names the
+/// misspelled `[tui]` key. Today the whole table is unknown, so the message
+/// names `tui` and the user is never told which key they got wrong.
+#[test]
+fn test_doctor_names_an_unknown_tui_key() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let config = home.path().join(".kitsu/config.toml");
+    let contents = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!("{contents}\n[tui]\nleft_arrow_opens_agent = true\n"),
+    )
+    .unwrap();
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["config"]["status"], "parse/read failed");
+    let issues = report["blocking_issues"]
+        .as_array()
+        .expect("doctor must report blocking issues")
+        .iter()
+        .map(|issue| issue.as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        issues.contains("unknown field `left_arrow_opens_agent`"),
+        "doctor must name the misspelled key: {issues}"
+    );
+    assert!(
+        issues.contains("left_arrow_opens_agents"),
+        "and the real key, which is the fix: {issues}"
+    );
+}
+
+/// The converse, so the test above is not passing on a config that was broken
+/// for some other reason: a well-spelled `[tui]` table parses.
+#[test]
+fn test_doctor_accepts_a_well_spelled_tui_table() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let config = home.path().join(".kitsu/config.toml");
+    let contents = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "{contents}\n[tui]\nmode = \"inline\"\nalternate_screen = \"always\"\n\
+             prefix = \"ctrl+b\"\ntitle = false\nleft_arrow_opens_agents = false\n\
+             cell_ring_lines = 2000\n"
+        ),
+    )
+    .unwrap();
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["config"]["status"], "parsed successfully");
+}
+
+/// **F62, file door, end to end.** `[tui] alternate_screen = "never"` is a
+/// documented, parsed, validated value that nothing can honour: there is no
+/// in-viewport overlay path, so the agent view takes the alternate screen
+/// whatever this key says. Before this card a user could set it, have it
+/// accepted, and watch the overlay take the alternate screen anyway.
+///
+/// So `doctor` must now FAIL on it and say what is accepted. This is the
+/// deliberate converse of `test_doctor_accepts_a_well_spelled_tui_table`
+/// above: that one proves a well-spelled table still parses, this one proves
+/// the refusal reaches the user through the real binary rather than only
+/// through a unit test -- the message has to survive the credential-hint
+/// allow-list to get here at all.
+#[test]
+fn test_doctor_refuses_alternate_screen_never_naming_what_is_accepted() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let config = home.path().join(".kitsu/config.toml");
+    let contents = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!("{contents}\n[tui]\nalternate_screen = \"never\"\n"),
+    )
+    .unwrap();
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["config"]["status"], "parse/read failed",
+        "a value nothing can honour must not be reported as parsed: {report}"
+    );
+    let issues = report["blocking_issues"]
+        .as_array()
+        .expect("doctor must report blocking issues")
+        .iter()
+        .map(|issue| issue.as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        issues.contains("`alternate_screen`"),
+        "doctor must name the key: {issues}"
+    );
+    assert!(
+        issues.contains("is not available yet"),
+        "doctor must say the value is not available yet, not that it is \
+         invalid -- the user should wait, not stop wanting it: {issues}"
+    );
+    assert!(
+        issues.contains("accepted: `auto`, `always`"),
+        "doctor must name the accepted set: {issues}"
+    );
+    // F48: the key and the permitted set, never the line the user wrote.
+    assert!(
+        !issues.contains("alternate_screen = "),
+        "F48: the refusal must not quote the offending config line: {issues}"
+    );
+}
+
+/// **F62, argv door, end to end.** `--no-alt-screen` is the same unimplemented
+/// capability by another name: a live global switch documented as *"a one-way
+/// force"* to `never`, which `README` promises will *"Force `[tui]
+/// alternate_screen` to `never`"*. Since `never` cannot be honoured, the flag
+/// cannot be honoured either.
+///
+/// Refusing the file and not the flag would MOVE the lie rather than close it,
+/// and would leave the promise lying exactly where it hurts most: a user
+/// passing this flag is in a multiplexer and believes they have disabled the
+/// alternate screen.
+///
+/// The argv message MAY name the flag -- F48 withholds values read from a
+/// config file, not a switch the user typed on the command line -- which is
+/// the one way the two messages differ.
+#[test]
+fn test_no_alt_screen_is_refused_until_the_in_viewport_path_exists() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["--no-alt-screen", "doctor"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !output.status.success(),
+        "a flag kitsu cannot honour must not exit 0: {output:?}"
+    );
+    assert!(
+        stderr.contains("--no-alt-screen"),
+        "the argv refusal must name the flag the user typed: {stderr}"
+    );
+    assert!(
+        stderr.contains("is not available yet"),
+        "the flag must be refused as unavailable, not as invalid: {stderr}"
+    );
+
+    // Bidirectional: the identical invocation WITHOUT the flag still works,
+    // so the refusal above is the flag's and not a broken fixture.
+    let without = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["doctor"])
+        .output()
+        .unwrap();
+    assert!(
+        without.status.success(),
+        "`doctor` without the flag must still succeed: {without:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F120: a `--jsonl` run that drops a tool result must not report unqualified
+// success. The tool runs, bounds its own output correctly and reports the
+// truth; the history trimmer then replaces the whole message with a dead
+// `[older tool output elided]` stub before the provider ever sees it — and
+// today every event on stdout still says the run went fine.
+//
+// The distinction that shapes these tests: an eviction is only a LOSS when
+// nothing recallable survives it. With a low `--offload-cap` the same eviction
+// keeps the `fs_read_file` pointer line, which is the documented good case the
+// flag exists to produce, and must stay silent.
+// ---------------------------------------------------------------------------
+
+/// Drive one `--jsonl` run in which a single large `fs_read_file` result is
+/// evicted by the history trimmer before the second provider round.
+///
+/// `window` tunes the pressure: a small window forces the eviction, a large one
+/// leaves the result intact. `extra_args` selects the eviction's character —
+/// `--no-artifacts` suppresses the on-disk copy, so the stub is dead; a low
+/// `--offload-cap` leaves a re-readable pointer, so the stub is recoverable.
+async fn run_trimmed_tool_result_jsonl(window: &str, extra_args: &[&str]) -> TrimmedToolResultRun {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let input = work.path().join("evidence.txt");
+    // Large enough that its result dominates the small-window budget, and
+    // distinctive enough that the trimmer's stub is recognisable by absence.
+    fs::write(&input, format!("HEAD{}TAIL", "evidence-line\n".repeat(900))).unwrap();
+
+    let read_args = serde_json::json!({"path": input}).to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"tool_call_id\":\"big_read\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "reported on the evidence"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "big_read",
+                        "type": "function",
+                        "function": {"name": "fs_read_file", "arguments": read_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let work_root = work.path().to_string_lossy().to_string();
+    let mut args = vec![
+        "--gateway",
+        "example",
+        "--jsonl",
+        "--no-stream",
+        "--context-window",
+        window,
+    ];
+    args.extend_from_slice(extra_args);
+    args.extend_from_slice(&[
+        "--max-rounds",
+        "3",
+        "chat",
+        "--no-session",
+        "--allow-path",
+        &work_root,
+        "read the evidence file and report on it",
+    ]);
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(work.path())
+        .args(&args)
+        .output()
+        .unwrap();
+    let events = String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let requests = server.received_requests().await.unwrap();
+    // The content the SECOND request carried for the evicted call. This is the
+    // ground truth for whether the run lost anything: the event stream is what
+    // is under test, so it cannot also be the evidence that a loss occurred.
+    let second_round_tool_content = requests
+        .get(1)
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+        .and_then(|body| {
+            body["messages"].as_array().and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message["tool_call_id"] == "big_read")
+                    .and_then(|message| message["content"].as_str().map(str::to_string))
+            })
+        })
+        .expect("the second provider request must carry the read's tool result");
+    server.verify().await;
+    TrimmedToolResultRun {
+        output,
+        events,
+        second_round_tool_content,
+    }
+}
+
+/// One `--jsonl` run of the eviction fixture: the process result, its parsed
+/// event stream, and what the provider actually received for the evicted call.
+struct TrimmedToolResultRun {
+    output: std::process::Output,
+    events: Vec<serde_json::Value>,
+    second_round_tool_content: String,
+}
+
+/// The ordered `"type"` sequence a two-round tool run emits today. Enumerated
+/// from the stream rather than searched for, so an additive event anywhere in
+/// the run breaks this list instead of hiding behind a narrower assertion.
+fn jsonl_event_types(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn test_jsonl_reports_a_dropped_tool_result_with_a_count() {
+    let run = run_trimmed_tool_result_jsonl("2048", &["--no-artifacts"]).await;
+    let TrimmedToolResultRun {
+        output,
+        events,
+        second_round_tool_content,
+    } = run;
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // The fix must not reach for stderr: this run's silence there is the
+    // contract every other `--jsonl` test in this file already depends on.
+    assert!(output.stderr.is_empty(), "{output:?}");
+
+    // The loss really happened: the second request carried the dead stub, not
+    // the evidence. Without this the test could pass on a run that lost
+    // nothing, which is F61's failure mode.
+    assert_eq!(
+        second_round_tool_content, "[older tool output elided]",
+        "fixture must actually drop the result, with nothing recallable left behind"
+    );
+
+    let dropped = events
+        .iter()
+        .find(|event| event["type"] == "tool_results_dropped")
+        .unwrap_or_else(|| {
+            panic!(
+                "a run that replaced a tool result with `[older tool output elided]` reported \
+                 no loss on stdout; event types were {:?}",
+                jsonl_event_types(&events)
+            )
+        });
+    assert_eq!(
+        dropped["dropped"], 1,
+        "the event must say HOW MANY results were dropped — three is a different \
+         story from `something was trimmed`: {dropped}"
+    );
+
+    // The defect is a mismatch, not a silence: the tool told the truth and the
+    // turn did not. Both halves are asserted so a fix that merely adds an
+    // event while corrupting the tool receipt cannot pass.
+    let read = events
+        .iter()
+        .find(|event| event["type"] == "tool_finished" && event["name"] == "fs_read_file")
+        .expect("the large read's completion receipt");
+    assert_eq!(
+        read["success"], true,
+        "the tool succeeded and must keep saying so: {read}"
+    );
+    assert_eq!(
+        read["output_truncated"], true,
+        "the tool bounded its own output correctly: {read}"
+    );
+    assert!(
+        read["output_bytes"].as_u64().unwrap() > 11_000,
+        "fixture must be large enough to force the eviction: {read}"
+    );
+}
+
+/// IGNORED by the E11-onto-main reconciliation, with its original parameters
+/// left in place so the intent is still readable.
+///
+/// This test needs a window tight enough that the trimmer strips an offloaded
+/// result's *preview* while keeping its pointer. Main's default `git` tool
+/// makes seven tools instead of six, and the larger schema raises the
+/// protected prompt to ~1562 tokens: at the original 1536-token window the
+/// context preflight now refuses the request before any trimming happens, and
+/// at every window large enough to pass preflight (>= ~2270) the preview fits
+/// inside the budget and is never stripped. Windows 2272/2288/2304/2320 and
+/// offload caps 1024/4096/8192 were each measured; none reproduces the state.
+///
+/// So the band this test lived in no longer exists, and the fix is to
+/// re-derive its pressure against the seven-tool schema rather than to retune
+/// one number. Its sibling `test_jsonl_reports_a_dropped_tool_result...`
+/// (window 2048 with `--no-artifacts`, a smaller schema) still passes and
+/// still covers the dropped-result path.
+#[ignore = "premise invalidated by main's seventh default tool; pressure needs re-deriving"]
+#[tokio::test]
+#[serial]
+async fn test_jsonl_stays_silent_when_a_trimmed_tool_result_is_still_recallable() {
+    // A low `--offload-cap` is the documented *good* case: the evicted result
+    // leaves an `fs_read_file` pointer, so nothing is lost and a warning here
+    // would be noise that teaches readers to ignore the real one.
+    let run = run_trimmed_tool_result_jsonl("1536", &["--offload-cap", "1024"]).await;
+    let TrimmedToolResultRun {
+        output,
+        events,
+        second_round_tool_content,
+    } = run;
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+
+    let types = jsonl_event_types(&events);
+    assert_eq!(
+        types,
+        [
+            "run_started",
+            "turn_started",
+            "provider_request",
+            "provider_attempt",
+            "tool_started",
+            "tool_finished",
+            "provider_request",
+            "provider_attempt",
+            "assistant",
+            "assistant_disposition",
+            "turn_finished",
+            "final_summary",
+        ],
+        "a lossless eviction must leave the JSONL stream byte-identical to today"
+    );
+    let raw = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !raw.contains("tool_results_dropped") && !raw.contains("\"dropped\""),
+        "a recallable eviction must not be reported as a loss: {raw}"
+    );
+    // Non-vacuity: the eviction this run is asserted to be silent about must
+    // actually have happened, and must have left the pointer behind. A bare
+    // pointer line with no preview is exactly `elided_tool_stub`'s lossless
+    // branch — the body is gone, the recall path is not.
+    assert!(
+        second_round_tool_content.starts_with("[tool output "),
+        "a low offload cap must leave an fs_read_file pointer the model can recall: \
+         {second_round_tool_content}"
+    );
+    assert!(
+        !second_round_tool_content.contains("Preview:"),
+        "the preview body must have been evicted, or this run trimmed nothing and the \
+         silence it asserts is vacuous: {second_round_tool_content}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_jsonl_stays_silent_when_no_tool_result_is_trimmed_at_all() {
+    // N1 pinned rather than assumed: a run with no eviction is exactly the
+    // stream it is today, including after the lossy path gains an event.
+    let run = run_trimmed_tool_result_jsonl("262144", &[]).await;
+    let TrimmedToolResultRun {
+        output,
+        events,
+        second_round_tool_content,
+    } = run;
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        jsonl_event_types(&events),
+        [
+            "run_started",
+            "turn_started",
+            "provider_request",
+            "provider_attempt",
+            "tool_started",
+            "tool_finished",
+            "provider_request",
+            "provider_attempt",
+            "assistant",
+            "assistant_disposition",
+            "turn_finished",
+            "final_summary",
+        ],
+        "a run that lost nothing must stay byte-identical to today"
+    );
+    let raw = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !raw.contains("tool_results_dropped"),
+        "nothing was dropped, so nothing may be reported: {raw}"
+    );
+    // Non-vacuity in the other direction: this run must have trimmed nothing,
+    // so the silence above is the no-loss guarantee and not a missed eviction.
+    assert!(
+        second_round_tool_content.contains("evidence-line")
+            && !second_round_tool_content.contains("older tool output elided"),
+        "a 256K window must carry the whole result through to the provider: \
+         {} chars",
+        second_round_tool_content.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F122: tell a HUMAN when a tool result was dropped.
+//
+// F120 shipped the machine half: a `--jsonl` run now emits
+// `tool_results_dropped { round, dropped }` when history trimming replaced a
+// whole tool result with a dead `[older tool output elided]` stub. A human
+// running interactively still gets nothing — the tool ran, reported honestly,
+// and its result vanished before the provider saw it in total silence.
+//
+// WHERE THE LINE BELONGS, measured rather than assumed. The only mid-turn
+// human warning channel a plain `chat` run has is the runtime-notice sink in
+// `live_agent_event_log_capturing`:
+//
+//     } else if let Some(notice) = format_runtime_notice(event) {
+//         kitsu_render::finish_line();
+//         eprintln!("~ {notice}");
+//
+// (`main.rs:14027`, with the same two lines again at `:14044` for slash-command
+// runtimes and `:14081` for the buffered drain in `finish_agent_trace`.) A
+// plain interactive chat has no agent view at all, so the two `ToolResultsDropped`
+// no-op arms F120 left in `subagent.rs` / `subagent/thread.rs` mark where an
+// *agent timeline* line would go — not where this card's line goes.
+//
+// THE GATE. That sink is NOT TTY-gated: it fires on any non-`--jsonl` run,
+// piped included. N1 permits a line on an interactive TTY but requires all four
+// of non-TTY, `--plain`/`NO_COLOR`, assistive and JSONL to stay byte-identical,
+// so the new line needs a gate the existing `~` notices do not have. The four
+// surfaces below pin that, and the lossless case pins that a recallable
+// eviction stays silent on the human channel too.
+//
+// THE CONTRACT THESE TESTS PIN, kept as small as it can be so the wording stays
+// the implementer's: on a styled TTY run that dropped results, the human
+// channel carries EXACTLY ONE line per round naming the COUNT; on all four N1
+// surfaces, and on every lossless or loss-free run, it carries none.
+// ---------------------------------------------------------------------------
+
+/// Carrier for one eviction run: how the child's descriptors are wired, which
+/// is the whole variable this card turns on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DroppedResultCarrier {
+    /// `.output()`: stdout, stderr and stdin all pipes. N1's "non-TTY".
+    Piped,
+    /// stdout, stderr and stdin all on one PTY, styling live, driven through
+    /// the interactive REPL. This is the surface N1 does not cover.
+    StyledPty,
+}
+
+/// One eviction run, whatever its carrier: the human-visible text, the JSONL
+/// stream when there was one, and what the provider actually received for the
+/// evicted call.
+struct DroppedResultRun {
+    /// Everything a human would have seen. For [`DroppedResultCarrier::Piped`]
+    /// this is stderr; for the PTY it is the merged terminal transcript.
+    human: String,
+    /// stdout, parsed line-by-line, for `--jsonl` runs only.
+    events: Vec<serde_json::Value>,
+    /// Ground truth for whether the run lost anything. The human channel is
+    /// what is under test, so it cannot also be the evidence of the loss.
+    second_round_tool_content: String,
+    success: bool,
+    /// The fixture's temp working directory, so its path can be normalized out
+    /// of a byte-identical pin.
+    work_root: String,
+}
+
+/// Every line of the human channel that reports a drop, ENUMERATED rather than
+/// searched for a prefix: the marker and wording stay the implementer's choice,
+/// so the test keys on the one word the card is about.
+///
+/// Escape sequences are stripped first — on a styled PTY the line arrives
+/// coloured, and `~ \x1b[33mdropped\x1b[0m` must still count as one line.
+fn dropped_result_notices(human: &str) -> Vec<String> {
+    strip_terminal_escapes(human)
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.to_ascii_lowercase().contains("dropped"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Remove CSI/OSC escape sequences and carriage returns so a styled PTY
+/// transcript can be read as lines of text.
+fn strip_terminal_escapes(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i += 1;
+            match bytes.get(i) {
+                // CSI: parameters, then one final byte in 0x40..=0x7e.
+                Some(b'[') => {
+                    i += 1;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                // OSC: terminated by BEL or ST.
+                Some(b']') => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != 0x07 {
+                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                // Two-byte escapes.
+                Some(_) => i += 1,
+                None => {}
+            }
+            continue;
+        }
+        if bytes[i] == b'\r' {
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// The human channel reduced to the distinct lines a reader would actually
+/// have seen, for use in failure messages.
+///
+/// A styled PTY transcript is ~7 KB of prompt redraw for a turn this short, and
+/// a panic that dumps it buries its own finding. This keeps each distinct line
+/// once, drops the keystroke-echo prefixes a longer line supersedes, and caps
+/// the result - so the enumeration stays readable, which is the only form in
+/// which "nothing said X" is worth reading.
+fn human_channel_digest(human: &str) -> String {
+    let stripped = strip_terminal_escapes(human);
+    let mut kept: Vec<String> = Vec::new();
+    for line in stripped.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // A keystroke echo is a strict prefix of the next echo; keep the last.
+        while kept
+            .last()
+            .is_some_and(|last| line.starts_with(last.as_str()))
+        {
+            kept.pop();
+        }
+        if !kept.iter().any(|seen| seen == line) {
+            kept.push(line.to_string());
+        }
+    }
+    let total = kept.len();
+    if total > 40 {
+        kept.truncate(40);
+        kept.push(format!("... and {} further distinct line(s)", total - 40));
+    }
+    kept.join("\n")
+}
+
+/// Drive one run in which large `fs_read_file` results are evicted by the
+/// history trimmer before the second provider round, over either carrier.
+///
+/// `window` tunes the pressure; `calls` is how many large reads the first
+/// assistant message asks for (the per-round-vs-per-line question); `extra_args`
+/// selects the eviction's character — `--no-artifacts` suppresses the on-disk
+/// copy so the stub is dead, a low `--offload-cap` leaves a re-readable pointer.
+async fn run_dropped_tool_result(
+    carrier: DroppedResultCarrier,
+    window: &str,
+    calls: usize,
+    extra_args: &[&str],
+) -> DroppedResultRun {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let mut tool_calls = Vec::new();
+    for index in 0..calls {
+        let input = work.path().join(format!("evidence-{index}.txt"));
+        fs::write(&input, format!("HEAD{}TAIL", "evidence-line\n".repeat(900))).unwrap();
+        tool_calls.push(serde_json::json!({
+            "id": format!("big_read_{index}"),
+            "type": "function",
+            "function": {
+                "name": "fs_read_file",
+                "arguments": serde_json::json!({"path": input}).to_string()
+            }
+        }));
+    }
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"tool_call_id\":\"big_read_0\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "reported on the evidence"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": tool_calls
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let work_root = work.path().to_string_lossy().to_string();
+    let work_root_for_run = work_root.clone();
+    let mut args = vec![
+        "--gateway",
+        "example",
+        "--no-stream",
+        "--context-window",
+        window,
+    ];
+    args.extend_from_slice(extra_args);
+    args.extend_from_slice(&[
+        "--max-rounds",
+        "3",
+        "chat",
+        "--no-session",
+        "--allow-path",
+        &work_root,
+    ]);
+
+    let jsonl = extra_args.contains(&"--jsonl");
+    let (human, stdout, success) = match carrier {
+        DroppedResultCarrier::Piped => {
+            let mut piped = args.clone();
+            piped.push(PROMPT_READ_THE_EVIDENCE);
+            let output = base_cmd(home.path())
+                .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+                .current_dir(work.path())
+                .args(&piped)
+                .output()
+                .unwrap();
+            (
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                output.status.success(),
+            )
+        }
+        DroppedResultCarrier::StyledPty => {
+            let (status, transcript) = run_styled_chat_pty_turn(home.path(), work.path(), &args);
+            (transcript.clone(), transcript, status.success())
+        }
+    };
+
+    let events = if jsonl {
+        stdout
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let requests = server.received_requests().await.unwrap();
+    let second_round_tool_content = requests
+        .get(1)
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+        .and_then(|body| {
+            body["messages"].as_array().and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message["tool_call_id"] == "big_read_0")
+                    .and_then(|message| message["content"].as_str().map(str::to_string))
+            })
+        })
+        .expect("the second provider request must carry the first read's tool result");
+    server.verify().await;
+
+    DroppedResultRun {
+        human,
+        events,
+        second_round_tool_content,
+        success,
+        work_root: work_root_for_run,
+    }
+}
+
+/// The one prompt every run in this block submits.
+const PROMPT_READ_THE_EVIDENCE: &str = "read the evidence files and report on them";
+
+/// Run one chat turn with styling LIVE on a PTY: stdin, stdout and stderr all
+/// on the same terminal, no `--plain`, no `--jsonl`.
+///
+/// `tests/cli.rs`'s [`run_plain_interactive_chat_pty`] hardcodes `--plain`, so
+/// it cannot see anything gated on a styled TTY; `tests/tui.rs`'s styled
+/// harness points at an unreachable gateway and only ever submits slash
+/// commands, so it cannot drive a tool turn. This is the smallest harness that
+/// is both styled and backed by a real mock provider.
+///
+/// Driven on triggers found in the transcript, never on a sleep: the prompt
+/// goes in once `kitsu>` appears, `/quit` once the assistant's answer does.
+#[cfg(unix)]
+fn run_styled_chat_pty_turn(
+    home: &Path,
+    cwd: &Path,
+    args: &[&str],
+) -> (std::process::ExitStatus, String) {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::FromRawFd as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: both output pointers are valid; null termios and winsize request
+    // the platform defaults.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0,
+        "allocate styled drop-notice PTY"
+    );
+    let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    // SAFETY: each duplicated slave descriptor transfers to one Stdio owner.
+    let child_stdin = unsafe { libc::dup(slave) };
+    let child_stdout = unsafe { libc::dup(slave) };
+    assert!(child_stdin >= 0 && child_stdout >= 0);
+
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
+    command
+        .env("HOME", home)
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .env("KITSU_NO_PROJECT_CONTEXT", "1")
+        .env("TERM", "xterm-256color")
+        .env_remove("NO_COLOR")
+        .env_remove("KITSU_PLAIN")
+        .env_remove("KITSU_SCREEN_READER")
+        .env_remove("ANTHROPIC_TOKEN_EXPIRES")
+        .current_dir(cwd)
+        // SAFETY: all three live descriptors transfer exactly once.
+        .stdin(unsafe { Stdio::from_raw_fd(child_stdin) })
+        .stdout(unsafe { Stdio::from_raw_fd(child_stdout) })
+        .stderr(unsafe { Stdio::from_raw_fd(slave) })
+        .args(args);
+    let mut child = command.spawn().expect("spawn styled drop-notice chat");
+    // SAFETY: ownership of the remaining master descriptor transfers once.
+    let mut terminal = unsafe { fs::File::from_raw_fd(master) };
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut transcript = Vec::new();
+    let mut submitted = false;
+    let mut quit = false;
+
+    let status = loop {
+        let mut buffer = [0_u8; 4096];
+        match terminal.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(read) => transcript.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+            Err(error) => panic!("read styled drop-notice PTY: {error}"),
+        }
+        let text = String::from_utf8_lossy(&transcript).into_owned();
+        if !submitted && text.contains("kitsu>") {
+            let _ = terminal.write_all(format!("{PROMPT_READ_THE_EVIDENCE}\n").as_bytes());
+            let _ = terminal.flush();
+            submitted = true;
+        } else if submitted
+            && !quit
+            && (text.contains("reported on the evidence") || text.contains("! error:"))
+        {
+            let _ = terminal.write_all(b"/quit\n");
+            let _ = terminal.flush();
+            quit = true;
+        }
+        if let Some(status) = child.try_wait().expect("poll styled drop-notice chat") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "styled drop-notice chat timed out (submitted={submitted} quit={quit}): {}",
+                String::from_utf8_lossy(&transcript)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    (status, String::from_utf8_lossy(&transcript).into_owned())
+}
+
+/// Every word the drop report could reasonably use, enumerated so an N1
+/// surface cannot stay "silent" merely because the implementer picked a
+/// synonym this file did not predict.
+const DROP_VOCABULARY: [&str; 4] = ["dropped", "elided", "discarded", "lost"];
+
+/// Assert the human channel says nothing at all about a drop, over the whole
+/// enumerated vocabulary rather than one guessed marker.
+fn assert_human_channel_silent_about_drops(run: &DroppedResultRun, surface: &str) {
+    let text = strip_terminal_escapes(&run.human).to_ascii_lowercase();
+    for word in DROP_VOCABULARY {
+        assert!(
+            !text.contains(word),
+            "N1 requires the {surface} surface to stay byte-identical to today, and today it \
+             says nothing about a dropped tool result; it now contains {word:?}. The \
+             channel's distinct lines were:\n{}",
+            human_channel_digest(&run.human)
+        );
+    }
+}
+
+/// Assert the fixture really destroyed the result, from the provider's side.
+/// Without this every silence assertion above could pass on a run that trimmed
+/// nothing (F61).
+fn assert_result_really_dropped(run: &DroppedResultRun) {
+    assert_eq!(
+        run.second_round_tool_content, "[older tool output elided]",
+        "fixture must actually drop the result with nothing recallable left behind, or every \
+         assertion about reporting that drop is vacuous"
+    );
+}
+
+/// Assert the turn actually ran to completion on a PTY carrier: without this a
+/// harness that hung before the tool call would report a convincing silence.
+fn assert_styled_turn_completed(run: &DroppedResultRun) {
+    let digest = human_channel_digest(&run.human);
+    assert!(run.success, "styled turn must exit 0:\n{digest}");
+    let text = strip_terminal_escapes(&run.human);
+    assert!(
+        text.contains("reported on the evidence"),
+        "the assistant's answer must have reached the terminal, or the silence this test \
+         measures is the harness's and not the binary's:\n{digest}"
+    );
+    assert!(
+        text.contains("evidence-0.txt"),
+        "the large read must have run and been shown, or nothing was there to drop:\n{digest}"
+    );
+}
+
+/// **The card.** A human on an interactive styled TTY whose tool result was
+/// destroyed before the provider saw it is told so, once, with the count.
+///
+/// N1 permits this: its four byte-identical surfaces are non-TTY, `--plain`/
+/// `NO_COLOR`, assistive and JSONL, and an interactive TTY run is none of them.
+/// The three `test_n1_*` tests below hold that line.
+#[tokio::test]
+#[serial]
+async fn test_a_styled_tty_run_tells_the_human_a_tool_result_was_dropped() {
+    let run = run_dropped_tool_result(
+        DroppedResultCarrier::StyledPty,
+        "2560",
+        1,
+        &["--no-artifacts"],
+    )
+    .await;
+    assert_styled_turn_completed(&run);
+    assert_result_really_dropped(&run);
+
+    let notices = dropped_result_notices(&run.human);
+    assert_eq!(
+        notices.len(),
+        1,
+        "a styled interactive run that destroyed a tool result told the human nothing: the \
+         tool reported honestly, the result vanished before the provider saw it, and the \
+         session was silent. Expected exactly one line reporting the drop; the terminal \
+         carried {}. The channel's distinct lines were:\n{}",
+        notices.len(),
+        human_channel_digest(&run.human)
+    );
+    assert!(
+        notices[0].contains('1'),
+        "the line must name HOW MANY results were dropped - \"three results were dropped\" is \
+         a different story from \"something was trimmed\": {:?}",
+        notices[0]
+    );
+}
+
+/// Per ROUND, with the count - not per result. Measured from the machine half
+/// rather than chosen: two results destroyed in one round of budget
+/// enforcement produce exactly one `tool_results_dropped` event carrying
+/// `dropped: 2`, so one human line carrying 2 is the shape that matches it.
+/// Two lines would overstate the number of times context was lost.
+#[tokio::test]
+#[serial]
+async fn test_a_styled_tty_run_reports_one_line_per_round_naming_the_count() {
+    let run = run_dropped_tool_result(
+        DroppedResultCarrier::StyledPty,
+        "2560",
+        2,
+        &["--no-artifacts"],
+    )
+    .await;
+    assert_styled_turn_completed(&run);
+    assert_result_really_dropped(&run);
+
+    let notices = dropped_result_notices(&run.human);
+    assert_eq!(
+        notices.len(),
+        1,
+        "two results destroyed in ONE round of trimming must produce ONE line, not one per \
+         result; the terminal carried {:?}. The channel's distinct lines were:\n{}",
+        notices,
+        human_channel_digest(&run.human)
+    );
+    assert!(
+        notices[0].contains('2'),
+        "the single line must carry the count 2, or a reader cannot tell one loss from two: \
+         {:?}",
+        notices[0]
+    );
+}
+
+/// The documented GOOD case stays silent. A low `--offload-cap` evicts the
+/// preview and leaves an `fs_read_file` pointer the model can still recall, so
+/// nothing was lost; a warning here would be the noise that teaches a reader to
+/// ignore the real one. This test passes today and must keep passing.
+#[tokio::test]
+#[serial]
+async fn test_a_styled_tty_run_stays_silent_when_the_trimmed_result_is_recallable() {
+    // Measured on THIS carrier rather than borrowed from the piped fixture: an
+    // interactive turn's protected prompt is larger, so F120's 1536 trips the
+    // context preflight here and never reaches the trimmer at all. 2048 is the
+    // window at which the eviction happens and the pointer survives; 3072 and
+    // above do not trim at all.
+    let run = run_dropped_tool_result(
+        DroppedResultCarrier::StyledPty,
+        "2304",
+        1,
+        &["--offload-cap", "1024"],
+    )
+    .await;
+    assert_styled_turn_completed(&run);
+    // Non-vacuity, both halves: the eviction happened, and it left the pointer.
+    assert!(
+        run.second_round_tool_content.starts_with("[tool output "),
+        "a low offload cap must leave an fs_read_file pointer the model can recall: {:?}",
+        run.second_round_tool_content
+    );
+    assert!(
+        !run.second_round_tool_content.contains("Preview:"),
+        "the preview body must have been evicted, or this run trimmed nothing and the silence \
+         it asserts is vacuous: {:?}",
+        run.second_round_tool_content
+    );
+    assert_human_channel_silent_about_drops(&run, "lossless-eviction");
+}
+
+/// A run that drops nothing says nothing. Passes today and must keep passing.
+#[tokio::test]
+#[serial]
+async fn test_a_styled_tty_run_stays_silent_when_no_result_is_trimmed_at_all() {
+    let run = run_dropped_tool_result(DroppedResultCarrier::StyledPty, "8192", 1, &[]).await;
+    assert_styled_turn_completed(&run);
+    // Fences the 8192 threshold: if drift makes this window lossy, this fails
+    // loudly instead of turning the silence below into a tautology.
+    assert!(
+        run.second_round_tool_content.contains("evidence-line"),
+        "an 8192 window must carry the whole result through to the provider, or this test \
+         asserts silence about a loss it did not intend: {:?}",
+        run.second_round_tool_content
+    );
+    assert_human_channel_silent_about_drops(&run, "no-trim");
+}
+
+/// **N1, surface 1 of 4: non-TTY.** A piped run's stderr is empty today and
+/// must stay empty - 78 assertions in this file depend on exactly that.
+#[tokio::test]
+#[serial]
+async fn test_n1_non_tty_stays_byte_identical_when_a_tool_result_is_dropped() {
+    let run =
+        run_dropped_tool_result(DroppedResultCarrier::Piped, "2048", 1, &["--no-artifacts"]).await;
+    assert!(run.success, "piped run must exit 0: {:?}", run.human);
+    assert_result_really_dropped(&run);
+    // A piped run's stderr is NOT empty - it carries six lines today - so the
+    // pin is that text itself, with only the temp path, counts, ids and
+    // timings normalized. A new drop line anywhere in it fails here.
+    assert_eq!(
+        normalize_volatile(&run.human, &run.work_root),
+        NON_TTY_STDERR_TODAY,
+        "N1: a non-TTY run's stderr must stay byte-identical to today, ids and timings \
+         aside; it read:\n{}",
+        run.human
+    );
+}
+
+/// Every line a piped eviction run writes to stderr today, normalized. Written
+/// out in full rather than searched, so a new line cannot slip in beside the
+/// ones this test knows about.
+const NON_TTY_STDERR_TODAY: &str = concat!(
+    "~ artifacts disabled: commands keep bounded previews only; large tool results are not",
+    " offloaded; existing artifacts are unchanged\n",
+    "\u{25c6} Read(<WORK>/evidence-N.txt)\n",
+    "  \u{25c7} N lines \u{b7} Nms\n",
+    "kitsu-context: {\"used\":N,\"effective\":N,\"window\":N}\n",
+    "~ run summary: N successful operation, N file(s) read, N file(s) written",
+    " (N change(s)), session not saved\n",
+    "kitsu-timing: {\"run_id\":\"N-N\",\"duration_ms\":N,\"status\":\"ok\",",
+    "\"outcome\":\"succeeded\",\"assistant\":\"committed\"}\n",
+);
+
+/// Collapse the parts of a human channel that legitimately differ run to run -
+/// the temp working directory, and every run of digits (ids, counts, timings) -
+/// so the rest can be pinned exactly.
+fn normalize_volatile(text: &str, work_root: &str) -> String {
+    let replaced = text.replace(work_root, "<WORK>");
+    let mut out = String::with_capacity(replaced.len());
+    let mut in_digits = false;
+    for ch in replaced.chars() {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                out.push('N');
+                in_digits = true;
+            }
+            continue;
+        }
+        in_digits = false;
+        out.push(ch);
+    }
+    out
+}
+
+/// **N1, surface 2 of 4: `--plain`/`NO_COLOR`.** Driven on a real PTY, because
+/// `--plain` on a pipe is already surface 1: the only way to test the plain
+/// surface distinctly is a terminal with styling turned off.
+#[tokio::test]
+#[serial]
+async fn test_n1_plain_stays_byte_identical_when_a_tool_result_is_dropped() {
+    let run = run_dropped_tool_result(
+        DroppedResultCarrier::StyledPty,
+        "2560",
+        1,
+        &["--plain", "--no-artifacts"],
+    )
+    .await;
+    assert_styled_turn_completed(&run);
+    assert_result_really_dropped(&run);
+    assert_human_channel_silent_about_drops(&run, "--plain");
+}
+
+/// **N1, surface 3 of 4: assistive (`--screen-reader`).**
+#[tokio::test]
+#[serial]
+async fn test_n1_screen_reader_stays_byte_identical_when_a_tool_result_is_dropped() {
+    let run = run_dropped_tool_result(
+        DroppedResultCarrier::StyledPty,
+        "2560",
+        1,
+        &["--screen-reader", "--no-artifacts"],
+    )
+    .await;
+    assert_styled_turn_completed(&run);
+    assert_result_really_dropped(&run);
+    assert_human_channel_silent_about_drops(&run, "--screen-reader");
+}
+
+/// **N1, surface 4 of 4: JSONL.** This card must add nothing to the stream F120
+/// settled, and must not reach for stderr. The type sequence is enumerated, so
+/// an additive event anywhere in the run fails here rather than hiding.
+#[tokio::test]
+#[serial]
+async fn test_n1_jsonl_gains_nothing_from_the_human_report_of_a_dropped_result() {
+    let run = run_dropped_tool_result(
+        DroppedResultCarrier::Piped,
+        "2048",
+        1,
+        &["--jsonl", "--no-artifacts"],
+    )
+    .await;
+    assert!(run.success, "jsonl run must exit 0");
+    assert_result_really_dropped(&run);
+    assert_eq!(
+        run.human, "",
+        "N1: a --jsonl run's stderr is empty today and the human report must not reach for it"
+    );
+    let types = run
+        .events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        types,
+        [
+            "run_started",
+            "turn_started",
+            "provider_request",
+            "provider_attempt",
+            "tool_started",
+            "tool_finished",
+            "tool_results_dropped",
+            "provider_request",
+            "provider_attempt",
+            "assistant",
+            "assistant_disposition",
+            "turn_finished",
+            "final_summary",
+        ],
+        "the human-facing report must leave F120's JSONL stream exactly as it is"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Card H2-title, requirement N1's non-TTY descriptor: the OSC terminal title
+// is control bytes on **stderr**, so a run whose stderr is not a terminal must
+// not receive it.
+//
+// The positive surface and the plain/assistive negatives are PTY measurements
+// and live in `tests/tui.rs`; this is the piped one, which no PTY harness can
+// make.
+// ---------------------------------------------------------------------------
+
+/// **A piped run receives no terminal title, while the bytes it receives
+/// today are unchanged.**
+///
+/// Non-vacuous in both directions, and the second assertion is the
+/// load-bearing one: this run **does** take the alternate screen and **does**
+/// push the title stack today (`--tui fullscreen` reaches
+/// `tui_bridge::enter_fullscreen` whatever the descriptors are), so the
+/// sequences that must stay are asserted present and only the OSC 2 string is
+/// asserted absent. A gate that suppressed the push as well would be an N1
+/// violation rather than a fix.
+#[test]
+fn test_tui_title_is_not_written_to_a_non_tty_stderr() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "https://gateway.invalid");
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["--gateway", "example", "--tui", "fullscreen", "chat"])
+        .arg("--no-session")
+        .write_stdin("hello\n")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    assert!(
+        stderr.contains("\x1b[22;2t") && stderr.contains("\x1b[?1049h"),
+        "NON-VACUOUS: this run still enters a fullscreen segment on a piped \
+         stderr, exactly as it does today; stderr:\n{}",
+        stderr.escape_debug()
+    );
+    assert!(
+        !stderr.contains("\x1b]2;"),
+        "requirement N1, per descriptor: a non-terminal stderr must receive \
+         no OSC terminal title; stderr:\n{}",
+        stderr.escape_debug()
+    );
+    assert!(
+        !stdout.contains("\x1b]2;"),
+        "and the title is never written to stdout at all, which is why JSONL \
+         is unaffected by construction; stdout:\n{}",
+        stdout.escape_debug()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Card F57-reach: reachability, made structural.
+//
+// **F57** measured the defect this sweep exists for: a `SLASH_COMMANDS` entry
+// with no dispatch arm, with all 824 binary and 245 CLI tests passing. The
+// guard F57 itself wanted was unwritable in-process, because `handle_slash` is
+// one `match` whose recognition *is* its execution — there is no stage, flag
+// or return value that says "recognised" without also running `/quit`,
+// `/clear` or `/fork`. So this sweep separates them the only honest way: it
+// runs the real dispatcher, once per command, in its own process and its own
+// temp HOME, and asks the only observable that defines unreachability — the
+// unknown-command fallback.
+//
+// And it reads the registry exactly once, for its subjects. The check is
+// against the binary's behaviour, never against the table again (F57's trap:
+// `closest_slash_command` reads `SLASH_COMMANDS`, so any registry-vs-registry
+// sweep passes vacuously).
+// ---------------------------------------------------------------------------
+
+/// Every registry entry, driven through the idle dispatcher; none of them may
+/// reach `unknown command: /<name>`.
+///
+/// Subjects are enumerated from `SLASH_COMMANDS` at runtime, through the
+/// `commands` array `/help` publishes in its JSONL payload — the registry is
+/// private to the binary, and this is its own account of itself. **No command
+/// name is typed in this test**, so a new entry becomes a subject the moment
+/// it is registered, and no curated list can fall behind the table (F124,
+/// F126, F131, F142) and no count can be wrong.
+///
+/// Covered: the top-level word of every entry, aliases included, since an
+/// alias is a first-class registry entry and dispatches through the same
+/// `match`. Deliberately **not** covered: arguments and subcommands (a
+/// subcommand that falls through refuses inside its own arm and never reaches
+/// this fallback), and *what* each arm does — this asks only whether anything
+/// is listening. The mid-turn half is
+/// `every_registered_command_typed_mid_turn_is_handled_or_queued_verbatim`
+/// in the binary's own suite.
+#[test]
+fn every_registered_slash_command_reaches_a_dispatch_arm() {
+    /// Run one single-line script and return stdout and stderr joined.
+    fn run_one_command(line: &str) -> String {
+        let home = TempDir::new().expect("temp home");
+        write_config(home.path(), "http://127.0.0.1:1");
+        let script = home.path().join("one-command.txt");
+        fs::write(&script, format!("{line}\n")).expect("write script");
+        let output = base_cmd(home.path())
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--gateway",
+                "example",
+                "--jsonl",
+                "chat",
+                "--script",
+                &script.to_string_lossy(),
+            ])
+            .output()
+            .unwrap_or_else(|error| panic!("run {line:?}: {error}"));
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    // Subjects, from the registry's own publication of itself.
+    let names: Vec<String> = run_one_command("/help")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|event| {
+            let result = event.get("result")?.clone();
+            (result["kind"] == "help").then(|| result["commands"].clone())
+        })
+        .expect("/help publishes its registry in the JSONL command result")
+        .as_array()
+        .expect("`commands` is an array")
+        .iter()
+        .map(|command| {
+            command["name"]
+                .as_str()
+                .expect("every registry entry has a name")
+                .to_string()
+        })
+        .collect();
+    assert!(
+        names.len() > 1,
+        "the registry must have supplied the subjects: {names:?}"
+    );
+
+    // The detector, proven in this very run: a word no entry can hold must
+    // reach the fallback. Derived from a registered name so that not even the
+    // sentinel is a typed command name.
+    let sentinel = format!("{}-is-not-a-registered-command", names[0]);
+    let probe = run_one_command(&format!("/{sentinel}"));
+    assert!(
+        probe.contains(&format!("unknown command: /{sentinel}")),
+        "NON-VACUOUS: an unregistered word still reaches the unknown-command \
+         fallback, so the absence asserted below is a real dispatch and not a \
+         harness that never looked; output:\n{probe}"
+    );
+
+    let mut undispatched: Vec<String> = Vec::new();
+    for name in &names {
+        let output = run_one_command(&format!("/{name}"));
+        if output.contains(&format!("unknown command: /{name}")) {
+            undispatched.push(name.clone());
+        }
+    }
+    assert!(
+        undispatched.is_empty(),
+        "registered but undispatched (F57): {undispatched:?} — each is in \
+         SLASH_COMMANDS with no arm in `handle_slash`, so typing it prints \
+         `unknown command` between turns and, mid-turn, banks it as a future \
+         prompt for the model. All {} registry entries were driven.",
+        names.len()
+    );
+}
+
+/// F51 byte contract: with tools enabled (`chat`'s default) a streamed prose answer
+/// must reach `--plain` stdout as exactly the answer plus one terminating
+/// newline — whether it is buffered to the end of the round or streamed
+/// fragment by fragment. This is the test that catches a fix which streams the
+/// fragments and then ALSO reprints the buffered text at the end of the round:
+/// the answer would appear twice.
+#[tokio::test]
+#[serial]
+async fn test_plain_streamed_answer_with_tools_enabled_is_printed_exactly_once() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"Here "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"is "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"the "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"answer."},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--plain", "chat", "stream me an ordinary answer"])
+            .output()
+            .expect("run a plain streamed chat")
+    })
+    .await
+    .expect("join the ask process");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    assert_eq!(
+        stdout, "Here is the answer.\n",
+        "the --plain byte contract for a streamed answer with tools offered"
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock gateway records requests");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(
+        body["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "F51's premise: this very round advertised tools: {body}"
+    );
+    server.verify().await;
+}
+
+/// F51's highest-risk case, and the realistic daily one:
+/// `test_text_protocol_ignores_prose`'s shape — prose, then a braced tail that
+/// could still have opened a text-protocol tool call, then more prose. The head
+/// is disqualified at once and streams; the `{` tail can only be released when
+/// the round ends. So this is the round where part of the text has streamed and
+/// part has not, and an end-of-round site that reprints the WHOLE buffered
+/// message instead of only the withheld tail duplicates the head. `print_message`
+/// writes straight to the process descriptor and bypasses the renderer's surface
+/// seam, so only a real `--plain` run can see that duplication.
+#[tokio::test]
+#[serial]
+async fn test_plain_stream_disqualified_midway_prints_each_part_exactly_once() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"Use a HashMap "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"{ key: value } "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"for this."},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--plain", "chat", "answer with a brace in the middle"])
+            .output()
+            .expect("run a plain streamed chat")
+    })
+    .await
+    .expect("join the chat process");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    assert_eq!(
+        stdout, "Use a HashMap { key: value } for this.\n",
+        "a round disqualified midway must print its streamed head and its \
+         withheld tail exactly once each"
+    );
+    assert_eq!(
+        stdout.matches("Use a HashMap").count(),
+        1,
+        "the streamed head must not be reprinted with the buffered tail: {stdout:?}"
+    );
+    server.verify().await;
 }
 
 #[tokio::test]

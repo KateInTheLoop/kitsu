@@ -483,6 +483,14 @@ pub enum AgentRuntimeEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         command: Option<Box<CommandRuntimeResult>>,
     },
+    /// History trimming replaced one or more tool results with a dead
+    /// `[older tool output elided]` stub: the bodies are gone and nothing
+    /// recallable was left in their place, so the provider never saw them.
+    /// A lossless eviction (one that keeps an offload pointer the model can
+    /// still `fs_read_file`) is deliberately NOT reported here — that is the
+    /// documented good case `--offload-cap` exists to produce, and reporting
+    /// it would teach readers to ignore this event.
+    ToolResultsDropped { round: u32, dropped: u32 },
     TurnFinished {
         success: bool,
         completion: String,
@@ -1712,6 +1720,10 @@ where
         let mut stream = stream_result?;
 
         let mut assistant_text = String::new();
+        // F51: how many bytes of `assistant_text` have already gone out to
+        // stdout this round. Zero means nothing streamed, so the end-of-round
+        // site still prints the whole message as it always did.
+        let mut streamed_len = 0usize;
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut finish = FinishReason::Stop;
 
@@ -1745,6 +1757,21 @@ where
                         abort_if_event_sink_failed(cfg)?;
                     }
                     assistant_text.push_str(&t);
+                    // F51: tools WERE offered this round, so this text may yet
+                    // turn out to be a text-protocol tool call — but holding
+                    // all of it means the default configuration never streams.
+                    // Release the prefix that can no longer open one and
+                    // withhold the rest until the round ends. Stdout only: the
+                    // event log must still receive this round's text once, at
+                    // end of round, so concatenated deltas reproduce the
+                    // committed answer.
+                    if cfg.stream && tools_were_offered && !cfg.quiet {
+                        let safe = text_protocol_safe_prefix(&assistant_text);
+                        if safe > streamed_len {
+                            kitsu_render::print_fragment(&assistant_text[streamed_len..safe]);
+                            streamed_len = safe;
+                        }
+                    }
                 }
                 ChatDelta::ToolCall(tc) => tool_calls.push(tc),
                 ChatDelta::Usage(u) => {
@@ -1878,7 +1905,14 @@ where
         // normally (previously over-suppressed, hiding read/grep output).
         if cfg.stream && tools_were_offered && !synthesized_call && !needs_structured_finalization {
             if !cfg.quiet {
-                kitsu_render::print_message(&assistant_text);
+                if streamed_len == 0 {
+                    kitsu_render::print_message(&assistant_text);
+                } else {
+                    // F51: the head already streamed. Printing the whole
+                    // message here would duplicate it in the default
+                    // configuration, so emit only the withheld tail.
+                    kitsu_render::print_fragment(&assistant_text[streamed_len..]);
+                }
             }
             // Text accompanying a structured tool call is intermediate
             // narration, not the committed answer returned by this turn. Keep
@@ -2309,6 +2343,60 @@ fn relax_json_escapes(candidate: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// How much of a round's accumulated text can be shown to the user without
+/// risking that a text-protocol tool call (ISSUE-001) leaks into the
+/// transcript. Returns a byte offset into `text`.
+///
+/// The safe prefix ends at the first byte that could still begin one of the
+/// three opening forms the text-protocol tests pin:
+/// - `{` — a bare call object (`test_text_protocol_bare_json`). It can always
+///   still complete into one, so everything from it is held to end of round.
+/// - `<` — held only while the remainder is a prefix of, or starts with,
+///   `"<tool_call>"` (`test_text_protocol_tagged`). Otherwise it is ordinary
+///   prose: skip it and keep scanning.
+/// - `` ` `` — the same against ```` "```" ```` (`test_text_protocol_fenced_json`).
+///
+/// This is a continuous rule over the whole accumulated text, not a one-shot
+/// latch, because the fenced form puts narration BEFORE the fence: that
+/// narration is released and the fence following it is still withheld. Any
+/// other byte is prose (`test_text_protocol_ignores_prose`, whose inline
+/// `{ key: value }` is not an opener to the parser but is still held here,
+/// because incrementally it cannot be distinguished from one).
+///
+/// Worst-case hold before the first byte reaches the user is 11 bytes
+/// (`"<tool_call>"`) and 3 for a fence; ordinary prose holds nothing, because
+/// its first character is none of the three. Only text opening with `{` is
+/// held unboundedly, and that text must be held anyway.
+fn text_protocol_safe_prefix(text: &str) -> usize {
+    const TAG: &str = "<tool_call>";
+    const FENCE: &str = "```";
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let marker = match bytes[i] {
+            b'{' => return i,
+            b'<' => TAG,
+            b'`' => FENCE,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // `{`, `<` and `` ` `` are ASCII, so `i` is a char boundary.
+        let rest = &text[i..];
+        if rest.len() < marker.len() {
+            // Still short: it is viable only while it matches so far.
+            if marker.as_bytes().starts_with(rest.as_bytes()) {
+                return i;
+            }
+        } else if rest.starts_with(marker) {
+            return i;
+        }
+        i += 1;
+    }
+    bytes.len()
 }
 
 fn parse_text_tool_calls(
@@ -3263,7 +3351,7 @@ where
         // still a checked invariant: elide, then drop whole exchanges, then fail
         // locally if protected content alone exceeds the configured cap.
         if initial.used > initial.target {
-            let (after_elide, elided) =
+            let (after_elide, elided, dropped) =
                 trim_tool_results_counted(messages, initial.used, initial.target, |m| {
                     m.byte_size() as u64
                 });
@@ -3272,6 +3360,7 @@ where
                 progress.tool_results_elided = elided;
                 progress.outcome = Some(CompactionOutcome::ToolResultsElided);
             }
+            report_dropped_tool_results(cfg, round, dropped);
             if after_elide > initial.target {
                 let mut current = after_elide;
                 let mut removed_total = 0u32;
@@ -3354,9 +3443,10 @@ where
     // deterministic below the threshold and does not damage protected recent
     // tool context merely to manufacture savings.
     if !force {
-        let (after_elide, elided) =
+        let (after_elide, elided, dropped) =
             trim_tool_results_counted(messages, running, target, message_tokens);
         running = after_elide;
+        report_dropped_tool_results(cfg, round, dropped);
         if elided > 0 {
             meter.invalidate();
             progress.tool_results_elided = elided;
@@ -3910,6 +4000,20 @@ async fn collect_text<P: Provider>(
     }
 }
 
+/// Report an unrecoverable tool-result loss on the runtime event stream, and
+/// only that: `dropped == 0` emits nothing, so every run that loses nothing
+/// (including a lossless offload-pointer eviction) keeps its stream exactly as
+/// it is today. Emitted at the elision site because that is the only place the
+/// lossy/lossless split is known.
+fn report_dropped_tool_results(cfg: &AgentConfig, round: u32, dropped: u32) {
+    if dropped == 0 {
+        return;
+    }
+    if let Some(log) = &cfg.event_log {
+        log.record(AgentRuntimeEvent::ToolResultsDropped { round, dropped });
+    }
+}
+
 /// Elide the oldest tool-result bodies (replacing each with a short stub) until
 /// the running `total` — measured by `size` — is at or under `limit`,
 /// decrementing by the amount each elision actually frees. Never touches the
@@ -3925,17 +4029,24 @@ fn trim_tool_results(
     trim_tool_results_counted(messages, total, limit, size).0
 }
 
+/// Returns `(total, elided, dropped)`. `elided` counts every eviction;
+/// `dropped` counts only the unrecoverable subset — an eviction whose stub is
+/// not an [`OFFLOAD_POINTER_PREFIX`] pointer, so the body is gone with no
+/// recall path. The two differ exactly when a low `--offload-cap` has already
+/// offloaded the result: `elided_tool_stub` then keeps the pointer line and
+/// drops only the preview, which is lossless and must not be reported as loss.
 fn trim_tool_results_counted(
     messages: &mut [ChatMessage],
     mut total: u64,
     limit: u64,
     size: impl Fn(&ChatMessage) -> u64,
-) -> (u64, u32) {
+) -> (u64, u32, u32) {
     if total <= limit {
-        return (total, 0);
+        return (total, 0, 0);
     }
     let last_user_idx = messages.iter().rposition(|m| m.role == Role::User);
     let mut elided = 0u32;
+    let mut dropped = 0u32;
     let mut i = 0;
     while total > limit && i < messages.len() {
         // Only elide tool results (never system / last-user / assistant turns).
@@ -3944,14 +4055,18 @@ fn trim_tool_results_counted(
             let stub = elided_tool_stub(&messages[i]);
             let after = size(&stub);
             if after < before {
+                let recallable = stub.content.starts_with(OFFLOAD_POINTER_PREFIX);
                 total = total.saturating_sub(before - after);
                 messages[i] = stub;
                 elided = elided.saturating_add(1);
+                if !recallable {
+                    dropped = dropped.saturating_add(1);
+                }
             }
         }
         i += 1;
     }
-    (total, elided)
+    (total, elided, dropped)
 }
 
 /// Build the elided replacement for a tool-result message. If the message is

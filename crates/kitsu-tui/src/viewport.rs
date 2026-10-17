@@ -65,6 +65,15 @@ struct Inner {
     /// clear exactly the rows `show` pinned, and a separately stored row count
     /// could outlive or contradict the bottom row it belongs to.
     geometry: Option<(u16, u16)>,
+    /// The bounded cell ring, or `None` on a surface built with
+    /// [`InlineSurface::new`] (requirement **N4**, plan row T3-S6).
+    ///
+    /// It lives behind the *same* mutex as the sinks rather than one of its
+    /// own so that the retained order cannot disagree with the written order:
+    /// two threads writing transcript lines serialise on this lock, and a
+    /// separate ring lock would let their pushes land in the opposite order
+    /// from their bytes.
+    cells: Option<crate::cells::CellRing>,
 }
 
 impl Inner {
@@ -75,6 +84,115 @@ impl Inner {
             Fd::Stderr => &mut *self.err,
         }
     }
+}
+
+/// What a resize should do to an inline viewport (finding F16).
+///
+/// DECSTBM margins are **absolute row numbers**, so a latched geometry is
+/// wrong the instant the terminal is resized: shrinking strands the pinned row
+/// off-screen or leaves margins past the bottom of the screen, growing leaves
+/// the region covering only part of the window, and either way
+/// [`InlineSurface::paint`] goes on addressing rows from the stale geometry.
+///
+/// The decision is kept in this pure value so the policy -- in particular what
+/// happens when a resize crosses finding F19's `rows >= viewport_rows + 2`
+/// bound in either direction -- is testable without a terminal, a signal or a
+/// blocking read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResizePlan {
+    /// Emit nothing: either the dimensions did not change, or the viewport is
+    /// already released and the terminal is still too short to pin one.
+    ///
+    /// The first half is what keeps a spurious `SIGWINCH` from flickering the
+    /// pinned row.
+    Unchanged,
+    /// A viewport is pinned and stays pinned at a new size: tear the old
+    /// geometry down and set the new one up, so both margins and the pinned
+    /// rows are right for the new size. Never patch one margin in place.
+    Relatch { rows: u16, viewport_rows: u16 },
+    /// A viewport is pinned and the new size is below F19's bound: release it
+    /// -- region reset, rows cleared, nothing pinned -- and stay released
+    /// while the terminal is too short. A pinned row that cannot be drawn
+    /// correctly is worse than no pinned row, and keeping a region whose
+    /// margins exceed the screen is exactly the corruption F19 was about.
+    Release,
+    /// No viewport is pinned and the new size clears F19's bound: install one.
+    /// This is the second half of the round trip -- a terminal made too short
+    /// and then tall again ends up correctly pinned.
+    Install { rows: u16, viewport_rows: u16 },
+}
+
+/// Decide what a resize to `rows` x `viewport_rows` should do, given the
+/// dimensions currently installed (`None` when nothing is pinned).
+///
+/// The bound is [`InlineSurface::show`]'s own, `rows >= viewport_rows + 2`, and
+/// must stay that way: a plan that says install where `show` declines would
+/// leave the caller believing a region is pinned when none is.
+pub fn plan_resize(installed: Option<(u16, u16)>, rows: u16, viewport_rows: u16) -> ResizePlan {
+    // A spurious notification carries no dimensions, so the redundant resize
+    // is the common case and has to be the cheapest one: nothing at all.
+    if installed == Some((rows, viewport_rows)) {
+        return ResizePlan::Unchanged;
+    }
+    // `show`'s own bound, and `saturating_add` for the same reason it uses
+    // one: a nonsensical `viewport_rows` near `u16::MAX` must decline rather
+    // than wrap into an apparently workable geometry.
+    let workable = rows >= viewport_rows.saturating_add(2);
+    match (installed.is_some(), workable) {
+        (true, true) => ResizePlan::Relatch {
+            rows,
+            viewport_rows,
+        },
+        (true, false) => ResizePlan::Release,
+        (false, true) => ResizePlan::Install {
+            rows,
+            viewport_rows,
+        },
+        // Released and still too short: there is nothing to tear down and
+        // nothing that can be pinned, so no bytes.
+        (false, false) => ResizePlan::Unchanged,
+    }
+}
+
+/// The usable viewport height on a `terminal_rows`-high terminal for a caller
+/// that wants `requested` rows drawn (T0-S14).
+///
+/// F19's bound still rules -- the region needs two scrolling rows above the
+/// viewport -- so the usable maximum is `terminal_rows - 2`. A request above
+/// that is **clamped, not refused**: a palette too tall for the window is
+/// shortened, and only a terminal that cannot pin even one row ends up with no
+/// viewport at all (which is `plan_resize`'s `Release`, already built).
+///
+/// Pure, for the same reason [`plan_resize`] is: the property that the height
+/// latched is always one [`InlineSurface::show`] would accept has to be
+/// checkable without a terminal.
+///
+pub fn clamp_viewport_rows(terminal_rows: u16, requested: u16) -> u16 {
+    // `saturating_sub` is the whole of the degenerate case: a terminal under
+    // three rows has no usable height at all, and zero is the honest answer
+    // rather than a geometry `show` would decline.
+    requested.min(terminal_rows.saturating_sub(2))
+}
+
+/// The rows of `content` that survive the clamp on a `terminal_rows`-high
+/// terminal: the **last** [`clamp_viewport_rows`]`(terminal_rows,
+/// content.len())` of them, in order.
+///
+/// Rows are dropped from the **top**. The composer is the bottom row and the
+/// palette sits above it, so the row the user is typing into must be the last
+/// thing to go; losing it to make room for a list of suggestions would be the
+/// wrong trade.
+///
+/// Returning the slice rather than a count is deliberate: its `len()` *is*
+/// the height, so the two cannot disagree even in here.
+pub fn fit_viewport_rows(content: &[String], terminal_rows: u16) -> &[String] {
+    // `content.len()` may exceed `u16::MAX`; the clamp's own ceiling is well
+    // under that, so saturating the cast cannot change the answer.
+    let height = clamp_viewport_rows(
+        terminal_rows,
+        u16::try_from(content.len()).unwrap_or(u16::MAX),
+    );
+    &content[content.len() - height as usize..]
 }
 
 /// An inline viewport: a pinned region at the bottom of the terminal with the
@@ -94,8 +212,41 @@ impl InlineSurface {
                 out,
                 err,
                 geometry: None,
+                cells: None,
             }),
         }
+    }
+
+    /// Wrap the two descriptors **and** feed a bounded cell ring of
+    /// `cell_ring_lines` lines (requirement **N4**, plan row T3-S6).
+    ///
+    /// Opt-in on purpose: a surface built with [`new`](Self::new) retains
+    /// nothing and pays nothing, which is what every non-inline caller wants.
+    /// The inline install uses this constructor, so inline mode always retains.
+    pub fn with_cell_ring(
+        out: Box<dyn Write + Send>,
+        err: Box<dyn Write + Send>,
+        cell_ring_lines: usize,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                out,
+                err,
+                geometry: None,
+                // The bound is the caller's: `CellRing` defines no constants of
+                // its own, so nothing here can drift from
+                // `TuiConfig::{MIN,DEFAULT,MAX}_CELL_RING_LINES`.
+                cells: Some(crate::cells::CellRing::new(cell_ring_lines)),
+            }),
+        }
+    }
+
+    /// The retained cells, oldest first, or `None` when this surface was built
+    /// without a ring.
+    // Reader-less for the same reason `with_cell_ring` is; see its note.
+    #[allow(dead_code)]
+    pub fn cells(&self) -> Option<Vec<crate::cells::CellLine>> {
+        self.lock().cells.as_ref().map(|ring| ring.lines())
     }
 
     /// Take the lock, ignoring poisoning: a panic inside a write leaves the
@@ -188,15 +339,34 @@ impl InlineSurface {
     /// on, and emitting absolute positions against a guess would scribble over
     /// the transcript. Doing nothing is the only choice that cannot corrupt
     /// the screen.
-    pub fn paint(&self, viewport: &[String]) {
+    /// # Width fitting (finding F16, truncation half)
+    ///
+    /// Every row passes through [`fit_row_to_width`] against `cols` before it
+    /// is written, so no painted row can wrap into the row below it. With a
+    /// one-row viewport an over-long row merely wrapped untidily; with the
+    /// multi-row composer and the slash palette it wraps *into and corrupts*
+    /// the next pinned row, which is why the fitting is here and not left to
+    /// each caller.
+    ///
+    /// A row already within `cols` visible columns is written byte-for-byte as
+    /// before -- that is `fit_row_to_width`'s first rule and what keeps the
+    /// paint byte sequences above unchanged.
+    ///
+    /// `cols` is a **parameter** rather than part of the latched geometry:
+    /// `InlineSurface` lives in `kitsu-tui` and must not probe the terminal
+    /// itself (a second probe is a second source of truth), and a column count
+    /// latched at `show` would be stale after a resize for exactly the reason
+    /// the row geometry is. Callers pass
+    /// [`kitsu_render::live::terminal_columns`], the shared probe the live row
+    /// already uses.
+    pub fn paint(&self, viewport: &[String], cols: usize) {
         let mut inner = self.lock();
         let Some((bottom, _)) = inner.geometry else {
             return;
         };
         for (i, row) in viewport.iter().enumerate() {
             let line = bottom as usize + 1 + i;
-            // No width fitting: a row wider than the terminal wraps into the
-            // next viewport row. Recorded as a known gap for a later card.
+            let row = kitsu_render::fit_row_to_width(row, cols);
             let _ = write!(inner.err, "\x1b[{line};1H\x1b[2K{row}");
         }
         let _ = write!(inner.err, "\x1b[{bottom};1H");
@@ -214,6 +384,14 @@ impl Surface for InlineSurface {
         let _ = sink.write_all(text.as_bytes());
         let _ = sink.write_all(b"\r\n");
         let _ = sink.flush();
+        // After the write, inside the lock already held for it: the lock is not
+        // widened by one byte, the bytes reach the terminal before any
+        // bookkeeping, and the ring's order is the written order by
+        // construction. The ring is fed the line's bytes verbatim -- the CRLF
+        // is this backend's line ending, not part of the line.
+        if let Some(ring) = inner.cells.as_mut() {
+            ring.push(fd, text);
+        }
     }
 
     /// Hand the block a writer and forward its bytes verbatim to the sink for
@@ -231,6 +409,44 @@ impl Surface for InlineSurface {
         let sink = inner.sink(fd);
         let _ = sink.write_all(&bytes);
         let _ = sink.flush();
+        // After the write and flush, inside the lock already held for the copy:
+        // a second acquisition would let two blocks land in the ring in the
+        // opposite order from their bytes, and the ring is N4's sole record.
+        // The block itself still ran with no lock held, above. The trait
+        // default is deliberately not reused: forwarding to `transcript_line`
+        // would add a CRLF per line and break the "the block owns its endings"
+        // contract, which is why this override exists. The ring stores line
+        // text without endings, so the scratch buffer is split here and only
+        // the texts are pushed.
+        //
+        // A block whose bytes end without a newline is retained as a short
+        // line rather than held back until some later block terminates it:
+        // holding it would mean text that is on the terminal is absent from
+        // the ring, and a partial final line that is never terminated (the
+        // shape behind F47) would be lost from the overlay and the `[` dump
+        // for good. Retaining it short can split one logical line across two
+        // ring entries, which is visible and recoverable; losing it is not.
+        if let Some(ring) = inner.cells.as_mut() {
+            let text = String::from_utf8_lossy(&bytes);
+            for line in text.lines() {
+                ring.push(fd, line);
+            }
+        }
+    }
+
+    /// Record the user's submitted prompt in the cell ring, **writing no
+    /// bytes** -- the whole reason this seam is not `transcript_line`.
+    ///
+    /// The composer painted the submitted row and erased it, so the line is on
+    /// no descriptor; writing it here would add a transcript line the inline
+    /// renderer's one-write-per-line contract (**R3**) says is not there and
+    /// change the byte stream of every session. A backend built without a ring
+    /// records nothing, exactly as the trait default does.
+    fn note_prompt(&self, text: &str) {
+        let mut inner = self.lock();
+        if let Some(ring) = inner.cells.as_mut() {
+            ring.push_prompt(text);
+        }
     }
 }
 
@@ -488,7 +704,7 @@ mod tests {
         surface.show(24, 3);
         assert_eq!(sink.bytes(), b"\x1b[1;21r\x1b[21;1H".to_vec());
         let before = sink.bytes().len();
-        surface.paint(&["composer".to_string()]);
+        surface.paint(&["composer".to_string()], 80);
         assert_eq!(
             &sink.bytes()[before..],
             b"\x1b[22;1H\x1b[2Kcomposer\x1b[21;1H"
@@ -505,7 +721,7 @@ mod tests {
         // 10, and the cursor goes back to row 8 inside the region.
         surface.show(10, 2);
         let before = sink.bytes().len();
-        surface.paint(&["composer".to_string(), "status".to_string()]);
+        surface.paint(&["composer".to_string(), "status".to_string()], 80);
         assert_eq!(
             &sink.bytes()[before..],
             b"\x1b[9;1H\x1b[2Kcomposer\x1b[10;1H\x1b[2Kstatus\x1b[8;1H"
@@ -580,11 +796,14 @@ mod tests {
             let fd = if i % 2 == 1 { Fd::Stdout } else { Fd::Stderr };
             surface.transcript_line(fd, &format!("line {i:02}"));
         }
-        surface.paint(&[
-            "> composer".to_string(),
-            "status: 2 agents".to_string(),
-            "hint: ctrl-c".to_string(),
-        ]);
+        surface.paint(
+            &[
+                "> composer".to_string(),
+                "status: 2 agents".to_string(),
+                "hint: ctrl-c".to_string(),
+            ],
+            80,
+        );
         sink.bytes()
     }
 
@@ -828,12 +1047,515 @@ mod tests {
         for (rows, viewport_rows) in TOO_SHORT {
             let (surface, sink) = shared();
             surface.show(rows, viewport_rows);
-            surface.paint(&["> composer".to_string()]);
+            surface.paint(&["> composer".to_string()], 80);
             assert!(
                 sink.bytes().is_empty(),
                 "show({rows}, {viewport_rows}) then paint must emit nothing, got {:?}",
                 sink.text()
             );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Finding F16: the viewport has no resize handling.
+    //
+    // Geometry is latched once at install and never updated, and DECSTBM
+    // margins are absolute row numbers. `plan_resize` is the pure half of the
+    // fix: it takes the dimensions currently installed plus the new ones and
+    // says what should happen, so the policy is pinned here rather than in a
+    // signal handler nobody can drive from a unit test.
+    //
+    // The decided policy, which these tests pin:
+    //
+    //   * same dimensions            -> nothing at all (a spurious SIGWINCH
+    //                                   must not flicker the pinned row);
+    //   * new size, bound cleared    -> release the old geometry and set up
+    //                                   the new one, never patch a margin;
+    //   * resize below F19's bound   -> release and stay released;
+    //   * released, still too short  -> nothing;
+    //   * released, bound cleared    -> install.
+    // ---------------------------------------------------------------------
+
+    use super::{plan_resize, ResizePlan};
+
+    #[test]
+    fn plan_resize_does_nothing_when_the_dimensions_are_unchanged() {
+        // The spurious-SIGWINCH case. A resize notification carries no
+        // dimensions, so a redundant one is the common case, not the odd one:
+        // re-latching here would tear the region down and set it back up on
+        // every window focus change that happens to raise the signal, which
+        // the user sees as the pinned row flickering.
+        assert_eq!(
+            plan_resize(Some((24, 1)), 24, 1),
+            ResizePlan::Unchanged,
+            "a resize to the same dimensions must emit nothing"
+        );
+        assert_eq!(
+            plan_resize(Some((40, 3)), 40, 3),
+            ResizePlan::Unchanged,
+            "and the same with a taller viewport"
+        );
+    }
+
+    #[test]
+    fn plan_resize_relatches_when_the_terminal_changes_size_above_the_bound() {
+        // Both directions. Shrinking is the dangerous one -- the old bottom
+        // margin may now be past the bottom of the screen -- but growing is
+        // just as wrong, leaving the transcript scrolling in a subset of the
+        // window with dead space below it.
+        assert_eq!(
+            plan_resize(Some((24, 1)), 40, 1),
+            ResizePlan::Relatch {
+                rows: 40,
+                viewport_rows: 1
+            },
+            "growing must re-latch so the region covers the whole new screen"
+        );
+        assert_eq!(
+            plan_resize(Some((40, 1)), 24, 1),
+            ResizePlan::Relatch {
+                rows: 24,
+                viewport_rows: 1
+            },
+            "shrinking must re-latch so the margins stay on screen"
+        );
+        // A changed viewport row count is a resize too: this is the seam the
+        // multi-row composer and the slash palette will drive.
+        assert_eq!(
+            plan_resize(Some((24, 1)), 24, 3),
+            ResizePlan::Relatch {
+                rows: 24,
+                viewport_rows: 3
+            },
+            "a changed pinned row count re-latches at the same height"
+        );
+    }
+
+    #[test]
+    fn plan_resize_releases_the_viewport_when_a_resize_crosses_below_the_bound() {
+        // The decision this card makes: a pinned row that cannot be drawn
+        // correctly is worse than no pinned row, so the viewport releases
+        // rather than keeping a region whose margins no longer fit.
+        for (rows, viewport_rows) in TOO_SHORT {
+            assert_eq!(
+                plan_resize(Some((24, 1)), rows, viewport_rows),
+                ResizePlan::Release,
+                "a resize to ({rows}, {viewport_rows}) is below F19's bound, so the \
+                 viewport must release rather than keep a broken region"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_resize_stays_released_while_the_terminal_is_too_short() {
+        // Released and still too short: nothing to tear down and nothing that
+        // can be pinned, so no bytes. Without this, every SIGWINCH while a
+        // window is dragged through a too-short size would emit a teardown for
+        // a geometry that was never latched.
+        for (rows, viewport_rows) in TOO_SHORT {
+            assert_eq!(
+                plan_resize(None, rows, viewport_rows),
+                ResizePlan::Unchanged,
+                "released and still too short at ({rows}, {viewport_rows}): no bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_resize_reinstalls_once_a_later_resize_clears_the_bound() {
+        // The other half of the round trip. A terminal dragged too short and
+        // then tall again must end up with a correctly pinned viewport, not
+        // permanently without one.
+        assert_eq!(
+            plan_resize(None, 24, 1),
+            ResizePlan::Install {
+                rows: 24,
+                viewport_rows: 1
+            },
+            "a released viewport re-installs as soon as the terminal is tall enough"
+        );
+        assert_eq!(
+            plan_resize(None, 3, 1),
+            ResizePlan::Install {
+                rows: 3,
+                viewport_rows: 1
+            },
+            "including at the smallest workable geometry, rows == viewport_rows + 2"
+        );
+    }
+
+    #[test]
+    fn plan_resize_pins_a_geometry_exactly_when_show_would_emit_one() {
+        // The property, driven over every small geometry: the plan may only
+        // ask for a pinned viewport where `show` actually emits a region. A
+        // plan that said install where `show` declines would leave the caller
+        // believing a region is pinned when none is -- finding F19's defect
+        // moved one layer up.
+        for rows in 0u16..=40 {
+            for viewport_rows in 0u16..=8 {
+                let workable = rows >= viewport_rows + 2;
+                for installed in [None, Some((24u16, 1u16)), Some((40u16, 3u16))] {
+                    let plan = plan_resize(installed, rows, viewport_rows);
+                    let pins = match plan {
+                        ResizePlan::Relatch { .. } | ResizePlan::Install { .. } => true,
+                        ResizePlan::Release | ResizePlan::Unchanged => false,
+                    };
+                    if installed == Some((rows, viewport_rows)) {
+                        assert_eq!(
+                            plan,
+                            ResizePlan::Unchanged,
+                            "plan_resize({installed:?}, {rows}, {viewport_rows}) must be inert"
+                        );
+                        continue;
+                    }
+                    assert_eq!(
+                        pins,
+                        workable,
+                        "plan_resize({installed:?}, {rows}, {viewport_rows}) returned {plan:?}, \
+                         but show() {} emit a region for that geometry",
+                        if workable { "would" } else { "would not" }
+                    );
+                    // And a plan that pins must carry the *new* dimensions:
+                    // carrying the old ones is the stale-geometry bug itself.
+                    if let ResizePlan::Relatch {
+                        rows: r,
+                        viewport_rows: v,
+                    }
+                    | ResizePlan::Install {
+                        rows: r,
+                        viewport_rows: v,
+                    } = plan
+                    {
+                        assert_eq!(
+                            (r, v),
+                            (rows, viewport_rows),
+                            "the plan must carry the new dimensions, not the latched ones"
+                        );
+                    }
+                    // Release only ever applies to a viewport there is
+                    // something to release.
+                    if plan == ResizePlan::Release {
+                        assert!(
+                            installed.is_some(),
+                            "plan_resize({installed:?}, {rows}, {viewport_rows}) asked to \
+                             release a viewport that was never pinned"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Finding F16, truncation half: `paint` fits each row to the terminal.
+    //
+    // `paint` used to write every row with no width limit, so a row wider
+    // than the terminal wrapped into the next viewport row. With a one-row
+    // viewport that was untidy; with the multi-row composer and the slash
+    // palette it overwrites the row below. The fitting itself is pinned in
+    // `kitsu_render::fit_row_to_width`; these tests pin the wiring, and the
+    // existing byte-exact paint tests above are the regression net for rows
+    // that already fit.
+    // ---------------------------------------------------------------------
+
+    /// Visible width of a styled row, the in-tree idiom: sanitise the escapes
+    /// away, then measure.
+    fn visible_cols(row: &str) -> usize {
+        kitsu_render::sanitize_terminal_text(row).chars().count()
+    }
+
+    #[test]
+    fn paint_leaves_a_row_within_the_terminal_width_byte_identical() {
+        // The property the fitting may not cost us: a row that fits produces
+        // exactly the bytes it produced before this card, the trailing park
+        // included and with nothing appended to the row itself -- even when it
+        // leaves styling active.
+        let (surface, sink) = shared();
+        surface.show(10, 2);
+        let before = sink.bytes().len();
+        surface.paint(&["composer".to_string(), "\x1b[31mstatus".to_string()], 80);
+        assert_eq!(
+            &sink.bytes()[before..],
+            b"\x1b[9;1H\x1b[2Kcomposer\x1b[10;1H\x1b[2K\x1b[31mstatus\x1b[8;1H",
+            "a fitting row is written byte-for-byte, with no reset appended"
+        );
+    }
+
+    #[test]
+    fn paint_truncates_an_over_long_row_so_it_cannot_wrap() {
+        let (surface, sink) = shared();
+        surface.show(10, 2);
+        let before = sink.bytes().len();
+        // 30 visible columns into a 12-column terminal.
+        surface.paint(&["0123456789abcdefghijklmnopqrst".to_string()], 12);
+        let tail = String::from_utf8(sink.bytes()[before..].to_vec()).expect("UTF-8");
+        assert_eq!(
+            tail, "\x1b[9;1H\x1b[2K0123456789ab\x1b[8;1H",
+            "the row is cut to the terminal's width, got {tail:?}"
+        );
+
+        // And the property rather than the literal: the text written between
+        // the clear and the park is at most `cols` visible columns, for every
+        // width.
+        for cols in 1usize..=40 {
+            let (surface, sink) = shared();
+            surface.show(10, 2);
+            let before = sink.bytes().len();
+            surface.paint(&["0123456789abcdefghijklmnopqrst".to_string()], cols);
+            let tail = String::from_utf8(sink.bytes()[before..].to_vec()).expect("UTF-8");
+            let body = tail
+                .strip_prefix("\x1b[9;1H\x1b[2K")
+                .and_then(|rest| rest.strip_suffix("\x1b[8;1H"))
+                .unwrap_or_else(|| panic!("paint at {cols} cols emitted {tail:?}"));
+            assert!(
+                visible_cols(body) <= cols,
+                "paint at {cols} cols wrote {} visible columns: {body:?}",
+                visible_cols(body)
+            );
+        }
+    }
+
+    #[test]
+    fn paint_keeps_an_over_long_row_from_disturbing_another_viewport_row() {
+        // The case this card exists for, driven through the emulator because
+        // wrapping is a property of the terminal and not of the byte stream.
+        //
+        // The row painted *after* an over-long one happens to repair the
+        // damage, since it clears its own line; so the corruption shows where
+        // a real multi-row viewport will show it -- a partial repaint. Here
+        // the status row is painted once and the composer row alone is
+        // repainted, exactly as a keystroke redraw would.
+        let (surface, sink) = shared();
+        surface.show(6, 2);
+        surface.paint(&["> ".to_string(), "status: ok".to_string()], 12);
+        surface.paint(&["0123456789abcdefghijklmnopqrst".to_string()], 12);
+        let mut parser = vt100::Parser::new(6, 12, 0);
+        parser.process(&sink.bytes());
+        let screen: Vec<String> = parser.screen().rows(0, 12).collect();
+        assert_eq!(
+            screen[4], "0123456789ab",
+            "the composer row holds exactly the terminal's width"
+        );
+        assert_eq!(
+            screen[5], "status: ok",
+            "and the status row below it survives the repaint rather than \
+             being overwritten by the composer's overflow"
+        );
+    }
+
+    #[test]
+    fn paint_keeps_an_over_long_last_row_from_scrolling_the_whole_screen() {
+        // The worse half of the same defect: the *last* pinned row sits on the
+        // last row of the screen, so its overflow autowraps off the bottom and
+        // scrolls everything -- the transcript above and the viewport itself
+        // move up a row, which is precisely the corruption the viewport exists
+        // to avoid.
+        let (surface, sink) = shared();
+        surface.show(6, 2);
+        // Deliberately within the 12-column width: a longer line autowraps
+        // and scrolls the region by itself, which would confound the very
+        // thing asserted below. The transcript's own clipping is the
+        // terminal's business; this test is about the viewport's last row.
+        surface.transcript_line(Fd::Stdout, "transcript");
+        surface.paint(
+            &[
+                "> composer".to_string(),
+                "0123456789abcdefghijklmnopqrst".to_string(),
+            ],
+            12,
+        );
+        let mut parser = vt100::Parser::new(6, 12, 0);
+        parser.process(&sink.bytes());
+        let screen: Vec<String> = parser.screen().rows(0, 12).collect();
+        assert_eq!(
+            screen[2], "transcript",
+            "the over-long pinned row caused no FURTHER scroll. One scroll is \
+             expected and is the transcript's own newline: the cursor is \
+             parked on the region's last row, so writing a line there scrolls \
+             the region once by itself. If the last pinned row had wrapped off \
+             the bottom instead of being cut, everything would have shifted \
+             again and this would read one row higher"
+        );
+        assert_eq!(screen[4], "> composer", "the first pinned row stayed put");
+        assert_eq!(
+            screen[5], "0123456789ab",
+            "and the last pinned row is cut rather than wrapping off the \
+             bottom of the screen"
+        );
+    }
+
+    #[test]
+    fn paint_resets_style_after_truncating_a_styled_row_so_it_cannot_bleed() {
+        // The bleed case: cutting a row mid-style leaves SGR active, and the
+        // next row painted immediately after would inherit it. The reset is
+        // owed by the fitter, so this is a wiring test -- what reaches the
+        // sink must end the row's styling before the next position.
+        let (surface, sink) = shared();
+        surface.show(10, 2);
+        let before = sink.bytes().len();
+        surface.paint(
+            &[
+                "\x1b[31mred row that overflows the terminal".to_string(),
+                "plain".to_string(),
+            ],
+            8,
+        );
+        let tail = String::from_utf8(sink.bytes()[before..].to_vec()).expect("UTF-8");
+        let (first, rest) = tail
+            .split_once("\x1b[10;1H")
+            .unwrap_or_else(|| panic!("two rows are painted: {tail:?}"));
+        assert!(
+            first.ends_with("\x1b[0m"),
+            "the truncated styled row ends with a reset: {first:?}"
+        );
+        assert_eq!(
+            // Eight columns means eight: "red row" is seven, so the eighth
+            // visible character -- the space -- is kept. Reserving a column
+            // would contradict `fit_row_to_width("abcdefghij", 9)`.
+            first,
+            "\x1b[9;1H\x1b[2K\x1b[31mred row \x1b[0m",
+            "and the whole first row is exactly that: {first:?}"
+        );
+        assert_eq!(rest, "\x1b[2Kplain\x1b[8;1H");
+
+        // Through the emulator: the second row is not red.
+        let mut parser = vt100::Parser::new(10, 8, 0);
+        parser.process(&sink.bytes());
+        let second = parser.screen().cell(9, 0).expect("row 10, column 1");
+        assert!(
+            !second.fgcolor().eq(&vt100::Color::Idx(1)),
+            "the second row must not inherit the first row's colour"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // T0-S14: a dynamic viewport height.
+    //
+    // The height follows the content a caller hands the viewport, clamped to
+    // what the terminal can hold: F19's bound means the usable maximum is
+    // `terminal_rows - 2`. A request above that is **clamped rather than
+    // refused** -- a palette too tall for the window is shortened, not made to
+    // take the whole viewport down with it -- and when rows must be dropped
+    // they go from the **top**, so the composer, the bottom row, always
+    // survives.
+    //
+    // Both decisions live in pure functions for the reason `plan_resize` does.
+    // ---------------------------------------------------------------------
+
+    use super::{clamp_viewport_rows, fit_viewport_rows};
+
+    fn rows_of(labels: &[&str]) -> Vec<String> {
+        labels.iter().map(|row| row.to_string()).collect()
+    }
+
+    #[test]
+    fn clamp_viewport_rows_leaves_a_request_the_terminal_can_hold_alone() {
+        // Two scrolling rows above the viewport is the whole of the bound, so
+        // on 24 rows anything up to 22 passes through untouched -- and one row
+        // (today's hardcoded height) must be untouched on every terminal that
+        // can pin it at all.
+        assert_eq!(clamp_viewport_rows(24, 1), 1);
+        assert_eq!(clamp_viewport_rows(24, 5), 5);
+        assert_eq!(clamp_viewport_rows(24, 22), 22, "rows - 2 is usable");
+        assert_eq!(
+            clamp_viewport_rows(3, 1),
+            1,
+            "the smallest workable geometry"
+        );
+    }
+
+    #[test]
+    fn clamp_viewport_rows_shortens_a_request_taller_than_the_terminal_can_hold() {
+        // The decision: clamp, do not refuse. Some rows fit, so some rows are
+        // drawn.
+        assert_eq!(
+            clamp_viewport_rows(5, 5),
+            3,
+            "a five-row palette on a five-row terminal is cut to the three rows \
+             that fit below two scrolling rows"
+        );
+        assert_eq!(clamp_viewport_rows(24, 40), 22);
+        assert_eq!(clamp_viewport_rows(4, 9), 2);
+        // And where not even one row can be pinned the clamp is zero, which is
+        // F19's release case rather than a geometry anyone installs.
+        assert_eq!(clamp_viewport_rows(2, 1), 0);
+        assert_eq!(clamp_viewport_rows(1, 3), 0);
+        assert_eq!(clamp_viewport_rows(0, 1), 0);
+    }
+
+    #[test]
+    fn fit_viewport_rows_drops_rows_from_the_top_so_the_composer_survives() {
+        // The headline, pinned exactly as the card states it: five rows
+        // requested on a terminal that can hold three, and the three that
+        // remain are the **last** three, in order.
+        let content = rows_of(&["one", "two", "three", "four", "> composer"]);
+        assert_eq!(
+            fit_viewport_rows(&content, 5),
+            &content[2..],
+            "the topmost rows go first: the composer is the bottom row and must \
+             be the last thing dropped"
+        );
+        assert_eq!(
+            fit_viewport_rows(&content, 5).last().map(String::as_str),
+            Some("> composer")
+        );
+        // A request the terminal can hold is handed back whole.
+        assert_eq!(fit_viewport_rows(&content, 24), &content[..]);
+        // And where nothing can be pinned, nothing survives.
+        assert!(fit_viewport_rows(&content, 2).is_empty());
+    }
+
+    #[test]
+    fn fit_viewport_rows_always_matches_the_clamp_and_show_accepts_that_height() {
+        // The property that makes the clamp worth having as a pure function,
+        // and the same one `plan_resize_pins_a_geometry_exactly_when_show_would_emit_one`
+        // pins for the resize path: the height a request ends up with is
+        // always a height `show` would latch.
+        for terminal_rows in 0u16..=16 {
+            for requested in 0usize..=12 {
+                let content: Vec<String> = (0..requested).map(|i| format!("row {i}")).collect();
+                let height = clamp_viewport_rows(terminal_rows, requested as u16);
+                let fitted = fit_viewport_rows(&content, terminal_rows);
+
+                assert!(
+                    height <= requested as u16,
+                    "clamp_viewport_rows({terminal_rows}, {requested}) grew the request to \
+                     {height}"
+                );
+                assert_eq!(
+                    fitted.len(),
+                    height as usize,
+                    "fit_viewport_rows must hand back exactly the clamped height for \
+                     ({terminal_rows}, {requested})"
+                );
+                assert_eq!(
+                    fitted,
+                    &content[requested - fitted.len()..],
+                    "the surviving rows are the last ones, in order, for \
+                     ({terminal_rows}, {requested})"
+                );
+
+                if height > 0 {
+                    let (surface, sink) = shared();
+                    surface.show(terminal_rows, height);
+                    assert!(
+                        !sink.bytes().is_empty(),
+                        "clamp_viewport_rows({terminal_rows}, {requested}) returned {height}, \
+                         a height show() declines to latch -- the clamp must never admit a \
+                         geometry the terminal discards"
+                    );
+                    assert_eq!(
+                        surface.lock().geometry,
+                        Some((terminal_rows - height, height))
+                    );
+                } else {
+                    assert!(
+                        terminal_rows < 3 || requested == 0,
+                        "clamp_viewport_rows({terminal_rows}, {requested}) refused a height \
+                         the terminal could hold: at least one row fits"
+                    );
+                }
+            }
         }
     }
 
@@ -856,6 +1578,216 @@ mod tests {
             sink.text(),
             "one\r\ntwo\r\nthree\r\nfour\n",
             "the per-descriptor split must not reorder output"
+        );
+    }
+
+    /// A surface built with [`InlineSurface::new`] feeds no ring: classic and
+    /// any ring-less backend pay nothing for T3-S6.
+    ///
+    /// Not vacuous: the surface is written to first and the write is asserted
+    /// to have produced bytes, so `cells()` is `None` on a surface that really
+    /// did carry transcript lines.
+    #[test]
+    fn an_inline_surface_without_a_cell_ring_retains_no_cells() {
+        let (surface, sink) = shared();
+        surface.transcript_line(Fd::Stdout, "assistant");
+        surface.transcript_line(Fd::Stderr, "tool");
+        assert_eq!(sink.text(), "assistant\r\ntool\r\n");
+        assert_eq!(
+            surface.cells(),
+            None,
+            "no ring was asked for, so nothing is retained"
+        );
+    }
+
+    /// Feeding the ring must not change a single byte: the same calls against
+    /// a ring-fed surface and a ring-less one produce identical streams, and
+    /// only the ring-fed one retains cells.
+    ///
+    /// Not vacuous: the shared sink is asserted non-empty, and the ring-fed
+    /// surface is asserted to have retained both lines, so the byte equality
+    /// is between two surfaces that both actually wrote.
+    #[test]
+    fn feeding_the_cell_ring_changes_no_bytes() {
+        let plain_sink = SharedSink::new();
+        let plain = InlineSurface::new(Box::new(plain_sink.clone()), Box::new(plain_sink.clone()));
+        let ringed_sink = SharedSink::new();
+        let ringed = InlineSurface::with_cell_ring(
+            Box::new(ringed_sink.clone()),
+            Box::new(ringed_sink.clone()),
+            8,
+        );
+        for surface in [&plain, &ringed] {
+            surface.show(24, 2);
+            surface.transcript_line(Fd::Stdout, "assistant");
+            surface.transcript_line(Fd::Stderr, "\x1b[1mtool\x1b[0m");
+            surface.paint(&["row".to_string()], 80);
+            surface.hide();
+        }
+        assert!(!plain_sink.bytes().is_empty(), "the control surface wrote");
+        assert_eq!(
+            ringed_sink.bytes(),
+            plain_sink.bytes(),
+            "the ring is a reader, not a writer"
+        );
+        let cells = ringed.cells().expect("a ring was asked for");
+        assert_eq!(
+            cells
+                .iter()
+                .map(|line| (line.fd(), line.styled().to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Fd::Stdout, "assistant".to_string()),
+                (Fd::Stderr, "\x1b[1mtool\x1b[0m".to_string()),
+            ]
+        );
+        assert_eq!(plain.cells(), None);
+    }
+
+    /// **T3-S10. A writer that bypasses the surface reaches the terminal but
+    /// is invisible to the cell ring.**
+    ///
+    /// This is the data-completeness half of finding **F17**. F17 measured
+    /// that a direct `eprintln!`/`println!` is *visually* harmless in inline
+    /// mode — it inherits the cursor, which is parked inside the DECSTBM
+    /// region, so the terminal scrolls it away with the transcript. What that
+    /// measurement cannot see is requirement **N4**: the ring is to be the
+    /// sole source for the transcript overlay and the `[` dump, and it is fed
+    /// only from [`Surface::transcript_line`]. So output that never reached
+    /// the surface appeared on screen perfectly and is absent from the only
+    /// in-process record of the screen.
+    ///
+    /// The bypassing writer is modelled by writing into a clone of the sink
+    /// the surface holds, which is exactly the shape of the real thing: the
+    /// bytes land on the same descriptor, in order, and the surface is never
+    /// called. The ~421 direct writer sites in `main.rs` do this to the
+    /// process's real fd 1 and 2.
+    ///
+    /// # Why this is not vacuous
+    ///
+    /// The same ring is proved to capture a seam write in the same test, on
+    /// the same descriptor, in the same run: the retained line is asserted to
+    /// be exactly the seam one, so "the bypassed line is missing" is a
+    /// property of *how it was written* and not of a ring that retains
+    /// nothing. Both lines are also asserted present in the byte stream, so
+    /// the bypassing write really happened.
+    ///
+    /// This test **characterises** the limitation rather than demanding a fix:
+    /// routing hundreds of writers is the expensive branch F17 ruled out, and
+    /// the honest deliverable is a tested, documented gap.
+    #[test]
+    // The bare `\n` is the subject of this test: a direct `eprintln!` emits a
+    // line feed and no carriage return, which is exactly what is being
+    // modelled. `writeln!` would emit the same byte but hide the point.
+    #[allow(clippy::write_with_newline)]
+    fn a_writer_that_bypasses_the_surface_reaches_the_terminal_but_not_the_cell_ring() {
+        let sink = SharedSink::new();
+        let surface =
+            InlineSurface::with_cell_ring(Box::new(sink.clone()), Box::new(sink.clone()), 8);
+        surface.transcript_line(Fd::Stderr, "through the seam");
+        // The bypassing writer: same descriptor, no surface call. This is
+        // `eprintln!` in `main.rs`, which adds the bare line feed `ONLCR`
+        // then turns into CR LF.
+        {
+            let mut bypass = sink.clone();
+            write!(bypass, "bypassing the seam\n").expect("direct write");
+        }
+        assert_eq!(
+            sink.text(),
+            "through the seam\r\nbypassing the seam\n",
+            "both writers must have reached the descriptor, in order"
+        );
+        let cells = surface.cells().expect("a ring was asked for");
+        assert_eq!(
+            cells
+                .iter()
+                .map(|line| (line.fd(), line.styled().to_string()))
+                .collect::<Vec<_>>(),
+            vec![(Fd::Stderr, "through the seam".to_string())],
+            "the ring holds the seam write and nothing of the bypassing one, so \
+             the overlay and the `[` dump cannot show output that bypassed the \
+             surface"
+        );
+    }
+
+    /// **T3-S10. `write_block` routes through the seam and is still missing
+    /// from the cell ring — and it carries the streamed assistant text.**
+    ///
+    /// Unlike the test above, this gap is *not* a documented limitation to
+    /// live with. [`InlineSurface::write_block`] copies the block's bytes to
+    /// the sink and pushes nothing, while `kitsu_render::print_fragment` and
+    /// its flush route **the assistant's streamed output** through
+    /// `write_block` (`crates/kitsu-render/src/lib.rs`, the
+    /// `active_surface().write_block(Fd::Stdout, ..)` calls), and
+    /// `render_error` routes error notices through it on stderr. N4 makes the
+    /// ring the sole source for the overlay, so as it stands the overlay
+    /// would render a conversation with the assistant's own replies missing
+    /// while every tool line was present.
+    ///
+    /// The expectation is derived from what `write_block` actually does: the
+    /// block owns its line endings and the bytes are forwarded verbatim, so
+    /// the byte stream is `"alpha\nbeta\n"` and the ring must gain the two
+    /// lines **without their endings**, which is the form
+    /// `transcript_line` stores (the CRLF is the backend's, not part of the
+    /// line).
+    ///
+    /// # Why this is not vacuous, and not unsatisfiable
+    ///
+    /// The byte assertion fixes the only other way to pass — rewriting the
+    /// block's bytes — so the ring must gain the lines without the stream
+    /// changing. A ring-less surface is written the same way in the same test
+    /// and asserted to retain nothing, so the fix cannot be "always allocate
+    /// a ring".
+    ///
+    /// Deliberately **not** asserted: what a block ending without a newline
+    /// should do. `print_fragment`'s unstyled branch can write a partial
+    /// line, and whether the ring should hold it back until it is terminated
+    /// or retain it as a short line is a design decision this test leaves
+    /// open rather than pinning from guesswork.
+    #[test]
+    #[allow(clippy::write_with_newline)]
+    fn write_block_feeds_the_cell_ring_the_lines_it_wrote() {
+        let ringed_sink = SharedSink::new();
+        let ringed = InlineSurface::with_cell_ring(
+            Box::new(ringed_sink.clone()),
+            Box::new(ringed_sink.clone()),
+            8,
+        );
+        let plain_sink = SharedSink::new();
+        let plain = InlineSurface::new(Box::new(plain_sink.clone()), Box::new(plain_sink.clone()));
+        for surface in [&ringed, &plain] {
+            surface.write_block(Fd::Stdout, &mut |out: &mut dyn std::io::Write| {
+                write!(out, "alpha\nbeta\n").expect("block write");
+            });
+        }
+        assert_eq!(
+            ringed_sink.text(),
+            "alpha\nbeta\n",
+            "the block owns its line endings and they must still be forwarded \
+             verbatim: feeding the ring is not a licence to change bytes"
+        );
+        assert_eq!(
+            ringed_sink.bytes(),
+            plain_sink.bytes(),
+            "the ring is a reader, not a writer"
+        );
+        let cells = ringed.cells().expect("a ring was asked for");
+        assert_eq!(
+            cells
+                .iter()
+                .map(|line| (line.fd(), line.styled().to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Fd::Stdout, "alpha".to_string()),
+                (Fd::Stdout, "beta".to_string()),
+            ],
+            "`write_block` carries the streamed assistant text, so a ring that \
+             only sees `transcript_line` is not N4's sole source for the overlay"
+        );
+        assert_eq!(
+            plain.cells(),
+            None,
+            "a surface built without a ring still retains nothing"
         );
     }
 }

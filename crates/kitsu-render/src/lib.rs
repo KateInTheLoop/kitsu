@@ -334,7 +334,15 @@ pub fn configure_terminal_modes(plain: bool, reduced_motion: bool, screen_reader
     FORCE_SCREEN_READER.store(screen_reader, Ordering::Relaxed);
 }
 
-fn reduced_motion_mode() -> bool {
+/// Whether animation must be suppressed: the `--reduced-motion` flag or
+/// `KITSU_REDUCED_MOTION`.
+///
+/// Public because the flag has consumers outside this crate: the inline
+/// viewport's status row must not repaint merely because its elapsed segment
+/// ticked (note **N9**'s "periodic age refresh"), and the only process-wide
+/// home of the flag is here. Callers read it; only
+/// [`configure_terminal_modes`] sets it.
+pub fn reduced_motion_mode() -> bool {
     FORCE_REDUCED_MOTION.load(Ordering::Relaxed)
         || std::env::var_os("KITSU_REDUCED_MOTION").is_some()
 }
@@ -392,10 +400,15 @@ pub fn print_fragment(s: &str) {
         // count `push` returns is computed from the formatted text rather
         // than from what the writer actually accepted.
         active_surface().write_block(Fd::Stdout, &mut |out| {
-            stream_buffer()
+            let written = stream_buffer()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(out, &sanitized);
+            // `push` emits only newline-terminated lines, so anything it wrote
+            // leaves the cursor at column 0 of a fresh row.
+            if written > 0 {
+                live::set_partial_line(false);
+            }
         });
     } else {
         // Non-TTY or plain: use existing sanitizer path (byte-identical)
@@ -436,7 +449,13 @@ pub fn print_message(s: &str) {
             let _ = out.write_all(b"\n");
         }
         let _ = out.flush();
-        ASSISTANT_OUTPUT_WRITTEN.store(false, Ordering::Release);
+        if stdout_style() {
+            // A message whose last line has no terminating newline leaves the
+            // cursor mid-row on a row holding assistant text. The live row is
+            // painted wherever the cursor stands, so tell it to step down
+            // first or the repaint this suspension ends with erases that line.
+            live::set_partial_line(!rendered.is_empty() && !rendered.ends_with('\n'));
+        }
     });
 }
 
@@ -923,6 +942,176 @@ fn fit_banner_value(value: &str, width: usize) -> String {
     let mut result = String::from("…");
     result.push_str(&chars[tail_start..].iter().collect::<String>());
     result
+}
+
+/// Fit one physical terminal row to `cols` **visible** columns, escape-aware
+/// (the truncation half of finding F16).
+///
+/// This is the primitive the inline viewport needs and the crate did not have:
+/// [`display_width`] is not escape-aware (it counts the bytes of an ANSI
+/// sequence as visible columns) and [`fit_banner_value`] elides middle-out
+/// keeping the *tail*, which is right for a path and wrong for a row of text.
+/// It lives here, beside the width and sanitisation primitives, so `kitsu-tui`
+/// shares the one measurement rather than growing a second.
+///
+/// The contract, in the order the rules apply:
+///
+/// 1. **A row that already fits is returned byte-identical.** Not re-encoded,
+///    not normalised, with no reset appended -- even when it leaves styling
+///    active. Every `InlineSurface::paint` test asserts exact bytes and the
+///    output tier's whole discipline rests on byte-identity, so a fitter that
+///    rewrote short rows would be worse than no fitter.
+/// 2. Escape sequences cost **zero** columns, so a heavily styled row whose
+///    visible text fits is never truncated for its escapes.
+/// 3. Truncation counts visible columns through [`char_display_width`], so a
+///    wide CJK character costs 2.
+/// 4. **A wide character is never split.** If a 2-column character would land
+///    in the last single column the fit stops before it, and the leftover
+///    column is left **unpadded**: `paint` has already cleared the row with
+///    `ESC[2K`, so an unwritten cell shows the terminal's background, while
+///    padding with a space would both diverge from the byte-identical path and
+///    advance the cursor a column further than the text occupies.
+/// 5. If truncation cuts a row that had styling active, exactly one `ESC[0m`
+///    is appended so the style cannot bleed into whatever is drawn next. This
+///    is deliberately conditional on *both* halves: unconditionally appending
+///    a reset would break rule 1, and appending it to a truncated row that
+///    carried no escapes at all would make plain text no longer plain.
+/// 6. `cols == 0` yields an empty string for any row with visible width above
+///    zero -- nothing can be drawn in zero columns, and emitting the row's SGR
+///    into no columns would only bleed. A row of width zero (empty, or escapes
+///    alone) fits under rule 1 and so comes back byte-identical, rule 1 being
+///    first.
+pub fn fit_row_to_width(row: &str, cols: usize) -> String {
+    // Rule 1 first, and before anything can modify the string: measure the
+    // visible width and, if it fits, hand back the very same bytes. No
+    // allocation path below can run for a fitting row, which is what keeps
+    // every byte-identity assertion in `InlineSurface::paint` true. Rule 6
+    // falls out of the ordering: a zero-width row (empty, or escapes alone)
+    // fits even in zero columns and so returns here.
+    let mut visible = 0usize;
+    let mut cursor = 0usize;
+    while cursor < row.len() {
+        if let Some((len, _)) = escape_sequence_at(row, cursor) {
+            // Rule 2: an escape sequence costs zero columns.
+            cursor += len;
+            continue;
+        }
+        let ch = row[cursor..].chars().next().expect("non-empty remainder");
+        // Rule 3: visible columns, so a wide character costs 2.
+        visible += char_display_width(ch);
+        cursor += ch.len_utf8();
+    }
+    if visible <= cols {
+        return row.to_string();
+    }
+
+    // The row is over-long. Copy escapes through unconditionally (they are
+    // free) and visible characters until the next one would not fit.
+    let mut fitted = String::with_capacity(row.len());
+    let mut used = 0usize;
+    let mut wrote_visible = false;
+    // Rule 5's predicate is SGR specifically -- a CSI sequence whose final
+    // byte is `m` -- rather than "any escape seen". The appended reset exists
+    // to stop *colour and attributes* bleeding into whatever is drawn next,
+    // and only SGR leaves such state behind: a cursor move or an OSC sequence
+    // leaves nothing to reset, so a reset after one would be bytes emitted
+    // for no reason into a stream other tests assert exactly. Do not
+    // "simplify" this to any-escape.
+    let mut saw_sgr = false;
+    let mut cursor = 0usize;
+    while cursor < row.len() {
+        if let Some((len, is_sgr)) = escape_sequence_at(row, cursor) {
+            fitted.push_str(&row[cursor..cursor + len]);
+            saw_sgr |= is_sgr;
+            cursor += len;
+            continue;
+        }
+        let ch = row[cursor..].chars().next().expect("non-empty remainder");
+        let width = char_display_width(ch);
+        if used + width > cols {
+            // Rule 4: a wide character that would land in the final single
+            // column stops the fit, and the leftover column stays unpadded.
+            break;
+        }
+        fitted.push(ch);
+        used += width;
+        wrote_visible = true;
+        cursor += ch.len_utf8();
+    }
+
+    if !wrote_visible {
+        // Rule 6, and its generalisation: with no visible text drawn there is
+        // nothing for the surviving escapes to style, so emitting them would
+        // only bleed into the next row.
+        return String::new();
+    }
+    if saw_sgr {
+        fitted.push_str("\x1b[0m");
+    }
+    fitted
+}
+
+/// If `row[at..]` begins an ANSI escape sequence, its byte length and whether
+/// it is SGR (a CSI sequence with final byte `m`). Mirrors the state machine
+/// in [`TerminalTextSanitizer`], which only exists in stripping form and whose
+/// restructuring the output tier's byte-identity invariant runs through; this
+/// is a small read-only scanner instead.
+fn escape_sequence_at(row: &str, at: usize) -> Option<(usize, bool)> {
+    let bytes = row.as_bytes();
+    if bytes.get(at) != Some(&0x1b) {
+        return None;
+    }
+    let mut i = at + 1;
+    match bytes.get(i) {
+        // CSI: parameter and intermediate bytes, then a final byte.
+        Some(b'[') => {
+            i += 1;
+            while let Some(&b) = bytes.get(i) {
+                if (0x20..=0x3f).contains(&b) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            match bytes.get(i) {
+                Some(&b) if (0x40..=0x7e).contains(&b) => Some((i + 1 - at, b == b'm')),
+                // Unterminated: the rest of the row is the sequence.
+                _ => Some((row.len() - at, false)),
+            }
+        }
+        // OSC and the other control strings, terminated by BEL or ST.
+        Some(b']') | Some(b'P') | Some(b'X') | Some(b'^') | Some(b'_') => {
+            i += 1;
+            while let Some(&b) = bytes.get(i) {
+                if b == 0x07 {
+                    return Some((i + 1 - at, false));
+                }
+                if b == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                    return Some((i + 2 - at, false));
+                }
+                i += 1;
+            }
+            Some((row.len() - at, false))
+        }
+        // An escape with intermediate bytes, then a final byte.
+        Some(&b) if (0x20..=0x2f).contains(&b) => {
+            while let Some(&b) = bytes.get(i) {
+                if (0x20..=0x2f).contains(&b) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            Some((bytes.get(i).map_or(i, |_| i + 1) - at, false))
+        }
+        // A single-character escape.
+        Some(_) => {
+            let ch = row[i..].chars().next().expect("non-empty remainder");
+            Some((i + ch.len_utf8() - at, false))
+        }
+        // A lone trailing ESC.
+        None => Some((1, false)),
+    }
 }
 
 /// Content cells between the banner box's side bars.
@@ -1462,7 +1651,7 @@ pub fn finish_line() {
     active_surface().write_block(Fd::Stdout, &mut |out| {
         // Flush any partial line from the streaming buffer UNSTYLED
         // and reset its fence state.
-        stream_buffer()
+        let flushed = stream_buffer()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .flush_unstyled(out);
@@ -1474,10 +1663,20 @@ pub fn finish_line() {
             .reset();
 
         if !ASSISTANT_OUTPUT_WRITTEN.swap(false, Ordering::AcqRel) {
+            // The flushed partial line, if there was one, is now the row the
+            // cursor sits on and nothing has terminated it.
+            if stdout_style() && flushed > 0 {
+                live::set_partial_line(true);
+            }
             return;
         }
         let _ = out.write_all(b"\n");
         let _ = io::stdout().flush();
+        if stdout_style() {
+            // The line is terminated: the cursor is back at column 0 of a
+            // fresh row and the live row may paint there.
+            live::set_partial_line(false);
+        }
     });
 }
 
@@ -1617,6 +1816,28 @@ fn approval_options_with_mode(always_label: &str, styled: bool) -> String {
     )
 }
 
+/// The bottom-pane approval modal's rows, in paint order: the [`approval_header`] row, every
+/// [`approval_detail`] provenance row the surface has, then the one shared
+/// [`approval_options`] line.
+///
+/// Composition only, as requirement **R7** needs it: the caller composes each
+/// row with the existing helpers above and this says what order they are
+/// painted in, so the pane modal and the classic stderr prompt cannot drift
+/// into two different option lines. Painting belongs to the `kitsu` crate's
+/// `tui_bridge` (it owns the pinned `InlineSurface`); this crate cannot see
+/// it, and `kitsu-tui` cannot see a `PermissionRequest`.
+///
+/// The rows are the caller's own strings, cloned and never re-composed: the
+/// option line the pane paints is the very [`approval_options`] value the
+/// classic prompt prints, so the two cannot drift into two spellings.
+pub fn approval_modal(header: &str, details: &[String], options: &str) -> Vec<String> {
+    let mut rows = Vec::with_capacity(details.len() + 2);
+    rows.push(header.to_string());
+    rows.extend(details.iter().cloned());
+    rows.push(options.to_string());
+    rows
+}
+
 /// A dimmed detail row beneath an approval header (cwd, executable, timeout).
 pub fn approval_detail(text: &str) -> String {
     let text = sanitize_terminal_inline(text);
@@ -1730,6 +1951,11 @@ pub fn compaction_boundary() {
 pub enum DeckState {
     /// Working right now.
     Running,
+    /// Parked on a user answer: a pending permission, in effect, and the one
+    /// row on the surface that needs the user. `◉` is the permission glyph the
+    /// approval header already uses, so the vocabulary is shared rather than
+    /// extended.
+    Blocked,
     /// Finished; its result has not been collected yet.
     ResultReady,
     /// Finished by failing.
@@ -1742,6 +1968,7 @@ impl DeckState {
     fn glyph(self) -> &'static str {
         match self {
             Self::Running => GLYPH_TOOL_CALL,
+            Self::Blocked => GLYPH_APPROVAL,
             Self::ResultReady => GLYPH_RECEIPT,
             Self::Failed | Self::Stopped => GLYPH_TOOL_RESULT,
         }
@@ -1750,6 +1977,10 @@ impl DeckState {
     fn color(self) -> (u8, u8, u8) {
         match self {
             Self::Running | Self::ResultReady => theme().accent,
+            // Cream is the palette's "look here" slot, and the only one not
+            // already spoken for. Reusing the accent would have left blocked
+            // colour-identical to running, curing only half of F34.
+            Self::Blocked => theme().highlight,
             Self::Failed => theme().error,
             Self::Stopped => theme().warn,
         }
@@ -1759,6 +1990,7 @@ impl DeckState {
     fn plain_marker(self) -> &'static str {
         match self {
             Self::Running => "[run]",
+            Self::Blocked => "[blk]",
             Self::ResultReady => "[rdy]",
             Self::Failed => "[err]",
             Self::Stopped => "[stp]",
@@ -1782,6 +2014,109 @@ fn deck_header_with_mode(summary: &str, styled: bool, plain: bool) -> String {
         format!("{}", line.truecolor(r, g, b).bold())
     } else {
         line
+    }
+}
+
+/// The agent view's state taxonomy (requirement **A2**), and the **one** place
+/// its order is defined.
+///
+/// `DeckState` above is a *glyph* vocabulary: four fill levels. A2 needs six
+/// groups, because it splits a finished agent by whether its result has been
+/// observed and it separates a failure from a cancellation. The two are
+/// deliberately different types — a glyph is not a group — but they live in
+/// the same module so the refinement is visible in one file.
+///
+/// **Why `kitsu-render` and not `kitsu-tui`.** The order has two consumers:
+/// `kitsu-tui`'s agent-view overlay and the binary's `/jobs view` text deck.
+/// `kitsu-tui` cannot depend on `kitsu` (`kitsu` is a binary-only crate, F5),
+/// and `kitsu-render` is the only crate both already depend on. Forking the
+/// order into a second array is the F2/F38/F45/F57 failure family; the
+/// `jobs_view_group` anti-fork test in `tui_bridge.rs` pins that it has not.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AgentViewState {
+    /// Parked on a user answer: `AgentThreadPhase::Blocked`.
+    NeedsInput,
+    /// Working right now: `AgentThreadPhase::Running`.
+    Working,
+    /// Finished, and its handoff is still `Ready` — nobody has looked.
+    DoneUnviewed,
+    /// Finished, and its handoff is `Acknowledged` (or `Unavailable`, so there
+    /// is nothing left to observe).
+    DoneViewed,
+    Failed,
+    Cancelled,
+}
+
+impl AgentViewState {
+    /// A2's six groups in A2's order. The single source; nothing else may
+    /// hard-code a second ordering.
+    pub fn order() -> [AgentViewState; 6] {
+        [
+            Self::NeedsInput,
+            Self::Working,
+            Self::DoneUnviewed,
+            Self::DoneViewed,
+            Self::Failed,
+            Self::Cancelled,
+        ]
+    }
+
+    /// This state's index in [`AgentViewState::order`].
+    ///
+    /// Read *out of* [`AgentViewState::order`] rather than written out a
+    /// second time: a rank that restated the sequence could drift from it,
+    /// which is the whole failure this type exists to prevent.
+    pub fn rank(self) -> usize {
+        Self::order()
+            .into_iter()
+            .position(|state| state == self)
+            .expect("`order` lists every AgentViewState")
+    }
+
+    /// The group heading the agent view prints, in A2's own words.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NeedsInput => "needs input",
+            Self::Working => "working",
+            Self::DoneUnviewed => "done (unviewed)",
+            Self::DoneViewed => "done (viewed)",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// The machine spelling the `s:` filter term accepts (A3).
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::NeedsInput => "needs-input",
+            Self::Working => "working",
+            Self::DoneUnviewed => "done-unviewed",
+            Self::DoneViewed => "done-viewed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// This state's deck marker state — the **one** bridge from A2's six
+    /// groups to the deck's glyph vocabulary, so the agent-view overlay cannot
+    /// invent a second marker table (the F2/F38/F45/F57 drift family).
+    pub fn deck_state(self) -> DeckState {
+        match self {
+            Self::NeedsInput => DeckState::Blocked,
+            Self::Working => DeckState::Running,
+            Self::DoneUnviewed => DeckState::ResultReady,
+            Self::DoneViewed | Self::Cancelled => DeckState::Stopped,
+            Self::Failed => DeckState::Failed,
+        }
+    }
+
+    /// Parse an `s:` filter value. `None` for a word that is not one of the
+    /// six [`AgentViewState::wire`] spellings.
+    ///
+    /// The accepted vocabulary is read back off [`AgentViewState::wire`], so a
+    /// renamed spelling cannot be accepted here under its old name.
+    pub fn from_wire(word: &str) -> Option<AgentViewState> {
+        Self::order().into_iter().find(|state| state.wire() == word)
     }
 }
 
@@ -2242,14 +2577,14 @@ pub fn emit_usage(prompt_tokens: u64, completion_tokens: u64, total_tokens: u64)
 #[cfg(test)]
 mod tests {
     use super::{
-        approval_header_with_mode, approval_options_with_mode, context_lines,
+        approval_header_with_mode, approval_modal, approval_options_with_mode, context_lines,
         deck_header_with_mode, deck_marker_with_mode, display_width, error_display_lines,
-        fit_banner_value, format_message, grouped_count, human_turn_stats,
+        fit_banner_value, fit_row_to_width, format_message, grouped_count, human_turn_stats,
         milestone_line_with_mode, sanitize_plain_inline, sanitize_terminal_inline,
         sanitize_terminal_text, section_heading, spinner_mode, static_spinner_line, theme_row,
         tool_activity_line, write_run_timing_with_mode, write_static_spinner, write_turn_stats,
-        write_turn_stats_with_mode, AsyncNoticeLevel, DeckState, HumanRunReceipt, LineStyler,
-        PromptSafeAsyncNotice, RenderMode, RunTimingStatus, SpinnerMode, StreamBuffer,
+        write_turn_stats_with_mode, AgentViewState, AsyncNoticeLevel, DeckState, HumanRunReceipt,
+        LineStyler, PromptSafeAsyncNotice, RenderMode, RunTimingStatus, SpinnerMode, StreamBuffer,
         TerminalTextSanitizer, AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES, SPINNER_VERBS, THEMES,
     };
 
@@ -3077,6 +3412,74 @@ mod tests {
         assert!(!approval_options_with_mode("always (/etc)", false).contains('\u{1b}'));
     }
 
+    /// **T3-S7a.** The bottom-pane modal's rows are exactly the surfaces that
+    /// already exist, in paint order: the header, then every provenance
+    /// detail row the caller has, then the option line last.
+    ///
+    /// Requirement **R7** is a parity requirement, so the modal is a
+    /// *composition* of the three helpers above rather than a second set of
+    /// strings: everything asserted here is a value produced by one of them.
+    #[test]
+    fn approval_modal_paints_header_then_details_then_the_option_line() {
+        let header = approval_header_with_mode("kitsu wants to read /etc/hostname", false);
+        let options = approval_options_with_mode("always (/etc)", false);
+        let rows = approval_modal(&header, &[], &options);
+        assert_eq!(
+            rows,
+            vec![header.clone(), options.clone()],
+            "with no provenance rows the modal is the header and the option \
+             line, in that order"
+        );
+    }
+
+    /// **T3-S7a, R7's `command approvals keep their provenance rows`.** Every
+    /// detail row survives, in order, between the header and the option line
+    /// -- the five the command prompter composes today (cwd, executable,
+    /// timeout, authority) must not be dropped to make the modal fit.
+    #[test]
+    fn approval_modal_keeps_every_provenance_row_in_order() {
+        let header = approval_header_with_mode("run /bin/true", false);
+        let options = approval_options_with_mode("allow this exact argv/cwd for session", false);
+        let details = vec![
+            "  cwd: /repo".to_string(),
+            "  executable: /bin/true (ambient PATH lookup; observed: /bin/true; bytes not pinned)"
+                .to_string(),
+            "  timeout: 30000 ms".to_string(),
+            "  authority: session".to_string(),
+        ];
+        let rows = approval_modal(&header, &details, &options);
+        let mut expected = vec![header.clone()];
+        expected.extend(details.iter().cloned());
+        expected.push(options.clone());
+        assert_eq!(
+            rows, expected,
+            "the modal is header + every provenance row + option line, with \
+             nothing dropped or reordered"
+        );
+    }
+
+    /// **T3-S7a, the one-source rule.** The modal's last row is the
+    /// `approval_options` value *itself*, byte for byte. A re-typed option
+    /// line in the pane -- the drift R7 exists to forbid -- fails here even
+    /// if it reads the same to a human, because the composer's own output is
+    /// the expected value.
+    #[test]
+    fn approval_modal_option_line_is_the_shared_composer_byte_for_byte() {
+        let header = approval_header_with_mode("kitsu wants to write /tmp/x", false);
+        let options = approval_options_with_mode("always (/tmp)", false);
+        let rows = approval_modal(&header, &["  cwd: /tmp".to_string()], &options);
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some(options.as_str()),
+            "the option line must be the shared composer's string, not a copy"
+        );
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some("  [y] allow once \u{b7} [a] always (/tmp) \u{b7} [n] deny"),
+            "...and that string is still the classic prompt's own text"
+        );
+    }
+
     #[test]
     fn section_heading_is_bold_only_when_styled() {
         assert_eq!(section_heading("permissions", false), "permissions");
@@ -3227,6 +3630,174 @@ mod tests {
         assert!(!plain_header.contains('\u{1b}'));
     }
 
+    /// **F34.** A blocked agent is the one row on this surface the user has to
+    /// act on, so its marker may not be the busy marker. `deck_marker_with_mode`
+    /// branches on *both* `styled` and `plain`, so all three tiers are pinned
+    /// here: a test that checked only the styled path would leave two thirds of
+    /// the marker unpinned.
+    ///
+    /// `◉` is `GLYPH_APPROVAL`, already the permission glyph
+    /// (`approval_header`), and already the glyph
+    /// `docs/tui-and-agent-view-design.md` §4.4 nominates for a blocked row.
+    /// Blocked is the only state left that is neither accent (live), ember
+    /// (failed) nor amber (stopped), and `highlight`/cream is the palette's
+    /// "look here" slot.
+    #[test]
+    fn the_blocked_deck_marker_differs_from_running_in_all_three_tiers() {
+        // Styled TTY.
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Blocked, true, false),
+            format!("{}◉\u{1b}[39m", sgr(CREAM))
+        );
+        // Non-TTY: glyph without colour.
+        assert_eq!(deck_marker_with_mode(DeckState::Blocked, false, false), "◉");
+        // `--plain`/`NO_COLOR`: stable ASCII, zero escape bytes.
+        let plain = deck_marker_with_mode(DeckState::Blocked, true, true);
+        assert_eq!(plain, "[blk]");
+        assert!(!plain.contains('\u{1b}'));
+
+        // The point of the state: in every tier it differs from `Running`.
+        // Asserted per tier rather than once, so a glyph that changed only in
+        // the styled path could not satisfy this.
+        for (styled, plain) in [(true, false), (false, false), (true, true)] {
+            assert_ne!(
+                deck_marker_with_mode(DeckState::Blocked, styled, plain),
+                deck_marker_with_mode(DeckState::Running, styled, plain),
+                "blocked renders as running (styled={styled}, plain={plain})"
+            );
+        }
+
+        // Non-vacuity: the five markers are five distinct strings in each
+        // tier, so `assert_ne!` above is not passing on an accident shared
+        // with some other state.
+        let states = [
+            DeckState::Running,
+            DeckState::Blocked,
+            DeckState::ResultReady,
+            DeckState::Failed,
+            DeckState::Stopped,
+        ];
+        for (styled, plain, expected_distinct) in
+            [(true, false, 5), (false, false, 4), (true, true, 5)]
+        {
+            let rendered = states
+                .iter()
+                .map(|state| deck_marker_with_mode(*state, styled, plain))
+                .collect::<std::collections::BTreeSet<String>>();
+            // Non-TTY collapses `Failed`/`Stopped` onto `◇` — they are
+            // distinguished by colour, which that tier has none of. That
+            // pre-existing collision is unchanged, and `Blocked` is not part
+            // of it.
+            assert_eq!(
+                rendered.len(),
+                expected_distinct,
+                "styled={styled}, plain={plain}: {rendered:?}"
+            );
+        }
+    }
+
+    /// **Plain-mode byte contract.** `--plain` output is promised stable, so
+    /// the four shipped plain markers are pinned here *as bytes* beside the new
+    /// one. `[blk]` is additive: every existing state keeps the exact marker it
+    /// shipped with.
+    #[test]
+    fn the_blocked_plain_marker_is_additive_and_moves_no_shipped_marker() {
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Running, true, true),
+            "[run]"
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::ResultReady, true, true),
+            "[rdy]"
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Failed, true, true),
+            "[err]"
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Stopped, true, true),
+            "[stp]"
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Blocked, true, true),
+            "[blk]"
+        );
+    }
+
+    /// **F3, decided.** The agent-view overlay and the `/jobs` deck render the
+    /// *same* marker vocabulary, and they do it by calling the *same* function:
+    /// `AgentViewState::deck_state` is the only bridge between A2's six groups
+    /// and the deck's five glyphs. Two glyph tables for one dataset is the
+    /// F2/F38/F45/F57 drift family that `AgentViewState` itself exists to
+    /// prevent.
+    ///
+    /// §4.4 forbade `◈`/`◆`/`◇` as row glyphs for one stated reason — "so plain
+    /// mode never renders a row as `tool>` or `result>`", i.e. the glyphs'
+    /// `ascii_structural_markers` images (`*`, `>`, `#`) are ambiguous. The
+    /// deck's markers never reach that mapping: `plain_marker` substitutes a
+    /// bracketed token first. The reason is therefore already satisfied, which
+    /// is why §4.4 is amended rather than the vocabulary forked. The second
+    /// half of this test is that amendment's evidence.
+    #[test]
+    fn every_agent_view_state_shares_the_deck_marker_vocabulary() {
+        let expected = [
+            (AgentViewState::NeedsInput, DeckState::Blocked),
+            (AgentViewState::Working, DeckState::Running),
+            (AgentViewState::DoneUnviewed, DeckState::ResultReady),
+            (AgentViewState::DoneViewed, DeckState::Stopped),
+            (AgentViewState::Failed, DeckState::Failed),
+            (AgentViewState::Cancelled, DeckState::Stopped),
+        ];
+        // Read against `order()` so a seventh state cannot be added without
+        // being given a marker here.
+        assert_eq!(
+            expected.map(|(state, _)| state).to_vec(),
+            AgentViewState::order().to_vec()
+        );
+        for (state, deck) in expected {
+            assert_eq!(state.deck_state(), deck, "{state:?}");
+        }
+
+        // §4.4's amendment, stated as bytes. The overlay deliberately *shares*
+        // `◈` with the section header in the glyph tiers — the deck has shipped
+        // that collision since D1 and disambiguates structurally (a header is
+        // unindented and wordy; a row is indented and starts `#<id>`).
+        assert_eq!(
+            deck_marker_with_mode(AgentViewState::DoneUnviewed.deck_state(), false, false),
+            "◈"
+        );
+        assert_eq!(
+            deck_header_with_mode("agent deck", false, false),
+            "◈ agent deck"
+        );
+
+        // In plain mode the two are unambiguous, which is what §4.4's reason
+        // actually asked for: the header is `# …` and every row marker is a
+        // bracketed token that contains no structural character at all.
+        assert_eq!(
+            deck_header_with_mode("agent deck", false, true),
+            "# agent deck"
+        );
+        for state in AgentViewState::order() {
+            let marker = deck_marker_with_mode(state.deck_state(), true, true);
+            assert_eq!(
+                marker,
+                format!("[{}]", &marker[1..marker.len() - 1]),
+                "{state:?}: a plain row marker is a bracketed token"
+            );
+            // Non-vacuous: `#`, `*` and `>` are exactly the images the three
+            // banned glyphs have under `ascii_structural_markers`, and the one
+            // a header actually prints is `#`.
+            for structural in ['#', '*', '>'] {
+                assert!(
+                    !marker.contains(structural),
+                    "{state:?}: plain marker {marker:?} collides with {structural:?}"
+                );
+            }
+        }
+        assert_eq!(sanitize_plain_inline("◈ ◆ ◇"), "# * >");
+    }
+
     #[test]
     fn theme_row_renders_styled_with_palette_swatch() {
         let kitsune_theme = &THEMES[0]; // kitsune theme
@@ -3291,6 +3862,193 @@ mod tests {
             assert!(styled_row.contains('●'));
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Finding F16, truncation half: `fit_row_to_width`.
+    //
+    // The inline viewport writes each pinned row with no width limit, so an
+    // over-long row wraps into the row below -- harmless with a one-row
+    // viewport, corruption once the multi-row composer and the slash palette
+    // make the viewport several rows tall. These tests pin the escape-aware
+    // fitter that fixes it; see the function's own documentation for the
+    // numbered contract they correspond to.
+    // ---------------------------------------------------------------------
+
+    /// The *visible* width of a styled string: the in-tree idiom, sanitising
+    /// the escapes away before measuring, exactly as `compose_row` measures a
+    /// styled prompt.
+    fn visible_width(s: &str) -> usize {
+        display_width(&sanitize_terminal_text(s))
+    }
+
+    #[test]
+    fn fit_row_to_width_returns_a_fitting_row_byte_identical() {
+        // Rule 1, the property this card pins hardest. Byte-identity, not
+        // merely equal-looking: no re-encoding, no normalisation, no appended
+        // reset -- including for the last case, a row that ends with styling
+        // still active. `InlineSurface::paint`'s existing tests all assert
+        // exact bytes, so anything else here breaks them.
+        for (row, cols) in [
+            ("", 80usize),
+            ("composer", 80),
+            ("composer", 8), // exactly the width
+            ("> ", 2),
+            ("日本語", 6),                       // exactly the width, wide chars
+            ("\x1b[1mbold\x1b[0m", 80),          // styled and already reset
+            ("\x1b[31mred and never reset", 80), // styling left active
+        ] {
+            let fitted = fit_row_to_width(row, cols);
+            assert_eq!(
+                fitted.as_bytes(),
+                row.as_bytes(),
+                "fit_row_to_width({row:?}, {cols}) must return the row byte-identical, got {fitted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_row_to_width_counts_escapes_as_zero_width() {
+        // Rule 2. `display_width` counts the bytes of an ANSI sequence as
+        // visible columns, so a naive fitter truncates a heavily styled row
+        // whose visible text fits comfortably. Here the visible text is 11
+        // columns and the byte count far more.
+        let row = "\x1b[1m\x1b[38;2;255;0;0mhello\x1b[0m \x1b[2mworld\x1b[0m";
+        assert_eq!(visible_width(row), 11, "the visible text is 11 columns");
+        assert!(
+            row.len() > 40,
+            "and its byte count is far larger: {}",
+            row.len()
+        );
+        let fitted = fit_row_to_width(row, 20);
+        assert_eq!(
+            fitted.as_bytes(),
+            row.as_bytes(),
+            "escapes cost no columns, so this row fits and is returned identical: {fitted:?}"
+        );
+    }
+
+    #[test]
+    fn fit_row_to_width_truncates_a_plain_row_to_the_visible_column_count() {
+        // Rule 3 on the simple case: a plain row is cut, nothing is elided
+        // with an ellipsis (that is `fit_banner_value`'s job and the wrong
+        // shape here) and nothing is appended.
+        assert_eq!(fit_row_to_width("abcdefghij", 4), "abcd");
+        assert_eq!(fit_row_to_width("abcdefghij", 9), "abcdefghi");
+        assert_eq!(fit_row_to_width("> composer text", 10), "> composer");
+    }
+
+    #[test]
+    fn fit_row_to_width_charges_two_columns_for_a_wide_character() {
+        // Rule 3 with wide characters: three CJK characters are six columns,
+        // so a four-column fit keeps two of them.
+        assert_eq!(fit_row_to_width("日本語", 4), "日本");
+        assert_eq!(fit_row_to_width("日本語", 2), "日");
+        // And mixed: "a" plus one wide character is three columns.
+        assert_eq!(fit_row_to_width("a日本", 3), "a日");
+    }
+
+    #[test]
+    fn fit_row_to_width_never_splits_a_wide_character_and_leaves_the_gap_unpadded() {
+        // Rule 4. A 2-column character that would land in the last single
+        // column is dropped entirely rather than written into half a cell,
+        // and the leftover column is left blank rather than padded: `paint`
+        // has already cleared the row, so an unwritten cell is background,
+        // while a pad space would diverge from the byte-identical path and
+        // push the cursor a column too far.
+        assert_eq!(
+            fit_row_to_width("日本語", 3),
+            "日",
+            "the second wide character does not fit in the one remaining column"
+        );
+        assert_eq!(
+            fit_row_to_width("a日", 2),
+            "a",
+            "and the row comes back one column narrower, not space-padded"
+        );
+        assert_eq!(fit_row_to_width("日", 1), "", "nor at the very first cell");
+    }
+
+    #[test]
+    fn fit_row_to_width_appends_one_reset_only_when_it_truncates_a_styled_row() {
+        // Rule 5, and the distinction is the whole point: the reset is owed
+        // only when the row was *both* truncated and styled.
+        let styled = "\x1b[31mred text that runs well past the end";
+        let fitted = fit_row_to_width(styled, 7);
+        assert_eq!(
+            fitted, "\x1b[31mred tex\x1b[0m",
+            "a truncated styled row ends with exactly one reset so the colour \
+             cannot bleed into the next row, got {fitted:?}"
+        );
+        assert_eq!(
+            fitted.matches("\x1b[0m").count(),
+            1,
+            "exactly one reset, not one per surviving escape: {fitted:?}"
+        );
+
+        // Truncated but never styled: still plain bytes, no reset.
+        assert_eq!(
+            fit_row_to_width("plain text that is far too long", 5),
+            "plain",
+            "a truncated plain row stays plain"
+        );
+
+        // Styled but fitting: rule 1 wins and nothing is appended, even
+        // though the styling is left active.
+        let short = "\x1b[31mred";
+        assert_eq!(
+            fit_row_to_width(short, 80).as_bytes(),
+            short.as_bytes(),
+            "a fitting styled row is byte-identical -- the reset is a \
+             truncation remedy, not a general one"
+        );
+    }
+
+    #[test]
+    fn fit_row_to_width_with_zero_columns_yields_nothing_unless_the_row_is_already_zero_width() {
+        // Rule 6. Nothing can be drawn in zero columns, and emitting the
+        // row's SGR into no columns would bleed style for no visible text --
+        // so a row with any visible width fits to the empty string, reset
+        // included.
+        assert_eq!(fit_row_to_width("composer", 0), "");
+        assert_eq!(fit_row_to_width("\x1b[31mred", 0), "");
+        assert_eq!(fit_row_to_width("日", 0), "");
+        // A zero-width row, however, already fits: rule 1 is first, so it
+        // comes back byte-identical rather than being emptied.
+        for row in ["", "\x1b[0m", "\x1b[1m\x1b[31m"] {
+            assert_eq!(
+                fit_row_to_width(row, 0).as_bytes(),
+                row.as_bytes(),
+                "a row of visible width 0 fits in 0 columns: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_row_to_width_output_never_exceeds_the_column_count() {
+        // The property behind every case above, driven over a mixed corpus and
+        // every width: whatever comes out is at most `cols` visible columns,
+        // which is what makes a painted row unable to wrap.
+        let rows = [
+            "",
+            "composer",
+            "> kitsu ready",
+            "日本語のテキスト",
+            "a日b本c語",
+            "\x1b[1mbold\x1b[0m plain \x1b[31mred",
+            "\x1b[38;2;1;2;3m色\x1b[0mmixed 日 text",
+            "\x1b[2m…\x1b[0m",
+        ];
+        for row in rows {
+            for cols in 0usize..=24 {
+                let fitted = fit_row_to_width(row, cols);
+                assert!(
+                    visible_width(&fitted) <= cols,
+                    "fit_row_to_width({row:?}, {cols}) = {fitted:?} is {} visible columns wide",
+                    visible_width(&fitted)
+                );
+            }
+        }
+    }
 }
 
 /// T0-S3a: the renderer's output seam. These tests pin the `Surface` trait,
@@ -3302,9 +4060,10 @@ mod surface_seam_tests {
     use super::live;
     use super::surface::{active_surface, set_surface, ClassicSurface, Fd, Surface};
     use super::{
-        milestone, milestone_line_with_mode, plain_mode, sanitize_plain_inline,
+        milestone, milestone_line_with_mode, plain_mode, print_message, sanitize_plain_inline,
         sanitize_terminal_inline, stderr_is_tty, stderr_style, tool_activity, tool_activity_line,
-        tool_result, tool_result_error, tool_result_line, EMBER, GLYPH_TOOL_RESULT,
+        tool_result, tool_result_error, tool_result_line, turn_wrote_assistant_output, EMBER,
+        GLYPH_TOOL_RESULT,
     };
     use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
@@ -3746,9 +4505,9 @@ mod surface_seam_tests {
 
     use super::surface::suspends_for;
     use super::{
-        error_lines, finish_line, print_fragment, print_message, render_error,
-        sanitize_terminal_text, stdout_style, stream_buffer, stream_sanitizer,
-        turn_wrote_assistant_output, LineStyler, ASSISTANT_OUTPUT_WRITTEN, TURN_ASSISTANT_OUTPUT,
+        error_lines, finish_line, print_fragment, render_error, sanitize_terminal_text,
+        stdout_style, stream_buffer, stream_sanitizer, LineStyler, ASSISTANT_OUTPUT_WRITTEN,
+        TURN_ASSISTANT_OUTPUT,
     };
     use std::sync::atomic::Ordering;
 
@@ -3972,39 +4731,6 @@ mod surface_seam_tests {
                  line (before {before}, inside {depth})"
             );
         }
-    }
-
-    #[test]
-    fn complete_message_keeps_a_long_tail_and_terminates_before_repaint() {
-        let _guard = surface_slot_lock();
-        let _state = StreamStateGuard::new();
-        let message = format!(
-            "{}FINAL_TAIL_WITHOUT_NEWLINE",
-            "long wrapped transcript line ".repeat(600)
-        );
-        let calls = record_calls(|| print_message(&message));
-        let (fd, bytes) = one_block(&calls);
-        assert_eq!(fd, Fd::Stdout);
-        assert_eq!(sanitize_terminal_text(&bytes), format!("{message}\n"));
-        assert!(turn_wrote_assistant_output());
-        let calls = record_calls(finish_line);
-        assert_eq!(one_block(&calls).1, "");
-    }
-
-    #[test]
-    fn complete_message_flushes_a_streamed_tail_before_the_next_message() {
-        let _guard = surface_slot_lock();
-        let _state = StreamStateGuard::new();
-        stream_buffer()
-            .lock()
-            .unwrap()
-            .buffer
-            .push_str("partial tail");
-        let calls = record_calls(|| print_message("\n[stopped]"));
-        assert_eq!(
-            sanitize_terminal_text(&one_block(&calls).1),
-            "partial tail\n[stopped]\n"
-        );
     }
 
     /// (4) `print_fragment` on a completed line routes through the seam as one
@@ -4466,5 +5192,38 @@ mod surface_seam_tests {
             !impl_block.contains("io::stdout()"),
             "StreamBuffer must write only to the writer it is handed"
         );
+    }
+
+    #[test]
+    fn complete_message_flushes_a_streamed_tail_before_the_next_message() {
+        let _guard = surface_slot_lock();
+        let _state = StreamStateGuard::new();
+        stream_buffer()
+            .lock()
+            .unwrap()
+            .buffer
+            .push_str("partial tail");
+        let calls = record_calls(|| print_message("\n[stopped]"));
+        assert_eq!(
+            sanitize_terminal_text(&one_block(&calls).1),
+            "partial tail\n[stopped]\n"
+        );
+    }
+
+    #[test]
+    fn complete_message_keeps_a_long_tail_and_terminates_before_repaint() {
+        let _guard = surface_slot_lock();
+        let _state = StreamStateGuard::new();
+        let message = format!(
+            "{}FINAL_TAIL_WITHOUT_NEWLINE",
+            "long wrapped transcript line ".repeat(600)
+        );
+        let calls = record_calls(|| print_message(&message));
+        let (fd, bytes) = one_block(&calls);
+        assert_eq!(fd, Fd::Stdout);
+        assert_eq!(sanitize_terminal_text(&bytes), format!("{message}\n"));
+        assert!(turn_wrote_assistant_output());
+        let calls = record_calls(finish_line);
+        assert_eq!(one_block(&calls).1, "");
     }
 }

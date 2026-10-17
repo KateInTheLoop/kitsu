@@ -680,12 +680,14 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--plain` | off | Use stable ASCII markers, disable color/animation, and select literal line-oriented input. |
 | `--screen-reader` | off | Use escape-free, literal line-oriented input and plain rendering; `KITSU_SCREEN_READER` is the environment equivalent. |
 | `--reduced-motion` | off | Keep styled output but replace animated waiting indicators with a static status. |
+| `--tui <MODE>` | `classic` | Select the renderer: `classic` or `inline`. Overrides `[tui] mode`; `/tui` switches at runtime. |
+| `--no-alt-screen` | off | **Refused, not available yet.** It was meant to force `[tui] alternate_screen` to `never` for multiplexers where the alternate screen misbehaves, but no in-viewport overlay path exists, so the agent view takes the alternate screen whatever this resolves to. Passing it now **fails with a message** instead of being silently ignored. |
 | `--temperature <f>` | unset | Sampling temperature. Omitted from the request unless set (some models reject it). |
 | `--reasoning-effort <level>` | unset | Forward `none`, `minimal`, `low`, `medium`, `high`, or `xhigh` to compatible gateways; omitted otherwise. `/reasoning` can change it between chat turns. |
 | `--max-rounds <n>` | `10` | Max agent tool-call rounds per turn (minimum `1`). Raise (e.g. `40`) for tool-heavy work. |
 | `--timeout-secs <n>` | `120` | Total inference deadline, including retries, backoff, streamed body reads, and every provider/tool round in one scripted turn. One-shot chat also charges piped-input and attachment acquisition to the same deadline; a positional prompt never waits for unrelated stdin EOF. If the deadline expires after real output already streamed, one-shot runs keep it: the answer ends with a `[stopped: deadline expired …]` marker and is labeled partial (exit code stays `2`). |
 | `--agent-join-timeout <n>` | `--timeout-secs` | How long a non-interactive exit (scripted or piped chat) waits for live background agents to finish before cancelling them. |
-| `--agent-spawn-cap <n>` | `8` interactive, `2` automation | Per-turn cap shared by synchronous, parallel, and background subagent spawns. `0` disables spawning and removes all four multi-agent tools from `/tools`, the system prompt, and provider requests. |
+| `--agent-spawn-cap <n>` | `8` interactive, `2` automation | Per-turn cap shared by synchronous, parallel, and background subagent spawns. `0` disables spawning and removes all five multi-agent tools from `/tools`, the system prompt, and provider requests. |
 | `--max-output-tokens <n>` | unset (gateway default) | Cap output tokens. Required by some gateways (e.g. Anthropic). If the model hits an explicit cap, strict one-shot/scripted runs keep the partial text visible but do not commit the turn, exit `2`, and suggest retrying with twice the current value. |
 | `--yes` | off | Never prompt for filesystem access; enabled tools remain confined to explicit/current roots and requests outside them are denied. Never enables tools or approves developer commands. |
 | `--dangerously-allow-all-filesystem` | off | **DANGER:** let enabled filesystem tools access every non-protected host path without prompting. This is the explicit global bypass; it still never enables tools or approves commands. |
@@ -829,9 +831,34 @@ it won't ask again.
   for it, is replaced atomically, refreshes at turn boundaries, and is removed
   on clean exit. Treat it as a hint, never a source of truth: it may be stale,
   absent, or left by a process that died, and writing it never affects a turn.
+- `[agents] blocking` decides what a background agent does when a tool of its
+  own needs permission you have not granted. The default, `fail_closed`, is
+  today's behaviour: the operation is refused and the agent carries on, because
+  a detached agent has nobody to ask. Set it to `ask` and the agent **parks**
+  instead — it reports as `blocked`, appears first in `/jobs view` under
+  `needs input`, and waits for you to answer, after which `allow once` or
+  `allow always` applies exactly the grant the foreground prompt would have
+  applied. Nothing is refused behind your back and no new kind of permission is
+  created.
+
+  `ask` only has an effect where a human could actually answer. Scripted,
+  piped and JSONL runs never reach the question at all — their permission mode
+  short-circuits before the route is consulted — so setting `ask` cannot change
+  what automation does, by construction rather than by policy.
+
+  `[agents] block_timeout_secs` bounds the wait, defaulting to `1800` (thirty
+  minutes). If nobody answers in that time the agent ends as failed-interrupted
+  rather than waiting forever, so an unattended run can never hang on a
+  question. The unit is in the key name on purpose: a bare `block_timeout` is
+  exactly where seconds and minutes get confused, and that spelling is rejected
+  rather than guessed at.
 - `[hooks] on_agent_state` runs a local command on each agent state change,
   exporting `KITSU_AGENT_ID`, `KITSU_AGENT_STATE` and
-  `KITSU_AGENT_WAITING_FOR`. It is executed **directly, never through a shell,
+  `KITSU_AGENT_WAITING_FOR`. A background agent parked on a permission reports
+  `STATE=blocked` and a `WAITING_FOR` of `read_file`, `write_file` or
+  `run_command` — the kind it asked for, **never** the path or command line,
+  since a hook runs an external program. The state file and
+  `kitsu agents --json` use those same three words. It is executed **directly, never through a shell,
   with no expansion**, so config text cannot turn into shell execution; use a
   script, or write `sh -c` yourself. Its output is discarded so it cannot
   disturb kitsu's own rendering, kitsu never waits for it, and a failure,
@@ -920,6 +947,8 @@ Slash commands inside the REPL:
 | `/checkpoints` / `/checkpoint <id>` | List recoverable write checkpoints or preview one verified diff. |
 | `/permissions` | Show effective filesystem authority with invocation/session provenance, revoked invocation roots, protected/internal reads, protected writes, and the command non-sandbox warning. |
 | `/tools` | Show enabled tools and the effective permission behavior. |
+| `/jobs view` | In the inline viewport this opens the **agent view overlay** (also `Ctrl+X a`, or ← twice on an empty composer; `Ctrl+X 1`–`Ctrl+X 9` attach by **displayed position**, not by `#id`, without opening it); in classic it prints the grouped text deck. In the overlay, `↑`/`↓` move the selection (which follows the agent, not the row position, so a re-group cannot move your next keystroke onto a different one), `Space` peeks the selected agent and collects its result as `/jobs show` does, `r` replies to a blocked one, `x` stops it (twice; the second press prunes an already-finished agent, but never one whose result nobody has read), `n` renames it, `p` marks its result collected, `+` starts a new one (`task` or `@profile task`, admitted by kitsu's own 8-running/128-record limits rather than the model's per-turn spawn cap), `/` filters the rows (`s:<state> n:<text> o:<text> p:<profile>` — and the filter governs which agent the keys act on, not just what you see), `?` lists the keys and `Esc` closes. Pasted text is content in a name or correction line and is ignored elsewhere — it is never run as keystrokes. |
+| `/tui [classic\|inline\|fullscreen]` | Report or switch the live renderer between turns, keeping the conversation; bare `/tui` reports the renderer actually running. **`fullscreen`** takes the alternate screen and paints the viewport's scrollback, giving the screen back when you leave it. `/help tui` lists the composer's own chords, including **`Ctrl+O`**, which opens the **transcript overlay** over the retained scrollback from inline and fullscreen alike (`PgUp`/`PgDn` scroll, `{`/`}` jump between prompts, `/` searches on Enter with `n`/`N` walking the matches, `q`/`Esc` close). Refused during a turn. |
 | `/allow <path>` | Grant read access to a path for the rest of the session (no more prompts there). |
 | `/allow-write <path>` | Grant write access to a path for the rest of the session. |
 | `/allow-read-write <path>` | Grant both read and write access for the rest of the session. |
@@ -932,10 +961,11 @@ Slash commands inside the REPL:
 | `/context [refresh]` | Show detailed context provenance, or refresh unpinned model metadata without discarding the current known window on failure. |
 | `/compact` | Compact eligible older exchanges now and report the actual method and savings. |
 | `/profiles` | List validated background-agent profiles with their instructions, requested reasoning effort, tool grant, and session-grant inheritance. Built-ins are a read-only `reviewer` and tool-free `reasoning` worker; both inherit the invocation's reasoning-effort policy rather than requesting one, so they never add a request field a gateway may reject. |
-| `/agent [list\|show ID\|steer ID TEXT\|stop ID\|close ID]` | Inspect one bounded, redacted agent timeline; steer or stop that thread; acknowledge and close retained results. |
-| `/jobs [list\|view\|explain ID\|show ID\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. `view` groups the same deck by state, agents needing input first, so one row does not hide among many. `explain ID` answers why one agent is in its state, since when, and what it is waiting on, and is read-only: unlike `show` it never acknowledges a ready result, so diagnosing an agent cannot quietly satisfy the unobserved-result exit guard. Steering **restarts** the worker with the correction on a fresh transcript — the receipt reports the elapsed work that discards; completed file changes are kept. `/agents` remains an alias: bare lists, a numeric argument shows that thread, and any other argument is forwarded to `/jobs`. |
+| `/agent [any /jobs subcommand]` | Inspect one bounded, redacted agent timeline; steer or stop that thread; acknowledge and close retained results. |
+| `/jobs [list\|view\|explain ID\|show ID\|reply ID y\|a\|n\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. `view` groups the same deck by state, agents needing input first, so one row does not hide among many. `explain ID` answers why one agent is in its state, since when, and what it is waiting on, and is read-only: unlike `show` it never acknowledges a ready result, so diagnosing an agent cannot quietly satisfy the unobserved-result exit guard. Steering **restarts** the worker with the correction on a fresh transcript — the receipt reports the elapsed work that discards; completed file changes are kept. `/agents` remains an alias: bare lists, a numeric argument shows that thread, and any other argument is forwarded to `/jobs`. |
 | `/artifacts [list\|prune ID\|prune all]` | Inspect aggregate command-artifact quota/usage and explicitly prune retained evidence. Also reports what earlier runs left on disk; reclaim that with the host-only `kitsu artifacts`. |
 | `/queue [list\|add\|remove\|edit\|move\|promote\|clear]` | Inspect and edit the bounded eight-prompt FIFO; `/queue <prompt>` remains shorthand for add. A single word one edit away from a subaction (e.g. `/queue lst`) gets a close-match suggestion instead of being silently queued; `/queue add <word>` queues it verbatim. |
+| `/detach` | Leave the agent you attached from the agent view and return the composer to the session, answering `detached from agent N; it keeps running`. **Detaching stops nothing** — stopping is `x` in the view or `/jobs stop <id>`. Answers `not attached to a background agent` when there is nothing to leave. The two keys are silent, since the prompt label changing is their feedback, and they are **not** interchangeable: `←` only detaches on an **empty** composer (with text typed it is cursor movement), while `Ctrl+X d` works with a line in progress and **keeps what you typed**. |
 | `/steer <correction>` | While a response is running on Unix, cancel its partial turn, keep/report completed file effects, and restart it immediately with the correction before queued follow-ups. |
 | `/retry` | Retry the last failed or cancelled prompt. Failed turns are removed from conversation history first. |
 | `/new` | Autosave the current conversation and start a fresh session. |
@@ -948,7 +978,7 @@ Slash commands inside the REPL:
 | `/delete <id>` | Permanently delete an exact inactive live-session ID. |
 | `/undo [id]` | Restore the latest or selected model-write checkpoint only when its files still match. |
 | `/clear` | Save the current durable conversation, start a fresh session/context, and keep the prior ID resumable. With autosave disabled, clear memory with an explicit non-preservation warning. |
-| `/help` | Show help. |
+| `/help [command\|keys]` | Show help. `/help <command>` explains one command; **`/help keys`** prints the agent view's key bindings — the same table the view's own `?` help shows, from one source, so the two cannot disagree. |
 | `/exit [wait\|cancel]` (or `/quit`) | Exit only when jobs are done, explicitly wait, or immediately cancel the foreground plus queued/background work and join it first. |
 
 ### Coding workflows: paste & file generation
@@ -1152,23 +1182,53 @@ retains the rich Rustyline editor, including history, completion, and bracketed
 multi-line paste. Pass `--reduced-motion` or set `KITSU_REDUCED_MOTION=1` to
 replace the animated wait indicator with a visible static status.
 
-Set `KITSU_TUI=inline` to opt into the **inline viewport**, a preview renderer
-that pins a status row to the bottom of the terminal and lets the transcript
-scroll above it, instead of repainting one status row in place. The value is
-matched exactly: only `inline` selects it, so `INLINE`, `Inline` or a stray
-trailing space leave you in the renderer you already had. The variable is
-unset by default and a session without it is byte-identical to one from before
-the viewport existed.
+Pass `--tui inline`, or set `[tui] mode = "inline"` in your config, to opt into
+the **inline viewport**: a preview renderer that pins a status row to the bottom
+of the terminal and lets the transcript scroll above it, instead of repainting
+one status row in place. The flag wins over the config key, and the config key
+wins over the default — **no environment variable selects it**. The default is
+`classic`, and a session that does not ask for the viewport is byte-identical to
+one from before it existed.
 
-It is a preview, and the idle prompt inside it is kitsu's own editor rather
-than Rustyline, so it does not yet have Tab completion or the bordered
-slash-command palette that lists and filters commands as you type. Command
-history **does** persist across sessions, and Ctrl+R reverse search works.
-What it does have:
+A mistyped mode is an error that names the key and lists what it accepts, rather
+than quietly falling back to classic; `fullscreen` is named in the design but is
+**not accepted yet**. The rest of the `[tui]` table:
+
+| key | default | meaning |
+|---|---|---|
+| `mode` | `classic` | `classic` or `inline`; `--tui` overrides it |
+| `alternate_screen` | `auto` | `auto` or `always`. **`never` is recognised but refused** — it needs an in-viewport overlay path that does not exist yet, so accepting it would be a silent no-op. `--no-alt-screen` is refused for the same reason. |
+| `prefix` | `"ctrl+x"` | the chord prefix for viewport commands |
+| `title` | `true` | set the terminal window title to `kitsu · <state> · <N> agents` so a multiplexer can classify windows by it, and push/pop the title stack around fullscreen. **Only on a styled terminal** — piped, `--plain`, `--screen-reader` and JSONL runs are untouched. The title follows the agent registry, so it keeps up **during** a turn as agents block and finish, not only at the prompt. It is restored on exit in every mode — except under a multiplexer, which drops the title-stack sequences, and except a `classic` session killed by a signal, which never installs the restoring handler. |
+| `left_arrow_opens_agents` | `true` | ← opens the agent pane when the composer is empty |
+| `cell_ring_lines` | `10000` | scrollback the viewport retains, `fullscreen` paints and the `Ctrl+O` transcript overlay reads, `1`–`1000000`. Holds the **streamed** conversation and **your own submitted prompts** (marked, one cell per line) — not kitsu's own diagnostics, and not an answer that was buffered because tools were offered that round |
+
+Keys not yet consumed by a shipped surface are parsed and validated now so the
+spelling cannot change under you later. Note that adding a `[tui]` table makes
+**older** kitsu builds reject the config file, since they do not know the key.
+
+It is a preview, but the idle prompt inside it now has most of what the classic
+one does, built on kitsu's own editor rather than Rustyline: command history
+persists across sessions, Ctrl+R reverse search works, Tab completes a slash
+command from the hint beside your draft, and typing a slash prefix opens the
+**bordered command palette** above the composer — it grows and narrows as you
+type, shrinks to fit a short window, and closes when the prefix does. The pinned row itself is a live status row — model, an eight-cell context meter
+with its percentage, elapsed turn time, `[N queued]`, and the background-agent
+tag — refreshed while a turn runs and never wrapping, at any width from 40 to 200
+columns. When the terminal is too narrow for all of it, segments drop in a fixed
+order: the meter goes first, then elapsed, then the model (truncated before it is
+dropped), then `[N queued]`, and the agent tag is last to go, because a blocked
+agent is the one thing there you have to act on. `@file`
+path completion works here too, offering the same candidates in the same order
+as the classic prompt — both read from one completion source, so they cannot
+drift apart. Still missing: syntax highlighting of the draft. What it does
+have:
 insertion and cursor motion, Home/End, Backspace/Delete, the Ctrl+U/K/W kills,
 Up/Down through the current session's history, bracketed paste kept as one
-draft, Ctrl+D to exit on an empty line, Ctrl+C to clear the line, and Ctrl+Z to
-suspend — which releases the pinned row and hands the shell back an ordinary
+draft, resizing the window (the pinned row follows, and the viewport steps
+aside entirely if you shrink the terminal below three rows, coming back when
+you grow it again), Ctrl+D to exit on an empty line, Ctrl+C to clear the line,
+and Ctrl+Z to suspend — which releases the pinned row and hands the shell back an ordinary
 terminal, then restores the row and your unsubmitted draft on `fg`. Ctrl+\ is
 deliberately inert: its usual action dumps core, and this process holds your API
 credentials and conversation in memory. Everything else — every tier, every byte of non-TTY, `--plain`,

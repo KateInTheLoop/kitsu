@@ -70,6 +70,12 @@ pub enum EditorAction {
     /// Ctrl+\: quit with SIGQUIT. The collector restores canonical termios
     /// first so the terminal is sane after the default core-dump exit.
     Quit,
+    /// Ctrl+L: repaint. The editor neither clears nor redraws anything
+    /// itself — it owns the draft, not the screen — so it reports the
+    /// keystroke and the collector repaints its surface (requirement R8).
+    /// The draft and cursor are untouched, and the byte never enters the
+    /// buffer.
+    Redraw,
 }
 
 /// What one [`TypeaheadEditor::feed`] call produced.
@@ -275,6 +281,20 @@ impl TypeaheadEditor {
         self.history_cursor = None;
         self.stash.clear();
         true
+    }
+
+    /// Whether a lone `ESC` is being held, waiting for the byte that would
+    /// make it a sequence.
+    ///
+    /// Added for the agent view's steer line (card T4-S4b), which must tell a
+    /// real `Esc` keypress from the first byte of an arrow on a quiet tick —
+    /// finding **F65**, met again by a sub-mode that reads arbitrary bytes.
+    /// [`TypeaheadEditor::resolve_lone_escape`] cannot answer that question:
+    /// it reports whether the *draft changed*, so it returns `false` for an
+    /// `Esc` resolved on an already-empty line. `false` mid-paste, for the
+    /// same reason `resolve_lone_escape` never fires there.
+    pub fn escape_pending(&self) -> bool {
+        self.pending == Pending::Escape && !self.in_paste
     }
 
     /// Drop all transient input state (paste mode, partial escape/UTF-8
@@ -499,6 +519,11 @@ impl TypeaheadEditor {
             0x17 => self.delete_word_left(outcome),
             0x09 => outcome.actions.push(EditorAction::CompleteRequest),
             0x12 => self.search_enter_or_cycle(outcome),
+            // Ctrl+L: a repaint request and nothing else. `outcome.changed`
+            // is deliberately left alone -- the draft and the cursor are
+            // untouched, so the caller's "repaint when the draft changed"
+            // path must not be what answers this; the action is.
+            0x0c => outcome.actions.push(EditorAction::Redraw),
             0x1a => outcome.actions.push(EditorAction::Suspend),
             0x1c => outcome.actions.push(EditorAction::Quit),
             0x03 => {
@@ -756,6 +781,7 @@ mod tests {
                 | EditorAction::RecallRequest
                 | EditorAction::Interrupt
                 | EditorAction::Suspend
+                | EditorAction::Redraw
                 | EditorAction::Quit => None,
             })
             .collect()
@@ -956,6 +982,43 @@ mod tests {
         assert_eq!(editor.buffer_string(), "draft stays");
         let outcome = editor.feed(&[0x1c]);
         assert_eq!(outcome.actions, vec![EditorAction::Quit]);
+    }
+
+    /// R8, the editor's half: Ctrl+L asks for a repaint and changes nothing.
+    ///
+    /// `changed` must stay `false`: the draft did not change, so the caller's
+    /// ordinary "repaint when changed" path is NOT what repaints here — the
+    /// action is. A `changed: true` shortcut would make Ctrl+L work by
+    /// accident on the idle row and do nothing wherever the action is what is
+    /// consulted.
+    #[test]
+    fn ctrl_l_requests_a_redraw_without_touching_the_draft() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        editor.feed(b"half a thought");
+        editor.feed(b"\x1b[D");
+        let before = (editor.buffer_string(), editor.cursor());
+        let outcome = editor.feed(&[0x0c]);
+        assert_eq!(outcome.actions, vec![EditorAction::Redraw]);
+        assert!(
+            !outcome.changed,
+            "Ctrl+L changes no draft state, so it must not report one"
+        );
+        assert_eq!(
+            (editor.buffer_string(), editor.cursor()),
+            before,
+            "Ctrl+L must leave the draft and the cursor exactly as they were"
+        );
+    }
+
+    /// And inside a bracketed paste it is content noise like Ctrl+C: a pasted
+    /// file containing a form feed must not repaint the screen mid-paste, and
+    /// must not put a control character in the draft either.
+    #[test]
+    fn ctrl_l_inside_a_paste_is_dropped_as_content_noise() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        let outcome = editor.feed(b"\x1b[200~ab\x0ccd\x1b[201~");
+        assert!(outcome.actions.is_empty());
+        assert_eq!(editor.buffer_string(), "abcd");
     }
 
     #[test]
@@ -1249,5 +1312,78 @@ mod tests {
         bytes.extend(b"\nr\x1b[201~");
         editor.feed(&bytes);
         assert_eq!(editor.buffer_string(), "fé\nr");
+    }
+
+    /// Card T4-S4b. **A held `ESC` is observable**, so a collector can tell a
+    /// real `Esc` from the first byte of an arrow on a quiet tick.
+    ///
+    /// The agent view's steer line needs exactly this and cannot get it from
+    /// `resolve_lone_escape`, whose `bool` is "the draft changed": on an empty
+    /// line an `Esc` resolves and it still answers `false`. That case is the
+    /// fourth assertion here, and it is the whole reason this accessor exists.
+    #[test]
+    fn a_held_escape_is_observable_and_a_sequence_or_a_paste_is_not() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        assert!(
+            !editor.escape_pending(),
+            "nothing is held before anything is fed"
+        );
+
+        editor.feed(b"ab");
+        assert!(
+            !editor.escape_pending(),
+            "ordinary text holds no escape: {:?}",
+            editor.buffer_string()
+        );
+
+        editor.feed(b"\x1b");
+        assert!(
+            editor.escape_pending(),
+            "a chunk that ends in a bare ESC is still ambiguous"
+        );
+        assert!(editor.resolve_lone_escape());
+        assert!(!editor.escape_pending(), "resolving it clears the hold");
+
+        // The case `resolve_lone_escape` cannot report: the same keypress on
+        // an empty draft answers `false`, so its bool is not an `Esc`
+        // detector.
+        let mut empty = TypeaheadEditor::new(Vec::new());
+        empty.feed(b"\x1b");
+        assert!(empty.escape_pending());
+        assert!(
+            !empty.resolve_lone_escape(),
+            "NON-VACUOUS: the same keypress on an empty draft answers `false`, \
+             so `escape_pending` is the only way to see it"
+        );
+
+        // An arrow: the `ESC` is spoken for by the byte after it, and the
+        // sequence's final byte leaves nothing held.
+        let mut arrow = TypeaheadEditor::new(Vec::new());
+        arrow.feed(b"\x1b");
+        assert!(arrow.escape_pending());
+        arrow.feed(b"[");
+        assert!(
+            !arrow.escape_pending(),
+            "`ESC [` is a CSI sequence, not an `Esc` key"
+        );
+        arrow.feed(b"D");
+        assert!(!arrow.escape_pending());
+
+        // Mid-paste, a stalled terminator is not an `Esc`: the guard
+        // `resolve_lone_escape` already documents, reported rather than
+        // silently diverging from it.
+        let mut pasting = TypeaheadEditor::new(Vec::new());
+        pasting.feed(b"\x1b[200~pasted\x1b");
+        assert!(
+            !pasting.escape_pending(),
+            "a paste stalling between its ESC and the rest of the terminator \
+             must not read as an `Esc`; draft: {:?}",
+            pasting.buffer_string()
+        );
+        assert_eq!(
+            pasting.buffer_string(),
+            "pasted",
+            "NON-VACUOUS: the paste really is open and really did arrive"
+        );
     }
 }
