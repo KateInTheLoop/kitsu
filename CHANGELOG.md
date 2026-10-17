@@ -93,6 +93,40 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- `--reduced-motion` (and `KITSU_REDUCED_MOTION=1`) now affects the inline
+  viewport, not just the wait indicator: the status row stops repainting just
+  because the clock moved. It still updates the moment something actually
+  changes — a prompt queued, an agent needing input — because hiding that to
+  keep the row quiet would defeat the point of the tag.
+- The viewport's status row is now capped at 60 repaints a second in the painter
+  itself, rather than relying on how often its caller happens to ask. Collapsed
+  frames keep the newest state rather than dropping it.
+- **`/tui [classic|inline]`** switches the renderer mid-session without losing
+  the conversation, and reports the live renderer when called bare. `fullscreen`
+  is refused until it exists, and `/tui` typed during a turn is refused rather
+  than queued — it is accepted between turns.
+- **Ctrl+L repaints** the inline viewport's pinned row.
+- Fixed: interrupting the inline viewport with **Ctrl+C**, or the process taking
+  a `SIGTERM` or panicking, used to leave the terminal with a **pinned scroll
+  region** — output stayed trapped in part of the screen until you ran `reset`.
+  Every one of those paths now releases the region, restores line settings,
+  turns bracketed paste off and shows the cursor, and then lets the signal
+  finish the process as it would have. Turn cancellation with Ctrl+C is
+  unaffected. `kill -9` still cannot restore anything, by its nature.
+- In the inline viewport, answering a permission prompt no longer leaves the
+  typed letter and a stray `> ` in your transcript: the answer is read on the
+  keypress and the cue is drawn in the modal, so the transcript keeps only the
+  `◉ permission —` record. Classic mode still echoes the answer as it always
+  has. Note that in the viewport a *pasted* answer is denied rather than
+  accepted, and the long forms `yes`/`always`/`no` need classic or
+  `/jobs reply`.
+- In the inline viewport, **permission prompts now appear as a modal in the
+  bottom pane** instead of scrolling past in the transcript, with the same
+  option line as the classic prompt and, for command approvals, the same
+  provenance rows (working directory, executable, timeout, authority). Once you
+  answer, the viewport leaves the same `◉ permission —` line in the transcript
+  that classic leaves, so the record of what was asked and allowed is identical.
+  Classic output is unchanged, and `--plain` keeps its existing prompt.
 - The inline viewport's pinned bottom row is now a **live status row** instead of
   the word `kitsu`: the model, a compact eight-cell context meter with its
   utilisation percentage, the elapsed time in the current turn, `[N queued]` when

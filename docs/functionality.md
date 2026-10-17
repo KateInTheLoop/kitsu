@@ -309,6 +309,39 @@ that thread, and any other argument is forwarded verbatim to `/jobs`, so every
 subcommand is reachable through either name.
 
 Background agents run in-process, so nothing outside kitsu can observe them.
+Under `--reduced-motion` the viewport's status row no longer repaints because
+time passed -- the elapsed segment stops ticking -- while the queue and
+background-agent tags keep updating, since those are state changes rather than
+animation. The row is also coalesced to at most 60 repaints per second in the
+painter, so a burst of field changes collapses to the newest value instead of
+one paint each; the newest value is never dropped.
+`/tui [classic|inline]` switches the renderer between turns and keeps the
+conversation: what was printed before the switch stays on screen exactly once,
+and the viewport's live status row returns with it. Bare `/tui` reports the
+renderer actually running. `fullscreen` is refused until that renderer exists,
+naming what is accepted, and `/tui` during a turn is refused rather than queued,
+because the mid-turn fall-through would otherwise send it to the model as a
+prompt. Switching into a terminal shorter than the viewport's minimum stays
+classic and says so.
+`Ctrl+L` repaints the viewport's pinned row. Every exit path from the viewport
+releases the scroll region and restores the terminal: a normal quit, a panic,
+`SIGINT` and `SIGTERM`. The signal path writes one precomposed escape sequence
+and restores the line settings captured when raw mode was entered, then re-raises
+the signal with its default disposition, so the process still dies by the signal
+and in-turn Ctrl+C cancellation keeps working. `kill -9` cannot be restored from.
+In the viewport the answer is read on the keypress while the input collector
+still holds raw mode, so nothing is echoed and the transcript keeps only the
+receipt; the cue is a row of the modal. Classic reads the answer canonically and
+still echoes it, which is what keeps line editing and the `yes`/`always`/`no`
+long forms working there. One parser serves the filesystem approval, the command
+approval and `/jobs reply`, so the accepted answers cannot drift apart.
+In the inline viewport a permission prompt renders as a bottom-pane modal
+rather than scrolling past: the same option line the classic prompt shows, from
+the same composer, and for a command approval the same provenance rows. Because
+the modal is transient, the viewport writes the `◉ permission —` receipt into the
+transcript once you answer, which is the line classic leaves in place by virtue
+of printing it there; the sanitized text is identical either way. `--plain`
+keeps its own unstyled prompt and no modal.
 In the inline viewport the pinned bottom row carries the model, a compact
 context meter, the elapsed time in the current turn, `[N queued]` and the
 background-agent tag, refreshed on the same 50 ms input tick that keeps the
@@ -316,10 +349,15 @@ ambient counter current, and deduplicated so an unchanged row writes no bytes.
 The meter reads the same session usage and effective budget `/context` reports,
 so the two cannot disagree. It never wraps between 40 and 200 columns and sheds
 segments in the order R5 documents.
-In the inline viewport the composer offers `@file` path completion and slash
-completion with the **same candidates, in the same order**, as the classic
-prompt: both hosts call one completion source, and a test sweeps every prefix of
-every registered command requiring all three to agree, so the two cannot drift.
+In the inline viewport, slash completion works: Tab accepts the showing hint,
+and typing a slash prefix opens the bordered command palette above the composer.
+**`@file` path completion is not yet wired there** -- the shared completion
+source and its parity test exist, and a sweep over every prefix of every
+registered command requires the classic prompt, the shared source and the inline
+host to agree, so they cannot drift once connected; but nothing in production
+drives the inline host yet. A 10 KiB bracketed paste at the idle inline prompt
+stays a single draft and is accepted in single-digit milliseconds, measured by
+`crates/kitsu/tests/paste_latency.rs` against requirement N2's 100 ms budget.
 `--tui <classic|inline>` and the `[tui]` table select the renderer: `mode`
 (default `classic`), `alternate_screen` (`auto|always|never`, forced to `never`
 by `--no-alt-screen`), `prefix` (default `ctrl+x`), `title`,

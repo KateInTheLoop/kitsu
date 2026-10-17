@@ -1799,6 +1799,58 @@ mod tests {
         }
     }
 
+    /// The configured bound reaches the ring, at each documented edge, with
+    /// the constants read from [`TuiConfig`] so the test and the config cannot
+    /// drift (plan row T3-S6, requirement **N4**).
+    ///
+    /// `MIN` (1) retains exactly one line; `DEFAULT` (10 000) and `MAX`
+    /// (1 000 000) are above any plausible push count here, so the ring keeps
+    /// everything pushed and evicts nothing — which is what proves the bound
+    /// is the *configured* number and not a hardcoded one.
+    ///
+    /// Not vacuous: at each bound the retained contents are asserted, not just
+    /// a count, and the `MIN` case evicts while the others do not, so a ring
+    /// that ignored its argument fails one half or the other.
+    #[test]
+    fn the_configured_cell_ring_bound_reaches_the_ring_at_its_edges() {
+        use kitsu_render::surface::Fd;
+        use kitsu_tui::cells::CellRing;
+
+        let mut minimum = CellRing::new(TuiConfig::MIN_CELL_RING_LINES);
+        for text in ["a", "b", "c"] {
+            minimum.push(Fd::Stdout, text);
+        }
+        assert_eq!(minimum.limit(), TuiConfig::MIN_CELL_RING_LINES);
+        assert_eq!(minimum.len(), 1);
+        assert_eq!(
+            minimum
+                .lines()
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>(),
+            vec!["c".to_string()]
+        );
+        assert_eq!(minimum.evicted(), 2);
+
+        for limit in [
+            TuiConfig::DEFAULT_CELL_RING_LINES,
+            TuiConfig::MAX_CELL_RING_LINES,
+        ] {
+            let mut ring = CellRing::new(limit);
+            for n in 0..256 {
+                ring.push(Fd::Stderr, &format!("line {n}"));
+            }
+            assert_eq!(ring.limit(), limit);
+            assert_eq!(ring.len(), 256, "a bound of {limit} evicts nothing here");
+            assert_eq!(ring.evicted(), 0);
+            assert_eq!(
+                ring.lines().last().expect("a line").plain(),
+                "line 255",
+                "the newest line is last"
+            );
+        }
+    }
+
     /// An empty prefix is not a prefix. The chord model (design §642) needs a
     /// key to hang the chords on, so a blank value is an error naming the key
     /// rather than a silently chord-less session.

@@ -518,13 +518,39 @@ future suspend/repaint coordination — not pixel correctness.
 So routing hundreds of writers is **not** required for idle slash output, which
 removes the most expensive branch Q3 threatened.
 
-**The condition, and it matters:** this was measured at idle **in cooked mode**.
-Nothing has entered raw mode for the session yet — rustyline enters it only
-while reading a line — so `ONLCR` is still supplying the carriage return those
-392 writers omit. Once T0-S5d owns stdin in raw mode for the whole session they
-lose it and will staircase, exactly as F14 describes. **The harness must be
-re-run after the input path lands**, and the answer above must not be quoted as
-unconditional.
+**The original condition is DISCHARGED, and replaced — corrected in T3-S10.**
+
+The caveat used to read: this was measured at idle in cooked mode, so the
+harness must be re-run once the input path owns raw mode, and the answer must
+not be quoted as unconditional.
+
+**It was re-run, and this finding did not know for seven cards.** The test is
+`inline_mode_raw_idle_input_does_not_staircase_command_output`
+(`crates/kitsu/tests/tui.rs`, "Test 6. The staircase question, re-asked for raw
+input mode"). The mechanism: `RawStdinGuard::engage` clears only `c_lflag`
+(`ICANON`, `ECHO`, `ISIG`) and **leaves `c_oflag` alone**, so `OPOST`/`ONLCR`
+still supplies the carriage return the direct writers omit. The answer may now
+be quoted for **both cooked and raw idle input**.
+
+Verified in T3-S10 that every `tcsetattr` in the workspace preserves that:
+`RawStdinGuard::engage` (`c_lflag` only), `read_secret_tty` (`ECHO` only), the
+dying-signal handler (restores a snapshot taken *before* raw mode), and the
+in-loop approval read, which reuses `RawStdinGuard` and has no termios of its
+own.
+
+**The condition that IS still live:** the answer depends on nothing in `kitsu`
+ever entering **crossterm's** raw mode, which *does* clear `OPOST`.
+`kitsu_tui::TuiRuntime::enter` calls `crossterm::enable_raw_mode()` and has **no
+caller in `kitsu`** — a standing fact already recorded in `tests/tui.rs`. **The
+day someone wires `TuiRuntime` in, the staircase question reopens for every
+direct writer**, which is also the day N5's title and alt-screen clauses stop
+being vacuous. Both are T5's problem, and they arrive together.
+
+**The count drifts upward and no test asserts it:** 392 when this finding was
+written, **421** in T3-S10 (`eprintln!` 366, `println!` 43, `eprint!` 10,
+`print!` 2, tests excluded). A count assertion was deliberately **not** written —
+see the reasoning in N4's limitation list, since 132 of those sites are on paths
+where no viewport can exist.
 
 
 ## F18 — inline teardown prints the closing summary after releasing the region
@@ -2781,3 +2807,493 @@ samples what it calls mid-stream, and with tools enabled there is no mid-stream
 to sample — the burst arrives whole. The assertion is still valid (a wide
 transcript must not reach the pinned row) but it is not testing the in-flight
 case its name implies. Worth renaming when someone next touches it.
+
+## F52 — N4 said "memory" and specified lines; a single huge line is still unbounded
+
+Found by the T3-S6 test author while deciding what the ring stores, and raised
+rather than quietly patched.
+
+**N4 reads "Memory in `fullscreen` MUST be bounded by a configurable cell ring
+(default 10 000 lines, oldest evicted)".** Those two clauses are not the same
+claim. The ring caps **lines**; memory is lines × line length, and nothing
+bounds the second factor. Ten thousand lines of unbounded width is unbounded
+memory, so the requirement's guarantee held only under an unstated assumption
+about line length.
+
+Storing **styled** bytes makes each retained line longer than its plain form
+too, which is the right call for other reasons (the ring is the only copy, and
+styling can be stripped but never reconstructed) but does widen the gap between
+"10 000 lines" and any particular byte figure.
+
+**Why it was not simply fixed.** A per-line byte clamp is cheap to write and
+would make the bound literal — but the ring is **the sole source for the
+transcript overlay and the `[` dump**, so clamping truncates content nothing
+else retains. That is a product trade: a hard memory ceiling bought with silent
+loss of the widest lines, which are often exactly the ones worth reading
+(wide tables, long tool output). It deserves a decision, not a patch slipped
+into an unrelated card.
+
+**Amended rather than papered over:** N4 now says the bound is in lines, states
+that a pathological line still costs what it costs, and names the clamp as a
+deliberate trade rather than an oversight.
+
+**Options, for whoever takes it:**
+- a per-line byte clamp with a visible marker on truncated rows, so the overlay
+  shows that something was cut rather than silently shortening it;
+- a byte-budget ring that evicts on total bytes rather than line count, which
+  makes the bound literal and the line count variable — closer to what N4's
+  first clause promises;
+- leave it, and rely on the line bound plus the fact that terminal-destined
+  output is usually already wrapped to the terminal's width.
+
+**Two cautions for whoever writes the clamp**, from the implementer that
+deliberately did not:
+- **Truncating styled bytes can cut an SGR sequence in half**, leaving the
+  terminal in whatever colour the severed escape implied. A clamped line must
+  either be cut at a character boundary **and** have a reset appended, or be
+  sanitized before truncation — which forfeits the "styling can be stripped but
+  never reconstructed" property, though only for over-long lines.
+- **The clamp must be reported.** An overlay that silently shows a shortened
+  line is exactly the kind of quiet loss N4 exists to prevent. The assertion
+  worth writing is *"a clamped line is marked"*, not merely
+  `len() <= cap` — a length test passes for an implementation that lies about
+  what it kept.
+
+The general lesson is the one this epic keeps producing: **a requirement that
+states a guarantee and a mechanism in one sentence can be wrong about the
+guarantee while being right about the mechanism**, and only someone implementing
+the mechanism notices.
+
+## F53 — `--plain --tui inline` installs a viewport that plain output cannot use
+
+Found by the T3-S7a implementer, which asked rather than deciding for itself.
+
+The inline viewport is installed on **mode alone**: the block at
+`main.rs:16585` resolves `[tui] mode` and calls `tui_bridge::install`, with no
+condition on styling, `--plain`, or assistive output. So `--plain --tui inline`
+really does install the viewport, pin a scroll region, and paint a status row —
+while every *content* path takes the plain, unstyled branch.
+
+For approvals that means **R7 is not satisfied in that combination**: the plain
+prompter keeps its own `permission> …` text on stderr and never paints the pane
+modal. Routing it through the shared composer would have "fixed" R7 by changing
+plain's bytes, and `--plain` is a **byte-contract tier** — a weaker parity
+requirement must not be bought with a stronger stability guarantee. The
+implementer flagged it instead of trading them, which was right.
+
+**The combination is incoherent beyond approvals.** `--plain` exists for
+screen readers and byte-stable capture; a pinned pane, a DEC scroll region and a
+repainting status row are the opposite of that. The viewport's own status row
+*does* get painted in this mode, which is already questionable on the same
+grounds.
+
+**The likely right fix is mode resolution, not more branches:** have `--plain`
+(and assistive output) resolve to `classic` regardless of `[tui] mode`, so the
+contradiction cannot be configured. That would make R7 vacuously satisfied
+there, delete a reachable-but-unsupported combination, and remove the need for
+every future TUI surface to carry a plain-mode branch. It is a small card and it
+should come with a test that `--plain --tui inline` is byte-identical to
+`--plain` alone.
+
+Recorded rather than fixed because it is a **mode-resolution decision** with its
+own acceptance, and T3-S7a had no mandate to change which renderer a flag
+selects. R7 has been clarified to state the exclusion explicitly rather than
+leave it implied.
+
+## F54 — "Ctrl+C is swallowed at an approval prompt" is measured, but its cause is probably the harness
+
+The T3-S7b test author measured, honestly and reproducibly, that sending `\x03`
+at an approval prompt does **nothing**: it is echoed as the two characters `^C`
+and left in the line buffer, so `\x03` followed by `/quit` is read as the single
+answer `^C/quit`, rejected as invalid, and denied. It reported this as a
+pre-existing UX hole identical in classic and inline.
+
+**The measurement is real. The stated cause is probably wrong, and I nearly let
+it through as a product defect.**
+
+The code's intent is explicit, at `main.rs:14668-14673`:
+
+> ISIG is cleared so Ctrl+C reaches the editor as a byte … **Approval handoffs
+> restore the original termios (ISIG on), so approval prompts keep kernel
+> Ctrl+C.**
+
+And `RawStdinGuard::drop` really does `tcsetattr(…, &self.original)` — the
+snapshot taken before `ICANON|ECHO|ISIG` were cleared. So at the approval read
+`ISIG` should be **on**, and `\x03` should raise `SIGINT`.
+
+**The likely explanation is the test harness, not the product.** The observed
+combination — `^C` **echoed** (so `ECHO` on) but **no signal** (so no SIGINT
+delivered) — is exactly what happens when the terminal discipline is restored
+correctly but the child **is not in the pseudo-terminal's foreground process
+group**. The kernel delivers `SIGINT` to the foreground group of the controlling
+terminal; a child that never called `setsid`/`tcsetpgrp` on the slave does not
+receive it, and `\x03` stays an ordinary byte. The harness spawns the child with
+the slave on all three descriptors and does not establish a session.
+
+**Two competing explanations, neither yet settled:**
+1. **Harness artefact** (my hypothesis, from the echo-without-signal signature
+   and the absence of any session setup): real users at a real terminal *do* get
+   Ctrl+C at approvals, exactly as the comment claims, and nothing is broken.
+2. **Real defect**: something between the handoff and the read leaves `ISIG`
+   off, and the comment documents an intent the code does not achieve.
+
+**Why this matters more than the bug would.** If (1) is true and someone
+"fixes" the hole — by mapping `\x03` in the reader, say — they would be adding a
+second Ctrl+C path that only exists because a test could not deliver a signal,
+and real terminals would then have two. Worse, a test asserting the mapped
+behaviour would **lock the artefact in**.
+
+**How to settle it, cheaply:** check whether the harness's child is the
+foreground process group of the slave (`tcgetpgrp` on the slave versus the
+child's pgid), or run kitsu by hand in a real terminal and press Ctrl+C at a
+permission prompt. One minute of either answers it. **Nobody should write code
+against this until that is done.**
+
+The general lesson, and it is the mirror of F43: **a measurement is evidence of
+behaviour, not evidence of cause.** F43 recorded a mechanism nobody had traced;
+this is a trace that stopped one layer short — the agent proved *what* happened
+inside its harness and then attributed it to the product, which is a different
+claim requiring different evidence.
+
+## F55 — an unfair mutex starved the in-loop approval read, and the hazard was already documented
+
+Hit and fixed inside T3-S7b. Worth recording because the bug was **predicted by a
+comment already in the file**, and because it is the exact failure the
+rendering/protocol split was created to isolate.
+
+**The bug.** The first version of the in-loop approval read serialized on
+`APPROVAL_INPUT_LOCK` — the mutex the existing claim path uses. In **release
+only**, three approval tests (two of them T3-S7a's, i.e. previously passing)
+timed out at the first script step with the modal never painted. Cause: the
+typeahead collector `try_lock`s that mutex **every 50 ms tick**, and
+`std::sync::Mutex` is **unfair**, so the prompter — which deliberately publishes
+no claim — was starved indefinitely. Release suite: **107.96 s with 3 failures**
+before, **12.4 s with 0** after.
+
+**The hazard was already written down.** `ApprovalInputGuard::enter`'s own
+comment describes precisely this: "the type-ahead loop can observe false … and
+reacquire it indefinitely". The first implementation reused the lock *because*
+it looked like the right lock, and walked into the failure the comment exists to
+warn about.
+
+**The fix** is a separate `APPROVAL_PANE_READ_LOCK` that the collector never
+touches, documented at the static with the measurement. Across the
+publish-and-block the prompter holds **only** that mutex, does not hold
+`APPROVAL_INPUT_LOCK`, and does not increment `APPROVAL_INPUT_ACTIVE` — so the
+collector never drops its guard and never waits on anything the prompter owns.
+
+**Three lessons, in order of how much they will save someone:**
+1. **A lock that "is clearly the right lock" may be the wrong one when one side
+   polls it.** `try_lock` in a tick loop is not a fair queue; it is a repeated
+   coin-toss that a blocked waiter loses forever. Any mutex touched by a polling
+   loop should be treated as unavailable to anything that needs to *wait*.
+2. **Release-only concurrency failures are real and cheap to miss.** All three
+   failures reproduced in release and none in debug — the tick loop simply wins
+   the race more reliably when the code is fast. A card gated only on a debug
+   run would have shipped this.
+3. **The bounded test is what turned a hang into a diagnosis.** Every PTY test
+   in this suite dies at a 20-second deadline with the whole transcript
+   attached, so the starvation surfaced as three named failures with evidence
+   rather than as a suite that hung. That bound was worth insisting on.
+
+## F45 closed — the duplicate command answer parser is retired
+
+F45's one-parser rule had a violation nobody had noticed: `CliCommandPrompter`
+carried its **own** inline `match` on `y|yes|a|always|n|no`, with its own
+trimming, bracketed-paste stripping and lowercasing, rather than calling the
+shared `parse_permission_answer` that the filesystem prompter and `/jobs reply`
+both use. The T3-S7b test author found it while checking how a keypress should
+map onto the shared parser.
+
+It is now retired: the command prompter calls `parse_permission_answer` and maps
+`Decision → CommandDecision`, with the invalid-answer branch unchanged.
+Behaviour-identical by inspection — same trims, same lowercase, same three
+answers — and confirmed by the unchanged binary, CLI and command-modal suites.
+
+**One parser now serves all three answer surfaces**: the filesystem approval, the
+command approval, and `/jobs reply`. The finding that named the rule is finally
+true of the code.
+
+## F56 — a signal handler cannot share the restore writer, so the bytes are duplicated — and now compared
+
+T3-S8's handler needs the restore sequences as a **precomposed `const`**,
+because a signal handler may not write through `io::Write` (it locks and may
+allocate) or call into crossterm. The restore helper that the panic path uses
+writes the same four sequences through a `Write`. So the byte string exists
+**twice**, by necessity rather than carelessness.
+
+The implementer flagged exactly this and declined to add the test itself, being
+restricted to production code. It was right to flag it: **two copies of one byte
+sequence with nothing comparing them is this project's most-repeated defect
+shape** — F2's suggester table, F38's four unchecked string literals, F45's two
+vocabularies, and the `/agent` args string that was stale in three files at
+once.
+
+**Closed at review** with a test asserting the handler's `const` equals the
+helper's output byte-for-byte, and **verified to have teeth**: dropping the
+title-pop sequence from the handler made it fail with both strings printed, and
+restoring the file by checksum made it pass again.
+
+The failure it prevents is specific and nasty: a sequence added to the helper
+and forgotten in the handler would mean **a signal exit restores less than a
+panic does**, which nobody would notice until a user's terminal came back
+half-fixed from one path and whole from another.
+
+**The general rule, now with five instances behind it:** when duplication is
+genuinely forced — different calling conventions, different safety constraints —
+the duplication is acceptable **only if a test compares the copies.** The copies
+cannot be eliminated; the drift can.
+
+## F57 — a registered-but-undispatched top-level command is silently wrong twice, and the suite says nothing
+
+Measured in T3-S9, not reasoned about. The author added a `SLASH_COMMANDS`
+entry with **no dispatch arm** and ran the suites: the binary prints
+`unknown command: /tui - did you mean /quit?` and **all 824 binary tests and
+245 CLI tests pass.** Nothing asserts that a registered command is reachable.
+
+**The second failure mode is worse than the first.** The mid-turn dispatcher's
+default fall-through is `queue.enqueue(line)`, so a registered-but-undispatched
+command typed **during a turn** does not merely fail — it becomes **a future
+prompt sent to the model.** The user types `/tui inline`, nothing visibly
+happens, and the model is later asked to respond to the literal text
+`/tui inline`.
+
+### Why the F2-style guard cannot be copied here
+
+F38's `/jobs` fix worked because `closest_jobs_subcommand` kept its **own
+hardcoded table**, so "every dispatched subcommand is its own nearest
+suggestion" catches a table that drifted from the dispatcher.
+
+`closest_slash_command` **reads `SLASH_COMMANDS` directly**. So the analogous
+sweep — every registry name is its own nearest suggestion — **passes vacuously**:
+it compares the registry with itself. The registry being the single source,
+which is normally the fix, is exactly what makes this guard impossible.
+
+**The two halves therefore need separate guards**, which T3-S9 adds:
+- a missing *entry* is caught by the registry tests and the suggester test;
+- a missing *arm* is caught by behavioural tests asserting
+  `unknown command: /tui` does **not** appear, and by a unit test asserting the
+  mid-turn queue stays **empty**.
+
+### The general lesson
+
+**A single source of truth guarantees that readers agree with it; it guarantees
+nothing about whether anyone acts on what they read.** Six cards in this epic
+converged on "one source, many readers" as the fix for drift — and this is its
+blind spot: the registry can be perfectly consistent with every surface that
+*displays* it while nothing dispatches it. Reachability is a different property
+from consistency and needs its own test.
+
+Worth a later card: a test that drives **every** registry entry through the
+dispatcher and requires none of them to reach the unknown-command fallback. That
+would make reachability structural for all 54 commands rather than only the one
+this card happened to add.
+
+## F58 — an UNSATISFIABLE test nearly changed the product, which is the mirror of a vacuous one
+
+T3-S9's `every_registry_fed_surface_shows_the_tui_switch` asserted:
+
+```rust
+let palette = slash_palette("tu", false, 80);
+assert!(palette.contains(" /tui [classic|inline]"), …);
+```
+
+At width 80 the palette takes its **wide** branch, which renders
+`" /{name:<22} {description}"` — the bare **name** and the description. The
+asserted substring is the **compact** branch's shape, used only below a
+40-column inner width. So **no registry entry whatsoever could satisfy that
+assertion at width 80.** It was not failing because `/tui` was missing; it was
+unsatisfiable by configuration.
+
+**The implementer could not edit tests, so the only path open to it was to
+change the product** — and it did, making the wide branch show syntax in the
+label slot when it fits. That change was careful and well-reasoned, and it
+**altered the palette for every short-argument command** (`/model <name>`,
+`/theme [name]`, `/usage [session]`, `/undo [id]`) in a card about a renderer
+switch. It flagged the deviation rather than burying it, which is why this is a
+finding and not a regression.
+
+**Reverted at review; the test was corrected instead** to assert the wide
+branch's real shape (the name and the description both present). The intent —
+"the palette offers `/tui` for the prefix `tu`" — is served exactly as well, and
+the palette is byte-for-byte what it was.
+
+### Why this is worth a finding of its own
+
+This project has **seven** findings about **vacuous** assertions — tests that
+can never fail. This is the mirror image: an assertion that can never *pass*.
+The failure modes are opposite but the cause is identical — **an expectation
+written from a mental model of the output rather than from the output** — and
+the consequences differ in an important way:
+
+- a **vacuous** test fails to protect, and is discovered late or never;
+- an **unsatisfiable** test is discovered immediately, but **it exerts pressure
+  on the product**, because the implementer's job is to make it pass and the
+  test is the specification.
+
+So an unsatisfiable test is the more dangerous of the two in a TDD loop. The
+protection is the same one that catches vacuity: **derive the expectation from a
+real sample of the output**, not from what the output ought to look like. T3-S9
+did that correctly for its transcript markers — the author verified the marker's
+exact bytes and its 76-column width against a real run — and then did not do it
+for this one line.
+
+**Rule: when a test demands something the design does not do, the test or the
+requirement is amended deliberately — the product is not changed incidentally
+to satisfy it.** An implementer forbidden from touching tests must flag the
+conflict, as this one did, rather than resolve it in the product.
+
+## F39 third occurrence — and the first one with a name and a shape
+
+The two earlier occurrences were unidentified, and in both cases the evidence
+was destroyed by how we looked at the output: once by re-running (my mistake),
+once by piping the only copy through `tail`.
+
+T3-S10's implementer hit a third, **and this one is identified**:
+`test_scripted_and_jsonl_runs_are_byte_identical_under_the_default`
+(`crates/kitsu/tests/cli.rs`) failed once in a workspace run, with one side
+producing only `"FOREGROUND_DONE\n"` instead of the full scripted transcript.
+
+**It is a shape, not a mystery.** One side finished and reported before the
+background agent's output had joined, so the comparison ran against a truncated
+transcript — a **join-timing** difference, not a byte-content difference. That is
+a far more actionable description than either earlier occurrence got.
+
+**It handled it correctly**, which is why the diagnosis exists: it did not
+re-run to make it pass. It verified the test passes standalone, verified a
+workspace run with its change **stashed** also passed, and reasoned that the
+code it touched is reachable only from tests (`with_cell_ring` has no production
+caller) so it cannot influence the CLI harness at all.
+
+**What this suggests about the family.** All three occurrences are in suites that
+drive real child processes and wait on asynchronous completion, and this one's
+shape — comparing output before a background contributor has joined — would
+explain an intermittent byte-identity failure without any product defect. The
+earlier two may well be the same thing wearing different names.
+
+**The actionable fix is in the test, not the product:** the byte-identity
+comparison should wait on a completion signal from the background agent rather
+than on the foreground's own done-marker. Worth a small card, and worth checking
+whether the other byte-identity tests share the pattern.
+
+## F59 — `cargo check` runs build scripts, so "no linker needed" was wrong
+
+The T3-S11 plan row asserts the Windows check needs no toolchain beyond the
+target:
+
+> `rustup target add x86_64-pc-windows-gnu && cargo check --target x86_64-pc-windows-gnu -p kitsu` (**no linker needed**)
+
+**Measured in T3-S11: the target installs fine, and the check fails.** Not at
+link time — `cargo check` indeed does not link — but at **build-script** time:
+
+```
+error: failed to run custom build command for `ring v0.17.14`
+  CC_x86_64-pc-windows-gnu = None
+```
+
+`ring` compiles C, so its build script needs a MinGW cross-compiler
+(`x86_64-w64-mingw32-gcc`), which is not installed here. `cargo check` skips
+**linking**, not **building dependencies' build scripts** — those still run, and
+a build script that invokes a C compiler needs that compiler for the target.
+`ring` arrives via `kitsu-providers`, i.e. through TLS, not through anything the
+TUI touches.
+
+### But the part N6 actually cares about is green, and that was worth measuring
+
+The renderer and viewport crates do not depend on `ring`, and all three
+**compile cleanly for `x86_64-pc-windows-gnu`, zero errors**:
+
+| crate | `cargo check --target x86_64-pc-windows-gnu` |
+|---|---|
+| `kitsu-tui` (holds `viewport.rs`) | **clean** |
+| `kitsu-render` | **clean** |
+| `kitsu-editor` | **clean** |
+
+So **the viewport code is already Windows-portable**, and what blocks the
+whole-binary check is a TLS dependency's C build script — nothing in the
+terminal work. That is a much more useful statement than "the Windows check
+fails".
+
+### Consequences
+
+- The plan row's parenthetical should read **"needs a MinGW cross-compiler for
+  `ring`'s build script"**, not "no linker needed".
+- The `cfg(unix)` narrowing the row also asks for (4 gates in `tui_bridge.rs`,
+  85 in `main.rs`) **cannot be verified here**, because `tui_bridge.rs` lives in
+  the crate that cannot be checked. Narrowing a platform gate without a
+  compiler to prove it is guessing, so it was **not attempted** — it belongs
+  with whoever has the cross-compiler, or with CI.
+- `viewport.rs` has **zero** `cfg(unix)` gates already, which is consistent with
+  it checking clean.
+
+**The reusable lesson:** `cargo check` is not a pure type-check across targets.
+It is a type-check *plus* every dependency build script, and a build script is
+arbitrary code with arbitrary toolchain needs. A cross-target check is only as
+portable as the least portable build script in the tree.
+
+## F39 fourth occurrence — the shape is now confirmed, with the exact extra lines
+
+T3-S10 recorded the third occurrence and proposed a shape: a byte-identity
+comparison running before a background agent had joined. T3-S12 hit the **same
+test** again under full-workspace load and produced the detail that confirms it.
+
+`test_scripted_and_jsonl_runs_are_byte_identical_under_the_default` failed once
+with the scripted run carrying **`joining them`** and **`joined 1 background
+agent`** lines the JSONL run did not. Under load the detached agent had not
+finished by input end, so one side joined and narrated it while the other had
+already finished.
+
+**So this is no longer a mystery and no longer a product concern.** It is a test
+that compares two runs whose **background-agent lifetimes are not
+synchronised**, and under load their join points diverge. The two unidentified
+earlier occurrences are plausibly the same thing; both were in suites driving
+real child processes.
+
+**It passed alone and the clean full-workspace re-run was 2178/0**, and the
+implementer did not re-run to make it pass — it diagnosed first, which is how
+the detail exists.
+
+**The fix is in the test, and it is now specific:** either join the background
+agent deterministically before comparing, or exclude the join narration from the
+comparison. Worth a small card, and worth checking the other byte-identity tests
+for the same pattern — four occurrences across three cards is frequent enough to
+cost someone an afternoon eventually.
+
+## F60 — T3's exit gate has a clause with no test, and the harness cannot express it
+
+Found while running T3's exit gate clause by clause in T3-S13. The gate reads:
+
+> per-fd sanitize equality on the streamed two-tool PTY run; all fixtures
+> byte-identical in classic/plain/JSONL; both profiles; `cargo test --locked`;
+> Windows `cargo check`.
+
+**The first clause cannot be run, for two independent reasons.**
+
+1. **No two-tool-call streamed PTY run exists.** The nearest test streams
+   **one** tool call, in **classic only**, and asserts screen order and a
+   request body — not cross-renderer equality. `tool_call(` appears at four
+   sites in the terminal suite, none of them two calls in one streamed turn.
+2. **Per-fd separation is structurally impossible in the harness as built.**
+   `run_styled_chat_pty_core` hands the child **three `dup`s of one pty slave**,
+   so stdout and stderr *are the same descriptor* and the harness reads one
+   interleaved stream. There is no "inline's stdout" to compare against
+   "classic's stdout".
+
+**What passes and must not be mistaken for it:**
+`inline_mode_commits_the_same_permission_receipt_as_classic` asserts sanitize
+equality of the `◉ permission —` receipt between renderers. That is **R7's**
+risk gate — one line, on one fd-blind stream. It is good evidence that the two
+renderers agree about *that* receipt, and it is not this clause.
+
+**The card to write**, specified so nobody has to rediscover it: allocate **two**
+ptys, stdout on one and stderr on the other, each `TIOCSWINSZ`'d and both real
+ttys so the inline gate still opens; add a streamed turn with **two** tool calls
+to the streaming harness; then assert sanitized stdout and sanitized stderr
+**separately**, classic against inline.
+
+**Why this was worth finding rather than assuming.** An exit gate is the thing
+that decides a milestone is done. Four of its five clauses ran and passed; this
+one would have been read as passing because adjacent tests with similar names
+do. The lesson is the same one F57 produced from the other direction: **a gate
+is only as real as the test that implements it, and "there is a test about
+this area" is not that test.**

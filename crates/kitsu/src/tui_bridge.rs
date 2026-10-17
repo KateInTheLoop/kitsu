@@ -63,16 +63,32 @@ pub(crate) enum TuiMode {
     Inline,
 }
 
-/// Decide the mode from one environment value, failing closed.
+impl TuiMode {
+    /// The one spelling `/tui`, `--tui` and `[tui] mode` all use.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TuiMode::Classic => "classic",
+            TuiMode::Inline => "inline",
+        }
+    }
+}
+
+/// Whether an inline viewport is installed **right now**.
 ///
-/// The match is **byte-exact and case-sensitive, with no trimming**: only
-/// `"inline"` selects the viewport. A typo must leave the user in the renderer
-/// they already had, and a forgiving match would make the set of values that
-/// silently switch renderers unbounded.
-pub(crate) fn mode_from_value(value: Option<&std::ffi::OsStr>) -> TuiMode {
-    match value {
-        Some(value) if value.as_encoded_bytes() == b"inline" => TuiMode::Inline,
-        _ => TuiMode::Classic,
+/// Process-global for the same reason `STATUS_PAINTER` is, plus one of its
+/// own: `/tui`'s dispatch arm has to report the live renderer and cannot see
+/// the `run_chat` local that holds the guard. Maintained by exactly two
+/// writers — [`install`] on the way in and [`BridgeGuard::drop`] on the way
+/// out — so a runtime switch keeps it true by construction rather than by a
+/// caller remembering to update it.
+static INLINE_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The renderer this process is painting through at this instant.
+pub(crate) fn live_mode() -> TuiMode {
+    if INLINE_INSTALLED.load(std::sync::atomic::Ordering::Acquire) {
+        TuiMode::Inline
+    } else {
+        TuiMode::Classic
     }
 }
 
@@ -82,49 +98,26 @@ pub(crate) fn mode_from_value(value: Option<&std::ffi::OsStr>) -> TuiMode {
 /// **previous** values rather than restoring defaults: the surface slot's
 /// former occupant and the live-row setting as it was found.
 pub(crate) struct BridgeGuard {
-    /// The viewport, kept so `Drop` can release its scroll region after the
-    /// seam has been pointed back at the displaced surface.
-    viewport: Arc<InlineSurface>,
+    /// The viewport and its latched geometry, kept so `Drop` can release the
+    /// scroll region after the seam has been pointed back at the displaced
+    /// surface.
+    ///
+    /// Behind an `Arc` because the geometry is shared with the process-global
+    /// modal painter (card T3-S7a): an approval prompter runs with no guard
+    /// in hand and must re-latch and paint through the *same* clamp this
+    /// session's guard does, never a second copy of it.
+    pane: Arc<PinnedPane>,
     /// The surface that was in the slot before the viewport went in.
     previous_surface: Arc<dyn Surface>,
     /// The live-row setting as it was found, which may itself be `false`.
     previous_live_rows: bool,
-    /// The status text [`install`] painted, so the row can fall back to it
-    /// whenever there is no draft to show.
-    ///
-    /// The *fallback*, not the row: once [`enable_live_status`] has handed the
-    /// guard a [`StatusSource`], every idle paint re-reads that instead (see
-    /// [`status_row`]). It is still carried, because `install` is reached by
-    /// callers with no live session behind them -- this module's own tests --
-    /// and a renderer with nothing to compose from must still paint something
-    /// rather than an empty row.
-    ///
-    /// [`enable_live_status`]: Self::enable_live_status
-    /// [`status_row`]: Self::status_row
-    status: String,
     /// Requirement **R5**'s live status row, once a session has one.
     ///
     /// `RefCell` because the guard is held by shared reference everywhere
-    /// (exactly as [`rows`](Self::rows) is a `Cell`) and the session that owns
+    /// (exactly as the pane's latched geometry is a `Cell`) and the session that owns
     /// the fields does not exist yet when `install` runs: the viewport is
     /// installed before the prompt queue the queue tag counts.
     live_status: std::cell::RefCell<Option<Arc<StatusSource>>>,
-    /// The terminal height [`install`] was given.
-    ///
-    /// Finding F21: the guard carries its own geometry because
-    /// `InlineSurface::hide` *takes* the latched `(bottom, viewport_rows)`.
-    /// A release therefore leaves the surface with nothing to pin, so the
-    /// reinstall must supply the geometry again from here — and it has to be
-    /// durable rather than consumed, because a session can suspend more than
-    /// once.
-    /// Finding F16: a resize updates this in place, so it is a `Cell` --
-    /// `resize` takes `&self` because every caller holds the guard by
-    /// reference, and a resize that could not update the stored geometry
-    /// would make the next suspend reinstall the pre-resize one.
-    rows: std::cell::Cell<u16>,
-    /// The pinned row count [`install`] was given, kept for the same reason
-    /// as [`rows`](Self::rows).
-    viewport_rows: std::cell::Cell<u16>,
 }
 
 /// Install the inline viewport, or do nothing at all in classic mode.
@@ -170,15 +163,53 @@ pub(crate) fn install(
     let previous_live_rows = live::set_live_rows_enabled(false);
     let previous_surface = set_surface(viewport.clone());
 
-    Some(BridgeGuard {
+    let pane = Arc::new(PinnedPane {
         viewport,
+        status: status.to_string(),
+        rows: std::sync::atomic::AtomicU16::new(rows),
+        viewport_rows: std::sync::atomic::AtomicU16::new(viewport_rows),
+    });
+    // Card T3-S7a: publish the pane for the approval modal, which paints from
+    // a thread that holds no guard. Taken back by `Drop`, exactly as
+    // `STATUS_PAINTER` is.
+    *lock(&MODAL_PANE) = Some(pane.clone());
+    INLINE_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
+
+    Some(BridgeGuard {
+        pane,
         previous_surface,
         previous_live_rows,
-        status: status.to_string(),
         live_status: std::cell::RefCell::new(None),
-        rows: std::cell::Cell::new(rows),
-        viewport_rows: std::cell::Cell::new(viewport_rows),
     })
+}
+
+/// The pinned pane: the inline viewport plus the geometry currently latched
+/// on it -- the terminal height and the pinned row count [`install`] was
+/// given.
+///
+/// Finding F21: the geometry is carried here because `InlineSurface::hide`
+/// *takes* the latched `(bottom, viewport_rows)`. A release therefore leaves
+/// the surface with nothing to pin, so the reinstall must supply the geometry
+/// again from here -- and it has to be durable rather than consumed, because
+/// a session can suspend more than once.
+///
+/// Finding F16: a resize updates both in place, so every method here takes
+/// `&self` -- each caller holds the pane by shared reference, and a resize
+/// that could not update the stored geometry would make the next suspend
+/// reinstall the pre-resize one.
+///
+/// They are `AtomicU16` rather than `Cell` for one reason: `BridgeGuard` is a
+/// `run_chat` local that is neither `Send` nor `Sync`, so a pane the
+/// process-global modal painter can reach must carry its geometry in a form
+/// that crosses threads.
+pub(crate) struct PinnedPane {
+    viewport: Arc<InlineSurface>,
+    /// The status text [`install`] painted: what the single pinned row falls
+    /// back to when no session has published live fields, and so what the
+    /// approval modal's teardown restores in that case.
+    status: String,
+    rows: std::sync::atomic::AtomicU16,
+    viewport_rows: std::sync::atomic::AtomicU16,
 }
 
 /// Requirement **R5**'s status row as *live state*, re-read on every paint
@@ -207,6 +238,10 @@ pub(crate) struct StatusSource {
     /// `live_agents_state` applies, and what keeps a 50 ms tick from emitting
     /// twenty identical paints a second into the transcript's stream.
     painted: std::sync::Mutex<Option<String>>,
+    /// When the cadence painter last actually wrote the row, for note
+    /// **N3**'s frame budget. `None` until the first paint, so the first
+    /// frame of a session is never made to wait.
+    last_paint: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 /// The model and meter numbers, pushed at turn boundaries.
@@ -233,6 +268,7 @@ impl StatusSource {
             turn_start: std::sync::Mutex::new(None),
             counts,
             painted: std::sync::Mutex::new(None),
+            last_paint: std::sync::Mutex::new(None),
         })
     }
 
@@ -308,6 +344,82 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 static STATUS_PAINTER: std::sync::Mutex<Option<(Arc<InlineSurface>, Arc<StatusSource>)>> =
     std::sync::Mutex::new(None);
 
+/// The pinned pane, published for painters that hold no [`BridgeGuard`]
+/// (card T3-S7a's approval modal), and taken back by the guard's `Drop`.
+///
+/// Process-global for exactly `STATUS_PAINTER`'s reason: an approval prompter
+/// runs on the tool executor, while the guard is a `run_chat` local that is
+/// neither `Send` nor `Sync`. `InlineSurface::paint` is write-only and knows
+/// nothing about stdin, and the pane carries its own latched geometry, so a
+/// painter needs nothing from the guard but this handle.
+static MODAL_PANE: std::sync::Mutex<Option<Arc<PinnedPane>>> = std::sync::Mutex::new(None);
+
+/// Requirement **R7**: paint an approval prompt as a modal on the pinned
+/// bottom rows, and say whether it went there.
+///
+/// `false` means no pinned pane is installed -- classic mode, or a terminal
+/// below finding F19's bound -- and the caller then prints the classic stderr
+/// prompt instead. That is what keeps classic's bytes identical: classic
+/// installs no viewport, so this is inert before it writes anything.
+///
+/// The rows are [`kitsu_render::approval_modal`]'s composition of the
+/// caller's own header, provenance and option strings, painted through
+/// [`PinnedPane::paint_rows`] so the clamp, the re-latch and the paint are
+/// one operation with F19's and F16's behaviour intact.
+/// Card **T3-S7b**: `cue` is the row the user types at, appended below the
+/// option line when the answer is read in-loop. It is a *row* rather than a
+/// `> ` written into the scroll region, which is the whole point of the card:
+/// the modal owns the cue, so nothing about the prompt lands in the
+/// transcript. `None` keeps the modal exactly as T3-S7a painted it.
+pub(crate) fn paint_approval_modal(
+    header: &str,
+    details: &[String],
+    options: &str,
+    cue: Option<&str>,
+) -> bool {
+    let Some(pane) = lock(&MODAL_PANE).clone() else {
+        return false;
+    };
+    let mut rows = kitsu_render::approval_modal(header, details, options);
+    if let Some(cue) = cue {
+        rows.push(cue.to_string());
+    }
+    pane.paint_rows(&rows)
+}
+
+/// Whether a pinned pane is published at all: card **T3-S7b**'s "is there a
+/// pane" question, asked *before* anything is claimed or printed.
+///
+/// Deliberately cheap and deliberately not the whole answer: a published pane
+/// whose viewport is released still paints nothing, so the bypass decision is
+/// taken from [`paint_approval_modal`]'s own return value. This only says
+/// whether it is worth asking -- in classic mode it is not, and the prompter
+/// must then not disturb a byte.
+pub(crate) fn approval_pane_published() -> bool {
+    lock(&MODAL_PANE).is_some()
+}
+
+/// Take the modal back down once the decision has been read, leaving the one
+/// status row the pane had before it.
+///
+/// The row is recomposed from the published [`StatusSource`] rather than
+/// remembered, so the row that comes back is the row the cadence would paint
+/// next -- and `invalidate` is what lets that cadence paint it again, since
+/// its dedupe would otherwise believe the modal's bottom row is on screen.
+pub(crate) fn clear_approval_modal() {
+    let Some(pane) = lock(&MODAL_PANE).clone() else {
+        return;
+    };
+    let row = match lock(&STATUS_PAINTER).clone() {
+        Some((_, source)) => {
+            source.invalidate();
+            source.compose(live::terminal_columns())
+        }
+        None => pane.status.clone(),
+    };
+    pane.paint_rows(std::slice::from_ref(&row));
+}
+
 /// Repaint R5's status row on the pinned viewport row, if one is installed
 /// and a session has published its fields.
 ///
@@ -324,16 +436,48 @@ pub(crate) fn repaint_status_row() {
         return;
     };
     let cols = live::terminal_columns();
-    let row = source.compose(cols);
+    let fields = source.fields();
+    let row = live::compose_status_row(&fields, cols);
+    // The dedupe key. Normally it is the row itself: an unchanged row costs
+    // no bytes (T3-S5b). Under `--reduced-motion` it is the row recomposed
+    // with `elapsed: None`, so a row whose *only* moved segment is the clock
+    // compares equal to the one on screen and no paint follows -- note
+    // **N9**'s "periodic age refresh", suppressed. The queue tag and the
+    // ambient agent tag stay in the key, because they are state and not
+    // animation: freezing them would hide a blocked agent.
+    let key = if kitsu_render::reduced_motion_mode() {
+        let still = live::StatusFields {
+            elapsed: None,
+            ..fields
+        };
+        live::compose_status_row(&still, cols)
+    } else {
+        row.clone()
+    };
     {
         let mut painted = lock(&source.painted);
-        if painted.as_deref() == Some(row.as_str()) {
+        if painted.as_deref() == Some(key.as_str()) {
             return;
         }
-        *painted = Some(row.clone());
+        // Note **N3**'s frame budget, enforced here rather than in a
+        // caller's `sleep`: the row has more than one author now (the
+        // approval modal's teardown paints it too), and the dedupe above
+        // only ever catches a byte-identical row, so field churn alone would
+        // otherwise paint as fast as it is called. Inside the window the
+        // call returns *without* recording the key, so the next call past it
+        // paints whatever the fields say then -- intermediate frames
+        // collapse, the latest one is never lost.
+        if lock(&source.last_paint).is_some_and(|last| last.elapsed() < STATUS_FRAME_INTERVAL) {
+            return;
+        }
+        *painted = Some(key);
     }
+    *lock(&source.last_paint) = Some(std::time::Instant::now());
     viewport.paint(std::slice::from_ref(&row), cols);
 }
+
+/// Note **N3**'s coalescing window: one row paint per 1/60 s.
+const STATUS_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
 
 impl BridgeGuard {
     /// Hand the guard requirement **R5**'s live fields, replacing the fixed
@@ -344,14 +488,15 @@ impl BridgeGuard {
     /// registration is the guard's, so `Drop` takes it back and a released
     /// viewport can never be painted by a late tick.
     pub(crate) fn enable_live_status(&self, source: Arc<StatusSource>) {
-        *lock(&STATUS_PAINTER) = Some((self.viewport.clone(), source.clone()));
+        *lock(&STATUS_PAINTER) = Some((self.pane.viewport.clone(), source.clone()));
         *self.live_status.borrow_mut() = Some(source);
         // Paint at once rather than at the next read: `install` has already
         // put the fallback text on the row, and leaving it there until the
         // first keystroke would show a frame of a row this session does not
         // use.
         let row = self.status_row();
-        self.viewport
+        self.pane
+            .viewport
             .paint(std::slice::from_ref(&row), live::terminal_columns());
     }
 
@@ -370,7 +515,7 @@ impl BridgeGuard {
                 source.invalidate();
                 source.compose(live::terminal_columns())
             }
-            None => self.status.clone(),
+            None => self.pane.status.clone(),
         }
     }
     /// Paint the idle prompt's draft onto the pinned viewport row.
@@ -426,7 +571,8 @@ impl BridgeGuard {
         // through it would shrink a viewport another caller made taller --
         // which `resize_relatches_by_tearing_down_the_old_geometry_and_setting_up_the_new`
         // pins against. The draft paints into whatever height is latched.
-        self.viewport
+        self.pane
+            .viewport
             .paint(std::slice::from_ref(&row), live::terminal_columns());
     }
 
@@ -516,7 +662,75 @@ impl BridgeGuard {
     /// genuinely latched, so the next paint lands on the right absolute
     /// lines.
     pub(crate) fn resize_rows(&self, rows: u16) -> bool {
-        self.resize(rows, self.viewport_rows.get())
+        self.resize(rows, self.pane.viewport_rows())
+    }
+
+    /// T0-S15: how many rows a [`paint_rows`](Self::paint_rows) request for
+    /// `requested` rows would actually be granted on this terminal.
+    ///
+    /// The pane's own query, so the guard and the modal painter share one
+    /// clamp (see [`PinnedPane::granted_rows`]).
+    pub(crate) fn granted_rows(&self, requested: u16) -> u16 {
+        self.pane.granted_rows(requested)
+    }
+
+    /// T0-S14: draw `content` on the pinned viewport, making the viewport as
+    /// tall as the content needs -- the pane's one operation (see
+    /// [`PinnedPane::paint_rows`]).
+    pub(crate) fn paint_rows(&self, content: &[String]) -> bool {
+        self.pane.paint_rows(content)
+    }
+
+    /// Finding F21, step 1: hand the terminal back as a normal full-screen
+    /// scrolling terminal before the process stops.
+    ///
+    /// Exactly `InlineSurface::hide`'s teardown — clear the pinned rows,
+    /// release the DECSTBM region, park below the transcript — and nothing
+    /// else: no termios restore and no signal, both of which are the
+    /// caller's, in that order, after this returns.
+    pub(crate) fn release_for_suspend(&self) {
+        // Delegated, not reimplemented: `hide` is the only place the teardown
+        // byte sequence lives, so a release cannot drift from a drop.
+        self.pane.viewport.hide();
+    }
+
+    /// Finding F16: apply a terminal resize, through the pane that owns the
+    /// latched geometry (see [`PinnedPane::resize`]).
+    pub(crate) fn resize(&self, rows: u16, viewport_rows: u16) -> bool {
+        self.pane.resize(rows, viewport_rows)
+    }
+
+    /// Finding F21, step 5: put back what [`release_for_suspend`] took, so the
+    /// round trip is indistinguishable from a fresh [`install`].
+    ///
+    /// [`release_for_suspend`]: Self::release_for_suspend
+    pub(crate) fn reinstall_after_resume(&self) {
+        // Exactly what [`install`] does after the geometry gate, in the same
+        // order and through the same two calls: re-latch and set the region,
+        // then paint the row. The geometry comes from the guard because
+        // `hide` took the surface's own copy (see [`rows`](Self::rows)), and
+        // the row is the *status* — the draft is the caller's to repaint when
+        // it re-enters the reader.
+        self.pane
+            .viewport
+            .show(self.pane.rows(), self.pane.viewport_rows());
+        let row = self.status_row();
+        self.pane
+            .viewport
+            .paint(std::slice::from_ref(&row), live::terminal_columns());
+    }
+}
+
+impl PinnedPane {
+    /// The terminal height currently latched.
+    fn rows(&self) -> u16 {
+        self.rows.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The pinned row count currently latched.
+    fn viewport_rows(&self) -> u16 {
+        self.viewport_rows
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// T0-S15: how many rows a [`paint_rows`](Self::paint_rows) request for
@@ -534,7 +748,7 @@ impl BridgeGuard {
     /// list is right and for a box removes the lid. The palette therefore asks
     /// what height it will get *before* laying its content out.
     pub(crate) fn granted_rows(&self, requested: u16) -> u16 {
-        clamp_viewport_rows(self.rows.get(), requested)
+        clamp_viewport_rows(self.rows(), requested)
     }
 
     /// T0-S14: draw `content` on the pinned viewport, making the viewport as
@@ -566,7 +780,7 @@ impl BridgeGuard {
         // with the terminal height unchanged -- so `Unchanged` still emits
         // nothing and `Release` still releases.
         let height = clamp_viewport_rows(
-            self.rows.get(),
+            self.rows(),
             u16::try_from(content.len()).unwrap_or(u16::MAX),
         );
         if height == 0 {
@@ -577,11 +791,11 @@ impl BridgeGuard {
             // emits no bytes.
             return self.installed().is_some();
         }
-        self.resize(self.rows.get(), height);
+        self.resize(self.rows(), height);
         // The rows painted are `fit_viewport_rows`' slice, whose `len()` is
         // the very height just latched: there is no second count to drift.
         self.viewport.paint(
-            fit_viewport_rows(content, self.rows.get()),
+            fit_viewport_rows(content, self.rows()),
             live::terminal_columns(),
         );
         self.installed().is_some()
@@ -636,8 +850,9 @@ impl BridgeGuard {
         // emits the teardown alone). The only arm that needs its own
         // treatment is `Unchanged`, which must emit no bytes whatsoever.
         let plan = plan_resize(self.installed(), rows, viewport_rows);
-        self.rows.set(rows);
-        self.viewport_rows.set(viewport_rows);
+        self.rows.store(rows, std::sync::atomic::Ordering::Relaxed);
+        self.viewport_rows
+            .store(viewport_rows, std::sync::atomic::Ordering::Relaxed);
         if plan != ResizePlan::Unchanged {
             self.viewport.hide();
             self.viewport.show(rows, viewport_rows);
@@ -653,26 +868,8 @@ impl BridgeGuard {
     /// dimensions *is* whether a viewport is pinned, and there is no second
     /// flag that could contradict it.
     fn installed(&self) -> Option<(u16, u16)> {
-        let (rows, viewport_rows) = (self.rows.get(), self.viewport_rows.get());
+        let (rows, viewport_rows) = (self.rows(), self.viewport_rows());
         (rows >= viewport_rows.saturating_add(2)).then_some((rows, viewport_rows))
-    }
-
-    /// Finding F21, step 5: put back what [`release_for_suspend`] took, so the
-    /// round trip is indistinguishable from a fresh [`install`].
-    ///
-    /// [`release_for_suspend`]: Self::release_for_suspend
-    pub(crate) fn reinstall_after_resume(&self) {
-        // Exactly what [`install`] does after the geometry gate, in the same
-        // order and through the same two calls: re-latch and set the region,
-        // then paint the row. The geometry comes from the guard because
-        // `hide` took the surface's own copy (see [`rows`](Self::rows)), and
-        // the row is the *status* — the draft is the caller's to repaint when
-        // it re-enters the reader.
-        self.viewport
-            .show(self.rows.get(), self.viewport_rows.get());
-        let row = self.status_row();
-        self.viewport
-            .paint(std::slice::from_ref(&row), live::terminal_columns());
     }
 }
 
@@ -752,6 +949,203 @@ pub(crate) fn install_sigwinch_handler() {
     }
 }
 
+/// The byte string a dying signal handler writes, composed at compile time.
+///
+/// Exactly [`kitsu_tui::write_restore_sequences`]'s stream, in the same
+/// order (region reset, show cursor, bracketed paste off, title pop), spelled
+/// as one `const` so the handler performs **one** `write(2)` of a buffer it
+/// does not have to build. Composing it at run time would mean formatting or
+/// allocating inside a signal handler, which is exactly what is not allowed
+/// there -- and calling the helper itself is no better, because `io::Write`
+/// on `Stderr` takes a lock.
+const SIGNAL_RESTORE: &[u8] = b"\x1b[r\x1b[?25h\x1b[?2004l\x1b[23;2t";
+
+/// The signal kitsu is raising **on itself** right now, or `0`.
+///
+/// Set by [`raise_in_process`] around its `raise(2)` and read by the dying
+/// signal handler, which returns without doing anything when the two match.
+/// That is what keeps turn cancellation working: in raw mode `ISIG` is
+/// cleared, so Ctrl+C reaches the editor as a byte, and the during-turn
+/// collector re-raises the real `SIGINT` in-process precisely so the
+/// `tokio::signal::ctrl_c()` arm of the turn's `select!` fires. A handler
+/// that restored the terminal and died on *that* signal would turn every
+/// mid-turn Ctrl+C into an exit.
+///
+/// The flag needs no window of tolerance: `raise(2)` runs the handler
+/// synchronously on the raising thread before it returns, so the store, the
+/// handler's load and the clear are strictly ordered with no interleaving to
+/// reason about.
+static SELF_RAISED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The termios the terminal had before raw mode, if a raw guard is holding
+/// it, published for the dying signal handler.
+///
+/// `Drop` is what normally puts this back, and a signal is exactly the exit
+/// path `Drop` does not run on, so the snapshot has to be reachable from a
+/// handler -- which rules out a `Mutex` (locking is not async-signal-safe).
+/// An `UnsafeCell` behind a flag is the whole of the synchronisation, and it
+/// is sound here because the only writers are the raw guard's `engage` and
+/// `drop`, which run on one thread at a time and never while the handler is
+/// reading: the handler's reader is the same thread, interrupted.
+struct CanonicalTermios {
+    /// `MaybeUninit` because a `termios` has no const-constructible value and
+    /// `valid` already says whether this one has been written.
+    modes: std::cell::UnsafeCell<std::mem::MaybeUninit<libc::termios>>,
+    valid: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: see `CanonicalTermios`. Access is gated on `valid`, the writers are
+// the raw guard's engage/drop on a single thread, and the only other reader
+// is a signal handler running on a thread that is itself inside one of those
+// windows or outside both.
+unsafe impl Sync for CanonicalTermios {}
+
+static CANONICAL_TERMIOS: CanonicalTermios = CanonicalTermios {
+    modes: std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()),
+    valid: std::sync::atomic::AtomicBool::new(false),
+};
+
+/// Publish the pre-raw-mode termios snapshot for the dying signal handler.
+///
+/// Called by `RawStdinGuard::engage` with what `tcgetattr` returned, i.e.
+/// the modes a restore owes the terminal.
+pub(crate) fn publish_canonical_termios(modes: &libc::termios) {
+    // SAFETY: the flag is cleared first, so a handler that interrupts the
+    // copy reads nothing rather than a half-written struct.
+    CANONICAL_TERMIOS
+        .valid
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    unsafe { (*CANONICAL_TERMIOS.modes.get()).write(*modes) };
+    CANONICAL_TERMIOS
+        .valid
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Withdraw the snapshot: the raw guard has already restored it itself, so a
+/// handler must not `tcsetattr` a stale copy over whatever owns the terminal
+/// now (rustyline's readline, or an approval prompt).
+pub(crate) fn forget_canonical_termios() {
+    CANONICAL_TERMIOS
+        .valid
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Raise `signal` on this process with the dying-signal handler suppressed
+/// for the duration.
+///
+/// Every in-process `raise` kitsu performs is a *request* -- cancel the turn,
+/// suspend, quit -- addressed to a `select!` arm or to the signal's own
+/// default behaviour, never a terminal restore. See [`SELF_RAISED`].
+pub(crate) fn raise_in_process(signal: libc::c_int) {
+    SELF_RAISED.store(signal, std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: raising a signal on this process; the handlers reachable from
+    // here are this module's own and the runtime's.
+    unsafe { libc::raise(signal) };
+    SELF_RAISED.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Install the restore that runs on the exit paths `Drop` does not cover
+/// (requirement N5): a panic, `SIGINT` and `SIGTERM`.
+///
+/// # The panic path goes **through** `kitsu_tui::install_panic_restore`
+///
+/// Deliberately, and this is the only thing installed here that is not a
+/// `sigaction`. That helper *chains* the hook it finds rather than replacing
+/// it, and the hook it finds is `main`'s broken-pipe guard -- so after this
+/// call a panic runs the terminal restore, then the broken-pipe guard, then
+/// the default report. A hook installed here instead would have to replace
+/// one of those two, and replacing the guard would silently resurrect exit
+/// 101 on a closed stdout.
+///
+/// # The signal handler does not terminate by itself
+///
+/// It restores the terminal and then re-raises on the default disposition,
+/// which is what ends the session. It is inert for a signal kitsu raised on
+/// itself ([`SELF_RAISED`]), because that raise is how a turn is cancelled.
+///
+/// Installed once per process, and only by the inline path: classic mode
+/// pins no scroll region and holds raw mode only inside rustyline's own
+/// readline, so it has nothing here to give back and keeps the dispositions
+/// it was started with.
+pub(crate) fn install_exit_restore() {
+    /// Restore the terminal, then die the way the signal says.
+    ///
+    /// **Everything in here is async-signal-safe**, which is why it does not
+    /// reuse the panic helper's body: that one calls
+    /// `crossterm::terminal::disable_raw_mode` (a lock and an allocation) and
+    /// writes through `io::Write` on `Stderr` (a lock). What runs here is an
+    /// atomic load, one `write(2)` of a `const` buffer, `tcgetattr`-free
+    /// `tcsetattr` of an already-captured struct, `sigaction` and `raise` --
+    /// all on POSIX's async-signal-safe list, with no allocation, no locking
+    /// and no formatting.
+    extern "C" fn handler(signal: libc::c_int) {
+        if SELF_RAISED.load(std::sync::atomic::Ordering::SeqCst) == signal {
+            return;
+        }
+        // SAFETY: a single `write` of a `'static` buffer to a descriptor this
+        // process owns; a short write or an error is not worth handling while
+        // the process is dying.
+        unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                SIGNAL_RESTORE.as_ptr().cast::<libc::c_void>(),
+                SIGNAL_RESTORE.len(),
+            );
+        }
+        if CANONICAL_TERMIOS
+            .valid
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // SAFETY: `valid` says the cell holds a complete snapshot taken
+            // by `tcgetattr` on this very descriptor.
+            unsafe {
+                libc::tcsetattr(
+                    libc::STDIN_FILENO,
+                    libc::TCSANOW,
+                    (*CANONICAL_TERMIOS.modes.get()).as_ptr(),
+                );
+            }
+        }
+        // And now die as the signal says. Putting the default disposition
+        // back before re-raising is what makes this a restore rather than an
+        // exit: the process's status is the signal's, not an exit code this
+        // module invented, and a second delivery arriving mid-restore cannot
+        // loop through the handler again.
+        //
+        // SAFETY: a zeroed `sigaction` with `SIG_DFL`, an empty mask and no
+        // flags, followed by a raise on this process.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = libc::SIG_DFL;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+            libc::raise(signal);
+        }
+    }
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        kitsu_tui::install_panic_restore();
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            // SAFETY: a zeroed `sigaction` filled in before use, with a
+            // handler that is async-signal-safe (see above). `sa_flags = 0`
+            // for the same reason `install_sigwinch_handler` uses it: no
+            // `SA_RESTART`, so a signal arriving while the inline reader
+            // blocks in `read()` surfaces rather than being swallowed by a
+            // restarted syscall -- though here the handler never returns to
+            // that read anyway.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = handler as *const () as libc::sighandler_t;
+                action.sa_flags = 0;
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(signal, &action, std::ptr::null_mut());
+            }
+        }
+    });
+}
+
 impl Drop for BridgeGuard {
     /// Restore the previous surface **before** releasing the region, so the
     /// last bytes the viewport's descriptor sees are exactly the region reset
@@ -761,9 +1155,16 @@ impl Drop for BridgeGuard {
         // runs on another thread, so it must be unpublished before the region
         // is released rather than after.
         *lock(&STATUS_PAINTER) = None;
+        // Card T3-S7a: and the modal painter's handle, for the same reason --
+        // a late approval paint must not reach a released viewport.
+        *lock(&MODAL_PANE) = None;
         set_surface(self.previous_surface.clone());
         live::set_live_rows_enabled(self.previous_live_rows);
-        self.viewport.hide();
+        self.pane.viewport.hide();
+        // Last, because `live_mode` must not answer `classic` while a region
+        // is still pinned: the flag describes the terminal, so it is cleared
+        // only once the terminal has been given back.
+        INLINE_INSTALLED.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -922,6 +1323,16 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
                         changed = true;
                     }
                 }
+                // Ctrl+L (requirement R8): repaint the pinned row from the
+                // editor's unchanged state. Routed through the loop's own
+                // repaint rather than painting here so the row is composed
+                // exactly once per chunk and from the state the *whole*
+                // chunk left behind -- a paint inlined here would be
+                // overwritten by the one below whenever the same read also
+                // carried draft bytes. The editor reports `changed: false`
+                // (nothing about the draft changed), so this is the only
+                // thing that can answer the keystroke.
+                EditorAction::Redraw => changed = true,
                 // Ctrl+\ stays inert on purpose: its conventional action is to
                 // re-raise SIGQUIT, which terminates *and dumps core*, and this
                 // process holds API tokens and conversation text in memory --
@@ -1108,10 +1519,9 @@ mod tests {
     use serial_test::serial;
 
     use super::{
-        install, mode_from_value, palette_rows, suspend_and_resume, BridgeGuard, SuspendEffects,
-        TuiMode, PALETTE_MIN_ROWS,
+        install, palette_rows, suspend_and_resume, BridgeGuard, SuspendEffects,
+        TuiMode, PALETTE_MIN_ROWS, SIGNAL_RESTORE,
     };
-    use std::ffi::OsStr;
 
     /// A sink whose buffer outlives the surface that owns it, so bytes written
     /// through a `Box<dyn Write + Send>` stay observable after the surface is
@@ -1226,28 +1636,6 @@ mod tests {
             Box::new(err.clone()),
         );
         (guard, out, err)
-    }
-
-    /// Test 1. The gate's truth table, including the two cases that decide how
-    /// it fails: a different case and a trailing space are **Classic**, so the
-    /// match is byte-exact and a typo keeps the user in the renderer they
-    /// already had.
-    #[test]
-    fn mode_from_value_selects_inline_only_for_the_exact_value() {
-        assert!(matches!(
-            mode_from_value(Some(OsStr::new("inline"))),
-            TuiMode::Inline
-        ));
-
-        for value in [
-            "", "classic", "Inline", "INLINE", "inline ", " inline", "1", "true",
-        ] {
-            assert!(
-                matches!(mode_from_value(Some(OsStr::new(value))), TuiMode::Classic),
-                "{value:?} must fail closed to classic"
-            );
-        }
-        assert!(matches!(mode_from_value(None), TuiMode::Classic));
     }
 
     /// Test 2. Installing in inline mode writes the viewport's control bytes
@@ -4275,5 +4663,421 @@ mod tests {
             );
             drop(guard);
         }
+    }
+
+    /// Requirement N5, the wiring. Nothing in production installs any
+    /// restore for a signal today: the only `sigaction` this binary performs
+    /// is `SIGWINCH`'s, so `SIGINT` and `SIGTERM` are still at `SIG_DFL` and
+    /// the process dies without releasing the viewport.
+    ///
+    /// Asserted by **querying the disposition**, which is what makes this
+    /// non-vacuous without raising anything: `sigaction` with a null `act`
+    /// reports what is installed, and `SIG_DFL` is exactly the state that
+    /// kills the process before any restore can run. The test raises no
+    /// signal (that would terminate the test binary under the default
+    /// disposition it is checking for) and asserts no particular exit code,
+    /// which is the PTY tests' business.
+    ///
+    /// The panic half is **not** re-asserted here: chaining is pinned by
+    /// `kitsu_tui`'s own `install_panic_restore_chains_the_previous_hook`,
+    /// and the panic hook is process-global, so a second test that replaced
+    /// it would race the other 800-odd tests in this binary. What this test
+    /// does owe the reader is the requirement: `install_exit_restore` must
+    /// reach the panic path through that helper, not through a hook of its
+    /// own that drops `main`'s broken-pipe guard.
+    /// `SIGNAL_RESTORE` must be byte-identical to what
+    /// `kitsu_tui::write_restore_sequences` writes.
+    ///
+    /// The duplication is forced, not careless: a signal handler cannot write
+    /// through `io::Write` (it locks and may allocate), so the handler needs a
+    /// precomposed `const`. But two copies of one byte sequence with nothing
+    /// comparing them is this project's most-repeated defect shape -- F2's
+    /// suggester table, F38's four unchecked literals, F45's two vocabularies,
+    /// the `/agent` args string that was stale in three files at once. This
+    /// test is the comparison, so a sequence added to the helper and forgotten
+    /// here fails immediately instead of leaving a signal exit that restores
+    /// less than a panic does.
+    #[test]
+    fn the_handler_byte_string_equals_the_restore_helper_output() {
+        let mut helper = Vec::new();
+        kitsu_tui::write_restore_sequences(&mut helper).expect("writing into a Vec cannot fail");
+        assert_eq!(
+            SIGNAL_RESTORE,
+            helper.as_slice(),
+            "the handler's precomposed bytes and the restore helper have \
+             drifted: the handler writes {:?} but the helper writes {:?}",
+            String::from_utf8_lossy(SIGNAL_RESTORE),
+            String::from_utf8_lossy(&helper),
+        );
+    }
+
+    #[test]
+    fn install_exit_restore_takes_sigint_and_sigterm_off_the_default_disposition() {
+        fn handler_of(signal: libc::c_int) -> libc::sighandler_t {
+            // SAFETY: a query only -- null `act`, valid out-pointer.
+            unsafe {
+                let mut current: libc::sigaction = std::mem::zeroed();
+                assert_eq!(
+                    libc::sigaction(signal, std::ptr::null(), &mut current),
+                    0,
+                    "query the disposition of signal {signal}"
+                );
+                current.sa_sigaction
+            }
+        }
+
+        super::install_exit_restore();
+
+        for (signal, name) in [(libc::SIGINT, "SIGINT"), (libc::SIGTERM, "SIGTERM")] {
+            let installed = handler_of(signal);
+            assert_ne!(
+                installed,
+                libc::SIG_DFL,
+                "{name} must not be left at SIG_DFL: the default disposition \
+                 terminates the process before anything can release the \
+                 viewport's scroll region or restore termios"
+            );
+            assert_ne!(
+                installed,
+                libc::SIG_IGN,
+                "{name} must not be ignored either -- a signal that does \
+                 nothing is not a restore"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Card **T3-S12**: the status row's frame budget and `--reduced-motion`
+    // (notes **N3** and **N9**).
+    //
+    // **FAILING-FIRST.** Both measurements below were taken on this tree
+    // before a line of them was written, with a throwaway probe in this very
+    // module, and both are reported here as numbers rather than as beliefs
+    // (F43/F47):
+    //
+    // * **Reduced motion is ignored by the painter.** With
+    //   `configure_terminal_modes(false, true, false)` in force, a turn
+    //   running and *nothing changed but the clock*, `repaint_status_row`
+    //   emitted a full row paint one second later:
+    //   `ESC[24;1H ESC[2K example-model-v1 · ■□□□□□□□ 1% · 2s ESC[23;1H`.
+    //   That is N9's "periodic age refresh", still refreshing. The code path
+    //   is `repaint_status_row` -> `StatusSource::compose` ->
+    //   `StatusSource::fields`, whose `elapsed` is
+    //   `turn_start.map(Instant::elapsed)`; nothing between the flag and the
+    //   row consults `reduced_motion`, and the dedupe in `repaint_status_row`
+    //   compares *composed rows*, so a row whose only changed segment is
+    //   elapsed is a changed row.
+    //
+    // * **The 60 fps budget is a property of the caller, not of the
+    //   painter.** `run_live_typeahead` calls the painter on a 50 ms
+    //   `libc::poll` tick (20 fps), and T3-S5b's dedupe suppresses an
+    //   unchanged row, so in production the budget holds. It does **not**
+    //   hold of `repaint_status_row` itself: a loop that changed one
+    //   non-elapsed field (the queue depth) on every call produced **54003
+    //   paints in 209 ms**, about 258 000 fps, because the dedupe only ever
+    //   catches a byte-identical row. N3 asks for coalescing, and coalescing
+    //   that lives in the caller's sleep is coalescing only for as long as
+    //   nobody adds a second caller -- which this epic has already done once
+    //   (the approval modal, T3-S7a, paints the same row through
+    //   `clear_approval_modal`).
+    //
+    // What these tests deliberately do **not** pin:
+    //
+    // * **Synchronized output (`CSI ?2026 h/l`) is deferred**, and
+    //   [`synchronized_output_is_not_emitted_until_a_capability_probe_exists`]
+    //   pins the deferral rather than the feature. Reason: the only in-band
+    //   way to learn whether a terminal implements mode 2026 is DECRQM
+    //   (`CSI ?2026$p`) and then *reading a reply* on stdin -- and stdin here
+    //   is owned by `run_live_typeahead`'s raw-mode poll loop, which is also
+    //   serving approval reads (T3-S7b). A probe that waits for a report it
+    //   may never get is a hang; a probe with a timeout is a sleep on the
+    //   first frame; and emitting the mode unconditionally leaves `?2026h` as
+    //   visible garbage on a terminal that does not know it. Until the
+    //   reader can be asked for a DECRPM reply, the honest state is: do not
+    //   emit it. The row is one line, so tearing is not a live defect.
+    // * The agent and queue tags under reduced motion. They are **state**,
+    //   not animation: `[2 blocked]` appearing is an event the user must act
+    //   on, and N9 names only the spinner, counter flashes and the periodic
+    //   age refresh. Suppressing them would hide a blocked agent, so the
+    //   reduced-motion test's positive control is precisely that a queue-depth
+    //   change still repaints.
+    // ---------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{repaint_status_row, StatusCounts, StatusSource};
+
+    /// Process-wide reduced-motion override, restored on the way out.
+    ///
+    /// `kitsu_render` exposes a setter and no getter, and this binary's only
+    /// other caller of `configure_terminal_modes` is `main` (which never runs
+    /// under `cargo test`), so the value to restore is the documented default:
+    /// every flag off. Tests that use this are `#[serial]` for the same reason
+    /// the surface slot's tests are.
+    struct ReducedMotion;
+
+    impl ReducedMotion {
+        fn on() -> Self {
+            kitsu_render::configure_terminal_modes(false, true, false);
+            Self
+        }
+
+        fn off() {
+            kitsu_render::configure_terminal_modes(false, false, false);
+        }
+    }
+
+    impl Drop for ReducedMotion {
+        fn drop(&mut self) {
+            Self::off();
+        }
+    }
+
+    /// The viewport geometry these tests install over: a 24-row terminal with
+    /// one pinned row, so the row is 24 and the park row is 23.
+    const T3_S12_ROWS: u16 = 24;
+    const T3_S12_VIEWPORT_ROWS: u16 = 1;
+
+    /// The prefix `InlineSurface::paint` writes once per painted row --
+    /// absolute position then erase-line -- derived from
+    /// [`expected_status_paint`] rather than retyped, so counting these counts
+    /// frames.
+    fn paint_marker() -> String {
+        let painted = expected_status_paint(T3_S12_ROWS, T3_S12_VIEWPORT_ROWS, "");
+        let park = format!("\x1b[{};1H", T3_S12_ROWS - T3_S12_VIEWPORT_ROWS);
+        painted
+            .strip_suffix(&park)
+            .expect("a one-row paint ends by parking the cursor")
+            .to_string()
+    }
+
+    /// How many row paints `text` contains.
+    fn row_paints(text: &str) -> usize {
+        text.matches(&paint_marker()).count()
+    }
+
+    /// A live status row installed over a 24x1 inline viewport, with a
+    /// turn running and a queue depth the test can move.
+    ///
+    /// Returns the guard, the stderr sink, the source and the queue-depth
+    /// cell. The usage numbers are the PTY suite's own fixture model and a
+    /// realistic window, so the composed row is a real sample.
+    fn live_status_fixture() -> (BridgeGuard, SharedSink, Arc<StatusSource>, Arc<AtomicUsize>) {
+        let (guard, _out, err) = install_inline(T3_S12_ROWS, T3_S12_VIEWPORT_ROWS, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let queued = Arc::new(AtomicUsize::new(0));
+        let cell = queued.clone();
+        let source = StatusSource::new(Box::new(move || StatusCounts {
+            queued: cell.load(Ordering::Relaxed),
+            blocked: 0,
+            running: 0,
+        }));
+        source.set_usage("example-model-v1", 1_000, 100_000);
+        guard.enable_live_status(source.clone());
+        source.begin_turn();
+        (guard, err, source, queued)
+    }
+
+    /// Note **N9**, both halves, in one test because the second is what keeps
+    /// the first from being satisfied by an over-broad fix.
+    ///
+    /// 1. **Under `--reduced-motion` the row does not repaint merely because
+    ///    time passed.** A second and a bit elapses with every field but the
+    ///    clock untouched, and the painter writes **nothing**.
+    /// 2. **It still repaints on a real state change.** The queue depth moves
+    ///    from 0 to 3 and the row is painted, carrying `[3 queued]`. A fix
+    ///    that froze the row outright would hide a blocked agent, which is the
+    ///    opposite of what N9 asks for.
+    ///
+    /// Half 1 is a negative assertion, so the test carries its own control
+    /// (the eight-finding family): with reduced motion **off**, the same
+    /// sleep and the same pair of calls *do* produce a paint, which proves the
+    /// sleep really crosses a one-second boundary and the row really would
+    /// have changed. Without that control, "nothing was emitted" could mean
+    /// nothing was ever wired.
+    #[test]
+    #[serial]
+    fn reduced_motion_suppresses_the_elapsed_tick_but_not_a_state_change() {
+        let _state = GlobalState::capture();
+        let _motion = ReducedMotion::on();
+        let (guard, err, _source, queued) = live_status_fixture();
+
+        // Establish a painted row, then let only the clock move.
+        repaint_status_row();
+        let before = err.text().len();
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        repaint_status_row();
+        let window = err.text()[before..].to_string();
+        assert_eq!(
+            window,
+            "",
+            "under --reduced-motion the row must not repaint because a second \
+             passed (N9's periodic age refresh), got {:?}",
+            window.escape_debug().to_string()
+        );
+
+        // Half 2: a real state change still reaches the screen.
+        let before = err.text().len();
+        queued.store(3, Ordering::Relaxed);
+        repaint_status_row();
+        let window = err.text()[before..].to_string();
+        assert_eq!(
+            row_paints(&window),
+            1,
+            "a queue-depth change is state, not animation, and must still \
+             paint exactly once, got {:?}",
+            window.escape_debug().to_string()
+        );
+        let visible = kitsu_render::sanitize_terminal_text(&window);
+        assert!(
+            visible.contains("[3 queued]"),
+            "and the painted row must carry the new depth, got {visible:?}"
+        );
+        assert!(
+            visible.contains("example-model-v1"),
+            "and still be the status row, got {visible:?}"
+        );
+
+        // The control: the same wait, the same two calls, reduced motion off.
+        ReducedMotion::off();
+        repaint_status_row();
+        let before = err.text().len();
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        repaint_status_row();
+        let window = err.text()[before..].to_string();
+        assert_eq!(
+            row_paints(&window),
+            1,
+            "control: with motion allowed the elapsed tick must paint, so the \
+             assertion above is about the flag and not about dead wiring, got \
+             {:?}",
+            window.escape_debug().to_string()
+        );
+        drop(guard);
+    }
+
+    /// Note **N3**'s frame budget, measured at the painter rather than at its
+    /// caller: **no more than 60 row paints per second**, however often
+    /// `repaint_status_row` is called and however often the fields move.
+    ///
+    /// The budget is computed from the window this loop actually occupied, not
+    /// from a magic number: 60 fps allows `ceil(seconds * 60)` frames, plus
+    /// one for the frame at the window's start, which is owed immediately
+    /// (a rate limiter that made the *first* frame wait would show a stale row
+    /// for 16 ms on every keystroke).
+    ///
+    /// Three positive controls, so neither half can pass vacuously:
+    ///
+    /// * the loop really churned (thousands of calls, every one of them with
+    ///   a different queue depth than the last);
+    /// * at least one frame got through, so the budget is not satisfied by
+    ///   painting nothing;
+    /// * **the last value is not lost.** Coalescing may drop intermediate
+    ///   frames; it may not leave the final state unpainted. After the churn
+    ///   the depth is set once more and the painter is given a tick's worth of
+    ///   wall clock and a further call, after which the screen must carry it.
+    #[test]
+    #[serial]
+    fn status_row_paints_stay_inside_the_sixty_frame_budget() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, _source, queued) = live_status_fixture();
+
+        let before = err.text().len();
+        let start = std::time::Instant::now();
+        let mut calls = 0usize;
+        while start.elapsed() < std::time::Duration::from_millis(250) {
+            // Alternate between two depths: each call composes a row that
+            // differs from the one before, so T3-S5b's byte-identity dedupe
+            // can never be what holds the rate down.
+            queued.store(calls % 2, Ordering::Relaxed);
+            repaint_status_row();
+            calls += 1;
+        }
+        let window_secs = start.elapsed().as_secs_f64();
+        let window = err.text()[before..].to_string();
+        let painted = row_paints(&window);
+        let allowed = (window_secs * 60.0).ceil() as usize + 1;
+
+        assert!(
+            calls > 1_000,
+            "control: the loop must really churn, got {calls} calls in \
+             {window_secs:.3}s"
+        );
+        assert!(
+            painted >= 1,
+            "control: the budget must be met by coalescing, not by painting \
+             nothing -- {calls} calls produced no frame at all"
+        );
+        assert!(
+            painted <= allowed,
+            "N3: {painted} row paints in {window_secs:.3}s exceeds 60 fps \
+             ({allowed} allowed); {calls} calls"
+        );
+
+        // And the last state is not lost to the coalescing.
+        queued.store(7, Ordering::Relaxed);
+        repaint_status_row();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        repaint_status_row();
+        let visible = kitsu_render::sanitize_terminal_text(&err.text());
+        assert!(
+            visible.contains("[7 queued]"),
+            "coalescing may drop intermediate frames but must not leave the \
+             final state unpainted; screen bytes: {:?}",
+            err.text().escape_debug().to_string()
+        );
+        drop(guard);
+    }
+
+    /// Note **N3**'s synchronized-output clause, **deferred on purpose**: no
+    /// paint may emit `CSI ?2026 h` or `l` until something can establish that
+    /// the terminal implements the mode.
+    ///
+    /// This is not a style ban (F41) -- it is the byte-level contract of the
+    /// deferral argued at the top of this block: mode 2026 can only be
+    /// detected by a DECRQM report read from stdin, stdin belongs to the
+    /// type-ahead loop, and a terminal that does not implement the mode shows
+    /// the sequence instead of obeying it. Emitting it blind is the one
+    /// outcome worse than not having it. When a probe exists, the test to
+    /// write is "the mode is emitted *after* a positive DECRPM report and
+    /// never without one", and this test is what that one replaces.
+    ///
+    /// Positive controls: the same stream must contain the viewport's region
+    /// and at least two row paints, so the absence is an absence in a stream
+    /// that was really written.
+    #[test]
+    #[serial]
+    fn synchronized_output_is_not_emitted_until_a_capability_probe_exists() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, _source, queued) = live_status_fixture();
+
+        repaint_status_row();
+        queued.store(2, Ordering::Relaxed);
+        repaint_status_row();
+        let text = err.text();
+
+        assert!(
+            row_paints(&text) >= 2,
+            "control: the session must really have painted rows, got {:?}",
+            text.escape_debug().to_string()
+        );
+        assert!(
+            text.contains(&expected_show(T3_S12_ROWS, T3_S12_VIEWPORT_ROWS)),
+            "control: and really have pinned the viewport, got {:?}",
+            text.escape_debug().to_string()
+        );
+        for mode in ["\x1b[?2026h", "\x1b[?2026l"] {
+            assert_eq!(
+                text.matches(mode).count(),
+                0,
+                "synchronized output is deferred until a capability probe \
+                 exists: {:?} must not be emitted; stream {:?}",
+                mode.escape_debug().to_string(),
+                text.escape_debug().to_string()
+            );
+        }
+        drop(guard);
     }
 }

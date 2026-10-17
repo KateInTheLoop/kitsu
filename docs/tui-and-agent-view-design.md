@@ -1,6 +1,6 @@
 # Kitsu TUI and agent view — design and requirements
 
-- **Status:** Draft v2.1 (revised after reviews `reviews/tui-design-review-1.md`
+- **Status:** **Implemented through milestone T3** (T3-S13). Requirements R1-R5, R7, R8, N2-N5, N8, N9 and B1-B5 are shipped or amended in place with the reason; R6 (transcript overlay), A1-A8 (the agent view) and the `fullscreen` renderer remain for T4 and T5. **Q1's live terminal matrix is still unrun and gates making `inline` a default rather than an opt-in.** Previously: Draft v2.1 (revised after reviews `reviews/tui-design-review-1.md`
   and `reviews/tui-plan-review-1.md`)
 - **Date:** 2026-10-12
 - **Branch:** `features/tui_herdr_improvements`
@@ -200,6 +200,35 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
 - **R2** `/tui [classic|inline|fullscreen]` MUST switch at runtime without
   losing the conversation; `--tui <mode>` and `[tui] mode` in `kitsu.toml`
   set the start mode.
+
+  **Completed in T3-S9, which decided three things R2 left open.** All three are
+  user-visible rules, not implementation details, so they belong here:
+  - **`fullscreen` is refused** until T5's renderer exists, naming what is
+    accepted — `/tui fullscreen is not available yet; accepted: classic,
+    inline` — the same vocabulary `[tui] mode`'s error uses. A value that
+    parsed and silently behaved as `inline` is the quiet coercion this epic has
+    refused everywhere else.
+  - **Mid-turn `/tui` is refused**, not queued and not deferred to the turn
+    boundary. The reason is specific: the mid-turn dispatcher's default
+    fall-through **enqueues the line as a future prompt to the model**, so an
+    unhandled `/tui inline` would be *sent to the model as text* — see **F57**.
+    A swap landing silently seconds later is also indistinguishable from the one
+    the user would get by retyping.
+  - **Bare `/tui` reports the live renderer**, doubling as the usage line, and
+    must track the renderer actually running rather than the start mode.
+
+  **A switch is narrated** (`~ switched to the … renderer; the conversation is
+  unchanged`), because R2's guarantee is that the conversation survives and a
+  silent switch leaves the user unable to tell a working switch from a lost one.
+  Switching into a terminal too short for the viewport's minimum height stays
+  classic and says so; geometry is re-probed on every install, since no viewport
+  listens for resize during a classic segment.
+
+  **"Classic is byte-identical" is scoped to sessions that never switched.**
+  Once any inline segment has existed, the signal restore installed with it
+  (N5) stays registered for the life of the process, so a later `SIGINT` writes
+  a region reset even in classic. That is harmless — it is a reset of a region
+  nothing has pinned — but it is not byte-identity.
 - **R3** In `inline` mode every finished transcript cell MUST be written to
   native scrollback exactly once, on the **same fd** `classic` uses (assistant
   text → stdout, receipts/notices → stderr), as the same text, so per fd
@@ -256,6 +285,49 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   with the same `[y] allow once · [a] always (<dir>) · [n] deny` option line
   (command approvals keep their provenance rows) and the same `◉ permission —`
   text in the transcript receipt afterwards.
+
+  **Clarified in T3-S7a, after implementing it.** The "receipt afterwards" is
+  **new behaviour in the viewport only, and that is not a parity break.** In
+  `classic` the prompt *is* the transcript line: it is printed into the scroll
+  region and stays there, so the record already exists. The pane modal is
+  **transient**, so the viewport must author a receipt to leave the same trace
+  classic leaves by accident of where it prints. Classic's bytes are therefore
+  unchanged, and a test pins that it emits exactly one `◉ permission —` line per
+  approval.
+
+  Ordering matters and is easy to get wrong: **the receipt must be written
+  before the modal is cleared.** A transcript line is text plus CRLF with no
+  addressing, so it lands at the parked cursor; tearing the modal down first
+  re-parks the cursor and the receipt is glued to the status row instead of
+  following the newline the kernel echoed with the answer.
+
+  **Where the answer is read, added in T3-S7b.** Where a pane is published the
+  answer is read **in-loop**, on the keypress, while the input collector still
+  holds its raw-mode guard — so the kernel echoes nothing and the answer never
+  reaches the transcript — and the `> ` cue is painted as a row of the modal.
+  Where no pane is published the read stays **canonical with echo**, which
+  classic and `--plain` rely on for line editing, backspace and the `yes` /
+  `always` / `no` long forms. That asymmetry is a **stated contract**, not an
+  implementation detail: a test pins that classic still echoes the answer into
+  its transcript, which is what catches a bypass that reaches too far.
+
+  Two consequences of the in-loop read, both deliberate: the long forms are
+  **unreachable by keypress** in the viewport (they remain available in classic
+  and in `/jobs reply`, which share the one parser), and a **bracketed paste**
+  at a viewport approval begins with `ESC`, which the parser rejects — so a
+  pasted answer is **denied** rather than accepted. Failing closed is the right
+  direction for a permission prompt, but it is a behaviour difference worth
+  knowing.
+
+  **`--plain` is excluded.** The plain prompter has its own unstyled text
+  (`permission> …`) and `--plain` is a **byte-contract tier**, so routing it
+  through the shared modal composer would change bytes that other requirements
+  promise are stable. `--plain --tui inline` is reachable today — the viewport
+  installs on `mode` alone, not on styling — and in that combination the prompt
+  stays on stderr and **R7 is not satisfied**. See **F53**: the better fix is
+  probably for `--plain` to resolve to `classic` rather than for the plain
+  prompter to grow a modal, but that is a mode-resolution decision and not R7's
+  to make.
 - **R8** `Ctrl+L` MUST repaint. Resize MUST reflow the viewport without
   duplicating history lines.
 
@@ -398,14 +470,133 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   Measured by a benchmark, not a CI gate (see Stage 2).
 - **N3** Frame budget: coalesce redraws to ≤ 60 fps; use synchronized output
   (`CSI ?2026 h/l`) when the terminal supports it; never redraw history.
+
+  **Amended in T3-S12 on two points, because the original said what but not
+  where.**
+
+  **(a) The budget is enforced in the painter, not inherited from a caller.**
+  Before this card it held only because one caller slept 50 ms between ticks.
+  Measured: a loop moving a single **non-elapsed** field defeated the
+  byte-identity dedupe entirely and reached roughly **109 000 frames per second
+  in debug and 400 000 in release**. After the fix both profiles sit flat at
+  **60**. That matters because the epic had already grown a **second** author of
+  this row (`clear_approval_modal`), and a budget that lives in one caller's
+  sleep is not a budget.
+
+  **Coalescing means collapse the intermediate frames and keep the latest —
+  never discard what arrived during the window.** The implementation records the
+  dedupe key only when it actually paints, so a suppressed call consumes
+  nothing and the next call past the window recomposes from the fields **as they
+  stand then**. Nothing is latched and no timer thread exists. The dedupe is
+  checked **before** the window, so an unchanged row still costs zero bytes and
+  does not burn a frame.
+
+  **(b) Synchronized output is DEFERRED, with the reason recorded.** Mode 2026
+  can only be detected in band with DECRQM and **reading the reply on stdin** —
+  which the input loop owns in raw mode while also serving approval reads. A
+  probe that waits for a report that may never arrive is a **hang**; with a
+  timeout it is a **sleep on the first frame**; emitting the mode blind leaves
+  `?2026h` as **visible garbage** on terminals that do not implement it. The row
+  is one line, so tearing is not a live defect. Two tests pin that the bytes are
+  **never emitted**, each documenting the test to write once a probe exists:
+  emitted after a positive report, never without one.
 - **N4** Memory in `fullscreen` MUST be bounded by a configurable **cell
   ring** (default 10 000 lines, oldest evicted), not by conversation length.
   Kitsu persists only `messages`, so the ring is the sole source for the
   transcript overlay and the `[` dump; evicted content is reachable through
   `/export`.
+
+  **Amended in T3-S6, because the original wording overpromised.** The bound is
+  in **lines, not bytes.** Ten thousand lines of unbounded length is unbounded
+  memory, so "memory MUST be bounded" was true only under an assumption about
+  line length that nothing enforces. A single pathological line — a model
+  emitting one enormous unbroken row — still costs whatever it costs. Closing
+  that would need a per-line byte clamp, which **truncates content the ring is
+  the only copy of**, so it is a deliberate trade and not an oversight to be
+  quietly patched. See **F52**.
+
+  **A stored line is the surface's bytes verbatim, styling included**, with the
+  stripped form derived on demand. The overlay repaints these rows, so storing
+  stripped text would silently decolour it; and since the ring is the only copy,
+  styling can be stripped later but never reconstructed. The `--plain` tier's
+  structural-marker substitution is **not** applied at storage — it is an output
+  transform, not a storage one.
+
+  **The ring is an opt-in field on the TUI backend, not a process global**, and
+  `classic` cannot construct one: the renderer crate has no dependency path to
+  the viewport crate, which makes "classic pays nothing for this" a
+  **compile-time** property rather than a runtime guard. The ring is therefore
+  **not fed in production until R6's overlay reads it** — feeding an unread ring
+  would spend up to ten thousand styled lines of memory for no benefit.
+
+  **The limitation list, added in T3-S10, in descending severity.** N4 calls the
+  ring "the sole source"; these are the ways that is not yet literally true.
+
+  1. **Output that bypasses the surface is permanently absent from the ring, and
+     this is accepted.** There are **421** direct `eprintln!`/`println!` sites in
+     `main.rs`: about **251** are chat-path output a user could reasonably expect
+     in the overlay (`handle_slash` 114, `run_chat` 100, `handle_jobs_command`
+     37), and about **132** are on paths where no viewport can exist at all (the
+     subcommands and scripted runners), so those can never be a gap. **F17**
+     established this is visually harmless — a direct write inherits the parked
+     cursor and the terminal scrolls the region whoever wrote the bytes — so it
+     is a **data-completeness** gap, not a corruption one. `/export` is the route
+     to what the overlay cannot show, the same escape hatch this requirement
+     already names for evicted content.
+
+     **No test asserts the count**, deliberately: a `== 421` assertion fails on
+     every new diagnostic, which is noise rather than protection, and it would
+     make the 132 irrelevant sites indistinguishable from the 251 that matter.
+     The number belongs here; the test belongs on the mechanism.
+
+     The cheap lever, when R6 gives completeness a reader, is to **wrap the slash
+     dispatcher** — one site covering 114 of them — and it should be spent then.
+
+  2. **A block that ends without a newline is retained as a short ring line**,
+     not held back until terminated. The ring is the sole record, so holding a
+     partial back means text already on the terminal is missing from the overlay,
+     and a final partial never terminated would be lost permanently — exactly
+     the shape of **F47**. Retaining it short can split one logical line into two
+     entries: visible, recoverable, never lost.
+
+  3. **(Fixed in T3-S10, recorded because it was nearly shipped.)**
+     `write_block` went *through* the seam and fed the ring **nothing**, because
+     it overrides a trait default that would have forwarded each line to the fed
+     path. It carries the **streamed assistant reply** and every `! error:`
+     notice, so the ring would have held every tool line and no assistant text —
+     the exact inverse of the gap anyone was looking for.
 - **N5** Terminal restore MUST happen on every exit path including panics and
   `SIGINT` (raw mode off, alt screen left, bracketed paste off, title reset).
-  Known today: `kill -9` mid-turn leaves raw mode; the TUI must not add paths.
+
+  **Amended in T3-S8, because the "known today" note understated it.** Before
+  this card, `SIGINT`, `SIGTERM` and a panic left the viewport's **DECSTBM
+  scroll region pinned** — worse than leaving raw mode, because the terminal
+  stays visually broken until `reset`. `kill -9` remains the one path that
+  cannot restore, by definition. The restore now runs from a signal handler
+  that performs **one `write(2)` of a precomposed `const`** plus a `tcsetattr`
+  of a snapshot captured when raw mode was entered — both async-signal-safe —
+  and then puts the default disposition back and re-raises, so the process dies
+  **by the signal** rather than by an exit code this module invented.
+
+  **The handler must not terminate, and that is a hard constraint, not a
+  style.** In raw mode Ctrl+C reaches the editor as a byte and the during-turn
+  collector **re-raises `SIGINT` in-process** so the turn is cancelled; tokio's
+  `ctrl_c()` goes through a registry whose handler **chains to the previously
+  installed one**, so a restore-and-exit handler would be invoked on every
+  in-turn cancellation and kill the session mid-cancel. A flag records the
+  signal kitsu raises on itself, and the handler is inert for it — sound with no
+  tolerance window, because `raise(2)` runs the handler synchronously on the
+  raising thread.
+
+  **Two clauses of this requirement are vacuous today, not met.** The alt-screen
+  and window-title clauses describe a runtime (`kitsu_tui::TuiRuntime`) that has
+  **no caller in the binary**, so nothing pushes a title or enters the alt
+  screen and nothing has to restore them. A test asserting their restore would
+  pass by construction, which is why none was written. They become real when
+  T5's fullscreen renderer uses that runtime.
+
+  The restore is installed **only in the viewport**, so classic keeps the signal
+  dispositions it started with.
 - **N6** Works under tmux, zellij, screen, Windows Terminal; `inline` degrades
   to `fullscreen` where DEC scroll regions misbehave (Codex's Windows
   fallback); `--no-alt-screen` forces `inline`.
@@ -437,6 +628,23 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   definition, `cli.rs`); there it disables spinner animation, counter flashes,
   and periodic age refresh. Its output is not covered by N1's byte-identical
   rule.
+
+  **Clarified in T3-S12, because this listed what stops and not what must
+  keep going.** "Static" must not be read as "frozen". Under reduced motion the
+  status row **does not repaint merely because time passed** — the elapsed
+  segment's periodic refresh is the animation this requirement names. But the
+  **queue tag and the ambient agent tag keep updating**, because those are
+  **state, not animation**: `[2 blocked]` appearing is an event the user must
+  act on, and suppressing it to make the row quiet would hide a blocked agent —
+  defeating the very affordance R5 and A8 exist for.
+
+  The implementation draws that line in the **dedupe key** rather than in what
+  is painted: the key is the row recomposed with `elapsed: None`, so a
+  clock-only change compares equal and no paint follows, while every other field
+  still changes the key. The bytes written are always the real row **including**
+  elapsed, so when a state change does paint, the age shown is current rather
+  than stale by construction. **Reduced motion removes the periodic refresh, not
+  the field.**
 
 ---
 
