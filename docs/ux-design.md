@@ -140,6 +140,90 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   rather than re-raising `SIGINT`, because at an idle prompt there is no turn to
   cancel and the raise would take the default disposition and exit.
 
+  **The slash-command palette** sits above the composer whenever the draft is a
+  bare single-token slash prefix. It is the **same renderer** the classic
+  Rustyline prompt uses — one function owns the labels, both frame sets, the
+  entry formatting, the row cap and the "N more" row — so the two surfaces
+  cannot drift; a test asserts the inline rows equal the classic output. The
+  composer is always the **last** row, the palette above it.
+
+  It is **built to the height it will be granted**, never built full and then
+  clipped: clipping would drop the top row, which is the frame and its label,
+  leaving a box with no lid. On a short window the box is simply smaller, with
+  fewer entries and an honest "N more" count that reflects what the *height*
+  hid, not only the row cap. Below three rows of palette plus one of composer
+  there is no palette at all rather than a partial frame.
+
+  The palette stands down in two cases: when the draft is not a bare
+  single-token slash prefix, and when the prefix is already a command's whole
+  name, since there is nothing left to offer.
+
+  **Completions at the idle prompt rank by registry order**, which is what makes
+  those two cases sufficient: the hint, the text Tab inserts and the palette's
+  lead entry are the same completion by construction, so the palette can never
+  contradict the row it sits above. The **during-turn** row ranks differently
+  and deliberately — commands that act on the running turn come first there,
+  because they are the ones usable at that moment. The two policies are separate
+  named functions rather than one with a flag, so a call site declares which it
+  wants and cannot inherit the wrong one silently. (A third stand-down case
+  existed briefly, hiding the palette when a hint disagreed with it; it was a
+  symptom of the idle prompt having inherited the during-turn ranking, and went
+  away with the cause.)
+
+  When a prefix is already the lead entry's whole name the hint is **empty**
+  rather than completing a longer sibling — typing `/agent` suggests nothing
+  even though `/agents` exists, because the hint's job is to complete the entry
+  the palette leads with.
+
+  Every keystroke repaints **every** pinned row, not just the composer —
+  otherwise the palette above would show matches for a prefix already changed.
+
+  **The viewport's height follows its content, clamped to what the window can
+  hold.** A caller hands over the rows it wants drawn and the viewport becomes
+  that tall, re-latching the region on each change — the same operation a
+  terminal resize performs. The ceiling is the minimum-height rule: two
+  scrolling rows must remain above the viewport, so a request taller than that
+  is **shortened rather than refused**, because a palette too tall for the
+  window should lose rows, not take the composer down with it. Refusing is
+  reserved for a window so short that not even one row can be pinned.
+
+  When rows must be dropped, **the topmost go first**: the composer is the
+  bottom row and the palette sits above it, so the row being typed into is the
+  last thing lost. The count drawn always equals the latched height — extra rows
+  would land inside the scroll region and scroll away with the transcript, which
+  looks like a vanishing palette rather than an off-by-one.
+
+  **Rows are fitted to the terminal's width before they are drawn.** A pinned
+  row wider than the terminal would wrap into the row below it and overwrite
+  it — harmless with one row, corrupting with several, which is why this is
+  settled before the composer grows. Fitting is escape-aware and shares the
+  renderer's own width primitives: escape sequences cost zero columns, a wide
+  character costs two and is never split across the boundary, and a row that
+  already fits is passed through **byte-identically** so the output tiers stay
+  byte-comparable. A truncated row that carried colour or attributes gets one
+  reset appended so its styling cannot bleed into whatever is drawn next;
+  a truncated plain row stays plain.
+
+  **Resize re-pins the viewport, and releases it when the terminal is too
+  short.** `DECSTBM` margins are absolute row numbers, so a resized window
+  invalidates them: the region must be re-set rather than patched. A `SIGWINCH`
+  handler stores into one atomic flag — the only async-signal-safe action
+  available to it — and the reader, whose blocking read the signal interrupts,
+  checks the flag on waking, re-latches the geometry and repaints the live
+  draft (not the status, since a resize happens mid-read). A resize to the same
+  dimensions emits nothing, so a spurious signal cannot flicker the row.
+
+  Re-latching is the same pair of operations as a suspend/resume at new
+  dimensions, minus the paint, which is why all four cases — grow, shrink,
+  release, re-install — fall out of one hide-then-show sequence: `hide` is inert
+  with no latched geometry and `show` is inert below the minimum height. That
+  minimum is the same bound the renderer uses at startup: a terminal must hold
+  at least two scrolling rows above the viewport, because the region's bottom
+  margin has to exceed its top. **Crossing that bound downward releases the
+  viewport entirely** — region reset, rows cleared, nothing pinned — rather than
+  keeping a region whose margins no longer fit the screen; crossing back up
+  re-installs it.
+
   **Suspension releases the terminal before stopping.** Ctrl+Z at the inline
   prompt clears the pinned rows, releases the scroll region and restores
   canonical terminal modes, *then* raises the stop signal, so the shell is
@@ -171,12 +255,23 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   before the draft is windowed, so it survives a long draft, while the
   completion suffix is unreserved and is dropped when the row is too narrow.
 
-  Still absent at the inline prompt, and **separate pieces of work rather than
-  one** — an earlier version of this file wrongly said a single seam change
-  covered them: **Tab completion**, which needs the reader to act on the
-  editor's completion request rather than drop it, and **the bordered
-  slash-command palette**, which lists and filters commands over several rows
-  and so needs a viewport taller than one row.
+  **Tab accepts the hint**, which is parity with the during-turn row and the
+  same seven-line behaviour: take the draft, compute the slash-completion
+  suffix, and append it if one is showing. Two details are load-bearing. The
+  suffix is recomputed from the draft rather than read back out of the hint
+  slot, because the slot holds the *search status* while Ctrl+R is armed and
+  appending that would type `⌕ reverse-search '…'` into the prompt — reachable,
+  not theoretical, since actions are handled after a whole read completes and a
+  later Ctrl+R in the same read can arm the status first. And a search is not
+  special-cased: the editor treats any control key in search mode as accept,
+  exit, re-feed, so by the time Tab is seen the draft is the matched history
+  line and no slash hint applies.
+
+  Still absent at the inline prompt: Rustyline's completion **lists** — `@file`
+  path completion and the bordered slash-command palette, which lists and
+  filters commands over several rows and so needs a viewport taller than one
+  row. (An earlier version of this file wrongly bundled Tab in with those; it
+  is a hint, they are lists, and only the lists need the extra rows.)
 
   Tiering is unchanged: the viewport requires a styled interactive TTY, so
   non-TTY, `--plain`, assistive and JSONL sessions never enter it and stay

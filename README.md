@@ -1160,15 +1160,20 @@ trailing space leave you in the renderer you already had. The variable is
 unset by default and a session without it is byte-identical to one from before
 the viewport existed.
 
-It is a preview, and the idle prompt inside it is kitsu's own editor rather
-than Rustyline, so it does not yet have Tab completion or the bordered
-slash-command palette that lists and filters commands as you type. Command
-history **does** persist across sessions, and Ctrl+R reverse search works.
-What it does have:
+It is a preview, but the idle prompt inside it now has most of what the classic
+one does, built on kitsu's own editor rather than Rustyline: command history
+persists across sessions, Ctrl+R reverse search works, Tab completes a slash
+command from the hint beside your draft, and typing a slash prefix opens the
+**bordered command palette** above the composer — it grows and narrows as you
+type, shrinks to fit a short window, and closes when the prefix does. Still
+missing: `@file` path completion, and syntax highlighting of the draft. What it
+does have:
 insertion and cursor motion, Home/End, Backspace/Delete, the Ctrl+U/K/W kills,
 Up/Down through the current session's history, bracketed paste kept as one
-draft, Ctrl+D to exit on an empty line, Ctrl+C to clear the line, and Ctrl+Z to
-suspend — which releases the pinned row and hands the shell back an ordinary
+draft, resizing the window (the pinned row follows, and the viewport steps
+aside entirely if you shrink the terminal below three rows, coming back when
+you grow it again), Ctrl+D to exit on an empty line, Ctrl+C to clear the line,
+and Ctrl+Z to suspend — which releases the pinned row and hands the shell back an ordinary
 terminal, then restores the row and your unsubmitted draft on `fg`. Ctrl+\ is
 deliberately inert: its usual action dumps core, and this process holds your API
 credentials and conversation in memory. Everything else — every tier, every byte of non-TTY, `--plain`,
