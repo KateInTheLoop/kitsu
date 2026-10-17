@@ -26,6 +26,10 @@ shapes may change in any minor release.
   still in use, so it was never cleaned up; and taking an artifact generation
   lock could report failure and skip work. All five lock sites now share one
   implementation, so there is a single place for this to be right.
+- In the styled terminal, the **last line of a streamed answer could vanish**
+  when the model's final chunk did not end in a newline — the usual shape — so
+  an answer could appear to end a line early. The line was written and then
+  painted over by the live status row.
 - Cancelling a background agent that was waiting for a permission left **no
   record of how the request ended** — `/jobs show` kept the request with nothing
   after it, so the timeline said the agent had asked and never said what
@@ -89,9 +93,26 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
-- `KITSU_TUI=inline` opts into an inline viewport: a status row pinned to the
-  bottom of the terminal with the transcript scrolling above it, instead of one
-  status row repainted in place. The idle prompt inside it is kitsu's own
+- The inline viewport's pinned bottom row is now a **live status row** instead of
+  the word `kitsu`: the model, a compact eight-cell context meter with its
+  utilisation percentage, the elapsed time in the current turn, `[N queued]` when
+  prompts were submitted mid-turn, and the background-agent tag. It refreshes
+  while a turn runs, never wraps between 40 and 200 columns, sheds segments in a
+  fixed order as the terminal narrows (the agent tag is last to go), and is
+  cleared on exit. Classic mode is unchanged.
+- The inline viewport's composer gained **`@file` path completion** and hint
+  highlighting. It offers the same candidates in the same order as the classic
+  prompt, because both read from one completion source rather than two
+  implementations kept in step by hand.
+- `--tui inline`, or `[tui] mode = "inline"` in the config, opts into an inline
+  viewport: a status row pinned to the bottom of the terminal with the
+  transcript scrolling above it, instead of one status row repainted in place.
+  The flag wins over the config key and the config key over the `classic`
+  default; no environment variable selects it. The rest of the `[tui]` table —
+  `alternate_screen`, `prefix`, `title`, `left_arrow_opens_agents` and
+  `cell_ring_lines` — is parsed and validated now, and a mistyped key or value
+  is an error that **names the key** instead of being quietly ignored. Adding a
+  `[tui]` table makes older kitsu builds reject the config file. The idle prompt inside it is kitsu's own
   editor, so typing is echoed on the pinned row rather than by the terminal,
   and a draft is carried over rather than dropped. The gate is matched exactly
   — only `inline` selects it — and with the variable unset output is

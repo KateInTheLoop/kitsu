@@ -59,6 +59,27 @@ pub trait Surface: Send + Sync {
             self.transcript_line(fd, line);
         }
     }
+
+    /// Offer the backend the queued-prompt preview rows that belong directly
+    /// above the status row (requirement R5, plan row T3-S5).
+    ///
+    /// `rows` carries `kitsu_render::live::compose_stack_rows`' output, whole
+    /// and in order: already sanitized, styled and clamped per row. A backend
+    /// that implements this paints them verbatim — it must not filter,
+    /// re-wrap or re-clamp them, since the row count is the viewport's
+    /// region arithmetic.
+    ///
+    /// # Default implementation
+    ///
+    /// **Nothing.** A backend with no pinned bottom rows has nowhere to put
+    /// previews, and the classic renderer already composes its own from
+    /// `live_queue_state`; forwarding these rows to
+    /// [`Surface::transcript_line`] would scroll the previews into the
+    /// transcript and change classic's bytes. Only a backend that owns
+    /// bottom rows overrides this.
+    fn queue(&self, rows: &[String]) {
+        let _ = rows;
+    }
 }
 
 /// Does a write on `fd` share a terminal with the live status row, and so

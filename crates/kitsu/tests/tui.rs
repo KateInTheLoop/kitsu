@@ -60,6 +60,16 @@ const COLS: u16 = 80;
 /// How long a session may take before the harness kills the child and fails.
 const DEADLINE: Duration = Duration::from_secs(20);
 
+/// The model id both configs below declare, and therefore the leading segment
+/// of requirement **R5**'s composed status row in every session in this file.
+///
+/// Named once rather than spelled per assertion: the status-row tests all
+/// identify the pinned row by the segment R5's drop order keeps longest
+/// (`compose_status_row` truncates the model before it discards it), so a
+/// change to the fixture model must not be able to leave half of them
+/// matching a stale literal.
+const STATUS_ROW_MODEL: &str = "example-model-v1";
+
 /// How long the driver waits for a resize to show up in the stream before
 /// re-delivering `SIGWINCH`. See the `rearm` binding in
 /// [`run_styled_chat_pty_with`] for why re-delivery is both necessary and
@@ -282,8 +292,12 @@ struct Options {
     /// still running, so a session that suspends itself would simply poll to
     /// the deadline.
     resume_on_stop: bool,
-    rows: u16,
-    cols: u16,
+    /// Set `KITSU_TUI=inline` in the child's environment anyway.
+    ///
+    /// Only the T3-S2 removal test sets this: it exists so one test can prove
+    /// the retired variable has no effect, and every other session in this
+    /// file keeps the variable removed.
+    legacy_env_gate: bool,
 }
 
 impl Default for Options {
@@ -291,8 +305,7 @@ impl Default for Options {
         Self {
             no_session: true,
             resume_on_stop: false,
-            rows: ROWS,
-            cols: COLS,
+            legacy_env_gate: false,
         }
     }
 }
@@ -307,8 +320,9 @@ fn run_styled_chat_pty(home: &Path, tui: Option<&str>, script: &[Step]) -> Sessi
 ///
 /// The child gets all three descriptors on the PTY slave (one `dup` each, the
 /// same discipline `tests/cli.rs` uses) and no `--plain`/`--no-stream`, so
-/// styling and the viewport are live. `tui` is the value of `KITSU_TUI`:
-/// `None` leaves it unset, which is classic mode.
+/// styling and the viewport are live. `tui` is the value passed to the
+/// `--tui <MODE>` flag: `None` passes no flag at all, which is classic mode
+/// (plan row T3-S2 retired the `KITSU_TUI` gate).
 ///
 /// `options` carries everything that is not the script; see [`Options`].
 fn run_styled_chat_pty_with(
@@ -316,6 +330,19 @@ fn run_styled_chat_pty_with(
     tui: Option<&str>,
     script: &[Step],
     options: Options,
+) -> Session {
+    run_styled_chat_pty_core(home, tui, script, options, &[])
+}
+
+/// The one body every styled PTY session shares. `extra_args` is appended
+/// after `chat`'s own flags, which is what lets the streaming harness below
+/// add `--allow-path` without a second copy of the terminal plumbing.
+fn run_styled_chat_pty_core(
+    home: &Path,
+    tui: Option<&str>,
+    script: &[Step],
+    options: Options,
+    extra_args: &[String],
 ) -> Session {
     use std::io::{Read as _, Write as _};
     use std::os::fd::FromRawFd as _;
@@ -383,6 +410,7 @@ fn run_styled_chat_pty_with(
     if options.no_session {
         command.arg("--no-session");
     }
+    command.args(extra_args);
     if options.resume_on_stop {
         // Put the child in its own process group.
         //
@@ -431,10 +459,18 @@ fn run_styled_chat_pty_with(
             });
         }
     }
-    match tui {
-        Some(mode) => command.env("KITSU_TUI", mode),
-        None => command.env_remove("KITSU_TUI"),
-    };
+    // T3-S2: the renderer is selected by the `--tui <MODE>` flag. The
+    // `KITSU_TUI` preview gate is gone, so it is actively REMOVED from the
+    // child's environment here: were a stray `KITSU_TUI=inline` in the test
+    // runner's shell still able to select the viewport, the classic-mode
+    // measurements in this file would be silently measuring inline mode.
+    command.env_remove("KITSU_TUI");
+    if options.legacy_env_gate {
+        command.env("KITSU_TUI", "inline");
+    }
+    if let Some(mode) = tui {
+        command.args(["--tui", mode]);
+    }
 
     let mut child = command.spawn().expect("spawn styled carrier chat");
     // SAFETY: ownership of the remaining master descriptor transfers once.
@@ -615,7 +651,7 @@ fn help_then_quit() -> Vec<Step> {
     ]
 }
 
-/// Test 1. **The harness itself.** Classic mode, `KITSU_TUI` unset: the
+/// Test 1. **The harness itself.** Classic mode, no `--tui` flag: the
 /// session must start, run `/help`, print the command list, and exit on
 /// `/quit`. If this fails the harness is wrong and nothing after it means
 /// anything.
@@ -696,11 +732,30 @@ fn inline_mode_pins_the_region_and_direct_writes_stay_inside_it() {
     // The screen as it stood with all of `/help` printed and `/quit` not yet
     // processed.
     let screen = session.screen_at(1);
-    assert_eq!(
-        screen[(ROWS - 1) as usize].trim_end(),
-        "kitsu",
-        "the pinned viewport row must still show the bridge's status text \
-         after /help printed; whole screen:\n{}",
+    // T3-S6 (the wiring card): the pinned row is no longer the literal
+    // `kitsu` placeholder but requirement R5's composed status row, so what
+    // survives `/help` is *that*. The row is model-led by construction — the
+    // model is the only segment R5 never drops outright at a 80-column
+    // terminal, and the drop order truncates it before discarding it — so the
+    // model name is what identifies the row as the status row rather than
+    // debris. The meter is deliberately not pinned here: this session is at
+    // the **idle** prompt with no turn and no usage recorded, so whether a
+    // meter has a denominator at all is the config's business, not this
+    // test's. `inline_mode_status_row_shows_r5_segments_during_a_streamed_turn`
+    // pins the full segment set where a turn makes them all real.
+    let row = screen[(ROWS - 1) as usize].trim_end();
+    assert!(
+        row.starts_with(STATUS_ROW_MODEL),
+        "the pinned viewport row must show R5's composed status row, which \
+         leads with the live model {STATUS_ROW_MODEL:?}, after /help printed; \
+         row {ROWS} reads {row:?}; whole screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        row.chars().count() <= COLS as usize,
+        "the status row must never exceed the terminal's {COLS} columns, but \
+         row {ROWS} is {} columns of {row:?}; whole screen:\n{}",
+        row.chars().count(),
         Session::dump(&screen)
     );
     // And the transcript really did reach the bottom of the region rather than
@@ -839,13 +894,42 @@ fn inline_mode_teardown_parks_below_the_transcript_and_clears_the_status_row() {
     );
 
     // And the viewport row no longer carries stale status text: `hide` cleared
-    // it. Whatever occupies row 24 is the summary the cursor was parked for,
-    // never the painted `kitsu` status.
-    assert_ne!(
+    // it.
+    //
+    // **This assertion used to be `assert_ne!(.., "kitsu")`, and the wiring
+    // card made that vacuous** — once the row carries R5's composed status row
+    // instead of the placeholder, "not `kitsu`" holds even if the row were
+    // left showing a frozen half-drawn status row, or arbitrary debris. Its
+    // *intent* (the row is cleared on the way out) survives; its *expression*
+    // did not. Finding **F41**: pin what the row IS.
+    //
+    // Measured, not guessed: `hide` clears row 24, releases the region and
+    // parks on row 24, and the closing summary printed there is wider than
+    // `COLS`, so it wraps and scrolls the screen up by one — leaving the
+    // summary's two physical rows on 22 and 23 and **row 24 genuinely
+    // empty**. That is the exact post-state, so that is what is asserted.
+    assert_eq!(
         screen[(ROWS - 1) as usize].trim_end(),
-        "kitsu",
-        "the painted status row must be cleared on the way out; screen:\n{}",
+        "",
+        "the painted status row must be cleared on the way out, leaving row \
+         {ROWS} empty; it reads {:?}; screen:\n{}",
+        screen[(ROWS - 1) as usize],
         session.screen_dump()
+    );
+    // ...and that is not vacuous, because the row genuinely *was* the status
+    // row until teardown: the same session's mid-run screen has R5's
+    // model-led row on 24. Without this, an inline mode that never painted a
+    // status row at all would satisfy the clear above.
+    let mid = session.screen_at(1);
+    assert!(
+        mid[(ROWS - 1) as usize]
+            .trim_end()
+            .starts_with(STATUS_ROW_MODEL),
+        "the clear is only meaningful if a status row was there to clear: \
+         mid-run row {ROWS} must lead with {STATUS_ROW_MODEL:?}, but reads \
+         {:?}; mid-run screen:\n{}",
+        mid[(ROWS - 1) as usize],
+        Session::dump(&mid)
     );
 
     // Finally the raw bytes, so a regression in the sequence itself is named
@@ -1720,4 +1804,1288 @@ fn inline_mode_shows_the_slash_palette_above_the_composer() {
         "the palette must not have been submitted as text; whole screen:\n{}",
         Session::dump(&after)
     );
+}
+
+// ---------------------------------------------------------------------------
+// T3-S1: the styled *streaming* harness.
+//
+// Everything above drives the binary with slash commands only, which is why
+// `write_config` can point at `https://gateway.invalid`: no request is ever
+// made. No PTY test has therefore ever driven a real turn, so nothing here
+// has yet seen the viewport while model output is streaming into it or while
+// a tool call interrupts it.
+//
+// The pieces this section adds:
+//
+// * [`SseMock`] -- a blocking, dependency-free HTTP/1.1 server on
+//   `127.0.0.1:0` that answers each POST with a *chunked* `text/event-stream`
+//   body, one HTTP chunk per scripted SSE event with a real gap between them.
+//   The gap matters: a body written in one write arrives as one read and the
+//   renderer never sees a partial answer, which is the state the viewport
+//   assertions are about. `tests/cli.rs` serves SSE the same way at
+//   `spawn_stalling_sse_server` and `test_jsonl_partial_stream_failure_*`;
+//   this is that pattern without a tokio runtime, because the tests in this
+//   file are plain `#[test]`.
+// * [`Turn`] -- one request's worth of events. Request *n* is answered by turn
+//   *n*, and the last turn answers every request after it, so a tool round
+//   trip is just two turns.
+// * [`run_styled_streaming_chat_pty`] -- the harness the plan names: the
+//   session above, with the config pointed at the mock instead of
+//   `gateway.invalid`, and the request bodies the child sent handed back so a
+//   test can prove the tool result really went to the model.
+// ---------------------------------------------------------------------------
+
+/// The events one request is answered with, and the pause between them.
+struct Turn {
+    /// SSE event payloads, each written as its own HTTP chunk. `data: [DONE]`
+    /// is appended by the mock, so a turn lists only its own events.
+    events: Vec<String>,
+    /// How long to wait between two chunks. Non-zero is what makes the stream
+    /// observable *while in flight* rather than as one atomic delivery.
+    gap: Duration,
+}
+
+/// One OpenAI-flavored content delta.
+fn delta(text: &str) -> String {
+    format!(
+        r#"data: {{"choices":[{{"index":0,"delta":{{"content":{}}},"finish_reason":null}}]}}"#,
+        serde_json_string(text)
+    )
+}
+
+/// One OpenAI-flavored tool call, delivered whole in a single delta (which is
+/// what every tool fixture in `tests/cli.rs` does).
+fn tool_call(id: &str, name: &str, arguments: &str) -> String {
+    format!(
+        r#"data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"{id}","type":"function","function":{{"name":"{name}","arguments":{}}}}}]}},"finish_reason":null}}]}}"#,
+        serde_json_string(arguments)
+    )
+}
+
+/// `finish_reason` terminator for a turn.
+fn finish(reason: &str) -> String {
+    format!(r#"data: {{"choices":[{{"index":0,"delta":{{}},"finish_reason":"{reason}"}}]}}"#)
+}
+
+/// Minimal JSON string encoder, so the fixtures above can embed paths and
+/// arbitrary text without a serde dependency in this file.
+fn serde_json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A blocking streaming-SSE gateway on a loopback port.
+///
+/// Serves one response per connection and closes it (`connection: close`), so
+/// the child's HTTP client cannot reuse a connection and request order is
+/// connection order. Every request body is recorded.
+struct SseMock {
+    address: std::net::SocketAddr,
+    bodies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    joiner: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SseMock {
+    /// Bind, start serving `turns`, and return before the first request.
+    fn start(turns: Vec<Turn>) -> Self {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::sync::atomic::Ordering;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind SSE mock");
+        let address = listener.local_addr().expect("mock address");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking SSE listener");
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let thread_bodies = std::sync::Arc::clone(&bodies);
+        let thread_stop = std::sync::Arc::clone(&stop);
+        let joiner = std::thread::spawn(move || {
+            let mut served = 0usize;
+            while !thread_stop.load(Ordering::Relaxed) {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                stream.set_nonblocking(false).expect("blocking connection");
+                let mut reader = std::io::BufReader::new(stream);
+
+                // Request line + headers.
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => return,
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = trimmed
+                        .split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim())
+                    {
+                        length = value.parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0_u8; length];
+                if reader.read_exact(&mut body).is_err() {
+                    return;
+                }
+                thread_bodies
+                    .lock()
+                    .expect("record request body")
+                    .push(String::from_utf8_lossy(&body).into_owned());
+
+                // The turn that answers this request: the last one repeats.
+                let turn = turns.get(served).or_else(|| turns.last());
+                served += 1;
+                let Some(turn) = turn else { continue };
+
+                let mut socket = reader.into_inner();
+                if socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                          transfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                let mut chunks: Vec<String> = turn
+                    .events
+                    .iter()
+                    .map(|event| format!("{event}\n\n"))
+                    .collect();
+                chunks.push("data: [DONE]\n\n".to_string());
+                let mut failed = false;
+                for (index, chunk) in chunks.iter().enumerate() {
+                    if index > 0 && !turn.gap.is_zero() {
+                        std::thread::sleep(turn.gap);
+                    }
+                    if socket
+                        .write_all(format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes())
+                        .and_then(|()| socket.flush())
+                        .is_err()
+                    {
+                        failed = true;
+                        break;
+                    }
+                }
+                if !failed {
+                    let _ = socket.write_all(b"0\r\n\r\n");
+                    let _ = socket.flush();
+                }
+            }
+        });
+
+        Self {
+            address,
+            bodies,
+            stop,
+            joiner: Some(joiner),
+        }
+    }
+
+    /// `http://127.0.0.1:<port>`, for the gateway's `base_url`.
+    fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    /// Every request body the child sent, in order.
+    fn bodies(&self) -> Vec<String> {
+        self.bodies.lock().expect("read request bodies").clone()
+    }
+}
+
+impl Drop for SseMock {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(joiner) = self.joiner.take() {
+            let _ = joiner.join();
+        }
+    }
+}
+
+/// Write `~/.kitsu/config.toml` pointing the `example` gateway at `base_url`.
+///
+/// Identical to [`write_config`] except for the reachable address and a pinned
+/// `context_window` (so `/context` and the status row have a number to show
+/// without a `models_path` probe). [`write_config`] is left alone: the thirteen
+/// sessions above assert on a run that makes no request at all.
+fn write_streaming_config(home: &Path, base_url: &str) {
+    let dir = home.join(".kitsu");
+    fs::create_dir_all(&dir).expect("create ~/.kitsu");
+    let config = format!(
+        r#"default_gateway = "example"
+
+[gateways.example]
+flavor       = "openai"
+base_url     = "{base_url}"
+chat_path    = "{CHAT_PATH}"
+models_path  = ""
+model        = "example-model-v1"
+context_window = 4096
+auth         = {{ method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN", expires_env = "ANTHROPIC_TOKEN_EXPIRES", refresh_hint = "run `refresh-token` to refresh the gateway JWT" }}
+"#
+    );
+    fs::write(dir.join("config.toml"), config).expect("write config.toml");
+}
+
+/// A finished streaming session: the [`Session`] plus what the mock saw.
+struct StreamSession {
+    session: Session,
+    /// Request bodies in order, so a test can prove round two really carried
+    /// the tool result rather than only that the final text rendered.
+    bodies: Vec<String>,
+}
+
+impl std::ops::Deref for StreamSession {
+    type Target = Session;
+
+    fn deref(&self) -> &Session {
+        &self.session
+    }
+}
+
+/// **The T3-S1 harness.** Run a styled, streaming interactive chat on a
+/// `ROWS`x`COLS` PTY against a local SSE mock serving `turns`, driven by
+/// `script`.
+///
+/// Identical in every terminal respect to [`run_styled_chat_pty_with`] — same
+/// PTY, same three descriptors on the slave, same trigger-driven driver, same
+/// `vt100` replay — and different in exactly one: the gateway is reachable, so
+/// submitting a line makes the child stream a real turn. `allow_path` passes
+/// `--allow-path <home>` so a tool call runs without an approval prompt (the
+/// same thing `tests/cli.rs`'s tool-round fixtures do).
+fn run_styled_streaming_chat_pty(
+    home: &Path,
+    tui: Option<&str>,
+    script: &[Step],
+    turns: Vec<Turn>,
+    allow_path: bool,
+) -> StreamSession {
+    let mock = SseMock::start(turns);
+    write_streaming_config(home, &mock.base_url());
+    let extra = if allow_path {
+        vec![
+            "--allow-path".to_string(),
+            home.to_string_lossy().into_owned(),
+        ]
+    } else {
+        Vec::new()
+    };
+    let session = run_styled_chat_pty_core(home, tui, script, Options::default(), &extra);
+    let bodies = mock.bodies();
+    StreamSession { session, bodies }
+}
+
+/// The trigger every streaming script uses for its *second* input: the live
+/// summary line kitsu prints when a turn has finished (`↳ 0.1s · … (6%
+/// used)`). Triggering on the end of the turn rather than on a fragment of
+/// the answer keeps `/quit` out of the mid-turn queue, and triggering on
+/// something the surface under test genuinely prints is finding **F46**.
+const TURN_DONE_MARKER: &str = "% used)";
+
+/// Submit `prompt` at the idle prompt, then leave once the turn is over.
+///
+/// Classic mode's idle prompt is rustyline in cooked mode, so the trigger is
+/// the banner and the terminator is `\n`; inline mode's is the raw reader, so
+/// it is [`RAW_MODE_MARKER`] and `\r` (the same split every script above
+/// makes).
+fn ask_then_quit_classic(prompt: &'static str) -> Vec<Step> {
+    vec![
+        send("/help for commands", prompt),
+        send(TURN_DONE_MARKER, "/quit\n"),
+    ]
+}
+
+fn ask_then_quit_inline(prompt: &'static str) -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, prompt),
+        send(TURN_DONE_MARKER, "/quit\r"),
+    ]
+}
+
+/// Test 14. **The harness itself, on a real turn (T3-S1).** Classic mode: a
+/// three-fragment streamed answer must reach the screen in order, under the
+/// echoed prompt, and the mock must have been asked exactly one question.
+///
+/// If this fails, nothing else in this section means anything: the streaming
+/// half of the harness is wrong.
+#[test]
+#[serial]
+fn classic_mode_streams_a_turn_into_the_transcript() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty(
+        home.path(),
+        None,
+        &ask_then_quit_classic("say hello\n"),
+        vec![Turn {
+            events: vec![
+                delta("STREAM_ALPHA\n"),
+                delta("STREAM_BETA\n"),
+                delta("STREAM_OMEGA\n"),
+                finish("stop"),
+            ],
+            gap: Duration::from_millis(60),
+        }],
+        false,
+    );
+
+    assert!(
+        session.status.success(),
+        "the streaming classic session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+
+    // The child really talked to the mock, and sent the submitted prompt.
+    assert_eq!(
+        session.bodies.len(),
+        1,
+        "one turn is one request; bodies: {:?}",
+        session.bodies
+    );
+    assert!(
+        session.bodies[0].contains(r#""content":"say hello""#),
+        "the request must carry the submitted prompt; body:\n{}",
+        session.bodies[0]
+    );
+
+    // The screen as it stood when the turn had finished and `/quit` had not
+    // yet been submitted.
+    let screen = session.screen_at(1);
+    let rows = |needle: &str| {
+        screen
+            .iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{needle:?} must be on the screen after a streamed turn; \
+                     screen:\n{}",
+                    Session::dump(&screen)
+                )
+            })
+    };
+    let echo = rows("kitsu> say hello");
+    let alpha = rows("STREAM_ALPHA");
+    let beta = rows("STREAM_BETA");
+    let omega = rows("STREAM_OMEGA");
+    assert!(
+        echo < alpha && alpha < beta && beta < omega,
+        "the streamed fragments belong under the echoed prompt in order, but \
+         they are on rows {}, {}, {}, {}; screen:\n{}",
+        echo + 1,
+        alpha + 1,
+        beta + 1,
+        omega + 1,
+        Session::dump(&screen)
+    );
+    // Each fragment is its own transcript row, not a concatenation: the
+    // newlines the model sent were honored.
+    assert_eq!(
+        screen[alpha].trim_end(),
+        "STREAM_ALPHA",
+        "screen:\n{}",
+        Session::dump(&screen)
+    );
+}
+
+/// Test 15. **The same turn in inline mode.** The streamed answer must land
+/// *inside* the scroll region, the pinned status row must still read `kitsu`
+/// after the turn, and the region must still be set exactly once — i.e. the
+/// turn did not re-latch or lose the viewport.
+#[test]
+#[serial]
+fn inline_mode_streams_a_turn_inside_the_region_with_the_status_row_intact() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty(
+        home.path(),
+        Some("inline"),
+        &ask_then_quit_inline("say hello\r"),
+        vec![Turn {
+            events: vec![
+                delta("STREAM_ALPHA\n"),
+                delta("STREAM_BETA\n"),
+                delta("STREAM_OMEGA\n"),
+                finish("stop"),
+            ],
+            gap: Duration::from_millis(60),
+        }],
+        false,
+    );
+
+    assert!(
+        session.status.success(),
+        "the streaming inline session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+    assert_eq!(
+        session.bodies.len(),
+        1,
+        "one turn is one request; bodies: {:?}",
+        session.bodies
+    );
+
+    let screen = session.screen_at(1);
+    let region = (ROWS - 1) as usize; // rows 1..=23, viewport_rows = 1
+    for needle in ["STREAM_ALPHA", "STREAM_BETA", "STREAM_OMEGA"] {
+        let row = screen
+            .iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{needle:?} must be on the screen after a streamed turn in \
+                     inline mode; screen:\n{}",
+                    Session::dump(&screen)
+                )
+            });
+        assert!(
+            row < region,
+            "streamed text belongs inside the scroll region (rows 1..={region}), \
+             but {needle:?} is on row {}; screen:\n{}",
+            row + 1,
+            Session::dump(&screen)
+        );
+    }
+    // The wiring card (T3-S5's deferred half) replaced the `"kitsu"`
+    // placeholder this row used to hold with requirement R5's composed status
+    // row, so what must survive a streamed turn is **that**. The intent is
+    // unchanged and is the whole point of the assertion: the stream must not
+    // reach row 24. Pinned as what the row IS (finding F41) rather than as a
+    // literal — model-led, because the model is the segment R5's drop order
+    // keeps longest, and within `COLS`, R5's standing no-wrap rule.
+    let status = screen[region].trim_end();
+    assert!(
+        status.starts_with(STATUS_ROW_MODEL),
+        "the pinned status row must survive a streamed turn, still showing \
+         R5's composed row led by the live model {STATUS_ROW_MODEL:?}; row \
+         {ROWS} reads {status:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        status.chars().count() <= COLS as usize,
+        "the surviving status row must still fit the terminal's {COLS} \
+         columns, but is {} columns of {status:?}; screen:\n{}",
+        status.chars().count(),
+        Session::dump(&screen)
+    );
+    assert_eq!(
+        session.raw_count(&format!("\x1b[1;{}r", ROWS - 1)),
+        1,
+        "a streamed turn must not re-latch the region; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+}
+
+/// Test 16. **A turn that calls a tool.** Two mock turns: the first streams a
+/// `fs_read_file` call, the second — which is the request carrying the tool
+/// result — streams the final answer. Asserted on three things at once, so a
+/// pass means the whole round trip happened rather than just that some text
+/// rendered:
+///
+/// * the tool activity card and its receipt are on the screen;
+/// * the final answer is below them;
+/// * the *second request body* carries the file's contents in a `tool`
+///   message, which is the only direct evidence that the result went back to
+///   the model.
+#[test]
+#[serial]
+fn streaming_turn_calls_a_tool_and_renders_its_result() {
+    let home = TempDir::new().expect("temp home");
+    let note = home.path().join("note.txt");
+    fs::write(&note, "TOOL_MARKER_42\n").expect("write the note the model reads");
+    let arguments = format!(r#"{{"path":"{}"}}"#, note.to_string_lossy());
+
+    let session = run_styled_streaming_chat_pty(
+        home.path(),
+        None,
+        &ask_then_quit_classic("read the note\n"),
+        vec![
+            Turn {
+                events: vec![
+                    tool_call("call_1", "fs_read_file", &arguments),
+                    finish("tool_calls"),
+                ],
+                gap: Duration::from_millis(20),
+            },
+            Turn {
+                events: vec![delta("the note says TOOL_MARKER_42\n"), finish("stop")],
+                gap: Duration::from_millis(40),
+            },
+        ],
+        true,
+    );
+
+    assert!(
+        session.status.success(),
+        "the tool-calling session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+    assert_eq!(
+        session.bodies.len(),
+        2,
+        "a tool round trip is two requests; bodies: {:?}",
+        session.bodies
+    );
+    assert!(
+        !session.bodies[0].contains("TOOL_MARKER_42"),
+        "the first request cannot know the file's contents; body:\n{}",
+        session.bodies[0]
+    );
+    assert!(
+        session.bodies[1].contains(r#""role":"tool""#)
+            && session.bodies[1].contains("TOOL_MARKER_42"),
+        "the second request must carry the tool result back to the model; \
+         body:\n{}",
+        session.bodies[1]
+    );
+
+    let screen = session.screen_at(1);
+    let find = |needle: &str| {
+        screen
+            .iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{needle:?} must be on the screen after a tool round trip; \
+                     screen:\n{}",
+                    Session::dump(&screen)
+                )
+            })
+    };
+    // The activity card names the tool by its display verb, with the path.
+    let card = find("◆ Read(");
+    assert!(
+        screen[card].contains("note.txt"),
+        "the activity card must name the file it read ({:?}); screen:\n{}",
+        screen[card],
+        Session::dump(&screen)
+    );
+    let receipt = find("◇ 1 line");
+    let answer = find("the note says TOOL_MARKER_42");
+    assert!(
+        card < receipt && receipt < answer,
+        "the card, its receipt and the final answer belong in that order, but \
+         they are on rows {}, {}, {}; screen:\n{}",
+        card + 1,
+        receipt + 1,
+        answer + 1,
+        Session::dump(&screen)
+    );
+}
+
+/// Twelve numbered lines, each wider than the 80-column terminal, so the
+/// stream both wraps and scrolls while it is in flight.
+fn wide_stream_events() -> Vec<String> {
+    let mut events: Vec<String> = (1..=12)
+        .map(|n| delta(&format!("L{n:02}-{}-END{n:02}\n", "x".repeat(90))))
+        .collect();
+    events.push(finish("stop"));
+    events
+}
+
+/// Test 17. **Width and scroll while the stream is in flight (inline mode).**
+///
+/// The screen is sampled *mid-stream*: the `/quit` step triggers on `L08`, so
+/// `marks[1]` is a moment when four more lines are still to come. Three
+/// things are asserted about that moment, which is the one the rest of
+/// milestone T3 is about:
+///
+/// * the pinned status row is still the status row — a stream scrolling the
+///   region does not reach row 24;
+/// * a line wider than the terminal **wraps** rather than being truncated:
+///   its `END` sentinel is on the row after its `L` sentinel;
+/// * the region really scrolled: `L01` was streamed (it is in the raw bytes)
+///   and is no longer on the screen, so the assertion above is not vacuous.
+#[test]
+#[serial]
+fn inline_mode_wide_stream_wraps_and_scrolls_without_touching_the_status_row() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "stream wide\r"),
+            // Mid-stream: L08 of 12.
+            send("L08-", "/quit\r"),
+        ],
+        vec![Turn {
+            events: wide_stream_events(),
+            gap: Duration::from_millis(40),
+        }],
+        false,
+    );
+
+    let region = (ROWS - 1) as usize;
+    let screen = session.screen_at(1);
+    // Same treatment, same reason as
+    // `inline_mode_streams_a_turn_inside_the_region_with_the_status_row_intact`:
+    // the row is R5's composed status row now, not the `"kitsu"` placeholder.
+    // The claim being made is unchanged — a stream in flight must not reach
+    // row 24 — and it is stronger stated as what the row is: the model-led
+    // status row, intact and within `COLS`, mid-stream.
+    let status = screen[region].trim_end();
+    assert!(
+        status.starts_with(STATUS_ROW_MODEL),
+        "a stream in flight must not reach the pinned status row, which must \
+         still be R5's composed row led by the live model \
+         {STATUS_ROW_MODEL:?}; row {ROWS} reads {status:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        status.chars().count() <= COLS as usize,
+        "the untouched status row must still fit the terminal's {COLS} \
+         columns, but is {} columns of {status:?}; screen:\n{}",
+        status.chars().count(),
+        Session::dump(&screen)
+    );
+
+    // Wrapping, measured on a line that is certainly complete mid-stream.
+    let head = screen
+        .iter()
+        .position(|row| row.contains("L05-"))
+        .unwrap_or_else(|| {
+            panic!(
+                "L05 must be on the mid-stream screen; screen:\n{}",
+                Session::dump(&screen)
+            )
+        });
+    assert_eq!(
+        screen[head].chars().count(),
+        COLS as usize,
+        "a line wider than the terminal must fill the row it starts on; \
+         screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        head + 1 < region && screen[head + 1].contains("END05"),
+        "the overflow of L05 belongs on the next row inside the region, but \
+         row {} holds {:?}; screen:\n{}",
+        head + 2,
+        screen.get(head + 1).cloned().unwrap_or_default(),
+        Session::dump(&screen)
+    );
+
+    // The region scrolled, and the check above is therefore about a screen
+    // that really moved: L01 was streamed and has left the screen.
+    assert!(
+        session.raw_count("L01-") > 0,
+        "L01 must have been streamed at all; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        !screen.iter().any(|row| row.contains("L01-")),
+        "twelve wrapped lines must have scrolled L01 out of the region; \
+         screen:\n{}",
+        Session::dump(&screen)
+    );
+}
+
+/// Test 18. **A product defect, left failing on purpose (T3-S1).**
+///
+/// A streamed answer whose last line is **not** newline-terminated loses that
+/// line entirely in classic styled mode: it is written to the terminal and
+/// then erased before the user can see it. `STREAM_ALPHA` and `STREAM_BETA`
+/// arrive with newlines and survive; `STREAM_OMEGA` does not and is gone from
+/// every screen, final and mid-session alike. A provider that does not end
+/// its last content delta with `\n` — which is the common case — therefore
+/// drops its answer's last line in the styled terminal. Measured with the
+/// same harness, **inline mode keeps it**: an unterminated last fragment is
+/// still on the screen there, which is what makes this classic-mode-specific
+/// rather than a property of the stream.
+///
+/// What the raw bytes show, in stream order: the live row clears the row
+/// (`\r\x1b[2K`), `finish_line`'s `flush_unstyled` writes the partial line
+/// onto it, the live row repaints `kitsu> ` from column 0 of *that same row*,
+/// a `\r\x1b[2K` erases it, and only then does the terminating newline
+/// arrive.
+///
+/// *Hypothesis* for the cause, from `kitsu-render`: the live row paints and
+/// clears relative to wherever the cursor happens to be — `render_region`'s
+/// fast path writes `\r\x1b[2K{status}` and `clear_region_locked` writes
+/// `\r\x1b[2K` with no absolute positioning (`live.rs:631-637`, `:709-713`) —
+/// so it assumes stdout always leaves the cursor at column 0 of a fresh row.
+/// `finish_line` breaks that assumption for one instant: it writes the
+/// buffered partial line and its terminating `\n` as two separate writes
+/// (`lib.rs:1611-1641`), so between them the cursor sits mid-row on a row
+/// holding assistant text. Which of the two live-row writers lands in that
+/// window, and why it is not covered by `write_block`'s suspension, is not
+/// something this test establishes; that part is a hypothesis.
+///
+/// Known failure, T3-S1. Do not weaken this assertion: it is the finding.
+#[test]
+#[serial]
+fn classic_mode_keeps_the_final_unterminated_line_of_a_streamed_answer() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty(
+        home.path(),
+        None,
+        &ask_then_quit_classic("say hello\n"),
+        vec![Turn {
+            events: vec![
+                delta("STREAM_ALPHA\n"),
+                delta("STREAM_BETA\n"),
+                // No trailing newline: what a provider's last delta usually
+                // looks like.
+                delta("STREAM_OMEGA"),
+                finish("stop"),
+            ],
+            gap: Duration::from_millis(60),
+        }],
+        false,
+    );
+
+    let screen = session.screen_at(1);
+    // Precondition: the newline-terminated fragments did render, so a failure
+    // below is about the unterminated line and not about the turn.
+    for needle in ["STREAM_ALPHA", "STREAM_BETA"] {
+        assert!(
+            screen.iter().any(|row| row.contains(needle)),
+            "{needle:?} must render; screen:\n{}",
+            Session::dump(&screen)
+        );
+    }
+    // And the last line really was streamed: the mock sent it and the child
+    // wrote it to the terminal.
+    assert!(
+        session.raw_count("STREAM_OMEGA") > 0,
+        "the unterminated line must at least reach the terminal; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    assert!(
+        screen.iter().any(|row| row.contains("STREAM_OMEGA")),
+        "a streamed answer's last line must survive even without a trailing \
+         newline, but it was written and then erased; screen:\n{}",
+        Session::dump(&screen)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T3-S2: the environment gate is gone (plan row T3-S2, "env gate removed").
+// FAILING-FIRST: `--tui` does not exist yet, so the flag halves of this test
+// fail on an argument error, and `main.rs` still reads `KITSU_TUI`, so the
+// env half fails by pinning the region it must no longer pin.
+// ---------------------------------------------------------------------------
+
+/// `KITSU_TUI` no longer selects anything, and `--tui` is the only thing that
+/// does.
+///
+/// The variable was a T0 preview gate. Keeping it alongside `[tui] mode` and
+/// `--tui` would be three ways to set one thing with no written precedence,
+/// which is how the three drift apart (F45); it is removed instead, and this
+/// test is what keeps it removed.
+///
+/// The negative is proved not to be vacuous inside the test itself: the same
+/// script, same harness, same geometry, run once with the variable and once
+/// with the flag. The flag run must contain the DECSTBM the variable run must
+/// not, so an absence caused by a broken harness would fail the second half.
+#[test]
+#[serial]
+fn kitsu_tui_environment_variable_no_longer_selects_the_viewport() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+
+    let bottom = ROWS - 1; // rows - viewport_rows, with viewport_rows = 1
+    let region = format!("\x1b[1;{bottom}r");
+
+    // The variable alone: classic, i.e. no scroll region is ever set.
+    let via_env = run_styled_chat_pty_with(
+        home.path(),
+        None,
+        &help_then_quit(),
+        Options {
+            legacy_env_gate: true,
+            ..Options::default()
+        },
+    );
+    assert_eq!(
+        via_env.raw_count(&region),
+        0,
+        "KITSU_TUI=inline must no longer set a scroll region; raw:\n{}",
+        via_env.raw_text().escape_debug()
+    );
+    assert!(
+        via_env.raw_text().contains("commands:"),
+        "the session must still have run /help, or the absence above proves \
+         nothing; raw:\n{}",
+        via_env.raw_text().escape_debug()
+    );
+
+    // The flag alone: inline, i.e. the region this harness can observe.
+    let via_flag = run_styled_chat_pty(home.path(), Some("inline"), &help_then_quit());
+    assert_eq!(
+        via_flag.raw_count(&region),
+        1,
+        "--tui inline must set the region exactly once, which is what makes \
+         the assertion above a real absence; raw:\n{}",
+        via_flag.raw_text().escape_debug()
+    );
+
+    // And the flag wins over the leftover variable, in the direction that
+    // would be a silent surprise: an explicit `--tui classic` with
+    // `KITSU_TUI=inline` set stays classic.
+    let both = run_styled_chat_pty_with(
+        home.path(),
+        Some("classic"),
+        &help_then_quit(),
+        Options {
+            legacy_env_gate: true,
+            ..Options::default()
+        },
+    );
+    assert_eq!(
+        both.raw_count(&region),
+        0,
+        "--tui classic must stay classic with KITSU_TUI=inline set; raw:\n{}",
+        both.raw_text().escape_debug()
+    );
+}
+
+// ===========================================================================
+// The wiring card: requirement **R5**'s composed status row, on screen.
+//
+// `kitsu_render::live::compose_status_row` and the `Surface::queue` seam
+// shipped in T3-S5 with **no production caller**; the pinned row still
+// painted the literal `"kitsu"` that `main.rs` passed to
+// `tui_bridge::install` as a `status: &str`. These tests are the user-visible
+// half: the row reaches row 24, carries R5's segments at the terminal's real
+// width, and — the part a static string can never satisfy — **ticks**.
+//
+// # The repaint cadence these tests assume
+//
+// `main.rs`'s `run_live_typeahead` is the one loop that runs for the whole of
+// a foreground turn: it is started by `TypeaheadCollector::start` whenever
+// `typeahead_live_prompt` is `Some`, which is
+// `!assistive_input && stdin_is_tty() && stderr_styled()` — true of every
+// inline session, since inline mode *is* a styled tty. Its body polls stdin
+// with `libc::poll(&mut descriptor, 1, 50)` and already refreshes the ambient
+// agent tag once per tick through `sync_agent_counts`, which is the mechanism
+// requirement A8's 250 ms budget is met by. A 50 ms tick is twenty times
+// finer than the one-second granularity of R5's elapsed segment, so a row
+// repainted on that tick is never more than one tick stale, and the cadence
+// costs no new thread, no new timer and no new dependency.
+//
+// `read_line_inline` is deliberately *not* a cadence: it blocks in `read()`
+// with no timeout (that is how `SIGWINCH` is delivered — see
+// `install_sigwinch_handler`'s `SA_RESTART` warning), and between turns R5's
+// elapsed segment is `None` anyway, so the idle prompt has nothing to tick.
+//
+// **Measured before these tests were written** (the pre-wiring baseline, so
+// the assertions below are known not to pass for the wrong reason): over a
+// five-event streamed turn with 700 ms gaps, row 24 is painted exactly three
+// times, every one of them the string `"kitsu"`, and none of them during the
+// turn.
+// ===========================================================================
+
+/// Strip CSI escape sequences from `text`, leaving the printable cells.
+///
+/// Hand-rolled rather than borrowed from `kitsu_render::sanitize_terminal_text`
+/// on purpose: `kitsu` has no library target, so an integration test cannot
+/// reach into the workspace's render crate, and adding a dev-dependency to
+/// borrow one function is not worth it. The raw-byte tests below are the only
+/// callers; everything else asserts on `vt100`'s already-parsed screen.
+fn strip_csi(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            out.push(ch);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            // Consume parameter/intermediate bytes up to and including the
+            // final byte, which is the first in 0x40..=0x7e.
+            while let Some(&c) = chars.peek() {
+                chars.next();
+                if ('\x40'..='\x7e').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every row the inline viewport painted onto its pinned row, in stream
+/// order, with escapes stripped.
+///
+/// `InlineSurface::paint` writes `ESC[<line>;1H ESC[2K <row>` for each pinned
+/// row and then parks the cursor with `ESC[<bottom>;1H`, so one paint of row
+/// `ROWS` is exactly the bytes between those two addresses. Reading the
+/// *paint history* rather than two sampled screens is what makes the elapsed
+/// test honest: it observes every repaint the child actually performed,
+/// needs no second scripted mark, and contains no sleep.
+fn pinned_row_paints(session: &Session) -> Vec<String> {
+    let text = session.raw_text();
+    let open = format!("\x1b[{};1H\x1b[2K", ROWS);
+    let close = format!("\x1b[{};1H", ROWS - 1);
+    let mut painted = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(index) = rest.find(&open) {
+        rest = &rest[index + open.len()..];
+        let end = rest.find(&close).unwrap_or(rest.len());
+        painted.push(strip_csi(&rest[..end]));
+    }
+    painted
+}
+
+/// Every pinned-row paint that is R5's status row, i.e. model-led.
+///
+/// The teardown clear is a paint of row `ROWS` too, and the closing summary
+/// is written at the cursor it parks, so the raw window for the last paint
+/// carries both. Selecting on the model keeps those out without banning
+/// anything: a row that leads with the live model is the status row and
+/// nothing else in this binary writes one.
+fn status_row_paints(session: &Session) -> Vec<String> {
+    pinned_row_paints(session)
+        .into_iter()
+        .filter(|row| row.trim_start().starts_with(STATUS_ROW_MODEL))
+        .collect()
+}
+
+/// The elapsed segment of a composed status row, as whole seconds.
+///
+/// `kitsu_render::format_wait_elapsed` renders `{secs}s` under a minute and
+/// `{mins}m{secs:02}s` at or above one, and R5 places elapsed after the model
+/// and the meter, so the token is the row's last ` · `-joined content
+/// segment. `None` when the row carries no elapsed segment at all, which is
+/// a legitimate state (between turns, or at a width that dropped it) and so
+/// is not an assertion failure here.
+fn elapsed_secs(row: &str) -> Option<u64> {
+    row.split(" · ")
+        .map(str::trim)
+        .filter_map(|segment| {
+            let rest = segment.strip_suffix('s')?;
+            match rest.split_once('m') {
+                Some((mins, secs)) => {
+                    Some(mins.parse::<u64>().ok()? * 60 + secs.parse::<u64>().ok()?)
+                }
+                None => rest.parse::<u64>().ok(),
+            }
+        })
+        .last()
+}
+
+/// **The wiring acceptance test.** R5's composed status row is on the pinned
+/// row *during a real streamed turn*, through the T3-S1 streaming harness so
+/// the model name is the session's live one rather than a fixture's.
+///
+/// The screen is sampled at `marks[1]`, i.e. the moment `/quit` goes in,
+/// which `TURN_DONE_MARKER` places just after the turn finished. Asserted:
+///
+/// * the row leads with the live model — the segment R5's drop order keeps
+///   longest, and the thing that tells a status row from debris;
+/// * it carries the context meter, which the streaming config makes real by
+///   declaring `context_window = 4096`: R5's 8-cell meter plus a percentage,
+///   so the row shows how full the window is without `/context`;
+/// * it carries an elapsed segment, which is the whole reason the row needs
+///   a cadence;
+/// * it never wraps: at most `COLS` cells, R5's standing rule;
+/// * nothing is queued and no agent is detached in this session, so the
+///   `[N queued]` tag and the ambient tag are **absent** — and that absence
+///   is not vacuous, because the three positive segments above are present
+///   on the same row.
+#[test]
+#[serial]
+fn inline_mode_status_row_shows_r5_segments_during_a_streamed_turn() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty(
+        home.path(),
+        Some("inline"),
+        &ask_then_quit_inline("say hello\r"),
+        vec![Turn {
+            events: vec![
+                delta("STREAM_ALPHA\n"),
+                delta("STREAM_BETA\n"),
+                finish("stop"),
+            ],
+            gap: Duration::from_millis(400),
+        }],
+        false,
+    );
+
+    assert!(
+        session.status.success(),
+        "the streaming inline session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+
+    let screen = session.screen_at(1);
+    let row = screen[(ROWS - 1) as usize].trim_end().to_string();
+
+    assert!(
+        row.starts_with(STATUS_ROW_MODEL),
+        "the pinned row must be R5's status row, leading with the live model \
+         {STATUS_ROW_MODEL:?}; row {ROWS} reads {row:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+    // The meter: eight cells of `■`/`□` and a percentage, exactly what
+    // `compose_status_row` builds from `used`/`effective`.
+    let meter = row
+        .split(" · ")
+        .find(|segment| segment.contains('■') || segment.contains('□'))
+        .unwrap_or_else(|| {
+            panic!(
+                "R5's context meter must be on the status row; row {ROWS} \
+                 reads {row:?}; screen:\n{}",
+                Session::dump(&screen)
+            )
+        });
+    assert_eq!(
+        meter.chars().filter(|&c| c == '■' || c == '□').count(),
+        8,
+        "the status row's meter is eight cells (half of /context's sixteen), \
+         but {meter:?} has a different count; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        meter.trim_end().ends_with('%'),
+        "the meter carries its utilisation percentage, but reads {meter:?}; \
+         screen:\n{}",
+        Session::dump(&screen)
+    );
+    // The elapsed segment, present at all (its *advance* is the next test).
+    //
+    // Asserted on the paint **history** rather than this screen, because the
+    // screen is sampled once the turn has finished and R5's elapsed is `None`
+    // between turns -- a row with no elapsed segment there is correct, not a
+    // regression. The history says the segment was on the row *while the turn
+    // ran*, which is the claim.
+    let painted = status_row_paints(&session);
+    assert!(
+        painted.iter().any(|row| elapsed_secs(row).is_some()),
+        "R5's elapsed segment must be on the status row while the turn runs; \
+         the status row was painted {} time(s): {painted:#?}",
+        painted.len()
+    );
+    // It never wraps.
+    assert!(
+        row.chars().count() <= COLS as usize,
+        "the status row must never exceed {COLS} columns, but row {ROWS} is \
+         {} columns of {row:?}; screen:\n{}",
+        row.chars().count(),
+        Session::dump(&screen)
+    );
+    // Nothing queued and no detached agent, so neither optional tag renders.
+    // Not a bare substring ban (F41): the three segments above pin what the
+    // row IS, and these two say the row is *that and only that*.
+    assert!(
+        !row.contains("queued"),
+        "nothing was queued in this session, so R5's `[N queued]` tag must \
+         not render; row {ROWS} reads {row:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        !row.contains("agent"),
+        "no agent was detached in this session, so R5's ambient tag must not \
+         render; row {ROWS} reads {row:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+}
+
+/// **The cadence test.** R5's elapsed segment *advances* while a turn runs.
+///
+/// A status row that is composed once and painted once is indistinguishable
+/// from the old static `"kitsu"` by every assertion in the test above, so
+/// this is the one that pins the feature rather than its appearance. There is
+/// no sleep anywhere in it: the turn's own 900 ms inter-chunk gaps are what
+/// make real time pass inside the child, the script's two steps are
+/// trigger-driven as always, and the observation is the **complete paint
+/// history** recovered from the raw byte stream after the session ended —
+/// every repaint the child actually performed, in order.
+///
+/// Asserted:
+///
+/// * at least two status-row paints carry an elapsed segment, so there is
+///   something to compare (a single paint cannot show motion);
+/// * the elapsed values never go backwards — a row recomposed per tick from a
+///   turn-start `Instant` is monotone, and a decrease would mean the start
+///   instant is being reset or the segments are coming from different turns;
+/// * and at least one pair genuinely differs, which is the advance itself.
+///   Three chunks at 900 ms span over two seconds, so a 50 ms cadence has
+///   ~40 opportunities to observe the second tick over.
+///
+/// Pre-wiring baseline, measured: `status_row_paints` is **empty**, because
+/// every one of the three pinned-row paints is the literal `"kitsu"`.
+#[test]
+#[serial]
+fn inline_mode_status_row_elapsed_advances_while_a_turn_runs() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty(
+        home.path(),
+        Some("inline"),
+        &ask_then_quit_inline("say hello slowly\r"),
+        vec![Turn {
+            events: vec![
+                delta("TICK_ONE\n"),
+                delta("TICK_TWO\n"),
+                delta("TICK_THREE\n"),
+                finish("stop"),
+            ],
+            // Real time inside the child, not in the test process: the mock
+            // holds each chunk back, so the turn lasts ~2.7s of elapsed time
+            // the row has to show.
+            gap: Duration::from_millis(900),
+        }],
+        false,
+    );
+
+    let paints = status_row_paints(&session);
+    let samples: Vec<u64> = paints.iter().filter_map(|row| elapsed_secs(row)).collect();
+
+    assert!(
+        samples.len() >= 2,
+        "the status row must be repainted on the turn's cadence, so a turn \
+         lasting ~2.7s must leave at least two paints carrying an elapsed \
+         segment; got {} of {} pinned-row paint(s): {:#?}",
+        samples.len(),
+        pinned_row_paints(&session).len(),
+        paints
+    );
+    assert!(
+        samples.windows(2).all(|pair| pair[0] <= pair[1]),
+        "elapsed is measured from one turn-start instant, so the painted \
+         values can never go backwards; samples: {samples:?}; paints: {:#?}",
+        paints
+    );
+    assert!(
+        samples.first() < samples.last(),
+        "the elapsed segment must genuinely advance over a ~2.7s turn — a \
+         row frozen at {:?} is the static placeholder with extra steps; \
+         samples: {samples:?}; paints: {:#?}",
+        samples.first(),
+        paints
+    );
+}
+
+/// **The `[N queued]` tag, reusing R5's existing expectation.** A prompt
+/// submitted *while a turn is running* is queued rather than run, and the
+/// status row must say so.
+///
+/// The tag's text is `kitsu_render::live::queued_tag`'s — `[1 queued]` — the
+/// same literal the classic live row has shown since F38 named it; nothing
+/// new is invented here.
+///
+/// # The mid-turn trigger (finding **F46**)
+///
+/// **Measured first, because the obvious triggers do not work.** In inline
+/// mode a streamed answer does not reach the terminal progressively: the
+/// whole of `TICK_ONE`/`TWO`/`THREE` plus the turn summary arrives in one
+/// burst *after* the turn, so triggering the mid-turn submission on a
+/// streamed fragment (or on the `queued:` receipt that follows it) fires once
+/// the turn is already over, and the prompt is then queued against the next
+/// turn instead. The single thing the child emits at *turn start* is the
+/// bracketed-paste toggle — the idle reader releasing raw mode
+/// (`ESC[?2004l`) as the typeahead collector takes stdin — and it does not
+/// occur before the submission, so it is a usable and honest trigger: a byte
+/// the surface under test genuinely emits, at the moment the test needs.
+///
+/// With that trigger the receipt lands *before* the first streamed fragment
+/// (measured), leaving the rest of the turn for the row to be repainted on
+/// its cadence with the tag on it.
+///
+/// The observation is the paint history for the same reason the elapsed test
+/// uses it: the tag's whole life is inside the turn, and the screen after it
+/// has nothing left to show.
+///
+/// The second turn is what consumes the queued prompt, which is why the mock
+/// is given two.
+#[test]
+#[serial]
+fn inline_mode_status_row_shows_the_queued_tag_for_a_mid_turn_submission() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "say hello\r"),
+            // Turn start: the idle reader has just released raw mode.
+            send("\x1b[?2004l", "queue this\r"),
+            send(TURN_DONE_MARKER, "/quit\r"),
+        ],
+        vec![
+            Turn {
+                events: vec![
+                    delta("TICK_ONE\n"),
+                    delta("TICK_TWO\n"),
+                    delta("TICK_THREE\n"),
+                    finish("stop"),
+                ],
+                gap: Duration::from_millis(900),
+            },
+            Turn {
+                events: vec![delta("SECOND_TURN\n"), finish("stop")],
+                gap: Duration::from_millis(60),
+            },
+        ],
+        false,
+    );
+
+    // The queue really accepted it: the dispatcher's own live receipt. If this
+    // is missing the test below is measuring the wrong thing, so it is named
+    // separately rather than folded into the row assertion.
+    let text = session.raw_text();
+    assert!(
+        text.contains("queued: queue this"),
+        "the mid-turn submission must reach the prompt queue; raw:\n{}",
+        text.escape_debug()
+    );
+
+    let painted = status_row_paints(&session);
+    let tagged: Vec<&String> = painted
+        .iter()
+        .filter(|row| row.trim_end().ends_with("[1 queued]"))
+        .collect();
+    assert!(
+        !tagged.is_empty(),
+        "one prompt queued mid-turn must render `queued_tag`'s own \
+         `[1 queued]` at the end of R5's status row, after the content \
+         segments; the status row was painted {} time(s): {painted:#?}",
+        painted.len()
+    );
+    // ...and the tagged row is still a whole status row, not the tag alone:
+    // it leads with the live model and it still fits the terminal.
+    for row in tagged {
+        let row = row.trim_end();
+        assert!(
+            row.starts_with(STATUS_ROW_MODEL),
+            "a queued-tag paint must still be the model-led status row, but \
+             reads {row:?}; paints: {painted:#?}"
+        );
+        assert!(
+            row.chars().count() <= COLS as usize,
+            "the status row must never exceed {COLS} columns with the queue \
+             tag on it either, but {row:?} is {} columns; paints: {painted:#?}",
+            row.chars().count()
+        );
+    }
 }

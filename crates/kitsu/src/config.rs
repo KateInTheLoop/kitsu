@@ -66,6 +66,12 @@ pub struct Config {
     /// handed a silently materialized table.
     #[serde(default)]
     pub hooks: Option<HooksConfig>,
+    /// Optional `[tui]` table (design §4.8). Absent is the same as every key
+    /// at its default, which is why callers read it as
+    /// `tui.unwrap_or_default()` rather than being handed a silently
+    /// materialized table.
+    #[serde(default)]
+    pub tui: Option<TuiConfig>,
 }
 
 /// When the per-process agent state file is written (docs/architecture.md).
@@ -159,6 +165,289 @@ pub struct HooksConfig {
     /// `agent_hook`'s job. An empty or whitespace-only string means no hook.
     #[serde(default)]
     pub on_agent_state: Option<String>,
+}
+
+/// Which renderer a chat session runs (`[tui] mode`, design §4.8).
+///
+/// `fullscreen` is in the design's grammar but deliberately absent here: the
+/// fullscreen renderer is T5 work, and a value that parses today and silently
+/// behaves as `inline` is the quiet coercion this table exists to prevent. It
+/// becomes a variant when its renderer does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TuiMode {
+    /// The line renderer kitsu has always had, and the default: the inline
+    /// viewport is a preview until the terminal matrix
+    /// (docs/roadmap/cycles/e11/terminal-matrix.md) has been run by a human.
+    #[default]
+    Classic,
+    /// The pinned inline viewport from `kitsu-tui`.
+    Inline,
+}
+
+/// Whether a session takes the terminal's alternate screen (`[tui]
+/// alternate_screen`).
+///
+/// A tri-state rather than a boolean, because `auto` ("whatever this terminal
+/// and this renderer can do") is not expressible as one, and a boolean would
+/// make the two explicit answers indistinguishable from the inferred one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AlternateScreen {
+    /// Let the renderer decide. The default.
+    #[default]
+    Auto,
+    /// Always take the alternate screen.
+    Always,
+    /// Never take it; `--no-alt-screen` forces this.
+    Never,
+}
+
+/// The prefix every `[tui]` value error carries.
+///
+/// It is also the credential boundary: each message bearing this prefix is
+/// written in this file and interpolates the KEY NAME and the permitted values
+/// only — never the offending value. That is what lets `Config::load` surface
+/// these while it still withholds serde's own `invalid type` message, which
+/// quotes the input and so could echo a token out of a mistyped line.
+const TUI_VALUE_ERROR: &str = "invalid value for `[tui]` key ";
+
+/// The accepted `mode` spellings, as the error messages list them.
+const TUI_MODES: &str = "`classic`, `inline`";
+/// The accepted `alternate_screen` spellings.
+const TUI_ALTERNATE_SCREENS: &str = "`auto`, `always`, `never`";
+
+/// Deserialize `mode` loudly.
+///
+/// Both failures — a wrong type and an unknown spelling — become the same
+/// `TUI_VALUE_ERROR` message, which names the key and lists the permitted
+/// values and interpolates **nothing the user wrote**. That is deliberate and
+/// it is the reason this key gets the same help as `title` or `prefix`:
+/// serde's own `unknown variant` message would echo the offending value, so
+/// it could not cross the credential boundary in `Config::load` and a
+/// misspelled `mode` would reach `kitsu doctor` as nothing but a line number.
+///
+/// The match is byte-exact: `"Inline"`, `"INLINE"` and `"inline "` are typos,
+/// and a typo in a key the user wrote on purpose must be a loud error rather
+/// than the fail-closed fallback the retired `KITSU_TUI` gate used.
+fn deserialize_tui_mode<'de, D>(deserializer: D) -> Result<TuiMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let invalid = || {
+        D::Error::custom(format!(
+            "{TUI_VALUE_ERROR}`mode`: expected one of {TUI_MODES}"
+        ))
+    };
+    let raw = String::deserialize(deserializer).map_err(|_| invalid())?;
+    match raw.as_str() {
+        "classic" => Ok(TuiMode::Classic),
+        "inline" => Ok(TuiMode::Inline),
+        _ => Err(invalid()),
+    }
+}
+
+/// Deserialize `alternate_screen` loudly.
+///
+/// A boolean is the mistake the key's name invites, and `"sometimes"` is the
+/// mistake its meaning invites; both fail with the one `TUI_VALUE_ERROR`
+/// message naming the key and the tri-state, for the same reason as
+/// [`deserialize_tui_mode`] — the message must be safe to print, so it never
+/// repeats the value.
+fn deserialize_alternate_screen<'de, D>(deserializer: D) -> Result<AlternateScreen, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let invalid = || {
+        D::Error::custom(format!(
+            "{TUI_VALUE_ERROR}`alternate_screen`: expected one of {TUI_ALTERNATE_SCREENS}"
+        ))
+    };
+    let raw = String::deserialize(deserializer).map_err(|_| invalid())?;
+    match raw.as_str() {
+        "auto" => Ok(AlternateScreen::Auto),
+        "always" => Ok(AlternateScreen::Always),
+        "never" => Ok(AlternateScreen::Never),
+        _ => Err(invalid()),
+    }
+}
+
+/// Deserialize one `[tui]` boolean, naming the key and nothing else.
+///
+/// serde's own message for `title = "true"` is `invalid type: string "true",
+/// expected a boolean` — it quotes the value, so it cannot cross the
+/// suppression boundary in `Config::load`. This one is value-free by
+/// construction.
+fn deserialize_tui_bool<'de, D>(deserializer: D, key: &str) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    bool::deserialize(deserializer).map_err(|_| {
+        D::Error::custom(format!(
+            "{TUI_VALUE_ERROR}`{key}`: expected a boolean (true or false)"
+        ))
+    })
+}
+
+fn deserialize_tui_title<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_tui_bool(deserializer, "title")
+}
+
+fn deserialize_tui_left_arrow<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_tui_bool(deserializer, "left_arrow_opens_agents")
+}
+
+/// Deserialize `prefix`, rejecting a blank value.
+///
+/// An empty prefix is not a prefix: the chord model needs a key to hang the
+/// chords on, and a blank value would otherwise buy a silently chord-less
+/// session. The message names the key and shows the default spelling; it never
+/// echoes what was written.
+fn deserialize_tui_prefix<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let invalid = || {
+        D::Error::custom(format!(
+            "{TUI_VALUE_ERROR}`prefix`: expected a non-empty key name such as `{}`",
+            TuiConfig::DEFAULT_PREFIX
+        ))
+    };
+    let raw = String::deserialize(deserializer).map_err(|_| invalid())?;
+    if raw.trim().is_empty() {
+        return Err(invalid());
+    }
+    Ok(raw)
+}
+
+/// Deserialize `cell_ring_lines` inside its bound.
+///
+/// The bound is checked at the parse, not where the ring is built: `0` is not
+/// "disabled" and `u64::MAX` is not "unbounded", and a memory bound the user
+/// cannot read is one they trip over at runtime instead. The message states
+/// the key and the range, and never the rejected number — the range is the
+/// fix, and a value echoed back out of a config file is how a token leaks.
+fn deserialize_cell_ring_lines<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let invalid = || {
+        D::Error::custom(format!(
+            "{TUI_VALUE_ERROR}`cell_ring_lines`: expected an integer between {} and {}",
+            TuiConfig::MIN_CELL_RING_LINES,
+            TuiConfig::MAX_CELL_RING_LINES
+        ))
+    };
+    let lines = usize::try_from(u64::deserialize(deserializer).map_err(|_| invalid())?)
+        .map_err(|_| invalid())?;
+    if !(TuiConfig::MIN_CELL_RING_LINES..=TuiConfig::MAX_CELL_RING_LINES).contains(&lines) {
+        return Err(invalid());
+    }
+    Ok(lines)
+}
+
+/// The `[tui]` table (design §4.8). Unknown keys are rejected loudly, so a
+/// misspelled key is an error naming the key rather than a setting that
+/// silently never applies.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TuiConfig {
+    /// Which renderer the session runs. `--tui <MODE>` overrides.
+    #[serde(default, deserialize_with = "deserialize_tui_mode")]
+    pub mode: TuiMode,
+    /// Whether the session takes the alternate screen. `--no-alt-screen`
+    /// forces `never`.
+    #[serde(default, deserialize_with = "deserialize_alternate_screen")]
+    pub alternate_screen: AlternateScreen,
+    /// The chord prefix key.
+    #[serde(
+        default = "default_tui_prefix",
+        deserialize_with = "deserialize_tui_prefix"
+    )]
+    pub prefix: String,
+    /// Whether the viewport paints its title row.
+    #[serde(default = "default_true", deserialize_with = "deserialize_tui_title")]
+    pub title: bool,
+    /// Whether Left opens the agents pane.
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_tui_left_arrow"
+    )]
+    pub left_arrow_opens_agents: bool,
+    /// How many lines of cell scrollback the viewport retains.
+    #[serde(
+        default = "default_cell_ring_lines",
+        deserialize_with = "deserialize_cell_ring_lines"
+    )]
+    pub cell_ring_lines: usize,
+}
+
+fn default_tui_prefix() -> String {
+    TuiConfig::DEFAULT_PREFIX.to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_cell_ring_lines() -> usize {
+    TuiConfig::DEFAULT_CELL_RING_LINES
+}
+
+// Hand-written rather than derived, for the reason `AgentsConfig` carries the
+// same note: every caller reads the table as `tui.unwrap_or_default()`, which
+// goes through *this* impl and never through serde, so a derived `Default`
+// would hand a config with no `[tui]` table an empty chord prefix and a
+// ZERO-line cell ring while the `#[serde(default = "...")]` attributes above
+// only cover a key's absence from a table that is present.
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            mode: TuiMode::default(),
+            alternate_screen: AlternateScreen::default(),
+            prefix: default_tui_prefix(),
+            title: true,
+            left_arrow_opens_agents: true,
+            cell_ring_lines: default_cell_ring_lines(),
+        }
+    }
+}
+
+impl TuiConfig {
+    /// The default chord prefix.
+    pub const DEFAULT_PREFIX: &'static str = "ctrl+x";
+    /// The default cell scrollback depth in lines.
+    pub const DEFAULT_CELL_RING_LINES: usize = 10_000;
+    /// The smallest accepted `cell_ring_lines`. One line, not zero: zero would
+    /// make "no scrollback" indistinguishable from a typo.
+    pub const MIN_CELL_RING_LINES: usize = 1;
+    /// The largest accepted `cell_ring_lines`.
+    pub const MAX_CELL_RING_LINES: usize = 1_000_000;
+
+    /// The renderer this run uses: `--tui` beats `[tui] mode` beats the
+    /// default. There is no fourth source — the `KITSU_TUI` preview gate was
+    /// retired with this card, so nothing here reads the environment.
+    pub fn effective_mode(&self, flag: Option<TuiMode>) -> TuiMode {
+        flag.unwrap_or(self.mode)
+    }
+
+    /// The alternate-screen decision this run uses. `--no-alt-screen` is
+    /// one-way: it forces `never` over any configured value, and its absence
+    /// forces nothing.
+    pub fn effective_alternate_screen(&self, no_alt_screen_flag: bool) -> AlternateScreen {
+        if no_alt_screen_flag {
+            AlternateScreen::Never
+        } else {
+            self.alternate_screen
+        }
+    }
 }
 
 /// A single named gateway profile. Unknown keys are rejected loudly: a typo
@@ -439,7 +728,23 @@ impl Config {
                 // serde's unknown-field message enumerates key NAMES only —
                 // safe to surface, and exactly what a typo'd key needs.
                 let message = error.message().to_string();
-                let hint = message.starts_with("unknown field").then_some(message);
+                // Two safe classes, and nothing else:
+                //   * serde's unknown-field message enumerates key NAMES only
+                //     — safe to surface, and exactly what a typo'd key needs.
+                //   * `[tui]` value errors written in this file, which
+                //     interpolate the key name and the permitted values and
+                //     never the offending value (see `TUI_VALUE_ERROR`).
+                // Everything else stays withheld — serde's `invalid type`
+                // above all, which quotes the input, and its `unknown
+                // variant`, which echoes the word the user wrote. A config
+                // file holds gateway tokens, and a mistyped line can put one
+                // where the parser would quote it back. No `[tui]` key relies
+                // on either: every one of the six fails with a message written
+                // above, so the table names the key the user got wrong
+                // without the allow-list ever having to admit a value.
+                let hint = (message.starts_with("unknown field")
+                    || message.starts_with(TUI_VALUE_ERROR))
+                .then_some(message);
                 ConfigError::Parse {
                     line: location.map(|(line, _)| line),
                     column: location.map(|(_, column)| column),
@@ -1102,6 +1407,422 @@ mod tests {
             "[agents]\nstate_file = \"on\"\n\n[hooks]\non_agent_state = \"notify\"\n",
         )
         .unwrap();
+        assert_eq!(
+            parsed.agents.unwrap_or_default().state_file,
+            StateFileMode::On
+        );
+        assert_eq!(
+            parsed.hooks.unwrap_or_default().on_agent_state.as_deref(),
+            Some("notify")
+        );
+    }
+    // -----------------------------------------------------------------
+    // T3-S2: the `[tui]` table (design §4.8, plan row T3-S2).
+    // FAILING-FIRST: none of `Config::tui`, `TuiConfig`, `TuiMode`,
+    // `AlternateScreen` exists yet, so this block does not compile until the
+    // implementer adds them.
+    //
+    // Scope decisions pinned here, with their reasons:
+    //
+    // * `mode` accepts `classic` and `inline` only. The design's grammar also
+    //   lists `fullscreen`, but fullscreen is T5 work; a name that parses
+    //   today and silently behaves as `inline` is exactly the kind of
+    //   quiet coercion this card's risk gate exists to forbid. When T5 lands,
+    //   `tui_mode_rejects_fullscreen_until_the_t5_renderer_exists` is the test
+    //   to change, deliberately.
+    // * `cell_ring_lines` is range-checked HERE, not in T3-S6. The ring is
+    //   built in T3-S6; if the parser admits `0` or `4_000_000_000`, T3-S6 has
+    //   to invent a silent fallback, and a memory bound you cannot state is
+    //   not a bound. The checked range is
+    //   `MIN_CELL_RING_LINES..=MAX_CELL_RING_LINES`.
+    // * The range error must reach the USER. `ConfigError::Parse` only keeps
+    //   its hint when the serde message starts with "unknown field", so a
+    //   custom serde range message would be withheld as a possible credential
+    //   excerpt. The tests below therefore assert on `Config::load`'s
+    //   rendered error, which forces either a dedicated `ConfigError` variant
+    //   or a widened hint allow-list.
+    // -----------------------------------------------------------------
+
+    /// Parse a config from text the way the product does: through a real file
+    /// and `Config::load`, so `ConfigError`'s own rendering is what is pinned
+    /// rather than the raw serde message.
+    fn load_config_text(text: &str) -> Result<Config, ConfigError> {
+        let directory = tempfile::tempdir().expect("temp config directory");
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, text).expect("write config text");
+        Config::load(&path)
+    }
+
+    /// All six keys, every one of them set away from its default, so a test
+    /// that passed by accident on a default cannot pass here.
+    #[test]
+    fn tui_table_parses_all_six_keys() {
+        let parsed: Config = toml::from_str(
+            "[tui]\n\
+             mode = \"inline\"\n\
+             alternate_screen = \"never\"\n\
+             prefix = \"ctrl+b\"\n\
+             title = false\n\
+             left_arrow_opens_agents = false\n\
+             cell_ring_lines = 250\n",
+        )
+        .expect("the full [tui] table must parse");
+        let tui = parsed.tui.expect("[tui] must be present when written");
+        assert_eq!(tui.mode, TuiMode::Inline);
+        assert_eq!(tui.alternate_screen, AlternateScreen::Never);
+        assert_eq!(tui.prefix, "ctrl+b");
+        assert!(!tui.title);
+        assert!(!tui.left_arrow_opens_agents);
+        assert_eq!(tui.cell_ring_lines, 250);
+
+        // ...and each value above differs from the default, which is what
+        // makes the assertions non-vacuous.
+        let default = TuiConfig::default();
+        assert_ne!(default.mode, TuiMode::Inline);
+        assert_ne!(default.alternate_screen, AlternateScreen::Never);
+        assert_ne!(default.prefix, "ctrl+b");
+        assert!(default.title);
+        assert!(default.left_arrow_opens_agents);
+        assert_ne!(default.cell_ring_lines, 250);
+    }
+
+    /// The defaults, read the way every caller reads them.
+    ///
+    /// This is the T2-S5a trap restated: callers reach the table through
+    /// `tui.unwrap_or_default()`, which goes through the **derived** `Default`
+    /// and never through serde, so `#[serde(default = "...")]` alone would
+    /// hand a config with no `[tui]` table an empty prefix and a ZERO-line
+    /// cell ring. Absent table, empty table and `TuiConfig::default()` must
+    /// all be the same six values.
+    #[test]
+    fn tui_table_defaults_are_identical_absent_empty_and_through_unwrap_or_default() {
+        let absent: Config = toml::from_str("default_gateway = \"example\"\n").unwrap();
+        let empty: Config = toml::from_str("[tui]\n").unwrap();
+        let tables = [
+            ("absent", absent.tui.unwrap_or_default()),
+            ("empty", empty.tui.unwrap_or_default()),
+            ("struct default", TuiConfig::default()),
+        ];
+        for (label, tui) in tables {
+            // `mode` is classic until a human has run the Q1 terminal matrix
+            // (docs/roadmap/cycles/e11/terminal-matrix.md). Nothing in this
+            // card may make the preview renderer the default.
+            assert_eq!(tui.mode, TuiMode::Classic, "{label}: mode");
+            assert_eq!(
+                tui.alternate_screen,
+                AlternateScreen::Auto,
+                "{label}: alternate_screen"
+            );
+            assert_eq!(tui.prefix, TuiConfig::DEFAULT_PREFIX, "{label}: prefix");
+            assert_eq!(tui.prefix, "ctrl+x", "{label}: prefix spelling");
+            assert!(tui.title, "{label}: title");
+            assert!(
+                tui.left_arrow_opens_agents,
+                "{label}: left_arrow_opens_agents"
+            );
+            assert_eq!(
+                tui.cell_ring_lines,
+                TuiConfig::DEFAULT_CELL_RING_LINES,
+                "{label}: cell_ring_lines"
+            );
+            assert_eq!(
+                tui.cell_ring_lines, 10_000,
+                "{label}: cell_ring_lines value"
+            );
+        }
+    }
+
+    /// Every key defaults independently: one key set must not drag the other
+    /// five off their defaults (the failure mode of a `#[serde(default)]` on
+    /// the struct rather than on each field).
+    #[test]
+    fn tui_keys_default_independently_of_one_another() {
+        let parsed: Config = toml::from_str("[tui]\nmode = \"inline\"\n").unwrap();
+        let tui = parsed.tui.unwrap_or_default();
+        assert_eq!(tui.mode, TuiMode::Inline);
+        assert_eq!(tui.alternate_screen, AlternateScreen::Auto);
+        assert_eq!(tui.prefix, "ctrl+x");
+        assert!(tui.title);
+        assert!(tui.left_arrow_opens_agents);
+        assert_eq!(tui.cell_ring_lines, 10_000);
+    }
+
+    /// Precedence, written down once: `--tui` beats `[tui] mode` beats the
+    /// default, and there is no fourth source — `KITSU_TUI` is gone (plan row
+    /// T3-S2, "env gate removed"), so nothing reads the environment here.
+    #[test]
+    fn tui_mode_precedence_is_flag_then_config_then_default() {
+        let classic = TuiConfig::default();
+        let inline = TuiConfig {
+            mode: TuiMode::Inline,
+            ..TuiConfig::default()
+        };
+
+        // Flag wins, in both directions, so "the flag wins" is not just
+        // "inline wins".
+        assert_eq!(
+            classic.effective_mode(Some(TuiMode::Inline)),
+            TuiMode::Inline
+        );
+        assert_eq!(
+            inline.effective_mode(Some(TuiMode::Classic)),
+            TuiMode::Classic
+        );
+        // No flag: the config decides.
+        assert_eq!(inline.effective_mode(None), TuiMode::Inline);
+        // Neither: the default.
+        assert_eq!(classic.effective_mode(None), TuiMode::Classic);
+        assert_eq!(
+            TuiConfig::default().effective_mode(None),
+            TuiMode::Classic,
+            "a config with no [tui] table must still be classic"
+        );
+    }
+
+    /// `--no-alt-screen` is a one-way flag: it forces `never` over any
+    /// configured value, and its absence never forces anything.
+    #[test]
+    fn no_alt_screen_flag_forces_never_over_any_configured_value() {
+        for configured in [
+            AlternateScreen::Auto,
+            AlternateScreen::Always,
+            AlternateScreen::Never,
+        ] {
+            let tui = TuiConfig {
+                alternate_screen: configured,
+                ..TuiConfig::default()
+            };
+            assert_eq!(
+                tui.effective_alternate_screen(true),
+                AlternateScreen::Never,
+                "--no-alt-screen must beat alternate_screen = {configured:?}"
+            );
+            assert_eq!(
+                tui.effective_alternate_screen(false),
+                configured,
+                "without the flag the configured value stands"
+            );
+        }
+    }
+
+    /// The risk gate (design §4.8): a misspelled key inside `[tui]` is an
+    /// error that NAMES the key. Today `[tui]` is itself an unknown field on
+    /// `Config`, so the message names `tui` and the user is told nothing about
+    /// their typo — which is why the assertion is on the inner key's name and
+    /// on the enumeration that proves the table is known.
+    #[test]
+    fn tui_table_rejects_unknown_keys_and_names_the_key() {
+        let error = toml::from_str::<Config>("[tui]\ncell_ring_line = 500\n")
+            .expect_err("a typo inside [tui] must be rejected, not ignored");
+        let message = error.message();
+        assert!(
+            message.starts_with("unknown field `cell_ring_line`"),
+            "the message must name the misspelled key first: {message}"
+        );
+        assert!(
+            message.contains("cell_ring_lines"),
+            "and enumerate the real keys, which is the user's fix: {message}"
+        );
+
+        // The same typo through the product's own loader, which is what
+        // `kitsu doctor` prints.
+        let rendered = load_config_text("[tui]\ncell_ring_line = 500\n")
+            .expect_err("Config::load must reject it too")
+            .to_string();
+        assert!(
+            rendered.contains("unknown field `cell_ring_line`"),
+            "ConfigError must carry the key name, not withhold it: {rendered}"
+        );
+    }
+
+    /// A `[tui]` key copied to the top level is a mistake, not a synonym.
+    #[test]
+    fn tui_keys_are_not_accepted_at_the_top_level() {
+        let error = toml::from_str::<Config>("mode = \"inline\"\n")
+            .expect_err("`mode` is a [tui] key and must not be accepted flat");
+        assert!(
+            error.message().starts_with("unknown field `mode`"),
+            "{error}"
+        );
+    }
+
+    /// An unknown `mode` fails loudly with the offending value named — the
+    /// `StateFileMode` precedent. It must NOT fail closed to classic the way
+    /// the retired `KITSU_TUI` parser did: an env preview gate can swallow a
+    /// typo, a config key the user wrote on purpose cannot.
+    #[test]
+    fn tui_mode_rejects_unknown_values_instead_of_falling_back_to_classic() {
+        for value in ["Inline", "INLINE", "inline ", "1", "true", "", "viewport"] {
+            let text = format!("[tui]\nmode = \"{value}\"\n");
+            let error = toml::from_str::<Config>(&text)
+                .expect_err(&format!("mode = {value:?} must be rejected, not defaulted"));
+            let message = error.message().to_string();
+            // Authorised change (coordinator, T3-S2): the message is this
+            // file's own key-naming one rather than serde's `unknown
+            // variant`, which would echo `value` back and so could not be
+            // surfaced by `Config::load` at all. The assertion is still that
+            // the value is REJECTED, loudly and by name.
+            assert!(
+                message.contains("invalid value for `[tui]` key `mode`")
+                    && message.contains("`classic`, `inline`"),
+                "mode = {value:?} must fail naming the key and the modes: {message}"
+            );
+        }
+
+        // The accepted spelling, so the loop above is not rejecting everything.
+        let parsed: Config = toml::from_str("[tui]\nmode = \"inline\"\n").unwrap();
+        assert_eq!(parsed.tui.unwrap_or_default().mode, TuiMode::Inline);
+    }
+
+    /// Fullscreen is T5's renderer. Until it exists the name is rejected, so
+    /// nobody is silently handed the inline viewport under a third name.
+    /// **Change this test deliberately in T5**, not incidentally.
+    #[test]
+    fn tui_mode_rejects_fullscreen_until_the_t5_renderer_exists() {
+        let error = toml::from_str::<Config>("[tui]\nmode = \"fullscreen\"\n")
+            .expect_err("fullscreen must not parse before the T5 renderer exists");
+        let message = error.message();
+        // Authorised change (coordinator, T3-S2): the message names the KEY
+        // and the modes that exist, not the rejected word — a value out of a
+        // config file is never echoed. "expected one of `classic`, `inline`"
+        // states the T5 boundary at least as clearly as naming `fullscreen`
+        // did.
+        assert!(
+            message.contains("invalid value for `[tui]` key `mode`"),
+            "the message must name the key: {message}"
+        );
+        assert!(
+            message.contains("classic") && message.contains("inline"),
+            "and list what is accepted today: {message}"
+        );
+    }
+
+    /// `alternate_screen` is the tri-state of design §4.8, not a boolean. A
+    /// boolean is the mistake a reader makes from the key's name, so it is an
+    /// error naming the key rather than a coercion.
+    #[test]
+    fn alternate_screen_is_a_tri_state_and_rejects_booleans() {
+        for (text, expected) in [
+            (
+                "[tui]\nalternate_screen = \"auto\"\n",
+                AlternateScreen::Auto,
+            ),
+            (
+                "[tui]\nalternate_screen = \"always\"\n",
+                AlternateScreen::Always,
+            ),
+            (
+                "[tui]\nalternate_screen = \"never\"\n",
+                AlternateScreen::Never,
+            ),
+        ] {
+            let parsed: Config = toml::from_str(text).expect(text);
+            assert_eq!(parsed.tui.unwrap_or_default().alternate_screen, expected);
+        }
+
+        let rendered = load_config_text("[tui]\nalternate_screen = true\n")
+            .expect_err("a boolean must not be coerced to auto/always")
+            .to_string();
+        assert!(
+            rendered.contains("alternate_screen"),
+            "the error must name the key the user got wrong: {rendered}"
+        );
+
+        let error = toml::from_str::<Config>("[tui]\nalternate_screen = \"sometimes\"\n")
+            .expect_err("an unknown tri-state value must fail closed loudly");
+        // Authorised change (coordinator, T3-S2): same message as the boolean
+        // above, naming the key and the tri-state and never the value, so all
+        // six keys of this table fail with one vocabulary.
+        assert!(
+            error
+                .message()
+                .contains("invalid value for `[tui]` key `alternate_screen`")
+                && error.message().contains("`auto`, `always`, `never`"),
+            "{error}"
+        );
+    }
+
+    /// `title` and `left_arrow_opens_agents` are booleans and stay booleans:
+    /// a string `"true"` is a typo, not a value.
+    #[test]
+    fn tui_boolean_keys_reject_strings_naming_the_key() {
+        for key in ["title", "left_arrow_opens_agents"] {
+            let rendered = load_config_text(&format!("[tui]\n{key} = \"true\"\n"))
+                .expect_err(&format!("{key} = \"true\" must be rejected"))
+                .to_string();
+            assert!(
+                rendered.contains(key),
+                "the error must name the key the user got wrong: {rendered}"
+            );
+        }
+
+        // Real booleans still parse, both ways round.
+        let off: Config =
+            toml::from_str("[tui]\ntitle = false\nleft_arrow_opens_agents = false\n").unwrap();
+        let off = off.tui.unwrap_or_default();
+        assert!(!off.title);
+        assert!(!off.left_arrow_opens_agents);
+    }
+
+    /// The memory bound (T3-S6's risk gate N4) is stated at the parse. Zero is
+    /// not "disabled" and `u64::MAX` is not "unbounded": both are rejected
+    /// with the key named and the accepted range shown, because a bound the
+    /// user cannot read is a bound they will trip over at runtime instead.
+    #[test]
+    fn cell_ring_lines_rejects_zero_and_absurd_values_naming_the_key() {
+        assert_eq!(TuiConfig::MIN_CELL_RING_LINES, 1);
+        assert_eq!(TuiConfig::MAX_CELL_RING_LINES, 1_000_000);
+
+        for value in ["0", "1000001", "4000000000", "-1", "1.5", "\"10000\""] {
+            let text = format!("[tui]\ncell_ring_lines = {value}\n");
+            let rendered = load_config_text(&text)
+                .expect_err(&format!(
+                    "cell_ring_lines = {value} must be rejected, not clamped"
+                ))
+                .to_string();
+            assert!(
+                rendered.contains("cell_ring_lines"),
+                "the error must name the key for {value}: {rendered}"
+            );
+        }
+
+        // ...and the bounds themselves are accepted, so the range check is
+        // not simply rejecting everything.
+        for value in [
+            TuiConfig::MIN_CELL_RING_LINES,
+            TuiConfig::DEFAULT_CELL_RING_LINES,
+            TuiConfig::MAX_CELL_RING_LINES,
+        ] {
+            let parsed = load_config_text(&format!("[tui]\ncell_ring_lines = {value}\n"))
+                .unwrap_or_else(|error| panic!("{value} must be accepted: {error}"));
+            assert_eq!(parsed.tui.unwrap_or_default().cell_ring_lines, value);
+        }
+    }
+
+    /// An empty prefix is not a prefix. The chord model (design §642) needs a
+    /// key to hang the chords on, so a blank value is an error naming the key
+    /// rather than a silently chord-less session.
+    #[test]
+    fn tui_prefix_rejects_an_empty_value_naming_the_key() {
+        let rendered = load_config_text("[tui]\nprefix = \"\"\n")
+            .expect_err("an empty prefix must be rejected")
+            .to_string();
+        assert!(rendered.contains("prefix"), "{rendered}");
+    }
+
+    /// The three optional tables are independent: `[tui]` must not disturb
+    /// `[agents]` or `[hooks]`, and the flat keys keep working beside it.
+    #[test]
+    fn tui_agents_and_hooks_tables_coexist() {
+        let parsed: Config = toml::from_str(
+            "agent_spawn_cap = 3\n\n\
+             [tui]\nmode = \"inline\"\n\n\
+             [agents]\nstate_file = \"on\"\n\n\
+             [hooks]\non_agent_state = \"notify\"\n",
+        )
+        .expect("all three tables must coexist");
+        assert_eq!(parsed.agent_spawn_cap, Some(3));
+        assert_eq!(parsed.tui.unwrap_or_default().mode, TuiMode::Inline);
         assert_eq!(
             parsed.agents.unwrap_or_default().state_file,
             StateFileMode::On

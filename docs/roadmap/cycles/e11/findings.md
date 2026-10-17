@@ -2480,3 +2480,304 @@ was a **surface problem** — the assertion was watching a view that could not
 print the thing it waited for. Raising the timeout would have hidden each one.
 When a PTY test reaches its deadline, the first question is *"can this command
 ever print what I am waiting for?"*, not *"is the machine slow?"*.
+
+## F47 — a streamed answer's last line was being erased, and the first hypothesis was wrong
+
+Found by T3-S1's new streaming PTY harness, on its first real turn. **The TUI
+tests had never talked to a reachable gateway** — `write_config` pointed at
+`https://gateway.invalid` — so in thirteen tests nothing had ever rendered a
+streaming turn or a tool call. The defect was waiting there the whole time.
+
+### The defect
+
+In **classic styled mode**, when an answer's final line carries **no trailing
+newline** — the usual provider shape — that line was written to the terminal and
+then **erased**. It appeared on no screen, final or mid-session. Inline mode was
+unaffected, which is what localised it.
+
+Deterministic: 20 runs, both profiles, no flake.
+
+### The first hypothesis was wrong, and that is the reusable part
+
+The test author proposed that `finish_line`'s two separate writes (the partial
+line, then its newline) left a window in which a live-row writer landed — and
+**labelled it a hypothesis** rather than asserting it, which is what made the
+next step cheap.
+
+It was wrong in its central claim. The fixer instrumented `kitsu-render`, ran
+the failing test, and found **`print_fragment` never appears in the trace at
+all**: in classic mode with tools advertised, deltas are **buffered rather than
+streamed live** (`orchestrator.rs:1725-1731`), and the whole answer is printed
+in one shot by `print_message` (`orchestrator.rs:1869-1871`). The streaming path
+the hypothesis blamed was not running.
+
+**The verified cause:** `print_message` renders inside
+`live::with_live_row_suspended`, and for text not ending in a newline the
+suspension **closes with the cursor mid-row** on the row holding the last line.
+The guard's `Drop` calls `redraw` → `render_region`, which paints with no
+absolute positioning — **on that same row** — and `finish_line`'s following
+`clear_row` wipes the remainder. `SUSPEND_DEPTH` and `write_block` are innocent;
+the spinner thread never raced; the whole thing is single-threaded.
+
+Two lessons, and the first is the same one F43 taught at my expense: **a
+mechanism is a hypothesis until someone reads the path, and the cheapest way to
+settle it is instrumentation rather than argument.** The second: a label of
+"hypothesis" is not a weakness in a report — it is what tells the next person
+the claim still needs settling, and it saved this fix from being applied to the
+wrong writer.
+
+### The invariant that was never written down
+
+The region's painters are **relative** (`\r\x1b[2K`, `\x1b[1A\x1b[2K`), so each
+acts on whatever row the cursor occupies. The unwritten contract is: *when the
+region takes a fresh row, the cursor is at column 0 of a row the region owns.*
+Nothing in `docs/ux-design.md` stated it, which is why a writer could violate it
+silently. The fix makes it explicit — writers that may end mid-row declare it,
+and the region steps down one row before taking ownership — and the invariant is
+now documented in `ux-design.md` as load-bearing, with the requirement that any
+new writer able to finish without a newline must declare it too.
+
+### Still uncovered, flagged by the fixer
+
+Three other writers can leave the cursor mid-row: the credential prompt
+(`main.rs:2306`, mid-row **by design**) and two bare `print!` calls
+(`main.rs:2967`, `main.rs:9982`). All three are non-chat paths where no live row
+is drawn, so they are theoretical **today** and would become real the moment a
+live row were painted concurrently. No test covers any of them. A regression
+test for the credential prompt under a drawn live row is the gap worth taking
+next.
+
+## F48 — policy: a value from argv is echoed, a value from the config file is not
+
+Settled in T3-S2 while making `[tui]` errors name their key. Recorded because it
+is a **policy future cards need**, not a detail of one table, and because the two
+cases differ in kind rather than degree.
+
+**The rule.** An error about a value the user typed on the command line may
+quote that value. An error about a value read from the config file names the
+**key and the permitted set**, never the value.
+
+**Why the config side suppresses.** The threat is **adjacency**, not the value
+itself. The file holds gateway tokens the user did not type in this breath; a
+parse error can quote a line they never meant to expose; and the error
+**travels** — into `doctor --json`, logs, CI output, and pasted bug reports. The
+user cannot predict which line the parser will quote, so the safe default is
+that no config value crosses the boundary.
+
+**Why the flag side echoes.** A flag value was typed on the line the user is
+looking at, is one argument long, and is already in their shell history and
+terminal scrollback, so echoing adds **no disclosure**. Withholding it costs
+real diagnostic value: `--tui inlien`, `--tui ìnline` (a Unicode look-alike) and
+a shell-mangled `--tui $MODE` that expanded to empty are **indistinguishable**
+without the value. The empty case is why that flag needed a hand-written parser
+at all — clap's own message for an empty value says "a value is required … but
+none was supplied", which is actively misleading when the user did supply one.
+It is also what every other flag in the binary already does, so suppressing only
+one would read as a bug rather than a policy.
+
+**The exception to apply if it ever arises:** if a flag's value is itself a
+credential — a `--token`-shaped argument — suppress **at that flag**, not
+everywhere. None exists today.
+
+**How the config side is enforced**, since "remember not to" is not an
+enforcement mechanism: each `[tui]` field's `deserialize_with` **drops** serde's
+error with `.map_err(|_| …)` rather than wrapping it, and substitutes a message
+the codebase owns. There is no `other =>` binding anywhere in that path, so no
+code **can** interpolate the input. The error allow-list then admits exactly two
+classes — serde's `unknown field` (which enumerates key *names*) and the local
+`invalid value for `[tui]` key …` prefix.
+
+The decisive property, verified by running the real loader: a typo and a
+credential in the same key produce **byte-identical messages**, differing only
+in the reported column. A message that cannot depend on the value cannot leak
+it — which is a stronger guarantee than one that merely tries not to.
+
+### F20 third pass — what R4 actually left undone, and what T3-S3 closes
+
+F20 has now been corrected twice and clarified a third time, so here is the
+settled list. Of the four things R4 was thought to have left behind:
+
+- **cross-session history** — the original claim was **false**; it works, by
+  borrowing rustyline's persistence;
+- **reverse search** — also **false**; only the `⌕ reverse-search '…'` indicator
+  was missing, and T0-S9 restored it;
+- **Tab accepting the showing slash suffix** — **done** in T0-S10;
+- **the lists** — `@file` path completion and the bordered palette — **the
+  genuine remainder.**
+
+**T3-S3 closes the `@file` half**, through one shared completion source rather
+than a second implementation, and re-hosts the highlighter.
+
+**It does not close the bordered palette**, and that distinction matters: the
+palette's *content* is already solved (`tui_bridge::palette_rows` is a tested
+thin join over the one renderer), so what remains is purely its **height and
+placement** — a geometry problem entangled with **F16** (resize) and **F19**
+(the short-terminal clamp), not a completion problem. Anyone reading "T3-S3
+done" should not read it as "F20 closed".
+
+The lesson F20 keeps teaching, now for the third time: **a list of "what is
+missing" written from memory of a design is unreliable.** Two of its four items
+were features that already worked. Each correction came from reading the code or
+running the binary, never from re-reading the design.
+
+## F49 — T3-S4 needed no production code, and the plan row would have made the product worse
+
+The plan told T3-S4 to have the TUI composer "load/save the rustyline history
+file format". Investigated before implementing, and the answer is that **history
+is already shared, by delegation to a single owner**, and the row's literal
+instruction would have created a **second parser for a format rustyline owns and
+a second writer competing for one file on disk**.
+
+**What the reading established** (all in `main.rs`): rustyline loads the file
+(`:17433`), the inline reader is handed a **snapshot** of its entries
+(`:6155`, taken inside `read_idle_chat_line`, which runs **per loop iteration**,
+so it is fresh every turn), every submitted line is recorded on the path
+**common to both readers** (`:17576`, outside any branch on which reader
+produced it), and rustyline saves the file (`:18412`). `kitsu-tui` contains the
+string "history" **nowhere**; the walk lives in `kitsu-editor` over a `Vec` it is
+*handed*. So there is exactly one implementation and one file owner.
+
+Order, de-duplication and blank handling were checked against **rustyline
+14.0.0's own source**, not assumed: `iter()` is oldest-first and both walks take
+the newest on the first ↑; the dedup policy is rustyline's default
+`IgnoreConsecutive`, which kitsu does not override and the editor matches; blank
+lines never reach either walk because `:17573` continues first. The first-↑
+divergence that would otherwise exist is already closed deliberately
+(`tui_bridge.rs:651` declines `RecallRequest` at the idle prompt).
+
+**So the card shipped two tests and a plan amendment, and no code.** That is the
+right outcome, and the general rule is worth keeping: **a plan row describes an
+implementation that was plausible when it was written. If the system has since
+solved the same problem a better way, satisfying the row makes the product worse
+while making the plan look right.** Amend the plan.
+
+### Two latent risks found on the way, neither this card's to fix
+
+1. **A dropped cargo feature would turn a tolerated error into a panic.**
+   `DefaultHistory` is `FileHistory` only because rustyline's
+   `with-file-history` is a **default** feature. `MemHistory`'s `save` and
+   `load` are `unimplemented!()`, so `let _ = rl.load_history(&path)` — written
+   to tolerate a missing file — would **panic** rather than return `Err` if that
+   feature were ever disabled, including by someone adding
+   `default-features = false` for an unrelated reason. The `let _ =` makes it
+   look safe. Worth a compile-time assertion or a comment at the call site.
+
+2. **↑ on a multi-line draft diverges between the renderers.** Classic binds ↑
+   to `LineUpOrPreviousHistory`, which moves the cursor *within* a multi-line
+   draft and only walks history when there is no line above;
+   `TypeaheadEditor` has no intra-draft line motion and always walks. This is
+   **reachable** — a bracketed paste submits a multi-line draft as one entry,
+   and rustyline escapes the newline into the file — so multi-line history
+   entries are real. The test author deliberately wrote **no** failing test,
+   because the inline viewport is **one row** and cannot display a multi-line
+   draft at all, and pinned the boundary in a doc comment so nobody extends the
+   walk by one ↑ and gets a false pass. This belongs with the bordered palette
+   under **F16**/**F19** — height and placement — not with history.
+
+   Labelled as hypothesis, per F43/F47: the *mechanism* was established by
+   reading; whether a user's real history file contains such an entry was not
+   tested through a terminal.
+
+## F39 second occurrence — and both times our own tooling destroyed the evidence
+
+F39 recorded one unidentified `--test cli` failure in seven full-suite runs,
+whose name I lost **by re-running instead of saving the failing output**.
+
+T3-S4 produced a second, in a different suite: the first
+`cargo test -p kitsu --test tui -- --test-threads=1` of that session reported
+**18 passed, 1 failed**, and four consecutive re-runs afterwards were 19/19
+green. The agent reported it rather than burying it, and saved output on every
+run after that — but the name was already gone, because **that run had been
+piped through `tail -4`**.
+
+**Two occurrences, two different suites, and in both cases the evidence was
+destroyed by how we were looking at it** — once by re-running, once by
+truncating the output through `tail`. That is the same family as this project's
+standing rule never to assert absence from a `head`-truncated search: the habit
+that makes output readable is the habit that throws away the part that matters.
+
+**The rule, now with two data points behind it:** when running a suite that
+could plausibly fail, write the full output to a file **first** and read the file
+— never pipe the only copy through `head`, `tail` or `grep`. Both of this
+project's unidentified failures would have been diagnosable under that rule.
+
+Neither occurrence has recurred, neither is characterised, and both remain open.
+
+## F50 — A8's 250 ms latency requirement has no test, and "shipped" was true only of the mechanism
+
+Found while scoping T3-S5, by searching rather than assuming. Requirement **A8**
+says the ambient background-agent counter "MUST update within 250 ms of a
+registry change". That requirement is **satisfied in practice and asserted
+nowhere.**
+
+- The mechanism: `sync_agent_counts` runs once per input poll tick
+  (`main.rs:15071`), and the tick is `libc::poll(..., 50)` (`main.rs:15084`) —
+  50 ms, comfortably inside the budget.
+- The coverage: searches for `250 ms`, `250ms` and `A8` across `crates/` return
+  **nothing**. The five `agents_tag_*` tests pin the tag's **content** — the
+  truth table, blocked outranking running, hidden when both are zero — and not
+  its **latency**. No test asserts the poll interval, and nothing fails if
+  someone raises it to a second.
+
+**The distinction worth keeping:** "A8 is shipped" was true of the mechanism and
+false of the test, and only a search established which. A requirement whose
+number appears nowhere in the test suite is a requirement nobody is holding.
+
+This is the same shape as **F49**'s latent `load_history` panic and **F47**'s
+erased line: a property that holds today by a construction nobody wrote a test
+against. The cheap fix is a unit assertion on the poll interval constant plus a
+comment tying it to A8, so raising the interval fails loudly rather than
+silently breaking a numbered requirement. Not taken in T3-S5, which was told not
+to re-test A8; worth a small card.
+
+## F51 — with tools enabled, an ordinary answer does not stream; it arrives in one burst
+
+Measured during the status-row wiring card, then traced. The agent observed that
+in inline mode a streamed answer reaches the terminal as a **single burst after
+the turn ends** rather than progressively, and **labelled it an open question**
+rather than guessing a cause. I read the path.
+
+**The mechanism is F47's**, at `orchestrator.rs:1728`:
+
+```rust
+if cfg.stream && !tools_were_offered {
+    kitsu_render::print_fragment(&t);
+}
+```
+
+with a comment explaining that a streaming round can emit a tool call as JSON,
+"we suppress that and only print real answers", and that "the final round
+withholds tools, so final answers still stream live".
+
+**The consequence, which is probably not what anyone intended.** That last
+sentence is true of a round that *follows* a tool call. But an ordinary
+single-round answer with tools enabled — **the default configuration** — has
+tools offered in that very round, so `tools_were_offered` is true and **nothing
+streams**. The user types a question, sees a spinner, and then the whole answer
+appears at once. Visible streaming happens only *after* a tool call, in the
+follow-up round that withholds tools.
+
+So the product streams least in the common case and most in the uncommon one.
+
+**It is pre-existing, deliberate at the line level, and identical in classic
+mode** — this is not a regression and not the TUI's doing. F47 found the same
+branch from the other side: it is why a classic streamed answer's last line was
+being erased by `print_message` rather than by the fragment path.
+
+**Not fixed here**, because the suppression exists for a real reason (tool-call
+JSON must not leak into the transcript) and the fix is a product decision rather
+than a bug fix. The options worth weighing, none of them this card's:
+- stream fragments while **withholding** text that parses as a tool call, which
+  needs incremental detection and is the only option that keeps the default
+  fast-feeling;
+- offer tools only on rounds where they are plausibly needed, which changes
+  model behaviour, not just rendering;
+- accept it and say so in the documentation, so "streaming" is not promised
+  where it does not happen.
+
+**It also means one existing test's name overstates what it measures:**
+`inline_mode_wide_stream_wraps_and_scrolls_without_touching_the_status_row`
+samples what it calls mid-stream, and with tools enabled there is no mid-stream
+to sample — the burst arrives whole. The assertion is still valid (a wide
+transcript must not reach the pinned row) but it is not testing the in-flight
+case its name implies. Worth renaming when someone next touches it.
