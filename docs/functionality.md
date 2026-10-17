@@ -623,10 +623,26 @@ One per-turn spawn budget covers synchronous `spawn_agent`, parallel
 `spawn_agents`, and detached `spawn_agent_bg` calls. It defaults to eight in
 interactive chat and two in scripted or piped automation, and can be overridden
 by `--agent-spawn-cap` or `agent_spawn_cap` in config. A zero cap unregisters
-all four multi-agent schemas, including `agent_result`, so `/tools`, the system
+all five multi-agent schemas, including `agent_result` and `agent_wait`, so
+`/tools`, the system
 prompt, `provider_request.tools_offered`, and the actual provider body agree
 that multi-agent work is disabled; unrelated filesystem, command, skill, and
 workspace-evidence tools remain available.
+
+`agent_wait(id, until, timeout_secs)` blocks the foreground model on one
+background agent's state. `until` is `done` -- the agent finished, **failed, or
+was cancelled** -- or `blocked`, meaning it is parked waiting on an approval
+answer, the state `/jobs` groups as `needs input`. A state that already holds
+returns immediately; so does a state that has become **unreachable**, such as
+waiting for `blocked` on an agent that has gone terminal, rather than holding the
+round open for a change that can never come. `timeout_secs` defaults to 60 and is
+capped at 30 minutes, and `0` polls once. **A timeout is a normal result, not an
+error:** the model is told the state it did not reach, the timeout actually used
+and the agent's current status, and is free to do other work. An unknown id is an
+error, returned at once rather than costing a whole timeout. The tool starts no
+agent, so it never consumes the per-turn spawn budget -- but each call is one
+round of the caller's turn, so a model that polls in a loop is bounded by
+`--max-rounds` as well as by its own timeout.
 
 ### `@file` attachments
 
@@ -740,6 +756,24 @@ schema inputs, required-write files, explicit model writes, and explicit
 lifecycle/export commands are outside this automatic-storage policy.
 `/status`, `/permissions`, `/artifacts`, doctor JSON, and JSONL
 `run_started.artifact_policy` disclose the effective mode and source.
+
+**When trimming loses a tool result, the run says so.** If the context budget
+forces history trimming to replace an entire tool result with a dead placeholder,
+a `--jsonl` run now emits `{"type":"tool_results_dropped","round":N,"dropped":N}`.
+Before this, the result was removed before the provider saw it and every event in
+the stream still reported success -- the tool's own receipt was honest and the
+turn's was not. The event fires **only when the loss is unrecoverable**: with a
+low `--offload-cap` an evicted result leaves a re-readable pointer the model can
+recall, which is not a loss and stays silent, so the warning does not become
+noise. A run that loses nothing emits nothing new.
+
+**An interactive session is told as well.** On a terminal the run prints
+`~ context budget dropped 2 tool results in round 3; the provider never saw them`
+-- the count first, one line per round. It appears **only** when both stdout and
+stderr are terminals and styling is on, so a redirected run, `--plain`,
+`NO_COLOR`, `--screen-reader` and `--jsonl` are all byte-identical to before. That
+gate is stricter than it strictly needs to be, deliberately: a run with stdout
+redirected is being consumed by something, and a mid-turn notice is noise to it.
 
 ## Context management
 

@@ -10,7 +10,27 @@ shapes may change in any minor release.
 ## [Unreleased]
 
 ### Fixed
-
+- **A "Text file busy" command failure now says it is transient.** Running a tool
+  while something still has it open for writing -- an editor mid-save, a build
+  writing the binary, a tool being replaced -- failed with a bare
+  `command failed: Text file busy (os error 26)`, which reads like a broken tool.
+  The message now adds that the condition is transient and that retrying once the
+  writer has finished will work. The OS error is still reported verbatim, and no
+  other spawn failure is described as transient.
+- **A failed executable staging now names the step that failed.** When kitsu pins
+  and hashes a contained command's executable, eighteen different operations could
+  fail into one message -- `cannot stage immutable executable: <os error>` -- so an
+  `os error 16` told you nothing about which syscall produced it. The message now
+  reads `cannot stage immutable executable: add-seals: Device or resource busy (os
+  error 16)`, naming one of sixteen steps while preserving the OS error verbatim.
+- **The published JSONL schema now covers `tool_results_dropped`.** When that
+  event shipped, `docs/schemas/kitsu-chat-v1.schema.json` was not updated, so a
+  consumer validating against the published contract was told a line reporting
+  **lost tool output** was an unknown event it need not understand. The schema now
+  defines the event, pins its `type`, gives it a branch of the closed root, and
+  excludes it from the forward-compatible catch-all. **A test now requires every
+  event the binary can emit to satisfy all three**, so the next one cannot ship
+  undocumented.
 - A session commit could fail with `session '<id>' is already active in this or
   another process` when nothing else held it. The session lock is advisory and
   kernel-held per open file description, and a descriptor marked close-on-exec
@@ -40,6 +60,31 @@ shapes may change in any minor release.
   reason.
 
 ### Added
+- **An interactive session now says so too when a tool result is dropped**, not
+  just `--jsonl`. The line reads `~ context budget dropped 2 tool results in round
+  3; the provider never saw them`, naming the count first, once per round. It
+  appears **only on a terminal**: a run with either stdout or stderr redirected,
+  or `--plain`/`NO_COLOR`, `--screen-reader`, or `--jsonl`, is byte-identical to
+  before. The recallable case stays silent, since an evicted result that leaves a
+  re-readable pointer is not a loss.
+- **A `tool_results_dropped` JSONL event**, so a run that loses a tool result says
+  so. When the context budget forces history trimming to replace a whole tool
+  result with a dead placeholder, the stream now carries
+  `{"type":"tool_results_dropped","round":N,"dropped":N}` -- previously the result
+  vanished before the provider saw it and **every event still reported success**.
+  It fires **only when the loss is unrecoverable**: with a low `--offload-cap` an
+  evicted result leaves a re-readable pointer instead, which is not a loss and
+  stays silent. Runs that lose nothing are byte-identical to before.
+- **A new `agent_wait(id, until, timeout_secs)` tool**, so a model can block on a
+  background agent instead of polling. `until` is `done` -- finished, failed or
+  cancelled -- or `blocked`, meaning parked on an approval answer. A state that
+  already holds, or that has become unreachable, returns **immediately** rather
+  than holding the turn open. The timeout defaults to 60 seconds, caps at 30
+  minutes, and **expiring is a normal result, not an error** -- the model is told
+  what it did not reach and what the agent is doing now. It starts no agent, so it
+  never consumes the per-turn spawn budget; a zero `--agent-spawn-cap` unregisters
+  it along with the other multi-agent tools, since there would be no agent to wait
+  on.
 - **`/` searches the `Ctrl+O` transcript overlay, and `n`/`N` walk the matches.**
   The search runs **when you press Enter**, not as you type: a full pass over a
   10 000-line scrollback costs milliseconds and allocates a string per line, so

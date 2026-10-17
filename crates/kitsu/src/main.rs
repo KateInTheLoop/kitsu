@@ -3581,6 +3581,38 @@ fn safe_provider_error_message(
     }
 }
 
+/// Human-mode notice for an unrecoverable tool-result loss, gated to an
+/// interactive styled terminal and nothing else.
+///
+/// This is deliberately NOT part of [`format_runtime_notice`]: all three
+/// runtime-notice sinks share that formatter and two of them are not
+/// terminals, so extending it would print this line on the piped and
+/// `--plain` surfaces that must stay byte-identical. `stderr_styled()` is
+/// `stderr_is_tty() && !plain_mode()`, which already excludes `--plain`,
+/// `--screen-reader`, `NO_COLOR`, `KITSU_PLAIN`, `KITSU_SCREEN_READER` and
+/// `TERM=dumb`; `is_tty()` adds the stdout half; the callers are already
+/// inside their `!jsonl` branch.
+///
+/// One line per round naming the count, matching the event: the trimmer
+/// aggregates within a round, so two bodies destroyed in one enforcement pass
+/// are one loss of context, not two.
+fn format_dropped_results_notice(event: &kitsu_core::AgentRuntimeEvent) -> Option<String> {
+    let kitsu_core::AgentRuntimeEvent::ToolResultsDropped { round, dropped } = event else {
+        return None;
+    };
+    if *dropped == 0 {
+        return None;
+    }
+    if !(kitsu_render::stderr_styled() && kitsu_render::is_tty()) {
+        return None;
+    }
+    Some(format!(
+        "context budget dropped {dropped} tool result{} in round {round}; the provider never saw {}",
+        if *dropped == 1 { "" } else { "s" },
+        if *dropped == 1 { "it" } else { "them" },
+    ))
+}
+
 /// Integration hook for human-mode runtime notices. The event log can call
 /// this beside its JSONL serializer; results contain only host-owned bounded
 /// facts, numeric status/timing fields, and no provider-controlled text.
@@ -14106,6 +14138,10 @@ fn live_agent_event_log_capturing(
             // The process-long emitter retains a terminal write failure. The
             // turn boundary below converts it into the required nonzero exit.
             emit_runtime_event(&turn_id, event).is_ok()
+        } else if let Some(notice) = format_dropped_results_notice(event) {
+            kitsu_render::finish_line();
+            eprintln!("~ {notice}");
+            true
         } else if let Some(notice) = format_runtime_notice(event) {
             // A mid-stream status must start on its own line, never fused onto
             // the last streamed stdout character.
@@ -14123,6 +14159,10 @@ fn live_command_event_log(jsonl: bool, line: usize, command: &str) -> kitsu_core
     kitsu_core::AgentEventLog::with_fallible_observer(move |event| {
         if jsonl {
             emit_command_runtime_event(line, &command, event).is_ok()
+        } else if let Some(notice) = format_dropped_results_notice(event) {
+            kitsu_render::finish_line();
+            eprintln!("~ {notice}");
+            true
         } else if let Some(notice) = format_runtime_notice(event) {
             kitsu_render::finish_line();
             eprintln!("~ {notice}");
@@ -14160,6 +14200,10 @@ fn finish_agent_trace(
         return emit_agent_trace(turn_id, log, assistant);
     }
     for event in log.take() {
+        if let Some(notice) = format_dropped_results_notice(&event) {
+            kitsu_render::finish_line();
+            eprintln!("~ {notice}");
+        }
         if let Some(notice) = format_runtime_notice(&event) {
             kitsu_render::finish_line();
             eprintln!("~ {notice}");
@@ -19666,6 +19710,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             let registration = tools.register_with_descriptor(d, h);
             registration.expect("tool name must be unique");
             let (d, h) = subagent::agent_result_tool(agent_registry.clone());
+            let registration = tools.register_with_descriptor(d, h);
+            registration.expect("tool name must be unique");
+            // T5-S6 (H5): block on a background agent's state. It spawns
+            // nothing, so it consumes no `SpawnBudget` — but it lives inside
+            // the `spawn_cap > 0` gate on purpose, next to `agent_result`,
+            // which consumes none either: at a zero cap no background agent
+            // can exist for a wait to wait on, so a registered `agent_wait`
+            // would advertise a capability the session cannot deliver and the
+            // model would burn a round on "no background agent #N".
+            let (d, h) = subagent::agent_wait_tool(agent_registry.clone());
             let registration = tools.register_with_descriptor(d, h);
             registration.expect("tool name must be unique");
         }
@@ -35943,6 +35997,19 @@ mod tests {
         // A view that was never shown is the same answer.
         apply_agent_view_exit(&AgentViewExit::declined(), &mut attached);
         assert_eq!(attached, Some(ids[0]));
+
+        // **F107-b**: end the attachment before returning, or this test
+        // leaves `FOREGROUND_RECAP` holding a buffer and the surface slot
+        // holding the `BufferedSurface` that displaced the real one. Harmless
+        // only while every later path attaches before it detaches; a
+        // detach-first test would `set_surface` this test's dead buffer.
+        // Driven through the composer loop's own detach arm -- the route both
+        // `\u{2190}` and `Ctrl+X d` land in -- rather than a test-only
+        // teardown, because the thing that must be exercised is the
+        // production end of an attachment. Measured: the slot is `Some(..)`
+        // here without this call and `None` with it, and the displaced
+        // surface is reinstalled.
+        let _ = apply_inline_detach(&mut attached, String::new());
     }
 
     /// Finding **F76**, end to end: **`Ctrl+X d` with a line typed detaches
@@ -36187,6 +36254,14 @@ mod tests {
             "A5: `\u{2190}` on an empty composer detaches while attached"
         );
         *binding.lock().expect("the binding") = None;
+        // **F107-b**: clearing the cell is the whole of the detach for the
+        // two derived surfaces, but it is not the whole of the attachment --
+        // `apply_agent_view_exit` also installed a recap buffer, and only
+        // `replay_foreground_recap` (the one function all four production
+        // transitions out of an attachment call) takes it back out. Without
+        // it the re-attach below nests a second buffer over the first and the
+        // test returns with both leaked.
+        replay_foreground_recap(ids[0]);
         assert_eq!(label(), BASE, "the label goes back to the session's own");
         assert!(
             !row().contains("attached"),
@@ -36209,6 +36284,10 @@ mod tests {
             "A5: `Ctrl+X d` detaches too"
         );
         *binding.lock().expect("the binding") = None;
+        // **F107-b**, as above: the second attachment's buffer, ended through
+        // the production function. Measured: `FOREGROUND_RECAP` is `None` and
+        // the surface this test started with is reinstalled.
+        replay_foreground_recap(ids[0]);
         assert!(!row().contains("attached"), "{:?}", row());
         assert_eq!(label(), BASE);
     }
