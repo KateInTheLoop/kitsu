@@ -113,6 +113,30 @@ enum Action {
     /// [`run_styled_chat_pty_with`]'s driver for the re-arm, and the
     /// `inline_mode_resize_*` tests for why.
     Resize { rows: u16, cols: u16 },
+    /// Deliver `signal` to the child with `kill(2)` and **write no bytes**.
+    ///
+    /// Card T3-S8, requirement N5. Delivered with `kill` to the child's pid
+    /// rather than by writing `\x03` to the master, and that is finding
+    /// **F54**, not a stylistic choice: this PTY is nobody's controlling
+    /// terminal (no session leader, no `tcsetpgrp`), so the line discipline
+    /// generates no job-control signals at all -- a `\x03` byte would simply
+    /// be read by the child as a byte, which is also exactly what inline
+    /// mode's raw mode (`ISIG` cleared) makes of it. A test that wanted a
+    /// *signal* and sent a byte would be measuring the editor's Ctrl+C
+    /// keymap instead.
+    Signal(libc::c_int),
+    /// Write nothing and perform no action for `Duration`, then mark the
+    /// stream and move on.
+    ///
+    /// The point is the **mark**: it separates "everything the child wrote in
+    /// response to the previous step alone" from the next step's input, the
+    /// same window the `Action::Resize` tests assert in, for a step whose
+    /// effect emits nothing a later trigger could key on. Without it the only
+    /// way to sequence a step after a keystroke whose output is not unique is
+    /// a trigger that was already satisfied, which fires on the next 5 ms
+    /// poll and can have its bytes coalesced into the same `read` as the
+    /// keystroke.
+    Pause(Duration),
 }
 
 /// One scripted action: wait until `trigger` appears in everything read so far,
@@ -137,6 +161,22 @@ fn resize(trigger: &'static str, rows: u16, cols: u16) -> Step {
     Step {
         trigger,
         action: Action::Resize { rows, cols },
+    }
+}
+
+/// A step that delivers `signal` to the child once `trigger` is seen.
+fn signal(trigger: &'static str, signal: libc::c_int) -> Step {
+    Step {
+        trigger,
+        action: Action::Signal(signal),
+    }
+}
+
+/// A step that waits `millis` once `trigger` is seen, writing nothing.
+fn pause(trigger: &'static str, millis: u64) -> Step {
+    Step {
+        trigger,
+        action: Action::Pause(Duration::from_millis(millis)),
     }
 }
 
@@ -190,6 +230,45 @@ struct Session {
     /// Every window resize the script performed, in stream order. Empty for
     /// every script that never resizes, which is all nine original ones.
     resizes: Vec<Resized>,
+    /// The PTY's line settings read back **after** the session ended, through
+    /// a descriptor on the slave the harness keeps for itself (the same
+    /// `dup`-a-probe discipline `tests/cli.rs`'s
+    /// `test_auth_login_hides_tty_input_and_restores_echo_on_sigint` uses).
+    ///
+    /// Card T3-S8: this is the half of a terminal restore that is *not* a
+    /// byte in the stream. `RawStdinGuard::engage` clears `ICANON`, `ECHO`
+    /// and `ISIG` with `tcsetattr`, and that state belongs to the pty, not to
+    /// the process -- so it **survives the child's death**, which is what
+    /// makes it a non-vacuous observation: a child killed by a signal with no
+    /// restore leaves these three cleared here, exactly as it leaves a real
+    /// user's terminal unusable.
+    termios: libc::termios,
+}
+
+impl Session {
+    /// Whether the pty was canonical again once the session ended: `ICANON`,
+    /// `ECHO` and `ISIG` all back on, which is what `RawStdinGuard`'s restore
+    /// puts back and nothing else in this binary touches.
+    fn raw_mode_off(&self) -> bool {
+        let flags = self.termios.c_lflag;
+        flags & libc::ICANON != 0 && flags & libc::ECHO != 0 && flags & libc::ISIG != 0
+    }
+
+    /// The three line flags, named, for a failure message.
+    fn termios_dump(&self) -> String {
+        let flags = self.termios.c_lflag;
+        format!(
+            "ICANON={} ECHO={} ISIG={}",
+            flags & libc::ICANON != 0,
+            flags & libc::ECHO != 0,
+            flags & libc::ISIG != 0
+        )
+    }
+
+    /// Everything the child wrote from scripted action `step` onwards.
+    fn raw_after(&self, step: usize) -> String {
+        String::from_utf8_lossy(&self.raw[self.marks[step]..]).into_owned()
+    }
 }
 
 impl Session {
@@ -386,7 +465,11 @@ fn run_styled_chat_pty_core(
     // exactly once by the child-spawning machinery.
     let child_stdin = unsafe { libc::dup(slave) };
     let child_stdout = unsafe { libc::dup(slave) };
-    assert!(child_stdin >= 0 && child_stdout >= 0);
+    // The harness's own descriptor on the slave, never handed to the child:
+    // it keeps the pty alive after the child dies so its line settings can be
+    // read back (see `Session::termios`).
+    let probe_slave = unsafe { libc::dup(slave) };
+    assert!(child_stdin >= 0 && child_stdout >= 0 && probe_slave >= 0);
 
     let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
     command
@@ -497,6 +580,9 @@ fn run_styled_chat_pty_core(
     // keystroke would still hang to the deadline, which is exactly the
     // failure the tests want.
     let mut rearm: Option<(usize, Instant)> = None;
+    // An `Action::Pause` in flight: when it is over. The step is not counted
+    // as performed, and the stream is not marked, until then.
+    let mut pausing: Option<Instant> = None;
 
     let status = loop {
         let mut buffer = [0_u8; 8192];
@@ -509,9 +595,29 @@ fn run_styled_chat_pty_core(
             Err(error) => panic!("read styled carrier PTY: {error}"),
         }
 
+        if let Some(until) = pausing {
+            if Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+                if let Some(status) = poll_child(&mut child, options.resume_on_stop, &mut stops) {
+                    break status;
+                }
+                continue;
+            }
+            // The mark goes here, at the end of the pause, so the window that
+            // closes at it holds everything the child wrote in response to
+            // the step before.
+            pausing = None;
+            marks.push(raw.len());
+            step += 1;
+        }
+
         if let Some(next) = script.get(step) {
             let seen = String::from_utf8_lossy(&raw);
             if seen.contains(next.trigger) {
+                if let Action::Pause(span) = next.action {
+                    pausing = Some(Instant::now() + span);
+                    continue;
+                }
                 marks.push(raw.len());
                 match next.action {
                     Action::Send(bytes) => {
@@ -536,6 +642,18 @@ fn run_styled_chat_pty_core(
                         rearm =
                             (step + 1 < script.len()).then(|| (step + 1, Instant::now() + REARM));
                     }
+                    Action::Signal(signal) => {
+                        // SAFETY: signalling a child this harness owns, by
+                        // pid. See `Action::Signal` on why not through the
+                        // terminal.
+                        assert_eq!(
+                            unsafe { libc::kill(pid, signal) },
+                            0,
+                            "deliver signal {signal} to the styled carrier"
+                        );
+                    }
+                    // Handled above: a pause never reaches here.
+                    Action::Pause(_) => unreachable!(),
                 }
                 step += 1;
             }
@@ -577,12 +695,28 @@ fn run_styled_chat_pty_core(
         std::thread::sleep(Duration::from_millis(5));
     };
 
+    // Read the line settings back before the probe descriptor is closed: the
+    // pty outlives the child precisely because this descriptor is still open.
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: `probe_slave` is a live descriptor on the pty slave and the
+    // out-pointer is valid.
+    assert_eq!(
+        unsafe { libc::tcgetattr(probe_slave, termios.as_mut_ptr()) },
+        0,
+        "read the styled carrier's line settings back"
+    );
+    // SAFETY: `tcgetattr` returned 0, so the value is initialised.
+    let termios = unsafe { termios.assume_init() };
+    // SAFETY: the harness owns this descriptor and closes it exactly once.
+    unsafe { libc::close(probe_slave) };
+
     Session {
         raw,
         status,
         stops,
         marks,
         resizes,
+        termios,
     }
 }
 
@@ -2087,8 +2221,6 @@ fn run_styled_streaming_chat_pty(
     turns: Vec<Turn>,
     allow_path: bool,
 ) -> StreamSession {
-    let mock = SseMock::start(turns);
-    write_streaming_config(home, &mock.base_url());
     let extra = if allow_path {
         vec![
             "--allow-path".to_string(),
@@ -2097,7 +2229,26 @@ fn run_styled_streaming_chat_pty(
     } else {
         Vec::new()
     };
-    let session = run_styled_chat_pty_core(home, tui, script, Options::default(), &extra);
+    run_styled_streaming_chat_pty_with_args(home, tui, script, turns, &extra)
+}
+
+/// [`run_styled_streaming_chat_pty`] with the child's extra arguments spelled
+/// out instead of reduced to `allow_path`.
+///
+/// T3-S7a needs two things the boolean cannot say: a run with **no** grant at
+/// all (so a tool call reaches the approval gate) and `--enable-commands` (so
+/// the *command* gate exists). The boolean form above is unchanged and
+/// delegates here.
+fn run_styled_streaming_chat_pty_with_args(
+    home: &Path,
+    tui: Option<&str>,
+    script: &[Step],
+    turns: Vec<Turn>,
+    extra_args: &[String],
+) -> StreamSession {
+    let mock = SseMock::start(turns);
+    write_streaming_config(home, &mock.base_url());
+    let session = run_styled_chat_pty_core(home, tui, script, Options::default(), extra_args);
     let bodies = mock.bodies();
     StreamSession { session, bodies }
 }
@@ -3088,4 +3239,2010 @@ fn inline_mode_status_row_shows_the_queued_tag_for_a_mid_turn_submission() {
             row.chars().count()
         );
     }
+}
+
+// ===========================================================================
+// T3-S7a: the approval modal RENDERS in the bottom pane.
+//
+// Requirement **R7**: an approval prompt in a TUI mode must render as a
+// bottom-pane modal carrying the same `[y] allow once · [a] always (<dir>) ·
+// [n] deny` option line (command approvals keeping their provenance rows),
+// and the same `◉ permission —` text must be in the transcript receipt
+// afterwards. The risk gate is the *receipt*: its sanitize must equal
+// classic's.
+//
+// This card is the rendering half only. The `APPROVAL_INPUT_ACTIVE` protocol
+// is deliberately untouched (card T3-S7b), so the sessions below are driven
+// exactly as a user drives one today: the approval reader runs in **canonical
+// mode with echo**, which `run_live_typeahead` restores the moment the claim
+// is observed (`main.rs`, the `if APPROVAL_INPUT_ACTIVE.load(..) > 0` arm of
+// its poll loop), so an answer is terminated by `\n` and not `\r` even in
+// inline mode.
+//
+// # Triggers (finding F46)
+//
+// Every trigger here is a byte the child emits **today** *and* after the
+// change: the header and the provenance rows are composed from the same
+// strings whether they go to stderr in the scroll region (today) or onto the
+// pinned rows (after). A test that triggered on a pane paint would time out
+// before it could fail.
+// ===========================================================================
+
+/// Every `ESC[<line>;1H ESC[2K <row>` write in the stream, as `(line, row)`
+/// with CSI escapes stripped from the row.
+///
+/// This is [`pinned_row_paints`] generalized from one row to any: the modal
+/// is taller than the status row, so a paint of it addresses several
+/// consecutive lines before parking the cursor. The write is the *only* way
+/// a pinned row is ever drawn (`InlineSurface::paint`, pinned by
+/// `paint_positions_clears_and_writes_each_row_then_reparks`), and a
+/// transcript line is written with no addressing at all
+/// (`transcript_line`: text plus CRLF, "no escape bytes whatever"), so a row
+/// that appears here appeared in the pinned pane and nowhere else.
+fn addressed_pane_writes(session: &Session) -> Vec<(u16, String)> {
+    let text = session.raw_text();
+    let bytes = text.as_bytes();
+    // Every cursor address `ESC[<n>;1H`: (start, line, end-of-sequence).
+    let mut addresses: Vec<(usize, u16, usize)> = Vec::new();
+    let mut index = 0usize;
+    while index + 2 < bytes.len() {
+        if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 2;
+        let digits = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor > digits && bytes[cursor..].starts_with(b";1H") {
+            let line = text[digits..cursor].parse::<u16>().unwrap_or(0);
+            addresses.push((index, line, cursor + 3));
+            index = cursor + 3;
+            continue;
+        }
+        index += 1;
+    }
+    let mut writes = Vec::new();
+    for (position, (_, line, end)) in addresses.iter().copied().enumerate() {
+        if !bytes[end..].starts_with(b"\x1b[2K") {
+            continue;
+        }
+        let from = end + 4;
+        let to = addresses
+            .get(position + 1)
+            .map(|(start, _, _)| *start)
+            .unwrap_or(bytes.len());
+        if to <= from {
+            continue;
+        }
+        writes.push((line, strip_csi(&text[from..to])));
+    }
+    writes
+}
+
+/// Rows the inline viewport painted into the bottom pane, in stream order.
+///
+/// The pane is pinned to the bottom of the screen, so every row of it
+/// addresses a line in `(ROWS - PANE_MAX)..=ROWS`. The bound exists so a
+/// modal cannot satisfy R7 by being painted somewhere in the scroll region
+/// that happens to carry a `ESC[2K`.
+const PANE_MAX: u16 = 8;
+
+fn pane_rows(session: &Session) -> Vec<String> {
+    addressed_pane_writes(session)
+        .into_iter()
+        .filter(|(line, _)| *line > ROWS - PANE_MAX && *line <= ROWS)
+        .map(|(_, row)| row)
+        .collect()
+}
+
+/// Every `◉ permission — …` line in the stream, sanitized and trimmed.
+///
+/// `strip_csi` is this file's stand-in for `sanitize_terminal_text` (see its
+/// docs: an integration test cannot link the render crate), so this is R7's
+/// "the sanitize of the receipt" for a whole session's bytes. Split on both
+/// terminators because the transcript's own line ending in inline mode is
+/// CRLF and the classic prompt's is LF.
+fn permission_receipts(session: &Session) -> Vec<String> {
+    strip_csi(&session.raw_text())
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| line.starts_with("◉ permission —"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The same, over only the bytes the child wrote **after** scripted action
+/// `step` -- R7's "afterwards".
+fn permission_receipts_after(session: &Session, step: usize) -> Vec<String> {
+    let tail = String::from_utf8_lossy(&session.raw[session.marks[step]..]).into_owned();
+    strip_csi(&tail)
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| line.starts_with("◉ permission —"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A tool round that touches the filesystem gate: round one asks to read
+/// `forbidden`, round two answers in prose.
+fn gated_read_turns(forbidden: &Path) -> Vec<Turn> {
+    vec![
+        Turn {
+            events: vec![
+                tool_call(
+                    "gated-read-1",
+                    "fs_read_file",
+                    &format!(
+                        "{{\"path\":{}}}",
+                        serde_json_string(&forbidden.to_string_lossy())
+                    ),
+                ),
+                finish("tool_calls"),
+            ],
+            gap: Duration::from_millis(30),
+        },
+        Turn {
+            events: vec![delta("GATE_ROUND_DONE\n"), finish("stop")],
+            gap: Duration::from_millis(30),
+        },
+    ]
+}
+
+/// A tool round that touches the *command* gate. The answer is a denial, so
+/// nothing is ever executed and the test does not depend on OS containment
+/// being available at all -- only on the prompt being rendered.
+fn gated_command_turns(cwd: &Path) -> Vec<Turn> {
+    vec![
+        Turn {
+            events: vec![
+                tool_call(
+                    "gated-command-1",
+                    "command_exec",
+                    &format!(
+                        "{{\"argv\":[\"/bin/true\"],\"cwd\":{}}}",
+                        serde_json_string(&cwd.to_string_lossy())
+                    ),
+                ),
+                finish("tool_calls"),
+            ],
+            gap: Duration::from_millis(30),
+        },
+        Turn {
+            events: vec![delta("COMMAND_GATE_DONE\n"), finish("stop")],
+            gap: Duration::from_millis(30),
+        },
+    ]
+}
+
+/// A gated read answered `y`, in one mode. `marks[1]` is the answer.
+fn gated_read_session(tui: Option<&str>, forbidden: &Path, extra: &[String]) -> StreamSession {
+    let home = TempDir::new().expect("temp home");
+    let script: Vec<Step> = match tui {
+        Some(_) => vec![
+            send(RAW_MODE_MARKER, "read the file\r"),
+            send("kitsu wants to read", "y\n"),
+            send(TURN_DONE_MARKER, "/quit\r"),
+        ],
+        None => vec![
+            send("/help for commands", "read the file\n"),
+            send("kitsu wants to read", "y\n"),
+            send(TURN_DONE_MARKER, "/quit\n"),
+        ],
+    };
+    run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        tui,
+        &script,
+        gated_read_turns(forbidden),
+        extra,
+    )
+}
+
+/// **T3-S7a, the acceptance round-trip.** A real PTY approval in inline mode:
+/// the modal's header and its option line are painted into the pinned bottom
+/// pane, and `y` from the same stdin the protocol already hands over carries
+/// the turn through.
+///
+/// The gate is real: the child is given no `--allow-path`, its only read root
+/// is its launch directory (`home`), and the model asks to read a file in a
+/// different temporary directory.
+///
+/// The absence this test depends on is proved not vacuous by the positives
+/// around it: the gate fired (the prompt's own text is in the stream), the
+/// turn completed after the answer, and the pane was painted many times in
+/// this session -- so "the option line is not among the pane's rows" is a
+/// statement about the pane, not about an empty list.
+#[test]
+#[serial]
+fn inline_mode_renders_the_approval_modal_in_the_bottom_pane() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+
+    let session = gated_read_session(Some("inline"), &forbidden, &[]);
+    let text = strip_csi(&session.raw_text());
+
+    // The gate really fired, and the answer really carried the turn.
+    assert!(
+        text.contains("kitsu wants to read"),
+        "the model's read of {} must reach the approval gate; raw:\n{}",
+        forbidden.display(),
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        text.contains("GATE_ROUND_DONE"),
+        "answering `y` must let the turn finish; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    let rows = pane_rows(&session);
+    assert!(
+        !rows.is_empty(),
+        "this session must paint the pinned pane at all, or the two \
+         assertions below say nothing; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    let expected_header = format!("◉ permission — kitsu wants to read {}", forbidden.display());
+    assert!(
+        rows.iter().any(|row| row.trim() == expected_header),
+        "R7: the approval header must be painted on a pinned pane row as \
+         {expected_header:?}; the pane painted {} row(s): {rows:#?}",
+        rows.len()
+    );
+    let expected_options = format!(
+        "[y] allow once · [a] always ({}) · [n] deny",
+        outside.path().display()
+    );
+    assert!(
+        rows.iter().any(|row| row.trim() == expected_options),
+        "R7: the option line must be painted on a pinned pane row as \
+         {expected_options:?}; the pane painted {} row(s): {rows:#?}",
+        rows.len()
+    );
+}
+
+/// **T3-S7a, R7's risk gate.** The `◉ permission —` receipt in inline mode is
+/// byte-identical, after sanitize, to the one classic leaves in the
+/// transcript -- and it is there *afterwards*, i.e. in the bytes the child
+/// wrote after the answer went in, because the modal itself is transient.
+///
+/// Both sessions are given the **same** forbidden path, so the two receipts
+/// are comparable as bytes rather than as shapes.
+#[test]
+#[serial]
+fn inline_mode_commits_the_same_permission_receipt_as_classic() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+
+    let classic = gated_read_session(None, &forbidden, &[]);
+    let classic_receipts = permission_receipts(&classic);
+    assert_eq!(
+        classic_receipts,
+        vec![format!(
+            "◉ permission — kitsu wants to read {}",
+            forbidden.display()
+        )],
+        "the classic receipt is the baseline this test compares against; \
+         raw:\n{}",
+        classic.raw_text().escape_debug()
+    );
+
+    let inline = gated_read_session(Some("inline"), &forbidden, &[]);
+    let after = permission_receipts_after(&inline, 1);
+    assert_eq!(
+        after,
+        classic_receipts,
+        "R7: after the modal closes, inline mode must leave classic's exact \
+         sanitized receipt in the transcript; inline's whole-session \
+         receipts were {:#?}; raw:\n{}",
+        permission_receipts(&inline),
+        inline.raw_text().escape_debug()
+    );
+}
+
+/// **T3-S7a, R7's `command approvals keep their provenance rows`.** The
+/// command modal carries all four provenance rows the classic command prompt
+/// composes -- cwd, executable, timeout, authority -- on pinned pane rows,
+/// with the command option line.
+///
+/// Answered `n`: the denial is what keeps this test independent of whether
+/// OS containment is available on the machine running it. The prompt is
+/// rendered before any execution either way.
+#[test]
+#[serial]
+fn inline_mode_command_approval_modal_keeps_its_provenance_rows() {
+    let home = TempDir::new().expect("temp home");
+    // A command root that is **not** the launch directory: `HOME` is the
+    // launch directory here, so `--enable-commands` alone would default the
+    // root to it and be refused for intersecting `~/.kitsu` ("managed
+    // credential namespace", measured).
+    let work = TempDir::new().expect("temp command root");
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "run the command\r"),
+            send("authority:", "n\n"),
+            send(TURN_DONE_MARKER, "/quit\r"),
+        ],
+        gated_command_turns(work.path()),
+        &[
+            "--command-root".to_string(),
+            work.path().to_string_lossy().into_owned(),
+        ],
+    );
+
+    let text = strip_csi(&session.raw_text());
+    assert!(
+        text.contains("authority:"),
+        "the command gate must fire at all; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    let rows = pane_rows(&session);
+    assert!(
+        !rows.is_empty(),
+        "this session must paint the pinned pane at all; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    for provenance in ["cwd:", "executable:", "timeout:", "authority:"] {
+        assert!(
+            rows.iter().any(|row| row.trim().starts_with(provenance)),
+            "R7: the command modal must keep its {provenance:?} provenance \
+             row on a pinned pane row; the pane painted {} row(s): {rows:#?}",
+            rows.len()
+        );
+    }
+    let expected_options = "[y] allow once · [a] allow this exact argv/cwd for session · [n] deny";
+    assert!(
+        rows.iter().any(|row| row.trim() == expected_options),
+        "R7: the command modal's option line must be the shared composer's \
+         own text {expected_options:?}; the pane painted {} row(s): \
+         {rows:#?}",
+        rows.len()
+    );
+}
+
+/// **T3-S7a, the classic guard.** Classic mode's approval bytes do not change:
+/// the prompt is the header, the option line and the `> ` cue in the scroll
+/// region, and classic paints **no** pinned pane at all -- it installs no
+/// viewport (`tui_bridge::install` returns `None` for `TuiMode::Classic`
+/// before emitting a byte), so there is nothing for a modal to be painted
+/// onto.
+///
+/// Passes today. It is the regression half of the card: the pane modal must
+/// be added without any classic byte moving.
+#[test]
+#[serial]
+fn classic_mode_approval_bytes_are_unchanged_by_the_pane_modal() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+
+    let session = gated_read_session(None, &forbidden, &[]);
+    let text = strip_csi(&session.raw_text());
+
+    assert_eq!(
+        permission_receipts(&session),
+        vec![format!(
+            "◉ permission — kitsu wants to read {}",
+            forbidden.display()
+        )],
+        "classic's receipt text is fixed; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    let expected_options = format!(
+        "  [y] allow once · [a] always ({}) · [n] deny",
+        outside.path().display()
+    );
+    assert!(
+        text.contains(&expected_options),
+        "classic's option line is fixed at {expected_options:?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        text.contains("GATE_ROUND_DONE"),
+        "the classic round-trip still completes; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        addressed_pane_writes(&session).is_empty(),
+        "classic mode installs no viewport, so it must address and clear no \
+         row at all; it wrote {:#?}",
+        addressed_pane_writes(&session)
+    );
+}
+
+// ===========================================================================
+// T3-S7b: the approval answer is read IN-LOOP and leaves the transcript alone.
+//
+// T3-S7a shipped the paint and deliberately left the read alone: the approval
+// reader runs in **canonical mode with echo** because `run_live_typeahead`'s
+// `if APPROVAL_INPUT_ACTIVE.load(..) > 0` arm drops the `RawStdinGuard` and
+// calls `live_input_end()` "for the approval reader", so the kernel echoes
+// the typed answer wherever the cursor is parked -- which in inline mode is
+// the scroll region, below a tidy modal. This section pins the fix.
+//
+// # What is being pinned, and what is deliberately not
+//
+// Nothing here says *how* the read moves in-loop, and nothing here mentions
+// `APPROVAL_INPUT_ACTIVE`. The protocol also serves **classic** styled mode
+// (`typeahead_live_prompt` is `Some` whenever `!assistive_input &&
+// stdin_is_tty() && stderr_styled()`, with no condition on `[tui] mode`), so
+// `classic_mode_still_echoes_the_approval_answer_in_the_transcript` below
+// pins that classic's canonical, echoing, line-edited read is **untouched** --
+// which it must be, since a raw single-key read would take line editing and
+// backspace away from a mode whose approval read is deliberately canonical.
+//
+// # Triggers (finding F46)
+//
+// Every trigger is a byte the child emits today *and* after the change: the
+// prompt's own header text (composed from the same strings either way),
+// `TURN_DONE_MARKER`, and `RAW_MODE_MARKER`. No test here triggers on a pane
+// paint or on the `> ` cue, because the cue is exactly what moves.
+//
+// # Bound (finding F46 again)
+//
+// Every session below runs under the harness's `DEADLINE` (20s): the driver
+// kills the child and panics with the whole transcript attached, so a read
+// that never resolves -- the deadlock this card's risk lives in -- **fails**
+// with evidence rather than hanging the suite.
+// ===========================================================================
+
+/// The trigger the interrupt test waits on once the approval read has been
+/// closed: the notice the failed turn prints, **discovered from a measured
+/// transcript** rather than guessed (finding **F46**).
+const INTERRUPTED_MARKER: &str = "authority input closed";
+
+/// How the interrupt test closes the approval read.
+///
+/// Measured, not assumed (findings **F43**/**F47**): under this harness
+/// **Ctrl+C does not interrupt an approval prompt at all**. At the approval
+/// moment the read is canonical and `ISIG` is *off*, so `\x03` is echoed as
+/// the two characters `^C` and left in the line buffer -- a probe that typed
+/// `\x03` and then `/quit` had `read_approval_line` return the single line
+/// `^C/quit` and answer "invalid permission response; denied". This is
+/// pre-existing and mode-independent: classic and inline behave identically.
+///
+/// `\x04` is the reachable driver. In canonical mode `ICANON` turns it into
+/// a zero-length read, which `read_approval_line` maps to `None` and the
+/// prompter to `Decision::Interrupt`; after the move in-loop it is the byte
+/// `kitsu_editor` already resolves to `EditorAction::Eof`. Either way it is
+/// "the approval read was closed without a decision", which is exactly the
+/// case T3-S7a's dismiss path exists for.
+const APPROVAL_EOF: &str = "\x04";
+
+/// Every cursor address `ESC[<n>;1H` in `text`, as `(start, line, end-of-sequence)`.
+///
+/// The same scan [`addressed_pane_writes`] performs inline, lifted to a bare
+/// `&str` so the helpers below can read a *window* of the stream (between two
+/// scripted marks) rather than only the whole session.
+fn cursor_addresses(text: &str) -> Vec<(usize, u16, usize)> {
+    let bytes = text.as_bytes();
+    let mut addresses = Vec::new();
+    let mut index = 0usize;
+    while index + 2 < bytes.len() {
+        if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 2;
+        let digits = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor > digits && bytes[cursor..].starts_with(b";1H") {
+            let line = text[digits..cursor].parse::<u16>().unwrap_or(0);
+            addresses.push((index, line, cursor + 3));
+            index = cursor + 3;
+            continue;
+        }
+        index += 1;
+    }
+    addresses
+}
+
+/// The part of `text` that **is the transcript**: everything no pinned-row
+/// write owns, with CSI escapes stripped.
+///
+/// This is the inverse of [`pane_rows`], and it rests on the same two facts
+/// that file documents: `InlineSurface::paint` draws a pinned row as
+/// `ESC[<line>;1H ESC[2K <row>`, and a transcript line is written with **no
+/// addressing at all** (`transcript_line`: text plus CRLF, "no escape bytes
+/// whatever"). So the stream splits at every cursor address: a segment
+/// introduced by an address that is immediately followed by `ESC[2K` is a
+/// pinned-row write and belongs to the pane; the stream's head, and the tail
+/// after a paint's cursor park, are transcript.
+///
+/// In classic mode no address is ever emitted, so this is the identity on
+/// classic's bytes -- which is what makes the classic guard below compare
+/// like with like.
+fn transcript_text(text: &str) -> String {
+    let addresses = cursor_addresses(text);
+    let mut out = String::new();
+    let mut keep_from = Some(0usize);
+    for (position, (start, _, end)) in addresses.iter().copied().enumerate() {
+        if let Some(from) = keep_from.take() {
+            out.push_str(&text[from..start]);
+        }
+        let row_write = text.as_bytes()[end..].starts_with(b"\x1b[2K");
+        if !row_write {
+            // A park, not a row write: what follows it is transcript, up to
+            // the next address (or the end of the window).
+            keep_from = Some(end);
+            continue;
+        }
+        let _ = position;
+    }
+    if let Some(from) = keep_from {
+        out.push_str(&text[from..]);
+    }
+    strip_csi(&out)
+}
+
+/// The transcript lines the child wrote **after** scripted action `step`,
+/// trimmed, with blanks dropped. `marks[step]` is the stream position just
+/// *before* that step's bytes went in, so `transcript_lines_after(s, 1)` of a
+/// gated-read session is "everything the transcript gained from the moment
+/// the answer was typed".
+fn transcript_lines_after(session: &Session, step: usize) -> Vec<String> {
+    let tail = String::from_utf8_lossy(&session.raw[session.marks[step]..]).into_owned();
+    transcript_text(&tail)
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The same, for the window between two scripted actions.
+fn transcript_lines_between(session: &Session, from: usize, to: usize) -> Vec<String> {
+    let window =
+        String::from_utf8_lossy(&session.raw[session.marks[from]..session.marks[to]]).into_owned();
+    transcript_text(&window)
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// [`pane_rows`] over a window of the stream: rows painted into the pinned
+/// pane after scripted action `step`.
+fn pane_rows_after(session: &Session, step: usize) -> Vec<String> {
+    let tail = String::from_utf8_lossy(&session.raw[session.marks[step]..]).into_owned();
+    let addresses = cursor_addresses(&tail);
+    let bytes = tail.as_bytes();
+    let mut rows = Vec::new();
+    for (position, (_, line, end)) in addresses.iter().copied().enumerate() {
+        if !bytes[end..].starts_with(b"\x1b[2K") {
+            continue;
+        }
+        if line <= ROWS - PANE_MAX || line > ROWS {
+            continue;
+        }
+        let from = end + 4;
+        let to = addresses
+            .get(position + 1)
+            .map(|(start, _, _)| *start)
+            .unwrap_or(bytes.len());
+        if to <= from {
+            continue;
+        }
+        rows.push(strip_csi(&tail[from..to]));
+    }
+    rows
+}
+
+/// A turn that asks to read **two** files, one gate round each, then answers
+/// in prose. `a` on the first prompt must grant the directory and skip the
+/// second gate; `y` must not.
+fn gated_two_read_turns(first: &Path, second: &Path) -> Vec<Turn> {
+    let mut turns = Vec::new();
+    for (index, path) in [first, second].iter().enumerate() {
+        turns.push(Turn {
+            events: vec![
+                tool_call(
+                    &format!("gated-two-{index}"),
+                    "fs_read_file",
+                    &format!(
+                        "{{\"path\":{}}}",
+                        serde_json_string(&path.to_string_lossy())
+                    ),
+                ),
+                finish("tool_calls"),
+            ],
+            gap: Duration::from_millis(30),
+        });
+    }
+    turns.push(Turn {
+        events: vec![delta("GATE_ROUND_DONE\n"), finish("stop")],
+        gap: Duration::from_millis(30),
+    });
+    turns
+}
+
+/// The receipt line an approved read of `path` leaves in the transcript.
+fn expected_receipt(path: &Path) -> String {
+    format!("◉ permission — kitsu wants to read {}", path.display())
+}
+
+/// Every `◉ permission — …` line in the **transcript**, in stream order.
+///
+/// [`permission_receipts`] reads the whole byte stream, so in inline mode it
+/// also matches the modal's own header *paint* -- a measured fact: a denied
+/// session's whole-stream receipts are
+/// `["◉ permission — … [y] allow once · … · [n] deny> n", "◉ permission — …"]`,
+/// because the pane's rows are addressed rather than newline-separated and so
+/// collapse into one "line". [`transcript_text`] drops every addressed row by
+/// construction, which leaves exactly the committed receipts.
+fn transcript_receipts(session: &Session) -> Vec<String> {
+    transcript_text(&session.raw_text())
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| line.starts_with("◉ permission —"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// **T3-S7b, the card's user-visible point.** In inline mode the typed answer
+/// is **not** echoed into the scroll region: the first thing the transcript
+/// gains from the moment the answer is typed is the `◉ permission —` receipt
+/// itself.
+///
+/// Per finding **F41** this pins what the transcript *is* rather than banning
+/// a substring: the assertion is an `assert_eq!` on the first transcript line
+/// after the answer. Today that line is `y` -- the kernel's echo, printed
+/// because the approval read is canonical with echo -- and after the change
+/// it must be the receipt.
+///
+/// The negative is not vacuous three times over: the gate demonstrably fired,
+/// the round-trip demonstrably **completed** (so a session that never
+/// answered, or one that deadlocked waiting for a key, fails here rather than
+/// passing by emitting nothing), and the receipt that must be first is
+/// asserted to be present at all.
+///
+/// Bound: the harness `DEADLINE` (20s), after which the driver kills the
+/// child and panics with the transcript.
+#[test]
+#[serial]
+fn inline_mode_approval_answer_never_reaches_the_transcript() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+
+    let session = gated_read_session(Some("inline"), &forbidden, &[]);
+    let text = strip_csi(&session.raw_text());
+
+    // Non-vacuity, part one: the gate fired and the answer carried the turn.
+    assert!(
+        text.contains("kitsu wants to read"),
+        "the read of {} must reach the approval gate; raw:\n{}",
+        forbidden.display(),
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        text.contains("GATE_ROUND_DONE"),
+        "the approval round-trip must COMPLETE -- this is what stops a \
+         never-answered or deadlocked read from satisfying the absence \
+         below; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    // Non-vacuity, part two: there IS a receipt in the window being read.
+    let lines = transcript_lines_after(&session, 1);
+    let receipt = expected_receipt(&forbidden);
+    assert!(
+        lines.contains(&receipt),
+        "the receipt {receipt:?} must be in the transcript after the answer; \
+         the transcript gained {lines:#?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    // The card: what the transcript gains first is the receipt, not the key.
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some(receipt.as_str()),
+        "T3-S7b: the first thing the transcript gains after the answer is \
+         typed must be the receipt and not the echoed answer; it gained \
+         {lines:#?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+}
+
+/// **T3-S7b, where the cue goes.** The `> ` cue belongs on a pinned pane row
+/// with the rest of the modal, not in the scroll region.
+///
+/// The negative is pinned over the window from the prompt submission to the
+/// answer, and it is not vacuous: the window is asserted to carry transcript
+/// lines at all (the turn's own output), and the cue is demonstrably in that
+/// window today -- it is the last thing `CliPrompter::ask` prints before the
+/// read (`eprint!("> ")` in the pane-painted branch).
+///
+/// The positive assertion -- a pinned row ending in the cue -- is the one
+/// place in this section that encodes a *design* choice: that the cue is
+/// relocated rather than replaced by something with no `>` in it. If the
+/// implementation renders the cue differently, this assertion is the one to
+/// revisit; the negative above is the requirement.
+///
+/// Bound: the harness `DEADLINE` (20s).
+#[test]
+#[serial]
+fn inline_mode_approval_cue_is_painted_on_a_pinned_row_not_in_the_transcript() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+
+    let session = gated_read_session(Some("inline"), &forbidden, &[]);
+
+    let window = transcript_lines_between(&session, 0, 1);
+    assert!(
+        !window.is_empty(),
+        "the transcript must gain lines between the prompt and the answer, \
+         or the absence below says nothing; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        !window.iter().any(|line| line == ">"),
+        "T3-S7b: the `> ` cue must not be written into the scroll region; \
+         the transcript gained {window:#?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    let rows = pane_rows(&session);
+    assert!(
+        !rows.is_empty(),
+        "this session must paint the pinned pane at all; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        rows.iter().any(|row| row.trim_end().ends_with('>')),
+        "T3-S7b: the cue the user types at belongs on a pinned pane row; the \
+         pane painted {} row(s): {rows:#?}",
+        rows.len()
+    );
+}
+
+/// **T3-S7b, the classic guard.** Classic styled mode's approval read stays
+/// canonical **with echo**: the cue is in the scroll region and the typed
+/// answer is echoed there, exactly as today.
+///
+/// This is the test that catches an over-broad fix. The typeahead collector
+/// and its `APPROVAL_INPUT_ACTIVE` protocol run in classic too
+/// (`typeahead_live_prompt` has no condition on `[tui] mode`), and classic has
+/// no pane to paint a modal into; a raw single-key read there would silently
+/// take line editing and backspace away from a mode whose approval read is
+/// deliberately canonical. Together with T3-S7a's
+/// `classic_mode_approval_bytes_are_unchanged_by_the_pane_modal` (the option
+/// line, the receipt and "no addressed rows at all") this is classic's
+/// byte-identity net.
+///
+/// Passes today, by construction: it is the regression half of the card.
+///
+/// Bound: the harness `DEADLINE` (20s).
+#[test]
+#[serial]
+fn classic_mode_still_echoes_the_approval_answer_in_the_transcript() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+
+    let session = gated_read_session(None, &forbidden, &[]);
+
+    let window = transcript_lines_between(&session, 0, 1);
+    assert!(
+        window.iter().any(|line| line == ">"),
+        "classic's `> ` cue stays in the scroll region; the transcript \
+         gained {window:#?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    let after = transcript_lines_after(&session, 1);
+    assert_eq!(
+        after.first().map(String::as_str),
+        Some("y"),
+        "classic's answer is still echoed by the kernel into the scroll \
+         region, so the first line the transcript gains after the answer is \
+         the echo; it gained {after:#?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        addressed_pane_writes(&session).is_empty(),
+        "classic installs no viewport, so it addresses no row at all; it \
+         wrote {:#?}",
+        addressed_pane_writes(&session)
+    );
+}
+
+/// **T3-S7b, `a` through the shared parser.** `a` is `AllowAlways`: the
+/// directory is granted, so the second file in it is **not** gated and there
+/// is exactly one receipt.
+///
+/// Not vacuous, and self-validating: the script answers **once**, so if `a`
+/// were resolved as anything but `AllowAlways` the second round would gate
+/// again, no answer would ever come, and the session would fail on its third
+/// trigger at the harness deadline. Passing therefore requires both that the
+/// second file was really read and that it was never gated.
+///
+/// Bound: the harness `DEADLINE` (20s).
+#[test]
+#[serial]
+fn inline_mode_allow_always_grants_the_whole_directory() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let first = outside.path().join("secret-one.txt");
+    let second = outside.path().join("secret-two.txt");
+    fs::write(&first, "one").expect("write the first gated file");
+    fs::write(&second, "two").expect("write the second gated file");
+    let home = TempDir::new().expect("temp home");
+
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "read the files\r"),
+            send("kitsu wants to read", "a\n"),
+            send(TURN_DONE_MARKER, "/quit\r"),
+        ],
+        gated_two_read_turns(&first, &second),
+        &[],
+    );
+
+    assert!(
+        strip_csi(&session.raw_text()).contains("GATE_ROUND_DONE"),
+        "the second read must run after the grant; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        strip_csi(&session.raw_text()).contains(&format!("{}", second.display())),
+        "the second file must really have been read; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert_eq!(
+        transcript_receipts(&session),
+        vec![expected_receipt(&first)],
+        "`a` grants the directory, so the second file is never gated and the \
+         session leaves exactly one receipt; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    let lines = transcript_lines_after(&session, 1);
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some(expected_receipt(&first).as_str()),
+        "and `a` is not echoed into the transcript either; it gained \
+         {lines:#?}; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+}
+
+/// **T3-S7b, `n` through the shared parser.** `n` is `Deny`: the tool call
+/// fails with the policy denial, the turn still finishes, one receipt is
+/// left, and the key is not echoed.
+///
+/// Bound: the harness `DEADLINE` (20s).
+#[test]
+#[serial]
+fn inline_mode_deny_refuses_the_read_and_the_turn_finishes() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+    let home = TempDir::new().expect("temp home");
+
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "read the file\r"),
+            send("kitsu wants to read", "n\n"),
+            send(TURN_DONE_MARKER, "/quit\r"),
+        ],
+        gated_read_turns(&forbidden),
+        &[],
+    );
+
+    let text = strip_csi(&session.raw_text());
+    assert!(
+        text.contains("GATE_ROUND_DONE"),
+        "a denial must still let the turn finish; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert!(
+        text.contains("user denied read access to"),
+        "`n` must reach the gate as `Decision::Deny`, which is what makes \
+         this a test of the answer and not only of the turn; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert_eq!(
+        transcript_receipts(&session),
+        vec![expected_receipt(&forbidden)],
+        "a denial is a decision, so it leaves the same single receipt; \
+         raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    let lines = transcript_lines_after(&session, 1);
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some(expected_receipt(&forbidden).as_str()),
+        "and `n` is not echoed into the transcript; it gained {lines:#?}; \
+         raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+}
+
+/// **T3-S7b, the interrupt path T3-S7a added.** Closing the approval read
+/// without answering ([`APPROVAL_EOF`]) is `Decision::Interrupt`: there is
+/// no decision to record, so the modal is **dismissed** with no receipt, and the pane goes back to showing the
+/// status row.
+///
+/// The absences are not vacuous: the modal is asserted to have been painted
+/// in the first place (its header is on a pinned row), so there was something
+/// to dismiss, and the status row coming back on a pinned row *after* the
+/// interrupt is the positive proof the teardown ran rather than the pane
+/// simply having gone quiet.
+///
+/// Bound: the harness `DEADLINE` (20s). An interrupt that leaves the reader
+/// waiting fails on the third step's trigger, with the transcript attached.
+#[test]
+#[serial]
+fn inline_mode_interrupting_the_approval_dismisses_the_modal_without_a_receipt() {
+    let outside = TempDir::new().expect("a directory no read root covers");
+    let forbidden = outside.path().join("secret.txt");
+    fs::write(&forbidden, "secret").expect("write the gated file");
+    let home = TempDir::new().expect("temp home");
+
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "read the file\r"),
+            send("kitsu wants to read", APPROVAL_EOF),
+            send(INTERRUPTED_MARKER, "/quit\r"),
+        ],
+        gated_read_turns(&forbidden),
+        &[],
+    );
+
+    let rows = pane_rows(&session);
+    let header = expected_receipt(&forbidden);
+    assert!(
+        rows.iter().any(|row| row.trim() == header),
+        "the modal must have been painted before it can be dismissed; the \
+         pane painted {} row(s): {rows:#?}",
+        rows.len()
+    );
+    assert_eq!(
+        permission_receipts_after(&session, 1),
+        Vec::<String>::new(),
+        "an interrupt records no decision, so it commits no receipt; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    let after = pane_rows_after(&session, 1);
+    assert!(
+        after
+            .iter()
+            .any(|row| row.trim_start().starts_with(STATUS_ROW_MODEL)),
+        "after the dismissal the pane must go back to the status row, which \
+         is what proves the modal was torn down; the pane painted {} row(s) \
+         after the interrupt: {after:#?}",
+        after.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T3-S8: `Ctrl+L`, resize without duplication, and terminal restore on every
+// exit path (requirements R8 and N5)
+// ---------------------------------------------------------------------------
+
+/// The help footer, the one transcript line in this file's scripts that is
+/// long, unique, and printed exactly once. Reused from Test 1 rather than
+/// invented: the duplication tests below need a line whose *count* is already
+/// established, so a change to the help text cannot leave them matching a
+/// stale literal.
+const HELP_FOOTER: &str = "/help <command> explains one command in detail";
+
+/// Bracketed paste off, the sequence `RawStdinGuard::drop` writes.
+const PASTE_OFF: &str = "\x1b[?2004l";
+
+/// DECSTBM reset: the sequence `InlineSurface::hide` writes, and the one a
+/// terminal is left unusable without.
+const REGION_RESET: &str = "\x1b[r";
+
+/// A draft that cannot occur in anything the binary prints by itself, so a
+/// paint carrying it is this test's draft and nothing else.
+const UNIQUE_DRAFT: &str = "xyzzy-draft";
+
+/// Print `/help`, type [`UNIQUE_DRAFT`] without submitting it, then `signal`.
+///
+/// The signal is the last step: the restore under test is the one the child
+/// performs while dying, so nothing may be written to it afterwards.
+fn help_then_draft_then_signal(signal_number: libc::c_int) -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/help\r"),
+        send("commands:", UNIQUE_DRAFT),
+        signal(UNIQUE_DRAFT, signal_number),
+    ]
+}
+
+/// Assert the restore every exit path owes (requirement N5), on a session
+/// whose last step was a signal.
+///
+/// # Why this is not vacuous
+///
+/// Each of the three observations is false today, and would be false again if
+/// the restore were removed:
+///
+/// * **`ESC[r`.** With no restore the child dies on the signal's default
+///   disposition and writes nothing more, so the window after the signal is
+///   empty and carries no region reset. The assertion that the region *was*
+///   pinned first is what makes the release about something real.
+/// * **`ESC[?2004l`.** Same: `RawStdinGuard::drop` writes it and `Drop` does
+///   not run on a signal.
+/// * **The line settings.** This one is not a byte in the stream at all. The
+///   pty's termios is set by the child's `tcsetattr` and **outlives the
+///   child** -- the harness holds its own descriptor on the slave, so the pty
+///   is still there to be asked. A killed child leaves `ICANON`, `ECHO` and
+///   `ISIG` cleared, which is precisely the terminal a user has to run
+///   `reset` on.
+///
+/// The alternate screen and the window title are deliberately **not**
+/// asserted: nothing in this binary enters either (`kitsu_tui::TuiRuntime` is
+/// unused by `kitsu`), so an assertion about leaving them would pass by
+/// construction. N5's other two clauses are vacuous today, not met.
+fn assert_restored_after_signal(session: &Session, step: usize, label: &str) {
+    let before = String::from_utf8_lossy(&session.raw[..session.marks[step]]).into_owned();
+    let region = format!("\x1b[1;{}r", ROWS - 1);
+    assert!(
+        before.contains(&region),
+        "{label}: the region must have been pinned before the signal, or there \
+         is nothing to release; raw before the signal:\n{}",
+        before.escape_debug()
+    );
+
+    let after = session.raw_after(step);
+    assert!(
+        after.contains(REGION_RESET),
+        "{label}: a terminal left with a pinned DECSTBM region stays broken \
+         until `reset`, so every exit path owes `ESC[r`; everything the child \
+         wrote after the signal was:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        after.contains(PASTE_OFF),
+        "{label}: bracketed paste was turned on by `RawStdinGuard::engage` and \
+         must be turned off again; the child wrote:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        session.raw_mode_off(),
+        "{label}: the pty must be canonical again once kitsu is gone, but reads \
+         {}; everything written after the signal was:\n{}",
+        session.termios_dump(),
+        after.escape_debug()
+    );
+}
+
+/// **The row's own risk gate: `kill -INT` restores (N5).**
+///
+/// `BridgeGuard::drop` restores correctly on a normal exit, but `Drop` does
+/// not run on a signal, and the only signal this process handles is
+/// `SIGWINCH`. So today a `SIGINT` at the inline idle prompt leaves the
+/// scroll region pinned and stdin raw.
+///
+/// The signal is delivered with `kill` to the child's pid: see
+/// [`Action::Signal`] and finding F54 for why `\x03` on the master is not a
+/// `SIGINT` here (and, under inline mode's `ISIG`-cleared termios, would not
+/// be one on a real terminal either).
+///
+/// The session must also *end*: the harness only returns once the child is
+/// reaped, so a `SIGINT` that is swallowed entirely fails this test on the
+/// driver's deadline with the whole transcript attached.
+#[test]
+#[serial]
+fn inline_mode_sigint_restores_the_terminal() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &help_then_draft_then_signal(libc::SIGINT),
+    );
+    assert_restored_after_signal(&session, 2, "SIGINT");
+}
+
+/// The same for `SIGTERM`, which N5 names beside `SIGINT`: `kill` with no
+/// arguments is what a supervisor, a `timeout`, or a closing terminal sends,
+/// and it is as unhandled today as `SIGINT` is.
+#[test]
+#[serial]
+fn inline_mode_sigterm_restores_the_terminal() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &help_then_draft_then_signal(libc::SIGTERM),
+    );
+    assert_restored_after_signal(&session, 2, "SIGTERM");
+}
+
+/// **Classic mode is unaffected.** A `SIGINT` to a classic session must not
+/// start emitting viewport geometry, and the transcript it already printed
+/// must not be re-emitted by whatever the restore does.
+///
+/// Classic's own raw-mode restore is *not* asserted here. Classic mode holds
+/// raw mode only inside rustyline's own readline, which this card does not
+/// touch; a claim about it would be this test smuggling in a second card.
+#[test]
+#[serial]
+fn classic_mode_sigint_pins_no_region_and_reprints_nothing() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        None,
+        &help_then_draft_then_signal(libc::SIGINT),
+    );
+
+    assert_eq!(
+        session.raw_count(&format!("\x1b[1;{}r", ROWS - 1)),
+        0,
+        "classic mode emits no viewport geometry, signal or no signal; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(REGION_RESET),
+        0,
+        "and releases a region it never pinned; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(HELP_FOOTER),
+        1,
+        "the transcript is printed once and never re-emitted; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+}
+
+/// Print `/help`, type [`UNIQUE_DRAFT`], press `Ctrl+L`, wait, then clear the
+/// draft and quit.
+///
+/// The [`Action::Pause`] is the load-bearing step. `Ctrl+L`'s repaint emits
+/// nothing a later trigger could key on that is not already in the stream, so
+/// without the pause the `/quit` step's trigger would be satisfied on the next
+/// 5 ms poll and its bytes could reach the child in the *same* `read` as the
+/// `\x0c` -- where the editor would have processed the whole chunk before the
+/// repaint ran, and the row would be repainted from a draft that the same
+/// chunk had already cleared. The pause makes `raw_between(2, 3)` exactly what
+/// the child wrote in answer to `Ctrl+L` and nothing else, the same window the
+/// resize tests assert in.
+///
+/// `\x15` (Ctrl+U) clears the draft before `/quit` so the submitted line is
+/// `/quit` and not `xyzzy-draft/quit`.
+fn help_then_draft_then_ctrl_l() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/help\r"),
+        send("commands:", UNIQUE_DRAFT),
+        send(UNIQUE_DRAFT, "\x0c"),
+        pause(UNIQUE_DRAFT, 400),
+        send(UNIQUE_DRAFT, "\x15/quit\r"),
+    ]
+}
+
+/// **Requirement R8, the `Ctrl+L` half.** What "repaint" means here, stated
+/// observably rather than as "something happened":
+///
+/// * the child answers the `\x0c` byte **alone** -- no other input is written
+///   during the pause -- by painting the pinned row again: the row's own
+///   address-and-clear (`ESC[24;1H ESC[2K`) followed by the draft;
+/// * so the draft survives: it is painted at least twice in the session, once
+///   while it was typed and once by the repaint, and `Ctrl+L` neither enters
+///   the draft as a control character nor clears it;
+/// * and the transcript is **not** re-emitted. A repaint that reprinted the
+///   scrolled-back transcript would duplicate every line of `/help`; the
+///   footer stays at exactly one occurrence in the whole byte stream, and at
+///   one occurrence on the screen.
+///
+/// Today `0x0c` falls into the editor's "other control bytes are ignored"
+/// arm, so the pause window is empty and the first assertion is what fails.
+#[test]
+#[serial]
+fn inline_mode_ctrl_l_repaints_the_pinned_row_without_duplicating_the_transcript() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &help_then_draft_then_ctrl_l());
+
+    let answer = session.raw_between(2, 3);
+    let paint = format!("\x1b[{ROWS};1H\x1b[2K");
+    assert!(
+        answer.contains(&paint),
+        "Ctrl+L alone must repaint the pinned row ({paint:?}); everything the \
+         child wrote between the keystroke and the next input was:\n{}",
+        answer.escape_debug()
+    );
+    assert!(
+        answer.contains(UNIQUE_DRAFT),
+        "and the repaint must carry the draft that was already typed; it \
+         wrote:\n{}",
+        answer.escape_debug()
+    );
+
+    let drafted = pinned_row_paints(&session)
+        .into_iter()
+        .filter(|row| row.contains(UNIQUE_DRAFT))
+        .count();
+    assert!(
+        drafted >= 2,
+        "the draft must be painted once as it was typed and once by the \
+         repaint, but only {drafted} of the pinned-row paints carry it: {:?}",
+        pinned_row_paints(&session)
+    );
+
+    assert_eq!(
+        session.raw_count(HELP_FOOTER),
+        1,
+        "a repaint must not re-emit the transcript; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    let screen = session.screen_at(3);
+    assert_eq!(
+        screen
+            .iter()
+            .filter(|row| row.contains(HELP_FOOTER))
+            .count(),
+        1,
+        "and must leave exactly one copy of it on the screen; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        session.status.success(),
+        "the session must still exit cleanly, but exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+}
+
+/// **Classic mode is unaffected by `Ctrl+L`.** rustyline owns the keystroke
+/// there; what this pins is that nothing in the classic path grew a viewport
+/// and that the transcript is not duplicated.
+#[test]
+#[serial]
+fn classic_mode_ctrl_l_pins_no_region_and_keeps_one_transcript() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), None, &help_then_draft_then_ctrl_l());
+
+    assert_eq!(
+        session.raw_count(&format!("\x1b[1;{}r", ROWS - 1)),
+        0,
+        "classic mode emits no viewport geometry on Ctrl+L; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(HELP_FOOTER),
+        1,
+        "and prints the transcript once; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+}
+
+/// Print `/help`, type a draft, grow the window, submit, then quit.
+///
+/// Built on the existing resize scripts' discipline: the resize writes no
+/// bytes and the submit triggers on the *new* region, so the measurement is
+/// of the signal alone.
+fn help_then_draft_then_grow() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/help\r"),
+        send("commands:", "/context"),
+        resize("/context", TALL_ROWS, COLS),
+        submit_on_tall_region(),
+        send("context window source", "/quit\r"),
+    ]
+}
+
+/// **Requirement R8, the resize half, over a screenful of transcript.**
+///
+/// Tests 10 to 12 already pin that the *pinned row* moves rather than being
+/// duplicated. What they do not have above them is a transcript: their
+/// sessions resize with nothing on the screen but a draft. This one prints
+/// `/help` first, so the region is full of scrolled transcript when the
+/// signal lands, and asserts the duplication R8 actually names -- a history
+/// line appearing twice -- against the same `HELP_FOOTER` sentinel Test 1
+/// counts.
+#[test]
+#[serial]
+fn inline_mode_resize_does_not_duplicate_transcript_lines() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &help_then_draft_then_grow());
+
+    let answer = session.raw_between(2, 3);
+    assert!(
+        answer.contains(&tall_region()),
+        "the signal alone must re-latch at the new geometry; it wrote:\n{}",
+        answer.escape_debug()
+    );
+    assert!(
+        !answer.contains(HELP_FOOTER),
+        "a reflow must not reprint transcript lines; between the resize and \
+         the next input the child wrote:\n{}",
+        answer.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(HELP_FOOTER),
+        1,
+        "the transcript line is emitted exactly once in the whole session; \
+         raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    let screen = session.screen_at(3);
+    assert_eq!(screen.len(), TALL_ROWS as usize);
+    assert_eq!(
+        screen
+            .iter()
+            .filter(|row| row.contains(HELP_FOOTER))
+            .count(),
+        1,
+        "and appears on exactly one row of the reflowed screen; screen:\n{}",
+        Session::dump(&screen)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Card T3-S9: `/tui classic|inline` as a runtime switch (requirement R2).
+//
+// `/tui` DOES NOT EXIST YET: it is not in `SLASH_COMMANDS` and there is no
+// dispatch arm, so every session below currently answers the command with
+// `unknown command: /tui - did you mean ...?` and never prints the switch
+// receipt the scripts trigger on. Each of these tests therefore fails today,
+// most of them by the harness deadline with the transcript attached (finding
+// F46 names that shape deliberately: the view cannot print what the script
+// waits for, because the feature is absent).
+// ---------------------------------------------------------------------------
+
+/// The transcript marker, and why it is `/theme <nonsense>` rather than
+/// anything purpose-built.
+///
+/// "The transcript continues across a switch" needs content that is
+/// (a) emitted by the binary itself, (b) **unique** in the whole byte stream,
+/// so "exactly once" is countable rather than approximated, (c) exactly one
+/// physical row at `COLS` = 80, because a 24-row screen with no scrollback in
+/// the emulator is the whole budget, and (d) available with no network, no
+/// tool and no turn. `/theme zz1` is all four: `kitsu_render::set_theme`
+/// rejects the name with one line that quotes it back, the quoted token
+/// appears nowhere else, and the line is 76 columns.
+///
+/// Pinned as whole lines rather than as substrings (finding F41): what is
+/// asserted is what the row **is**.
+const TUI_MARK_1: &str =
+    "unknown theme 'zz1' — available: kitsune, sakura, ocean, forest, ember, mono";
+const TUI_MARK_2: &str =
+    "unknown theme 'zz2' — available: kitsune, sakura, ocean, forest, ember, mono";
+const TUI_MARK_3: &str =
+    "unknown theme 'zz3' — available: kitsune, sakura, ocean, forest, ember, mono";
+
+/// The receipt a successful switch prints, per mode. **This is a decision
+/// this card makes, not an observation**: a switch must be narrated, because
+/// R2's gate is that the conversation survives and a silent switch leaves the
+/// user unable to tell a working switch from a lost one.
+const TUI_SWITCHED_TO_CLASSIC: &str =
+    "~ switched to the classic renderer; the conversation is unchanged";
+const TUI_SWITCHED_TO_INLINE: &str =
+    "~ switched to the inline renderer; the conversation is unchanged";
+
+/// Bare `/tui` **reports**, it does not print usage. Decision: the command's
+/// argument is optional in the registry (`/tui [classic|inline]`), the
+/// question "which renderer am I in?" has no other answer in the product, and
+/// `/theme` with no argument already answers the same question for themes.
+/// The accepted vocabulary rides along, so the report is also the usage line.
+const TUI_REPORT_CLASSIC: &str = "tui mode: classic (accepted: classic, inline)";
+const TUI_REPORT_INLINE: &str = "tui mode: inline (accepted: classic, inline)";
+
+/// `fullscreen` is refused, naming what is accepted, and saying why it is not
+/// a typo — consistent with `[tui] mode`'s own error, which lists
+/// ``classic``, ``inline`` and nothing else until T5 ships the renderer.
+const TUI_FULLSCREEN_REFUSED: &str =
+    "/tui fullscreen is not available yet; accepted: classic, inline";
+
+/// The DECSTBM region this geometry pins, and its release.
+fn tui_region() -> String {
+    format!("\x1b[1;{}r", ROWS - 1)
+}
+
+/// Inline → classic → inline in one session, with a marker printed in each of
+/// the three segments.
+fn switch_both_directions() -> Vec<Step> {
+    vec![
+        // Segment 1: inline.
+        send(RAW_MODE_MARKER, "/theme zz1\r"),
+        send(TUI_MARK_1, "/tui classic\r"),
+        // Segment 2: classic.
+        send(TUI_SWITCHED_TO_CLASSIC, "/theme zz2\r"),
+        send(TUI_MARK_2, "/tui inline\r"),
+        // Segment 3: inline again.
+        send(TUI_SWITCHED_TO_INLINE, "/theme zz3\r"),
+        send(TUI_MARK_3, "/quit\r"),
+    ]
+}
+
+/// **The card's acceptance, and requirement R2's gate.**
+///
+/// What makes "the transcript continues" an assertion rather than a slogan:
+/// each marker is counted **in the raw byte stream** (emitted exactly once —
+/// a switch that reprinted the scrollback to rebuild it would count 2) and
+/// **on the screen the user is left looking at** before `/quit` (present
+/// exactly once — a switch that cleared the screen, took the alternate
+/// screen, or scrolled the region away would count 0). Both halves are
+/// needed: counting only the stream passes for a switch that erases the
+/// screen, and counting only the screen passes for a switch that replays
+/// history.
+///
+/// Were the gate violated, this test says which way: a dropped transcript
+/// fails the screen count at 0 with the screen dumped, a replayed one fails
+/// the raw count at 2 or more.
+#[test]
+#[serial]
+fn tui_switch_both_directions_keeps_one_copy_of_the_transcript() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &switch_both_directions());
+
+    let text = session.raw_text();
+    for (label, mark) in [
+        ("zz1", TUI_MARK_1),
+        ("zz2", TUI_MARK_2),
+        ("zz3", TUI_MARK_3),
+    ] {
+        assert_eq!(
+            session.raw_count(mark),
+            1,
+            "the {label} transcript line must be written exactly once in the \
+             whole session — a switch neither drops it nor replays it; raw:\n{}",
+            text.escape_debug()
+        );
+    }
+
+    // The screen with all three segments printed and `/quit` not yet sent.
+    let screen = session.screen_at(5);
+    for (label, mark) in [
+        ("zz1", TUI_MARK_1),
+        ("zz2", TUI_MARK_2),
+        ("zz3", TUI_MARK_3),
+    ] {
+        assert_eq!(
+            screen.iter().filter(|row| row.trim_end() == mark).count(),
+            1,
+            "the {label} line, printed {} the switch, must still be on screen \
+             exactly once after both switches; screen:\n{}",
+            if label == "zz3" { "after" } else { "before" },
+            Session::dump(&screen)
+        );
+    }
+
+    // Not vacuous in the other direction either: the three markers are in
+    // transcript order, so the screen holds a *continuing* conversation and
+    // not three unordered fragments.
+    let positions: Vec<usize> = [TUI_MARK_1, TUI_MARK_2, TUI_MARK_3]
+        .iter()
+        .map(|mark| {
+            screen
+                .iter()
+                .position(|row| row.trim_end() == *mark)
+                .expect("each marker was just asserted to be on screen")
+        })
+        .collect();
+    assert!(
+        positions[0] < positions[1] && positions[1] < positions[2],
+        "the three markers must read down the screen in the order they were \
+         printed, but they are on rows {positions:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+
+    assert!(
+        session.status.success(),
+        "the session must still exit cleanly, but exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+}
+
+/// **Requirement 4 of the card: the region is released on the way out of
+/// inline and re-pinned on the way back in.** T3-S8's lesson is the reason: a
+/// leaked DECSTBM region leaves the user's terminal clamped to 23 rows with
+/// no kitsu left to release it.
+///
+/// Counted, not merely present: this session enters inline twice and leaves
+/// it twice (once by `/tui classic`, once by `/quit`), so the region is set
+/// twice and released twice. A switch that forgot the teardown would set it
+/// twice and release once; one that tore down without re-installing would set
+/// it once.
+#[test]
+#[serial]
+fn tui_switch_releases_the_region_and_re_pins_it() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &switch_both_directions());
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        2,
+        "the region is pinned once per inline segment, and this session has \
+         two; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count("\x1b[r"),
+        2,
+        "and released once per exit from inline: the switch away, and the \
+         session's end; raw:\n{}",
+        text.escape_debug()
+    );
+
+    // The classic segment is genuinely region-free: between the switch away
+    // and the switch back the child pins nothing.
+    let classic_segment = session.raw_between(1, 3);
+    assert!(
+        !classic_segment.contains(&tui_region()),
+        "no region may be pinned while the session is in classic mode; \
+         between the two switches the child wrote:\n{}",
+        classic_segment.escape_debug()
+    );
+    assert!(
+        classic_segment.contains("\x1b[r"),
+        "and the release must happen *in* that window rather than only at \
+         exit; between the two switches the child wrote:\n{}",
+        classic_segment.escape_debug()
+    );
+
+    // ...and the re-install really re-pinned, so the count above is not two
+    // copies of one install: the status row is painted again on the bottom
+    // row of the second inline segment. R5's row, not the `kitsu` fallback —
+    // a re-install that forgot to republish `StatusSource` would leave the
+    // placeholder there, which is a live trap in `run_chat` (the source is
+    // handed to the guard once, outside the loop).
+    let screen = session.screen_at(5);
+    let row = screen[(ROWS - 1) as usize].trim_end();
+    assert!(
+        row.starts_with(STATUS_ROW_MODEL),
+        "after switching back to inline the pinned row must carry R5's \
+         composed status row again, which leads with {STATUS_ROW_MODEL:?}; \
+         row {ROWS} reads {row:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        session.raw_mode_off(),
+        "the pty must be canonical again after the session: {}",
+        session.termios_dump()
+    );
+}
+
+/// Classic → inline, the other start mode, with the transcript gate applied
+/// to the one switch this direction has.
+fn switch_from_classic() -> Vec<Step> {
+    vec![
+        send("/help for commands", "/theme zz1\r"),
+        send(TUI_MARK_1, "/tui inline\r"),
+        send(TUI_SWITCHED_TO_INLINE, "/theme zz2\r"),
+        send(TUI_MARK_2, "/quit\r"),
+    ]
+}
+
+/// A session **started** in classic mode switches into inline and keeps what
+/// it had already printed.
+#[test]
+#[serial]
+fn tui_switch_from_classic_into_inline_keeps_the_transcript_and_pins_the_region() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), None, &switch_from_classic());
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        1,
+        "the switch into inline pins the region exactly once; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count("\x1b[r"),
+        1,
+        "and the session releases it exactly once, at exit; raw:\n{}",
+        text.escape_debug()
+    );
+    // The region is pinned *after* the classic-segment transcript, which is
+    // what says the switch happened mid-session rather than at startup.
+    let pinned_at = text.find(&tui_region()).unwrap_or_else(|| {
+        panic!(
+            "the region must be pinned at all; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    let mark_at = text.find(TUI_MARK_1).unwrap_or_else(|| {
+        panic!(
+            "the classic segment must print its marker; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert!(
+        mark_at < pinned_at,
+        "the classic transcript must precede the region being pinned, \
+         otherwise this session started inline and proves nothing; raw:\n{}",
+        text.escape_debug()
+    );
+
+    let screen = session.screen_at(3);
+    for (label, mark) in [("zz1", TUI_MARK_1), ("zz2", TUI_MARK_2)] {
+        assert_eq!(
+            screen.iter().filter(|row| row.trim_end() == mark).count(),
+            1,
+            "the {label} line must be on screen exactly once after the \
+             switch; screen:\n{}",
+            Session::dump(&screen)
+        );
+        assert_eq!(
+            session.raw_count(mark),
+            1,
+            "...and written exactly once; raw:\n{}",
+            text.escape_debug()
+        );
+    }
+}
+
+/// `/tui fullscreen`, `/tui` bare, and `/tui wat`, in one classic session
+/// that keeps going afterwards.
+fn tui_argument_vocabulary() -> Vec<Step> {
+    vec![
+        send("/help for commands", "/tui\r"),
+        send(TUI_REPORT_CLASSIC, "/tui fullscreen\r"),
+        send(TUI_FULLSCREEN_REFUSED, "/theme zz1\r"),
+        // ...and the report tracks the LIVE mode, not the start mode: a
+        // `/tui` that printed `[tui] mode` or `--tui` back would answer
+        // `classic` here too.
+        send(TUI_MARK_1, "/tui inline\r"),
+        send(TUI_SWITCHED_TO_INLINE, "/tui\r"),
+        send(TUI_REPORT_INLINE, "/quit\r"),
+    ]
+}
+
+/// **Requirements 5 and 6 of the card.** `fullscreen` is refused by name —
+/// not as an unknown command and not as a typo — and bare `/tui` reports the
+/// mode it is in. Both messages name the accepted vocabulary, the same two
+/// spellings `[tui] mode` accepts, so a user who reads either one learns the
+/// whole grammar.
+///
+/// The refusal must also be inert: no region is pinned, and the session
+/// carries on printing its transcript afterwards.
+#[test]
+#[serial]
+fn tui_refuses_fullscreen_and_reports_the_mode_when_bare() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), None, &tui_argument_vocabulary());
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count(TUI_REPORT_CLASSIC),
+        1,
+        "bare /tui reports the current mode and the accepted spellings, \
+         exactly once; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TUI_FULLSCREEN_REFUSED),
+        1,
+        "/tui fullscreen is refused by name, with the accepted spellings; \
+         raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        !text.contains("unknown command: /tui"),
+        "/tui must be a registered command, so neither spelling may fall \
+         through to the unknown-command path; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TUI_REPORT_INLINE),
+        1,
+        "and after a switch the report follows the live renderer rather than \
+         the start mode; raw:\n{}",
+        text.escape_debug()
+    );
+    // The refusal itself pinned nothing: the only region in this session is
+    // the one the later, accepted `/tui inline` pins, and it comes after the
+    // refusal in the stream.
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        1,
+        "exactly one region, from the one accepted switch; raw:\n{}",
+        text.escape_debug()
+    );
+    let refused_at = text
+        .find(TUI_FULLSCREEN_REFUSED)
+        .expect("the refusal was just counted");
+    let pinned_at = text
+        .find(&tui_region())
+        .expect("the accepted switch's region was just counted");
+    assert!(
+        refused_at < pinned_at,
+        "a refused mode pins nothing, so the refusal must precede the only \
+         region in the stream; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TUI_MARK_1),
+        1,
+        "and the session keeps running after the refusal; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "the session exits cleanly after a refusal, but exited {:?}; \
+         screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+}
+
+/// Switch into inline, then **switch again**, then take a `SIGTERM`.
+fn switch_twice_then_sigterm() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/tui classic\r"),
+        send(TUI_SWITCHED_TO_CLASSIC, "/tui inline\r"),
+        send(TUI_SWITCHED_TO_INLINE, "/theme zz1\r"),
+        signal(TUI_MARK_1, libc::SIGTERM),
+        pause(TUI_MARK_1, 300),
+    ]
+}
+
+/// **T3-S8's restore, after a second install.** `install_exit_restore` is
+/// `Once`-gated, so the second install does not register anything: the
+/// question this pins is whether the restore that was registered by the
+/// *first* install still gives back what the *second* one took.
+///
+/// Read, not assumed (findings F43/F47): the handler reads only
+/// `SELF_RAISED`, the `CANONICAL_TERMIOS` snapshot and a `const` byte string
+/// — it holds no viewport handle at all — so `Once` is sound here by
+/// construction and this test is the proof rather than the discovery. What it
+/// *can* still catch is the re-install forgetting to re-publish the termios
+/// snapshot, which would leave the pty raw after the signal.
+#[test]
+#[serial]
+fn tui_switch_back_into_inline_still_restores_on_a_signal() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &switch_twice_then_sigterm());
+    let text = session.raw_text();
+
+    assert!(
+        session.raw_mode_off(),
+        "a SIGTERM taken in the *second* inline segment must still leave the \
+         pty canonical, but it reads {}; raw:\n{}",
+        session.termios_dump(),
+        text.escape_debug()
+    );
+    // The dying handler's own byte string, which only the signal path writes.
+    assert!(
+        text.contains("\x1b[r\x1b[?25h\x1b[?2004l\x1b[23;2t"),
+        "the dying-signal restore must run for the re-installed viewport; \
+         raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        !session.status.success(),
+        "a signalled session does not exit successfully; it exited {:?}",
+        session.status
+    );
+}
+
+/// **Requirement 7 of the card: a classic session that never switches is
+/// unchanged.** The byte-level half of that claim is that nothing the switch
+/// brought with it — a pinned region, a region release, or the dying-signal
+/// restore the inline path installs — appears in a session that never asks
+/// for one.
+///
+/// This is the one test in this block that **passes before the feature
+/// exists**: it is the guard that says the implementation did not reach into
+/// the classic path, and it can only ever fail afterwards.
+#[test]
+#[serial]
+fn classic_session_that_never_switches_emits_no_viewport_bytes() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), None, &help_then_quit());
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        0,
+        "no region; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count("\x1b[r"),
+        0,
+        "and no release, because there was nothing to release; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        !text.contains("\x1b[r\x1b[?25h\x1b[?2004l\x1b[23;2t"),
+        "and no dying-signal restore sequence; raw:\n{}",
+        text.escape_debug()
+    );
+    // Non-vacuous: this session really did run a transcript.
+    assert_eq!(
+        session.raw_count("/help <command> explains one command in detail"),
+        1,
+        "the session must have printed its transcript; raw:\n{}",
+        text.escape_debug()
+    );
+}
+
+// -------------------------------------------------------------------------
+// Card **T3-S12**, the risk gate: a PTY session under `--reduced-motion`
+// (notes **N3** and **N9**).
+//
+// What a PTY can and cannot measure here, said plainly (F43/F47): the status
+// row's elapsed segment is `None` between turns, so an **idle** session has
+// no age to refresh and the two tests below cannot measure N9's periodic age
+// refresh at all. That half is pinned where it can be driven --
+// `tui_bridge::tests::reduced_motion_suppresses_the_elapsed_tick_but_not_a_state_change`
+// -- because driving it from a PTY would need a model turn, and this harness's
+// gateway is `https://gateway.invalid` by design.
+//
+// What these two do measure is the rest of the gate: reduced motion still
+// **enters** the viewport (N9: it keeps styled output by definition), the
+// transcript is **never redrawn** (N3's third clause), an idle second costs
+// **zero bytes**, and no synchronized-output mode is emitted.
+// -------------------------------------------------------------------------
+
+/// A styled session with `--reduced-motion` on the command line. The flag is
+/// `global = true` in the CLI, so it rides along after `chat`'s own flags
+/// exactly as `--allow-path` does for the streaming harness.
+fn run_reduced_motion_chat_pty(home: &Path, tui: Option<&str>, script: &[Step]) -> Session {
+    run_styled_chat_pty_core(
+        home,
+        tui,
+        script,
+        Options::default(),
+        &["--reduced-motion".to_string()],
+    )
+}
+
+/// `/help`, then two pauses, then `/quit`.
+///
+/// Two pauses rather than one, and that is the measurement rather than a
+/// nicety: a mark is written after each step, so the bytes between the first
+/// pause's mark and the second's are **exactly** what the child wrote during
+/// the second pause, with no step's input or output mixed in. One pause would
+/// only bound a window that still contained all of `/help`.
+fn help_then_idle_then_quit() -> Vec<Step> {
+    vec![
+        send("/help for commands", "/help\n"),
+        pause("/help <command> explains one command in detail", 300),
+        pause("/help <command> explains one command in detail", 1_200),
+        send("/help <command> explains one command in detail", "/quit\n"),
+    ]
+}
+
+/// Notes **N3** and **N9** on a real terminal: inline mode under
+/// `--reduced-motion` pins its viewport, prints its transcript once, writes
+/// nothing at all while idle, and emits no synchronized-update mode.
+///
+/// Every assertion is derived from a measurement taken on this tree before the
+/// test was written (a throwaway probe in this file): region `ESC[1;23r` once,
+/// the `/help` footer once, **0 bytes** across a 1 200 ms idle pause, 8
+/// occurrences of the status row's model, and zero `?2026`.
+///
+/// The idle-pause assertion is a negative one, so it carries its controls in
+/// the same test: the session must have pinned a region, must have printed its
+/// transcript, and must have painted the status row at least once -- otherwise
+/// "wrote nothing" would be satisfied by a session that did nothing.
+#[test]
+#[serial]
+fn inline_mode_under_reduced_motion_is_static_and_never_redraws_history() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session =
+        run_reduced_motion_chat_pty(home.path(), Some("inline"), &help_then_idle_then_quit());
+
+    assert!(
+        session.status.success(),
+        "a reduced-motion inline session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+    // N9: reduced motion keeps styled output, so the viewport is entered.
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        1,
+        "--reduced-motion may enter inline mode and must pin the region once; \
+         raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    // N3, third clause: history is written once and never redrawn.
+    assert_eq!(
+        session.raw_count("/help <command> explains one command in detail"),
+        1,
+        "the transcript must be emitted exactly once -- a redraw of history \
+         would repeat it; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    // Control: the pinned row was really painted.
+    assert!(
+        session.raw_count(STATUS_ROW_MODEL) >= 1,
+        "control: the status row must have been painted; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    // N3/N9: an idle second costs nothing. `marks[1]..marks[2]` is the second
+    // pause's window; see `help_then_idle_then_quit`.
+    let during_idle = &session.raw[session.marks[1]..session.marks[2]];
+    assert_eq!(
+        during_idle.len(),
+        0,
+        "1 200 ms of idle must emit no bytes at all, got {:?}",
+        String::from_utf8_lossy(during_idle)
+            .escape_debug()
+            .to_string()
+    );
+    // The synchronized-output deferral, on the wire.
+    for mode in ["\x1b[?2026h", "\x1b[?2026l"] {
+        assert_eq!(
+            session.raw_count(mode),
+            0,
+            "synchronized output is deferred until a capability probe exists, \
+             so {:?} must not reach the terminal; raw:\n{}",
+            mode.escape_debug().to_string(),
+            session.raw_text().escape_debug()
+        );
+    }
+}
+
+/// And classic mode is unaffected by the card: `--reduced-motion` with no
+/// `--tui` flag pins no region, releases none, emits no synchronized-update
+/// mode, and still prints its transcript exactly once.
+///
+/// This is a guard rather than a measurement -- it passes before the feature
+/// exists and can only ever fail afterwards, exactly like
+/// `classic_session_that_never_switches_emits_no_viewport_bytes`, whose shape
+/// it borrows.
+#[test]
+#[serial]
+fn classic_mode_under_reduced_motion_emits_no_viewport_bytes() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_reduced_motion_chat_pty(home.path(), None, &help_then_quit());
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        0,
+        "classic mode pins no region under --reduced-motion; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count("\x1b[r"),
+        0,
+        "and releases none, because there was nothing to release; raw:\n{}",
+        text.escape_debug()
+    );
+    for mode in ["\x1b[?2026h", "\x1b[?2026l"] {
+        assert_eq!(
+            session.raw_count(mode),
+            0,
+            "and emits no synchronized-update mode {:?}; raw:\n{}",
+            mode.escape_debug().to_string(),
+            text.escape_debug()
+        );
+    }
+    // Non-vacuous: this session really did run a transcript.
+    assert_eq!(
+        session.raw_count("/help <command> explains one command in detail"),
+        1,
+        "the session must have printed its transcript once; raw:\n{}",
+        text.escape_debug()
+    );
 }

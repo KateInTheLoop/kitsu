@@ -70,6 +70,12 @@ pub enum EditorAction {
     /// Ctrl+\: quit with SIGQUIT. The collector restores canonical termios
     /// first so the terminal is sane after the default core-dump exit.
     Quit,
+    /// Ctrl+L: repaint. The editor neither clears nor redraws anything
+    /// itself — it owns the draft, not the screen — so it reports the
+    /// keystroke and the collector repaints its surface (requirement R8).
+    /// The draft and cursor are untouched, and the byte never enters the
+    /// buffer.
+    Redraw,
 }
 
 /// What one [`TypeaheadEditor::feed`] call produced.
@@ -499,6 +505,11 @@ impl TypeaheadEditor {
             0x17 => self.delete_word_left(outcome),
             0x09 => outcome.actions.push(EditorAction::CompleteRequest),
             0x12 => self.search_enter_or_cycle(outcome),
+            // Ctrl+L: a repaint request and nothing else. `outcome.changed`
+            // is deliberately left alone -- the draft and the cursor are
+            // untouched, so the caller's "repaint when the draft changed"
+            // path must not be what answers this; the action is.
+            0x0c => outcome.actions.push(EditorAction::Redraw),
             0x1a => outcome.actions.push(EditorAction::Suspend),
             0x1c => outcome.actions.push(EditorAction::Quit),
             0x03 => {
@@ -756,6 +767,7 @@ mod tests {
                 | EditorAction::RecallRequest
                 | EditorAction::Interrupt
                 | EditorAction::Suspend
+                | EditorAction::Redraw
                 | EditorAction::Quit => None,
             })
             .collect()
@@ -956,6 +968,43 @@ mod tests {
         assert_eq!(editor.buffer_string(), "draft stays");
         let outcome = editor.feed(&[0x1c]);
         assert_eq!(outcome.actions, vec![EditorAction::Quit]);
+    }
+
+    /// R8, the editor's half: Ctrl+L asks for a repaint and changes nothing.
+    ///
+    /// `changed` must stay `false`: the draft did not change, so the caller's
+    /// ordinary "repaint when changed" path is NOT what repaints here — the
+    /// action is. A `changed: true` shortcut would make Ctrl+L work by
+    /// accident on the idle row and do nothing wherever the action is what is
+    /// consulted.
+    #[test]
+    fn ctrl_l_requests_a_redraw_without_touching_the_draft() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        editor.feed(b"half a thought");
+        editor.feed(b"\x1b[D");
+        let before = (editor.buffer_string(), editor.cursor());
+        let outcome = editor.feed(&[0x0c]);
+        assert_eq!(outcome.actions, vec![EditorAction::Redraw]);
+        assert!(
+            !outcome.changed,
+            "Ctrl+L changes no draft state, so it must not report one"
+        );
+        assert_eq!(
+            (editor.buffer_string(), editor.cursor()),
+            before,
+            "Ctrl+L must leave the draft and the cursor exactly as they were"
+        );
+    }
+
+    /// And inside a bracketed paste it is content noise like Ctrl+C: a pasted
+    /// file containing a form feed must not repaint the screen mid-paste, and
+    /// must not put a control character in the draft either.
+    #[test]
+    fn ctrl_l_inside_a_paste_is_dropped_as_content_noise() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        let outcome = editor.feed(b"\x1b[200~ab\x0ccd\x1b[201~");
+        assert!(outcome.actions.is_empty());
+        assert_eq!(editor.buffer_string(), "abcd");
     }
 
     #[test]

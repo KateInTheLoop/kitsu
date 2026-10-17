@@ -293,8 +293,30 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   tokens and conversation text in memory, so honouring the convention would
   write credentials to disk on a stray keystroke.
 
-  **History and reverse search work; completion and the palette do not, for one
-  shared reason.** Inline mode borrows rustyline's history persistence wholesale
+  **What T3 added to this surface**, each shipped and documented in
+  `CHANGELOG.md`, listed here because this section is the renderer's own map:
+  the **approval modal** in the bottom pane, with the same option line and
+  provenance rows as classic and the same `◉ permission —` receipt afterwards
+  (R7); **`/tui classic|inline`** switching renderers between turns without
+  losing the conversation (R2); **`Ctrl+L`** repaint, and terminal restore on
+  panic, `SIGINT` and `SIGTERM` (N5); **`--reduced-motion`** reaching the
+  viewport, where the elapsed segment stops its periodic refresh while the
+  queue and agent tags keep updating, together with a **60 fps paint cap
+  enforced in the painter** (N3, N9); and the **bounded fd-tagged cell ring**
+  behind `[tui] cell_ring_lines`, not yet fed in production because R6's overlay
+  is its only reader (N4).
+
+  **Paste at the idle inline prompt** behaves as the during-turn row does: a
+  bracketed-paste burst is kept as one draft. Measured at **10 KiB in
+  single-digit milliseconds** against N2's 100 ms budget, by
+  `crates/kitsu/tests/paste_latency.rs` — about twenty times inside the budget
+  in debug and over a hundred in release.
+
+  **History, reverse search and the palette work; `@file` lists do not.**
+  (Corrected in T3-S13: this heading used to say the palette did not work,
+  while the same section documents the working palette some 140 lines above —
+  the file contradicted itself. `paint_composer` calls `palette_rows` in
+  production.) Inline mode borrows rustyline's history persistence wholesale
   without ever running its composer — the file is loaded at startup, the inline
   reader is handed that same list, and submitted lines are recorded on the
   common path after the read — so Up/Down walks previous sessions. Ctrl+R is
@@ -321,11 +343,16 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   exit, re-feed, so by the time Tab is seen the draft is the matched history
   line and no slash hint applies.
 
-  Still absent at the inline prompt: Rustyline's completion **lists** — `@file`
-  path completion and the bordered slash-command palette, which lists and
-  filters commands over several rows and so needs a viewport taller than one
-  row. (An earlier version of this file wrongly bundled Tab in with those; it
-  is a hint, they are lists, and only the lists need the extra rows.)
+  Still absent at the inline prompt: **`@file` path completion**. The shared
+  completion source and its parity test exist (T3-S3), but nothing in
+  production drives the inline host — `InlineComposerHost` carries
+  `#[allow(dead_code)]` and says so, and its only constructions are in the
+  parity tests. (Two earlier corrections to this passage: Tab was wrongly
+  bundled in — it is a hint, not a list — and the **bordered palette was
+  wrongly listed as absent**, when it renders in production. Each of the three
+  claims here has now been wrong at least once; the lesson is that "what is
+  missing" written from memory of a design is unreliable, which is also F20's
+  third pass.)
 
   Tiering is unchanged: the viewport requires a styled interactive TTY, so
   non-TTY, `--plain`, assistive and JSONL sessions never enter it and stay

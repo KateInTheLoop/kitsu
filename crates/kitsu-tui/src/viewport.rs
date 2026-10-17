@@ -65,6 +65,15 @@ struct Inner {
     /// clear exactly the rows `show` pinned, and a separately stored row count
     /// could outlive or contradict the bottom row it belongs to.
     geometry: Option<(u16, u16)>,
+    /// The bounded cell ring, or `None` on a surface built with
+    /// [`InlineSurface::new`] (requirement **N4**, plan row T3-S6).
+    ///
+    /// It lives behind the *same* mutex as the sinks rather than one of its
+    /// own so that the retained order cannot disagree with the written order:
+    /// two threads writing transcript lines serialise on this lock, and a
+    /// separate ring lock would let their pushes land in the opposite order
+    /// from their bytes.
+    cells: Option<crate::cells::CellRing>,
 }
 
 impl Inner {
@@ -203,8 +212,47 @@ impl InlineSurface {
                 out,
                 err,
                 geometry: None,
+                cells: None,
             }),
         }
+    }
+
+    /// Wrap the two descriptors **and** feed a bounded cell ring of
+    /// `cell_ring_lines` lines (requirement **N4**, plan row T3-S6).
+    ///
+    /// Opt-in on purpose: only a backend with a transcript overlay and a `[`
+    /// dump has a reader for the ring, so a surface built with
+    /// [`new`](Self::new) retains nothing and pays nothing.
+    // Constructed by tests only for now: nothing reads the ring until the
+    // transcript overlay (`Ctrl+O`, requirement R6) and the `[` dump land in
+    // T5, and feeding an unread ring would spend up to `DEFAULT_CELL_RING_LINES`
+    // styled lines of memory for no benefit. The production constructor arrives
+    // with R6's overlay, which is also what `InlineComposerHost` is waiting on.
+    #[allow(dead_code)]
+    pub fn with_cell_ring(
+        out: Box<dyn Write + Send>,
+        err: Box<dyn Write + Send>,
+        cell_ring_lines: usize,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                out,
+                err,
+                geometry: None,
+                // The bound is the caller's: `CellRing` defines no constants of
+                // its own, so nothing here can drift from
+                // `TuiConfig::{MIN,DEFAULT,MAX}_CELL_RING_LINES`.
+                cells: Some(crate::cells::CellRing::new(cell_ring_lines)),
+            }),
+        }
+    }
+
+    /// The retained cells, oldest first, or `None` when this surface was built
+    /// without a ring.
+    // Reader-less for the same reason `with_cell_ring` is; see its note.
+    #[allow(dead_code)]
+    pub fn cells(&self) -> Option<Vec<crate::cells::CellLine>> {
+        self.lock().cells.as_ref().map(|ring| ring.lines())
     }
 
     /// Take the lock, ignoring poisoning: a panic inside a write leaves the
@@ -342,6 +390,14 @@ impl Surface for InlineSurface {
         let _ = sink.write_all(text.as_bytes());
         let _ = sink.write_all(b"\r\n");
         let _ = sink.flush();
+        // After the write, inside the lock already held for it: the lock is not
+        // widened by one byte, the bytes reach the terminal before any
+        // bookkeeping, and the ring's order is the written order by
+        // construction. The ring is fed the line's bytes verbatim -- the CRLF
+        // is this backend's line ending, not part of the line.
+        if let Some(ring) = inner.cells.as_mut() {
+            ring.push(fd, text);
+        }
     }
 
     /// Hand the block a writer and forward its bytes verbatim to the sink for
@@ -359,6 +415,29 @@ impl Surface for InlineSurface {
         let sink = inner.sink(fd);
         let _ = sink.write_all(&bytes);
         let _ = sink.flush();
+        // After the write and flush, inside the lock already held for the copy:
+        // a second acquisition would let two blocks land in the ring in the
+        // opposite order from their bytes, and the ring is N4's sole record.
+        // The block itself still ran with no lock held, above. The trait
+        // default is deliberately not reused: forwarding to `transcript_line`
+        // would add a CRLF per line and break the "the block owns its endings"
+        // contract, which is why this override exists. The ring stores line
+        // text without endings, so the scratch buffer is split here and only
+        // the texts are pushed.
+        //
+        // A block whose bytes end without a newline is retained as a short
+        // line rather than held back until some later block terminates it:
+        // holding it would mean text that is on the terminal is absent from
+        // the ring, and a partial final line that is never terminated (the
+        // shape behind F47) would be lost from the overlay and the `[` dump
+        // for good. Retaining it short can split one logical line across two
+        // ring entries, which is visible and recoverable; losing it is not.
+        if let Some(ring) = inner.cells.as_mut() {
+            let text = String::from_utf8_lossy(&bytes);
+            for line in text.lines() {
+                ring.push(fd, line);
+            }
+        }
     }
 }
 
@@ -1490,6 +1569,216 @@ mod tests {
             sink.text(),
             "one\r\ntwo\r\nthree\r\nfour\n",
             "the per-descriptor split must not reorder output"
+        );
+    }
+
+    /// A surface built with [`InlineSurface::new`] feeds no ring: classic and
+    /// any ring-less backend pay nothing for T3-S6.
+    ///
+    /// Not vacuous: the surface is written to first and the write is asserted
+    /// to have produced bytes, so `cells()` is `None` on a surface that really
+    /// did carry transcript lines.
+    #[test]
+    fn an_inline_surface_without_a_cell_ring_retains_no_cells() {
+        let (surface, sink) = shared();
+        surface.transcript_line(Fd::Stdout, "assistant");
+        surface.transcript_line(Fd::Stderr, "tool");
+        assert_eq!(sink.text(), "assistant\r\ntool\r\n");
+        assert_eq!(
+            surface.cells(),
+            None,
+            "no ring was asked for, so nothing is retained"
+        );
+    }
+
+    /// Feeding the ring must not change a single byte: the same calls against
+    /// a ring-fed surface and a ring-less one produce identical streams, and
+    /// only the ring-fed one retains cells.
+    ///
+    /// Not vacuous: the shared sink is asserted non-empty, and the ring-fed
+    /// surface is asserted to have retained both lines, so the byte equality
+    /// is between two surfaces that both actually wrote.
+    #[test]
+    fn feeding_the_cell_ring_changes_no_bytes() {
+        let plain_sink = SharedSink::new();
+        let plain = InlineSurface::new(Box::new(plain_sink.clone()), Box::new(plain_sink.clone()));
+        let ringed_sink = SharedSink::new();
+        let ringed = InlineSurface::with_cell_ring(
+            Box::new(ringed_sink.clone()),
+            Box::new(ringed_sink.clone()),
+            8,
+        );
+        for surface in [&plain, &ringed] {
+            surface.show(24, 2);
+            surface.transcript_line(Fd::Stdout, "assistant");
+            surface.transcript_line(Fd::Stderr, "\x1b[1mtool\x1b[0m");
+            surface.paint(&["row".to_string()], 80);
+            surface.hide();
+        }
+        assert!(!plain_sink.bytes().is_empty(), "the control surface wrote");
+        assert_eq!(
+            ringed_sink.bytes(),
+            plain_sink.bytes(),
+            "the ring is a reader, not a writer"
+        );
+        let cells = ringed.cells().expect("a ring was asked for");
+        assert_eq!(
+            cells
+                .iter()
+                .map(|line| (line.fd(), line.styled().to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Fd::Stdout, "assistant".to_string()),
+                (Fd::Stderr, "\x1b[1mtool\x1b[0m".to_string()),
+            ]
+        );
+        assert_eq!(plain.cells(), None);
+    }
+
+    /// **T3-S10. A writer that bypasses the surface reaches the terminal but
+    /// is invisible to the cell ring.**
+    ///
+    /// This is the data-completeness half of finding **F17**. F17 measured
+    /// that a direct `eprintln!`/`println!` is *visually* harmless in inline
+    /// mode — it inherits the cursor, which is parked inside the DECSTBM
+    /// region, so the terminal scrolls it away with the transcript. What that
+    /// measurement cannot see is requirement **N4**: the ring is to be the
+    /// sole source for the transcript overlay and the `[` dump, and it is fed
+    /// only from [`Surface::transcript_line`]. So output that never reached
+    /// the surface appeared on screen perfectly and is absent from the only
+    /// in-process record of the screen.
+    ///
+    /// The bypassing writer is modelled by writing into a clone of the sink
+    /// the surface holds, which is exactly the shape of the real thing: the
+    /// bytes land on the same descriptor, in order, and the surface is never
+    /// called. The ~421 direct writer sites in `main.rs` do this to the
+    /// process's real fd 1 and 2.
+    ///
+    /// # Why this is not vacuous
+    ///
+    /// The same ring is proved to capture a seam write in the same test, on
+    /// the same descriptor, in the same run: the retained line is asserted to
+    /// be exactly the seam one, so "the bypassed line is missing" is a
+    /// property of *how it was written* and not of a ring that retains
+    /// nothing. Both lines are also asserted present in the byte stream, so
+    /// the bypassing write really happened.
+    ///
+    /// This test **characterises** the limitation rather than demanding a fix:
+    /// routing hundreds of writers is the expensive branch F17 ruled out, and
+    /// the honest deliverable is a tested, documented gap.
+    #[test]
+    // The bare `\n` is the subject of this test: a direct `eprintln!` emits a
+    // line feed and no carriage return, which is exactly what is being
+    // modelled. `writeln!` would emit the same byte but hide the point.
+    #[allow(clippy::write_with_newline)]
+    fn a_writer_that_bypasses_the_surface_reaches_the_terminal_but_not_the_cell_ring() {
+        let sink = SharedSink::new();
+        let surface =
+            InlineSurface::with_cell_ring(Box::new(sink.clone()), Box::new(sink.clone()), 8);
+        surface.transcript_line(Fd::Stderr, "through the seam");
+        // The bypassing writer: same descriptor, no surface call. This is
+        // `eprintln!` in `main.rs`, which adds the bare line feed `ONLCR`
+        // then turns into CR LF.
+        {
+            let mut bypass = sink.clone();
+            write!(bypass, "bypassing the seam\n").expect("direct write");
+        }
+        assert_eq!(
+            sink.text(),
+            "through the seam\r\nbypassing the seam\n",
+            "both writers must have reached the descriptor, in order"
+        );
+        let cells = surface.cells().expect("a ring was asked for");
+        assert_eq!(
+            cells
+                .iter()
+                .map(|line| (line.fd(), line.styled().to_string()))
+                .collect::<Vec<_>>(),
+            vec![(Fd::Stderr, "through the seam".to_string())],
+            "the ring holds the seam write and nothing of the bypassing one, so \
+             the overlay and the `[` dump cannot show output that bypassed the \
+             surface"
+        );
+    }
+
+    /// **T3-S10. `write_block` routes through the seam and is still missing
+    /// from the cell ring — and it carries the streamed assistant text.**
+    ///
+    /// Unlike the test above, this gap is *not* a documented limitation to
+    /// live with. [`InlineSurface::write_block`] copies the block's bytes to
+    /// the sink and pushes nothing, while `kitsu_render::print_fragment` and
+    /// its flush route **the assistant's streamed output** through
+    /// `write_block` (`crates/kitsu-render/src/lib.rs`, the
+    /// `active_surface().write_block(Fd::Stdout, ..)` calls), and
+    /// `render_error` routes error notices through it on stderr. N4 makes the
+    /// ring the sole source for the overlay, so as it stands the overlay
+    /// would render a conversation with the assistant's own replies missing
+    /// while every tool line was present.
+    ///
+    /// The expectation is derived from what `write_block` actually does: the
+    /// block owns its line endings and the bytes are forwarded verbatim, so
+    /// the byte stream is `"alpha\nbeta\n"` and the ring must gain the two
+    /// lines **without their endings**, which is the form
+    /// `transcript_line` stores (the CRLF is the backend's, not part of the
+    /// line).
+    ///
+    /// # Why this is not vacuous, and not unsatisfiable
+    ///
+    /// The byte assertion fixes the only other way to pass — rewriting the
+    /// block's bytes — so the ring must gain the lines without the stream
+    /// changing. A ring-less surface is written the same way in the same test
+    /// and asserted to retain nothing, so the fix cannot be "always allocate
+    /// a ring".
+    ///
+    /// Deliberately **not** asserted: what a block ending without a newline
+    /// should do. `print_fragment`'s unstyled branch can write a partial
+    /// line, and whether the ring should hold it back until it is terminated
+    /// or retain it as a short line is a design decision this test leaves
+    /// open rather than pinning from guesswork.
+    #[test]
+    #[allow(clippy::write_with_newline)]
+    fn write_block_feeds_the_cell_ring_the_lines_it_wrote() {
+        let ringed_sink = SharedSink::new();
+        let ringed = InlineSurface::with_cell_ring(
+            Box::new(ringed_sink.clone()),
+            Box::new(ringed_sink.clone()),
+            8,
+        );
+        let plain_sink = SharedSink::new();
+        let plain = InlineSurface::new(Box::new(plain_sink.clone()), Box::new(plain_sink.clone()));
+        for surface in [&ringed, &plain] {
+            surface.write_block(Fd::Stdout, &mut |out: &mut dyn std::io::Write| {
+                write!(out, "alpha\nbeta\n").expect("block write");
+            });
+        }
+        assert_eq!(
+            ringed_sink.text(),
+            "alpha\nbeta\n",
+            "the block owns its line endings and they must still be forwarded \
+             verbatim: feeding the ring is not a licence to change bytes"
+        );
+        assert_eq!(
+            ringed_sink.bytes(),
+            plain_sink.bytes(),
+            "the ring is a reader, not a writer"
+        );
+        let cells = ringed.cells().expect("a ring was asked for");
+        assert_eq!(
+            cells
+                .iter()
+                .map(|line| (line.fd(), line.styled().to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Fd::Stdout, "alpha".to_string()),
+                (Fd::Stdout, "beta".to_string()),
+            ],
+            "`write_block` carries the streamed assistant text, so a ring that \
+             only sees `transcript_line` is not N4's sole source for the overlay"
+        );
+        assert_eq!(
+            plain.cells(),
+            None,
+            "a surface built without a ring still retains nothing"
         );
     }
 }

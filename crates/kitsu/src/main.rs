@@ -177,6 +177,39 @@ static JSONL_SESSION_RECEIPT: Mutex<JsonlSessionReceipt> =
 // when more than one prompt is waiting.
 static APPROVAL_INPUT_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static APPROVAL_INPUT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Card **T3-S7b**: the in-loop approval read's hand-off.
+///
+/// When a pinned pane is published the prompter does **not** claim stdin
+/// (`APPROVAL_INPUT_ACTIVE` stays at zero, so the collector never drops its
+/// `RawStdinGuard` and the kernel never echoes a thing). It parks the sending
+/// half of a one-shot channel here and blocks on the receiving half; the live
+/// collector takes the sender on its next tick, reads one key with raw mode
+/// still engaged, and sends it back. `None` is "the read was closed without a
+/// decision" -- EOF, a dead reader, or a cancelled turn.
+///
+/// Process-global for `MODAL_PANE`'s reason: the prompter runs on the tool
+/// executor and the reader is the type-ahead collector's thread.
+static APPROVAL_KEY_REQUEST: std::sync::Mutex<Option<std::sync::mpsc::Sender<Option<char>>>> =
+    std::sync::Mutex::new(None);
+/// Whether a live raw-mode collector is running and able to serve
+/// [`APPROVAL_KEY_REQUEST`]. Published by `run_live_typeahead` while it holds
+/// its `RawStdinGuard`, and cleared when it lets the guard go for any reason
+/// (an approval claim, a job-control signal, the end of the turn). A prompter
+/// only bypasses the claim protocol while this is true, and a waiting
+/// prompter gives up the moment it goes false -- which is what makes "the
+/// collector is gone" an interrupt instead of a hang.
+static APPROVAL_KEY_READER: AtomicBool = AtomicBool::new(false);
+/// Serializes in-loop approval reads with each other.
+///
+/// Deliberately **not** `APPROVAL_INPUT_LOCK`: that mutex is `try_lock`ed by
+/// the collector on every 50 ms tick, and `std::sync::Mutex` is not fair, so
+/// a thread that blocks on it without first publishing a claim is starved
+/// indefinitely -- the very failure `ApprovalInputGuard::enter`'s comment
+/// describes, measured here as a 20 s approval that never painted. The in-loop
+/// path publishes no claim (publishing one is what makes the collector hand
+/// the terminal back, which is the echo this card removes), so it needs a
+/// mutex the collector never touches.
+static APPROVAL_PANE_READ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static FOREGROUND_CANCELLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_QUIT_CANCEL: AtomicBool = AtomicBool::new(false);
 static ASSISTIVE_INPUT_INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -5614,6 +5647,14 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         alias_of: None,
     },
     SlashCommandSpec {
+        name: "tui",
+        args: "[classic|inline]",
+        description: "report or switch the live renderer",
+        details: "Switches the renderer in place: `classic` is the line renderer kitsu has always had, `inline` is the pinned bottom viewport. The conversation is unchanged by a switch — the transcript already on screen stays exactly where it is, and nothing is replayed. Bare /tui reports the renderer in use. Accepted only between turns; a /tui typed during a turn is refused rather than queued. `fullscreen` is not available yet: it arrives with its own renderer. Persist a choice with `mode = \"inline\"` under `[tui]` in the config or --tui.",
+        group: CommandGroup::Session,
+        alias_of: None,
+    },
+    SlashCommandSpec {
         name: "undo",
         args: "[id]",
         description: "undo the latest or selected conflict-free file checkpoint",
@@ -5946,6 +5987,13 @@ fn slash_palette_rows(prefix: &str, rich: bool, inner_width: usize, max_rows: u1
     } else {
         let entry = |spec: &SlashCommandSpec| {
             if inner_width >= SLASH_DESCRIPTION_MIN_INNER_WIDTH {
+                // The *syntax* in the label slot whenever it fits that slot,
+                // so a command's argument vocabulary is visible on the one
+                // surface a user reads while typing the command. A long
+                // argument list (`/agent`, `/jobs`) keeps the bare name
+                // instead: it would fill the row by itself and crowd the
+                // description out, which is the compact branch's trade-off,
+                // not this one's.
                 format!(" /{:<22} {}", spec.name, spec.description)
             } else {
                 format!(" {}", spec.syntax())
@@ -14069,6 +14117,16 @@ async fn run_scripted_body(
                     }
                     continue;
                 }
+                SlashResult::SwitchTui(_) => {
+                    status.failures += 1;
+                    let message =
+                        "the renderer switch requires interactive chat; set the renderer with --tui or `[tui] mode`";
+                    finish_command("error", Some(message), EXIT_USER)?;
+                    if !cli.jsonl {
+                        eprintln!("{}:{line_number}: {message}", terminal_inline(path));
+                    }
+                    continue;
+                }
                 SlashResult::NewSession
                 | SlashResult::ResumeSession(_)
                 | SlashResult::ForkSession(_)
@@ -14687,6 +14745,20 @@ impl TypeaheadDispatcher {
             );
             return;
         }
+        // `/tui`, mid-turn: refused and narrated, and above all **not**
+        // allowed to reach the `enqueue` fall-through below, which would turn
+        // a renderer request into a future prompt for the model. Every
+        // spelling is refused, including the bare report and the modes that
+        // would be accepted between turns, because the answer the user wants
+        // is a renderer now and a swap that landed silently at the turn
+        // boundary would be indistinguishable from typing it again.
+        if line == "/tui" || line.starts_with("/tui ") {
+            self.deliver(
+                TypeaheadOutcome::Notice(TUI_MID_TURN_REFUSAL.to_string()),
+                result,
+            );
+            return;
+        }
         if line == "/queue" || line.starts_with("/queue ") {
             let argument = line.strip_prefix("/queue").unwrap_or_default();
             match parse_queue_command(argument).and_then(|command| {
@@ -14762,6 +14834,11 @@ impl RawStdinGuard {
             }
             original
         };
+        // Requirement N5: publish the snapshot for the dying-signal handler.
+        // `Drop` below is the normal restore, and a signal is precisely the
+        // exit path `Drop` does not run on, so the handler needs its own
+        // reachable copy of the modes this guard displaced.
+        tui_bridge::publish_canonical_termios(&original);
         // Bracketed paste on: a mid-turn paste arrives as one `ESC[200~`
         // delimited block instead of loose lines, so the editor can keep it
         // as a single draft. Terminals without support ignore the sequence.
@@ -14790,6 +14867,11 @@ impl Drop for RawStdinGuard {
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
         }
+        // Withdrawn after the restore, not before: a signal landing mid-drop
+        // should still find the snapshot. Once the modes are back, whatever
+        // claims the terminal next (rustyline, an approval prompt) owns them,
+        // and a handler must not `tcsetattr` this stale copy over it.
+        tui_bridge::forget_canonical_termios();
     }
 }
 
@@ -14982,6 +15064,12 @@ fn resolve_editor_actions(
             kitsu_editor::EditorAction::Suspend => {
                 effects.raise_signal = Some(libc::SIGTSTP);
             }
+            // Ctrl+L (requirement R8): the during-turn half. The draft did
+            // not change, so the redraw flag is what repaints the live row --
+            // the same flag a keystroke sets, consulted once per batch.
+            kitsu_editor::EditorAction::Redraw => {
+                effects.needs_redraw = true;
+            }
             kitsu_editor::EditorAction::Quit => {
                 effects.raise_signal = Some(libc::SIGQUIT);
             }
@@ -15099,6 +15187,103 @@ fn slash_hint_ranked(buffer: &str, ranking: impl Fn(&str) -> Option<&'static str
         .unwrap_or_default()
 }
 
+/// Card **T3-S7b**: whether a prompter has parked a request right now.
+///
+/// Checked after the poll and before the read, so a key that arrives while
+/// this tick was already blocked in `poll` is left in the kernel buffer for
+/// the service arm to read instead of being typed into the draft.
+#[cfg(unix)]
+fn approval_key_request_pending() -> bool {
+    APPROVAL_KEY_REQUEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+}
+
+/// Card **T3-S7b**, the collector's half: take the parked approval-key
+/// request, if a prompter has published one.
+#[cfg(unix)]
+fn take_approval_key_request() -> Option<std::sync::mpsc::Sender<Option<char>>> {
+    APPROVAL_KEY_REQUEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+/// Read **one** approval key from raw stdin, with the collector's
+/// `RawStdinGuard` still engaged — which is the whole fix: `ICANON`, `ECHO`
+/// and `ISIG` are clear, so the kernel echoes nothing and the typed answer
+/// cannot reach the scroll region.
+///
+/// `None` is "closed without a decision": end of input, `\x04` (which the
+/// canonical path saw as a zero-length read and the editor resolves as
+/// `EditorAction::Eof`), a cancelled foreground turn, or a stopping
+/// collector. The caller turns that into `Decision::Interrupt`, the case
+/// T3-S7a's dismiss path already exists for.
+///
+/// A bare `\r`/`\n` is skipped rather than answered: the line the user typed
+/// in the old protocol arrived terminated, so a terminator that lands in its
+/// own read must not be mistaken for an answer. Every other key is returned
+/// as-is and resolved by [`parse_permission_answer`] — the one parser — so an
+/// unmapped key takes today's "invalid permission response; denied" branch.
+#[cfg(unix)]
+fn read_approval_key(stop: &AtomicBool) -> Option<char> {
+    loop {
+        if stop.load(Ordering::Acquire) || FOREGROUND_CANCELLED.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut descriptor = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd for the duration of the call; stdin
+        // stays process-owned.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 50) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        if ready == 0 || descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            continue;
+        }
+        let mut buffer = [0u8; 64];
+        // SAFETY: reads into a stack buffer of the stated length from the
+        // process-owned stdin descriptor.
+        let count = unsafe {
+            libc::read(
+                libc::STDIN_FILENO,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len(),
+            )
+        };
+        if count < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        if count == 0 {
+            return None;
+        }
+        // The rest of the read is dropped: in the old protocol the kernel's
+        // line discipline swallowed the terminator too, and one key is one
+        // decision.
+        let Some(key) = String::from_utf8_lossy(&buffer[..count as usize])
+            .chars()
+            .find(|key| !matches!(key, '\r' | '\n'))
+        else {
+            continue;
+        };
+        if key == '\u{4}' {
+            return None;
+        }
+        return Some(key);
+    }
+}
+
 /// The live during-turn editor: raw stdin bytes feed the pure
 /// [`kitsu_editor::TypeaheadEditor`], and the draft renders on the shared
 /// status row with a real cursor, ↑/↓ history, and editable text — while
@@ -15149,11 +15334,44 @@ fn run_live_typeahead(
     tui_bridge::repaint_status_row();
     live::live_input_begin(prompt.clone());
     update_live_row(&editor);
+    // Card T3-S7b: this loop can now serve an approval read itself, so say so
+    // while the guard is held. Cleared on every path that lets the guard go.
+    APPROVAL_KEY_READER.store(raw.is_some(), Ordering::Release);
     while !stop.load(Ordering::Acquire) {
+        // Card T3-S7b, and deliberately the loop's **first** arm: a parked
+        // request needs raw mode, so it is served before the claim protocol's
+        // arm below can hand the terminal back. Nothing here takes
+        // `APPROVAL_INPUT_LOCK` -- the waiting prompter holds it -- so the
+        // service can never be blocked by the prompter it is serving.
+        if let Some(reply) = take_approval_key_request() {
+            if raw.is_none() {
+                raw = RawStdinGuard::engage();
+                APPROVAL_KEY_READER.store(raw.is_some(), Ordering::Release);
+            }
+            let key = if raw.is_some() {
+                read_approval_key(stop)
+            } else {
+                None
+            };
+            // Send before repainting: the prompter's receipt and teardown are
+            // the modal's, and it should not wait on a row.
+            let _ = reply.send(key);
+            // The key was read raw, so no paste can be half-consumed; reset
+            // anyway, for the canonical path's reason -- a latched paste mode
+            // would eat every later Enter.
+            editor.reset_pending_input();
+            if raw.is_some() {
+                live::live_input_begin(prompt.clone());
+                update_live_row(&editor);
+            }
+            continue;
+        }
         if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
             if let Some(guard) = raw.take() {
                 // Canonical mode (with echo) back on for the approval reader;
-                // the draft row is already hidden by the approval guard.
+                // the draft row is already hidden by the approval guard. No
+                // in-loop read can be served without the guard (T3-S7b).
+                APPROVAL_KEY_READER.store(false, Ordering::Release);
                 drop(guard);
                 live::live_input_end();
                 // The approval reader may consume the rest of an in-flight
@@ -15168,6 +15386,7 @@ fn run_live_typeahead(
             match RawStdinGuard::engage() {
                 Some(guard) => {
                     raw = Some(guard);
+                    APPROVAL_KEY_READER.store(true, Ordering::Release);
                     live::live_input_begin(prompt.clone());
                     update_live_row(&editor);
                 }
@@ -15221,6 +15440,12 @@ fn run_live_typeahead(
             continue;
         }
         if descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            continue;
+        }
+        // Card T3-S7b: a request parked while this tick sat in `poll` means
+        // the readable byte is an approval answer, not draft text. Leave it
+        // in the kernel buffer and let the service arm above read it.
+        if approval_key_request_pending() {
             continue;
         }
         quiet_ticks = 0;
@@ -15278,16 +15503,20 @@ fn run_live_typeahead(
             // termios on guard drop.
             if signal != libc::SIGINT {
                 if let Some(guard) = raw.take() {
+                    APPROVAL_KEY_READER.store(false, Ordering::Release);
                     drop(guard);
                     live::live_input_end();
                 }
             }
-            // SAFETY: raising a handled or default-disposition signal
-            // in-process; for SIGTSTP the loop's re-engage branch restores
-            // raw mode and repaints after fg/SIGCONT.
-            unsafe {
-                libc::raise(signal);
-            }
+            // Raised through the bridge rather than with a bare
+            // `libc::raise`: requirement N5's dying-signal handler must stay
+            // out of the way of a signal kitsu is raising on *itself*. This
+            // SIGINT is how the turn is cancelled (the `ctrl_c()` arm of the
+            // turn's `select!` fires on it), so a restore-and-exit handler
+            // answering it would turn Ctrl+C into a quit. For SIGTSTP the
+            // loop's re-engage branch restores raw mode and repaints after
+            // fg/SIGCONT.
+            tui_bridge::raise_in_process(signal);
         }
         if result.eof {
             break;
@@ -15296,6 +15525,9 @@ fn run_live_typeahead(
             update_live_row(&editor);
         }
     }
+    // The reader is leaving: a prompter waiting on an in-loop key must stop
+    // waiting (T3-S7b), so withdraw the offer before the guard goes.
+    APPROVAL_KEY_READER.store(false, Ordering::Release);
     live::live_input_end();
     drop(raw);
     result.pending_draft = editor.take_draft();
@@ -16698,8 +16930,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // released on every exit path. In classic mode — the default — `install`
     // writes nothing and touches no global state, so the session is
     // byte-identical.
+    // `mut` and reassignable, for card T3-S9: `/tui classic|inline` swaps the
+    // renderer at the idle-prompt seam by dropping this guard (which runs the
+    // established teardown in its established order) or by installing a fresh
+    // one. There is deliberately no second teardown path.
     #[cfg(unix)]
-    let tui_bridge_guard = {
+    let mut tui_bridge_guard = {
         // T3-S2 resolves the whole `[tui]` table here, at the one point where
         // the renderer is chosen. Only `mode` has a consumer today; the
         // remaining four are resolved and bound so that the alternate-screen
@@ -16721,14 +16957,24 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // back to the conventional 80x24, the same fallback the renderer's own
         // width probe uses.
         let (_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        tui_bridge::install(
+        let installed = tui_bridge::install(
             mode,
             rows,
             1,
             "kitsu",
             Box::new(std::io::stdout()),
             Box::new(std::io::stderr()),
-        )
+        );
+        if installed.is_some() {
+            // Requirement N5, and only here: the restore exists to give back
+            // what the *inline* viewport took (a pinned DECSTBM region, raw
+            // termios, bracketed paste). Classic mode pins no region and
+            // holds raw mode only inside rustyline's own readline, so it
+            // keeps the signal dispositions it was started with and its byte
+            // stream is unchanged, signal or no signal.
+            tui_bridge::install_exit_restore();
+        }
+        installed
     };
     let publish_agent_state = |turn_active: bool| {
         if !agent_state_enabled {
@@ -17610,8 +17856,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // the registry are read through a closure rather than copied in, because
     // the main loop drains the queue *between* turns -- a depth captured here
     // would be stale exactly when the idle row is painted.
+    //
+    // Built whether or not a viewport is installed, and kept for the whole
+    // session: a classic session that later types `/tui inline` needs the
+    // fields to hand the new guard, and composing them here is the only way
+    // the re-install can publish a row that already carries the live model
+    // instead of `install`'s fixed fallback. Publishing it is the guard's
+    // half, and is redone on every install (see the `/tui` arm below).
     #[cfg(unix)]
-    let status_source = tui_bridge_guard.as_ref().map(|guard| {
+    let status_source = {
         let queue = prompt_queue.clone();
         let registry = agent_registry.clone();
         let source = tui_bridge::StatusSource::new(Box::new(move || {
@@ -17623,9 +17876,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             }
         }));
         refresh_status_usage(Some(&source), &model, &messages, &session, &session_state);
-        guard.enable_live_status(source.clone());
-        source
-    });
+        if let Some(guard) = tui_bridge_guard.as_ref() {
+            guard.enable_live_status(source.clone());
+        }
+        Some(source)
+    };
     let mut exit_after_queue = false;
     // Session transitions are control-plane actions, not user prompts. They
     // always run before queued model work and never consume bounded queue
@@ -17814,6 +18069,105 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     }
                     report_write_checkpoints(write_journal.drain_and_take_reports().await);
                     break;
+                }
+                SlashResult::SwitchTui(request) => {
+                    #[cfg(unix)]
+                    {
+                        match request {
+                            TuiRendererRequest::Classic => {
+                                if tui_bridge_guard.is_some() {
+                                    // Dropping the guard **is** the teardown,
+                                    // in the order earlier cards established:
+                                    // the status painter is unpublished, then
+                                    // the modal painter, then the surface and
+                                    // the live-row flag are put back, and only
+                                    // then is the viewport hidden. There is no
+                                    // second teardown path here on purpose.
+                                    tui_bridge_guard = None;
+                                    eprintln!(
+                                        "~ switched to the {} renderer; the conversation is unchanged",
+                                        request.label()
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "~ already using the {} renderer; nothing changed",
+                                        request.label()
+                                    );
+                                }
+                            }
+                            TuiRendererRequest::Inline => {
+                                if tui_bridge_guard.is_some() {
+                                    eprintln!(
+                                        "~ already using the {} renderer; nothing changed",
+                                        request.label()
+                                    );
+                                } else {
+                                    // The geometry is probed again rather than
+                                    // remembered: the terminal may have been
+                                    // resized during the classic segment, when
+                                    // no viewport was listening for SIGWINCH.
+                                    let (_cols, rows) =
+                                        crossterm::terminal::size().unwrap_or((80, 24));
+                                    tui_bridge_guard = tui_bridge::install(
+                                        tui_bridge::TuiMode::Inline,
+                                        rows,
+                                        1,
+                                        "kitsu",
+                                        Box::new(std::io::stdout()),
+                                        Box::new(std::io::stderr()),
+                                    );
+                                    match tui_bridge_guard.as_ref() {
+                                        Some(guard) => {
+                                            // `Once`-gated, so a second install
+                                            // registers nothing -- which is
+                                            // correct: the handler holds no
+                                            // viewport handle at all, only two
+                                            // atomics and a `const` byte
+                                            // string, so the restore the first
+                                            // install registered gives back
+                                            // exactly what this one took.
+                                            tui_bridge::install_exit_restore();
+                                            // Requirement **R5** again, and the
+                                            // trap this card had to avoid: the
+                                            // fields are published once per
+                                            // *install*, not once per session.
+                                            // A re-install that skipped this
+                                            // would leave `install`'s fixed
+                                            // "kitsu" fallback on the pinned
+                                            // row for the rest of the session.
+                                            refresh_status_usage(
+                                                status_source.as_ref(),
+                                                &model,
+                                                &messages,
+                                                &session,
+                                                &session_state,
+                                            );
+                                            if let Some(source) = status_source.as_ref() {
+                                                guard.enable_live_status(source.clone());
+                                            }
+                                            eprintln!(
+                                                "~ switched to the {} renderer; the conversation is unchanged",
+                                                request.label()
+                                            );
+                                        }
+                                        // Finding F19's gate declined: the
+                                        // terminal is too short for a region.
+                                        // Nothing was displaced, so the
+                                        // classic renderer simply stays.
+                                        None => eprintln!(
+                                            "the inline renderer needs a terminal at least 3 rows tall; staying on the classic renderer"
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = request;
+                        eprintln!("the renderer switch is available on unix terminals only");
+                    }
+                    continue;
                 }
                 SlashResult::SubmitPrompt(prompt) => submitted = prompt,
                 SlashResult::QueueAction(command) => {
@@ -18686,6 +19040,57 @@ enum SlashResult {
     ArchiveSession(String),
     RestoreSession(String),
     DeleteSession(String),
+    /// `/tui classic|inline`: swap the live renderer between turns.
+    ///
+    /// Carried out of the dispatcher rather than performed in it, because the
+    /// swap is the `BridgeGuard`'s business and the guard is a `run_chat`
+    /// local the dispatcher cannot see. The dispatcher's job is to decide
+    /// *which* renderer was asked for; `run_chat` owns the teardown, the
+    /// re-install and the receipt.
+    SwitchTui(TuiRendererRequest),
+}
+
+/// The renderer `/tui` asked for. Deliberately not `tui_bridge::TuiMode`:
+/// this type crosses the `#[cfg(unix)]` seam (the dispatcher and
+/// `SlashResult` are platform-independent, the bridge is not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiRendererRequest {
+    Classic,
+    Inline,
+}
+
+impl TuiRendererRequest {
+    fn label(self) -> &'static str {
+        match self {
+            TuiRendererRequest::Classic => "classic",
+            TuiRendererRequest::Inline => "inline",
+        }
+    }
+}
+
+/// The modes `/tui` accepts, named in every message it prints so a user who
+/// reads any one of them learns the whole grammar. `fullscreen` is T5's
+/// renderer and is deliberately absent.
+const TUI_ACCEPTED_MODES: &str = "accepted: classic, inline";
+
+/// The refusal a `/tui` typed **during a turn** gets.
+///
+/// The renderer is not swapped mid-turn, and — this is the point — the line
+/// is not allowed to fall through to the type-ahead queue either, where it
+/// would quietly become a future prompt sent to the model.
+const TUI_MID_TURN_REFUSAL: &str =
+    "/tui is accepted only between turns; the renderer is not swapped mid-turn";
+
+/// The renderer in use at this instant, as `/tui` reports it.
+fn live_tui_mode_label() -> &'static str {
+    #[cfg(unix)]
+    {
+        tui_bridge::live_mode().label()
+    }
+    #[cfg(not(unix))]
+    {
+        "classic"
+    }
 }
 
 #[derive(Debug)]
@@ -19845,6 +20250,34 @@ async fn handle_slash(
                 }
             };
         }
+        "tui" => {
+            return match arg {
+                // Bare `/tui` reports, and the report doubles as the usage
+                // line. The mode comes from the *live* renderer rather than
+                // from `--tui` or `[tui] mode`, so it stays right across a
+                // switch.
+                "" => {
+                    eprintln!("tui mode: {} ({TUI_ACCEPTED_MODES})", live_tui_mode_label());
+                    SlashResult::Continue(None)
+                }
+                "classic" => SlashResult::SwitchTui(TuiRendererRequest::Classic),
+                "inline" => SlashResult::SwitchTui(TuiRendererRequest::Inline),
+                // Refused **by name**, not as a typo and not as an unknown
+                // command: `fullscreen` is a mode the design's grammar has,
+                // and it is inert here — nothing is torn down or pinned.
+                "fullscreen" => {
+                    eprintln!("/tui fullscreen is not available yet; {TUI_ACCEPTED_MODES}");
+                    SlashResult::Error
+                }
+                other => {
+                    eprintln!(
+                        "unknown tui mode '{}'; {TUI_ACCEPTED_MODES}",
+                        terminal_inline(other)
+                    );
+                    SlashResult::Error
+                }
+            };
+        }
         "queue" => {
             return match parse_queue_command(arg) {
                 Ok(command) => SlashResult::QueueAction(command),
@@ -20650,6 +21083,146 @@ fn read_approval_line() -> Option<String> {
     }
 }
 
+/// Requirement **R7**, the paint half: put an approval prompt on the pinned
+/// bottom rows when a TUI pane is installed, and say whether it went there.
+///
+/// A thin, portable wrapper over [`tui_bridge::paint_approval_modal`]: the
+/// bridge is `#![cfg(unix)]`, and on any other platform there is no pane to
+/// paint on, so this answers `false` and the caller prints the classic stderr
+/// prompt. **Classic mode answers `false` too** -- `tui_bridge::install`
+/// returns `None` for `TuiMode::Classic` before emitting a byte, so no pane is
+/// ever published and classic's bytes are untouched.
+fn approval_modal_paint(
+    header: &str,
+    details: &[String],
+    options: &str,
+    cue: Option<&str>,
+) -> bool {
+    #[cfg(unix)]
+    {
+        tui_bridge::paint_approval_modal(header, details, options, cue)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (header, details, options, cue);
+        false
+    }
+}
+
+/// Take the modal down with no receipt: the read was interrupted, so there is
+/// no decision for a receipt to record. Inert when nothing was painted.
+fn approval_modal_dismiss(header: Option<&str>) {
+    if header.is_none() {
+        return;
+    }
+    #[cfg(unix)]
+    tui_bridge::clear_approval_modal();
+}
+
+/// Requirement **R7**, the receipt half: once the decision has been read, take
+/// the modal down and leave the `◉ permission —` header in the transcript.
+///
+/// `header` is `Some` exactly when [`approval_modal_paint`] painted, so this
+/// is inert in classic mode and in plain mode -- in classic the prompt *is*
+/// the transcript line (it is printed into the scroll region and stays there),
+/// which is why only the pane renderer has a receipt to commit. The receipt is
+/// the modal's own header string, emitted through the renderer's surface seam,
+/// so its sanitize is classic's prompt line byte for byte.
+fn approval_modal_commit(header: Option<&str>) {
+    let Some(header) = header else {
+        return;
+    };
+    // The receipt first, the teardown second. The receipt is a transcript
+    // line -- text plus CRLF, no addressing at all -- so it lands wherever the
+    // cursor is parked, and that is immediately after the newline the kernel
+    // echoed with the answer. Clearing the modal first would repark the cursor
+    // with a cursor address instead, putting the receipt on a line the byte
+    // stream never terminated.
+    kitsu_render::surface::active_surface()
+        .transcript_line(kitsu_render::surface::Fd::Stderr, header);
+    #[cfg(unix)]
+    tui_bridge::clear_approval_modal();
+}
+
+/// Card **T3-S7b**: the row the user types at, painted at the bottom of the
+/// modal instead of written into the scroll region. The classic prompt's cue
+/// text, so the two spellings cannot drift.
+const APPROVAL_CUE: &str = "> ";
+
+/// Whether this approval can be read **in-loop**: a pinned pane is published
+/// *and* a live raw-mode collector is running to read the key.
+///
+/// Both halves are required. The pane is what gives the prompt somewhere to
+/// live; the live reader is what makes the key readable without the claim
+/// protocol. Classic mode publishes no pane, and a session whose collector is
+/// the canonical line-at-a-time loop (piped stdin, `--plain`, assistive
+/// input, a terminal that refused raw mode) has no in-loop reader -- both
+/// answer `false` here and keep today's claim/handoff path.
+fn approval_read_in_loop_available() -> bool {
+    #[cfg(unix)]
+    {
+        !kitsu_render::plain_mode()
+            && APPROVAL_KEY_READER.load(Ordering::Acquire)
+            && tui_bridge::approval_pane_published()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Card **T3-S7b**, the prompter's half, step one: park a request for the
+/// live collector and keep the receiving end.
+///
+/// Published **before** the modal is painted, which is what closes the only
+/// window where the collector could have read the user's key as draft text:
+/// the collector re-checks for a parked request after its poll and before its
+/// read, so by the time a key can exist -- the user has not seen a prompt yet
+/// -- the request is already parked and the key is served, not typed.
+fn publish_approval_key_request() -> std::sync::mpsc::Receiver<Option<char>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    *APPROVAL_KEY_REQUEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
+    receiver
+}
+
+/// Take back a request that will not be read after all (no pane painted).
+fn withdraw_approval_key_request() {
+    *APPROVAL_KEY_REQUEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+/// Card **T3-S7b**, the prompter's half, step two: block until the collector
+/// replies with one key.
+///
+/// The answer comes back as **the string a line read would have produced**,
+/// for [`parse_permission_answer`] -- the one parser -- to resolve. `None` is
+/// "closed without a decision", and it is returned promptly rather than
+/// waited out when the turn is cancelled or the collector stops offering to
+/// read, which is what makes this impossible to hang on.
+fn await_approval_key(receiver: &std::sync::mpsc::Receiver<Option<char>>) -> Option<String> {
+    let answer = loop {
+        match receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(key) => break key.map(|key| key.to_string()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if FOREGROUND_CANCELLED.load(Ordering::Acquire)
+                    || !APPROVAL_KEY_READER.load(Ordering::Acquire)
+                {
+                    break None;
+                }
+            }
+        }
+    };
+    // Withdraw an unserved request. Only one prompter is ever in here at a
+    // time -- they serialize on `APPROVAL_PANE_READ_LOCK` -- so this can only
+    // ever clear our own.
+    withdraw_approval_key_request();
+    answer
+}
+
 fn parse_permission_answer(answer: &str) -> Option<Decision> {
     let answer = answer
         .trim()
@@ -20668,24 +21241,12 @@ fn parse_permission_answer(answer: &str) -> Option<Decision> {
 impl Prompter for CliPrompter {
     fn ask(&self, req: &PermissionRequest) -> Decision {
         use std::io::Write;
-        let _input_guard = ApprovalInputGuard::enter();
-        // Disable bracketed paste (ESC[?2004l) for the raw read; rustyline
-        // re-enables it on the next prompt. Literal input never enables it.
-        if !kitsu_render::assistive_input_mode() {
-            eprint!("\x1b[?2004l");
-        }
-        if kitsu_render::plain_mode() {
-            eprint!(
-                "\npermission> kitsu wants to {} {}\n  [y] allow once   [a] always ({})   [n] deny\n> ",
-                req.action.verb(),
-                terminal_inline(&req.path),
-                terminal_inline(&req.grant_dir)
-            );
-        } else {
-            // The approval moment carries visual weight: one shared header
-            // design for file and command prompts (see CliCommandPrompter).
-            eprint!(
-                "\n{}\n{}\n> ",
+        // The approval moment carries visual weight: one shared header
+        // design for file and command prompts (see CliCommandPrompter).
+        // Composed once, for whichever path takes this prompt: classic prints
+        // these strings and the modal paints them, so they cannot drift.
+        let styled = (!kitsu_render::plain_mode()).then(|| {
+            (
                 kitsu_render::approval_header(&format!(
                     "kitsu wants to {} {}",
                     req.action.verb(),
@@ -20695,13 +21256,88 @@ impl Prompter for CliPrompter {
                     "always ({})",
                     terminal_inline(&req.grant_dir)
                 )),
-            );
+            )
+        });
+        // Card T3-S7b: the in-loop path, taken only where a pane is published
+        // *and* a live reader can read the key. It claims nothing: the
+        // collector keeps its `RawStdinGuard`, so the kernel echoes neither
+        // the cue nor the answer and the transcript stays clean.
+        let mut modal = None;
+        let mut pending = None;
+        let mut reader_owner = None;
+        if let (true, Some((header, options))) =
+            (approval_read_in_loop_available(), styled.as_ref())
+        {
+            // Serialize with every other in-loop approval read, on a mutex
+            // the collector never touches (see
+            // `APPROVAL_PANE_READ_LOCK`): holding it across the blocking
+            // read therefore cannot stall the thread that performs it.
+            let owner = APPROVAL_PANE_READ_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The draft row comes off the pane before the modal goes on it:
+            // `ApprovalInputGuard` does this for the other path, and its
+            // redraw would otherwise wipe the modal.
+            kitsu_render::live::live_input_end();
+            // Parked before the paint, so no key can exist before the
+            // collector knows to serve it rather than type it.
+            let receiver = publish_approval_key_request();
+            if approval_modal_paint(header, &[], options, Some(APPROVAL_CUE)) {
+                modal = Some(header.clone());
+                pending = Some(receiver);
+                reader_owner = Some(owner);
+            } else {
+                // No pane after all (a terminal below F19's bound): take the
+                // request back and let the claim path below run.
+                withdraw_approval_key_request();
+                drop(owner);
+            }
         }
-        let _ = std::io::stderr().flush();
-        let Some(line) = read_approval_line() else {
+        let in_loop = modal.is_some();
+        let _input_guard = (!in_loop).then(ApprovalInputGuard::enter);
+        if !in_loop {
+            // Disable bracketed paste (ESC[?2004l) for the raw read; rustyline
+            // re-enables it on the next prompt. Literal input never enables it.
+            // The in-loop path leaves paste mode alone: the collector's guard
+            // owns it, and one key is read from it rather than a line.
+            if !kitsu_render::assistive_input_mode() {
+                eprint!("\x1b[?2004l");
+            }
+            match styled.as_ref() {
+                None => eprint!(
+                    "\npermission> kitsu wants to {} {}\n  [y] allow once   [a] always ({})   [n] deny\n> ",
+                    req.action.verb(),
+                    terminal_inline(&req.path),
+                    terminal_inline(&req.grant_dir)
+                ),
+                Some((header, options)) => {
+                    // Requirement R7: in a TUI mode the prompt is a modal on
+                    // the pinned bottom rows. Reached here only when no live
+                    // reader is available (assistive or piped input), so the
+                    // `> ` cue and the echoed answer stay in the scroll
+                    // region -- the canonical read is still the kernel's.
+                    if approval_modal_paint(header, &[], options, None) {
+                        modal = Some(header.clone());
+                        eprint!("> ");
+                    } else {
+                        eprint!("\n{header}\n{options}\n> ");
+                    }
+                }
+            }
+            let _ = std::io::stderr().flush();
+        }
+        let answer = match pending.as_ref() {
+            Some(receiver) => await_approval_key(receiver),
+            None => read_approval_line(),
+        };
+        let Some(answer) = answer else {
+            approval_modal_dismiss(modal.as_deref());
             return Decision::Interrupt;
         };
-        parse_permission_answer(&line).unwrap_or_else(|| {
+        approval_modal_commit(modal.as_deref());
+        // The read is over: let the next approval in.
+        drop(reader_owner);
+        parse_permission_answer(&answer).unwrap_or_else(|| {
             eprintln!("invalid permission response; denied (enter y, a/always, or n next time)");
             Decision::Deny
         })
@@ -20711,10 +21347,6 @@ impl Prompter for CliPrompter {
 impl CommandPrompter for CliCommandPrompter {
     fn ask(&self, req: &CommandApprovalRequest) -> CommandDecision {
         use std::io::Write;
-        let _input_guard = ApprovalInputGuard::enter();
-        if !kitsu_render::assistive_input_mode() {
-            eprint!("\x1b[?2004l");
-        }
         let resolution = match req.executable.resolution {
             kitsu_tools::CommandExecutableResolution::AmbientPath => "ambient PATH lookup",
             kitsu_tools::CommandExecutableResolution::InvocationPath => "invocation path",
@@ -20725,24 +21357,18 @@ impl CommandPrompter for CliCommandPrompter {
             .as_deref()
             .map(terminal_inline)
             .unwrap_or_else(|| "not observed".to_string());
-        if kitsu_render::plain_mode() {
-            eprint!(
-                "\ncommand permission> run {}\n  cwd: {}\n  executable: {} ({resolution}; observed: {observed}; bytes not pinned)\n  timeout: {} ms\n  authority: {}\n  [y] allow once   [a] allow this exact argv/cwd for session   [n] deny\n> ",
-                terminal_inline(&req.display_argv()),
-                terminal_inline(&req.cwd),
-                terminal_inline(&req.executable.invocation),
-                req.timeout_ms,
-                terminal_inline(req.authority_notice()),
-            );
-        } else {
-            // Same weighted header design as the filesystem prompt above, with
-            // the command's provenance details dimmed beneath it.
-            eprint!(
-                "\n{}\n{}\n{}\n{}\n{}\n{}\n> ",
-                kitsu_render::approval_header(&format!(
-                    "run {}",
-                    terminal_inline(&req.display_argv())
-                )),
+        // Same weighted header design as the filesystem prompt above, with
+        // the command's provenance details dimmed beneath it. Composed once,
+        // for whichever path takes this prompt.
+        let styled = (!kitsu_render::plain_mode()).then(|| {
+            let header = kitsu_render::approval_header(&format!(
+                "run {}",
+                terminal_inline(&req.display_argv())
+            ));
+            // R7's "command approvals keep their provenance rows": the same
+            // four rows, in the same order, whether they go to stderr or onto
+            // the pinned rows.
+            let details = vec![
                 kitsu_render::approval_detail(&format!("cwd: {}", terminal_inline(&req.cwd))),
                 kitsu_render::approval_detail(&format!(
                     "executable: {} ({resolution}; observed: {observed}; bytes not pinned)",
@@ -20753,25 +21379,81 @@ impl CommandPrompter for CliCommandPrompter {
                     "authority: {}",
                     terminal_inline(req.authority_notice())
                 )),
-                kitsu_render::approval_options("allow this exact argv/cwd for session"),
-            );
+            ];
+            let options = kitsu_render::approval_options("allow this exact argv/cwd for session");
+            (header, details, options)
+        });
+        // Card T3-S7b, exactly as the filesystem prompt above: where a pane
+        // is published and a live reader can read the key, nothing is claimed
+        // and nothing is echoed.
+        let mut modal = None;
+        let mut pending = None;
+        let mut reader_owner = None;
+        if let (true, Some((header, details, options))) =
+            (approval_read_in_loop_available(), styled.as_ref())
+        {
+            let owner = APPROVAL_PANE_READ_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            kitsu_render::live::live_input_end();
+            let receiver = publish_approval_key_request();
+            if approval_modal_paint(header, details, options, Some(APPROVAL_CUE)) {
+                modal = Some(header.clone());
+                pending = Some(receiver);
+                reader_owner = Some(owner);
+            } else {
+                withdraw_approval_key_request();
+                drop(owner);
+            }
         }
-        let _ = std::io::stderr().flush();
-        let Some(line) = read_approval_line() else {
+        let in_loop = modal.is_some();
+        let _input_guard = (!in_loop).then(ApprovalInputGuard::enter);
+        if !in_loop {
+            if !kitsu_render::assistive_input_mode() {
+                eprint!("\x1b[?2004l");
+            }
+            match styled.as_ref() {
+                None => eprint!(
+                    "\ncommand permission> run {}\n  cwd: {}\n  executable: {} ({resolution}; observed: {observed}; bytes not pinned)\n  timeout: {} ms\n  authority: {}\n  [y] allow once   [a] allow this exact argv/cwd for session   [n] deny\n> ",
+                    terminal_inline(&req.display_argv()),
+                    terminal_inline(&req.cwd),
+                    terminal_inline(&req.executable.invocation),
+                    req.timeout_ms,
+                    terminal_inline(req.authority_notice()),
+                ),
+                Some((header, details, options)) => {
+                    if approval_modal_paint(header, details, options, None) {
+                        modal = Some(header.clone());
+                        eprint!("> ");
+                    } else {
+                        let details = details.join("\n");
+                        eprint!("\n{header}\n{details}\n{options}\n> ");
+                    }
+                }
+            }
+            let _ = std::io::stderr().flush();
+        }
+        let answer = match pending.as_ref() {
+            Some(receiver) => await_approval_key(receiver),
+            None => read_approval_line(),
+        };
+        let Some(answer) = answer else {
+            approval_modal_dismiss(modal.as_deref());
             return CommandDecision::Interrupt;
         };
-        match line
-            .trim()
-            .trim_start_matches("\u{1b}[200~")
-            .trim_end_matches("\u{1b}[201~")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "y" | "yes" => CommandDecision::AllowOnce,
-            "a" | "always" => CommandDecision::AllowForSession,
-            "n" | "no" => CommandDecision::Deny,
-            _ => {
+        approval_modal_commit(modal.as_deref());
+        drop(reader_owner);
+        // One parser, finding F45: this prompt used to re-implement
+        // `parse_permission_answer`'s trim, paste-marker strip, lowercase and
+        // match inline -- the same three answers under different names. The
+        // duplicate is retired; only the command-side *meaning* of `a`
+        // remains here, as the `Decision` -> `CommandDecision` mapping.
+        match parse_permission_answer(&answer) {
+            Some(Decision::AllowOnce) => CommandDecision::AllowOnce,
+            Some(Decision::AllowAlways) => CommandDecision::AllowForSession,
+            Some(Decision::Deny) => CommandDecision::Deny,
+            Some(Decision::Interrupt) => CommandDecision::Interrupt,
+            None => {
                 eprintln!("invalid command permission response; denied");
                 CommandDecision::Deny
             }
@@ -27331,5 +28013,192 @@ mod tests {
             !decided_waiting.contains("permission to"),
             "a cancelled approval is decided, not pending: {decided}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Card T3-S9: `/tui classic|inline` as a runtime switch.
+    //
+    // `/tui` is NOT a command yet (`SLASH_COMMANDS` has no `tui` entry and
+    // the dispatcher has no arm), so every test below this banner fails.
+    // ------------------------------------------------------------------
+
+    /// The refusal a `/tui` typed as type-ahead **during a turn** gets.
+    ///
+    /// The decision this card takes, and the reason: the default fall-through
+    /// in `TypeaheadDispatcher::dispatch` is `queue.enqueue(line)`, so an
+    /// unhandled `/tui inline` becomes a **future prompt sent to the model** —
+    /// strictly worse than doing nothing. Queuing the *switch* instead was
+    /// rejected because the mode a user asks for mid-turn is a mode they want
+    /// to see now, and a swap that lands silently several seconds later at the
+    /// turn boundary is indistinguishable from the switch they would get by
+    /// typing it again. So: refused, named, and the renderer untouched.
+    const TUI_MID_TURN_REFUSAL: &str =
+        "/tui is accepted only between turns; the renderer is not swapped mid-turn";
+
+    /// Site 1 of the top-level command's site list: the registry entry, which
+    /// is the one source `/help`, `/help <command>`, the palette and both
+    /// completion hosts read.
+    #[test]
+    fn the_command_registry_advertises_the_tui_switch() {
+        let tui = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "tui")
+            .expect("/tui is registered");
+        assert_eq!(tui.args, "[classic|inline]");
+        assert_eq!(tui.syntax(), "/tui [classic|inline]");
+        assert_eq!(
+            tui.alias_of, None,
+            "/tui is a command in its own right, not an alias"
+        );
+        assert_eq!(
+            tui.group,
+            CommandGroup::Session,
+            "the renderer is session state, which is where /theme lives too"
+        );
+        // The advertised vocabulary is exactly `[tui] mode`'s: `fullscreen` is
+        // T5's renderer and must not be advertised by a surface that would
+        // then refuse it.
+        assert!(
+            !tui.args.contains("fullscreen"),
+            "the args row must not advertise a mode that is refused: {}",
+            tui.args
+        );
+        assert!(
+            tui.details.contains("fullscreen"),
+            "the details, however, must say where `fullscreen` went, because \
+             the design's grammar has it: {}",
+            tui.details
+        );
+        assert!(
+            tui.details.contains("conversation"),
+            "and must state R2's gate — a switch keeps the conversation: {}",
+            tui.details
+        );
+    }
+
+    /// The remaining registry-fed sites, in one test, because one entry is
+    /// what feeds them all: `/help`'s grouped listing, `/help tui`, the
+    /// palette, and the shared completion source both hosts use (T3-S3).
+    ///
+    /// This is the top-level answer to finding F38: a top-level command has
+    /// **no unchecked string literal of its own** on these four surfaces —
+    /// they are all registry traversals. The literals a top-level command
+    /// does own are its dispatch arm's match pattern and its own messages,
+    /// and for the dispatch arm there is no registry-drift guard at all: an
+    /// entry with no arm prints `unknown command: /tui` and nothing in this
+    /// suite would notice. That is what the PTY tests in `tests/tui.rs` are
+    /// for.
+    #[test]
+    fn every_registry_fed_surface_shows_the_tui_switch() {
+        let help = slash_help("test-model", false);
+        assert!(
+            help.contains("/tui [classic|inline]"),
+            "/help lists the command: {help}"
+        );
+
+        let detail = slash_command_help("tui");
+        assert!(
+            detail.starts_with("/tui [classic|inline]"),
+            "/help tui leads with the syntax: {detail}"
+        );
+
+        let palette = slash_palette("tu", false, 80);
+        assert!(
+            palette.contains("/tui") && palette.contains("report or switch the live renderer"),
+            "the palette offers it for the prefix `tu`: {palette}"
+        );
+
+        let permissions = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let base = std::env::current_dir().unwrap();
+        let helper = chat_helper_completing_in(permissions, base);
+        let candidates = helper.completion.candidates("/tu", 3);
+        assert!(
+            candidates
+                .candidates
+                .iter()
+                .any(|candidate| candidate.replacement.trim_end() == "/tui"),
+            "the shared completion source completes `/tu` to `/tui`: {:?}",
+            candidates
+                .candidates
+                .iter()
+                .map(|candidate| candidate.replacement.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `/tui` is its own nearest suggestion, so a user who mistypes a
+    /// neighbouring command is not sent to it and a user who types it is not
+    /// sent elsewhere.
+    ///
+    /// Also the non-vacuity of the PTY tests' `unknown command: /tui`
+    /// assertion: today `closest_slash_command("tui")` answers with some
+    /// *other* command, which is exactly the failure mode those tests ban.
+    #[test]
+    fn tui_is_its_own_nearest_suggestion() {
+        assert_eq!(closest_slash_command("tui"), Some("tui"));
+        // And the neighbours keep theirs: `/tui` must not capture them.
+        assert_eq!(closest_slash_command("tools"), Some("tools"));
+        assert_eq!(closest_slash_command("tool"), Some("tools"));
+    }
+
+    /// **Mid-turn, the decision pinned.** A `/tui` submitted as type-ahead is
+    /// refused by name and, critically, is **not** enqueued as a prompt: the
+    /// assertion that matters is the empty queue, because the pre-feature
+    /// behaviour is a silent enqueue that would later be sent to the model.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mid_turn_tui_is_refused_rather_than_queued_as_a_prompt() {
+        for line in ["/tui", "/tui inline", "/tui classic", "/tui fullscreen"] {
+            let queue = Arc::new(std::sync::Mutex::new(prompt_queue::PromptQueue::new(8)));
+            let dispatcher = TypeaheadDispatcher {
+                queue: queue.clone(),
+                steering: prompt_queue::SteeringChannel::new(8).expect("steering channel"),
+                registry: subagent::AgentRegistry::new(),
+                runtime: tokio::runtime::Handle::current(),
+                live: false,
+            };
+            let mut result = TypeaheadCaptureResult::default();
+            dispatcher.dispatch(line, &mut result);
+
+            assert_eq!(
+                queue.lock().unwrap().iter().len(),
+                0,
+                "{line:?} must never become a future prompt for the model"
+            );
+            assert_eq!(result.captured, 0, "{line:?} is not captured type-ahead");
+            let [outcome] = &result.outcomes[..] else {
+                panic!(
+                    "{line:?} must produce exactly one narrated outcome, got {}",
+                    result.outcomes.len()
+                );
+            };
+            match outcome {
+                TypeaheadOutcome::Notice(notice) => assert_eq!(
+                    notice, TUI_MID_TURN_REFUSAL,
+                    "the refusal says when /tui is accepted"
+                ),
+                TypeaheadOutcome::SteeringError(error) | TypeaheadOutcome::QueueError(error) => {
+                    panic!(
+                        "{line:?} is neither a steering nor a queue failure; it is a \
+                         notice, so it is not narrated as `queue refused:`: {error}"
+                    )
+                }
+            }
+        }
+
+        // Non-vacuity: the same dispatcher still queues an ordinary line, so
+        // the empty queue above is a refusal and not a broken fixture.
+        let queue = Arc::new(std::sync::Mutex::new(prompt_queue::PromptQueue::new(8)));
+        let dispatcher = TypeaheadDispatcher {
+            queue: queue.clone(),
+            steering: prompt_queue::SteeringChannel::new(8).expect("steering channel"),
+            registry: subagent::AgentRegistry::new(),
+            runtime: tokio::runtime::Handle::current(),
+            live: false,
+        };
+        let mut result = TypeaheadCaptureResult::default();
+        dispatcher.dispatch("an ordinary follow-up", &mut result);
+        assert_eq!(queue.lock().unwrap().iter().len(), 1);
+        assert_eq!(result.captured, 1);
     }
 }
