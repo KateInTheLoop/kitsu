@@ -439,6 +439,87 @@ fn c_name(name: &OsStr) -> std::io::Result<CString> {
     })
 }
 
+/// Number of attempts an exclusive `flock` fence makes before it reports the
+/// session as already active. See [`flock_exclusive_with_fork_retry`].
+#[cfg(unix)]
+const FLOCK_FENCE_ATTEMPTS: u32 = 80;
+
+/// How many of those attempts use the short wait, aimed at a single
+/// fork-to-exec window. See [`flock_exclusive_with_fork_retry`].
+#[cfg(unix)]
+const FLOCK_FENCE_SHORT_ATTEMPTS: u32 = 32;
+
+/// Wait between two early attempts of an exclusive `flock` fence.
+#[cfg(unix)]
+const FLOCK_FENCE_SHORT_WAIT: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// Wait between two later attempts of an exclusive `flock` fence, once the
+/// short waits have not cleared the descriptor.
+#[cfg(unix)]
+const FLOCK_FENCE_LONG_WAIT: std::time::Duration = std::time::Duration::from_micros(500);
+
+/// Take `flock(LOCK_EX | LOCK_NB)` on `fd`, retrying a bounded number of times
+/// while the kernel answers `EWOULDBLOCK`/`EAGAIN`.
+///
+/// Why the retry exists: an advisory `flock` lock lives on the *open file
+/// description*, not on the descriptor. Our lock descriptors are `O_CLOEXEC`,
+/// and `O_CLOEXEC` closes the descriptor at `exec` — not at `fork`. So every
+/// time any other thread in this process spawns a child, that child holds a
+/// duplicate of every lock descriptor we have open, and therefore holds our
+/// locks, for the whole window between `fork` and `execve`. A fence taken in
+/// that window is refused even though nothing is actually contending and the
+/// previous holder has already closed its own descriptor. Measured in
+/// isolation, a thread flocking a file nobody else touches fails on roughly
+/// 5.5% of attempts while a sibling thread spawns trivial commands, and kitsu
+/// spawns tool subprocesses, agent hooks and `git` on other threads as a matter
+/// of course.
+///
+/// A single fork-to-exec window is microseconds wide, so the first
+/// [`FLOCK_FENCE_SHORT_ATTEMPTS`] attempts wait only
+/// [`FLOCK_FENCE_SHORT_WAIT`] and clear the common case almost immediately.
+/// Overlapping windows from several spawning threads at once can stay occupied
+/// for longer than that, so the remaining attempts wait
+/// [`FLOCK_FENCE_LONG_WAIT`] each. The whole budget is about 25 ms, which is
+/// what a genuinely contended caller pays before it gets its error.
+///
+/// This is a mitigation, not a guarantee. Under a sustained fork storm the
+/// window may never be empty within the budget, and an unlucky caller can still
+/// see a spurious "already active". The complete fix is to stop leaking the lock
+/// descriptor across `fork` at all, which is not available to us: it would
+/// require every spawn site in the process, including ones inside dependencies,
+/// to cooperate.
+///
+/// Do not "simplify" this back to a single attempt, and do not swap `flock` for
+/// `fcntl(F_SETLK)` record locks: those are per-process, and same-process
+/// detection here is load-bearing and tested (a fence taken twice in one process
+/// must fail the second time). `F_OFD_SETLK` locks inherit across `fork` exactly
+/// as `flock` does, so they are no escape either.
+///
+/// On exhaustion this returns the kernel's own `EWOULDBLOCK`/`EAGAIN` error, so
+/// callers keep reporting the same "already active" message byte for byte.
+#[cfg(unix)]
+pub(crate) fn flock_exclusive_with_fork_retry(
+    fd: std::os::fd::RawFd,
+) -> Result<(), std::io::Error> {
+    for attempt in 1..=FLOCK_FENCE_ATTEMPTS {
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        let would_block = error.raw_os_error() == Some(libc::EWOULDBLOCK)
+            || error.raw_os_error() == Some(libc::EAGAIN);
+        if !would_block || attempt == FLOCK_FENCE_ATTEMPTS {
+            return Err(error);
+        }
+        std::thread::sleep(if attempt <= FLOCK_FENCE_SHORT_ATTEMPTS {
+            FLOCK_FENCE_SHORT_WAIT
+        } else {
+            FLOCK_FENCE_LONG_WAIT
+        });
+    }
+    unreachable!("the retry loop returns on its last attempt")
+}
+
 #[cfg(unix)]
 fn openat_file(
     directory: &std::fs::File,
@@ -1475,9 +1556,7 @@ impl SessionLease {
                 ));
             }
 
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if result != 0 {
-                let error = std::io::Error::last_os_error();
+            if let Err(error) = flock_exclusive_with_fork_retry(file.as_raw_fd()) {
                 if error.raw_os_error() == Some(libc::EWOULDBLOCK)
                     || error.raw_os_error() == Some(libc::EAGAIN)
                 {
@@ -4373,6 +4452,73 @@ mod tests {
                 .unwrap_err()
                 .contains("already active")
         );
+    }
+
+    /// The twin of the writer-fence race: `SessionLease::acquire` takes the same
+    /// advisory `flock(LOCK_NB)`, and an advisory lock belongs to the open file
+    /// description. A `fork` on any other thread duplicates the lock fd into the
+    /// child, which holds the lock until it `exec`s and the `O_CLOEXEC` fd closes,
+    /// so a `LOCK_NB` attempt inside that window reports `EWOULDBLOCK` although
+    /// nobody holds the lease. Nothing else here ever leases this id, so every
+    /// attempt below must succeed.
+    #[cfg(unix)]
+    #[test]
+    fn session_lease_is_not_spuriously_busy_while_another_thread_forks() {
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const SPAWNERS: usize = 4;
+        const ATTEMPTS: usize = 300;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let directory = PrivateDirectory::open(&dir, "lease fork fixture").unwrap();
+        let id = "s-fork-race";
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..SPAWNERS)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let Ok(mut child) = Command::new("/bin/true")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                        else {
+                            return;
+                        };
+                        let _ = child.wait();
+                    }
+                })
+            })
+            .collect();
+
+        let mut failure = None;
+        for attempt in 0..ATTEMPTS {
+            match SessionLease::acquire(&directory, id) {
+                Ok(lease) => drop(lease),
+                Err(error) => {
+                    failure = Some((attempt, error));
+                    break;
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+
+        if let Some((attempt, error)) = failure {
+            panic!(
+                "uncontended session lease failed on attempt {attempt} of {ATTEMPTS} \
+                 while another thread was forking: {error}"
+            );
+        }
     }
 
     #[test]
