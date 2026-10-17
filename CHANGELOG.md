@@ -11,6 +11,9 @@ shapes may change in any minor release.
 
 ### Fixed
 
+- Preserve the last line of long assistant replies before live-row redraws;
+  bound the live composer to terminal height and prevent narrow-window wrapping.
+  Model output limits now print a truncation marker in streaming human output.
 - **Answers stream again in the default configuration.** Streaming was suppressed
   on any round that advertised tools -- which is every ordinary round -- so you
   typed a question, watched a spinner, and got the whole answer in one burst. The
@@ -89,6 +92,10 @@ shapes may change in any minor release.
   reason.
 
 ### Added
+
+- A `git` tool available by default in interactive chat, backed by exact
+  command approvals and Linux containment. General commands remain opt-in;
+  `--no-tools` disables Git too.
 - **The terminal window title now says what kitsu is doing** -- `kitsu · idle · 0
   agents`, `kitsu · working · 1 agent`, `kitsu · blocked · 3 agents` -- so a
   multiplexer or herder can classify windows by title (requirement H2, which had
