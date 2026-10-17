@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "kitsu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "kitsu-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures",
  "kitsu-providers",
@@ -1230,11 +1230,11 @@ dependencies = [
 
 [[package]]
 name = "kitsu-editor"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "kitsu-providers"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "futures",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "kitsu-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "owo-colors",
@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "kitsu-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "calamine",
  "chrono",
@@ -1290,7 +1290,7 @@ dependencies = [
 
 [[package]]
 name = "kitsu-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "kitsu-render",

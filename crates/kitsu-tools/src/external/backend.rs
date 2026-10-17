@@ -2780,7 +2780,15 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     unsafe fn run_raw_mcp_peer_v1(mode: RealMcpPeerModeV1) -> i32 {
-        const INITIALIZE: &[u8] = b"{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{\"capabilities\":{},\"clientInfo\":{\"name\":\"kitsu-tools\",\"version\":\"0.1.0\"},\"protocolVersion\":\"2025-11-25\"}}\n";
+        // The client announces `CARGO_PKG_VERSION`, so the expected line is built
+        // from it rather than spelling a version that goes stale on every bump.
+        const INITIALIZE: &[u8] = concat!(
+            "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{\"capabilities\":{},",
+            "\"clientInfo\":{\"name\":\"kitsu-tools\",\"version\":\"",
+            env!("CARGO_PKG_VERSION"),
+            "\"},\"protocolVersion\":\"2025-11-25\"}}\n"
+        )
+        .as_bytes();
         const INITIALIZED: &[u8] =
             b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
         const TOOLS_LIST: &[u8] = b"{\"id\":2,\"jsonrpc\":\"2.0\",\"method\":\"tools/list\"}\n";
