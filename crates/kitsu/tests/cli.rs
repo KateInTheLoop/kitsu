@@ -15321,6 +15321,175 @@ async fn test_scripted_exit_surfaces_terminal_background_results_in_human_and_js
     server.verify().await;
 }
 
+/// Card **F67-print**: `/jobs prune <id>` prints an unviewed result before it
+/// discards the record, so the interactive path stops being the only one that
+/// loses the work.
+///
+/// The asymmetry F67 records: `kitsu agents --json` / automation gets
+/// `terminal_job_payload(&status)` in the reply, while an interactive human got
+/// only `~ pruned background job #1` on stderr -- and `AgentRegistry::prune`
+/// removes the record, which is the one thing
+/// `take_unobserved_terminal_results` cannot see, so the exit guard could not
+/// surface it afterwards either. The result was simply gone.
+///
+/// The decision is to print, **then** prune -- not to refuse. So this pins
+/// BOTH halves, and the second half is what keeps the card from being "fixed"
+/// by turning it into a refusal:
+///
+/// 1. the result body reaches stderr, once, before the prune receipt, and
+/// 2. the record is really gone afterwards -- `/jobs` shows an empty deck.
+///
+/// Driven end to end rather than at a seam because the loss is a property of
+/// what the human sees on stderr, and stderr is the surface F67 is about.
+#[tokio::test]
+#[serial]
+async fn test_script_jobs_prune_prints_an_unviewed_result_before_discarding_the_record() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains(
+            "\"content\":\"background audit task\"",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "PRUNE_RESULT_SENTINEL"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The foreground turn is held open long enough for the detached agent to
+    // finish, so `/jobs prune 1` on the next script line meets a terminal
+    // record whose handoff is still `Ready`. A still-running agent would be
+    // refused with "still running", which is asserted against below rather
+    // than passing silently.
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(500))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "foreground complete"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "background-call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "spawn_agent_bg",
+                            "arguments": "{\"task\":\"background audit task\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("prune-unviewed.script");
+    fs::write(&script, "start detached work\n/jobs prune 1\n/jobs\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).arg("--no-stream");
+        cmd.args([
+            "--gateway",
+            "example",
+            "chat",
+            "--no-session",
+            "--allow-path",
+            &home_path.to_string_lossy(),
+            "--script",
+            &script_path,
+        ]);
+        cmd.output().unwrap()
+    })
+    .await
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "stderr: {stderr}\nstdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // The precondition, loudly: the prune really met a finished record. If the
+    // detached agent were still running the prune would have been refused and
+    // every assertion below would be about the wrong thing.
+    assert!(
+        !stderr.contains("is still running; stop it first"),
+        "the detached agent must be terminal when /jobs prune runs: {stderr}"
+    );
+
+    let pruned_at = stderr
+        .find("~ pruned background job #1")
+        .unwrap_or_else(|| panic!("the prune receipt is still printed: {stderr}"));
+    let result_at = stderr.find("PRUNE_RESULT_SENTINEL").unwrap_or_else(|| {
+        panic!(
+            "F67: /jobs prune must print the unviewed result instead of \
+             destroying it, as `agents --json` already keeps it: {stderr}"
+        )
+    });
+    assert!(
+        result_at < pruned_at,
+        "the result is printed, then the prune is reported: {stderr}"
+    );
+    // The header `print_background_results` already gives an unobserved
+    // result, measured rather than invented: the id and the task, with the
+    // body beneath it.
+    assert!(
+        stderr.contains("background job #1 result"),
+        "the printed result is headed the way the exit guard heads one: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("PRUNE_RESULT_SENTINEL").count(),
+        1,
+        "printed exactly once -- the prune prints it and the record is then \
+         gone, so shutdown cannot print it again: {stderr}"
+    );
+
+    // And the prune still happened. This is the half that fails if the card is
+    // "fixed" by refusing to prune an unviewed result (option three), which is
+    // the `x` key's answer and deliberately not this command's.
+    assert!(
+        stderr[pruned_at..].contains("no background agents"),
+        "the record is really gone: /jobs after the prune shows an empty \
+         deck, so printing did not become a refusal: {stderr}"
+    );
+    assert!(
+        stderr[pruned_at..].contains("0 total"),
+        "and the deck counts agree -- the row is gone, not merely unlisted: \
+         {stderr}"
+    );
+    server.verify().await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
@@ -21704,4 +21873,252 @@ fn test_tui_title_is_not_written_to_a_non_tty_stderr() {
          is unaffected by construction; stdout:\n{}",
         stdout.escape_debug()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Card F57-reach: reachability, made structural.
+//
+// **F57** measured the defect this sweep exists for: a `SLASH_COMMANDS` entry
+// with no dispatch arm, with all 824 binary and 245 CLI tests passing. The
+// guard F57 itself wanted was unwritable in-process, because `handle_slash` is
+// one `match` whose recognition *is* its execution — there is no stage, flag
+// or return value that says "recognised" without also running `/quit`,
+// `/clear` or `/fork`. So this sweep separates them the only honest way: it
+// runs the real dispatcher, once per command, in its own process and its own
+// temp HOME, and asks the only observable that defines unreachability — the
+// unknown-command fallback.
+//
+// And it reads the registry exactly once, for its subjects. The check is
+// against the binary's behaviour, never against the table again (F57's trap:
+// `closest_slash_command` reads `SLASH_COMMANDS`, so any registry-vs-registry
+// sweep passes vacuously).
+// ---------------------------------------------------------------------------
+
+/// Every registry entry, driven through the idle dispatcher; none of them may
+/// reach `unknown command: /<name>`.
+///
+/// Subjects are enumerated from `SLASH_COMMANDS` at runtime, through the
+/// `commands` array `/help` publishes in its JSONL payload — the registry is
+/// private to the binary, and this is its own account of itself. **No command
+/// name is typed in this test**, so a new entry becomes a subject the moment
+/// it is registered, and no curated list can fall behind the table (F124,
+/// F126, F131, F142) and no count can be wrong.
+///
+/// Covered: the top-level word of every entry, aliases included, since an
+/// alias is a first-class registry entry and dispatches through the same
+/// `match`. Deliberately **not** covered: arguments and subcommands (a
+/// subcommand that falls through refuses inside its own arm and never reaches
+/// this fallback), and *what* each arm does — this asks only whether anything
+/// is listening. The mid-turn half is
+/// `every_registered_command_typed_mid_turn_is_handled_or_queued_verbatim`
+/// in the binary's own suite.
+#[test]
+fn every_registered_slash_command_reaches_a_dispatch_arm() {
+    /// Run one single-line script and return stdout and stderr joined.
+    fn run_one_command(line: &str) -> String {
+        let home = TempDir::new().expect("temp home");
+        write_config(home.path(), "http://127.0.0.1:1");
+        let script = home.path().join("one-command.txt");
+        fs::write(&script, format!("{line}\n")).expect("write script");
+        let output = base_cmd(home.path())
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--gateway",
+                "example",
+                "--jsonl",
+                "chat",
+                "--script",
+                &script.to_string_lossy(),
+            ])
+            .output()
+            .unwrap_or_else(|error| panic!("run {line:?}: {error}"));
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    // Subjects, from the registry's own publication of itself.
+    let names: Vec<String> = run_one_command("/help")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|event| {
+            let result = event.get("result")?.clone();
+            (result["kind"] == "help").then(|| result["commands"].clone())
+        })
+        .expect("/help publishes its registry in the JSONL command result")
+        .as_array()
+        .expect("`commands` is an array")
+        .iter()
+        .map(|command| {
+            command["name"]
+                .as_str()
+                .expect("every registry entry has a name")
+                .to_string()
+        })
+        .collect();
+    assert!(
+        names.len() > 1,
+        "the registry must have supplied the subjects: {names:?}"
+    );
+
+    // The detector, proven in this very run: a word no entry can hold must
+    // reach the fallback. Derived from a registered name so that not even the
+    // sentinel is a typed command name.
+    let sentinel = format!("{}-is-not-a-registered-command", names[0]);
+    let probe = run_one_command(&format!("/{sentinel}"));
+    assert!(
+        probe.contains(&format!("unknown command: /{sentinel}")),
+        "NON-VACUOUS: an unregistered word still reaches the unknown-command \
+         fallback, so the absence asserted below is a real dispatch and not a \
+         harness that never looked; output:\n{probe}"
+    );
+
+    let mut undispatched: Vec<String> = Vec::new();
+    for name in &names {
+        let output = run_one_command(&format!("/{name}"));
+        if output.contains(&format!("unknown command: /{name}")) {
+            undispatched.push(name.clone());
+        }
+    }
+    assert!(
+        undispatched.is_empty(),
+        "registered but undispatched (F57): {undispatched:?} — each is in \
+         SLASH_COMMANDS with no arm in `handle_slash`, so typing it prints \
+         `unknown command` between turns and, mid-turn, banks it as a future \
+         prompt for the model. All {} registry entries were driven.",
+        names.len()
+    );
+}
+
+/// F51 byte contract: with tools enabled (`chat`'s default) a streamed prose answer
+/// must reach `--plain` stdout as exactly the answer plus one terminating
+/// newline — whether it is buffered to the end of the round or streamed
+/// fragment by fragment. This is the test that catches a fix which streams the
+/// fragments and then ALSO reprints the buffered text at the end of the round:
+/// the answer would appear twice.
+#[tokio::test]
+#[serial]
+async fn test_plain_streamed_answer_with_tools_enabled_is_printed_exactly_once() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"Here "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"is "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"the "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"answer."},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--plain", "chat", "stream me an ordinary answer"])
+            .output()
+            .expect("run a plain streamed chat")
+    })
+    .await
+    .expect("join the ask process");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    assert_eq!(
+        stdout, "Here is the answer.\n",
+        "the --plain byte contract for a streamed answer with tools offered"
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock gateway records requests");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(
+        body["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "F51's premise: this very round advertised tools: {body}"
+    );
+    server.verify().await;
+}
+
+/// F51's highest-risk case, and the realistic daily one:
+/// `test_text_protocol_ignores_prose`'s shape — prose, then a braced tail that
+/// could still have opened a text-protocol tool call, then more prose. The head
+/// is disqualified at once and streams; the `{` tail can only be released when
+/// the round ends. So this is the round where part of the text has streamed and
+/// part has not, and an end-of-round site that reprints the WHOLE buffered
+/// message instead of only the withheld tail duplicates the head. `print_message`
+/// writes straight to the process descriptor and bypasses the renderer's surface
+/// seam, so only a real `--plain` run can see that duplication.
+#[tokio::test]
+#[serial]
+async fn test_plain_stream_disqualified_midway_prints_each_part_exactly_once() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"Use a HashMap "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"{ key: value } "},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"for this."},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--plain", "chat", "answer with a brace in the middle"])
+            .output()
+            .expect("run a plain streamed chat")
+    })
+    .await
+    .expect("join the chat process");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    assert_eq!(
+        stdout, "Use a HashMap { key: value } for this.\n",
+        "a round disqualified midway must print its streamed head and its \
+         withheld tail exactly once each"
+    );
+    assert_eq!(
+        stdout.matches("Use a HashMap").count(),
+        1,
+        "the streamed head must not be reprinted with the buffered tail: {stdout:?}"
+    );
+    server.verify().await;
 }
