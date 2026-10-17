@@ -93,6 +93,29 @@ shapes may change in any minor release.
   permission, so a hook was told the state was `blocked` but given a nonsense
   reason.
 
+- **On Windows, kitsu now finds your home directory.** Seven code paths read
+  `HOME`, which Windows does not set, so config resolution and runtime state fell
+  back to a directory-relative `.kitsu`, `auth login` always refused, user skills
+  never resolved, and `~` expansion did nothing. Home is now `HOME`, then
+  `USERPROFILE`.
+- `fs_write_file` and `fs_edit_file` **refuse control bytes** other than tab,
+  newline and carriage return, naming the first offender. A model's JSON escape
+  such as `\u001b` used to decode into a real control byte and be written and
+  reported as a success.
+- A **truncated or brace-broken text-form tool call** is now caught and sent back
+  to the model for correction. It used to be committed as the final answer, with
+  the run reporting success while nothing executed.
+- A leading `~` in a path is expanded before the read and write checks, so a
+  model echoing a tilde-elided path back no longer fails every round. A refused
+  write whose parent directory is outside your grants now names the granted
+  roots, as a refused read already did.
+- Bedrock-based gateways no longer reject a turn after its first tool round: a
+  tool called with no arguments is replayed as `{}`, and a final round that
+  offers no tools replays the earlier tool history as text.
+- In Ask mode the model is told that access outside your granted roots opens a
+  permission prompt, so it attempts the edit instead of telling you to restart
+  with `--allow-read-write`.
+
 ### Added
 
 - A `git` tool available by default in interactive chat, backed by exact
@@ -182,6 +205,24 @@ shapes may change in any minor release.
   conversation, so kitsu's own diagnostics and an answer buffered because tools
   were offered that round are absent from it. `/export` remains the route to the
   full conversation.
+- **`--gateway local` finds a local server by itself.** With no
+  `[gateways.local]` profile it probes Ollama (11434), LM Studio (1234),
+  llama.cpp (8080) and vLLM (8000) and uses the first whose `/v1/models` lists a
+  model. A configured `[gateways.local]` still wins.
+- `--gateway remote` resolves to your `default_gateway`. Without `--gateway`,
+  `--model` routes to the detected local server when it lists that model, exactly
+  or as a unique case-insensitive substring (`--model glm` →
+  `glm-4.7-flash:q4_K_M`), and says so on stderr. An ambiguous substring fails
+  naming the matches.
+- **A container image** is published with each release:
+  `ghcr.io/kateintheloop/kitsu`, tagged with the version and `latest`, for amd64
+  and arm64. It is built from the same static binaries as the tarballs, on a
+  distroless non-root base.
+- `fs_read_file` on a **binary file** returns a bounded offset/hex/ASCII preview
+  of its first 512 bytes instead of an error.
+- A request the gateway rejects (HTTP 400 or 422) now shows **the gateway's own
+  reason**, bounded, with URLs elided and anything credential-like withheld.
+
 #### Background agents that can ask
 
 - `[agents] blocking = "ask"` lets a background agent **park** when one of its
