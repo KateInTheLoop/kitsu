@@ -42,7 +42,7 @@ Diff rendering keeps conventional green/red/cyan.
 |-------|---------------------|----------------------------|-----------|
 | `◆`   | `GLYPH_TOOL_CALL`   | tool call (FOX)            | `tool>` prefix (`*` in free text) |
 | `◇`   | `GLYPH_TOOL_RESULT` | tool result (dim; EMBER on error) | `result>` prefix (`>`) |
-| `◉`   | `GLYPH_APPROVAL`    | permission/approval prompt | `permission>` prefix (`o`) |
+| `◉`   | `GLYPH_APPROVAL`    | **a permission request, in both places one appears**: the `◉ permission — …` prompt and receipt, **and** the deck / agent-view row of an agent blocked waiting for one (`DeckState::Blocked`) | **two** plain forms, because they come from different tables: `permission>` prefix (`o`) for the prompt, **`[blk]`** for the row (`plain_marker`) |
 | `◈`   | `GLYPH_RECEIPT`     | receipts/section marker    | `#` |
 | `⛩`   | `GLYPH_TORII`       | session-boundary milestone | `*` |
 | `🦊`  | banner title        | identity (banner only)     | absent (one-line banner) |
@@ -50,6 +50,23 @@ Diff rendering keeps conventional green/red/cyan.
 
 Torii milestones mark the session passing a gate — compaction, `/new`,
 `/resume`, checkpoint `/undo` — one line per event, never in tool receipts.
+
+
+**One glyph, two surfaces, two plain forms (recorded in T4-S10).** `◉` was listed
+here with one meaning and one plain form while the code gave it two. The reuse is
+deliberate and the code says so — the state-marker table's comment reads *"`◉` is
+`GLYPH_APPROVAL`, already the permission glyph"* — but the **plain** forms are
+produced by **different functions**, so a reader of this table who assumed
+`--plain` renders `permission>` in an agent-view row would be wrong. `--plain` is
+a byte contract, so that mattered.
+
+**The keys surface introduces no glyph at all.** The help overlay is a title row
+plus one `  {label:<6} {what}` row per binding, ASCII throughout, and
+`/help keys` prints the same rows. The agent view's only glyphs are
+`deck_marker`'s four state markers (`◆` running, `◉` blocked, `◈` result ready,
+`◇` failed or stopped) and **`*` for the selected row** — which deliberately
+reuses `kitsu_render`'s profile-list mark rather than inventing one, the same
+rule that closed **F34**'s duplicate marker table.
 
 ## Key surfaces
 
@@ -381,6 +398,21 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   groups omitted. Those headings bypass `deck_header`, so they are pure ASCII
   in every tier; both views build their counts from one shared expression and
   their rows from one shared helper, so they cannot drift. `/jobs explain <id>`
+  **The deck's marker vocabulary, one source for every agent surface** (the
+  marker story, closing F34/F3): `deck_marker` maps each state to a glyph in the
+  styled and colourless tiers and to a **bracketed ASCII token** under
+  `--plain` — `◉`/`[blk]` **blocked**, `◆`/`[run]` working, `◈`/`[rdy]` done with
+  a result waiting, `◇`/`[err]` failed, `◇`/`[stp]` stopped. `--plain` is
+  checked **first**, so a glyph never reaches the structural-marker mapping;
+  that is what makes sharing `◈` with a section header safe, since a plain row
+  can never read as `#`. A blocked agent had shared the working glyph until that
+  story; it now has its own in all four of `/jobs list`, `/jobs view`,
+  `/jobs show` and `/jobs explain`, because those are the only places that map a
+  phase to a deck state and all four were changed together. Adding a sixth state
+  means adding a glyph, a colour **and** a plain token, and a test asserts the
+  plain tokens of the shipped five are byte-stable.
+
+  `/jobs explain <id>`
   renders one agent as a `deck_marker` header `agent #N explained | <phase>`
   followed by `  <label>: <value>` lines in a fixed order — `since`,
   `waiting on`, `because`, `last activity`, `steering`, `handoff` — each

@@ -1951,6 +1951,11 @@ pub fn compaction_boundary() {
 pub enum DeckState {
     /// Working right now.
     Running,
+    /// Parked on a user answer: a pending permission, in effect, and the one
+    /// row on the surface that needs the user. `◉` is the permission glyph the
+    /// approval header already uses, so the vocabulary is shared rather than
+    /// extended.
+    Blocked,
     /// Finished; its result has not been collected yet.
     ResultReady,
     /// Finished by failing.
@@ -1963,6 +1968,7 @@ impl DeckState {
     fn glyph(self) -> &'static str {
         match self {
             Self::Running => GLYPH_TOOL_CALL,
+            Self::Blocked => GLYPH_APPROVAL,
             Self::ResultReady => GLYPH_RECEIPT,
             Self::Failed | Self::Stopped => GLYPH_TOOL_RESULT,
         }
@@ -1971,6 +1977,10 @@ impl DeckState {
     fn color(self) -> (u8, u8, u8) {
         match self {
             Self::Running | Self::ResultReady => theme().accent,
+            // Cream is the palette's "look here" slot, and the only one not
+            // already spoken for. Reusing the accent would have left blocked
+            // colour-identical to running, curing only half of F34.
+            Self::Blocked => theme().highlight,
             Self::Failed => theme().error,
             Self::Stopped => theme().warn,
         }
@@ -1980,6 +1990,7 @@ impl DeckState {
     fn plain_marker(self) -> &'static str {
         match self {
             Self::Running => "[run]",
+            Self::Blocked => "[blk]",
             Self::ResultReady => "[rdy]",
             Self::Failed => "[err]",
             Self::Stopped => "[stp]",
@@ -2003,6 +2014,109 @@ fn deck_header_with_mode(summary: &str, styled: bool, plain: bool) -> String {
         format!("{}", line.truecolor(r, g, b).bold())
     } else {
         line
+    }
+}
+
+/// The agent view's state taxonomy (requirement **A2**), and the **one** place
+/// its order is defined.
+///
+/// `DeckState` above is a *glyph* vocabulary: four fill levels. A2 needs six
+/// groups, because it splits a finished agent by whether its result has been
+/// observed and it separates a failure from a cancellation. The two are
+/// deliberately different types — a glyph is not a group — but they live in
+/// the same module so the refinement is visible in one file.
+///
+/// **Why `kitsu-render` and not `kitsu-tui`.** The order has two consumers:
+/// `kitsu-tui`'s agent-view overlay and the binary's `/jobs view` text deck.
+/// `kitsu-tui` cannot depend on `kitsu` (`kitsu` is a binary-only crate, F5),
+/// and `kitsu-render` is the only crate both already depend on. Forking the
+/// order into a second array is the F2/F38/F45/F57 failure family; the
+/// `jobs_view_group` anti-fork test in `tui_bridge.rs` pins that it has not.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AgentViewState {
+    /// Parked on a user answer: `AgentThreadPhase::Blocked`.
+    NeedsInput,
+    /// Working right now: `AgentThreadPhase::Running`.
+    Working,
+    /// Finished, and its handoff is still `Ready` — nobody has looked.
+    DoneUnviewed,
+    /// Finished, and its handoff is `Acknowledged` (or `Unavailable`, so there
+    /// is nothing left to observe).
+    DoneViewed,
+    Failed,
+    Cancelled,
+}
+
+impl AgentViewState {
+    /// A2's six groups in A2's order. The single source; nothing else may
+    /// hard-code a second ordering.
+    pub fn order() -> [AgentViewState; 6] {
+        [
+            Self::NeedsInput,
+            Self::Working,
+            Self::DoneUnviewed,
+            Self::DoneViewed,
+            Self::Failed,
+            Self::Cancelled,
+        ]
+    }
+
+    /// This state's index in [`AgentViewState::order`].
+    ///
+    /// Read *out of* [`AgentViewState::order`] rather than written out a
+    /// second time: a rank that restated the sequence could drift from it,
+    /// which is the whole failure this type exists to prevent.
+    pub fn rank(self) -> usize {
+        Self::order()
+            .into_iter()
+            .position(|state| state == self)
+            .expect("`order` lists every AgentViewState")
+    }
+
+    /// The group heading the agent view prints, in A2's own words.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NeedsInput => "needs input",
+            Self::Working => "working",
+            Self::DoneUnviewed => "done (unviewed)",
+            Self::DoneViewed => "done (viewed)",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// The machine spelling the `s:` filter term accepts (A3).
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::NeedsInput => "needs-input",
+            Self::Working => "working",
+            Self::DoneUnviewed => "done-unviewed",
+            Self::DoneViewed => "done-viewed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// This state's deck marker state — the **one** bridge from A2's six
+    /// groups to the deck's glyph vocabulary, so the agent-view overlay cannot
+    /// invent a second marker table (the F2/F38/F45/F57 drift family).
+    pub fn deck_state(self) -> DeckState {
+        match self {
+            Self::NeedsInput => DeckState::Blocked,
+            Self::Working => DeckState::Running,
+            Self::DoneUnviewed => DeckState::ResultReady,
+            Self::DoneViewed | Self::Cancelled => DeckState::Stopped,
+            Self::Failed => DeckState::Failed,
+        }
+    }
+
+    /// Parse an `s:` filter value. `None` for a word that is not one of the
+    /// six [`AgentViewState::wire`] spellings.
+    ///
+    /// The accepted vocabulary is read back off [`AgentViewState::wire`], so a
+    /// renamed spelling cannot be accepted here under its old name.
+    pub fn from_wire(word: &str) -> Option<AgentViewState> {
+        Self::order().into_iter().find(|state| state.wire() == word)
     }
 }
 
@@ -2469,8 +2583,8 @@ mod tests {
         milestone_line_with_mode, sanitize_plain_inline, sanitize_terminal_inline,
         sanitize_terminal_text, section_heading, spinner_mode, static_spinner_line, theme_row,
         tool_activity_line, write_run_timing_with_mode, write_static_spinner, write_turn_stats,
-        write_turn_stats_with_mode, AsyncNoticeLevel, DeckState, HumanRunReceipt, LineStyler,
-        PromptSafeAsyncNotice, RenderMode, RunTimingStatus, SpinnerMode, StreamBuffer,
+        write_turn_stats_with_mode, AgentViewState, AsyncNoticeLevel, DeckState, HumanRunReceipt,
+        LineStyler, PromptSafeAsyncNotice, RenderMode, RunTimingStatus, SpinnerMode, StreamBuffer,
         TerminalTextSanitizer, AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES, SPINNER_VERBS, THEMES,
     };
 
@@ -3516,6 +3630,174 @@ mod tests {
         assert!(!plain_header.contains('\u{1b}'));
     }
 
+    /// **F34.** A blocked agent is the one row on this surface the user has to
+    /// act on, so its marker may not be the busy marker. `deck_marker_with_mode`
+    /// branches on *both* `styled` and `plain`, so all three tiers are pinned
+    /// here: a test that checked only the styled path would leave two thirds of
+    /// the marker unpinned.
+    ///
+    /// `◉` is `GLYPH_APPROVAL`, already the permission glyph
+    /// (`approval_header`), and already the glyph
+    /// `docs/tui-and-agent-view-design.md` §4.4 nominates for a blocked row.
+    /// Blocked is the only state left that is neither accent (live), ember
+    /// (failed) nor amber (stopped), and `highlight`/cream is the palette's
+    /// "look here" slot.
+    #[test]
+    fn the_blocked_deck_marker_differs_from_running_in_all_three_tiers() {
+        // Styled TTY.
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Blocked, true, false),
+            format!("{}◉\u{1b}[39m", sgr(CREAM))
+        );
+        // Non-TTY: glyph without colour.
+        assert_eq!(deck_marker_with_mode(DeckState::Blocked, false, false), "◉");
+        // `--plain`/`NO_COLOR`: stable ASCII, zero escape bytes.
+        let plain = deck_marker_with_mode(DeckState::Blocked, true, true);
+        assert_eq!(plain, "[blk]");
+        assert!(!plain.contains('\u{1b}'));
+
+        // The point of the state: in every tier it differs from `Running`.
+        // Asserted per tier rather than once, so a glyph that changed only in
+        // the styled path could not satisfy this.
+        for (styled, plain) in [(true, false), (false, false), (true, true)] {
+            assert_ne!(
+                deck_marker_with_mode(DeckState::Blocked, styled, plain),
+                deck_marker_with_mode(DeckState::Running, styled, plain),
+                "blocked renders as running (styled={styled}, plain={plain})"
+            );
+        }
+
+        // Non-vacuity: the five markers are five distinct strings in each
+        // tier, so `assert_ne!` above is not passing on an accident shared
+        // with some other state.
+        let states = [
+            DeckState::Running,
+            DeckState::Blocked,
+            DeckState::ResultReady,
+            DeckState::Failed,
+            DeckState::Stopped,
+        ];
+        for (styled, plain, expected_distinct) in
+            [(true, false, 5), (false, false, 4), (true, true, 5)]
+        {
+            let rendered = states
+                .iter()
+                .map(|state| deck_marker_with_mode(*state, styled, plain))
+                .collect::<std::collections::BTreeSet<String>>();
+            // Non-TTY collapses `Failed`/`Stopped` onto `◇` — they are
+            // distinguished by colour, which that tier has none of. That
+            // pre-existing collision is unchanged, and `Blocked` is not part
+            // of it.
+            assert_eq!(
+                rendered.len(),
+                expected_distinct,
+                "styled={styled}, plain={plain}: {rendered:?}"
+            );
+        }
+    }
+
+    /// **Plain-mode byte contract.** `--plain` output is promised stable, so
+    /// the four shipped plain markers are pinned here *as bytes* beside the new
+    /// one. `[blk]` is additive: every existing state keeps the exact marker it
+    /// shipped with.
+    #[test]
+    fn the_blocked_plain_marker_is_additive_and_moves_no_shipped_marker() {
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Running, true, true),
+            "[run]"
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::ResultReady, true, true),
+            "[rdy]"
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Failed, true, true),
+            "[err]"
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Stopped, true, true),
+            "[stp]"
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Blocked, true, true),
+            "[blk]"
+        );
+    }
+
+    /// **F3, decided.** The agent-view overlay and the `/jobs` deck render the
+    /// *same* marker vocabulary, and they do it by calling the *same* function:
+    /// `AgentViewState::deck_state` is the only bridge between A2's six groups
+    /// and the deck's five glyphs. Two glyph tables for one dataset is the
+    /// F2/F38/F45/F57 drift family that `AgentViewState` itself exists to
+    /// prevent.
+    ///
+    /// §4.4 forbade `◈`/`◆`/`◇` as row glyphs for one stated reason — "so plain
+    /// mode never renders a row as `tool>` or `result>`", i.e. the glyphs'
+    /// `ascii_structural_markers` images (`*`, `>`, `#`) are ambiguous. The
+    /// deck's markers never reach that mapping: `plain_marker` substitutes a
+    /// bracketed token first. The reason is therefore already satisfied, which
+    /// is why §4.4 is amended rather than the vocabulary forked. The second
+    /// half of this test is that amendment's evidence.
+    #[test]
+    fn every_agent_view_state_shares_the_deck_marker_vocabulary() {
+        let expected = [
+            (AgentViewState::NeedsInput, DeckState::Blocked),
+            (AgentViewState::Working, DeckState::Running),
+            (AgentViewState::DoneUnviewed, DeckState::ResultReady),
+            (AgentViewState::DoneViewed, DeckState::Stopped),
+            (AgentViewState::Failed, DeckState::Failed),
+            (AgentViewState::Cancelled, DeckState::Stopped),
+        ];
+        // Read against `order()` so a seventh state cannot be added without
+        // being given a marker here.
+        assert_eq!(
+            expected.map(|(state, _)| state).to_vec(),
+            AgentViewState::order().to_vec()
+        );
+        for (state, deck) in expected {
+            assert_eq!(state.deck_state(), deck, "{state:?}");
+        }
+
+        // §4.4's amendment, stated as bytes. The overlay deliberately *shares*
+        // `◈` with the section header in the glyph tiers — the deck has shipped
+        // that collision since D1 and disambiguates structurally (a header is
+        // unindented and wordy; a row is indented and starts `#<id>`).
+        assert_eq!(
+            deck_marker_with_mode(AgentViewState::DoneUnviewed.deck_state(), false, false),
+            "◈"
+        );
+        assert_eq!(
+            deck_header_with_mode("agent deck", false, false),
+            "◈ agent deck"
+        );
+
+        // In plain mode the two are unambiguous, which is what §4.4's reason
+        // actually asked for: the header is `# …` and every row marker is a
+        // bracketed token that contains no structural character at all.
+        assert_eq!(
+            deck_header_with_mode("agent deck", false, true),
+            "# agent deck"
+        );
+        for state in AgentViewState::order() {
+            let marker = deck_marker_with_mode(state.deck_state(), true, true);
+            assert_eq!(
+                marker,
+                format!("[{}]", &marker[1..marker.len() - 1]),
+                "{state:?}: a plain row marker is a bracketed token"
+            );
+            // Non-vacuous: `#`, `*` and `>` are exactly the images the three
+            // banned glyphs have under `ascii_structural_markers`, and the one
+            // a header actually prints is `#`.
+            for structural in ['#', '*', '>'] {
+                assert!(
+                    !marker.contains(structural),
+                    "{state:?}: plain marker {marker:?} collides with {structural:?}"
+                );
+            }
+        }
+        assert_eq!(sanitize_plain_inline("◈ ◆ ◇"), "# * >");
+    }
+
     #[test]
     fn theme_row_renders_styled_with_palette_swatch() {
         let kitsune_theme = &THEMES[0]; // kitsune theme
@@ -3768,6 +4050,7 @@ mod tests {
         }
     }
 }
+
 
 
 

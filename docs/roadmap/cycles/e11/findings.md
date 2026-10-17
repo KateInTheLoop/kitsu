@@ -3297,3 +3297,845 @@ one would have been read as passing because adjacent tests with similar names
 do. The lesson is the same one F57 produced from the other direction: **a gate
 is only as real as the test that implements it, and "there is a test about
 this area" is not that test.**
+
+## F61 — F58's second instance: a test unsatisfiable because it contradicted an invariant pinned elsewhere
+
+**F58** recorded an assertion that could never pass, satisfied by changing the
+product. T4-S1 produced the same family in a sharper form, and this time the
+implementer **stopped** instead of resolving it.
+
+The test tabulated all **fifteen** `(phase, handoff)` pairs and, for each,
+asserted both the classifier's answer *and* that a fixture DTO for that pair
+**validates**. But `AgentThreadSnapshotDto::validate` requires
+`terminal == timeline.closed`, a handoff **iff** terminal, and no open steering
+once terminal — so only **eight** of the fifteen are representable at all. And
+an existing, green test, `validate_treats_blocked_as_non_terminal`, pins exactly
+that: *"a blocked thread has no handoff"*.
+
+**So the new test and an existing test made contradictory demands of the same
+function**, and the existing one was in the must-stay-green set. No
+implementation could satisfy both. The implementer diagnosed it precisely,
+named the conflicting test, said the fix belonged in the test rather than the
+invariant, and **stopped** — which is the behaviour the brief asks for and the
+reason this cost one review instead of a loosened invariant.
+
+### The fix, and why it is narrower than shrinking the table
+
+Two different properties were tangled in one loop:
+
+- **the classifier is a total function over two enums**, and asserting all
+  fifteen is *correct* — defensive totality is cheap and right;
+- **the DTO forbids seven of them**, so a fixture cannot be valid for those.
+
+So the classifier assertions stayed at fifteen and only the **fixture validity
+and row mapping** were confined to the eight representable pairs, with the count
+asserted (`checked_dtos == 8`) so the guard cannot silently skip everything, and
+a second assertion that those eight still reach **all six** A2 groups — through
+a DTO the validator accepts, not merely through the classifier.
+
+**The fixture was also wrong independently**: it hard-coded `steering_open: true`
+and `closed: false`, so it was only a valid DTO for non-terminal phases. It now
+derives both from the phase. That is the deeper bug — a fixture that cannot
+represent the states its own test enumerates.
+
+### The lesson, beyond this instance
+
+**An unsatisfiable test has two sources, and the second is worse.** F58's was a
+mental model of the output. This one is a **conflict between two
+specifications**: a new test asserting what an older test forbids. The first is
+caught by deriving expectations from real samples. The second is only caught by
+noticing that the invariant is *already pinned somewhere* — which is why
+"stop and report" must stay available to an implementer, and why forbidding test
+edits is what made the conflict visible instead of silently resolved in the
+product.
+
+The arithmetic also deserves a note: the first estimate of representable pairs
+was **eleven**, by counting only the non-terminal-with-handoff cases and missing
+terminal-without-handoff. The real count is **eight**. A guard built on the wrong
+number would have skipped nothing and still failed; the count assertion is what
+makes the number checkable rather than assumed.
+
+
+## F34 and F3 CLOSED — the blocked marker, and one vocabulary for both surfaces
+
+Both closed in the marker story, taken between T4-S1 and T4-S2 because the gap
+had to shut **before** the agent-view overlay rendered rows or the overlay would
+ship it too.
+
+**F34 — a blocked agent no longer looks like a busy one.** `DeckState::Blocked`
+exists, with `◉` in the styled tier (the approval glyph, which §4.4 itself had
+nominated, and apt because a blocked agent **is** a pending approval), cream in
+colour (the "look here" slot — reusing the accent would have left blocked
+*colour-identical* to running and cured only half the finding), and `[blk]`
+under `--plain`.
+
+**F3 — one vocabulary, and §4.4 amended rather than obeyed.** The design banned
+`◆`/`◇`/`◈` as row glyphs so a plain row could never read as `tool>` or
+`result>`. The implementer read that reason before agreeing it should change,
+and found the ban was **the wrong instrument**: `deck_marker` checks `plain`
+**first** and returns a bracketed token, so a row glyph never reaches
+`ascii_structural_markers`. The hazard is prevented structurally; the
+prohibition was redundant — and the shipped deck had already broken it, using
+`◈` for result-ready rows since D1. The view now reaches the deck's vocabulary
+through `AgentViewState::deck_state()`: **one function, not two tables that
+agree today.**
+
+### The finding's own scope was wrong, and that is the lesson
+
+F34 said *"the only test that changes is T2-S3's"*. The test author **counted
+and found four**: two further production sites mapped blocked to running
+independently — `format_agent_thread` and `format_agent_explain` — each pinned
+by an existing test that strips the running marker off the output.
+
+Closing only the deck path would have moved the defect rather than fixed it:
+`/jobs list` and `/jobs view` showing `◉` while `/jobs show` and `/jobs explain`
+still showed `◆`. **Inconsistency across subcommands is worse than a uniform
+uninformative marker**, because it teaches a user to distrust the glyph
+everywhere. The authorisation was extended to all four tests; each pinned the
+**deferral**, not a behaviour.
+
+Verified after the fact: **zero** remaining blocked-to-running mappings, and all
+four sites return `Blocked`.
+
+**A trap worth remembering**, flagged in advance and then hit: those explain
+tests assert the body `is_ascii()` **after** stripping the marker. `◉` is
+non-ASCII, so it satisfies that assertion *only because it is stripped* —
+changing the enum without the `strip_prefix` fails the test on an ASCII
+assertion that looks entirely unrelated to the change.
+
+**Plain-mode bytes:** `[blk]` is added and **no shipped marker moved** —
+pinned by a dedicated test so a sixth state cannot renumber the five.
+
+**Loose end:** F34's text names the old test by its pre-rename name
+(`the_blocked_deck_row_is_marked_live_and_reads_blocked`), which no longer
+exists; the rename was correct, since "marked_live" was the claim being
+retracted. Anyone following that reference should look for
+`the_blocked_deck_row_is_marked_blocked_and_reads_blocked`.
+
+## F62 — `[tui] alternate_screen` is the last key without a consumer, and the overlay bypasses it
+
+T4-S2's overlay takes the **alternate screen unconditionally**. So
+`[tui] alternate_screen = never` — a documented, parsed, validated value — has
+no effect on the one surface it was introduced for.
+
+**Why it happened, and why I accepted it.** The alternate screen is what makes
+the close assertion true *by construction*: the transcript stays on the primary
+screen, so the restore is the terminal's own and the closed screen equals the
+pre-open screen row for row, while the open screen necessarily differs. An
+in-viewport overlay would have to repaint the region itself, and its restore
+would come from **the cell ring** — which is not fed in production (**N4**,
+**F52**) and carries a documented limitation list. So the `never` path depends
+on a reader that does not exist yet.
+
+**The honest status**, rather than calling the key done: of the six `[tui]`
+keys, `mode` (T3-S2), `prefix` and `left_arrow_opens_agents` (this card) have
+consumers; `cell_ring_lines` has a ring that nothing reads until R6; `title` and
+`alternate_screen` have none. Three cards have now bound keys "so they are not
+silently unreachable" and left them inert — a pattern worth watching, because a
+validated key that changes nothing is indistinguishable from a broken one from
+the user's side.
+
+**What closing it needs:** an in-viewport overlay path, which wants the ring fed
+(R6) so the restore has a source. That makes it T5 work, not a small follow-up.
+Until then the design says plainly that the `never` path is unexercised.
+
+## F63 — three T4-S2 behaviours the requirement did not specify, decided and recorded
+
+A1 specified *that* `←` opens the view on a second press. It did not say what
+**disarms** the first press, what happens to a `←` **inside a paste**, or what a
+**malformed `[tui] prefix`** does. All three are user-visible and all three were
+decided in T4-S2:
+
+1. **Any keystroke other than `←` disarms.** The alternative — arming until the
+   view opens — makes a keystroke's meaning depend on something the user did
+   minutes ago and can no longer see. Typing and deleting back to empty requires
+   two presses again.
+2. **A `←` or a prefix byte inside bracketed-paste content is content.** The
+   byte filter tracks the paste delimiters for exactly this reason, and holds a
+   sequence split across two reads so the editor sees the same stream either
+   way. Without that, pasting text containing the chord byte would open the
+   overlay mid-paste.
+3. **An unrecognisable prefix spelling yields no chord route at all**, rather
+   than falling back to the default. A silent rebinding to a chord the user did
+   not ask for is worse than a chord that does nothing, because the user cannot
+   tell the config was rejected.
+
+Recorded because each is the kind of decision that gets re-litigated by the next
+person to touch the reader, and because the *reasons* are the durable part — the
+behaviours are easy to re-derive once the reasoning is written down.
+
+## F64 — I have now propagated an unverified mechanism into a brief twice, and an agent caught it both times
+
+**F43** recorded the first instance: I wrote that a cancelled approval was "recorded as timed out", taking the mechanism from an implementer's report without tracing the path. The agent I briefed read the code, found cancellation never reaches that path at all, and said so instead of building what I asked for.
+
+**T4-S3 is the second, and the shape is identical.** The plan row's acceptance says *"unviewed failed agent still refuses"* and I repeated it in the brief as "the guard refuses to quit while a finished agent's result is unobserved". **Verified false:** the only refusal on the quit path counts `Running | Blocked` agents, so a finished-but-unviewed agent does **not** block `/quit`. What protects an unobserved result is **surfacing** — the loop prints `~ surfaced N previously unopened background result(s) before exit` on the way out.
+
+The agent **stopped rather than writing the test**, because a test asserting `/quit` refuses would have contradicted the quit path and the exit tests that pass today — an **F61**-shaped conflict, recognised as one.
+
+### Why the error is easy to make here, which is the useful part
+
+**The codebase itself calls this "the exit guard on unviewed results".** A doc comment on `agent_explain_view` says `/jobs explain` "never calls `result`, which acknowledges too, so diagnosing an agent cannot take custody of its result and defeat the exit guard on unviewed results." So the **name** is accurate and long-established; only the **mechanism** differs from what the name suggests. "Guard" implies refusal; this one surfaces.
+
+That is a better explanation than carelessness, and it generalises: **a well-named mechanism invites you to assume its implementation.** The name was right, the inference from the name was wrong, and nothing in the row or the doc comment would have corrected it.
+
+### The rule, now with two instances
+
+**A mechanism named in a plan row, a requirement, or another agent's report is a hypothesis until someone reads the path** — and that applies to *my* briefs, which are the specification an implementer builds to. Both times the cost was one review round because the agent stopped; the counterfactual is a product change built to a false premise, which is what F58 and F61 are about.
+
+Practically: when a brief asserts how something behaves, it should either cite the line that shows it or mark the claim as needing verification. This epic's briefs now routinely say "verified by me" against specific line numbers; the two failures are both places where I did not.
+
+**The plan row's acceptance needs amending** from "an unviewed failed agent still refuses" to "an unviewed failed result is still surfaced at exit, and a peeked one is not" — or the quit path changes, which would be a different card with its own requirement.
+
+## F65 — an arrow key is not one byte, and the overlay's close key ate the first one
+
+**Found by a test, not asserted from a brief**, which is the part worth keeping.
+
+T4-S4's PTY test pressed `↓` in the agent view and failed with *"`↓` is move, not an exit"*, dumping the pre-open banner. Cause: the overlay's byte loop matched `0x1b` as **close**, and an arrow key is **`ESC [ B`** — three bytes. So the first arrow **closed the view and fed `[B` into the composer underneath.** The view had been shipped (T4-S2) and peeked in (T4-S3) without this surfacing, because every key either card used is a single byte.
+
+**This is the mirror image of T4-S2's trap.** There, at the idle composer, a lone `ESC` stays *pending* in the editor's escape state machine until the next byte, which is then consumed as part of the sequence — so `Esc` then `/quit\r` submits `quit` as a prompt. Same ambiguity, opposite failure: the editor waits where the overlay acted.
+
+**The fix has to carry state across reads**, because a read can split a sequence: a pending-state decoder (`None`/`Escape`/`Csi`/`Ss3`), with `ESC` alone never acting, `[`/`O` opening a sequence consumed to its final byte, and a **50 ms grace** resolving a lone `ESC` as the `Esc` key when no byte follows — matching the editor collector's own poll tick. The `poll` retries on `EINTR`, so **a SIGWINCH arriving during an arrow is not read as a close**. Non-key bytes are dropped rather than forwarded, so no `[B` can reach the composer.
+
+**The lesson for the remaining key cards (T4-S4b, T4-S5…):** every multi-byte key is a latent version of this, and single-byte keys will not reveal it. A card that adds a key should ask what else starts with the same byte.
+
+## F66 — the agent-name limit is a renderer constant, and that is deliberate
+
+`AgentRegistry::NAME_MAX_CHARS` is defined as `kitsu_tui::agents_view::AgentRow::TASK_HEAD_CHARS` (48), with the rationale stated where it is defined: *a name stands in for the task head on A2's row, so the budget is the head's.* The dependency direction is legal (`kitsu` → `kitsu-tui`), and the reasoning is sound — a name that fits the row and a task head that fits it are the same width.
+
+**Recorded because it has a consequence a later reader should see coming:** a **validation** bound is now a **display** constant, so changing the row's head width silently changes **what names are legal**, and the `TooLong { max }` message reports a number that came from a renderer. Names stored before a narrowing stay stored and render truncated by the normal width fitting — they do not break — but they can no longer be re-entered as typed.
+
+Not changed, because the coupling is intentional and documented, and splitting it would need a reason this card does not have. The note is here so that a future row-width change is recognised as a **product change to name validation**, not a layout tweak.
+
+## F67 — pruning destroys an unviewed result, and the exit guard cannot know
+
+**Read, not taken from a report** (F43/F64 discipline — the mechanism was handed to me by an agent and I traced it):
+
+- `AgentRegistry::prune` does `agents.remove(&id)` once the record is non-terminal-free.
+- `take_unobserved_terminal_results` iterates `self.agents`, so **a removed record is invisible to it**.
+- Therefore pruning a finished agent whose handoff is still `Ready` **discards its result and the exit guard never mentions it** — there is nothing left to surface.
+
+**The nuance that keeps this from being a plain bug, and which the first telling of it missed.** The two prune surfaces differ:
+
+- **`kitsu agents --json` / automation** gets `terminal_job_payload(&status)` in the response, so the result **survives** in the reply.
+- **An interactive human** gets only `~ pruned background job #{id}` on stderr. The result is **gone**, unprinted.
+
+So the loss is **interactive-only**, and `/jobs prune <id>` is an explicit command naming a specific id — a user who types it has arguably asked for exactly this. That is why this is recorded as a **product question**, not filed as a defect.
+
+### What is clearly right, and is pinned
+
+**The `x` key must not inherit the behaviour**, because the second press of an arming is *not* an explicit id. T4-S4b therefore refuses to prune a terminal agent whose result is still unviewed, reports that the result is waiting, and prunes on the identical press once `Space` or `p` has collected it. **This asymmetry is the finding's practical content: the same registry call is safe behind a typed id and unsafe behind a keystroke.**
+
+### The open question for `/jobs prune`
+
+Three options, none taken here: leave it (explicit command, automation keeps the payload); **print the result before discarding it** (cheapest, and makes the interactive path match the JSON one); or refuse unless `--force`, matching the key. My own lean is the second — it costs one line, loses nothing, and removes the only path by which a result silently disappears — but it changes the output of an existing command, so it is a decision rather than a fix, and `--plain`'s byte contract makes any output change a breaking one.
+
+## F68 — REJECTED: a pasted correction executes the rest of itself as overlay keys
+
+**T4-S4b-i was rejected on review for this.** Found by reading the loop, not by a test, and not claimed from a report — the path is quoted below.
+
+The overlay reads raw bytes and processes a whole chunk at once:
+
+```rust
+let count = match stdin.read(&mut buffer) { … };
+for key in decode_overlay_keys(&buffer[..count], &mut pending) { … }
+```
+
+**The overlay does not enable bracketed paste** — that is a rustyline setting, and the overlay does not run rustyline. So a paste is indistinguishable from typing, and every byte of it is a key.
+
+Paste `fix the bug\nand retry` into the new steer or rename line and: the first line fills the draft, the `\n` **submits** it and closes the prompt, and the remaining bytes of **the same chunk** are then executed as overlay keys — `a`, `n` (which opens the rename prompt), `d`, ` `, `r`, … 
+
+### Why this is a rejection and not a note
+
+Before this card the overlay bound `↑`/`↓`, `Space`, `?` and `Esc`; a stray paste could scroll or peek, which is harmless. This card bound keys with **effects**:
+
+- **`r` then `y` answers a pending permission.** A pasted correction containing the letters `r` and `y` in sequence can **approve a filesystem write** on a blocked agent.
+- **`x` twice stops an agent**, and on a terminal one prunes it.
+
+So the card turns pasted text into privileged actions. That is a different severity class from anything the overlay did before, and it is **introduced by this card**, not pre-existing.
+
+### What makes it a clean fix rather than a redesign
+
+**This is exactly what `kitsu-editor` already solves** — it handles bracketed paste, split UTF-8 and the `ESC` ambiguity, and documents that a paste never submits. T4-S4b-ii was already scoped to route `s` through it. The hazard exists because this card bound text prompts to a **naive** line of its own instead, to satisfy the help test's "an advertised key must be bound" rule.
+
+Two defensible resolutions, for the rework to choose with evidence:
+1. **Guard the chunk** — once a prompt submits or an action key fires, the rest of that chunk must not be executed as commands.
+2. **Leave `s` and `n` unbound** until they can use the editor, and remove them from the help; then also guard `r`'s decision read, since `r`+`y` inside a paste is the sharp case and needs no text prompt at all.
+
+### The lesson, which is F65's generalised
+
+**F65** was *an arrow key is not one byte*. This is the same root with the opposite sign: **a chunk of bytes is not a sequence of intentions.** A loop that treats every decoded key as a deliberate keystroke is safe only while no key does anything. The moment a key acts, the loop needs to know where the human's intent ended — and that is precisely the knowledge a line editor carries and a raw byte loop does not.
+
+### F68, confirmed empirically — and it was worse than the reading suggested
+
+I rejected the card from reading the loop. The test author then **reproduced it against the real code** (a temporary pass-through over today's `decode_overlay_keys`, since reverted). One paste of `"retry the exxtract\nand fix the bug"` as a single chunk produced, in order, from the loop's own arms:
+
+```
+cannot read e as an answer for background agent #1; press y, a or n
+answered background agent #1: allow_once
+press x again to stop background agent #1
+stopped background agent #1
+background agent #1 is not waiting on an answer
+```
+
+**One pasted correction approved a parked filesystem request and then stopped the agent.** `registry.answer(id, Deny)` afterwards returned `NotBlocked` and the row went `Working → Cancelled`. The decoder returned **34 keys** for that chunk. In the rename prompt the same paste left the draft as `"d fix the bug"` — the `\n` submitted, `a`/`n` reopened rename, the rest typed into it. The PTY half reproduced too: a bracketed paste containing the word "quit" **closed the overlay**.
+
+So the severity was not hypothetical, and `allow_once` is the worst available outcome: a **write approval granted by text the user pasted as prose.**
+
+### The resolution, and the one judgement left open
+
+**Nothing in a paste is ever a key.** Inside a text prompt the whole payload including newlines is content and the prompt stays open; over the row list and inside `r`'s decision read a paste is **dropped entirely**. This keeps one answer to "what is a byte inside a paste?" across the binary — `kitsu-editor` already holds that a paste never submits, and T4-S2 decided a prefix byte inside a paste is content.
+
+Paste is detected two ways because one is not always available: **bracketed** (the overlay owns the terminal, so it emits `ESC[?2004h` itself, as `tui_bridge::KeyFilter` does without rustyline) and **unbracketed burst** (a chunk yielding more than one printable key is not typing) — the latter being what actually blocks `r`+`y` on a terminal that does not report pastes.
+
+**The burst rule is a heuristic and therefore has a false positive:** a fast typist, or a terminal that batches bytes, can put two printable keys in one read, so two quick `x` presses over the row list could be dropped. It **fails safe**, which is the right direction, but it collides with T2-S5b's standing rule that *a human must be able to tell "nothing happened" from "it worked"* — so a swallowed burst should say so rather than be silent. Left to the implementer with reasoning required.
+
+### A trap worth keeping
+
+**`ESC` alone is a strict prefix of `ESC[200~`.** A naive "hold the partial delimiter" implementation **silently kills F65's lone-`ESC` grace** — `escape_pending()` goes false and `Esc` stops working. Recognising `200~`/`201~` inside the existing CSI state is cleaner than prefix-holding. This cost the test author a design iteration and is pinned by explicit controls.
+
+## F69 — a test model that mirrors a loop stops mirroring it, and nothing fails
+
+Flagged by the implementer rather than hidden, which is the only reason it is visible.
+
+The overlay's byte loop cannot be called without a tty, so F68's registry-level tests drive it through `OverlayUnderTest` (`main.rs` ~30800), a test-local model that mirrors `match prompt.take()` **arm for arm** — and whose own comment says that is what it is for.
+
+T4-S4b-ii then changed the real `s`: an open steer line **bypasses `OverlayDecoder` entirely** and feeds raw bytes to the editor. The model still routes `s` to the naive `OverlayPrompt::Text { kind: Steer }` it replaced. So **the model's paste-into-the-steer-draft test now describes the model, not the product.**
+
+### Why this is not a false alarm, and not a reject either
+
+The behaviour it claims — a pasted newline is content and does not submit — **is still true of the real path, by a stronger route**: the editor enforces it as the one parser that owns bracketed paste, pinned by `pasted.feed(b"\x1b[200~one\ntwo\x1b[201~")` answering `Editing`. So coverage did not vanish; it **moved**, and the product is correct. Nothing was accepted on the strength of a test that passes while the product is wrong.
+
+But the model is now a **mirror that no longer reflects**, and the next person to change `s` will read it as authoritative. The failure mode is specific: a test model diverging from the code it models **cannot fail** when they disagree — agreement is not among the things it checks.
+
+### The family this belongs to
+
+**F57**: *a single source of truth guarantees readers agree with it; it guarantees nothing about whether anyone acts on what they read.* This is the same hole with the pieces swapped — the model and the loop are two readers of one design, and nothing compares them. The only honest fixes are to make the model reachable from the loop (so divergence is a compile error) or to delete the model and pin the loop through the PTY, which a fixture session with zero agents cannot currently do.
+
+**A nearby symptom, same cause:** `OverlayTextPrompt::Steer` is no longer constructed by production code at all — only by the model — so it now carries `#[cfg_attr(not(test), allow(dead_code))]`. **A production enum variant kept alive only by a test is a smell, not a fix.** Deleting it requires editing the model, so both belong to one follow-up card.
+
+### Also recorded: my sixth brief error (F64's tally)
+
+My brief said an empty correction is the registry's own `Empty` refusal **and not** a key-level guard. `agent_view_steer` **does** have a `correction.trim().is_empty()` guard — it just constructs the registry's own error so the wording is identical. Pre-existing, pinned by a passing test, left alone. The agent checked rather than believing me, which is now the sixth time across five cards.
+
+### F69, sharpened by the refactor — the arm was never even run, and there were three of them
+
+My write-up said the model's *paste-into-the-steer-draft test* now described the model rather than the product. **There is no such test.** The refactoring agent grepped every call site: the paste test drives `n`, the **rename** line, and **no test has ever fed `s`** to the model at all.
+
+So `OverlayTextPrompt::Steer` was not kept alive by an assertion. It was kept alive by **one unexercised arm of a model that looked authoritative and was never executed.** That makes the diagnosis stronger, not weaker: a mirror that cannot fail is bad, and a mirror with arms nobody runs is worse, because reading it is the only way it ever gets used — and reading it is exactly what misleads.
+
+**And there were two further divergences nobody had noticed**, both erased by the extraction and neither asserted:
+
+- inside a text prompt the model **ignored `Backspace`**, where the real loop does `draft.pop()`;
+- inside `r`'s decision read the model **kept the read open on `Esc`**, where the real loop closes it and clears the report.
+
+Three divergences, zero assertions touching any of them. The count is the point: **duplicated behaviour does not drift once and get noticed, it drifts repeatedly and silently**, because nothing in the design is watching.
+
+### The structural fix, and the gap it exposed
+
+The loop's input dispatch is now one function, `handle_overlay_input`, that both the loop and the tests call; `run_agent_view_overlay` keeps only what needs a terminal (alternate screen, size, painting, `stdin.read`, the two 50 ms graces, and the steer line's raw-byte read with its decoder bypass). Faithfulness was established by **token-comparing the new body against `git show HEAD:…` of the old one** — identical apart from the deleted arm.
+
+**The break-it experiment is the part worth keeping as a method.** Two deliberate one-line breaks in the real dispatch — truncating a paste to its first line, and dropping `n` from the action keys — both produced failures that *would have been invisible before*. A third attempted break did **not** fail anything: making a paste close `r`'s decision read is genuinely unasserted, because the paste test pastes while the frame is the row list and never after an `r`. That gap is **pre-existing**, not a regression, and closing it means adding an assertion — so it is recorded here as a candidate rather than smuggled into a refactor whose contract was that no assertion changes.
+
+**A refactor that claims to remove duplication should be made to prove it**, and breaking the surviving copy is the cheapest proof there is.
+
+## F39 — eighth occurrence, and it is now costing a gate every card
+
+`test_scripted_and_jsonl_runs_are_byte_identical_under_the_default` failed again, in **release** `--test cli` (244 passed, 1 failed), while debug was 245/245 twice. Same signature as the seven before: the two runs' background-agent join points diverge, one narrating `joining them` / `joined 1 background agent` where the other does not. **A test synchronisation defect, not a product one**, and unrelated to the overlay work it interrupted.
+
+Recorded because the pattern has changed character: it is no longer an occasional nuisance but **a red gate on most cards**, which trains the reviewer to wave a failing suite through — exactly the habit F43 and F64 are about. The test-side fix has been "open" for many cards and should be scheduled rather than deferred again.
+
+One process note from this occurrence, reported by the agent rather than hidden: its per-suite output file was **overwritten by the next suite in the same loop**, so it could not name the failing test. F39's own rule is *write full output to a file first and read the file* — the rule needs the second half said out loud: **one file per suite**, or the evidence destroys itself just as surely as a re-run does.
+
+## F39 — RESOLVED, and it was failing far more often than eight times
+
+Scheduled after the eighth occurrence, on the grounds that its cost was no longer the minute it wasted but the review discipline it eroded.
+
+### The diagnosis was right, and verified two ways
+
+**In the code:** `join_background_agents_at_exit` (`main.rs:14066`) takes **one snapshot** — `let running = registry.running(); if running == 0 { return }` — and both narrations (`~ input ended with N background agent(s) running; joining them` and `~ joined N background agent(s) before exit`) hang off it. **In a captured failure:** the transcript diff is *exactly* those two lines and nothing else, with N1's `background_result` present and identical on both sides.
+
+The race is structural: the detached agent needs one round trip to the mock, the foreground needs one more after `spawn_agent_bg` returns, and whichever lands first decides. Both narrations are correct for their timing — **a test synchronisation defect, not a product one.**
+
+### It was 11 failures in 20 standalone runs
+
+Run alone in release, the test failed **11 times out of 20**. The suite had been hiding the frequency behind serial ordering and load, so "eight occurrences" understated it by a wide margin. **A flake's observed rate is a property of how you run it, not of the flake** — which is worth remembering before calling anything rare.
+
+### What was actually impossible, which is the interesting part
+
+The obvious fix — drive the script through `/quit wait` so the agent drains deterministically — **does not work, and was measured failing 7 times in 20.** `await_background_agents` (`main.rs:14018`) has the *same* `if running == 0 { return }` early exit on the *same* snapshot, so the race simply moves to its own narration line.
+
+**Every wait primitive the product exposes narrates conditionally on that one snapshot**, and `agent_result` does not block. So **no script-only sequence can make entry into a wait deterministic.** That left two options: rewrite the test's whole I/O shape (piped stderr, a watcher thread, a gated mock response, and a multi-thread runtime flavour because the detached request precedes the foreground's), or push the detached completion behind end-of-input with a margin.
+
+### Why the margin was accepted, having forbidden sleep-based fixes
+
+My brief said no sleep-based fix, and that a bounded wait must be bounded on an observable condition rather than on time. The accepted fix satisfies that, because the two roles are separate:
+
+- **The synchronisation is condition-based and pre-existing product code** — the join already does `let mut changes = registry.subscribe(); while changes.borrow().running > 0 { … changes.changed() … }`. Verified by reading.
+- **The 1 s mock delay only decides which of two valid orderings occurs**, so the code path that waits on the condition is always entered. It is not `sleep(); assert`.
+
+Three things make it safe rather than merely convenient: the margin is ~200× (1 s against an end-of-input arriving in single-digit milliseconds); it sits well under the 15 s first join heartbeat, which would otherwise inject a variable `still waiting` line; and the test next door already uses the same device for the same purpose (`set_delay(30s)` to guarantee an agent is still running).
+
+**The decisive mitigation is a new assertion, not the delay.** The fix *adds* a guard that both scripted runs must contain both join lines — so if the ordering ever inverts, the test **says so** instead of silently comparing two transcripts that no longer cover the join path. That guard would have failed about half the runs before the fix, which is independent confirmation of the diagnosis. **A time margin that is policed by an assertion is a different thing from a time margin that is trusted.**
+
+Neither compared assertion changed by a byte; nothing was normalised out of the comparison.
+
+### Tally
+
+Baseline release 9/20 pass. `/quit wait` experiment 13/20. **Fix: 40 release and 10 debug runs, 0 failures**, each to its own numbered file, plus three full release suites at 245. My own independent check: 6 release runs green, full release `--test cli` **245**.
+
+## F70 — the `n` key silently drops a name the registry would accept
+
+**I hypothesised this in a brief and labelled it a hypothesis; the test author confirmed it with live evidence.** Both halves matter: the guess was right, and it was still checked before being believed.
+
+- `OverlayKey::Char` is **ASCII-only by construction**: `plain()` maps `0x20..=0x7e` and **drops** every other byte.
+- The `n` key fills its draft solely from `OverlayKey::Char(typed) => draft.push(typed)`.
+- `AgentRegistry::rename` rejects only empty, over-length and `char::is_control` names. **`café` is accepted** — asserted and passing.
+
+**Observed, not reasoned:** typing `n:café` over the row list produced the report
+
+```
+named background agent #1 :caf (was café)
+```
+
+The `n` key opened the rename prompt, `:caf` entered the draft, **the two bytes of `é` were silently dropped**, and the agent was renamed to `:caf`.
+
+### Why this slipped through a card I accepted
+
+T4-S4a wrote `n`'s legality rules into A3 — *"non-ASCII is legal — the rule is control characters, not ASCII-only"* — and the registry implements exactly that, pinned by its own tests. **The rule and its enforcement agreed; nothing tested whether the only path a user has could reach it.** That is **F57**'s hole once more (*a single source of truth guarantees readers agree with it; it guarantees nothing about whether anyone acts on what they read*), and it is the third time this epic has paid for it — F57 itself, F69's unreflecting mirror, and now a legality rule no keystroke can satisfy.
+
+**The pattern worth naming: a validation rule is only as wide as the narrowest input path that feeds it.** Writing "non-ASCII is legal" in a requirement and implementing it in the registry proves nothing about the keyboard.
+
+### Not fixed here, deliberately
+
+T4-S5 needed the same decision for its own filter line — `n:café` is a plausible *and legal* filter — and resolved it by reading the filter line's bytes through `kitsu-editor`, which handles non-ASCII, split multi-byte characters and bracketed paste. **`n`'s fix is the same shape**, and doing it inside T4-S5 would have meant an implementer changing behaviour no test of that card covered.
+
+**It is its own card**, and it has a pleasing side effect: `n` is the last consumer of the decoded text prompt, so routing it through the editor **removes that prompt entirely** — one fewer parser of the same bytes (**F45**), and one fewer surface where an input path can be narrower than the rule it feeds.
+
+### Also recorded: an unidentified `--test tui` flake
+
+One debug `--test tui -- --test-threads=1` run came back **59 passed, 1 failed**; the immediate re-run and the release run were both 60/60. **The failing test's name was not captured — grep consumed the output.**
+
+That is the same evidence loss F39's eighth occurrence warned about, and the rule it added (**one output file per suite**) exists precisely for this. An unidentified flake is strictly worse than a characterised one: F39 took **eight** occurrences to pin because the first two destroyed their own evidence. Probing deferred until the tree is quiet, since running these suites concurrently with another agent's can itself produce failures.
+
+## F71 — a message the test can read and the user can never see
+
+Caught by the implementer, **beyond its brief**, and it is the most valuable thing in T4-S5.
+
+T4-S5 decided that an invalid filter term is refused with the parser's own message. The obvious implementation puts that message in `state.report`, which the tests collect and assert — and the tests would have passed.
+
+**But the overlay's frame chain puts the open line innermost.** A report row painted under the row list is **not on screen while the filter line is open**. So the refusal would have been:
+
+- **observable to the test**, which reads `state.report` directly, and
+- **invisible to the user**, who sees the filter frame and nothing else.
+
+The card's own decision — *tell the user which character is wrong instead of showing an empty view* — would have shipped as a message nobody could read, with a green suite.
+
+### Why this is its own finding and not a detail
+
+Every "is this visible?" failure in this epic so far has been about the **product** lying to the user. This one is about the **test** being satisfied by something the user cannot reach: the test and the user were reading **different surfaces**, and only one of them is the product.
+
+**The rule: a test that asserts a message exists has not asserted that the message is on screen.** Collecting from state is the convenient thing to assert and the wrong thing to trust, and the gap is invisible precisely because the assertion passes.
+
+This is the same family as **F57** (readers agree with the source; nobody checks whether anyone acts on it), **F69** (a mirror that no longer reflects cannot fail) and **F70** (a legality rule no keystroke can satisfy) — four occurrences in one epic of *the thing we checked was not the thing that matters*. The fix here was to paint the refusal **on the filter frame itself** (`filter_prompt_rows` takes the report), and to clear a stale report when `/` opens, so the frame only ever shows a refusal of what was typed into it.
+
+### The unidentified `--test tui` flake did not reproduce
+
+Five green runs across both profiles — three of mine with one output file each, two of the implementer's. **That is not proof of absence**, and the original failing test's name was never captured, so it stays open. Recorded so the next occurrence is the second and not the first.
+
+## F72 — an unbracketed paste submits early in all three editor lines, and the heuristic that used to cover it is out of the path
+
+Raised by the test author as a blocker, and the safety half **traced by me before authorising anything**, because the shape resembles the defect that cost this epic a rejection.
+
+### The safety question, answered: no, F68 is not re-opened
+
+An open editor line (`s`, `/`, and `n` after this card) **bypasses the decoder entirely**, and `overlay_feed_chunk` ends that branch with `return false` — so the **whole chunk** is consumed by the line and the decoder is never reached. Verified by reading. Therefore when an unbracketed paste makes a line submit at its first newline, **the tail cannot become keys**: there is no path from it to `handle_overlay_input`. The `r`+`y` and double-`x` hazards of **F68** stay closed.
+
+### The real gap
+
+On a terminal that **does not report pastes**, a pasted multi-line value is not content — the editor submits at the first newline (its own documented rule for unbracketed input, pinned by `unbracketed_newlines_still_submit_each_line`) and the rest stays in the line. So the paste rule A3 states — *a paste is content, newlines included, and the line waits for your own `Enter`* — holds **only where the terminal brackets pastes.**
+
+**And the protection that used to cover this is now structurally absent.** F68 added the unbracketed-burst heuristic precisely because some terminals do not bracket; but that heuristic lives in the decoder, and these three lines bypass the decoder by design — for good reasons (non-ASCII, split multi-byte characters, and the editor's own paste rule). **The fix for one hazard removed the mitigation for another**, which is worth stating plainly: the bypass was introduced in T4-S4b-ii to *protect* the paste rule, and it simultaneously dropped the fallback that made the rule hold without terminal cooperation.
+
+This is not new with `n` — `s` and `/` already have it. `n` only makes it three, and removes the burst heuristic's incidental coverage of the rename path.
+
+### Why it is recorded rather than fixed here
+
+The honest fix is for the editor to learn an "unbracketed burst" rule of its own, or for the overlay to bracket-wrap what it hands a line. Either is a change to a parser three surfaces now depend on, with F68's rejection as the precedent for how badly that can go — so it is a card, not a side effect of a rename fix.
+
+**The consequence for this card:** the existing test `a_multi_line_paste_into_an_overlay_text_prompt_is_content_and_its_tail_never_runs` passes today only because the burst heuristic turns its **unbracketed** chunk into one paste. Once `n` is on the bypass that premise is gone and both its assertions fail. **Re-expressing it with a bracketed paste is authorised** — the overlay enables `ESC[?2004h` on entry, so a real paste in this surface *is* bracketed, which makes the bracketed form the more faithful test, not the weaker one. Its intent — a paste is content and its tail never runs — must survive unchanged.
+
+## F73 — `overlay_visible_rows` is registry order, not the order the user sees
+
+Found by an agent **implementing** a test rather than reading about it: its first custody test asserted a row order taken from `overlay_visible_rows` and failed on **its own precondition**.
+
+`overlay_visible_rows` returns `agent_view_rows(registry)` filtered — verified, it is the **registry's** order. **A2's display order is computed elsewhere**, inside the selection, via `agents_view::group_rows`/`display_order`. So the function whose name says "visible" does not yield the sequence the user sees.
+
+**Anyone writing a row-order expectation from it will get this wrong the same way.** The honest fix in a test is to derive the order through `group_rows`, which is what the passing version does.
+
+Worth noting *why* the naming misleads: the function is the single place the **filter** is applied (T4-S5), which is what "visible" refers to — membership, not sequence. Both facts are true and the name only carries one of them.
+
+## F74 — `StatusFields` has twelve construction sites and not one uses `..Default::default()`
+
+Raised as a blocker rather than worked around: A5's `attached · agent N` status segment needs a new field on `kitsu_render::live::StatusFields`, and **adding a field is a compile error in nine existing test modules** across `kitsu-tui` and `tui_bridge`.
+
+Verified by counting: **12 sites** (`kitsu-tui/src/status.rs` 8, `kitsu-render/src/live.rs` 1, `kitsu/src/tui_bridge.rs` 3), and **zero** of them use `..Default::default()`.
+
+**So every future field on this struct is a cross-crate, multi-test mechanical edit** — which is a standing tax on exactly the kind of change this epic keeps making (T3-S5 added the status row, T4 keeps adding things to it). It also pushes an implementer toward the wrong instinct: a struct that is painful to extend invites a second struct beside it, which is the duplication **F45** was closed by removing.
+
+**Not fixed here**, and the status segment is **its own card**: there is no failing test driving the field yet, so authorising the mechanical edit now would mean an implementer changing nine test modules with nothing red to justify it. The card writes the test first, then takes the edit with that authorisation. The prompt label carries the legibility argument for the `←` rule on its own meanwhile.
+
+The cheap mitigation when that card runs is to give the struct a `Default` and convert the sites to `..Default::default()`, so the *next* field costs one line instead of twelve.
+
+## The two rulings that go with T4-S6a
+
+**`Ctrl+X 1..9` is correctly out of scope, and the reason is a design constraint worth keeping.** §4.7 says "attach agent N", and the digit **cannot be an id**: ids pass 9 after nine spawns, so a digit-keyed id binding would be dead for `#10` — and *worse than dead*, it would be **wrong** once `#1` is pruned and `#11` exists. So the digit must be a **1-based ordinal over A2's display order**, which means resolving it against the registry at the composer's byte filter, a point that **has no registry**. That coupling is its own card.
+
+**The `⛩` milestone seam was rejected as a card, correctly.** It would pin two format strings over a `milestone_line` helper that already exists — so asserting the wording proves nothing — and **F71** says a visibility claim must go through the surface that paints it. The attach milestone is only observable where something can attach, and the detach-recap milestone is the recap's header and meaningless without the buffer. Neither was pinned, and the test banner says so. **Declining to write a test that would pass by construction is the right outcome**, and this is the fourth time in this epic.
+
+## F75 — REJECTED: `Enter` closes the agent view and attaches nothing, because the attachment has no reader
+
+**T4-S6a was rejected on review for this, and the gap is mine as much as the agents'.**
+
+`OverlayState::attaching` is **written** in the overlay's `Enter`/`→` arm (`main.rs:7956`) and **never read by production code** — verified: every other occurrence in the file is a test. Meanwhile `read_chat_line_inline` hardcodes `let attached: Option<u64> = None;` (`main.rs:6292`), so `composer_prompt` never shows a label and `read_line_inline_with_keys` can never see an attachment, which means **`←` and `Ctrl+X d` can never detach in production** either.
+
+All twelve tests pass, because they call the reader with `attached: Some(3)` directly and the overlay's state directly. **The two halves are each tested and nothing tests that they are connected.**
+
+### Why this is a rejection and not a follow-up
+
+Before this card, `Enter` and `→` were **not decoded at all** — pressing them did nothing. After it, `Enter` **closes the view** and still does nothing. That is **worse than the starting state**: closing the view is a visible response that implies the action succeeded, so the user believes they attached and then finds no label, no stream and no detach. A key that silently does nothing is a missing feature; a key that *appears* to work is a defect.
+
+This project has rejected "half-shipped" twice already on weaker grounds — **F38**'s lesson that a command which works but cannot be found is half-shipped, and the two cards that added a key to the help because a working-but-unadvertised key is a defect a user meets. This is the same standard pointed the other way.
+
+### How it got through, which is the part worth keeping
+
+**The test author designed the gap in, flagged it honestly, and gave a reason I should have challenged:** that production passes `None` because "nothing can attach yet, and inventing a carrier for session state would be a second source of truth". **I read that and briefed the implementer without questioning it**, so the implementer built exactly what it was asked for and reported exactly what it did.
+
+The reason does not hold. Attachment must **outlive** the overlay — `OverlayState` is per-invocation — so the composer loop's session state is not a *second* home for it, it is the **only** home it can have. Calling a necessary carrier a second source of truth is how a real wiring gap gets a principled-sounding justification.
+
+**This is the F57 family again, and the fifth time in this epic**: *a single source of truth guarantees readers agree with it; it guarantees nothing about whether anyone acts on what they read.* The variants so far — a registered command nobody dispatched, a mirror that no longer reflects, a legality rule no keystroke could satisfy, a message only the test could see, and now **a state nobody reads.**
+
+### What the rework must deliver
+
+Carry the attachment **out of the overlay and into the composer loop**, so the three keys work end to end: `Enter`/`→` attaches and the prompt says so, `←` on an empty composer detaches, `Ctrl+X d` detaches. The seam is the implementer's to find — I am not specifying a mechanism I have not read — but **if it genuinely cannot be done without duplicating state, that is a stop-and-report, not a workaround.**
+
+**And it needs a test that fails when the halves are disconnected**, which is the assertion this card never had. The twelve existing tests stay as they are.
+
+### F75 resolved, and the rework proved it the hard way
+
+The attachment now has a reader. It lives as **one local in `run_interactive`'s composer loop**, borrowed down into the inline reader, with two production carriers connecting the halves: the overlay runner returns `AgentViewExit { shown, attached }`, and `apply_agent_view_exit` applies it. Verified: `apply_agent_view_exit` is called from production (`main.rs:6382`), the session binding exists (`:19761`) and is passed down (`:19844`), and the hardcoded `let attached: Option<u64> = None;` is **gone** — zero occurrences.
+
+**Why that is the only honest home, which is the answer the first attempt got wrong:** `OverlayState` is per-invocation *and attach closes the view*, so by the time a composer could read `state.attaching` the state holding it no longer exists; and `read_chat_line_inline` returns on every submitted line, so a local there cannot hold it either. Everything else is **derived** from it per read — the prompt label and the reader's key routes — so there is no second field to drift.
+
+A distinction the rework added that nobody asked for and that is right: **leaving the view is not detaching.** A view closed with `q`/`Esc`, or never shown, leaves an existing attachment alone.
+
+### The demonstration is the part worth reusing
+
+I asked for a test that fails when the halves are disconnected. The agent produced **two** demonstrations and said which was weaker:
+
+1. Against a mechanically reconstructed pre-wiring tree: **six compile errors.** It labelled this the weaker proof itself — a test that fails to compile has not shown that it *notices* the defect.
+2. With the carriers **present but no-op'd** (`apply_agent_view_exit` body replaced by `let _ = (exit, attached);`) — *exactly* F75's shape — it fails at runtime on the load-bearing assertion:
+
+```
+assertion `left == right` failed: F75: the agent the view attached to must reach
+the composer's binding, which is the only home that outlives the overlay
+  left: None
+ right: Some(1)
+```
+
+**That second construction is the real gate**, and it is the "break the surviving copy on purpose" method from the F69 follow-up, applied here without being asked for. The general rule: **when a test exists to catch a wiring gap, re-create the gap rather than deleting the wiring** — deletion proves the test compiles against the wiring, not that it detects its absence.
+
+## F76 — `Ctrl+X d` discards a non-empty draft
+
+Flagged by the implementer for my attention rather than silently shipped or silently fixed.
+
+`InlineRead::Detached` carries no draft back, and its doc comment says it is "only ever reached on an empty one" — **true of `←`, which requires an empty composer, and not true of the chord.** `Ctrl+X d` has no such precondition, so pressing it with text typed clears the line: the loop's detach arm has nothing to replay and sets the carried draft to empty.
+
+**Not fixed in T4-S6a**, because carrying the draft means changing the `Detached` variant, which changes the twelve tests written for this card — an authorised test edit, which belongs in a card with a failing test of its own rather than in a rework whose contract was one added test.
+
+The shape is familiar: **a variant documented by the narrowest route that reaches it.** `←`'s empty-composer precondition got written into the type's comment, and then a second route was given the same variant without the precondition. The comment was accurate when written and became wrong when the second caller arrived — which is the same mechanism as **F69**'s mirror and **F70**'s unreachable rule, one level down in the type system rather than in a test or a validator.
+
+## F77 — `/detach` never detaches, and I documented that it does
+
+**The worst failure of this epic's review process so far, and it is mine.**
+
+T4-S6a's `/detach` arm (`main.rs:22195`) is **unconditional**:
+
+```rust
+"detach" => {
+    eprintln!("not attached to a background agent");
+    return SlashResult::Error;
+}
+```
+
+Its own comment explains why: *"Nothing in this card can attach, so there is one answer to give."* That was **true when written** — the first attempt had no working attachment. Then I rejected that attempt for **F75**, the rework wired attachment end to end, and **this arm was never revisited.** The slash dispatcher has no access to the composer's session binding, so wiring it means threading that binding through `handle_slash_command`'s call sites — a signature change, not a one-line fix.
+
+### What makes this worse than F75
+
+**I shipped documentation claiming it works.** `README.md`'s command table said `/detach` would "Leave an agent you attached … and return the composer to the session", `CHANGELOG.md` listed it among the three ways to return, and `docs/functionality.md` said "`Ctrl+X d` and `/detach` also detach". **All three were false when I committed them.** Corrected in this card's commit.
+
+So the standing requirement that documentation ships with the feature was satisfied *procedurally* — three files updated in the same commit — and **violated in substance**, because what they said was not true. **A doc update is only worth what its claims are worth**, and a reviewer writing docs from a brief rather than from the code is how a false claim gets the authority of a committed file.
+
+### And it is F75 repeating inside the card that fixed F75
+
+F75 was *a state nobody reads*. I rejected it, demanded the wiring, verified the chain overlay → `AgentViewExit` → `apply_agent_view_exit` → session binding → composer — and **never checked the third consumer of that binding.** I verified the route I had been thinking about and treated the card as whole.
+
+**Sixth occurrence in this epic** of *the thing we checked was not the thing that matters*: a registered command nobody dispatched (**F57**), a mirror that stopped reflecting (**F69**), a legality rule no keystroke could satisfy (**F70**), a message only the test could see (**F71**), a state nobody read (**F75**), and now **a command whose arm predates the feature it names.**
+
+The specific lesson, which is narrower and more useful than "check more": **when a rework makes something possible that was previously impossible, every arm that was written while it was impossible is now suspect.** That comment — "nothing in this card can attach" — was a precise, dated statement of an assumption, and it is exactly the thing a rework invalidates. It should have been a grep.
+
+### Carded, not fixed here
+
+Wiring it is a signature change across the dispatch sites, and this card is the status segment. The test author correctly pinned detach tracking for `←` and `Ctrl+X d` only and wrote **no** test asserting `/detach` clears the segment, rather than writing one that would have to fail.
+
+## F74 — corrected: nine constructions, three exhaustive, and `Default` was already derived
+
+**My count was wrong, and the way it was wrong matters.** I wrote that `StatusFields` has "12 construction sites, none using `..Default::default()`" and authorised adding a `Default` impl.
+
+Verified by the agent and confirmed by me: the struct **already derives `Default`** (`live.rs:254`, `#[derive(Clone, Debug, Default)]`), there are **nine literal constructions**, and **six already use functional-update syntax** (`..busy()` / `..fields`), so adding a field broke **exactly two** places — quoted as two `E0063` errors — not nine test modules. `kitsu-render/src/live.rs` has **zero** constructions.
+
+**I produced that number with a grep and trusted its shape.** `grep -c` over a type name counts *mentions in text*, not constructions in code, and summing per-file counts compounded it. The resulting finding overstated a real but much smaller tax, and the authorisation I wrote on top of it asked for work already done.
+
+**A count is evidence about text until someone reads the code.** This is the same class as F43 and F64 — a mechanism (here, a number) taken from a cheap signal and promoted to a finding without the read that would have corrected it.
+
+The underlying tax is real and now paid: three exhaustive sites converted, with one case left partly explicit because the values it spells out are what it documents. Note `clippy::needless_update` forbids a fully exhaustive literal plus `..Default::default()`, so a converted site must omit at least one field.
+
+## F78 — the status row's drop order is not monotonic in width
+
+Measured, not reasoned, while proving an assertion reachable: **a clipped model segment reappears at 44, 43 and 42 columns** once the row is busier, because `compose_status_row` offers each segment what the higher-ranked ones left, and dropping a thirteen-column queue tag frees enough room for a segment that was previously truncated.
+
+So the intuitive property — *narrower never shows more* — is **false**, and a test asserting a prefix or no-revive relationship across widths cannot hold. The test author had written exactly that assertion first and discovered it was unsatisfiable (the **sixth** unsatisfiable assertion in this epic, after F58, F61 and the two in F70's card).
+
+Related measurement from the same sweep: "if the queue tag survives, so does the attachment" is **false below 32 columns**, where the ten-column tag fits and the eighteen-column label does not. The surviving test therefore pins the **claim order exactly** — `painted == (cols >= tag + sep + label)` across 20..=200, derived from the tag's own text — and says nothing about the model's revival in either direction.
+
+**No future card should assert a prefix or no-revive property on this row.**
+
+## F79 — `/jobs view` discards the attachment: F75 verbatim, third consumer
+
+Found by the test author while writing F77's tests, and verified by me.
+
+`run_agent_view_overlay` has **two** call sites:
+
+- `main.rs:6377` — the inline reader: `let exit = run_agent_view_overlay(registry, false);` and it applies the whole thing.
+- `main.rs:14030` — `/jobs view` / `/agents view`: `let shown = run_agent_view_overlay(registry, true).shown;` — **the attachment is thrown away.**
+
+So in interactive inline mode, opening the view with `/jobs view`, selecting a row and pressing `Enter` **attaches to nothing**: the prompt label and the status row never change, and the detach keys stay inert. Attaching only works if you reached the view by the chord or the arrow route.
+
+**This is F75 word for word — *a state nobody reads* — in the third consumer of the same exit value.** F75 was the first consumer (the composer binding did not exist), F77 was the second (`/detach`'s arm predated the feature), and this is the third. I rejected a card for the first, documented the second as my worst review failure, and **the third was sitting in the same function the whole time.**
+
+### The lesson, which is sharper than the previous two
+
+After F75 I verified *the chain I had been thinking about* — overlay → carrier → binding → composer — and declared the card whole. After F77 I wrote that *"when a rework makes something possible that was previously impossible, every arm written while it was impossible is suspect"*. Both were right and both were too narrow.
+
+**The actual rule: when a function starts returning something new, every caller is a suspect, and callers are enumerable.** `run_agent_view_overlay` changed from `-> bool` to `-> AgentViewExit` in T4-S6a's rework. That change has a complete, mechanical list of places to check — two — and nobody checked the list. **A type change is the cheapest possible audit trigger and it was available for free.**
+
+### Folded into F77's card, deliberately
+
+Normally an adjacent defect gets its own card. This one does not, because:
+
+- It is the **same mechanism and the same seam**: the `&mut Option<u64>` parameter F77 needs for `detach` is exactly what `jobs view` needs to call `apply_agent_view_exit(&exit, attached)`. Two arms of one dispatcher, one parameter.
+- Leaving it would ship an **incoherent product**: `/detach` would work only if you attached by the chord, so "three ways to return" stays conditional on *how you attached* — and the README, CHANGELOG and `functionality.md` claims corrected last card would still be conditionally false.
+- **Shipping a known instance of F75, after rejecting one card for it and recording another as a review failure, would be indefensible.**
+
+The implementer is authorised to add the one test this needs, as an explicit exception to the test-first split, for those reasons.
+
+### F79's fix, and a test-only shim I removed on review
+
+The implementer found my brief wrong again (the tenth mechanism correction in this epic): the `/jobs view` arm is **not** in `handle_slash` but in `handle_jobs_command`, a separate function with **five existing unit-test call sites**. Threading the binding there meant either editing those five tests — which implementers may not do — or keeping the old three-argument name available. It chose the latter: a `#[cfg(test)]` shim named `handle_jobs_command` delegating to `handle_jobs_command_attaching(.., &mut None)`, and said so plainly rather than burying it.
+
+**I removed the shim on review**, and the reason is this epic's own history. A `#[cfg(test)]` function **shadowing a production name** means the tests call something production never calls — which is **F69** exactly, a test-only path that looks authoritative. The five sites now name the production function and pass `&mut None` explicitly, which *documents* that those tests do not drive the view instead of hiding it behind an alias. Five one-line edits, no assertion touched, 889 still passing.
+
+**The seam the implementer added is the right kind.** `run_agent_view_overlay` declines outside inline mode on a tty, so the arm cannot be entered from a test at all — which is **exactly why the discarded attachment survived review**. It therefore extracted `apply_jobs_view_exit(&exit, attached) -> bool`: the one call F79 needs plus the `shown` the text-deck fallback depends on, in one testable place. Making the unreachable thing reachable is the lesson of **F71** and **F75** applied before the fact rather than after.
+
+**Both traps were re-proved by prototype**, a method now used on four cards: a body applying the exit to a *local copy* leaves `shown == true` and still fails on the painted row, and `apply_detach_command` clearing a copy returns `Detached(1)` and still fails. Both prototypes reverted from byte copies.
+
+**No fourth consumer.** `run_agent_view_overlay` has exactly two call sites and `apply_agent_view_exit` exactly two production callers — checked, because F79's lesson is that the list is enumerable.
+
+## F80 — a fourth flake: the approval modal paints nothing in release, once
+
+Seen once by the F76 test author and **captured to its own file** rather than lost:
+`scratchpad/flake-kitsu-render-lib-release-approval_modal.txt`.
+
+`cargo test --release -p kitsu-render --lib` failed three tests together —
+`approval_modal_paints_header_then_details_then_the_option_line`,
+`approval_modal_keeps_every_provenance_row_in_order`,
+`approval_modal_option_line_is_the_shared_composer_byte_for_byte` — all with `left: []` or `left: None`, i.e. **the modal painted nothing at all.**
+
+Three things make the diagnosis likely without chasing it: the three tests fail *together*; the third names **"the shared composer"**; and the failure is *empty output* rather than wrong output. That reads as a **shared global not yet installed** when those tests run — cross-test ordering, not a defect in the modal.
+
+**It appeared during a run concurrent with another `cargo test`**, and seven later release runs plus the debug run were 130/130.
+
+**The concurrency is partly my doing**, and worth recording as a cause rather than a coincidence: earlier in this session I ran suites myself while an agent was running its own, which is the condition under which this appeared. Later briefs now say **do not run suites concurrently**, and the following card's agent ran them one at a time and saw nothing.
+
+So the standing flake list is now four: the two characterised ones, the **unidentified `--test tui`** (twelve runs clean, name never captured), and this. **F39 took eight occurrences to pin because its first two destroyed their own evidence** — this one has its evidence on disk from occurrence one, which is the whole point of the one-file-per-suite rule.
+
+## F81 — A8 is violated at the TUI idle composer, and the codebase already contained the argument
+
+I asked whether T4-S8 was test-only, since **F50** had established that A8's 250 ms budget was satisfied by a 50 ms poll tick and asserted nowhere. The answer is **no**: A8 is **broken**, at a path nobody had looked at.
+
+### The violation, verified
+
+- `sync_agent_counts` and `repaint_status_row` are called from **exactly one loop** — `run_live_typeahead`, the *during-a-turn* typeahead. `repaint_status_row` has only two other production callers, one of them the overlay handing the terminal back.
+- **At the idle composer there is no cadence at all.** `read_line_inline_with_keys` blocks in `input.read(&mut buffer)` with **no timeout** (verified: no poll above it); its only non-byte wake is an interrupted read plus a pending `SIGWINCH`, and a wake with no resize is explicitly retried **without a frame**.
+- **The idle composer's bottom row does carry the ambient tag** — `status_row()` → `StatusSource::compose` → `compose_status_row` (verified). So the counter is **on screen and indefinitely stale**.
+- The counts are a **pull**, read through a closure at paint time, so nothing needs pushing. **The entire gap is that at idle nobody calls paint.**
+
+**So a background agent that blocks while the user sits at the prompt changes nothing on screen until a keystroke, a terminal resize, or a submitted line.** That is precisely what the whole T2 blocked-agent surfacing exists to prevent.
+
+### A8's carve-out does not cover it
+
+A8 grants the "idle prompt keeps reporting at the next prompt cycle" latitude to **`classic`**, by its own sentence. The TUI idle composer gets no such grant, so this is an unqualified violation rather than an under-specified corner.
+
+### The part worth keeping: the argument was already written down
+
+Two comments in the tree bear on this, and they disagree:
+
+- `crates/kitsu/tests/tui.rs:2842` records the rationale for having no idle cadence: *"`read_line_inline` is deliberately not a cadence … between turns R5's elapsed segment is `None` anyway, so the idle prompt has nothing to tick."* **True of the clock. False of the ambient tag.**
+- `crates/kitsu/src/tui_bridge.rs:450`, in the reduced-motion logic, states the counter-argument exactly: the queue and ambient tags stay in the key *"because they are state and not animation: **freezing them would hide a blocked agent**."*
+
+**The same reasoning, about the same segment, written by the same project — applied to reduced motion and not to idle.** Nobody had to discover that freezing the tag hides a blocked agent; it was already a sentence in the file. The gap was that the rationale for no-idle-cadence reasoned about *elapsed time* and silently generalised to *everything on the row.*
+
+**The lesson: a justification that is true of one segment is not true of the row.** "Nothing to tick" was a claim about a clock, and it was allowed to excuse a surface that also carries state.
+
+### A second, smaller gap
+
+Mid-turn, `run_live_typeahead`'s approval arms `continue` **before** `sync_agent_counts`, so while an approval modal is up — which can be minutes — the ambient counter is frozen, and the modal paints a status row of its own, so the stale count is visible. Noted, not tested (adjacent to F54's territory).
+
+### Two corrections to my own records
+
+- **F50's proposed cheap fix described a constant that did not exist.** It said "a unit assertion on the poll interval constant"; the poll was a **bare literal `50`**. There was nothing to assert until this card introduced `AMBIENT_TICK_POLL_MS`. An F64-family slip in a finding of mine.
+- **The plan row's `Files: status.rs` is wrong.** `crates/kitsu-tui/src/status.rs` is pure painting — no clock, no cadence. The mechanism lives in `main.rs` and `tui_bridge.rs`.
+
+### And the row's "watch-driven" is right for the wrong reason
+
+It is needed not to tighten 50 ms to something smaller, but to give the **idle** composer a cadence it has never had. `registry.subscribe()` already exists, and because the counts are a pull the implementer needs **a caller, not a rewrite**. The classic-mode notifier is not that caller: it is gated on an opt-in environment variable and an assistive-input check, so a default TUI session has **no subscriber at all**.
+
+### The vacuous-pass trap, flagged by the test author in its own seam
+
+`idle_ambient_refresh_interval() -> Option<Duration>` can be made `Some(..)` **without wiring anything**, which would be *exactly* F50's failure — a requirement passing a test while nothing holds it. The seam's doc comment says so, and the implementer owes a **behavioural** test that an idle registry change reaches the surface **with no byte read**. That test could not be written in advance because it needs whichever wake mechanism the implementer chooses.
+
+### No sleeping test
+
+Both new tests are structural. The during-turn guard reads the named constant so raising the tick past 250 ms **fails by name** — F50's loud guard, finally built. The idle test asserts the painted row through the surface. The only sleep is the existing frame-budget helper that clears N3's coalescing window, which is the in-tree idiom and not a latency measurement. With four open flakes, waiting out a 250 ms budget on a loaded machine was not worth it.
+
+### F81's resolution, and the acceptance test that would have passed a lie
+
+The idle composer now has a cadence, driven by **`registry.subscribe()`** rather than a timeout on the idle read. The reason for that choice is worth keeping: `read_line_inline_with_keys` is **generic over `R: std::io::Read`** and is driven by in-memory cursors throughout the editor and composer tests, so giving it an fd to poll would mean a signature change to **the one function that owns the decoder and the three editor lines' byte bypass** — the path **F68** and **F72** say not to disturb. Because the counts are a pull, a subscriber only needs to *trigger a paint*: the composer stays blocked in `read()` and the row is repainted around it. **A caller, not a rewrite.**
+
+**A bare wake still paints nothing** — verified by reading: the step awaits `changed()`, compares the projected `(blocked, running)` against what it last showed, and **returns without painting** when they match. So a generation-only bump emits no bytes and reduced motion and N3's frame budget are untouched.
+
+### The result that matters most
+
+The implementer prototyped the broken shape I asked for — interval returning `Some(..)`, both repaints removed — and the outcome was:
+
+- **the test author's acceptance test PASSED**, and
+- the implementer's own behavioural test **failed** at the painted-row assertion (`left: ""`).
+
+**So the acceptance test alone would have accepted an implementation that paints nothing.** That is *exactly* **F50**'s failure mode — a requirement passing a test while nothing holds it — reproduced inside the card written to fix F50, and caught only because the test author flagged the trap in its own seam's doc comment and I required a behavioural test from the implementer.
+
+**The general lesson: a test that asserts a *capability exists* is not a test that the capability *does anything*.** `idle_ambient_refresh_interval() == Some(..)` is a claim about configuration; "an idle registry change reaches the screen with no byte read" is a claim about behaviour. The first is cheap to satisfy falsely. This is the seventh variant in this epic of *the thing we checked was not the thing that matters* — after F57, F69, F70, F71, F75 and F79 — and the first one caught **before** shipping rather than after.
+
+### A hazard found while implementing
+
+`repaint_status_row` **drops a paint inside N3's 1/60 s window without recording the key**, so a change arriving in that window could wait for a registry event that never comes while an agent sits blocked. The step therefore repaints, sleeps one frame interval, and repaints again; the dedupe makes the second call free when the first landed. **A rate limiter that silently discards rather than defers is a correctness problem for anything event-driven behind it.**
+
+### The mid-turn gap stays open
+
+`run_live_typeahead`'s approval arm still `continue`s **before** `sync_agent_counts`, so while an approval modal is up the counter is frozen and the modal's own row shows a stale count. Out of scope here (adjacent to **F54**, whose signal path is still unexplained). The implementer notes the new cadence may now refresh that row **incidentally**, since a registry change wakes the task during a turn too — but **asserted nothing about it and changed nothing in that arm**, which is the right call: an accidental fix is not a tested one.
+
+## F82 — three keys the view always accepted and never advertised, found by sweeping the keyboard
+
+T4-S10's job was to collapse three independent enumerations of the agent view's keys: the help's literal, the dispatch's `match` arms, and **a test's own list** (which meant adding a key to the product and the help but not to that list silently narrowed the test).
+
+**The design question was whether the table could be the dispatch source. It cannot:** `OverlayKey` is private to the binary, and `match` arms are not data, so `kitsu-tui` can neither be the match nor enumerate it. **An exhaustiveness test would have fallen into F57's trap** — a guard that reads the dispatch's own source cannot fail when the dispatch disagrees with it, which is precisely why F57's own guard was unwritable.
+
+### The guard that worked: enumerate the keyboard, not the code
+
+The test presses **every key the decoder can produce** — all of `0x20..=0x7e`, plus `↑ ↓ → Enter Backspace` and a quiet-tick-resolved `Esc` — on a fresh registry and view per key, and asks **the painted frame** whether anything happened (**F71**: never a state field). Then both directions: everything that changes the frame or closes the view must be a table row, and every row must change it.
+
+**It reads neither source, so it cannot agree with the dispatch by construction.** That is F57's trap actually solved rather than worked around.
+
+### What it found
+
+**Fifteen presses are dispatched; the help advertised twelve.** Missing: **`q`** (closes the view), and **`Enter`/`→`** (T4-S6a's attach).
+
+So the shipped view had three keys a user could press and could not discover — **the exact defect T4-S3, T4-S4b, T4-S5 and T4-S7 each closed once, open in triplicate.** Every one of those cards applied the rule *a key that works while unadvertised is half-shipped*, and every one applied it **only to the key it was adding.** Four correct applications of a rule left three violations standing, because nobody enumerated.
+
+**The lesson: a rule applied per-change is not a rule enforced.** The fix was never more diligence per card; it was one test that asks the question for all keys at once.
+
+### What the sweep deliberately does not cover, stated by its author
+
+- **A row wired to the wrong action.** It asks *did something happen*, not *did the right thing happen*; the per-key behaviour tests from the earlier cards remain the only guard on **what** each key does, and they were left untouched.
+- **Keys that act only from a non-fresh state** — inside `r`'s decision read, inside an open line, on `x`'s second press, under the help or a peek panel.
+- **Anything that never reaches the overlay's dispatch**, i.e. the whole composer chord surface.
+
+Naming the gaps is part of the guard being trustworthy: a sweep described as total would invite exactly the false confidence F57, F69 and F75 are about.
+
+### Two corrections to my brief, and one of the agent's own
+
+- **`/help keys` is not a new command.** `/help` is registered and its arm already forwards any argument, so F57's unregistered-arm hazard could not arise. The half that did matter was **registration**: the entry's `args` was `""`, so nothing offered `keys` in `/help`'s listing, the palette or either completion host. Now `"[command|keys]"`.
+- The brief's "three enumerations" undercounted the problem: the collapse **closes three live defects**, not just tidies duplication.
+- **The agent reported that `Ctrl+L` does not exist. It does**, in both halves, citing R8 — I verified before passing the brief on. Three of the four bindings it flagged as phantom are genuinely missing (`Ctrl+X o`, `Ctrl+X ?`, `Ctrl+X 1..9`); that one is not.
+
+### The vacuity guard carried forward unprompted
+
+Last card's result — an acceptance test passing an implementation that painted nothing — shaped this card's main assertion without being asked for. The help-equals-table test adds `!painted.is_empty()`, because **the one way an equality holds vacuously is both sides empty.** The table's rows are also asserted to *have consequences*: a `BindingKind` that is only a struct field fails, since `x`'s text must say "twice", `r`'s must name `y`/`a`/`n`, and the line-openers must carry their grammars.
+
+## F83 — the fixture that blocked two cards was already in the tree, and a comment went stale the moment this card shipped
+
+**Two things from T4-S6b, both about inherited beliefs rather than code.**
+
+### The blocker had dissolved and nobody checked
+
+T4-S4b and T4-S6a both deferred work on the grounds that *a steerable agent needs a live thread with an open correction channel, built from helpers that live in `subagent`'s own test module and are unreachable from `main.rs`'s.* That was true and it was recorded twice.
+
+**But the helpers were reachable all along — from `subagent.rs`.** `EchoProvider`, `ProviderBinder::fixed` and `empty_profile_runtime` are there, and **a passing test already drove a steerable agent end to end** (`background_steering_restarts_only_that_thread_and_handoff_is_explicit`). T4-S7 had already proved the pattern by writing its registry-level tests in that module and splitting three ways.
+
+So the blocker was never "a steerable agent is unreachable"; it was **"a steerable agent is unreachable *from where I was standing*"** — and the fix was to stand somewhere else. **A deferral records where someone was when they hit the wall, and gets re-read later as a property of the wall.** Worth checking any inherited "cannot be done" against the tree before building around it.
+
+### A comment went stale the instant the card landed — F77 again, caught this time
+
+The composer loop carried a comment from T4-S6a: *"the `⛩` milestone and the recap are **not** this card's (design §4.5: they land with T4-S6b and T4-S6c)."* **T4-S6b is this card, and it shipped the milestone** — so the comment became wrong at the moment of the commit that made it wrong, three lines above the arm that did it.
+
+That is **F77** exactly: `/detach`'s arm said *"nothing in this card can attach"*, true when written and false after the rework, and it cost three false documentation claims. **Found here only because I had promised to read the arm by eye** — no test touches a comment.
+
+**The pattern, now twice: a comment that names a future card dates itself.** "Not this card's — it lands with X" is true until X lands, and nothing fails when it stops being true. Corrected in place, with the reason recorded in the comment itself.
+
+### The route's enumeration question, answered better than I asked it
+
+**F82** established that *a rule applied per-change is not a rule enforced*, and I asked what enumerates a new user-visible route. The answer: **this route adds no key — it changes what `Enter` means — so the only thing that can enumerate it is the moment it begins.** Hence the milestone names the *route*, not just the agent. A key table cannot advertise a route that has no key, and bolting it on would have been the wrong fix for the right rule.
+
+### And the race was dissolved rather than decided
+
+A5 did not say whether routing reads the agent's state when the line is opened or when it is submitted. Both readings can be wrong — open-time can send a steer the registry must refuse, submit-time can hand a typed correction to a parser expecting `y`/`a`/`n`. The resolution was not to pick the less-bad one but to **make being wrong cheap**: submit-time routing, the registry as final adjudicator, and **every refusal sends nothing and hands the line back**, so the worst case is one extra keystroke with the user's words intact. In the implementation "refused" and "keeps the line" are the **same boolean**, so they cannot drift apart.
+
+## F84 — the transition that is not a route: enumerating the keys missed the one without a key
+
+My brief for T4-S6c said *"the three detach routes must all replay"* and cited **F79** (*callers are enumerable*). The test author enumerated them — and then found **a fourth way an attachment ends, which no key triggers**.
+
+`apply_agent_view_exit` **re-binds to a different agent**. No detach key is pressed, no detach arm runs, and whatever the first attachment buffered has nowhere to go. Its first prototype **dropped it silently.**
+
+### How it surfaced, which is the uncomfortable part
+
+It did not fail a test of its own. It announced itself as **cross-test interference**: a *different, existing* test (`the_attach_milestone_is_painted_once_per_change_of_binding`) left a stale buffer in a process-global slot, and the multithreaded run of the new route test failed because of it. **The bug was found by luck through a shared global, which is the kind of luck that does not repeat.**
+
+It is now pinned deliberately: `re_attaching_to_another_agent_replays_the_first_ones_recap_first` requires the previous agent's recap **under that agent's header, before the new agent's attach milestone** — order is the assertion, because the other order **attributes one agent's turn to another**.
+
+### The lesson, which is narrower and more useful than F79's
+
+**F79** says *when a function starts returning something new, every caller is a suspect, and callers are enumerable.* That is about **callers**. This is about **states**: I enumerated the ways a user *asks* to leave an attachment and missed the way an attachment *ends without being left*.
+
+**Enumerating the routes out of a state is not the same as enumerating the transitions out of it.** A route is something a user does; a transition is anything that changes the state, including being replaced. The three keys were the routes. The re-bind was a transition with no route, and a brief organised around user actions cannot see it.
+
+§4.5 does not cover it either, so the decision was the test author's and it is recorded in the requirement now.
+
+## F84b — the byte bound makes an old caution real, and it caught its own prototype
+
+**F52** carried two cautions. The first — *lines are the wrong unit for a memory bound* — is why this card does not reuse the cell ring. The second had never mattered: *truncating styled bytes can cut an SGR sequence in half.*
+
+**A byte bound makes it real for the first time in this epic**, and the test author pinned it unprompted: a clamped styled line must be cut on a `char` boundary **and end `\x1b[0m`**, which is the rule `fit_row` already follows — the renderer's existing rule, not a new one. **That test failed against the author's own first prototype**, which cut on a boundary but did not reset. So it is catching something real rather than restating the cap, and without it a severed escape would have coloured the rest of the session.
+
+### And the reason the ring was wrong is structural, not just unit-mismatch
+
+I argued from F52's units. The stronger argument is the dependency graph, verified: **`Surface` lives in `kitsu-render`; `CellRing` lives in `kitsu-tui`; and `kitsu-render` does not depend on `kitsu-tui`.** A buffer that decorates `Surface` must live beside the trait, so **the ring is unreachable from it regardless of how it is bounded.** The split that created this card feared a deferral past R6 if the implementer "reached for the ring" — it cannot be reached, so there is nothing to defer.
+
+**`cell_ring_lines` still has no reader.** This card does not become one, and **F52 stays open** for the overlay and the `[` dump; it is decided only for this buffer (byte-budgeted, oldest evicted, loss noted, clamped lines reset).
