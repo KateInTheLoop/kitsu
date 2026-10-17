@@ -566,6 +566,25 @@ mod tests {
         None
     }
 
+    /// The child writes its three lines one at a time, so a file that merely
+    /// exists may hold only the first. Wait for the whole record.
+    async fn await_file_lines(
+        path: &std::path::Path,
+        lines: usize,
+        timeout: std::time::Duration,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if let Ok(body) = std::fs::read_to_string(path) {
+                if body.lines().count() >= lines {
+                    return Some(body);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        None
+    }
+
     /// The end-to-end proof, and deliberately two proofs at once: the three
     /// variables reach the child, and the shell in this argv is *the user's own
     /// command* — `sh` chosen by them — not something kitsu wrapped around it.
@@ -641,7 +660,7 @@ mod tests {
 
         fire(&argv, &event);
 
-        let body = await_file(&out, std::time::Duration::from_secs(10))
+        let body = await_file_lines(&out, 3, std::time::Duration::from_secs(10))
             .await
             .expect("the hook command must have run");
         // Read through duplicates taken before the test's own redirect, so the
