@@ -1082,10 +1082,74 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   `agent wait --until`). It spawns nothing, so it does not consume the
   `SpawnBudget`; it is bounded by `--max-rounds` and its own timeout.
 
+  **Shipped in T5-S6, which settled two things H5 left open.**
+
+  **`done` is the registry's `terminal` predicate, not the `Done` variant** --
+  `!matches!(phase, Running | Blocked)`. Had it been the variant alone, a `done`
+  wait on an agent that **failed or was cancelled** would have burned the whole
+  timeout waiting for a state that can never arrive. By the same reasoning the
+  converse returns at once: waiting for `blocked` on an agent that has gone
+  terminal is unreachable, so the tool says so instead of holding the round open.
+  A `done` wait on a *parked* agent does run its timeout out, because `blocked` is
+  non-terminal and the agent is still live.
+
+  **"Bounded by `--max-rounds`" is a conjunction of two independent bounds, not
+  something the tool enforces.** `max_rounds` lives only on
+  `kitsu_core::AgentConfig` and is enforced only in the orchestrator loop; a tool
+  handler cannot see it. So the timeout bounds **one call** and `--max-rounds`
+  bounds **how many calls**, since each `agent_wait` is one round of the caller's
+  turn. Worst-case turn time is `max_rounds × 30 min`, which is why the clamp has
+  a ceiling. The round cap is already covered by `kitsu-core`'s own test, and
+  T5-S6 deliberately wrote **no** assertion for it: any test in the tool's file
+  would assert the **absence of a parameter**, which is structural and vacuous.
+
+  **A timeout is an `Ok` outcome, not an error**, naming the state not reached, the
+  timeout actually used, and the agent's current status. An unknown id *is* an
+  error and is returned immediately, because a typo must not cost a round. And a
+  **zero spawn cap unregisters it** -- not because it consumes budget (it does not)
+  but because at a zero cap no agent can exist to wait on, and a tool that cannot
+  succeed must not be advertised.
+
 ### 3.5 Non-functional and invariants (N)
 
 - **N1** Non-TTY, `--plain`/`NO_COLOR`, assistive (`--screen-reader`), and
-  JSONL output MUST stay byte-identical to today. The TUI is entered only when
+  JSONL output MUST stay byte-identical to today.
+
+  **Clarified in F120, after I misread it as a blanket ban.** N1 lists four
+  surfaces; **an interactive TTY run is not among them**, so a human-facing line
+  on a TTY is not an N1 question at all. And for the four it does list, N1
+  constrains **the bytes of the shapes that exist today**, not the set of shapes:
+  **a new additive event `"type"`, emitted only on a path that is currently
+  wrong, leaves every existing event byte-identical.** That is how
+  `tool_results_dropped` ships without violating it, and it is strictly less
+  exposure than mutating `turn_finished`/`final_summary` or touching `status`.
+
+  The reading has a limit worth stating: a consumer asserting *"exactly these
+  types appear"* is affected. That is accepted deliberately — **a run that
+  currently drops a tool result and reports success is not a shape N1 was written
+  to protect**, and the alternative is preserving a lie for byte-stability. The
+  conditional-field precedent (`final_summary` adds `output_last_message_state`
+  only when `Some`) remains the fallback if a field is ever preferred to an event.
+
+  **Clarified again in F122: which descriptor does "non-TTY" mean?** N1 did not say,
+  and it matters — the codebase distinguishes them with **separate functions**
+  (`is_tty()` is `io::stdout().is_terminal()`; `stderr_is_tty()` is its own), and
+  the three inline composites in the binary all key on **stdin** while N1's own
+  parenthetical says *"stdout is a TTY"*. Those differ for a real invocation such
+  as `kitsu chat <prompt> | tee`.
+
+  **The resolution follows from what N1 protects, which is consumers**, and a
+  consumer can redirect either descriptor independently. So **"non-TTY" means: for
+  each descriptor, when *that* descriptor is not a terminal, *its* bytes stay
+  identical.** It is not one global condition.
+
+  **Consequently a human-facing line, which goes to stderr, is gated on
+  `stderr_styled() && is_tty()`** — both descriptors being terminals. That is
+  **stricter than the minimum** the paragraph above requires (stderr alone would
+  do), and deliberately so: a run with stdout redirected is being consumed by
+  something, and a mid-turn human notice is noise to it. The looser gate can be
+  adopted later if a case appears; the stricter one cannot break a consumer that
+  exists today. The TUI is entered only when
   `stderr_styled() && stdout is a TTY && !plain_mode() && !assistive && !jsonl`.
 - **N2** Idle input latency MUST not regress: paste of 10 KiB into the
   composer completes in under 100 ms (the rustyline `ExternalPrinter` lesson).

@@ -225,8 +225,9 @@ pub struct AgentTimelineSnapshot {
 pub enum AgentThreadPhase {
     Running,
     /// Parked on a user answer. Non-terminal: the thread's timeline stays
-    /// open, it offers no handoff, and steering remains answerable. No agent
-    /// can enter this phase yet; a later story populates it.
+    /// open, it offers no handoff, and steering remains answerable. An agent
+    /// enters this phase through `AgentRegistry::park_prompt`, which blocks
+    /// the thread when it parks a permission request.
     Blocked,
     Done,
     Failed,
@@ -644,6 +645,11 @@ impl AgentThreadState {
                     &format!("tool {} {outcome}", safe_inline_label(name, 128)),
                 );
             }
+            // Deliberate no-op: the agents-view timeline is a TTY surface and
+            // F120 scopes the human-facing report of a dropped tool result to a
+            // separate card. Matched explicitly so a new timeline line cannot
+            // appear here by accident.
+            AgentRuntimeEvent::ToolResultsDropped { .. } => {}
             AgentRuntimeEvent::TurnFinished {
                 success,
                 tool_errors,

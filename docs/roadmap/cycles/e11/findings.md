@@ -5087,3 +5087,615 @@ That changes the card. The fix is not "enable bracketed paste on the route that 
 ### The pattern, and it is now the sixth
 
 I wrote a false attribution into a comment **while shipping the feature it described**, and it would have sent the next card at the wrong file — exactly what **F112**'s three errors did. The shape is the same every time: **a plausible mechanism, internally consistent, asserted without re-reading the line.** F91 named the rule (*an entry asserting "X already does Y" needs the line that shows it*), and this is the sixth instance of me breaking it. The comment is corrected **in place**, with the measurement, rather than deleted — **F90**: *"X is missing" and "X is refused" look identical from outside*, and so do *"the route lacks the enable"* and *"the route has it from its caller."*
+
+## F117 — a CLI test is a tool-schema tripwire, and registering `agent_wait` tripped it
+
+**T5-S6 shipped.** The part worth recording is not the tool but what registering it revealed.
+
+`cli::test_context_command_surfaces_window_runtime_evidence` (`tests/cli.rs:16218`) **failed deterministically** the moment the tool was registered — `left: Some(1) right: Some(0)`, i.e. the binary **exited 1**. The implementer confirmed it was theirs by stashing (passes at baseline) and reproduced the stderr by hand:
+
+> `context preflight stopped an oversized provider request: protected prompt needs about 6882 tokens, but the trim target is 6861 tokens (window 8192 …)`
+
+That test drives an **8192-token window with a ~23k-character prompt, and at baseline it clears the trim target by about 90 tokens.** The first `agent_wait` descriptor cost **217** tokens of schema, which put the protected prompt **21 tokens over**.
+
+### The fix was production code, not the test — correctly
+
+The descriptor was trimmed instead: shorter description, **no prose on `until`** (the closed `enum` already says everything), one-line `timeout_secs`. Cost fell to **148** tokens, clearing the target with ~48 to spare. **Every descriptor assertion still holds**, including the one requiring the description to contain *"does not count against"*. No test was touched.
+
+**That is the right instinct and worth naming:** the failing test was not wrong, and the tool's descriptor was genuinely verbose. A card that "fixed" the test's window or prompt would have destroyed a real budget guard to make room for prose a closed enum already conveys.
+
+### But the test is a tripwire, and that needs a card
+
+**Any next tool registered in the non-lean tier will break it again, at any size**, because the margin is ~48 tokens and the test asserts a **startup exit code**. So the failure says `left: Some(1) right: Some(0)` and **nothing about why** — the implementer only found the cause by reproducing the binary's stderr by hand.
+
+**Carded:** either the test should assert the preflight *message* rather than only the exit code, so the next breakage explains itself, or the margin should be made explicit and asserted, so that *"this change costs more schema than the window has"* is the failure a reader sees. The present shape makes a budget regression indistinguishable from any other startup failure.
+
+### H5's real cost is 151 tokens, not 148
+
+Registering the tool also moved the reported **base prompt** from 155 to 158 tokens — the tool's **name reaches the system prompt** as well as the schema list. Expected, but it means the honest figure for the requirement is **148 schema + 3 system prompt = 151**. Recorded because the next person to weigh a tool against a small window will want the whole number, not the schema half.
+
+### Two stale code comments fixed alongside
+
+`subagent/thread.rs:230` claimed *"No agent can enter this phase yet; a later story populates it"* — false since the park path landed. And the authorised test edit replaced a doc comment asserting `blocked` was unreachable, with the assertions left **byte-identical** and the test renamed from `blocked_is_always_zero_until_a_later_story_populates_it` to `blocked_is_zero_for_every_agent_this_test_never_parks`. **Both are F110's family** — a true statement that silently became false when a capability shipped, and neither was found by a sweep: one was found by the test author reading the state machine, the other by needing to use it.
+
+## F118 — my brief would have shipped a fix that printed nothing, and the agent measured instead of trusting me
+
+F117's tripwire is fixed: the four bare `assert_eq!(output.status.code(), Some(0));` sites in `tests/cli.rs` now carry a message naming the binary's own refusal. **Before and after, verbatim:**
+
+```
+left: Some(1)
+right: Some(0)
+```
+
+```
+assertion `left == right` failed: kitsu must exit 0; stderr: ; stdout error events:
+{"exit_code":1,...,"message":"context preflight stopped an oversized provider request:
+protected prompt needs about 7192 tokens, but the trim target is 6861 tokens (window 8192
+tokens, effective prompt budget 7680 tokens, trim target = effective minus a 819 tokens
+reserve); shorten the latest request or system instructions, disable large tool schemas,
+raise the window with --context-window <n>, ...","type":"error"}
+  left: Some(1)
+ right: Some(0)
+```
+
+A reader now gets required versus target, the window, the budget, the reserve and the remedies — **including *"disable large tool schemas"*, which is the actual cause** — without touching the binary.
+
+### The brief's central premise was wrong, and wrong in the way that matters
+
+I wrote: *"the preflight error already states the margin itself, so **surfacing stderr gives the diagnosis for free**."* **It does not.** The target test runs `--jsonl chat --script`, and **in JSONL mode the preflight failure is a JSONL `{"type":"error"}` event on stdout, not stderr.** A stderr-only message renders:
+
+```
+assertion `left == right` failed: kitsu must exit 0; stderr: 
+```
+
+**Empty.** The agent captured that intermediate state rather than reasoning about it, and widened the message to carry stderr **and** the stdout error events.
+
+**This is the sixteenth wrong brief, and the most consequential kind:** not an error that stops work, but one that would have shipped **a fix that looks like a fix and does nothing**. A card closed on it would have left the next tool's failure exactly as blind, with a message in the assertion making it look handled. **That is F75's shape — *a thing that appears to work is worse than one that plainly does not* — applied to my own tooling rather than to a key.**
+
+**What saved it was the instruction, not the instinct.** I had told the agent: *"if a site's stderr is empty or already consumed, say so instead of writing a message that would print nothing."* It hit exactly that case and did exactly that. **The guard worked because it was written down before the premise was tested** — which is the argument for putting the honest-failure clause in every brief, not just the ones where I suspect trouble.
+
+### The per-site answer, which only measurement could give
+
+Probed by flipping each expected value so the assertion fires on the **success** path:
+
+| site | stderr reachable? |
+|---|---|
+| `test_context_window_mismatch_warns_on_stderr` (non-JSONL) | **yes**, non-empty |
+| `test_jsonl_context_window_mismatch_emits_typed_event` | **no** — the very next line asserts `output.stderr.is_empty()`, **by design** |
+| `test_context_command_surfaces_window_runtime_evidence` | **no** — stdout carries it; proven under real failure |
+| `test_piped_chat_system_prompt_names_cwd_and_granted_roots` (non-JSONL) | **yes**, non-empty |
+
+**Two of four reach stderr; two are JSONL and reach the diagnosis only via stdout** — and one of those *asserts stderr is empty on the next line*, so a stderr-only message there was never going to work. One combined message covers both shapes, which is why all four got the same one.
+
+### A second tripwire, found by the inflation
+
+Under the inflated descriptor, **`test_no_artifacts_bounds_large_tool_result_and_saves_session_without_sidecar` also failed** — `assertion failed: tool_content.contains("bytes omitted by artifact-free policy")` — **the same blind-failure shape, outside this card's four sites.** Green again after revert. **Carded.** The inflation lever is now a known instrument for finding these: inflate a tool schema and see which tests fail without saying why.
+
+## F119 — the schema-regression exposure is two tests, not a family; and underneath it, a run that drops a tool result and reports success
+
+Swept systematically with the inflation lever rather than waiting for each tripwire to bite. **13 suites, both profiles, two inflation sizes, every run captured to its own file.**
+
+### The ratio, which is the card's deliverable
+
+| inflation | tests failing | blind |
+|---|---|---|
+| **large** (12 lorem copies, **+331 tokens** over target) | **2** | **1** (50%) |
+| **small** (2 copies, **+21 tokens** — the exact margin F117 tripped) | **1** | **0** |
+| union, after this card | **2** | **0** |
+
+**The exposure is smaller than feared, and that is a real result.** **No test outside `--test cli` fails under either inflation, in either profile.** The tripwire surface is two tests in one suite, not a family spread across the workspace — so the speculative sweep I was half-expecting to need is not needed.
+
+**F118's fix is working:** the context test, which was the original blind failure, now reports the preflight refusal verbatim at both inflation sizes.
+
+### The two tests fail by different mechanisms at different distances
+
+This is what the **small** inflation bought, and it is why asking for two sizes mattered:
+
+- **At +21 tokens**, the context test trips the **preflight** — an explicit refusal with an exit code.
+- **At +331**, the artifact-free test fails because the **history trimmer elides an entire tool message**, and the budget has to be squeezed much further before that happens.
+
+So they are not two instances of one defect. The realistic case — a normal tool, not lorem — hits only the first, which already explains itself.
+
+### The real finding, and it is production-side
+
+The artifact-free failure is the serious one, and the agent measured why a message was needed rather than stderr: that test **asserts `output.stderr.is_empty()`**, consumes stdout into its event vector, and — measured against the real failure — **there is no trim, budget or context event on stdout at all.** Every JSONL event reports `status: "ok"`, `turn_finished` and `final_summary` included.
+
+**So a run can silently drop an entire tool result and report success.** The tool ran, bounded its own output correctly (`artifact_status "suppressed_by_policy"`, `output_bytes 12030`, `output_retained_bytes 7936`), and then history trimming elided the message before the provider saw it — leaving `[older tool output elided]`, 26 bytes, and a run that claims it went fine.
+
+**The test now names it. A reader of the binary's output would see nothing.** That is observability in production code, out of this card's scope by its own constraint, and **carded**: a turn that drops a tool result should say so in its event stream, not only in a test's assertion message.
+
+### Two process notes worth keeping
+
+**The agent narrowed its own message after measuring the render.** Its first draft embedded the whole `tool_finished` event and produced **a 12 KB wall of filler that buried the finding**; it cut back to four policy fields and 300 characters of content *because the render was measured, not assumed*. A diagnostic that is too verbose to read is as useless as one that is empty — and only rendering it tells you which you have written.
+
+**The honest-failure clause earned its place a second time.** Carried from F118 into this brief, it correctly kept stderr **out** of the one message written here. Two cards running, that clause has been the difference between a diagnostic and a decoration.
+
+### F120 refined, after nearly refuting it
+
+I went to card F120 and first tried to disprove it, because its evidence was *"no trim, budget or context event on stdout"* — **an assertion of absence from a narrow search**, which is the error pattern that has bitten this project repeatedly (and my own standing note says never to assert absence from one).
+
+**And the search was indeed too narrow: the vocabulary F120 says is missing already exists.**
+
+- `CompactionOutcome::ToolResultsElided` (`orchestrator.rs:931`), named `"tool_results_elided"` by `compaction_outcome_name` (`main.rs:4982`).
+- `compaction_report_payload` (`main.rs:5004`) emits `"outcome"`, `"tokens_before"/"after"`, `"messages_before"/"after"` **and a dedicated `"tool_results_elided"` count.**
+- `--offload-cap`'s own help documents the trade-off precisely: lowering it *"makes trimming lossless: an evicted result leaves an `fs_read_file` pointer the model can recall, instead of a dead `[older tool output elided]`."*
+
+**So the system knows about this loss, has a name for it, has a count for it, and has a flag to avoid it.**
+
+### But the absence is real, and I verified it the non-narrow way
+
+Instead of grepping for event names I suspected, I **enumerated every event type** in the agent's captured failing run. The complete set is: `run_started`, `turn_started`, `provider_request`, `provider_attempt`, `tool_started`, `tool_finished`, `assistant`, `assistant_disposition`, `turn_finished`, `final_summary`. **There is no compaction event, and `tool_results_elided` appears zero times.**
+
+**That is the honest shape of F120**, and it is a better finding than the original:
+
+> **The elision happened on a path that produced no compaction report at all.** The reporting vocabulary exists and did not fire — so the card is *"make the existing report fire on this path, or establish why it cannot"*, **not** *"design an event for an unreported loss"*.
+
+`elided_tool_stub` has exactly **one** call site (`orchestrator.rs:3917`), while the outcome is recorded at **3246** and **3336** — so the question is concrete: whether 3917's caller is inside a path that records a `CompactionRecord`, and if not, why.
+
+### The method note, which is the transferable part
+
+**Two absence claims about the same thing were made in two different ways, and only one is trustworthy.** Grepping for *"trim|budget|context"* and concluding "no event" is a guess about naming. **Enumerating every `"type"` in the stream and reading the list is a measurement** — it cannot miss an event whose name I failed to predict. When the claim is *"nothing reports X"*, **enumerate the channel, do not search it.**
+
+## F121 — F120's refined hypothesis was also wrong: the record is created, counted, and then thrown away
+
+I refined F120 once (the vocabulary exists, it just didn't fire) and the test agent **refuted that too, by probe rather than by reading.** It put a *file-backed* probe — deliberately not stderr, which would have tripped the target test's own `assert!(output.stderr.is_empty())` before reaching the real failure — at both outcome sites and inside `record_progress`. The failing run printed:
+
+```
+PROBE_WINDOW elided=1
+PROBE_RECORD outcome=ToolResultsElided elided=1
+```
+
+**So the record IS created.** `trim_tool_results_counted` (the only caller of `elided_tool_stub`) has exactly two non-test callers and **both** set `ToolResultsElided`; `record_progress` is reached, passes its `?`, and pushes a real `CompactionRecord` into the ledger. There is no third unrecorded path.
+
+### The actual defect: there is no transport
+
+Verified independently:
+
+- **`compaction_report_payload` has exactly one call site** — the `/compact` slash command. Nothing else in the binary renders it.
+- **`orchestrator.rs:1564` calls `enforce_context_budget_recording(...).await?;` and discards the returned `CompactionReport`** — the call ends unbound, confirmed to the semicolon.
+- **`AgentRuntimeEvent` has no compaction variant at all**, enumerated over the whole enum rather than searched: `ProviderRequest`, `StructuredFinalizationDeferred`, `ProviderAttempt`, `AssistantDelta`, `Usage`, `ToolStarted`, `ToolFinished`, `TurnFinished`.
+- `final_summary`'s payload carries no compaction or elision field.
+
+**The loss is detected, named, counted, recorded in a ledger — and reaches only two surfaces, both user-initiated after the fact (`/compact`'s result and `/context`'s ledger JSON).** A `--jsonl` run that drops a tool result mid-turn has no surface whatsoever.
+
+**So the card as I briefed it is not executable.** *"Make the existing report fire on this path"* requires a transport that does not exist, and the agent **stopped on exactly the condition I gave it** — add a new event type or a new outcome name and stop — rather than designing one unasked.
+
+### The catch that changes the fix's shape
+
+**The existing count does not distinguish lossy from lossless.** With a low `--offload-cap`, `elided_tool_stub` keeps the offload-pointer line and drops only the preview body — a **recallable** elision, which is the documented *good* case — and `trim_tool_results_counted` **still counts it** and still sets `ToolResultsElided`.
+
+So a naive *"warn when `tool_results_elided > 0`"* fix **warns on the lossless case** and becomes the noise I warned the brief against. The split has to be computed inside `trim_tool_results_counted`, i.e. **a second counter**. That is materially more than "fire the existing report", and it is the honest scope.
+
+### My ruling on the channel, which was mine to give
+
+**N1 is not a blanket ban, and reading it as one was my error.** Quoted: *"Non-TTY, `--plain`/`NO_COLOR`, assistive (`--screen-reader`), and JSONL output MUST stay byte-identical to today."* **An interactive TTY run is not in that list.** So:
+
+- **JSONL: one new additive event `"type"`, emitted only on the lossy path.** A new type leaves every existing event's bytes untouched — strictly less exposure than mutating `turn_finished` or `final_summary`, and far less than touching `status`. Only a consumer asserting *"exactly these types appear"* is affected, and a run that currently lies is not a shape N1 was written to protect.
+- **Interactive TTY: a human line is permissible**, because N1 does not cover it. Scoped as a follow-up, not this card.
+- **Non-TTY, `--plain`, assistive: nothing new**, to honour N1 exactly.
+
+The conditional-field precedent the agent found (`final_summary` adds `output_last_message_state` only when `Some`) is noted as the fallback if a field is ever preferred to an event.
+
+### And a brief error of my own, the seventeenth
+
+My brief pointed the agent at *"`scratchpad/f119/` … `run.sh` and `inflate.py`"* as prior captures. **Those are in *my* session scratchpad, not the agent's** — each has its own — so the path resolved to nothing. The agent rebuilt the instrument from the brief's prose and reproduced the documented failure exactly, so nothing was lost. **Lesson: never point a brief at a session-local artifact without an absolute path, and prefer describing the instrument to citing a file.** The prose was what actually transferred.
+
+### F120's doc prep: the JSONL event vocabulary is not enumerated anywhere in the docs
+
+Applied **F114**'s positive check ahead of the commit — *for every user-visible thing a card touches, grep the docs for it by name* — to see which list a new `"type"` should join. **There is no list.** Counted per type across `README.md` and `docs/functionality.md`:
+
+| event type | README | functionality.md |
+|---|---|---|
+| `final_summary` | 7 | 7 |
+| `run_started` | 4 | 4 |
+| `provider_attempt` | 2 | 1 |
+| `assistant_disposition` | 1 | 1 |
+| **`tool_started`** | **0** | **0** |
+| **`tool_finished`** | **0** | **0** |
+| **`turn_finished`** | **0** | **0** |
+
+So the types that appear do so **because some feature's prose happens to name them**, not because the stream is documented. **Three of the ten are absent entirely** — including `tool_finished`, which is the event F120's own test asserts the honesty of.
+
+**Consequences, both worth stating:**
+
+1. **For this card:** a new `"type"` has no enumeration to join, so the honest obligation is a CHANGELOG entry plus a sentence where the JSONL stream is described — not an edit to a list that does not exist. That is a smaller doc change than F114's rule would suggest, and the rule's *answer* here is "there is nowhere to add it", which is itself the finding.
+2. **Pre-existing and larger:** **an integrator cannot learn the stream's vocabulary from the documentation.** They must read `AgentRuntimeEvent`. Given **N1** promises JSONL output stays *byte-identical*, that promise is being made about a surface the docs never fully describe — the contract is stricter than the documentation of it. **Noted, not carded in this epic**, since it is squarely outside E11's TUI scope, but it belongs in whatever cycle owns the JSONL contract.
+
+## F123 — my gate list omitted the crate the change lived in, and the implementer added it unasked
+
+**F120 shipped.** The event is `tool_results_dropped { round, dropped }`, emitted at the elision site from `cfg.event_log` and `round` — so `CompactionReport`, `compaction_report_payload` and the discarded call are all untouched, and `crates/kitsu/src/main.rs` has **zero diff**.
+
+### The gate gap, which is mine
+
+**Every brief this epic has carried the same baseline gate list, and `kitsu-core` was never in it.** The F120 change lives in `crates/kitsu-core/src/orchestrator.rs`, and that crate's `orchestrator_tests` module — including `trim_tool_results_preserves_offload_pointer_but_drops_preview`, which is *directly* about the behaviour this card changed — **compiles into `kitsu-core --lib`, not into `kitsu --bins`.**
+
+So the gate list I have been pasting into briefs for a dozen cards **would have let a change to the trimmer ship without running the trimmer's own tests.** The implementer ran it **on its own initiative**, having noticed its change was in a crate the list omitted: **160 passed, 0 failed**, both profiles. I verified it independently.
+
+**New baseline, to carry forward: `kitsu-core` 160 (plus 9, 7, 3, 2, 2, 0 in its other targets).**
+
+**The lesson is not "add a crate to the list".** It is that **the list was assembled from the crates this epic's cards had touched** — a TUI epic, so TUI crates — and then reused as if it were the workspace. A gate list that is not derived from the workspace is a gate list that silently excludes whatever the next card reaches. **The honest form is to derive it: `cargo test --workspace`, or at minimum check that the crate you changed is in the list before trusting it.**
+
+### Two smaller things
+
+**The implementer corrected my arithmetic**: I called the pinned event sequence "13-element"; it is **12**, and the tests were right. Cosmetic, reported rather than silently followed — which is the behaviour I want, since the alternative is an agent quietly "fixing" a test to match a number in my brief.
+
+**The two no-op arms are the right shape and are commented as decisions**, not omissions: *"Matched explicitly rather than swept into a wildcard so adding an activity line here stays a decision, not an accident."* The TTY surface is now **F122**, open — because N1 does not cover interactive TTY runs (clarified in the design doc this commit), so a human line there is permissible but ought to be chosen deliberately.
+
+## F124 — the gate list, derived from the workspace at last. It was missing two whole crates.
+
+**F123 said `kitsu-core` was absent from the baseline gate list I have pasted into a dozen briefs. It is worse than that.** Derived properly from `cargo metadata --no-deps`, then run:
+
+| crate | targets my list ran | targets it did **not** |
+|---|---|---|
+| `kitsu` | `--bins` + all 5 integration targets | — |
+| **`kitsu-core`** | **none** | **lib (160) + `run_contract` 9, `session_contract` 7, `session_k04` 3, `session_k07` 2, `session_k08` 2** |
+| `kitsu-editor` | lib + `public_api` (as `-p kitsu-editor`) | — |
+| **`kitsu-providers`** | **none** | **lib (120) + 7 route/wire targets: 2, 6, 4, 12, 4, 4, 31** |
+| `kitsu-render` | lib | — |
+| `kitsu-tools` | lib (413) | **`semantic_evidence` 15, `structural_context` 5** |
+| `kitsu-tui` | lib | — |
+
+**Two entire crates and four further targets — 1 140 tests across 21 targets in the non-`kitsu` half alone, of which my list reached 745.** All green; `cargo test --workspace --exclude kitsu` exits 0.
+
+### The canonical gate, to use in every brief from here
+
+```
+cargo test --workspace --exclude kitsu          # 21 targets, 1140 tests
+cargo test -p kitsu --bins                      # 975
+cargo test -p kitsu --test cli                  # 248
+cargo test -p kitsu --test tui -- --test-threads=1   # 75
+cargo test -p kitsu --test paste_latency        # 4
+cargo test -p kitsu --test carrier_matrix       # 7
+cargo test -p kitsu --test build_provenance     # 2
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace -- -D warnings
+```
+
+`kitsu` stays enumerated because **`--test tui` needs `--test-threads=1`**, which is why the workspace form cannot simply replace everything — and that constraint is almost certainly how the list came to be hand-written in the first place.
+
+### Why this happened, which is the transferable part
+
+**The list was assembled from the crates this epic's cards happened to touch** — a TUI epic, so `kitsu`, `kitsu-tui`, `kitsu-render`, `kitsu-editor`, `kitsu-tools` — **and then reused as if it were the workspace.** Nothing ever compared it against the member list. It was accurate for its first card and silently wrong for every card that reached further.
+
+**A gate list that is not derived is a gate list that excludes whatever you did not think of.** And the failure is invisible in exactly the wrong way: every brief reported *"all green, both profiles"*, truthfully, about a subset I had chosen without knowing I had chosen it.
+
+**It nearly cost something real.** F120 changed the history trimmer in `kitsu-core`, whose own test — `trim_tool_results_preserves_offload_pointer_but_drops_preview` — is *directly* about that behaviour and lives in a target my list never ran. The implementer ran it on initiative. **Had it not, the card would have shipped "fully verified" with the relevant test unexecuted.**
+
+**The same shape as F114**, one layer up: there I could not grep for a README row that was missing; here I could not notice a crate I had never listed. **Absence is the thing checklists cannot see, and the remedy is the same both times — derive the list from the system, do not curate it from memory.**
+
+## F125 — N1 never said which file descriptor, and three inline composites answered differently
+
+Flagged by F122's test author and verified: **N1 says "Non-TTY" without naming a descriptor**, and the system does not treat them as one thing.
+
+- `kitsu_render::is_tty()` is `io::stdout().is_terminal()` — **stdout**.
+- `stderr_is_tty()` is a **separate** function — **stderr**.
+- N1's own parenthetical says *"stdout is a TTY"*.
+- **The three inline composites in the binary all key on `stdin_is_tty()`** — verified, three occurrences, none of them stdout and none carrying a `jsonl` term.
+
+So the requirement, its own example, and the code each pick a different descriptor. **They differ for a real invocation**: `kitsu chat <prompt> | tee` has a terminal stdin and stderr but a piped stdout.
+
+### The resolution, now in the design doc
+
+**N1 protects consumers, and a consumer can redirect either descriptor independently.** So *"non-TTY"* means **per-descriptor**: when a given descriptor is not a terminal, *that* descriptor's bytes stay identical. It is not one global condition, which is why no single predicate was ever going to express it.
+
+F122's human line is therefore gated on **`stderr_styled() && is_tty()`** — both terminals — which is **stricter than the minimum** (stderr alone would satisfy the paragraph). Deliberate: a run with stdout redirected is being consumed by something, and a mid-turn notice is noise to it. **The stricter gate cannot break a consumer that exists today; the looser one might, and can be adopted later if a case appears.**
+
+### Why this is worth a finding rather than a quiet edit
+
+**I cited those three composites to the agent as *"possibly N1's predicate, measure it"*** — and the useful part is that the hedge was right for a reason I had not guessed. I expected "one predicate spelled three ways, so extract it". The answer was **four distinct conditions for four distinct jobs**, which is why the agent's recommendation was *do not extract* and why extraction would not have been behaviour-preserving.
+
+**An invariant that names a property without naming the thing it holds of is not yet an invariant.** N1 had been cited in a dozen cards and amended twice before anyone needed to know which descriptor it meant — and the moment a gate depended on it, three different answers were already in the tree.
+
+### Also now biting: F121's documentation gap
+
+`test_n1_jsonl_gains_nothing_from_the_human_report_of_a_dropped_result` is the **second** test hard-coding the full ordered JSONL `"type"` sequence, and there is still **no documented list** for either to reference. Two tests now encode a contract the documentation does not state — so a change to the stream breaks them with no doc to consult. Recorded under F121; still outside this epic's scope, but the cost is now concrete rather than hypothetical.
+
+## F126 — F121 was wrong, and two commits ago I shipped a contract gap because of it
+
+**RETRACTION.** F121 recorded that *"the JSONL event vocabulary is enumerated nowhere in the docs"* and that *"an integrator cannot learn the stream's vocabulary from the documentation."* **Both are false.**
+
+**There is a published JSON Schema** — `docs/schemas/kitsu-chat-v1.schema.json`, 42 `$defs`, with an event-shaped definition for **every one** of the eleven types: `run_started`, `turn_started`, `turn_finished`, `final_summary`, `tool_started`, `tool_finished`, `assistant`, `assistant_disposition`, `provider_request`, `provider_attempt`, `error`. **And the code already pins against it**, via `include_str!("../../../docs/schemas/kitsu-chat-v1.schema.json")` in `kitsu-render/src/jsonl.rs`.
+
+**How I got it wrong: I searched `README.md` and `docs/functionality.md` for type names, found three absent, and concluded the vocabulary was undocumented.** The documentation exists in a different *form* — a formal schema, not prose. **That is the third time this session I have asserted absence from a search whose shape could not have found the thing** (F116's backwards paste attribution, F120's two wrong hypotheses, now this), and it is the error my own standing note warns about.
+
+### The consequence, which is a real defect in a commit I accepted
+
+**`tool_results_dropped` is NOT in the schema.** Commit `2d1785c` added a new JSONL event type and never updated the published contract, so **the schema no longer describes the stream it documents.** I accepted that card — twice over, since F122 extended the same feature and I checked the docs again without finding this.
+
+### Why the existing guard did not catch it, which is the fix worth building
+
+`published_schema_keeps_command_payload_and_event_definitions_distinct` asserts that **specific** `$defs` exist and that **specific** `$ref`s point where expected. **It never requires that every `AgentRuntimeEvent` variant has a definition.** The schema is pinned for **structure**, not for **coverage** — so a new event type slips through in silence, which is exactly what happened.
+
+**The card is therefore two things**, and the second matters more than the first:
+
+1. Add `tool_results_dropped` to the schema — the gap I shipped.
+2. **Add a coverage test: every `AgentRuntimeEvent` variant must have a schema definition.** That converts *"remember to update the schema"* into an enforced invariant, which is the only form that has held up in this session.
+
+**Where it must live, measured:** `kitsu-render` has **no `kitsu-*` dependency** — load-bearing, it is what makes "classic pays nothing" a compile-time property — so the existing schema test **cannot see the enum**. The coverage test belongs in **`kitsu-core`**, where `AgentRuntimeEvent` is defined, and can reach the schema at `../../docs/schemas/kitsu-chat-v1.schema.json`. Verified both.
+
+### The pattern, stated once more because it keeps recurring
+
+**F124** found a gate list curated from memory rather than derived from the workspace. **F114** found a README row that was missing, which no grep could reveal. **This** is the same shape a third time: a contract pinned by a test that checks *the parts someone thought of* rather than *the whole set*. **Every one was invisible precisely because the check was authored from the same mental model as the thing it checked.** The remedy is identical each time — enumerate the system, do not curate a list from what you remember of it.
+
+### F126's exposure, bounded before briefing the fix
+
+Applied this card's own lesson one level up: **are there other published contracts pinned for structure but not coverage?** Measured — `docs/schemas/` contains **exactly one** file, `kitsu-chat-v1.schema.json`, referenced from **one** source file.
+
+**So the exposure is one schema, not a family.** Same shape of result as F119's sweep: a measured *"smaller than feared"*, which is worth having explicitly rather than leaving as an open worry. The coverage test this card adds therefore closes the whole class, not a sample of it.
+
+### F126 corrected — the finding about curated lists contained a curated list, and it was wrong
+
+**F126, and the brief I wrote from it, both listed eleven event types as having schema definitions:** `run_started`, `turn_started`, `turn_finished`, `final_summary`, `tool_started`, `tool_finished`, `assistant`, `assistant_disposition`, `provider_request`, `provider_attempt`, `error`. **Measured by the test author and verified by me, that list is wrong in both directions.**
+
+**`AgentRuntimeEvent` has nine variants:** `ProviderRequest`, `StructuredFinalizationDeferred`, `ProviderAttempt`, `AssistantDelta`, `Usage`, `ToolStarted`, `ToolFinished`, `TurnFinished`, `ToolResultsDropped`.
+
+- **Six of my eleven are not variants at all** — `run_started`, `turn_started`, `final_summary`, `assistant`, `assistant_disposition` and `error` are **frontend-level** events emitted elsewhere, which is why the schema has defs for them.
+- **Three real variants were missing from my list**: `structured_finalization_deferred`, `assistant_delta`, `usage`.
+
+**I had assembled it from the event types I had seen in a captured stream**, not from the enum — the identical method whose failure F126 exists to record. **The finding about curating lists was itself curated.** The card's conclusion survives untouched: the coverage hole is real and is exactly `tool_results_dropped`, at **8 of 9**.
+
+### And a second half of the same gap, which nobody had reported
+
+`$defs/forward_compatible_event` carries a **hand-maintained `type.not.enum` of 26 names**, and **`tool_results_dropped` is absent from it too** — verified. So the published contract today says a `tool_results_dropped` line is an *unknown forward-compatible event*, and **a schema-validating consumer accepts it as something it need not understand.** Commit `2d1785c` missed **both** places, and the fix is two schema edits, not one.
+
+**That is the sharper version of the defect.** The missing definition means the contract is silent about the event; the missing exclusion means the contract **actively mis-describes** it. A consumer doing the right thing — validating against the published schema — is told to ignore a line reporting data loss.
+
+### The enumeration the author built, which is the part to keep
+
+Rejected: a literal name array (the failure this card exists to fix), `strum::EnumIter` (no non-unit variants, and a production derive), `mem::Discriminant` (not enumerable), and parsing the enum out of source (*"a reimplemented Rust parser is a worse oracle than the compiler"*).
+
+Chosen: **one declarative macro whose single list expands into both a sample-value function and an exhaustive `match`** — so an arm and its sample come from the same entry and cannot drift. A plain samples-list-plus-match can be satisfied by adding an arm and forgetting the sample; this cannot.
+
+**And the tripwire was verified, not asserted:** transiently adding a tenth variant produced `error[E0004]: non-exhaustive patterns`, whose only repair is a new macro entry, which supplies a sample, which the coverage test walks, which then demands the `$defs` entry. **No wire name is typed anywhere in the file** — every one is read back out of `serde_json::to_value(&sample)["event"]`.
+
+### F126 closed — and the closing line is the agent's, because it is better than mine
+
+**Three dimensions, and two were found after my brief.** A contract entry is not one place: `tool_results_dropped` needed a **`$defs` definition** pinning its `type` (my brief), **absence from `forward_compatible_event`'s exclusion list** (found by the test author), and **a branch of the closed root `oneOf`** (found by the implementer). Verified: the root's keys are exactly `$schema, $id, title, description, oneOf, $defs` — **nothing else**, so it is genuinely closed, and **the two edits I prescribed would have made the schema reject a line the tool emits.** Strictly worse than the defect.
+
+**The third edit was not test-driven and the implementer said so** rather than presenting three edits as if the tests demanded all three. It was then **made** test-driven: the branch was dropped from a scratch copy (28 → 27, anchored), `include_str!` repointed, and the assertion failed naming the variant — a structural mutation standing in for validation the host cannot run.
+
+**Folded into one test, for a reason worth keeping.** The three are **one question** — *does the contract accept this variant's line?* — and the folded message says **`defined and pinned 9/9`** *and then* names the branch, so a reader is told the definition is right and the root is the problem. Three separate tests would have reported the branch gap with no way to see that the other two were fine.
+
+**One invariant added that I would not have thought of:** exactly one root branch pins no `type` constant — `not_event_shaped == ["forward_compatible_event"]`. **A second catch-all branch would silently reopen the closed root and void the whole dimension.** Asserted from the measurement, not assumed.
+
+**And one surface deliberately left unpinned, with its reason:** every event def having a branch. *"The schema author's structural choice, not an invariant the enum can speak to"* — and its home is `kitsu-render`'s structural test, not a coverage test driven by the Rust enum. Declining to assert something the oracle cannot speak to is the same discipline as declining to write the `--max-rounds` assertion two cards ago.
+
+### The closing line, verbatim, because it generalises past this schema
+
+> *A contract has as many coverage dimensions as it has places a name must appear, and enumerating those is the same problem one level up.*
+
+That is the honest end of the thread that runs **F114 → F124 → F126**: a README row that no grep could reveal, a gate list curated from the crates one epic touched, and a contract check that pinned the parts someone thought of. Each was invisible because the check shared a mental model with the thing checked. **This card fixed the third and named the fourth** — the enumeration of the dimensions themselves — rather than pretending the regress had bottomed out.
+
+## F127 — T5-S7 is blocked on an external spec, and saying so is the deliverable
+
+Took T5-S7 (the herdr integration manifest) as the next numbered story and measured it before briefing. **It cannot be built verifiably here.**
+
+**H4 reads:** *"Kitsu SHOULD ship a herdr integration manifest (`herdr-plugin.toml` or screen manifest) under `integrations/herdr/` so kitsu is detected natively."* It names **two** alternatives and specifies **neither**.
+
+**And that sentence is the only description of the format in the entire repository.** Every other `herdr` occurrence — the design doc, the plan, nine cycle records — discusses the integration *conceptually*. There is no schema, no example, and no herdr installation to test detection against.
+
+**So a manifest written now would be guesswork asserting a third-party schema nobody in this repo can check** — an artifact that *looks* like an integration and may not be one. That is the shape this session has refused repeatedly: the unverifiable claim that reads as settled. And **H4 is a SHOULD**, so declining to ship it violates no requirement.
+
+**Recorded with what it actually needs** — herdr's plugin/manifest schema, from a human or from herdr's own documentation — after which it is a small card. That is the third item now explicitly blocked on external input, alongside **Q1**'s live terminal matrix and **R6-d**'s dump-exposure decision.
+
+**The general point, since this is the fourth time this epic:** *"this card needs information that does not exist in the repository"* is a finding, not a failure to deliver. Writing the artifact anyway would convert a known unknown into an unknown unknown — a file future readers would reasonably trust.
+
+## F128 — F107-b done: only two of four tests leaked, and both leaked two slots
+
+**The brief said four tests leak `FOREGROUND_RECAP`. Two do.** Captured, not reasoned:
+
+```
+BEFORE:  the_jobs_view_command_…              recap_is_some=false
+         the_status_row_and_the_prompt_label_… recap_is_some=true
+         the_detach_command_…                 recap_is_some=false
+         the_views_attach_…                   recap_is_some=true
+```
+
+The two clean ones end with `apply_detach_command`, which calls `replay_foreground_recap` — **they already detach through production, which is exactly the shape the card asked for.** The agent left them alone rather than "fixing" them to make the count four. **Twentieth wrong brief.**
+
+### A second leak the same two carried, which the brief did not mention
+
+Probing `Arc::ptr_eq` on `active_surface()` at entry versus exit showed both leaking tests also left **the surface slot itself** holding the `BufferedSurface` that `begin_foreground_buffering` installed. **Strictly worse than the recap slot alone**, and the same cleanup closes it.
+
+And `the_status_row…` needed **two** cleanup calls, not one: it attaches, clears the binding cell directly (*which production never does* — the real routes go through `replay_foreground_recap`), then **attaches again**. Two buffers, one overwrite, and the first becomes unreachable through the global — so the cleanup had to balance each attachment where it ends, not all at the end.
+
+### The hypothetical is constructible, and it reproduced the assessor's sentence verbatim
+
+A throwaway detach-first test, run against the leak:
+
+```
+assertion `left == right` failed: the detach-first test's own probe must still be installed
+  left: []
+ right: ["after the detach-first"]
+```
+
+`left: []` because the detach-first call took **the other test's leaked buffer** and `set_surface`'d its inner surface over the live probe — the line went to real stderr instead. With the cleanup: passes. **Then deleted** — evidence, not a deliverable.
+
+**Production paths only**, chosen per test with a measured reason: `apply_inline_detach` (the composer loop's own arm, where `←` and `Ctrl+X d` land) for one; `replay_foreground_recap` for the other, because its binding is already `None` and the keystroke routes would short-circuit on `take()` and replay nothing. **No test-only teardown, no `#[cfg(test)]` reset.**
+
+**Verification proportionate to the subject:** the card is about cross-test contamination, so a single green run proves little. **61 debug + 61 release `--bins` runs, zero failures.**
+
+## F129 — my own committed code was fmt-dirty for two cards, and my gate said clean
+
+`cargo fmt -p kitsu -- --check` reported **six deviations in `crates/kitsu/tests/cli.rs`** — a file **unmodified in the working tree**, so the dirt was **committed**, by me, in the two `tool_results_dropped` cards. Flagged by the F107-b agent as *"not mine, but the next card to run fmt will sweep it into its diff."*
+
+**Fixed in this commit**, and verified semantically inert before accepting: the token streams are **identical modulo trailing commas** (which rustfmt drops when joining a multi-line call onto one line, and which are meaningless in Rust), the suite is green at 256, and `--check` is now clean. A naive string-literal comparison initially flagged a difference; it was a regex artifact — a quote inside a doc comment ran the match on into code — and both files have identical literal counts.
+
+**Why the gate missed it:** my gate list carries `cargo fmt -p kitsu -- --check`, agents reported it clean, and it was not. **The most likely explanation is that it was run before the final test edits**, which is the one ordering a per-card checklist cannot express. Noted rather than solved: **a gate that runs before the last edit is not a gate**, and the fix is to run fmt last, after the suites, not alongside them.
+
+## F130 — a twelfth flake, captured whole this time: ETXTBSY staging an executable
+
+During my post-fmt re-run, `kitsu-tools --lib` failed **412 passed / 1 failed** on `external::backend::tests::dropping_live_supervisor_transfers_and_cleans_all_owned_workers`. **In a crate my change does not touch.** Three re-runs: 413, 413, 413. In isolation: passes.
+
+**Captured whole to its own file** (1 142 lines) — and the assertion is the diagnosis:
+
+```
+cannot stage immutable executable: Device or resource busy (os error 16)
+```
+
+**ETXTBSY**, not disk space (`/tmp` at 20%). A test tried to write an executable **another process has open for execution** — parallel tests contending for one staging path.
+
+**So it is the same shape as F107, in a different medium:** shared mutable state across parallel tests, where the shared thing is a **filesystem path** rather than a process-global. Not fixed here — different crate, and `kitsu-tools` holds the maintainer's uncommitted work — but **carded with its mechanism named**, which is more than the eleventh flake has after six sightings' worth of runs.
+
+**And this is why the capture rule exists.** My own truncated capture two cards ago left the eleventh flake unidentifiable to this day. This one took one `grep -o` to diagnose because the whole run was kept.
+
+### F130 corrected — I named its mechanism from the errno, and the implementation refutes it
+
+I wrote that F130 was *"parallel tests contending for one staging path … a filesystem path rather than a process-global."* **That is wrong, and reading the implementation refutes it.**
+
+`stage_executable_image` (`kitsu-tools/src/external/backend.rs:1555`) stages through **`memfd_create`** — an **anonymous in-memory file with no filesystem path at all.** There is no path to contend for. I inferred "path contention" from `ETXTBSY` + the words *"stage immutable executable"*, which is **the same error I have now made four times this session: a mechanism asserted from a plausible reading instead of from the code.**
+
+### What is actually established, and what is not
+
+**Established:** the error is formatted in **production** code — `executable_sha256` wraps `stage_executable_image` — so this is not a test-only path; the errno is `16`; and it is not disk space (`/tmp` at 20%).
+
+**Not established:** *which operation failed.* The function has **six** fallible steps — `source.metadata()`, `source.seek()`, the `memfd_create` syscall, the header `read`, the `write_all` into the memfd, and the streaming `read` loop — and they all propagate through one `?` into one message:
+
+```rust
+format!("cannot stage immutable executable: {error}")
+```
+
+**The message names the activity and loses the operation.** `memfd_create` does not document `EBUSY`; a `read` returning it would be unusual. So I cannot say what happened, and the capture cannot tell me — there was no backtrace, and the wrapper discards the context.
+
+### Which makes the card a better one than "fix the flake"
+
+**This is F117's shape in production:** a failure that reports *that* something went wrong and not *what*. There, a bare exit-code assertion cost a card's worth of debugging until the message was made to name the refusal. Here, an `io::Error` from one of six syscalls is flattened into one string, so the **next** sighting will be exactly as undiagnosable as this one.
+
+**So the next card is diagnosis before repair: make the staging error name the operation that failed.** That is a small production change, it is testable (each failure mode should name its own step), and it converts a flake nobody can explain into one whose next occurrence explains itself. **Fixing the contention I guessed at would have been fixing something I had not shown to exist.**
+
+**And the ledger stays honest:** F130 remains **open with its mechanism unknown**, not "diagnosed". The eleventh flake is unidentifiable because I truncated its capture; the twelfth is unidentifiable because the *product* truncates its own error. Those are different failures and only the second is fixable in code.
+
+## F132 — the derived gate list needed `--no-fail-fast`, and its absence had already misled me once
+
+**F124** replaced a curated gate list with one derived from `cargo metadata`. **It was still wrong in a way that only shows up when something fails.**
+
+`cargo test --workspace --exclude kitsu` **halts at the first failing target** and never runs the rest. So a run with one failure reports a **partial** count, and the partial looks like a result.
+
+**It misled me the same day.** Verifying a formatting fix, I read *"18 ok-lines, failures: 2"* where the baseline is 28 targets, and my first thought was that my own change had broken ten targets in a crate it does not touch. It had not: one `kitsu-tools` test failed (**F130**), the run stopped there, and the remaining ten targets were never executed. **The number was not a smaller result; it was a truncated run** — and I nearly diagnosed a phantom regression from it.
+
+**Corrected in the gate list:** `cargo test --no-fail-fast --workspace --exclude kitsu`, so a failure costs one target's green and not the visibility of every target after it.
+
+### Why this belongs with F114, F124 and F126 rather than being a flag tip
+
+Those three were about **absence**: a README row that was missing, crates never listed, schema entries nothing required. **This is about a count that is present and means something other than what it appears to.** A gate that reports `18` when the baseline is `28` is not silent — it is *wrong in a way that invites a wrong diagnosis*, which is worse than silence, because silence prompts a question and a plausible number does not.
+
+**The generalisation for any gate I write from here:** a gate must report either the whole truth or an obvious failure, never a plausible fraction. `--no-fail-fast` buys that for cargo; the equivalent question is worth asking of every command on the list.
+
+### F101's sweep, this card's run: one real dangling reference, two false positives, both adjudicated
+
+Ran both doc sweeps as the discipline requires. **The reference sweep nominated three; exactly one was real.**
+
+- **`R6-d` — REAL.** The requirement map still cites it and **the row was gone.** I added it when splitting R6 four ways, then lost it in a later restructure of the same table. **Restored, with its gate and the reason intact.** Third time a correction of mine has created a dangling reference, and the third time this sweep has caught one.
+- **`F102` — false positive, and mine.** I widened the regex's prefix class to include `F` this run, so it now treats a **finding citation** (*"R6-c (blocked, F102)"*) as a missing story row. Findings are not plan rows. **The widening was a mistake**: it buys nothing and manufactures noise.
+- **`T5-S2` — the documented false positive**, from the compound row name `T5-S1b + T5-S2`. Unchanged, still known, still not worth a cleverer matcher.
+
+**The phrase sweep's five hits were all legitimate** — `@file` path completion and draft syntax highlighting really are unshipped, and the markdown-tolerant `not wired` pattern now returns **zero**, which is the first clean run since F110 made it tolerant.
+
+**So: 1 defect, 2 false positives, 5 correct negatives.** That ratio is the argument for keeping these as commands a person reads rather than gates — **and the argument against my own widening.** A sweep that nominates finding-numbers as missing rows trains its reader to skim, which is how the real `R6-d` hit would eventually be missed.
+
+## F133 — a thirteenth flake, and it is the mechanism I wrongly assigned to F130
+
+**F131 shipped** (below). During my acceptance run a **different** `kitsu-tools` test failed:
+
+```
+---- builtins::command::tests::replacing_an_approved_executable_forces_fresh_approval ----
+called `Result::unwrap()` on an `Err` value: ExecError("command failed: Text file busy (os error 26)")
+```
+
+**Captured whole to its own file** (1 374 lines) before anything else. Three re-runs: 416, 416, 416. The workspace re-ran at **1146 passed, 0 failed**.
+
+### The two flakes are different, and the errno is what separates them
+
+| | F130 | F133 |
+|---|---|---|
+| errno | **16** — `EBUSY`, *"Device or resource busy"* | **26** — `ETXTBSY`, *"Text file busy"* |
+| site | `stage_executable_image`, via `executable_sha256` | `replacing_an_approved_executable_forces_fresh_approval` |
+| mechanism | unknown; the **only** exit documenting `EBUSY` is `F_ADD_SEALS` | **`ETXTBSY` is definitionally "wrote a file being executed"** |
+
+**`ETXTBSY` is exactly the mechanism I guessed for F130 and was wrong about** — writing an executable that something currently has open for execution. The guess was not nonsense; it was **attached to the wrong flake.** F130 stages through `memfd_create`, which has no path to contend for; F133's test **replaces an executable by name**, which is precisely what `ETXTBSY` reports.
+
+**So the right conclusion is one I could not have reached by reasoning harder about F130:** there are two parallelism-sensitive executable flakes in this crate, one of which really is path contention. Distinguishing them took **reading the errno**, which is why F131's whole premise — *make the failure say which operation* — is worth the eighteen edits.
+
+**F133 is carded, not fixed.** Its mechanism is named, its capture is complete, and it is one re-run from being characterised — unlike the **eleventh** flake, which remains unidentifiable because I truncated its capture.
+
+## F131 — the staging failure names its step; 16 steps wired, 2 provable
+
+My brief's step count was right this time (18 exits / 16 steps) because the test author had **enumerated it from the function** after my first attempt listed eight and omitted the entire sealing tail.
+
+**The restructuring chosen, with its reason:** per-site `map_err` into one formatting helper, rather than an inner function returning `Result<_, (Step, io::Error)>`. The latter *"would have required wrapping the whole body in a nested function and threading the `PendingExecutableImageV1` construction through it — a real control-flow edit on a function that owns raw descriptors (`File::from_raw_fd` on two fds)."* The per-site form is pure expression substitution: **no new scope, no change to where the owned `File`s drop**, and the step is named at the exit that produced it rather than inferred by a caller. It keeps `error.kind()`, so the OS error text survives verbatim after the label — which is the entire point.
+
+**All 16 wired, including the 14 nothing can test** — notably `AddSeals`, the `EBUSY` exit that is F130's most plausible source. **A fix labelling only the two provable steps would have left F130 exactly as undiagnosable as before**, which is why "wire the untestable ones" was the brief's load-bearing instruction.
+
+**The mutation was sharper than I asked for:** remapping exit #2 to a neighbouring step made the *right* test fail *naming the wrong label*, while its sibling stayed green — so the two tests discriminate **per-exit**, not merely per-step.
+
+**And two distinctions the author drew that I had not:** the function's two `.expect(..)` sites are **panics, not error exits**, so they are neither counted nor wired; and the non-x86_64 stub returns a fixed `Unsupported` error and is outside the step vocabulary. Both correct, both unprompted.
+
+## F134 — F133's mechanism was wrong too, and I made the same mistake twice in two cards
+
+**RETRACTION.** F133 records that *"F133's test replaces an executable by name, which is precisely what `ETXTBSY` reports."* **False.** Verified against the capture:
+
+- The panic is at **`command.rs:3524:10`** — the `.unwrap()` on the **first** `execute_command` (the call spans 3515–3524).
+- `std::fs::rename` is at **3526**, two lines later.
+
+**At the moment of the ETXTBSY the executable had not been replaced at all.** I read the test's *name* — `replacing_an_approved_executable_forces_fresh_approval` — added the errno, and wrote down a mechanism. **That is the identical error I had corrected one card earlier on F130**, where I called a `memfd` path "path contention". Two flakes, two mechanism guesses, both wrong, both from the same habit: **the errno narrows, the test name suggests, and neither names.**
+
+### The real mechanism, which no amount of staring at the test would have produced
+
+1. `write_test_executable` opens the executable `O_WRONLY|O_CREAT|O_CLOEXEC`, writes, **closes**. Window: microseconds.
+2. Concurrently, one of the other 415 tests in the same binary **forks**. The child's fd table is a **copy of the parent's — including that write fd.**
+3. **`O_CLOEXEC` does not save you:** the kernel closes CLOEXEC descriptors *inside* `execve`, **after** `deny_write_access()` has already failed.
+4. Linux's `deny_write_access()` checks **`inode->i_writecount`, which is process-independent.** So between a sibling's `fork` and its child's `execve`, this inode has a writer — someone else's.
+5. The test's own `execve` → **ETXTBSY**, wrapped by `command_failed` into `ExecError("command failed: …")`.
+
+**So my ruled-out cause #3 was half right in the worst way:** the *fact* survives — `std::fs::write` does close the fd — but **the inference does not.** Closing it *in this process* is not enough. **The writer that defeats you is your own descriptor, surviving in somebody else's child.**
+
+**And cause #1 survives for a reason better than mine:** unique `tempfile::tempdir()` paths do not help because **the kernel check is on the inode, not the path.**
+
+### Evidence, labelled honestly
+
+**Reproduced outside the suite, not inside it.** A C harness with unique paths, `O_CLOEXEC`, the fd closed and `chmod`'d before exec, and sibling threads forking: **4/500** at zero linger, **84/500** with a 5 ms linger. A Rust harness in exactly the test's shape (`std::fs::write` + `set_permissions` + `Command::new`): **13/400**. **In-suite: 0 reproductions in 35 runs**, including 15 at `--test-threads=32` under eight CPU burners.
+
+So: **mechanism derived, independently reproduced in a harness, not reproduced in `kitsu-tools`.** One sighting in ~60 runs plus zero in 35 is consistent with the rate and is **not** evidence for the mechanism — the harness is.
+
+### A fix refuted by measurement before anyone proposed it
+
+`run_supervised_command` registers `pre_exec` **unconditionally**, even when `inherited_paths` is empty, which forces std off `posix_spawn` for every spawn. *"Make `pre_exec` conditional so std can use `posix_spawn`"* reads as a free win. **The harness says it would make this worse:** `posix_spawn` mode reproduced **13/400**, fork-plus-`pre_exec` **0/800**, at only 1.4× the spawn rate — so not a throughput artefact. **Do not take that fix.** And the agent declined to assert *why* `posix_spawn`'s window is wider, having not measured it — which is the right place to stop.
+
+### The finding that outranks the flake
+
+**This is a production defect, not a test defect.** A user replacing a tool between invocations hits exactly this, and so does a user whose editor or build is mid-write on it. Kitsu reports a flat `command failed: Text file busy (os error 26)` with **no indication that the condition is transient** — and `ETXTBSY` at `execve` is *definitionally* transient.
+
+**Carded, not fixed:** a bounded retry around the spawn in `run_supervised_command`. It is safe with respect to the security story — `cwd` revalidation, root revalidation and `observe_executable` all run before the spawn, so a retry around the spawn alone reopens no check-to-exec window that is not already documented. But it needs a bound, a backoff, a decision on re-running revalidation per attempt, and a test — **so it is a test-first card, and a defensible alternative is to keep failing and say the condition is transient.**
+
+**Test-side mitigation does not exist**, and that is worth recording: the F133 test's own hygiene is already correct, the writer comes from siblings it cannot control, no copy-or-rename trick changes the inode's writecount, and `#[serial]` would not help because the `rg`/`sh` spawners are not serial.
+
+## F136 — F135 shipped as the message, not the retry; and a lint exception I refused
+
+**Design (B) chosen over a bounded retry, on measurement.** The test author read what each pre-spawn check pins, and **the answer decided the card**:
+
+- **`observe_executable` pins a path and a stat snapshot** — `canonical_path, length, readonly, mtime, dev, ino, mode, uid, gid, ctime` — **no descriptor, no content hash**, with `identity.pinned` hard-coded `false`. **Verified by me.**
+- `AuthorizedCwd::revalidate` and `BoundCommandRoot::revalidate` **are** descriptor-anchored: a held directory `File` compared against the path's `dev`/`ino`.
+
+**So F134's safety claim did not survive.** It held that a retry *"reopens no check-to-exec window that is not already documented"* — true in **kind**, false in **extent**. Without per-attempt revalidation, the exec's distance from its last validation becomes **the sum of all prior attempts plus the backoff**, strictly wider than the single documented stat-to-exec gap — and **externally inducible**, since ETXTBSY can be provoked by holding a write descriptor, making kitsu loop, and swapping the file. With per-attempt revalidation the window stays today's size, but the semantics invert: **the editor-mid-write case is exactly where the fingerprint differs**, so a later attempt turns a transient `ExecError` into a permanent `PolicyDenied` and a re-prompt.
+
+**And the measurement that settled it:** the real ETXTBSY windows are **microseconds to milliseconds**, while the user-facing cases the card names are **human-scale**. No defensible bound rescues them. **A retry would have spent a new security decision to fix the flake-shaped case and still printed a message for the user-shaped case.**
+
+### The MSRV blocker, and why I refused the obvious fix
+
+`std::io::ErrorKind::ExecutableFileBusy` is the natural discriminator and is **stable only since 1.83**; this workspace declares **`rust-version = "1.80"`**. It compiles on the local 1.93 toolchain, so **every test passed** — and `clippy::incompatible_msrv`, implied by `-D warnings`, rejected it. **My brief named a discriminator that could not satisfy my own gate.**
+
+Three resolutions were offered and **I rejected two**:
+
+- **Raising the workspace MSRV** is a promise to every consumer and a maintainer's policy decision. Taking it to improve one error string's discriminator is the tail wagging the dog.
+- **`#[allow(clippy::incompatible_msrv)]`** I rejected on substance, not taste: **the lint is correct** — that code genuinely would not compile on 1.80 — so silencing it would make the declared `rust-version` **false**. The repo would claim support it does not have, and this would have been the **first such allow in the tree**, establishing the precedent on cosmetic grounds. **A lint exception that makes a stated guarantee untrue costs more than a nicer type name is worth.**
+- **`libc::ETXTBSY`** costs nothing: `libc` is already a `kitsu-tools` dependency, used **190 times** in a sibling module of the very file being edited, and `ETXTBSY` is a **named POSIX constant**, not a magic `26`.
+
+**With a required comment naming the MSRV reason and the migration trigger**, because without it a future reader sees `libc` where `std` would do, "fixes" it, and walks straight back into the lint.
+
+### Three things the agent did that I am recording as right
+
+**It distinguished "unavailable on the toolchain" from "unavailable under MSRV".** My brief said to stop if the kind was unavailable on its toolchain — it **was** available, on 1.93. A letter-of-the-law reading would have shipped it green locally and broken the clippy gate for everyone.
+
+**It re-ran the mutation after switching discriminators**, *"since the guard is no longer the one I first tested."* Exactly right: the earlier mutation proved the **old** guard, and swapping the condition invalidates the proof. Nobody asked for that.
+
+**It declined to run the release profile** while the discriminator was still in question, rather than burning two minutes of pty suites on code that might change — and said so, which beats both quietly doing it and quietly skipping it.

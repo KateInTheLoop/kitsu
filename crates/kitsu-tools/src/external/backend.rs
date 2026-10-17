@@ -112,6 +112,65 @@ enum FilesystemPreparationSetupV1 {
     RulesetRejected,
 }
 
+// Every fallible step of `stage_executable_image`, so a staging failure names
+// the operation that produced it and not only the activity (E11 / F131). The
+// macro expands one list into both the variants and `ALL`, so the roster and
+// the enum cannot drift; a new step added without a label is `error[E0004]`.
+macro_rules! executable_staging_steps_v1 {
+    ($($variant:ident),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum ExecutableStagingStepV1 {
+            $($variant),+
+        }
+
+        impl ExecutableStagingStepV1 {
+            const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
+executable_staging_steps_v1![
+    SourceMetadata,
+    SourceSizeBounds,
+    SourceRewind,
+    MemfdCreate,
+    MemfdDescriptor,
+    HeaderRead,
+    HeaderWrite,
+    ImageRead,
+    CopiedLengthBounds,
+    ImageWrite,
+    CopiedLengthAgreement,
+    ImageMode,
+    AddSeals,
+    GetSeals,
+    SealVerification,
+    ImageRewind,
+];
+
+impl ExecutableStagingStepV1 {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SourceMetadata => "source-metadata",
+            Self::SourceSizeBounds => "source-size-bounds",
+            Self::SourceRewind => "source-rewind",
+            Self::MemfdCreate => "memfd-create",
+            Self::MemfdDescriptor => "memfd-descriptor",
+            Self::HeaderRead => "header-read",
+            Self::HeaderWrite => "header-write",
+            Self::ImageRead => "image-read",
+            Self::CopiedLengthBounds => "copied-length-bounds",
+            Self::ImageWrite => "image-write",
+            Self::CopiedLengthAgreement => "copied-length-agreement",
+            Self::ImageMode => "image-mode",
+            Self::AddSeals => "add-seals",
+            Self::GetSeals => "get-seals",
+            Self::SealVerification => "seal-verification",
+            Self::ImageRewind => "image-rewind",
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TestFilesystemPreparationSetupV1 {
@@ -1551,78 +1610,137 @@ fn open_exact_descriptor(path: &Path, access: i32, directory: bool) -> io::Resul
     Ok(file)
 }
 
+// Prefixes a staging failure with the step that produced it, so the activity
+// reported by `executable_sha256` names an operation (E11 / F131). The error
+// kind is preserved and the original rendering -- errno text included -- is
+// kept verbatim after the label.
+fn staged_executable_failure_v1(step: ExecutableStagingStepV1, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{}: {error}", step.label()))
+}
+
 #[cfg(target_arch = "x86_64")]
 fn stage_executable_image(
     mut source: File,
     source_path: PathBuf,
 ) -> io::Result<PendingExecutableImageV1> {
-    let source_size = source.metadata()?.len();
+    use ExecutableStagingStepV1 as Step;
+
+    let source_size = source
+        .metadata()
+        .map_err(|error| staged_executable_failure_v1(Step::SourceMetadata, error))?
+        .len();
     if source_size == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "executable image is empty",
+        return Err(staged_executable_failure_v1(
+            Step::SourceSizeBounds,
+            io::Error::new(io::ErrorKind::InvalidData, "executable image is empty"),
         ));
     }
     if source_size > MAX_EXECUTABLE_BYTES_V1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "executable exceeds the bounded image cap",
+        return Err(staged_executable_failure_v1(
+            Step::SourceSizeBounds,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "executable exceeds the bounded image cap",
+            ),
         ));
     }
-    source.seek(SeekFrom::Start(0))?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| staged_executable_failure_v1(Step::SourceRewind, error))?;
     let name = b"kitsu-child-image\0";
     let flags = libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC | MFD_EXEC_V1;
     // SAFETY: memfd_create reads the static NUL-terminated name and returns a
     // new descriptor on success.
     let fd = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), flags) };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(staged_executable_failure_v1(
+            Step::MemfdCreate,
+            io::Error::last_os_error(),
+        ));
     }
-    let raw_fd = i32::try_from(fd).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    let raw_fd = i32::try_from(fd).map_err(|_| {
+        staged_executable_failure_v1(
+            Step::MemfdDescriptor,
+            io::Error::from_raw_os_error(libc::EOVERFLOW),
+        )
+    })?;
     // SAFETY: successful memfd_create returns one newly owned descriptor.
     let mut image = unsafe { File::from_raw_fd(raw_fd) };
     let mut context = Context::new(&SHA256);
     let mut header = [0_u8; 64];
-    let header_len = source.read(&mut header)?;
+    let header_len = source
+        .read(&mut header)
+        .map_err(|error| staged_executable_failure_v1(Step::HeaderRead, error))?;
     context.update(&header[..header_len]);
-    image.write_all(&header[..header_len])?;
+    image
+        .write_all(&header[..header_len])
+        .map_err(|error| staged_executable_failure_v1(Step::HeaderWrite, error))?;
     let mut copied = u64::try_from(header_len).expect("ELF header length fits u64");
     let mut buffer = [0_u8; 16 * 1024];
     loop {
-        let read = source.read(&mut buffer)?;
+        let read = source
+            .read(&mut buffer)
+            .map_err(|error| staged_executable_failure_v1(Step::ImageRead, error))?;
         if read == 0 {
             break;
         }
         copied = copied
             .checked_add(u64::try_from(read).expect("buffer length fits u64"))
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+            .ok_or_else(|| {
+                staged_executable_failure_v1(
+                    Step::CopiedLengthBounds,
+                    io::Error::from_raw_os_error(libc::EFBIG),
+                )
+            })?;
         if copied > MAX_EXECUTABLE_BYTES_V1 {
-            return Err(io::Error::from_raw_os_error(libc::EFBIG));
+            return Err(staged_executable_failure_v1(
+                Step::CopiedLengthBounds,
+                io::Error::from_raw_os_error(libc::EFBIG),
+            ));
         }
         context.update(&buffer[..read]);
-        image.write_all(&buffer[..read])?;
+        image
+            .write_all(&buffer[..read])
+            .map_err(|error| staged_executable_failure_v1(Step::ImageWrite, error))?;
     }
     if copied != source_size {
-        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+        return Err(staged_executable_failure_v1(
+            Step::CopiedLengthAgreement,
+            io::Error::from_raw_os_error(libc::ESTALE),
+        ));
     }
     // SAFETY: fchmod changes only the newly owned memfd mode.
     if unsafe { libc::fchmod(image.as_raw_fd(), 0o500) } != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(staged_executable_failure_v1(
+            Step::ImageMode,
+            io::Error::last_os_error(),
+        ));
     }
     let required_seals =
         libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
     // SAFETY: fcntl applies and queries seals on the owned memfd.
     if unsafe { libc::fcntl(image.as_raw_fd(), libc::F_ADD_SEALS, required_seals) } != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(staged_executable_failure_v1(
+            Step::AddSeals,
+            io::Error::last_os_error(),
+        ));
     }
     let observed_seals = unsafe { libc::fcntl(image.as_raw_fd(), libc::F_GET_SEALS) };
     if observed_seals < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(staged_executable_failure_v1(
+            Step::GetSeals,
+            io::Error::last_os_error(),
+        ));
     }
     if observed_seals & required_seals != required_seals {
-        return Err(io::Error::from_raw_os_error(libc::EPERM));
+        return Err(staged_executable_failure_v1(
+            Step::SealVerification,
+            io::Error::from_raw_os_error(libc::EPERM),
+        ));
     }
-    image.seek(SeekFrom::Start(0))?;
+    image
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| staged_executable_failure_v1(Step::ImageRewind, error))?;
     let digest = context.finish();
     let mut digest_bytes = [0_u8; 32];
     digest_bytes.copy_from_slice(digest.as_ref());
@@ -3983,6 +4101,124 @@ mod tests {
         assert!(backend.pending_image.is_none());
         assert_eq!(backend.prepared_containment_count_for_test(), 0);
         assert_eq!(backend.os_spawn_count(), 0);
+    }
+
+    // E11 / F131. `stage_executable_image` has eighteen fallible exits across
+    // sixteen distinguishable steps, and `executable_sha256` flattens all of
+    // them into `cannot stage immutable executable: {error}` -- which is why
+    // F130's `os error 16` cannot be attributed to a syscall. The shape pinned
+    // below is `cannot stage immutable executable: <step-label>: <error>`.
+    // Only the two `SourceSizeBounds` exits are constructible from a test
+    // without injecting syscall failures, so only those two are pinned here.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn empty_image_staging_failure_names_the_source_size_bounds_step() {
+        let tree = tempfile::tempdir().unwrap();
+        let executable = tree.path().join("empty-native-image");
+        std::fs::write(&executable, b"").unwrap();
+        std::fs::set_permissions(&executable, Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(std::fs::metadata(&executable).unwrap().len(), 0);
+
+        let mut backend = LinuxChildBackendV1::new(Vec::new());
+        let observed = backend.canonicalize_executable(&executable).unwrap();
+        let error = backend.executable_sha256(&observed).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "cannot stage immutable executable: {}: executable image is empty",
+                ExecutableStagingStepV1::SourceSizeBounds.label()
+            ),
+            "the empty-image failure does not name its step: {error}"
+        );
+        assert!(backend.pending_image.is_none());
+        assert_eq!(backend.prepared_containment_count_for_test(), 0);
+        assert_eq!(backend.os_spawn_count(), 0);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn oversize_image_staging_failure_names_the_source_size_bounds_step() {
+        let tree = tempfile::tempdir().unwrap();
+        let executable = tree.path().join("capped-native-image");
+        let source = File::create(&executable).unwrap();
+        source.set_len(MAX_EXECUTABLE_BYTES_V1 + 1).unwrap();
+        drop(source);
+        std::fs::set_permissions(&executable, Permissions::from_mode(0o755)).unwrap();
+
+        let mut backend = LinuxChildBackendV1::new(Vec::new());
+        let observed = backend.canonicalize_executable(&executable).unwrap();
+        let error = backend.executable_sha256(&observed).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "cannot stage immutable executable: {}: executable exceeds the bounded image cap",
+                ExecutableStagingStepV1::SourceSizeBounds.label()
+            ),
+            "the capped-image failure does not name its step: {error}"
+        );
+        assert!(backend.pending_image.is_none());
+        assert_eq!(backend.prepared_containment_count_for_test(), 0);
+        assert_eq!(backend.os_spawn_count(), 0);
+    }
+
+    // The label vocabulary, enforced from the enum rather than a curated list:
+    // a seventeenth step is `error[E0004]` here, and its only repair is a
+    // label. The rendered budget is measured against the longest label joined
+    // to the longest `io::Error` string the function can propagate, so no step
+    // can be named at the cost of a wall of text.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn every_enumerated_staging_step_has_a_unique_bounded_label() {
+        // The longest `io::Error` string the function can propagate in
+        // practice, and the one F130 actually captured.
+        const EBUSY_RENDERED_V1: &str = "Device or resource busy (os error 16)";
+        let mut seen = std::collections::BTreeSet::new();
+        for step in ExecutableStagingStepV1::ALL {
+            let expected = match step {
+                ExecutableStagingStepV1::SourceMetadata => "source-metadata",
+                ExecutableStagingStepV1::SourceSizeBounds => "source-size-bounds",
+                ExecutableStagingStepV1::SourceRewind => "source-rewind",
+                ExecutableStagingStepV1::MemfdCreate => "memfd-create",
+                ExecutableStagingStepV1::MemfdDescriptor => "memfd-descriptor",
+                ExecutableStagingStepV1::HeaderRead => "header-read",
+                ExecutableStagingStepV1::HeaderWrite => "header-write",
+                ExecutableStagingStepV1::ImageRead => "image-read",
+                ExecutableStagingStepV1::CopiedLengthBounds => "copied-length-bounds",
+                ExecutableStagingStepV1::ImageWrite => "image-write",
+                ExecutableStagingStepV1::CopiedLengthAgreement => "copied-length-agreement",
+                ExecutableStagingStepV1::ImageMode => "image-mode",
+                ExecutableStagingStepV1::AddSeals => "add-seals",
+                ExecutableStagingStepV1::GetSeals => "get-seals",
+                ExecutableStagingStepV1::SealVerification => "seal-verification",
+                ExecutableStagingStepV1::ImageRewind => "image-rewind",
+            };
+            let label = step.label();
+            assert_eq!(label, expected, "{step:?} label drifted");
+            assert!(
+                !label.is_empty()
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'-'),
+                "{step:?} label is not greppable kebab-case: {label}"
+            );
+            assert!(seen.insert(label), "{step:?} reuses the label {label}");
+            let rendered =
+                format!("cannot stage immutable executable: {label}: {EBUSY_RENDERED_V1}");
+            assert!(
+                rendered.len() <= 100,
+                "rendered staging failure is {} bytes: {rendered}",
+                rendered.len()
+            );
+        }
+        assert_eq!(seen.len(), ExecutableStagingStepV1::ALL.len());
+        // The step whose failure F130 captured, rendered under this shape.
+        assert_eq!(
+            format!(
+                "cannot stage immutable executable: {}: {EBUSY_RENDERED_V1}",
+                ExecutableStagingStepV1::AddSeals.label()
+            ),
+            "cannot stage immutable executable: add-seals: Device or resource busy (os error 16)"
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

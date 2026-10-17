@@ -53,6 +53,45 @@ struct ResultArgs {
     id: u64,
 }
 
+/// Arguments to `agent_wait` (T5-S6, H5). `timeout_secs` is `u64`, so a
+/// negative value is an argument error rather than a silent zero or infinity;
+/// `until` is a string so its rejection can name the argument.
+#[derive(serde::Deserialize)]
+struct WaitArgs {
+    id: u64,
+    until: String,
+    timeout_secs: Option<u64>,
+}
+
+/// The state an `agent_wait` call is waiting for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentWaitUntil {
+    /// The registry's terminal predicate: done, failed, or cancelled.
+    Done,
+    /// Parked on a user answer ([`AgentStatus::Blocked`]). Non-terminal.
+    Blocked,
+}
+
+impl AgentWaitUntil {
+    /// The `until` spelling, as the model wrote it and as the timeout reports it.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+/// Where one agent stands, as far as a wait is concerned. The two non-terminal
+/// statuses are distinguished because a park satisfies a `blocked` wait but
+/// not a `done` one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentWaitState {
+    Running,
+    Blocked,
+    Terminal,
+}
+
 /// Cap on concurrent subagents in one `spawn_agents` call, so the model can't
 /// fan out unboundedly against the gateway. Extra tasks beyond this are still run
 /// — just not all at once (see `buffer` below).
@@ -1420,6 +1459,24 @@ impl AgentRegistry {
             .map(|record| result_text(id, &record.status))
     }
 
+    /// Where one agent stands as far as `agent_wait` is concerned, or `None`
+    /// if the id belongs to no agent of this session.
+    ///
+    /// `Terminal` is the registry's own predicate — anything that is neither
+    /// `Running` nor `Blocked` — so a failed or cancelled agent satisfies a
+    /// `done` wait instead of hanging it to the timeout.
+    fn wait_state(&self, id: u64) -> Option<AgentWaitState> {
+        self.agents
+            .lock()
+            .expect("agent registry")
+            .get(&id)
+            .map(|record| match record.status {
+                AgentStatus::Running => AgentWaitState::Running,
+                AgentStatus::Blocked => AgentWaitState::Blocked,
+                _ => AgentWaitState::Terminal,
+            })
+    }
+
     /// Return the explicit handoff state without reading result content.
     pub fn handoff_state(&self, id: u64) -> Option<AgentHandoffState> {
         self.agents
@@ -1858,6 +1915,11 @@ fn record_telemetry_event(telemetry: &mut AgentTelemetry, event: AgentRuntimeEve
             telemetry.record_activity("usage updated".to_string());
         }
         AgentRuntimeEvent::AssistantDelta { .. } => {}
+        // Deliberate no-op: agent telemetry feeds the TTY agents view, and
+        // F120 scopes that human-facing surface to a separate card. Matched
+        // explicitly rather than swept into a wildcard so adding an activity
+        // line here stays a decision, not an accident.
+        AgentRuntimeEvent::ToolResultsDropped { .. } => {}
         AgentRuntimeEvent::ToolStarted { name, .. } => {
             telemetry.record_activity(format!("started tool {}", safe_activity_name(&name)))
         }
@@ -2582,6 +2644,144 @@ pub fn agent_result_tool(registry: Arc<AgentRegistry>) -> (ToolDescriptor, Handl
             registry
                 .result(a.id)
                 .ok_or_else(|| ToolError::ExecError(format!("no background agent #{}", a.id)))
+        })
+    });
+    (descriptor, handler)
+}
+
+/// Default timeout for one `agent_wait` call when the model omits
+/// `timeout_secs`. Deliberately short next to [`DEFAULT_AGENT_BLOCK_TIMEOUT`]:
+/// that one bounds a *human* answering an approval, this one bounds a
+/// foreground round the model is paying for.
+pub const DEFAULT_AGENT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Ceiling on an `agent_wait` timeout. A model that asks for `u64::MAX`
+/// seconds gets this instead of an overflowing deadline.
+pub const MAX_AGENT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Build the `agent_wait` tool (T5-S6, H5): block until a background agent
+/// reaches `done` or `blocked`, or until this call's own timeout elapses.
+///
+/// It spawns nothing, so it takes **no** [`SpawnBudget`] — that absent
+/// parameter is H5's "does not consume the `SpawnBudget`", enforced by the
+/// signature rather than by a runtime check. The `--max-rounds` bound is the
+/// orchestrator's, not this tool's: one call is one round of the caller's turn.
+pub fn agent_wait_tool(registry: Arc<AgentRegistry>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "agent_wait".to_string(),
+        // Kept deliberately terse: schema tokens come out of the model's
+        // window, and the five multi-agent tools already cost ~750 of them.
+        description: "Wait for a background subagent (spawn_agent_bg) to reach a state: \
+                      `done` (finished, failed, or cancelled) or `blocked` (parked on an \
+                      answer). Spawns nothing, so it does not count against the spawn cap. \
+                      Returns the agent's result or status, or a 'timed out' line."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "The background agent id"},
+                "until": {"type": "string", "enum": ["done", "blocked"]},
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Seconds to wait; default 60, max 1800, 0 polls once."
+                }
+            },
+            "required": ["id", "until"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let registry = registry.clone();
+        Box::pin(async move {
+            // A negative `timeout_secs` fails here, in `u64` deserialization:
+            // it is the model's mistake, and coercing it to zero or to forever
+            // would hide that.
+            let a: WaitArgs =
+                serde_json::from_str(&args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+            // `until` is deserialized as a string and matched here rather than
+            // as a serde enum, so the rejection names the argument at fault.
+            let until = match a.until.as_str() {
+                "done" => AgentWaitUntil::Done,
+                "blocked" => AgentWaitUntil::Blocked,
+                other => {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "until must be \"done\" or \"blocked\", got \"{other}\""
+                    )))
+                }
+            };
+            // Clamped BEFORE it becomes a deadline: an unclamped `i64::MAX`
+            // seconds overflows `std::time`'s instant arithmetic and panics.
+            let timeout = a
+                .timeout_secs
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(DEFAULT_AGENT_WAIT_TIMEOUT)
+                .min(MAX_AGENT_WAIT_TIMEOUT);
+
+            // Armed before the first state read, so a change landing between
+            // the read and the wait cannot be missed (the check-then-wait race).
+            let mut changes = registry.subscribe();
+            // First of the two unknown-id guards: a typo must cost nothing at
+            // all, never a whole timeout. The second is in the loop below,
+            // which re-reads the state on every wakeup.
+            if registry.wait_state(a.id).is_none() {
+                return Err(ToolError::ExecError(format!(
+                    "no background agent #{}",
+                    a.id
+                )));
+            }
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let Some(state) = registry.wait_state(a.id) else {
+                    // Second guard: the record vanished while we waited.
+                    return Err(ToolError::ExecError(format!(
+                        "no background agent #{}",
+                        a.id
+                    )));
+                };
+                match (until, state) {
+                    // `done` is the registry's terminal predicate, not the
+                    // `Done` variant alone: a failed or cancelled agent will
+                    // never reach `Done`, so waiting for the variant would
+                    // burn the whole timeout on a state that cannot arrive.
+                    (AgentWaitUntil::Done, AgentWaitState::Terminal)
+                    | (AgentWaitUntil::Blocked, AgentWaitState::Blocked) => {
+                        return Ok(registry
+                            .result(a.id)
+                            .unwrap_or_else(|| format!("no background agent #{}", a.id)))
+                    }
+                    // A terminal agent can never park, so holding the caller's
+                    // round open for a `blocked` that is now unreachable is
+                    // pointless. (The converse does NOT hold: `blocked` is
+                    // non-terminal, so a `done` wait on a parked agent runs
+                    // its timeout out.)
+                    (AgentWaitUntil::Blocked, AgentWaitState::Terminal) => {
+                        let result = registry
+                            .result(a.id)
+                            .unwrap_or_else(|| format!("no background agent #{}", a.id));
+                        return Ok(format!(
+                            "agent #{} reached a terminal state and can no longer block: {result}",
+                            a.id
+                        ));
+                    }
+                    _ => {}
+                }
+                // A timeout is a normal outcome, not a `ToolError`: the model
+                // is told the state it did not reach, the timeout actually
+                // used (defaulted or clamped), and where the agent stands.
+                if tokio::time::timeout_at(deadline, changes.changed())
+                    .await
+                    .is_err()
+                {
+                    let status = registry
+                        .peek_result(a.id)
+                        .unwrap_or_else(|| format!("no background agent #{}", a.id));
+                    return Ok(format!(
+                        "timed out after {}s waiting for agent #{} to reach {}: {status}",
+                        timeout.as_secs(),
+                        a.id,
+                        until.label()
+                    ));
+                }
+            }
         })
     });
     (descriptor, handler)
@@ -3752,12 +3952,13 @@ mod tests {
         assert_eq!(snapshot.unacknowledged, 1);
     }
 
-    /// Guard: `blocked` is reserved for a later story that introduces a
-    /// user-answer wait state. No agent can be blocked yet, so every snapshot
-    /// must publish zero. The story that starts populating `blocked` must
-    /// update this test deliberately rather than discover it as a surprise.
+    /// Guard: `blocked` counts agents parked on a user answer, and nothing
+    /// else. `park_prompt` is its only writer, so an agent this test never
+    /// parks — running or terminal — must leave every snapshot publishing
+    /// zero. A status that leaked into the count would misreport the
+    /// `needs input` group.
     #[test]
-    fn blocked_is_always_zero_until_a_later_story_populates_it() {
+    fn blocked_is_zero_for_every_agent_this_test_never_parks() {
         let registry = AgentRegistry::new();
         let running = registry.start("still running".to_string()).unwrap();
         assert_eq!(
@@ -5512,6 +5713,493 @@ mod tests {
                         && entry.text.contains("correction #1 applied")
                 }),
             "and the thread records the correction as applied"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // T5-S6 (H5): the `agent_wait` tool.
+    //
+    // `blocked` is NOT a new word here: `AgentStatus::Blocked` /
+    // `AgentProgressStatus::Blocked` / `AgentThreadPhase::Blocked` all label
+    // "blocked" and all mean *parked on a user answer*, which is what
+    // `park_prompt` installs. `done` is the registry's existing `terminal`
+    // predicate (`not in {Running, Blocked}`), so a failed or cancelled agent
+    // satisfies a `done` wait instead of hanging it to the timeout.
+    //
+    // Every timing assertion below runs on tokio's VIRTUAL clock
+    // (`start_paused = true`). Nothing sleeps on wall time: the clock only
+    // moves when the runtime is idle on a timer, so "returned at once" is
+    // `elapsed == ZERO` exactly and "timed out" is `elapsed == timeout`
+    // exactly. `yield_now` does not move it, so `await_blocked` is safe.
+    // ---------------------------------------------------------------------
+
+    fn wait_tool(registry: &Arc<AgentRegistry>) -> HandlerFn {
+        agent_wait_tool(registry.clone()).1
+    }
+
+    fn wait_args(id: u64, until: &str, timeout_secs: Option<i64>) -> String {
+        match timeout_secs {
+            Some(secs) => {
+                format!(r#"{{"id":{id},"until":"{until}","timeout_secs":{secs}}}"#)
+            }
+            None => format!(r#"{{"id":{id},"until":"{until}"}}"#),
+        }
+    }
+
+    /// Virtual-clock elapsed time across one `agent_wait` call, plus its
+    /// outcome. This is the whole no-flake seam: the duration is exact.
+    async fn timed_wait(
+        registry: &Arc<AgentRegistry>,
+        args: String,
+    ) -> (Result<String, ToolError>, std::time::Duration) {
+        let handler = wait_tool(registry);
+        let before = tokio::time::Instant::now();
+        let outcome = handler(args).await;
+        (outcome, tokio::time::Instant::now() - before)
+    }
+
+    /// A registry holding one agent parked on an approval, with its gate
+    /// receiver kept alive so nothing resolves the park behind the test.
+    async fn parked_registry() -> (
+        Arc<AgentRegistry>,
+        u64,
+        tokio::sync::oneshot::Receiver<Decision>,
+        kitsu_tools::PromptRequestSender,
+    ) {
+        let registry = AgentRegistry::new();
+        let id = registry.start("parks on an answer".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let answer = park_path_request(&sender, id);
+        await_blocked(&registry, id).await;
+        (registry, id, answer, sender)
+    }
+
+    /// The descriptor the model reads. `until` must be a closed enum, or the
+    /// model is free to invent a third state the tool cannot honour.
+    #[test]
+    fn agent_wait_describes_an_id_a_closed_until_enum_and_a_timeout() {
+        let (descriptor, _handler) = agent_wait_tool(AgentRegistry::new());
+        assert_eq!(descriptor.name, "agent_wait");
+        assert!(
+            !descriptor.description.is_empty(),
+            "the model needs to know what the tool blocks on"
+        );
+        let properties = &descriptor.parameters["properties"];
+        assert_eq!(properties["id"]["type"], "integer");
+        assert_eq!(
+            properties["until"]["enum"],
+            serde_json::json!(["done", "blocked"]),
+            "H5 spells the states `done|blocked`, and nothing else is answerable"
+        );
+        assert_eq!(
+            properties["timeout_secs"]["type"], "integer",
+            "the unit lives in the key name, as it does for `block_timeout_secs`"
+        );
+        assert_eq!(
+            descriptor.parameters["required"],
+            serde_json::json!(["id", "until"]),
+            "a timeout is optional and defaults; an id and a state are not"
+        );
+        assert!(
+            descriptor
+                .description
+                .to_lowercase()
+                .contains("does not count against"),
+            "H5's budget exemption is the model-visible half of the requirement: {}",
+            descriptor.description
+        );
+    }
+
+    /// The state is already satisfied when the call arrives: an agent that
+    /// finished long ago must answer in the same breath, not wait.
+    #[tokio::test(start_paused = true)]
+    async fn agent_wait_until_done_returns_an_already_finished_result_without_waiting() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("finished an hour ago".to_string()).unwrap();
+        registry.finish(id, Ok("THE ANSWER".to_string()));
+
+        let (outcome, elapsed) = timed_wait(&registry, wait_args(id, "done", Some(600))).await;
+        assert_eq!(
+            outcome.expect("a finished agent is a successful wait"),
+            "THE ANSWER",
+            "a satisfied wait returns exactly what `agent_result` would"
+        );
+        assert_eq!(
+            elapsed,
+            std::time::Duration::ZERO,
+            "an already-satisfied wait consumes none of its timeout"
+        );
+    }
+
+    /// `done` is the registry's `terminal` predicate, not the `Done` variant
+    /// alone. If it were the variant alone, waiting on an agent that failed or
+    /// was cancelled would burn the whole timeout for an answer that could
+    /// never change — the half-working case.
+    #[tokio::test(start_paused = true)]
+    async fn agent_wait_until_done_is_satisfied_by_failed_and_cancelled_agents() {
+        let registry = AgentRegistry::new();
+
+        let failed = registry.start("fails".to_string()).unwrap();
+        registry.finish(failed, Err("boom".to_string()));
+        let (outcome, elapsed) = timed_wait(&registry, wait_args(failed, "done", Some(600))).await;
+        assert_eq!(
+            outcome.expect("a failed agent is terminal, so the wait succeeds"),
+            format!("agent #{failed} failed: boom"),
+        );
+        assert_eq!(elapsed, std::time::Duration::ZERO, "failed is terminal now");
+
+        let cancelled = registry.start("is cancelled".to_string()).unwrap();
+        registry.cancel(cancelled).await;
+        let (outcome, elapsed) =
+            timed_wait(&registry, wait_args(cancelled, "done", Some(600))).await;
+        assert!(outcome
+            .expect("a cancelled agent is terminal, so the wait succeeds")
+            .starts_with(&format!("agent #{cancelled} cancelled: ")),);
+        assert_eq!(
+            elapsed,
+            std::time::Duration::ZERO,
+            "cancelled is terminal now"
+        );
+    }
+
+    /// `until: blocked` on an agent already parked on an answer.
+    #[tokio::test(start_paused = true)]
+    async fn agent_wait_until_blocked_returns_at_once_for_an_already_parked_agent() {
+        let (registry, id, _answer, _sender) = parked_registry().await;
+
+        let (outcome, elapsed) = timed_wait(&registry, wait_args(id, "blocked", Some(600))).await;
+        assert_eq!(
+            outcome.expect("a parked agent satisfies a `blocked` wait"),
+            format!("agent #{id} is waiting on an answer"),
+            "the blocked wording is the registry's existing one"
+        );
+        assert_eq!(elapsed, std::time::Duration::ZERO);
+    }
+
+    /// The agent reaches the state *while* the call is blocked. This is the
+    /// tool's whole reason to exist, and it must not race: the wait is armed
+    /// before the park happens.
+    #[tokio::test(start_paused = true)]
+    async fn agent_wait_wakes_when_the_agent_reaches_the_state_during_the_call() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("finishes later".to_string()).unwrap();
+
+        let handler = wait_tool(&registry);
+        let waiter = tokio::spawn(handler(wait_args(id, "done", Some(600))));
+        // Let the wait arm itself on the watch channel before anything changes.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        registry.finish(id, Ok("LATE ANSWER".to_string()));
+
+        assert_eq!(
+            waiter
+                .await
+                .expect("the wait task does not panic")
+                .expect("reaching the state is a successful wait"),
+            "LATE ANSWER",
+        );
+    }
+
+    /// A timeout is a NORMAL outcome, not an error: the model is told the
+    /// state it did not reach and must stay free to do something else.
+    #[tokio::test(start_paused = true)]
+    async fn agent_wait_until_done_times_out_as_an_ok_outcome_naming_the_current_state() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("runs forever".to_string()).unwrap();
+
+        let (outcome, elapsed) = timed_wait(&registry, wait_args(id, "done", Some(90))).await;
+        assert_eq!(
+            outcome.expect("a timeout is an answer the model can act on, not a tool error"),
+            format!(
+                "timed out after 90s waiting for agent #{id} to reach done: \
+                 agent #{id} is still running"
+            ),
+        );
+        assert_eq!(
+            elapsed,
+            std::time::Duration::from_secs(90),
+            "the wait honours exactly the timeout it was given"
+        );
+    }
+
+    /// The *other* terminal state: a `blocked` wait on an agent that goes
+    /// terminal can never be satisfied, so it must return at once rather than
+    /// hold the model's round open for a state that is now unreachable.
+    #[tokio::test(start_paused = true)]
+    async fn agent_wait_until_blocked_gives_up_at_once_once_the_agent_is_terminal() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("finishes instead".to_string()).unwrap();
+        registry.finish(id, Ok("done not blocked".to_string()));
+
+        let (outcome, elapsed) = timed_wait(&registry, wait_args(id, "blocked", Some(600))).await;
+        assert_eq!(
+            outcome.expect("an unreachable state is reported, not errored"),
+            format!(
+                "agent #{id} reached a terminal state and can no longer block: \
+                 done not blocked"
+            ),
+        );
+        assert_eq!(
+            elapsed,
+            std::time::Duration::ZERO,
+            "a terminal agent can never block, so waiting for it is pointless"
+        );
+    }
+
+    /// And the converse: `blocked` is NON-terminal, so a `done` wait on an
+    /// agent that parks and stays parked must run its timeout out. The park
+    /// must not be mistaken for an early answer.
+    #[tokio::test(start_paused = true)]
+    async fn agent_wait_until_done_runs_its_timeout_out_on_a_permanently_blocked_agent() {
+        let (registry, id, _answer, _sender) = parked_registry().await;
+
+        let (outcome, elapsed) = timed_wait(&registry, wait_args(id, "done", Some(120))).await;
+        assert_eq!(
+            outcome.expect("a timeout is a normal outcome"),
+            format!(
+                "timed out after 120s waiting for agent #{id} to reach done: \
+                 agent #{id} is waiting on an answer"
+            ),
+            "blocked is not done: the wait reports the park it is stuck behind"
+        );
+        assert_eq!(
+            elapsed,
+            std::time::Duration::from_secs(120),
+            "a blocked agent is still live, so the wait is bounded only by its timeout"
+        );
+    }
+
+    /// An unknown id — and, because the registry IS the session, an id
+    /// belonging to no agent of this session is the same case. It must fail
+    /// immediately: making a typo cost a 60-second round is the defect.
+    #[tokio::test(start_paused = true)]
+    async fn agent_wait_on_an_unknown_id_errors_immediately_without_spending_its_timeout() {
+        let registry = AgentRegistry::new();
+        let known = registry.start("exists".to_string()).unwrap();
+        let stranger = known + 999;
+
+        let (outcome, elapsed) =
+            timed_wait(&registry, wait_args(stranger, "done", Some(600))).await;
+        match outcome {
+            Err(ToolError::ExecError(message)) => assert_eq!(
+                message,
+                format!("no background agent #{stranger}"),
+                "the same wording `agent_result` uses for an unknown id"
+            ),
+            other => panic!("an unknown id is an execution error: {other:?}"),
+        }
+        assert_eq!(
+            elapsed,
+            std::time::Duration::ZERO,
+            "an id that cannot resolve must not cost a whole timeout"
+        );
+    }
+
+    /// Argument edges: an `until` outside the enum, and a NEGATIVE timeout.
+    /// Both are the model's mistake and both are rejected rather than guessed
+    /// at — a negative timeout silently read as zero, or as forever, is
+    /// exactly the invisible-now, visible-later failure.
+    #[tokio::test(start_paused = true)]
+    async fn agent_wait_rejects_an_unknown_until_value_and_a_negative_timeout() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("runs".to_string()).unwrap();
+
+        let (outcome, elapsed) = timed_wait(&registry, wait_args(id, "finished", Some(60))).await;
+        match outcome {
+            Err(ToolError::InvalidArgs(message)) => assert!(
+                message.contains("until"),
+                "the rejection must name the argument at fault: {message}"
+            ),
+            other => panic!("an `until` outside the enum is an argument error: {other:?}"),
+        }
+        assert_eq!(elapsed, std::time::Duration::ZERO);
+
+        let (outcome, elapsed) = timed_wait(&registry, wait_args(id, "done", Some(-5))).await;
+        assert!(
+            matches!(outcome, Err(ToolError::InvalidArgs(_))),
+            "a negative timeout is rejected, never coerced to zero or to forever: {outcome:?}"
+        );
+        assert_eq!(elapsed, std::time::Duration::ZERO);
+    }
+
+    /// `timeout_secs: 0` is a legitimate request: poll the state once and
+    /// answer now. It is not an error and it is not "wait forever".
+    #[tokio::test(start_paused = true)]
+    async fn agent_wait_with_a_zero_timeout_polls_once_and_returns_immediately() {
+        let registry = AgentRegistry::new();
+        let running = registry.start("still going".to_string()).unwrap();
+
+        let (outcome, elapsed) = timed_wait(&registry, wait_args(running, "done", Some(0))).await;
+        assert_eq!(
+            outcome.expect("a zero timeout is a poll, not an error"),
+            format!(
+                "timed out after 0s waiting for agent #{running} to reach done: \
+                 agent #{running} is still running"
+            ),
+        );
+        assert_eq!(elapsed, std::time::Duration::ZERO, "zero means zero");
+
+        // A zero timeout on an ALREADY satisfied state still answers.
+        let finished = registry.start("finished".to_string()).unwrap();
+        registry.finish(finished, Ok("QUICK".to_string()));
+        let (outcome, _) = timed_wait(&registry, wait_args(finished, "done", Some(0))).await;
+        assert_eq!(
+            outcome.expect("a satisfied state needs no time at all"),
+            "QUICK",
+            "a zero timeout must still report a state that is already true"
+        );
+    }
+
+    /// A missing timeout defaults; an absurd one clamps. Both pin the
+    /// constants, because an unclamped `u64::MAX` seconds is an overflowing
+    /// deadline and a 584-billion-year round.
+    #[tokio::test(start_paused = true)]
+    async fn agent_wait_defaults_a_missing_timeout_and_clamps_an_absurd_one() {
+        assert_eq!(
+            DEFAULT_AGENT_WAIT_TIMEOUT,
+            std::time::Duration::from_secs(60),
+            "T5-S6's default wait is one minute"
+        );
+        assert_eq!(
+            MAX_AGENT_WAIT_TIMEOUT,
+            std::time::Duration::from_secs(30 * 60),
+            "T5-S6 caps one wait at thirty minutes"
+        );
+        assert!(
+            DEFAULT_AGENT_WAIT_TIMEOUT < MAX_AGENT_WAIT_TIMEOUT,
+            "the default must sit under the ceiling it is clamped by"
+        );
+
+        let registry = AgentRegistry::new();
+
+        let id = registry.start("runs forever".to_string()).unwrap();
+        let (outcome, elapsed) = timed_wait(&registry, wait_args(id, "done", None)).await;
+        assert_eq!(
+            elapsed, DEFAULT_AGENT_WAIT_TIMEOUT,
+            "an omitted timeout waits exactly the default"
+        );
+        assert_eq!(
+            outcome.expect("a defaulted timeout is still a normal outcome"),
+            format!(
+                "timed out after {}s waiting for agent #{id} to reach done: \
+                 agent #{id} is still running",
+                DEFAULT_AGENT_WAIT_TIMEOUT.as_secs()
+            ),
+            "the reported number is the timeout actually used, not the one asked for"
+        );
+
+        let absurd = registry.start("outlives the universe".to_string()).unwrap();
+        let (outcome, elapsed) =
+            timed_wait(&registry, wait_args(absurd, "done", Some(i64::MAX))).await;
+        assert_eq!(
+            elapsed, MAX_AGENT_WAIT_TIMEOUT,
+            "an absurd timeout is clamped to the ceiling rather than overflowing"
+        );
+        assert_eq!(
+            outcome.expect("a clamped timeout still answers"),
+            format!(
+                "timed out after {}s waiting for agent #{absurd} to reach done: \
+                 agent #{absurd} is still running",
+                MAX_AGENT_WAIT_TIMEOUT.as_secs()
+            ),
+            "the model is told the clamped timeout, so it can tell it was clamped"
+        );
+    }
+
+    /// Two waits on the same id, and a wait on the agent that is itself
+    /// calling. Neither may deadlock: the registry lock is never held across
+    /// the wait, so a self-wait simply runs its timeout out and the model gets
+    /// its round back.
+    #[tokio::test(start_paused = true)]
+    async fn two_waits_on_one_id_both_resolve_and_a_self_wait_cannot_deadlock() {
+        let registry = AgentRegistry::new();
+        let id = registry
+            .start("one agent, two watchers".to_string())
+            .unwrap();
+
+        let first = tokio::spawn(wait_tool(&registry)(wait_args(id, "done", Some(600))));
+        let second = tokio::spawn(wait_tool(&registry)(wait_args(id, "done", Some(600))));
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        registry.finish(id, Ok("SHARED".to_string()));
+        assert_eq!(
+            first
+                .await
+                .expect("no panic")
+                .expect("the first waiter wakes"),
+            "SHARED",
+        );
+        assert_eq!(
+            second
+                .await
+                .expect("no panic")
+                .expect("the second waiter wakes too"),
+            "SHARED",
+            "a wait must not consume the state it observed"
+        );
+
+        // The self-wait: an agent waiting for its OWN completion. It is still
+        // running by definition, so the only correct outcome is its timeout.
+        let itself = registry.start("waits on itself".to_string()).unwrap();
+        let (outcome, elapsed) = timed_wait(&registry, wait_args(itself, "done", Some(30))).await;
+        assert_eq!(
+            elapsed,
+            std::time::Duration::from_secs(30),
+            "a self-wait returns on its timeout instead of hanging the turn"
+        );
+        assert!(outcome
+            .expect("a self-wait times out rather than erroring")
+            .contains("is still running"),);
+    }
+
+    /// H5's own emphasis: `agent_wait` spawns nothing, so it must work with
+    /// the turn's `SpawnBudget` fully spent, and must not spend any of it.
+    ///
+    /// The POSITIVE CONTROL is `spawn_agent` on the same exhausted budget
+    /// being refused: without it this test would pass against a budget that
+    /// was never exhausted in the first place.
+    #[tokio::test(start_paused = true)]
+    async fn agent_wait_works_on_an_exhausted_spawn_budget_and_never_consumes_it() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("already finished".to_string()).unwrap();
+        registry.finish(id, Ok("WAITED ANYWAY".to_string()));
+
+        let budget = Arc::new(SpawnBudget::new(1));
+        let mut cfg = sub_cfg();
+        cfg.quiet = true;
+        let (_descriptor, spawn) = spawn_agent_tool(
+            Arc::new(EchoProvider),
+            Arc::new(Registry::new()),
+            cfg,
+            Arc::new(Mutex::new(("m".to_string(), None))) as LiveModelWindow,
+            String::new(),
+            budget.clone(),
+        );
+
+        // Spend the whole cap, then confirm it really is spent.
+        spawn(r#"{"task":"burn the budget"}"#.to_string())
+            .await
+            .expect("the first spawn is within the cap");
+        assert_eq!(budget.used(), 1, "the cap of one is now spent");
+        let refused = spawn(r#"{"task":"one too many"}"#.to_string())
+            .await
+            .expect_err("the positive control: a second spawn is refused");
+        assert!(
+            format!("{refused}").contains("agent spawn cap reached"),
+            "the control must fail for the budget's reason: {refused}"
+        );
+
+        let used_before = budget.used();
+        let outcome = wait_tool(&registry)(wait_args(id, "done", Some(600)))
+            .await
+            .expect("H5: a wait spawns nothing, so an exhausted budget cannot refuse it");
+        assert_eq!(outcome, "WAITED ANYWAY");
+        assert_eq!(
+            budget.used(),
+            used_before,
+            "H5: a wait consumes none of the SpawnBudget"
         );
     }
 }
