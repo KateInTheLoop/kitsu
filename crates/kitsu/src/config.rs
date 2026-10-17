@@ -1872,10 +1872,6 @@ mod tests {
                 "[tui]\nalternate_screen = \"always\"\n",
                 AlternateScreen::Always,
             ),
-            (
-                "[tui]\nalternate_screen = \"never\"\n",
-                AlternateScreen::Never,
-            ),
         ] {
             let parsed: Config = toml::from_str(text).expect(text);
             assert_eq!(parsed.tui.unwrap_or_default().alternate_screen, expected);

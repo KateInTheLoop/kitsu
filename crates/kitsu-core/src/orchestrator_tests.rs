@@ -4467,9 +4467,13 @@ async fn structured_event_log_streams_safe_assistant_deltas_while_quiet() {
     let mut messages = vec![ChatMessage::user("work")];
 
     assert_eq!(
-        run_agent_turn(&provider, &tools, &mut messages, &c)
-            .await
-            .unwrap(),
+        capture_stdout_writes(async {
+            run_agent_turn(&provider, &tools, &mut messages, &c)
+                .await
+                .unwrap()
+        })
+        .await
+        .0,
         "hello world"
     );
     let deltas: Vec<_> = log
@@ -4520,9 +4524,13 @@ async fn structured_event_log_never_emits_synthesized_text_tool_json() {
     let mut messages = vec![ChatMessage::user("work")];
 
     assert_eq!(
-        run_agent_turn(&provider, &tools, &mut messages, &c)
-            .await
-            .unwrap(),
+        capture_stdout_writes(async {
+            run_agent_turn(&provider, &tools, &mut messages, &c)
+                .await
+                .unwrap()
+        })
+        .await
+        .0,
         "safe final answer"
     );
     let emitted: String = log
@@ -4570,9 +4578,13 @@ async fn assistant_deltas_exclude_intermediate_structured_tool_narration() {
     c.event_log = Some(log.clone());
     let mut messages = vec![ChatMessage::user("work")];
 
-    let answer = run_agent_turn(&provider, &tools, &mut messages, &c)
-        .await
-        .unwrap();
+    let answer = capture_stdout_writes(async {
+        run_agent_turn(&provider, &tools, &mut messages, &c)
+            .await
+            .unwrap()
+    })
+    .await
+    .0;
     let emitted: String = log
         .take()
         .into_iter()
@@ -5991,11 +6003,29 @@ fn response_schema_participates_in_session_cache_identity() {
 /// in one burst" and "nothing was printed" from "something was".
 struct CapturedStdout {
     writes: Arc<Mutex<Vec<String>>>,
+    /// The thread that installed this capture.
+    ///
+    /// The surface slot is process-global, and plenty of tests in this binary
+    /// print a turn's answer through it without taking
+    /// [`STDOUT_CAPTURE_LOCK`] — any non-streaming `run_agent_turn` does. Under
+    /// load their bytes were landing in whichever capture happened to be
+    /// installed, so a tool-call test could fail on JSON another test had
+    /// legitimately printed. Each `#[tokio::test]` here runs its turn on its
+    /// own current-thread runtime, so the installing thread identifies this
+    /// test's own writes exactly.
+    owner: std::thread::ThreadId,
+}
+
+impl CapturedStdout {
+    /// Whether the caller is the test that installed this capture.
+    fn is_owner(&self) -> bool {
+        std::thread::current().id() == self.owner
+    }
 }
 
 impl kitsu_render::surface::Surface for CapturedStdout {
     fn transcript_line(&self, fd: kitsu_render::surface::Fd, text: &str) {
-        if matches!(fd, kitsu_render::surface::Fd::Stdout) {
+        if matches!(fd, kitsu_render::surface::Fd::Stdout) && self.is_owner() {
             self.writes.lock().unwrap().push(format!("{text}\n"));
         }
     }
@@ -6010,7 +6040,7 @@ impl kitsu_render::surface::Surface for CapturedStdout {
     ) {
         let mut bytes: Vec<u8> = Vec::new();
         block(&mut bytes);
-        if matches!(fd, kitsu_render::surface::Fd::Stdout) && !bytes.is_empty() {
+        if matches!(fd, kitsu_render::surface::Fd::Stdout) && !bytes.is_empty() && self.is_owner() {
             self.writes
                 .lock()
                 .unwrap()
@@ -6034,6 +6064,7 @@ where
     let writes = Arc::new(Mutex::new(Vec::new()));
     let previous = kitsu_render::surface::set_surface(Arc::new(CapturedStdout {
         writes: Arc::clone(&writes),
+        owner: std::thread::current().id(),
     }));
     let out = turn.await;
     kitsu_render::surface::set_surface(previous);
