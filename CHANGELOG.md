@@ -10,6 +10,16 @@ shapes may change in any minor release.
 ## [Unreleased]
 
 ### Fixed
+- **`[tui] alternate_screen = never` and `--no-alt-screen` are now refused instead
+  of silently ignored.** Neither was honoured by anything: all three values of that
+  key did the same nothing, so `auto` was accidentally correct and **`never` did
+  not work** -- including for the case the flag was written for, a multiplexer
+  where the alternate screen misbehaves. Both now **fail with a message naming what
+  is accepted**, and the message says the value is *not available yet* rather than
+  invalid, because it is a coherent thing to want and will be honoured once an
+  in-viewport overlay path exists. `auto` and `always` are unaffected; a
+  misspelling such as `Never` still gets the vocabulary error listing all three
+  recognised spellings.
 - **A "Text file busy" command failure now says it is transient.** Running a tool
   while something still has it open for writing -- an editor mid-save, a build
   writing the binary, a tool being replaced -- failed with a bare
@@ -60,6 +70,25 @@ shapes may change in any minor release.
   reason.
 
 ### Added
+- **The terminal window title now says what kitsu is doing** -- `kitsu · idle · 0
+  agents`, `kitsu · working · 1 agent`, `kitsu · blocked · 3 agents` -- so a
+  multiplexer or herder can classify windows by title (requirement H2, which had
+  been specified since the epic began and never implemented). `[tui] title = true`
+  is the default and now actually controls it: setting it `false` suppresses both
+  the title and the push/pop of the terminal's title stack. **Only a styled
+  terminal receives it**; piped, `--plain`, `--screen-reader` and JSONL output are
+  byte-identical to before. The title follows the agent registry, so it keeps
+  up **during** a turn as agents block and finish, not only at the prompt; and the title is **restored when kitsu exits**, except
+  under a multiplexer (which drops the title-stack sequences) and except a
+  `classic` session killed by a signal (which installs no restoring handler).
+- **`Ctrl+X 1`…`Ctrl+X 9` attach to an agent by the position it is displayed at.**
+  `Ctrl+X 3` is the third row you can see -- **whatever its `#id`** -- so the
+  digits follow the agent view's own grouping and filter rather than agent
+  numbers. The nine digits reach the first nine rows; past that, open the view and
+  use the arrows. It switches agent when one is already attached, and re-attaching
+  to the agent you are on does nothing. `Ctrl+X 0` and a digit past the last row
+  do nothing at all, and the line you have typed is kept either way. Inside the
+  view the digits are ordinary characters.
 - **An interactive session now says so too when a tool result is dropped**, not
   just `--jsonl`. The line reads `~ context budget dropped 2 tool results in round
   3; the provider never saw them`, naming the count first, once per round. It
@@ -229,7 +258,9 @@ shapes may change in any minor release.
 - **A fullscreen renderer.** `/tui fullscreen` (also `--tui fullscreen` and
   `[tui] mode = "fullscreen"`) takes the terminal's alternate screen and paints
   the viewport's scrollback, **repainting as the conversation grows**, and gives
-  the screen and your window title back when you switch away.
+  the screen and your window title back when you switch away — and now that the
+  title is actually set, that restore means something rather than returning a
+  title nothing had changed.
   **It has its own prompt**, drawn on the bottom row, so the frame is no longer
   painted over between turns -- typing cannot scroll it at all. The slash-command
   palette is deliberately absent there (the only rows it could use are the

@@ -480,6 +480,29 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   `[tui] alternate_screen = never` does not yet get the in-viewport overlay this
   design describes elsewhere. That path is unexercised and `alternate_screen`
   remains a key without a consumer.
+
+  **Closed in F62 by refusal, not by implementation.** The key had **no consumer
+  at all** — all three values did the same nothing, so `auto` was accidentally
+  right and **`never` was a lie**. Both doors that produce it are now **refused by
+  name**: the config value at load, and `--no-alt-screen` in argv validation, which
+  fires for **every** subcommand including `doctor` — deliberately, because
+  `doctor` is where a user goes to learn whether their setup is sound, and a global
+  flag refused on some subcommands and accepted on others is a rule the user must
+  memorise. `auto` and `always` keep working: they describe today's behaviour.
+
+  The messages say **"not available yet"**, never "not valid" — the value is a
+  coherent thing to want and kitsu intends to honour it, and **F90** applies.
+  **Recognised spellings and accepted values are now different sets**: a typo still
+  gets all three in the vocabulary error, while the refusal lists the two accepted.
+  And `AlternateScreen::Never` **survives as a variant** with its dead-code
+  allowance, because deleting it would turn *"recognised, not yet available"* into
+  *"not a value"* — the same inversion F90 names.
+
+  **T5-S4 owns the implementation**, and it must also settle a disagreement this
+  sweep found: `:1408` says the flag forces **`inline`** while `README` said it
+  forces **`never`**. Those are different claims — a renderer versus a screen
+  value — and forcing a renderer would also disable fullscreen, a much larger
+  promise than *"do not take the alternate screen"*.
 - **A2** Rows MUST be grouped by state in this order: *Needs input*, *Working*,
   *Done (unviewed)*, *Done (viewed)*, *Failed*, *Cancelled*. Each row: state
   label, id, name or task head, model/profile, last activity + age, tokens.
@@ -1054,6 +1077,93 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   `$XDG_RUNTIME_DIR/kitsu/<pid>.json` on every registry generation change,
   containing the process state plus the redacted thread DTO array (bounded by
   the existing timeline limits), removed on clean exit.
+
+  **Shipped in H2-title, with two deviations stated rather than hidden.** The
+  state-file clause was already built; the title clause had been specified since
+  this epic began and **never implemented** — `tui_bridge` pushed and popped the
+  title *stack* in production **without consulting `tui.title`**, and the OSC 2
+  string was written nowhere, because the only code that would write it has no
+  non-test caller (deliberately: **F93**, routing through it also enables raw mode
+  and would staircase several hundred direct writers). So `tui.title` gated
+  **neither** half — an **unimplemented requirement wearing a config key**, which
+  **F139** records as a different diagnosis from a key whose referent was never
+  specified.
+
+  **Rendering, which H2 left as alternation:** `kitsu · <state> · <N> agent[s]`.
+  The count is **never omitted at zero** — H2's audience is a parser, and a title
+  that changes shape at zero makes *"no agents"* and *"stale title"*
+  indistinguishable from outside; `1 agent` is singular because people read it
+  too. The state word comes from `agent_state_file::process_state` **verbatim**, so
+  the *blocked outranks working* precedence stays in one home.
+
+  **Deviation 1 — cadence — closed by H2-cadence, and the premise recorded here
+  was false.** This paragraph previously said *"the registry's watch channel is
+  subscribed only behind an off-by-default environment variable, so there is no
+  general change hook in a chat session."* **That was wrong**, and it was wrong in
+  shipped documentation across two cards. There **is** an ungated, session-long
+  registry change subscriber — the idle composer's ambient cadence, whose own
+  rustdoc says it is *deliberately* ungated, *unlike* the opt-in classic-mode
+  notifier that the false claim had generalised from. It already deduped on
+  `(blocked, running)`, the title's own count inputs, and carries **no turn gate**,
+  so it fires mid-turn.
+
+  **The error was a curated list standing in for an enumerated one**: one
+  subscription site was measured and generalised to *"no hook exists"*. Listing them
+  found four, and the one that mattered was marked ungated on purpose.
+
+  **So the title now follows the registry** and keeps up during a turn as agents
+  block and finish. Three decisions, each measured rather than assumed:
+
+  - **The turn flag has to be plumbed, and exactly one case forces it.** Mid-turn
+    the word reduces to *blocked → `blocked`, else `working`*. Of the three mid-turn
+    transitions, blocking and unblocking render correctly **even with a wrong
+    flag** — blocked outranks everything. Only an agent **finishing** into zero
+    agents renders `idle` where the truth is `working`. That single case is the
+    whole reason the flag is threaded through.
+  - **The title rides *beside* the repaint, never inside it.** The status-row
+    repaint is deliberately inert in classic mode and in any session without a live
+    row — which is what keeps classic's byte stream identical — so a title folded
+    into it would leave a **styled classic** session exactly as stale as before.
+  - **One title write per change, not two.** The cadence repaints twice per change
+    because a paint inside the 1/60 s window returns without recording its key; the
+    title has no coalescing window, so a second write would be pure duplicate bytes.
+
+  **Known and unclosed:** a *second* mid-turn cadence exists — the live-typeahead
+  poll repaints the row throughout every foreground turn — and publishes no title.
+  The registry hook was chosen over it because it is event-driven and reaches
+  classic sessions, but anyone wiring the title there too would be adding writes
+  that this design does not dedupe.
+
+  **Deviation 2 — closed by H2-stack, with two residuals.** H2-title shipped with
+  the title outliving the process outside fullscreen, because `enter_fullscreen` was
+  the only thing that pushed the title stack. **H2-stack makes the push belong to
+  the session**: one push when the session first sets a title, one pop when it ends,
+  and `enter_fullscreen` pushes only when the session has not — which also makes the
+  dying-signal restore's long-unconditional **pop** the balancing one rather than a
+  pop against an empty stack.
+
+  **That design was forced, not chosen.** An existing test pins `PUSH == 1` **and**
+  `POP == 1` across a fullscreen→classic switch, so a session push plus an
+  unconditional fullscreen push is two and two and fails it. **And the session push
+  must carry the surface gate, not only the key gate** — the trap version, gated on
+  the key alone, **passes every pre-existing negative**, because on a plain
+  fullscreen surface a session push merely *replaces* the segment push and the count
+  stays one. It took a new classic-surface guard to make that visible at all.
+
+  **Residual 1:** under a **multiplexer** the title still outlives the process, in
+  every mode. The sequences are dropped, OSC 2 has no query form, and the old title
+  therefore cannot be read back and restored by hand. H2 names tmux as the audience,
+  so this is accepted rather than fixed.
+
+  **Residual 2:** a styled **`classic`** session killed by a **signal** still leaks
+  its title, because classic installs no dying-signal handler — deliberately, and
+  pinned by a test asserting that a classic session emits no viewport bytes.
+  Closing it would trade a guarantee for a cosmetic one.
+
+  **Unpinned byte-order consequence:** tuple bindings drop in reverse declaration
+  order, so on a styled exit *from* fullscreen the session pop is written before the
+  segment's leave-alt-screen. The segment's own pop is suppressed in that case, so
+  the counts hold at one and one, and **no test pins the interleaving.**
 - **H3** A `[hooks] on_agent_state = "<cmd>"` MUST run on agent state
   transitions, mirroring herdr's plugin events and Claude Code's
   `Notification` hook. Local command only (N7). Three decisions settled while
@@ -1893,7 +2003,7 @@ guard on half of it.
 ```toml
 [tui]
 mode = "inline"             # classic | inline | fullscreen
-alternate_screen = "auto"   # auto | always | never
+alternate_screen = "auto"   # auto | always; `never` recognised but refused (F62)
 prefix = "ctrl+x"
 title = true
 left_arrow_opens_agents = true
@@ -1968,7 +2078,8 @@ an unviewed failed agent.
 ### Stage 4 — Fullscreen renderer and polish (M)
 Fullscreen mode over the cell ring (N4), `[` dump, `v` editor, mouse wheel
 scrolling, herdr manifest (H4), `agent_wait` tool (H5), decision on
-`background_blocked` under JSONL (open question 7).
+`background_blocked` under JSONL (**closed in ADR-2**: its own event, never a
+new `status` value — see `docs/roadmap/cycles/e11/decisions.md`).
 *Acceptance:* a 5 000-line session renders with RSS flat once the ring is
 full; `[` output equals the ring contents; `agent_wait` unit tests for both
 `until` values and timeout.
@@ -2051,3 +2162,52 @@ tmux users immediately.
   `crates/kitsu-tools/src/permissions.rs`,
   `crates/kitsu-tools/src/builtins/command.rs`, `crates/kitsu/src/main.rs`.
 - Review: `reviews/tui-design-review-1.md` (findings and disposition).
+
+### Requirement traceability (derived, T5-S8)
+
+Generated by matching each requirement id the design **defines** against every plan row that
+**cites** it. All **35** defined requirements are cited by at least one row — derived, not asserted.
+
+**There is deliberately no “shipped” column.** Status and citations live in *different tables* in
+the plan, and the status vocabulary collides with domain vocabulary — `T2-S1`'s detail row contains
+the word *Blocked* as a **request state**, not a status. A regex over the plan's prose reported **17
+requirements unshipped**, which is false. Requirement→row is derivable; requirement→status is not,
+and a mechanically-derived status column would have been a fabrication (F138).
+
+| requirement | cited by plan rows |
+|---|---|
+| **A1** | `T1-S3`, `T3-S5`, `T4-S2` |
+| **A2** | `T1-S3`, `T3`, `T4-S1`, `T4-S6-ordinal` |
+| **A3** | `T3`, `T4-S1`, `T4-S4`, `T4-S4a`, `T4-S6-ordinal` |
+| **A4** | `T4-S3` |
+| **A5** | `T4-S6`, `T4-S6c` |
+| **A6** | `T4-S7` |
+| **A7** | `T4-S3` |
+| **A8** | `T1-S1`, `T1-S2`, `T4-S8` |
+| **B1** | `T2-S1` |
+| **B2** | `T2-S1`, `T2-S2` |
+| **B3** | `T2-S4` |
+| **B4** | `T2-S5`, `T2-S7` |
+| **B5** | `T2-S3` |
+| **H1** | `T1-S5`, `T2-S7`, `T5-S4` |
+| **H2** | `T1-S4` |
+| **H3** | `T1-S6`, `T2-S7` |
+| **H4** | `T5-S7` |
+| **H5** | `T5-S6` |
+| **N1** | `F120`, `F122`, `F126`, `T1-S2`, `T1-S4`, `T2-S5` |
+| **N2** | `R6-b`, `T3-S13` |
+| **N3** | `T3-S12` |
+| **N4** | `R6-prompts`, `T3-S10`, `T3-S6`, `T5-S1a`, `T5-S1b` |
+| **N5** | `F94`, `T3-S8`, `T5-S1b`, `T5-S1c`, `T5-S1c-ii` |
+| **N6** | `T3-S11`, `T5-S4` |
+| **N7** | `T1-S6` |
+| **N8** | `T2-S6` |
+| **N9** | `T3-S12` |
+| **R1** | `R1`, `T5-S1c-i`, `T5-S1c-ii`, `T5-S8` |
+| **R2** | `R2`, `T3-S9`, `T5-S1b` |
+| **R3** | `R3` |
+| **R4** | `R4`, `T3-S3`, `T3-S4` |
+| **R5** | `R5`, `T3-S5` |
+| **R6** | `R6`, `R6-a`, `R6-b`, `R6-c`, `R6-d`, `R6-prompts`, `T3-S6`, `T4-S6c`, `T4-S9`, `T5-S3` |
+| **R7** | `R7`, `T3-S7a`, `T3-S7c` |
+| **R8** | `R8`, `T3-S8` |

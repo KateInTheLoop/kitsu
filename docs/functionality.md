@@ -289,7 +289,18 @@ empty groups omitted. **In the inline viewport `/jobs view` opens an overlay
 instead of printing that deck** -- the same grouping, on the alternate screen,
 with `?` for the key list and `Esc` to close; `Ctrl+X a` (following
 `[tui] prefix`) and pressing left twice on an empty composer open it too, the
-first press only hinting so it cannot open by accident. Left on a non-empty
+first press only hinting so it cannot open by accident.
+
+`Ctrl+X 1` to `Ctrl+X 9` attach to an agent **by the position it is displayed
+at**, without opening the view: `Ctrl+X 3` is the third row you would see,
+whatever its `#id`, counted over the same grouping and filter the view shows. The
+nine digits reach the first nine rows and nothing below them -- for those, open
+the view and use the arrows. The chord switches agent when one is already
+attached, and re-attaching to the agent you are on does nothing rather than
+re-announcing it. `Ctrl+X 0`, and a digit past the last row, do nothing at all;
+the digit is not even typed into your line, and whatever you had typed is kept.
+Inside the view itself the digits are ordinary characters, since selecting there
+is `↑`/`↓`. Left on a non-empty
 draft still moves the cursor, and up-arrow history recall is untouched.
 `[tui] left_arrow_opens_agents = false` disables the left-arrow route alone.
 `Up`/`Down` move the selection, which follows the agent rather than the row
@@ -559,13 +570,41 @@ drives the inline host yet. A 10 KiB bracketed paste at the idle inline prompt
 stays a single draft and is accepted in single-digit milliseconds, measured by
 `crates/kitsu/tests/paste_latency.rs` against requirement N2's 100 ms budget.
 `--tui <classic|inline>` and the `[tui]` table select the renderer: `mode`
-(default `classic`), `alternate_screen` (`auto|always|never`, forced to `never`
-by `--no-alt-screen`), `prefix` (default `ctrl+x`), `title`,
+(default `classic`), `alternate_screen` (`auto` or `always`; **`never` is
+recognised but refused**, and `--no-alt-screen` with it — both need an
+in-viewport overlay path that does not exist yet, and accepting either would
+change nothing, which is worse than saying so), `prefix` (default `ctrl+x`),
+`title` (see below),
 `left_arrow_opens_agents`, and `cell_ring_lines` (default 10000, range
 1-1000000). The flag wins over the config key, the config key over the default,
 and **no environment variable participates**. A misspelled key or an invalid
 value is a startup error that names the key and lists what it accepts -- never a
-silent fallback -- and `kitsu doctor` reports it as a blocking issue. The error
+silent fallback -- and `kitsu doctor` reports it as a blocking issue.
+
+**`[tui] title` sets the terminal window title**, to `kitsu · idle · 0 agents`,
+`kitsu · working · 1 agent`, `kitsu · blocked · 3 agents` and so on — the state
+word, then how many background agents are live — so a multiplexer or a herder can
+classify windows by title without asking kitsu anything. `blocked` outranks
+`working`, the same precedence the live status row uses, and the count is always
+present: a title that dropped the number at zero would make *"no agents"* and
+*"stale title"* indistinguishable from outside. It defaults to on and also
+controls the push and pop of the terminal's title stack around fullscreen, so
+`title = false` silences both.
+
+**Only a styled terminal receives it.** A piped run, `--plain`, `--screen-reader`
+and `--jsonl` are byte-identical to before — the title is terminal decoration, and
+a consumer reading your output should never see it.
+
+**The title keeps up during a turn.** It is refreshed at the prompt and at the
+start of each turn, and also whenever the agent registry changes — so an agent
+that blocks or finishes **mid-turn** moves the title then, rather than at the next
+prompt. And the title is **restored on exit**, in every mode — but
+with two gaps worth knowing. Under a **multiplexer** it is not: multiplexers drop
+the title-stack sequences outright, and there is no way to read a window title back
+to restore it by hand. And a **`classic` session killed by a signal** leaves its
+title behind, because classic deliberately installs no terminal-restoring signal
+handler — that is what keeps a classic session's output free of viewport bytes.
+Quitting normally restores the title in every mode. The error
 names the key and the permitted values but never echoes the offending value,
 because a config file can hold credentials. `fullscreen` appears in the design
 but is not accepted yet.

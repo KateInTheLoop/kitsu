@@ -4058,6 +4058,7 @@ mod tests {
 
 
 
+
 /// T0-S3a: the renderer's output seam. These tests pin the `Surface` trait,
 /// the process-global slot's lock discipline, and the byte-identity of the
 /// stderr line writers that route through it. They are deliberately written
