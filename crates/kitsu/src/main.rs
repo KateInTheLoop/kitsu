@@ -4525,6 +4525,11 @@ struct ChatSetup {
     /// Config-level `[agents] state_file` mode deciding whether this process
     /// publishes the per-process agent state hint file.
     agent_state_file: crate::config::StateFileMode,
+    /// Config-level `[agents] blocking` mode: how a background agent's
+    /// ungranted permission request is handled (design B1).
+    agent_blocking: crate::config::AgentBlockingMode,
+    /// Config-level `[agents] block_timeout_secs`, already typed (B3).
+    agent_block_timeout: std::time::Duration,
     /// Config-level `[hooks] on_agent_state` command, already split into argv
     /// (requirement H3). `None` when absent, empty, or unsplittable, so an
     /// unusable command is a no-op rather than a per-boundary parse attempt.
@@ -5245,7 +5250,7 @@ impl SlashCommandSpec {
 const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "agent",
-        args: "[list|show <id>|steer <id> <text>|stop <id>|close <id>]",
+        args: "[list|view|show <id>|explain <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>|close <id>|reply <id> <y|a|n>]",
         description: "inspect and control one background agent thread",
         details: "Per-thread control of one background agent: `show` streams its bounded transcript, `steer` injects a correction, `stop` cancels, `close` acknowledges a finished thread. Ids come from /jobs.",
         group: CommandGroup::AgentsJobs,
@@ -5405,7 +5410,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "jobs",
-        args: "[list|view|show <id>|explain <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>]",
+        args: "[list|view|show <id>|explain <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>|reply <id> <y|a|n>]",
         description: "inspect, steer, stop, prune, and close background agent threads",
         details: "The agent deck: every background agent thread with state glyphs (filled = running, hollow = spent, half = result awaiting pickup), token/tool telemetry, and ids for /agent.",
         group: CommandGroup::AgentsJobs,
@@ -9710,6 +9715,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         kitsu_render::set_theme(name).map_err(CliError::user)?;
     }
 
+    let agents_config = config.agents.unwrap_or_default();
     Ok(ChatSetup {
         provider_route,
         gateway_name,
@@ -9720,7 +9726,9 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         auth_status,
         workspace_evidence: config.workspace_evidence.unwrap_or(true),
         agent_spawn_cap: config.agent_spawn_cap,
-        agent_state_file: config.agents.unwrap_or_default().state_file,
+        agent_state_file: agents_config.state_file,
+        agent_blocking: agents_config.blocking,
+        agent_block_timeout: agents_config.block_timeout(),
         agent_state_hook: config
             .hooks
             .unwrap_or_default()
@@ -11259,6 +11267,7 @@ fn background_agent_notice(
 fn agent_progress_status_label(status: subagent::AgentProgressStatus) -> &'static str {
     match status {
         subagent::AgentProgressStatus::Running => "running",
+        subagent::AgentProgressStatus::Blocked => "blocked",
         subagent::AgentProgressStatus::Done => "done",
         subagent::AgentProgressStatus::Failed => "failed",
         subagent::AgentProgressStatus::Cancelled => "cancelled",
@@ -11268,6 +11277,7 @@ fn agent_progress_status_label(status: subagent::AgentProgressStatus) -> &'stati
 fn terminal_agent_status_label(status: &subagent::AgentStatus) -> &'static str {
     match status {
         subagent::AgentStatus::Running => "running",
+        subagent::AgentStatus::Blocked => "blocked",
         subagent::AgentStatus::Done(_) => "done",
         subagent::AgentStatus::Failed(_) => "failed",
         subagent::AgentStatus::Cancelled(_) => "cancelled",
@@ -11282,7 +11292,12 @@ fn agent_deck_state(
     result_collected: bool,
 ) -> kitsu_render::DeckState {
     match status {
-        subagent::AgentProgressStatus::Running => kitsu_render::DeckState::Running,
+        // A blocked agent is non-terminal, and `kitsu-render` has no
+        // `Blocked` state: the live marker is the honest reuse. `ResultReady`
+        // would imply there is something to collect.
+        subagent::AgentProgressStatus::Running | subagent::AgentProgressStatus::Blocked => {
+            kitsu_render::DeckState::Running
+        }
         subagent::AgentProgressStatus::Done if !result_collected => {
             kitsu_render::DeckState::ResultReady
         }
@@ -11322,12 +11337,13 @@ fn agent_activity_child_row(activity: Option<&str>, ms_ago: Option<u64>, plain: 
 /// grouped view can never disagree on the numbers they report.
 fn jobs_deck_counts(snapshot: &subagent::AgentProgressSnapshot) -> String {
     format!(
-        "{} total \u{b7} {} running \u{b7} {} done \u{b7} {} failed \u{b7} {} cancelled \u{b7} {} running slot(s) free \u{b7} {} record slot(s) free",
+        "{} total \u{b7} {} running \u{b7} {} done \u{b7} {} failed \u{b7} {} cancelled \u{b7} {} blocked \u{b7} {} running slot(s) free \u{b7} {} record slot(s) free",
         snapshot.total,
         snapshot.running,
         snapshot.done,
         snapshot.failed,
         snapshot.cancelled,
+        snapshot.blocked,
         snapshot.available_running_slots,
         snapshot.available_record_slots,
     )
@@ -11470,11 +11486,12 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
 }
 
 /// Which `/jobs view` group one agent belongs to. `needs input` is
-/// unreachable today — no agent state parks on a user answer yet — so the
-/// group is never produced, and a later story only has to add its arm.
+/// unreachable today — nothing can put an agent into `Blocked` yet — so the
+/// group is still never produced, but the arm that will produce it is here.
 fn jobs_view_group(agent: &subagent::AgentProgress, result_collected: bool) -> &'static str {
     match agent.status {
         subagent::AgentProgressStatus::Running => "working",
+        subagent::AgentProgressStatus::Blocked => "needs input",
         subagent::AgentProgressStatus::Done if !result_collected => "done, result ready",
         subagent::AgentProgressStatus::Done => "done, collected",
         subagent::AgentProgressStatus::Failed => "failed",
@@ -11496,8 +11513,9 @@ fn format_jobs_view(registry: &subagent::AgentRegistry) -> String {
         output.push_str(JOBS_EMPTY_DECK_LINE);
         return output;
     }
-    // `needs input` is unreachable today: no agent state parks on a user
-    // answer yet. The group stays so a later story only supplies the state.
+    // `needs input` is reachable only under `[agents] blocking = "ask"`, which
+    // is where a gate parks a detached agent on a user answer; under the
+    // default `fail_closed` no agent ever enters the group.
     const GROUPS: [&str; 6] = [
         "needs input",
         "working",
@@ -11568,6 +11586,7 @@ fn jobs_snapshot_payload(registry: &subagent::AgentRegistry) -> serde_json::Valu
         "done": snapshot.done,
         "failed": snapshot.failed,
         "cancelled": snapshot.cancelled,
+        "blocked": snapshot.blocked,
         "max_running": snapshot.max_running,
         "max_records": snapshot.max_records,
         "available_running_slots": snapshot.available_running_slots,
@@ -11607,7 +11626,8 @@ fn format_steering_receipt(receipt: &subagent::thread::AgentSteeringReceipt) -> 
 /// terminal and the JSONL `thread` payload read identically.
 fn format_agent_thread(snapshot: &subagent::thread::AgentThreadSnapshot) -> String {
     let state = match snapshot.phase {
-        subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+        subagent::thread::AgentThreadPhase::Running
+        | subagent::thread::AgentThreadPhase::Blocked => kitsu_render::DeckState::Running,
         subagent::thread::AgentThreadPhase::Done
             if snapshot.handoff == subagent::thread::AgentHandoffState::Ready =>
         {
@@ -11658,6 +11678,28 @@ fn format_agent_thread(snapshot: &subagent::thread::AgentThreadSnapshot) -> Stri
     output
 }
 
+/// The permission a blocked agent is still waiting for, as `permission to X`
+/// (T2-S6), or `None` once its newest approval entry is a decision.
+///
+/// Reads the bounded redacted timeline, which holds the approval *kind* and
+/// no tool argument, so this can never surface a path or an argv word.
+fn pending_approval_request(thread: &subagent::thread::AgentThreadSnapshot) -> Option<String> {
+    let latest = thread
+        .timeline
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == subagent::thread::AgentTimelineKind::Approval)?;
+    let pending = latest.text.strip_suffix(" requested")?;
+    // The recorded spelling is `approval to <kind>`; accept the equivalent
+    // `permission to <kind>` too, so the line reads the same either way.
+    let kind = pending
+        .strip_prefix("approval to ")
+        .or_else(|| pending.strip_prefix("permission to "))
+        .unwrap_or(pending);
+    Some(format!("permission to {}", terminal_inline(kind)))
+}
+
 /// Human `/jobs explain <id>`, borrowed from herdr's `agent explain`: why is
 /// this agent in this state, since when, and what is it waiting on.
 ///
@@ -11676,7 +11718,8 @@ fn format_agent_explain(
     thread: &subagent::thread::AgentThreadSnapshot,
 ) -> String {
     let state = match thread.phase {
-        subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+        subagent::thread::AgentThreadPhase::Running
+        | subagent::thread::AgentThreadPhase::Blocked => kitsu_render::DeckState::Running,
         subagent::thread::AgentThreadPhase::Done
             if thread.handoff == subagent::thread::AgentHandoffState::Ready =>
         {
@@ -11686,7 +11729,12 @@ fn format_agent_explain(
         subagent::thread::AgentThreadPhase::Failed => kitsu_render::DeckState::Failed,
         subagent::thread::AgentThreadPhase::Cancelled => kitsu_render::DeckState::Stopped,
     };
-    let running = matches!(thread.phase, subagent::thread::AgentThreadPhase::Running);
+    // Non-terminal, not just `Running`: a blocked agent takes the live shape
+    // (`since: started …`, a steering line, no handoff line).
+    let running = matches!(
+        thread.phase,
+        subagent::thread::AgentThreadPhase::Running | subagent::thread::AgentThreadPhase::Blocked
+    );
     let elapsed = thread.elapsed_ms as f64 / 1000.0;
     let mut output = format!(
         "{} agent #{} explained | {}",
@@ -11713,9 +11761,16 @@ fn format_agent_explain(
     });
 
     if running {
-        match activity.as_deref() {
-            Some(activity) => output.push_str(&format!("\n  waiting on: {activity}")),
-            None => output.push_str("\n  waiting on: no activity recorded yet"),
+        // T2-S6: a parked permission request is the real answer to "what is
+        // this agent waiting on", so it outranks the last tool activity. The
+        // pending request is the newest approval entry that no outcome entry
+        // has closed; the entry text carries the kind only, never an
+        // argument.
+        let pending_permission = pending_approval_request(thread);
+        match (pending_permission.as_deref(), activity.as_deref()) {
+            (Some(permission), _) => output.push_str(&format!("\n  waiting on: {permission}")),
+            (None, Some(activity)) => output.push_str(&format!("\n  waiting on: {activity}")),
+            (None, None) => output.push_str("\n  waiting on: no activity recorded yet"),
         }
     } else {
         if matches!(thread.phase, subagent::thread::AgentThreadPhase::Failed) {
@@ -11773,6 +11828,66 @@ fn agent_explain_view(registry: &subagent::AgentRegistry, id: u64) -> Option<Str
         .into_iter()
         .find(|agent| agent.id == id)?;
     Some(format_agent_explain(&progress, &thread))
+}
+
+/// The one advertised form of `/jobs reply`, shared by both dispatchers so a
+/// bad argument reads identically whether a turn is running or not.
+const JOBS_REPLY_USAGE: &str = "usage: /jobs reply <id> <y|a|n>";
+
+/// Parse `<id> <y|a|n>` for `/jobs reply`.
+///
+/// The key is read by [`parse_permission_answer`], the very function the
+/// foreground approval prompt uses, rather than by a second match: that is what
+/// keeps the two prompts' vocabularies from drifting apart, and it is why
+/// `yes`/`always`/`no` and any casing work here too. `Interrupt` is
+/// unreachable, because that spelling is not in the accepted vocabulary.
+fn parse_jobs_reply(parts: &mut std::str::SplitWhitespace<'_>) -> Option<(u64, Decision)> {
+    let id = parts.next()?.parse::<u64>().ok()?;
+    let decision = parse_permission_answer(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((id, decision))
+}
+
+/// Machine label for one answered decision, for the `/jobs reply` payload.
+fn permission_decision_label(decision: Decision) -> &'static str {
+    match decision {
+        Decision::AllowOnce => "allow_once",
+        Decision::AllowAlways => "allow_always",
+        Decision::Deny => "deny",
+        Decision::Interrupt => "interrupt",
+    }
+}
+
+/// Machine label for one answer outcome. Spelled out rather than derived from
+/// `Debug`, so `NotBlocked` reads as `not_blocked` in the payload.
+fn agent_answer_outcome_label(outcome: subagent::AgentAnswerOutcome) -> &'static str {
+    match outcome {
+        subagent::AgentAnswerOutcome::Answered => "answered",
+        subagent::AgentAnswerOutcome::NotBlocked => "not_blocked",
+        subagent::AgentAnswerOutcome::NotFound => "not_found",
+    }
+}
+
+/// What the user reads after `/jobs reply`. A non-blocked agent is a reported
+/// no-op, not a failure: the id may have been answered, timed out, or finished
+/// between reading the deck and typing.
+fn jobs_reply_receipt(
+    id: u64,
+    outcome: subagent::AgentAnswerOutcome,
+    decision: Decision,
+) -> String {
+    match outcome {
+        subagent::AgentAnswerOutcome::Answered => format!(
+            "answered background agent #{id}: {}",
+            permission_decision_label(decision)
+        ),
+        subagent::AgentAnswerOutcome::NotBlocked => {
+            format!("background agent #{id} is not waiting on an answer")
+        }
+        subagent::AgentAnswerOutcome::NotFound => format!("no background job #{id}"),
+    }
 }
 
 async fn handle_jobs_command(
@@ -12017,11 +12132,38 @@ async fn handle_jobs_command(
                 }
             }
         }
-        _ => {
-            if let Some(suggestion) = closest_jobs_subcommand(action) {
-                eprintln!("unknown action '{action}' - did you mean '{suggestion}'?");
+        "reply" => {
+            let Some((id, decision)) = parse_jobs_reply(&mut parts) else {
+                eprintln!("{JOBS_REPLY_USAGE}");
+                return Err(());
+            };
+            let outcome = registry.answer(id, decision);
+            if matches!(outcome, subagent::AgentAnswerOutcome::NotFound) {
+                eprintln!("no background job #{id}");
+                return Err(());
             }
-            eprintln!("usage: /jobs [list|view|show <id>|explain <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>]");
+            eprintln!("~ {}", jobs_reply_receipt(id, outcome, decision));
+            Ok(serde_json::json!({
+                "kind": "jobs",
+                "action": "reply",
+                "changed": matches!(outcome, subagent::AgentAnswerOutcome::Answered),
+                "id": id,
+                "outcome": agent_answer_outcome_label(outcome),
+                "decision": permission_decision_label(decision),
+                "snapshot": jobs_snapshot_payload(registry),
+            }))
+        }
+        _ => {
+            // The unknown action is always named: a spelling far enough from
+            // every subcommand to have no nearest suggestion is exactly the
+            // one the user most needs told back to them.
+            match closest_jobs_subcommand(action) {
+                Some(suggestion) => {
+                    eprintln!("unknown action '{action}' - did you mean '{suggestion}'?")
+                }
+                None => eprintln!("unknown action '{action}'"),
+            }
+            eprintln!("usage: /jobs [list|view|show <id>|explain <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>|reply <id> <y|a|n>]");
             Err(())
         }
     }
@@ -12491,7 +12633,9 @@ fn print_background_results(results: &[subagent::AgentTerminalStatus]) {
         let body = match &result.status {
             subagent::AgentStatus::Done(body) => body.clone(),
             subagent::AgentStatus::Cancelled(reason) => format!("cancelled: {reason}"),
-            subagent::AgentStatus::Failed(_) | subagent::AgentStatus::Running => continue,
+            subagent::AgentStatus::Failed(_)
+            | subagent::AgentStatus::Running
+            | subagent::AgentStatus::Blocked => continue,
         };
         eprintln!("{}", kitsu_render::sanitize_terminal_text(&body));
     }
@@ -12502,7 +12646,11 @@ fn background_result_payload(result: &subagent::AgentTerminalStatus) -> serde_js
         subagent::AgentStatus::Done(body) => ("done", body.clone()),
         subagent::AgentStatus::Failed(error) => ("failed", error.clone()),
         subagent::AgentStatus::Cancelled(reason) => ("cancelled", reason.clone()),
-        subagent::AgentStatus::Running => ("running", String::new()),
+        // B4: no fifth status word. A blocked agent is non-terminal and so
+        // reports as `running`; a later stage needing it adds its own event.
+        subagent::AgentStatus::Running | subagent::AgentStatus::Blocked => {
+            ("running", String::new())
+        }
     };
     serde_json::json!({
         "id": result.id,
@@ -14300,8 +14448,17 @@ fn handle_active_jobs_command(
                 stopped.len()
             ))
         }
+        "reply" => {
+            let (id, decision) =
+                parse_jobs_reply(&mut parts).ok_or_else(|| JOBS_REPLY_USAGE.to_string())?;
+            let outcome = registry.answer(id, decision);
+            if matches!(outcome, subagent::AgentAnswerOutcome::NotFound) {
+                return Err(format!("no background job #{id}"));
+            }
+            Ok(jobs_reply_receipt(id, outcome, decision))
+        }
         _ => Err(
-            "active-turn controls: /jobs [list|view|show <id>|explain <id>|steer <id> <text>|stop <id>|stop-all]"
+            "active-turn controls: /jobs [list|view|show <id>|explain <id>|steer <id> <text>|stop <id>|stop-all|reply <id> <y|a|n>]"
                 .to_string(),
         ),
     }
@@ -15748,6 +15905,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         subagent::thread::AgentThreadLimits::default(),
     )
     .map_err(|error| CliError::user(format!("invalid background-thread limits: {error}")))?;
+    // `[agents] blocking` / `block_timeout_secs` (design B1/B3). The defaults
+    // are the registry's own, so a config with no `[agents]` table is a no-op.
+    agent_registry.set_blocking(setup.agent_blocking);
+    agent_registry.set_block_timeout(setup.agent_block_timeout);
 
     // G3 (docs/chat-ux-cycle-10.md): per-turn subagent spawn budget. Prompt
     // guidance demonstrably does not restrain small local models from agent
@@ -16451,16 +16612,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let Some(argv) = agent_hook_argv.as_ref() else {
             return;
         };
-        let current = agent_registry
-            .progress_snapshot()
-            .agents
-            .into_iter()
-            .map(|progress| agent_hook::AgentObservation {
-                id: progress.id,
-                state: agent_hook::agent_state_label(progress.status),
-                waiting_for: progress.telemetry.last_activity,
-            })
-            .collect::<Vec<_>>();
+        let current = agent_hook::observations(&agent_registry);
         let mut previous = previous_agent_observations.borrow_mut();
         for event in agent_hook::transitions(&previous, &current) {
             agent_hook::fire(argv, &event);
@@ -18599,6 +18751,7 @@ fn closest_jobs_subcommand(name: &str) -> Option<&'static str> {
         "stop",
         "stop-all",
         "prune",
+        "reply",
     ];
     SUBCOMMANDS
         .iter()
@@ -21592,7 +21745,9 @@ mod tests {
             task: "review the parser".to_string(),
             model: "test-model".to_string(),
             profile: Some("reviewer".to_string()),
+            name: None,
             phase: subagent::thread::AgentThreadPhase::Running,
+            waiting_for: None,
             handoff: subagent::thread::AgentHandoffState::Unavailable,
             elapsed_ms: 1200,
             result_bytes: None,
@@ -21785,6 +21940,181 @@ mod tests {
         assert!(!view.contains("done, "), "{view}");
         // No state can reach "needs input" yet, so the group is unreachable.
         assert!(!view.contains("needs input"), "{view}");
+    }
+
+    // -----------------------------------------------------------------
+    // T2-S3 (B5): the `Blocked` vocabulary on every /jobs surface. Nothing
+    // enters `Blocked` in this story, so each fixture is built by hand.
+    // -----------------------------------------------------------------
+
+    fn blocked_progress(id: u64) -> subagent::AgentProgress {
+        subagent::AgentProgress {
+            id,
+            task: "summarize the crate".to_string(),
+            profile: Some("reviewer".to_string()),
+            status: subagent::AgentProgressStatus::Blocked,
+            waiting_for: None,
+            elapsed_ms: 12_500,
+            result_bytes: None,
+            last_activity_ms_ago: Some(3_200),
+            telemetry: subagent::AgentTelemetry {
+                model: "qwen2.5-coder".to_string(),
+                last_activity: Some("tool read".to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// One wire word, three vocabularies: the `/jobs` JSON `status`, the
+    /// terminal-status label and the thread DTO `phase` all spell the new
+    /// state `blocked`, so the deck, the JSON and the hook cannot drift.
+    #[test]
+    fn every_blocked_label_is_the_single_word_blocked() {
+        assert_eq!(
+            agent_progress_status_label(subagent::AgentProgressStatus::Blocked),
+            "blocked"
+        );
+        assert_eq!(
+            terminal_agent_status_label(&subagent::AgentStatus::Blocked),
+            "blocked"
+        );
+        assert_eq!(
+            subagent::thread::AgentThreadPhase::Blocked.label(),
+            "blocked"
+        );
+        for label in [
+            agent_progress_status_label(subagent::AgentProgressStatus::Blocked),
+            subagent::thread::AgentThreadPhase::Blocked.label(),
+        ] {
+            assert!(label.is_ascii(), "deck labels stay ASCII: {label}");
+        }
+    }
+
+    /// T1 built the `needs input` group ahead of the state. `Blocked` maps
+    /// onto it rather than introducing a seventh heading.
+    #[test]
+    fn a_blocked_agent_belongs_to_the_needs_input_group() {
+        let agent = blocked_progress(3);
+        assert_eq!(jobs_view_group(&agent, false), "needs input");
+        assert_eq!(
+            jobs_view_group(&agent, true),
+            "needs input",
+            "collection state cannot move a non-terminal agent"
+        );
+    }
+
+    /// The deck row for a blocked agent: a live, non-terminal marker (there is
+    /// no `Blocked` `DeckState`, and B5 does not extend `kitsu-render`), and
+    /// the row's own status word is `blocked`.
+    #[test]
+    fn the_blocked_deck_row_is_marked_live_and_reads_blocked() {
+        assert_eq!(
+            agent_deck_state(subagent::AgentProgressStatus::Blocked, false),
+            kitsu_render::DeckState::Running
+        );
+        assert_eq!(
+            agent_deck_state(subagent::AgentProgressStatus::Blocked, true),
+            kitsu_render::DeckState::Running
+        );
+        let row = agent_deck_row_block(&blocked_progress(3), false, 2, 6);
+        assert!(row.contains("blocked"), "{row}");
+    }
+
+    /// The deck header counts gain a `blocked` term after `cancelled`, so the
+    /// per-state counts still sum to `total`. The existing count prefix is
+    /// unchanged, which is why the new term is appended rather than inserted.
+    #[test]
+    fn the_deck_counts_report_blocked_after_cancelled() {
+        let snapshot = subagent::AgentProgressSnapshot {
+            generation: 1,
+            total: 5,
+            running: 1,
+            done: 1,
+            failed: 1,
+            cancelled: 1,
+            blocked: 1,
+            max_running: 4,
+            max_records: 32,
+            available_running_slots: 3,
+            available_record_slots: 27,
+            agents: Vec::new(),
+        };
+        let counts = jobs_deck_counts(&snapshot);
+        assert!(
+            counts.contains("5 total · 1 running · 1 done · 1 failed · 1 cancelled · 1 blocked"),
+            "{counts}"
+        );
+    }
+
+    /// B4: JSONL output is unchanged. `background_result` keeps exactly
+    /// `done|failed|cancelled|running`; a blocked agent is non-terminal, so it
+    /// reports as `running` and never adds a fifth status word. A later stage
+    /// that needs it must add a `background_blocked` event instead.
+    #[test]
+    fn a_blocked_agent_adds_no_jsonl_status_value() {
+        let payload = background_result_payload(&subagent::AgentTerminalStatus {
+            id: 4,
+            task: "summarize the crate".to_string(),
+            status: subagent::AgentStatus::Blocked,
+            joined: false,
+        });
+        assert_eq!(payload["status"], "running");
+        assert_eq!(payload["result"], "");
+    }
+
+    /// `/jobs explain` on a blocked agent: the phase line says `blocked`, and
+    /// because `Blocked` is non-terminal the explanation keeps the live
+    /// shape (`since: started …`, steering reported) rather than the
+    /// past-tense terminal shape.
+    #[test]
+    fn explain_reads_a_blocked_agent_as_live() {
+        let (progress, thread) = explain_fixture(
+            9,
+            subagent::AgentProgressStatus::Blocked,
+            subagent::thread::AgentThreadPhase::Blocked,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        let explain = format_agent_explain(&progress, &thread);
+        assert_no_debug_leak(&explain);
+        let header = explain.lines().next().unwrap();
+        assert!(header.ends_with("| blocked"), "{header}");
+
+        let labels = explain_labels(&explain);
+        assert_eq!(labels[0].0, "since");
+        assert!(
+            labels[0].1.starts_with("started"),
+            "a blocked agent has not finished running: {explain}"
+        );
+        assert!(
+            labels.iter().any(|(label, _)| label == "steering"),
+            "steering stays answerable while blocked: {explain}"
+        );
+        assert!(
+            !labels.iter().any(|(label, _)| label == "handoff"),
+            "a non-terminal agent has no handoff line: {explain}"
+        );
+        let body = explain
+            .strip_prefix(&kitsu_render::deck_marker(kitsu_render::DeckState::Running))
+            .unwrap_or_else(|| panic!("no deck marker: {explain}"));
+        assert!(body.is_ascii(), "{explain}");
+    }
+
+    /// `/jobs show` on a blocked thread prints the DTO's own spelling.
+    #[test]
+    fn the_thread_view_names_the_blocked_phase() {
+        let (_progress, thread) = explain_fixture(
+            9,
+            subagent::AgentProgressStatus::Blocked,
+            subagent::thread::AgentThreadPhase::Blocked,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        let shown = format_agent_thread(&thread);
+        assert_no_debug_leak(&shown);
+        assert!(shown.contains("blocked"), "{shown}");
+        assert!(
+            shown.contains("handoff: unavailable"),
+            "a blocked thread offers no result: {shown}"
+        );
     }
 
     #[test]
@@ -22070,6 +22400,7 @@ mod tests {
             task: "summarize the crate".to_string(),
             profile: Some("reviewer".to_string()),
             status,
+            waiting_for: None,
             elapsed_ms: 12_500,
             result_bytes: Some(42),
             last_activity_ms_ago: Some(3_200),
@@ -22084,7 +22415,9 @@ mod tests {
             task: "summarize the crate".to_string(),
             model: "qwen2.5-coder".to_string(),
             profile: Some("reviewer".to_string()),
+            name: None,
             phase,
+            waiting_for: None,
             handoff,
             elapsed_ms: 12_500,
             result_bytes: Some(42),
@@ -22405,7 +22738,8 @@ mod tests {
             // every byte it adds to the state marker must already be ASCII and
             // every separator must be `|`.
             let marker = kitsu_render::deck_marker(match phase {
-                subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+                subagent::thread::AgentThreadPhase::Running
+                | subagent::thread::AgentThreadPhase::Blocked => kitsu_render::DeckState::Running,
                 subagent::thread::AgentThreadPhase::Done
                     if handoff == subagent::thread::AgentHandoffState::Ready =>
                 {
@@ -25585,5 +25919,722 @@ mod tests {
             .resolve()
             .expect_err("unset bare passthrough must error, not silently drop the flag");
         assert!(error.to_string().contains(name));
+    }
+
+    // ------------------------------------------------------------------
+    // T2-S5b: `/jobs reply <id> <y|a|n>` releases a parked agent.
+    //
+    // FAILING-FIRST. No dispatcher has a `reply` arm yet, so every test
+    // below currently fails: the two dispatch sites fall through to their
+    // unknown-subcommand branch, and the discoverability strings and the
+    // suggester table do not mention `reply`.
+    // ------------------------------------------------------------------
+
+    /// Park the exact request a path gate would park for `agent_id`, and hand
+    /// back the oneshot the gate itself is waiting on. Mirrors the registry's
+    /// own `park_path_request` fixture, which is private to `subagent`.
+    #[cfg(unix)]
+    fn park_a_path_request(
+        sender: &kitsu_tools::PromptRequestSender,
+        agent_id: u64,
+    ) -> tokio::sync::oneshot::Receiver<Decision> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        sender
+            .send(kitsu_tools::PromptRequest {
+                agent_id,
+                payload: kitsu_tools::PromptRequestPayload::Path(kitsu_tools::PermissionRequest {
+                    action: kitsu_tools::Action::Write,
+                    path: "/work/notes.txt".to_string(),
+                    grant_dir: "/work".to_string(),
+                }),
+                reply,
+            })
+            .expect("the registry owns the receiver and keeps it open");
+        answer
+    }
+
+    /// A registry holding exactly one agent parked on a permission request,
+    /// plus the gate's oneshot. Yields rather than sleeps, so it is safe under
+    /// a paused clock.
+    #[cfg(unix)]
+    async fn registry_with_one_blocked_agent() -> (
+        Arc<subagent::AgentRegistry>,
+        u64,
+        tokio::sync::oneshot::Receiver<Decision>,
+    ) {
+        let registry = subagent::AgentRegistry::new();
+        let id = registry.start("needs an answer".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let answer = park_a_path_request(&sender, id);
+        for _ in 0..1_000 {
+            let blocked = registry
+                .progress_snapshot()
+                .agents
+                .into_iter()
+                .any(|agent| {
+                    agent.id == id && agent.status == subagent::AgentProgressStatus::Blocked
+                });
+            if blocked {
+                return (registry, id, answer);
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("agent #{id} never became blocked after a request was parked");
+    }
+
+    // --- site 2: the mid-turn dispatcher (the plan's named acceptance) ---
+
+    /// T2-S5's acceptance verbatim: "reply during a running turn releases the
+    /// agent". The mid-turn dispatcher is the only `/jobs` route reachable
+    /// while a turn is in flight, so this is where that sentence is pinned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mid_turn_reply_releases_a_blocked_agent_with_the_decision_typed() {
+        for (letter, expected) in [
+            ("y", Decision::AllowOnce),
+            ("a", Decision::AllowAlways),
+            ("n", Decision::Deny),
+        ] {
+            let (registry, id, answer) = registry_with_one_blocked_agent().await;
+            let reported = handle_active_jobs_command(
+                &registry,
+                &tokio::runtime::Handle::current(),
+                &format!("reply {id} {letter}"),
+            )
+            .expect("replying to a blocked agent is not an error");
+            assert!(
+                reported.contains(&format!("#{id}")),
+                "the receipt names the agent it released: {reported}"
+            );
+            assert_eq!(
+                answer.await.expect("the gate's oneshot is resolved"),
+                expected,
+                "the gate sees exactly the decision `{letter}` spells"
+            );
+            // Released, not terminated: the agent goes back to running.
+            let status = registry
+                .progress_snapshot()
+                .agents
+                .into_iter()
+                .find(|agent| agent.id == id)
+                .map(|agent| agent.status);
+            assert_eq!(
+                status,
+                Some(subagent::AgentProgressStatus::Running),
+                "an answered agent resumes rather than ending"
+            );
+        }
+    }
+
+    /// The same three decisions under their long spellings, which the
+    /// foreground approval prompt already accepts (`parse_permission_answer`:
+    /// `y|yes`, `a|always`, `n|no`, case-insensitively). `/jobs reply` reads
+    /// its key the same way, so the two prompts never disagree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mid_turn_reply_accepts_the_same_keys_the_foreground_prompt_accepts() {
+        for (word, expected) in [
+            ("yes", Decision::AllowOnce),
+            ("ALWAYS", Decision::AllowAlways),
+            ("No", Decision::Deny),
+        ] {
+            let (_registry, id, answer) = registry_with_one_blocked_agent().await;
+            handle_active_jobs_command(
+                &_registry,
+                &tokio::runtime::Handle::current(),
+                &format!("reply {id} {word}"),
+            )
+            .expect("a long-form key is accepted");
+            assert_eq!(
+                answer.await.expect("the gate's oneshot is resolved"),
+                expected,
+                "`{word}` means the same thing at both prompts"
+            );
+        }
+    }
+
+    /// The three outcomes are distinguishable in what the user reads. A human
+    /// typing an id into a racy world must be able to tell "nothing happened"
+    /// from "it worked".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mid_turn_reply_distinguishes_answered_from_not_waiting_and_unknown() {
+        let (registry, blocked, _answer) = registry_with_one_blocked_agent().await;
+        let running = registry.start("busy, not parked".to_string()).unwrap();
+
+        let answered = handle_active_jobs_command(
+            &registry,
+            &tokio::runtime::Handle::current(),
+            &format!("reply {blocked} y"),
+        )
+        .expect("the blocked agent is answered");
+
+        let not_blocked = handle_active_jobs_command(
+            &registry,
+            &tokio::runtime::Handle::current(),
+            &format!("reply {running} y"),
+        );
+        let unknown = handle_active_jobs_command(
+            &registry,
+            &tokio::runtime::Handle::current(),
+            "reply 9999 y",
+        );
+
+        assert!(
+            not_blocked
+                .as_ref()
+                .err()
+                .or(not_blocked.as_ref().ok())
+                .expect("some message")
+                .contains("not waiting on an answer"),
+            "a running agent is reported as not waiting: {not_blocked:?}"
+        );
+        assert_eq!(
+            unknown,
+            Err("no background job #9999".to_string()),
+            "an unknown id reuses the one wording every other subcommand uses"
+        );
+        assert_ne!(
+            Ok(answered.clone()),
+            not_blocked,
+            "answered and not-waiting must not read alike"
+        );
+        assert_ne!(
+            Ok(answered),
+            unknown,
+            "answered and unknown must not read alike"
+        );
+    }
+
+    /// Bad input answers nothing. A missing id, a non-numeric id, a missing
+    /// key and an unknown key are all usage errors, and the parked agent is
+    /// still parked afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mid_turn_reply_rejects_bad_input_and_answers_nothing() {
+        let (registry, id, mut answer) = registry_with_one_blocked_agent().await;
+        for argument in [
+            "reply".to_string(),
+            "reply y".to_string(),
+            format!("reply {id}"),
+            "reply notanumber y".to_string(),
+            format!("reply {id} maybe"),
+            format!("reply {id} y extra"),
+        ] {
+            let error = handle_active_jobs_command(
+                &registry,
+                &tokio::runtime::Handle::current(),
+                &argument,
+            )
+            .expect_err(&format!("`{argument}` must be rejected"));
+            assert!(
+                error.contains("usage: /jobs reply <id> <y|a|n>"),
+                "`{argument}` must print the reply usage line, not {error}"
+            );
+            assert!(
+                matches!(
+                    answer.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "`{argument}` must not resolve the parked gate"
+            );
+        }
+        let status = registry
+            .progress_snapshot()
+            .agents
+            .into_iter()
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.status);
+        assert_eq!(
+            status,
+            Some(subagent::AgentProgressStatus::Blocked),
+            "the agent is still parked after every rejection"
+        );
+    }
+
+    // --- site 1: the idle dispatcher, and its JSON payload ---
+
+    /// The idle path releases the agent too, and its JSON payload matches the
+    /// shape `stop` emits: `kind`/`action`/`changed`/`snapshot`, plus the
+    /// `id`/`outcome` pair `close-steering` uses to report an outcome enum.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn idle_reply_releases_the_agent_and_emits_a_stop_shaped_payload() {
+        let (registry, id, answer) = registry_with_one_blocked_agent().await;
+        let journal = kitsu_tools::builtins::fs::WriteJournal::new();
+
+        let payload = handle_jobs_command(&registry, &journal, &format!("reply {id} a"))
+            .await
+            .expect("replying to a blocked agent succeeds");
+
+        assert_eq!(payload["kind"], "jobs");
+        assert_eq!(payload["action"], "reply");
+        assert_eq!(payload["changed"], true);
+        assert_eq!(payload["id"], id);
+        assert_eq!(payload["outcome"], "answered");
+        assert_eq!(payload["decision"], "allow_always");
+        assert!(
+            payload.get("snapshot").is_some(),
+            "every /jobs payload carries the deck snapshot: {payload}"
+        );
+        assert_eq!(
+            answer.await.expect("the gate's oneshot is resolved"),
+            Decision::AllowAlways
+        );
+    }
+
+    /// The two no-op outcomes on the idle path. `NotBlocked` is a reported
+    /// no-op (`changed: false`), exactly as `stop` reports an already-terminal
+    /// job; an unknown id is the usual `Err(())` rejection.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn idle_reply_reports_not_waiting_as_an_unchanged_payload_and_unknown_as_an_error() {
+        let registry = subagent::AgentRegistry::new();
+        let running = registry.start("busy, not parked".to_string()).unwrap();
+        let journal = kitsu_tools::builtins::fs::WriteJournal::new();
+
+        let payload = handle_jobs_command(&registry, &journal, &format!("reply {running} y"))
+            .await
+            .expect("a reported no-op is not a failure");
+        assert_eq!(payload["action"], "reply");
+        assert_eq!(payload["changed"], false);
+        assert_eq!(payload["outcome"], "not_blocked");
+
+        assert_eq!(
+            handle_jobs_command(&registry, &journal, "reply 9999 y").await,
+            Err(()),
+            "an unknown id is rejected"
+        );
+        assert_eq!(
+            handle_jobs_command(&registry, &journal, "reply").await,
+            Err(()),
+            "a missing id is a usage error"
+        );
+        assert_eq!(
+            handle_jobs_command(&registry, &journal, &format!("reply {running} maybe")).await,
+            Err(()),
+            "an unknown key is a usage error"
+        );
+    }
+
+    // --- sites 4-7: discoverability ---
+
+    #[test]
+    fn a_near_miss_for_reply_is_suggested_as_a_jobs_subcommand() {
+        assert_eq!(closest_jobs_subcommand("reply"), Some("reply"));
+        assert_eq!(closest_jobs_subcommand("repl"), Some("reply"));
+        assert_eq!(closest_jobs_subcommand("replyy"), Some("reply"));
+    }
+
+    /// Finding F2: `SUBCOMMANDS` drifts from the dispatcher silently. Every
+    /// subcommand the idle dispatcher serves must be suggestible, so the list
+    /// is pinned whole rather than one entry at a time.
+    #[test]
+    fn every_jobs_subcommand_is_its_own_nearest_suggestion() {
+        for subcommand in [
+            "list",
+            "view",
+            "show",
+            "explain",
+            "steer",
+            "close-steering",
+            "stop",
+            "stop-all",
+            "prune",
+            "reply",
+        ] {
+            assert_eq!(
+                closest_jobs_subcommand(subcommand),
+                Some(subcommand),
+                "`{subcommand}` is dispatched but not in the suggester table"
+            );
+        }
+    }
+
+    /// The advertised syntax for `/jobs`, for the `/agent` spelling that
+    /// forwards to the same dispatcher, and for the `/agents` alias.
+    #[test]
+    fn the_command_registry_advertises_jobs_reply_on_every_spelling() {
+        let jobs = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "jobs")
+            .expect("/jobs is registered");
+        assert!(jobs.args.contains("reply"), "{}", jobs.args);
+        assert!(
+            jobs.args.contains("reply <id> <y|a|n>"),
+            "the advertised form names the keys: {}",
+            jobs.args
+        );
+
+        // `/agent` is not a cosmetic row: it forwards its argument verbatim to
+        // `handle_jobs_command`, so anything it fails to advertise is a
+        // subcommand that works and cannot be found.
+        let agent = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "agent")
+            .expect("/agent is registered");
+        assert!(agent.args.contains("reply"), "{}", agent.args);
+
+        let agents = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "agents")
+            .expect("/agents is registered");
+        assert_eq!(agents.alias_of, Some("jobs"));
+        assert!(
+            agents.args.contains("any /jobs subcommand"),
+            "{}",
+            agents.args
+        );
+    }
+
+    /// Pre-existing drift from T1-S3, in the same breath: `/agent` reaches the
+    /// identical dispatcher as `/jobs`, so it must not advertise a smaller
+    /// vocabulary than the one it serves.
+    #[test]
+    fn the_agent_spelling_advertises_everything_it_forwards() {
+        let agent = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "agent")
+            .expect("/agent is registered");
+        for subcommand in ["view", "explain", "stop-all", "prune", "reply"] {
+            assert!(
+                agent.args.contains(subcommand),
+                "/agent forwards `{subcommand}` but does not advertise it: {}",
+                agent.args
+            );
+        }
+    }
+
+    /// Site 7: the usage line an unknown subcommand prints is the other half
+    /// of discoverability, and it is a separate literal from the `args:` row.
+    /// The mid-turn dispatcher returns its own line, so it is asserted here;
+    /// the idle dispatcher prints to stderr and is covered by the scripted
+    /// `test_script_jobs_reply_*` tests in `tests/cli.rs`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_mid_turn_usage_line_lists_reply() {
+        let registry = subagent::AgentRegistry::new();
+        let usage = handle_active_jobs_command(
+            &registry,
+            &tokio::runtime::Handle::current(),
+            "definitely-not-a-subcommand",
+        )
+        .expect_err("an unknown subcommand is a usage error");
+        assert!(
+            usage.contains("reply <id> <y|a|n>"),
+            "the active-turn controls line must advertise reply: {usage}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // T2-S6: the approval record in the two inspection surfaces.
+    // `record_approval_request`/`record_approval_outcome` are STUBS, so
+    // every test below this banner is expected to fail.
+    // ------------------------------------------------------------------
+
+    /// `/jobs show` renders the approval entries in timeline order, and the
+    /// path the gate actually parked (`/work/notes.txt`, `/work`) does not
+    /// appear. Driven through the real registry rather than a hand-built
+    /// snapshot: `format_agent_thread` prints any entry generically, so a
+    /// fixture-built Approval entry would prove nothing about whether one is
+    /// ever recorded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jobs_show_lists_the_approval_request_and_its_decision_in_order() {
+        let (registry, id, answer) = registry_with_one_blocked_agent().await;
+
+        let blocked = format_agent_thread(&registry.thread_snapshot(id).unwrap());
+        assert_no_debug_leak(&blocked);
+        assert!(
+            blocked.contains("approval"),
+            "the timeline names the approval entry's kind: {blocked}"
+        );
+        assert!(
+            blocked.contains("write a file"),
+            "/jobs show says what the agent asked for: {blocked}"
+        );
+        // NON-VACUOUS: `format_agent_thread` prints every entry's text
+        // verbatim through `sanitize_terminal_text`, which does not touch
+        // paths (see `redaction_does_not_remove_a_path_or_an_argv_word` in
+        // `subagent/thread.rs`). Any implementation that formatted the
+        // request's arguments into the entry would print them here.
+        for argument in ["notes.txt", "/work"] {
+            assert!(
+                !blocked.contains(argument),
+                "/jobs show leaked a tool argument ({argument}): {blocked}"
+            );
+        }
+
+        assert_eq!(
+            registry.answer(id, Decision::Deny),
+            subagent::AgentAnswerOutcome::Answered
+        );
+        assert_eq!(answer.await.expect("the gate is resolved"), Decision::Deny);
+
+        let decided = format_agent_thread(&registry.thread_snapshot(id).unwrap());
+        assert_no_debug_leak(&decided);
+        let request_at = decided
+            .find("write a file")
+            .unwrap_or_else(|| panic!("no request entry: {decided}"));
+        let decision_at = decided
+            .find("denied")
+            .unwrap_or_else(|| panic!("no decision entry: {decided}"));
+        assert!(
+            request_at < decision_at,
+            "the request is shown before its decision: {decided}"
+        );
+        for argument in ["notes.txt", "/work"] {
+            assert!(
+                !decided.contains(argument),
+                "/jobs show leaked a tool argument ({argument}): {decided}"
+            );
+        }
+    }
+
+    /// `/jobs explain` answers "why is this agent in this state". For a
+    /// blocked agent that is "it is waiting for permission to X", so the
+    /// `waiting on` line must say so instead of reporting the last tool
+    /// activity.
+    #[test]
+    fn explaining_a_blocked_agent_says_what_permission_it_waits_for() {
+        let (progress, mut thread) = explain_fixture(
+            9,
+            subagent::AgentProgressStatus::Blocked,
+            subagent::thread::AgentThreadPhase::Blocked,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        thread
+            .timeline
+            .entries
+            .push(subagent::thread::AgentTimelineEntry {
+                sequence: 2,
+                elapsed_ms: 20,
+                kind: subagent::thread::AgentTimelineKind::Approval,
+                round: None,
+                text: format!(
+                    "permission to {} requested",
+                    subagent::thread::AgentApprovalKind::WriteFile.label()
+                ),
+                truncated: false,
+            });
+        thread.timeline.retained_bytes += thread.timeline.entries[1].text.len();
+
+        let explain = format_agent_explain(&progress, &thread);
+        assert_no_debug_leak(&explain);
+        let labels = explain_labels(&explain);
+        let waiting = explain_label_value(&labels, "waiting on")
+            .unwrap_or_else(|| panic!("a blocked agent is waiting on something: {explain}"));
+        assert!(
+            waiting.contains("permission to write a file"),
+            "explain names the permission, not the last tool: {explain}"
+        );
+        let body = explain
+            .strip_prefix(&kitsu_render::deck_marker(kitsu_render::DeckState::Running))
+            .unwrap_or_else(|| panic!("no deck marker: {explain}"));
+        assert!(body.is_ascii(), "{explain}");
+    }
+
+    /// Once the request is decided the agent is no longer waiting on it, so
+    /// `explain` must not keep claiming it is. Pins that the outcome entry
+    /// closes the pending request rather than the request entry alone
+    /// driving the line.
+    #[test]
+    fn explaining_a_resumed_agent_no_longer_claims_to_wait_for_permission() {
+        let (progress, mut thread) = explain_fixture(
+            9,
+            subagent::AgentProgressStatus::Running,
+            subagent::thread::AgentThreadPhase::Running,
+            subagent::thread::AgentHandoffState::Unavailable,
+        );
+        for (sequence, text) in [
+            (2u64, "permission to write a file requested".to_string()),
+            (3, "permission to write a file allowed once".to_string()),
+        ] {
+            thread.timeline.retained_bytes += text.len();
+            thread
+                .timeline
+                .entries
+                .push(subagent::thread::AgentTimelineEntry {
+                    sequence,
+                    elapsed_ms: 20,
+                    kind: subagent::thread::AgentTimelineKind::Approval,
+                    round: None,
+                    text,
+                    truncated: false,
+                });
+        }
+
+        let explain = format_agent_explain(&progress, &thread);
+        let labels = explain_labels(&explain);
+        let waiting = explain_label_value(&labels, "waiting on")
+            .unwrap_or_else(|| panic!("a running agent still has a waiting-on line: {explain}"));
+        // NON-VACUOUS: the sibling test above requires this exact string to
+        // be printed from an Approval entry, and this thread's timeline
+        // carries that very entry. Only the decision distinguishes them.
+        assert!(
+            !waiting.contains("permission to"),
+            "an answered agent is not waiting for permission any more: {explain}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // F43: the two inspection surfaces must not call a cancellation a
+    // timeout. STUB: `AgentApprovalOutcome::Cancelled` does not exist, so
+    // the second test fails to COMPILE; the first fails on content.
+    // ------------------------------------------------------------------
+
+    /// `/jobs show` for a cancelled park and for a timed-out park, side by
+    /// side in one test so the absence assertion cannot be vacuous: the
+    /// timed-out agent proves this very surface does print "timed out" from
+    /// an approval entry, and the cancelled agent must not.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn jobs_show_distinguishes_a_cancelled_approval_from_a_timed_out_one() {
+        let registry = subagent::AgentRegistry::new();
+        let cancelled_id = registry
+            .start("cancelled while blocked".to_string())
+            .unwrap();
+        let timed_out_id = registry.start("never answered".to_string()).unwrap();
+        let sender = registry.prompt_sender();
+        let cancelled_answer = park_a_path_request(&sender, cancelled_id);
+        let timed_out_answer = park_a_path_request(&sender, timed_out_id);
+        for id in [cancelled_id, timed_out_id] {
+            for _ in 0..1_000 {
+                let blocked = registry
+                    .progress_snapshot()
+                    .agents
+                    .into_iter()
+                    .any(|agent| {
+                        agent.id == id && agent.status == subagent::AgentProgressStatus::Blocked
+                    });
+                if blocked {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        assert!(matches!(
+            registry.cancel(cancelled_id).await,
+            subagent::AgentCancelOutcome::Cancelled(_)
+        ));
+        assert_eq!(
+            cancelled_answer.await.expect("the gate is resolved"),
+            Decision::Interrupt
+        );
+        tokio::time::advance(
+            subagent::DEFAULT_AGENT_BLOCK_TIMEOUT + std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            timed_out_answer
+                .await
+                .expect("the timeout resolves the gate"),
+            Decision::Interrupt
+        );
+
+        let timed_out = format_agent_thread(&registry.thread_snapshot(timed_out_id).unwrap());
+        assert_no_debug_leak(&timed_out);
+        // NON-VACUITY: this surface prints an outcome's words verbatim.
+        assert!(
+            timed_out.contains("timed out"),
+            "/jobs show prints a timeout outcome from an approval entry: {timed_out}"
+        );
+
+        let cancelled = format_agent_thread(&registry.thread_snapshot(cancelled_id).unwrap());
+        assert_no_debug_leak(&cancelled);
+        assert!(
+            cancelled.contains("write a file cancelled"),
+            "/jobs show says the approval was cancelled: {cancelled}"
+        );
+        assert!(
+            !cancelled.contains("timed out"),
+            "a deliberate cancellation is not reported as an unattended \
+             timeout: {cancelled}"
+        );
+        for argument in ["notes.txt", "/work"] {
+            assert!(
+                !cancelled.contains(argument),
+                "/jobs show leaked a tool argument ({argument}): {cancelled}"
+            );
+        }
+    }
+
+    /// `/jobs explain` and the cancelled outcome. A GUARD, green today and
+    /// required to stay green: `pending_approval_request` keys on the
+    /// `" requested"` suffix, so the new `cancelled` outcome must close the
+    /// pending request exactly as `allowed once` does, and an implementer
+    /// who spells the entry differently (or records the cancellation as a
+    /// second *request*) would break this line.
+    ///
+    /// The phase is `Running` on purpose: `cancel_matching` calls
+    /// `thread.unblock()` before the terminal transition, so a thread that
+    /// is `Running` with a cancelled approval as its newest entry is a
+    /// state the cancel path really passes through.
+    ///
+    /// NON-VACUITY is proved inside this test: the first half builds the
+    /// same thread WITHOUT the outcome entry and shows this surface does
+    /// print "waiting on: permission to write a file" from it.
+    #[test]
+    fn explain_does_not_treat_a_cancelled_approval_as_a_pending_request() {
+        fn fixture_with(
+            texts: &[String],
+        ) -> (
+            subagent::AgentProgress,
+            subagent::thread::AgentThreadSnapshot,
+        ) {
+            let (progress, mut thread) = explain_fixture(
+                9,
+                subagent::AgentProgressStatus::Running,
+                subagent::thread::AgentThreadPhase::Running,
+                subagent::thread::AgentHandoffState::Unavailable,
+            );
+            for (offset, text) in texts.iter().enumerate() {
+                thread.timeline.retained_bytes += text.len();
+                thread
+                    .timeline
+                    .entries
+                    .push(subagent::thread::AgentTimelineEntry {
+                        sequence: 2 + offset as u64,
+                        elapsed_ms: 20,
+                        kind: subagent::thread::AgentTimelineKind::Approval,
+                        round: None,
+                        text: text.clone(),
+                        truncated: false,
+                    });
+            }
+            (progress, thread)
+        }
+
+        let requested = format!(
+            "approval to {} requested",
+            subagent::thread::AgentApprovalKind::WriteFile.label()
+        );
+        let cancelled = format!(
+            "approval to {} {}",
+            subagent::thread::AgentApprovalKind::WriteFile.label(),
+            subagent::thread::AgentApprovalOutcome::Cancelled.label()
+        );
+
+        let (progress, thread) = fixture_with(std::slice::from_ref(&requested));
+        let pending = format_agent_explain(&progress, &thread);
+        let pending_labels = explain_labels(&pending);
+        let pending_waiting = explain_label_value(&pending_labels, "waiting on")
+            .unwrap_or_else(|| panic!("a pending request has a waiting-on line: {pending}"));
+        assert_eq!(
+            pending_waiting, "permission to write a file",
+            "NON-VACUITY: this surface prints exactly this from a request              entry, so the absence asserted below is a real claim"
+        );
+
+        let (progress, thread) = fixture_with(&[requested, cancelled]);
+        let decided = format_agent_explain(&progress, &thread);
+        assert_no_debug_leak(&decided);
+        let decided_labels = explain_labels(&decided);
+        let decided_waiting = explain_label_value(&decided_labels, "waiting on")
+            .unwrap_or_else(|| panic!("the waiting-on line is still printed: {decided}"));
+        assert!(
+            !decided_waiting.contains("permission to"),
+            "a cancelled approval is decided, not pending: {decided}"
+        );
     }
 }

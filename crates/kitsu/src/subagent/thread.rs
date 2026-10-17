@@ -15,7 +15,9 @@ use kitsu_providers::{ProviderAttemptCategory, ProviderAttemptOutcome};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-pub const AGENT_THREAD_SCHEMA_VERSION: u32 = 1;
+/// Version 2 added the non-terminal `blocked` phase to a closed serde enum,
+/// so a v1 reader cannot decode a v2 DTO.
+pub const AGENT_THREAD_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_AGENT_TIMELINE_EVENTS: usize = 128;
 pub const DEFAULT_AGENT_TIMELINE_BYTES: usize = 64 * 1024;
 pub const DEFAULT_AGENT_TIMELINE_ENTRY_BYTES: usize = 4 * 1024;
@@ -111,6 +113,8 @@ pub enum AgentTimelineKind {
     Usage,
     Steering,
     Lifecycle,
+    /// One permission request parked on this agent, and its decision (T2-S6).
+    Approval,
 }
 
 impl AgentTimelineKind {
@@ -125,6 +129,72 @@ impl AgentTimelineKind {
             Self::Usage => "usage",
             Self::Steering => "steering",
             Self::Lifecycle => "lifecycle",
+            Self::Approval => "approval",
+        }
+    }
+}
+
+/// What a parked permission request is asking for, *without its arguments*.
+///
+/// Deliberately argument-free. `docs/functionality.md` states as an absolute
+/// that tool arguments and output are never copied into the inspection
+/// record, and a permission request is precisely a tool plus its arguments,
+/// so only the kind crosses into the timeline. `/jobs explain`'s question
+/// ("what is this agent waiting on") is answered by the kind alone.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentApprovalKind {
+    ReadFile,
+    WriteFile,
+    RunCommand,
+}
+
+impl AgentApprovalKind {
+    /// The machine spelling, shared by every surface outside the process: the
+    /// state file's `waiting_for`, the `on_agent_state` hook's
+    /// `KITSU_AGENT_WAITING_FOR`, and `kitsu agents --json`. It is the serde
+    /// spelling too, so one vocabulary reaches an outside reader.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::ReadFile => "read_file",
+            Self::WriteFile => "write_file",
+            Self::RunCommand => "run_command",
+        }
+    }
+
+    /// The phrase that follows "permission to".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReadFile => "read a file",
+            Self::WriteFile => "write a file",
+            Self::RunCommand => "run a command",
+        }
+    }
+}
+
+/// How a parked permission request was decided.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentApprovalOutcome {
+    AllowedOnce,
+    AllowedAlways,
+    Denied,
+    /// No human answered within `agents.block_timeout_secs` (B3). This is the
+    /// one outcome with nobody present, so the record matters most here.
+    TimedOut,
+    /// The park was cancelled rather than decided: `cancel_matching` took
+    /// the parked prompt itself and resolved the gate with `Interrupt`, so
+    /// the outcome is recorded at that site (F43).
+    Cancelled,
+}
+
+impl AgentApprovalOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AllowedOnce => "allowed once",
+            Self::AllowedAlways => "allowed always",
+            Self::Denied => "denied",
+            Self::TimedOut => "timed out",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -154,6 +224,10 @@ pub struct AgentTimelineSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum AgentThreadPhase {
     Running,
+    /// Parked on a user answer. Non-terminal: the thread's timeline stays
+    /// open, it offers no handoff, and steering remains answerable. No agent
+    /// can enter this phase yet; a later story populates it.
+    Blocked,
     Done,
     Failed,
     Cancelled,
@@ -164,6 +238,7 @@ impl AgentThreadPhase {
     pub fn label(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Blocked => "blocked",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -198,7 +273,19 @@ pub struct AgentThreadSnapshot {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Optional display name. Absent from the JSON entirely when `None`,
+    /// which keeps pre-`name` fixtures byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub phase: AgentThreadPhase,
+    /// What this agent is parked on, when it is parked: the permission
+    /// **kind** and nothing else (T2-S7, N8). Absent from the JSON entirely
+    /// when the agent is not blocked, which keeps every pre-T2-S7 fixture
+    /// byte-identical. The type is a unit enum with no argument-bearing
+    /// field, so a path or an argv word cannot travel here without altering
+    /// a public type (F40).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<AgentApprovalKind>,
     pub handoff: AgentHandoffState,
     pub elapsed_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -280,7 +367,10 @@ impl AgentThreadSnapshotDto {
                 "agent thread metadata contains oversized or unsafe text".to_string(),
             ));
         }
-        let terminal = self.thread.phase != AgentThreadPhase::Running;
+        let terminal = !matches!(
+            self.thread.phase,
+            AgentThreadPhase::Running | AgentThreadPhase::Blocked
+        );
         if terminal != self.thread.timeline.closed
             || (terminal && self.thread.handoff == AgentHandoffState::Unavailable)
             || (!terminal && self.thread.handoff != AgentHandoffState::Unavailable)
@@ -412,6 +502,11 @@ pub(crate) struct AgentThreadState {
     model: String,
     profile: Option<String>,
     phase: AgentThreadPhase,
+    /// The argument-free kind this thread is parked on, set by
+    /// [`AgentThreadState::record_approval_request`] and cleared by
+    /// [`AgentThreadState::unblock`]. A unit enum, so no tool argument can
+    /// travel from here to the snapshot (F40).
+    waiting_for: Option<AgentApprovalKind>,
     handoff: AgentHandoffState,
     result_bytes: Option<usize>,
     steering_sender: Option<mpsc::Sender<AgentSteeringMessage>>,
@@ -442,6 +537,7 @@ impl AgentThreadState {
                 .0,
                 profile: profile.map(|name| safe_inline_label(name, 64)),
                 phase: AgentThreadPhase::Running,
+                waiting_for: None,
                 handoff: AgentHandoffState::Unavailable,
                 result_bytes: None,
                 steering_sender: Some(sender),
@@ -654,6 +750,66 @@ impl AgentThreadState {
         was_open
     }
 
+    /// Record that this agent parked on a permission request (T2-S6).
+    ///
+    /// The entry reads `approval to <kind> requested`, built only from
+    /// `&'static str` labels and pinned by the registry's park tests.
+    ///
+    /// Takes the kind and nothing else: the path, grant dir, argv and cwd the
+    /// gate parked never reach this function, so no tool argument can be
+    /// formatted into the inspection record. Deliberately *not* routed
+    /// through `record_runtime_event`, which returns early unless the phase
+    /// is `Running` — a park is precisely the `Blocked` phase.
+    pub(crate) fn record_approval_request(&mut self, kind: AgentApprovalKind) {
+        // The blocked reason travels as this typed kind rather than as a
+        // free-form telemetry activity label, which would reach the hook
+        // environment as a string.
+        self.waiting_for = Some(kind);
+        self.timeline.push(
+            AgentTimelineKind::Approval,
+            None,
+            &format!("approval to {} requested", kind.label()),
+        );
+    }
+
+    /// Record how a parked permission request was decided (T2-S6).
+    ///
+    /// Reached by every resolution path, including B3's timeout, which is the
+    /// one decision taken with nobody present.
+    pub(crate) fn record_approval_outcome(
+        &mut self,
+        kind: AgentApprovalKind,
+        outcome: AgentApprovalOutcome,
+    ) {
+        self.timeline.push(
+            AgentTimelineKind::Approval,
+            None,
+            &format!("approval to {} {}", kind.label(), outcome.label()),
+        );
+    }
+
+    /// Park a running thread on a user answer (B5). `Blocked` is
+    /// non-terminal: `finish` and the steering rules still treat it exactly
+    /// as they treat `Running` once [`AgentThreadState::unblock`] resumes it.
+    pub(crate) fn block(&mut self) -> bool {
+        if self.phase != AgentThreadPhase::Running {
+            return false;
+        }
+        self.phase = AgentThreadPhase::Blocked;
+        true
+    }
+
+    /// Resume a blocked thread. Every terminal transition goes through
+    /// `Running`, so a cancellation of a blocked agent unblocks first.
+    pub(crate) fn unblock(&mut self) -> bool {
+        if self.phase != AgentThreadPhase::Blocked {
+            return false;
+        }
+        self.phase = AgentThreadPhase::Running;
+        self.waiting_for = None;
+        true
+    }
+
     pub(crate) fn finish(&mut self, phase: AgentThreadPhase, result_bytes: usize) {
         if self.phase != AgentThreadPhase::Running {
             return;
@@ -670,7 +826,7 @@ impl AgentThreadState {
                 AgentThreadPhase::Done => "agent completed; result ready for handoff",
                 AgentThreadPhase::Failed => "agent failed; result ready for handoff",
                 AgentThreadPhase::Cancelled => "agent cancelled; result ready for handoff",
-                AgentThreadPhase::Running => unreachable!(),
+                AgentThreadPhase::Running | AgentThreadPhase::Blocked => unreachable!(),
             },
         );
         self.timeline.closed = true;
@@ -702,7 +858,11 @@ impl AgentThreadState {
             task: self.task.clone(),
             model: self.model.clone(),
             profile: self.profile.clone(),
+            name: None,
             phase: self.phase,
+            waiting_for: (self.phase == AgentThreadPhase::Blocked)
+                .then_some(self.waiting_for)
+                .flatten(),
             handoff: self.handoff,
             elapsed_ms,
             result_bytes: self.result_bytes,
@@ -1185,5 +1345,555 @@ mod tests {
         let mut invalid = dto;
         invalid.thread.timeline.retained_bytes += 1;
         assert!(invalid.validate(limits).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // T2-S3 (B5): the `Blocked` phase. Nothing can enter it yet, so every
+    // fixture below is built by hand rather than driven through
+    // `AgentThreadState`.
+    // -----------------------------------------------------------------
+
+    /// A non-terminal `Blocked` thread, built to satisfy the post-B5
+    /// lifecycle rules: `handoff == Unavailable`, `timeline.closed == false`,
+    /// and steering still open.
+    fn blocked_snapshot(name: Option<&str>) -> AgentThreadSnapshot {
+        AgentThreadSnapshot {
+            id: 7,
+            task: "summarize the crate".to_string(),
+            model: "qwen2.5-coder".to_string(),
+            profile: Some("reviewer".to_string()),
+            name: name.map(str::to_string),
+            phase: AgentThreadPhase::Blocked,
+            waiting_for: None,
+            handoff: AgentHandoffState::Unavailable,
+            elapsed_ms: 12_500,
+            result_bytes: None,
+            steering_open: true,
+            pending_steering: 0,
+            timeline: AgentTimelineSnapshot {
+                entries: vec![AgentTimelineEntry {
+                    sequence: 1,
+                    elapsed_ms: 10,
+                    kind: AgentTimelineKind::UserTask,
+                    round: None,
+                    text: "summarize the crate".to_string(),
+                    truncated: false,
+                }],
+                dropped_entries: 0,
+                retained_bytes: 19,
+                closed: false,
+            },
+        }
+    }
+
+    /// The wire vocabulary: `blocked` on the phase enum, and the schema
+    /// version bumped to 2 because a closed serde enum gained a value.
+    #[test]
+    fn the_blocked_phase_label_is_blocked_at_schema_version_two() {
+        assert_eq!(AgentThreadPhase::Blocked.label(), "blocked");
+        assert!(
+            AgentThreadPhase::Blocked.label().is_ascii(),
+            "phase labels reach the ASCII-only deck"
+        );
+        assert_eq!(AGENT_THREAD_SCHEMA_VERSION, 2);
+    }
+
+    /// The round trip, and `skip_serializing_if` on the new `name`: an absent
+    /// name must not appear in the JSON at all, which is what keeps existing
+    /// fixtures byte-identical.
+    #[test]
+    fn a_blocked_dto_round_trips_and_omits_an_absent_name() {
+        let snapshot = blocked_snapshot(None);
+        let dto = AgentThreadSnapshotDto::from_snapshot(&snapshot);
+        dto.validate_default()
+            .expect("a blocked thread is a valid non-terminal DTO");
+
+        let encoded = serde_json::to_string(&dto).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["thread"]["phase"], "blocked");
+        assert!(
+            value["thread"].get("name").is_none(),
+            "an absent name is skipped entirely, not serialized as null: {encoded}"
+        );
+
+        let decoded: AgentThreadSnapshotDto = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, dto, "the blocked DTO survives a round trip");
+        decoded.validate_default().unwrap();
+    }
+
+    /// A present `name` is carried, and `deny_unknown_fields` still accepts
+    /// the field it now declares.
+    #[test]
+    fn a_present_thread_name_round_trips() {
+        let dto = AgentThreadSnapshotDto::from_snapshot(&blocked_snapshot(Some("reviewer-1")));
+        let encoded = serde_json::to_string(&dto).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["thread"]["name"], "reviewer-1");
+        let decoded: AgentThreadSnapshotDto = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.thread.name.as_deref(), Some("reviewer-1"));
+        decoded.validate_default().unwrap();
+    }
+
+    /// `terminal = phase not in {Running, Blocked}`: every lifecycle rule in
+    /// `validate()` must treat `Blocked` exactly as it treats `Running`.
+    #[test]
+    fn validate_treats_blocked_as_non_terminal() {
+        let dto = |snapshot: AgentThreadSnapshot| AgentThreadSnapshotDto::from_snapshot(&snapshot);
+
+        // A closed timeline is a terminal-only trait.
+        let mut closed = blocked_snapshot(None);
+        closed.timeline.closed = true;
+        assert!(
+            dto(closed).validate_default().is_err(),
+            "a blocked thread's timeline is still open"
+        );
+
+        // `handoff == Unavailable` iff non-terminal, so a blocked thread must
+        // never advertise a result to collect.
+        for handoff in [AgentHandoffState::Ready, AgentHandoffState::Acknowledged] {
+            let mut offered = blocked_snapshot(None);
+            offered.handoff = handoff;
+            assert!(
+                dto(offered).validate_default().is_err(),
+                "a blocked thread has no handoff: {handoff:?}"
+            );
+        }
+
+        // Steering stays available while an agent waits for its answer.
+        let mut open = blocked_snapshot(None);
+        open.steering_open = true;
+        assert!(
+            dto(open).validate_default().is_ok(),
+            "steering is open on a non-terminal thread"
+        );
+        let mut shut = blocked_snapshot(None);
+        shut.steering_open = false;
+        assert!(
+            dto(shut).validate_default().is_ok(),
+            "a closed steering channel is permitted, just not required"
+        );
+    }
+
+    /// The version bump is load-bearing: a v1 reader-written DTO carries the
+    /// old closed enum and must be rejected by this process's validator.
+    #[test]
+    fn the_previous_schema_version_is_rejected_by_validate() {
+        let mut dto = AgentThreadSnapshotDto::from_snapshot(&blocked_snapshot(None));
+        dto.schema_version = 1;
+        let error = dto
+            .validate_default()
+            .expect_err("version 1 is not this process's schema");
+        assert!(
+            error.to_string().contains("expected 2"),
+            "the error names the current schema: {error}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // T2-S6: the approval record. `record_approval_request` and
+    // `record_approval_outcome` are STUBS; every test below this banner is
+    // expected to fail until they append entries.
+    // -----------------------------------------------------------------
+
+    /// The wire and human vocabulary. Satisfied by the vocabulary stub alone
+    /// (the enums and labels), so it is a spelling pin, not a behaviour one.
+    #[test]
+    fn the_approval_timeline_kind_and_its_labels_have_one_spelling() {
+        assert_eq!(AgentTimelineKind::Approval.label(), "approval");
+        let kind = serde_json::to_string(&AgentTimelineKind::Approval).unwrap();
+        assert_eq!(kind, "\"approval\"", "the DTO spelling matches the label");
+        for (kind, label) in [
+            (AgentApprovalKind::ReadFile, "read a file"),
+            (AgentApprovalKind::WriteFile, "write a file"),
+            (AgentApprovalKind::RunCommand, "run a command"),
+        ] {
+            assert_eq!(kind.label(), label);
+            assert!(kind.label().is_ascii(), "approval labels reach the deck");
+        }
+        for (outcome, label) in [
+            (AgentApprovalOutcome::AllowedOnce, "allowed once"),
+            (AgentApprovalOutcome::AllowedAlways, "allowed always"),
+            (AgentApprovalOutcome::Denied, "denied"),
+            (AgentApprovalOutcome::TimedOut, "timed out"),
+        ] {
+            assert_eq!(outcome.label(), label);
+            assert!(outcome.label().is_ascii());
+        }
+    }
+
+    /// NON-VACUITY PROOF for every "the path does not appear" assertion in
+    /// this file and in `main.rs`.
+    ///
+    /// `sanitize_and_redact_text` redacts credentials. It does *not* redact a
+    /// filesystem path, a URL path, or an argv word. So an implementation
+    /// that formatted the request's arguments into the entry text would put
+    /// them into the snapshot verbatim, and the absence assertions below
+    /// would fail. They are claims about construction (kind-only entries),
+    /// not restatements of what redaction already does.
+    #[test]
+    fn redaction_does_not_remove_a_path_or_an_argv_word() {
+        for argument in [
+            "/work/secrets/notes.txt",
+            "/home/mmpg/workspace/kitsu",
+            "rm -rf /work/tmp",
+            "https://internal.invalid/private/report",
+        ] {
+            assert_eq!(
+                sanitize_and_redact_text(argument),
+                argument,
+                "redaction passes arguments through unchanged, so a kind-only \
+                 approval entry is the only thing keeping them out"
+            );
+        }
+    }
+
+    /// Parking records a request entry; deciding records the outcome. The
+    /// entries carry the kind and nothing else — no path, no grant dir, no
+    /// argv.
+    #[test]
+    fn an_approval_request_and_its_outcome_are_recorded_without_arguments() {
+        let (mut state, _runtime) = AgentThreadState::new(
+            "summarize the crate",
+            "model",
+            None,
+            AgentThreadLimits::default(),
+        );
+        assert!(state.block());
+        state.record_approval_request(AgentApprovalKind::WriteFile);
+        state.record_approval_outcome(
+            AgentApprovalKind::WriteFile,
+            AgentApprovalOutcome::AllowedOnce,
+        );
+        assert!(state.unblock());
+
+        let snapshot = state.snapshot(7, 12);
+        let approvals = snapshot
+            .timeline
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == AgentTimelineKind::Approval)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            approvals.len(),
+            2,
+            "one entry for the request and one for the decision: {:?}",
+            snapshot.timeline.entries
+        );
+        assert!(
+            approvals[0].text.contains("write a file"),
+            "the request names what it asks for: {:?}",
+            approvals[0]
+        );
+        assert!(
+            approvals[1].text.contains("allowed once"),
+            "the decision names the outcome: {:?}",
+            approvals[1]
+        );
+        assert!(
+            approvals[0].sequence < approvals[1].sequence,
+            "the request precedes its decision"
+        );
+
+        // N8 / docs/functionality.md: no tool argument crosses into the
+        // inspection record. See `redaction_does_not_remove_a_path_or_an_argv_word`
+        // for why this cannot pass vacuously.
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        for argument in ["/work", "notes.txt", "rm -rf", "https://"] {
+            assert!(
+                !encoded.contains(argument),
+                "an approval entry leaked an argument ({argument}): {encoded}"
+            );
+        }
+    }
+
+    /// Every outcome is recordable and spelled distinctly, including the
+    /// timeout, which is the one case with no human present.
+    #[test]
+    fn each_approval_outcome_including_the_timeout_leaves_a_distinct_record() {
+        for (outcome, expected) in [
+            (AgentApprovalOutcome::AllowedOnce, "allowed once"),
+            (AgentApprovalOutcome::AllowedAlways, "allowed always"),
+            (AgentApprovalOutcome::Denied, "denied"),
+            (AgentApprovalOutcome::TimedOut, "timed out"),
+        ] {
+            let (mut state, _runtime) =
+                AgentThreadState::new("task", "model", None, AgentThreadLimits::default());
+            state.record_approval_request(AgentApprovalKind::RunCommand);
+            state.record_approval_outcome(AgentApprovalKind::RunCommand, outcome);
+            let snapshot = state.snapshot(1, 1);
+            let texts = snapshot
+                .timeline
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == AgentTimelineKind::Approval)
+                .map(|entry| entry.text.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                texts.len(),
+                2,
+                "{outcome:?}: {:?}",
+                snapshot.timeline.entries
+            );
+            assert!(
+                texts[1].contains(expected),
+                "{outcome:?} is recorded as {expected:?}: {texts:?}"
+            );
+        }
+    }
+
+    /// An approval entry is recorded while the thread is `Blocked`.
+    /// `record_runtime_event` returns early unless the phase is `Running`, so
+    /// an implementation that routed the approval through that path would
+    /// record nothing at all — this is the test that catches it.
+    #[test]
+    fn an_approval_is_recorded_while_the_thread_is_blocked() {
+        let (mut state, _runtime) =
+            AgentThreadState::new("task", "model", None, AgentThreadLimits::default());
+        assert!(state.block());
+        assert_eq!(state.snapshot(1, 1).phase, AgentThreadPhase::Blocked);
+        state.record_approval_request(AgentApprovalKind::ReadFile);
+        assert!(
+            state
+                .snapshot(1, 1)
+                .timeline
+                .entries
+                .iter()
+                .any(|entry| entry.kind == AgentTimelineKind::Approval),
+            "the park itself happens in the Blocked phase, so the entry must \
+             be recordable there"
+        );
+    }
+
+    /// Item 5: a parked-and-answered agent cannot grow the timeline without
+    /// limit, and the DTO it produces still validates (which re-checks the
+    /// redaction and accounting invariants for the new entries).
+    #[test]
+    fn repeated_approvals_stay_within_the_timeline_budget_and_validate() {
+        let limits = tiny_limits();
+        let (mut state, _runtime) = AgentThreadState::new("task", "model", None, limits);
+        for _ in 0..64 {
+            state.record_approval_request(AgentApprovalKind::WriteFile);
+            state.record_approval_outcome(
+                AgentApprovalKind::WriteFile,
+                AgentApprovalOutcome::Denied,
+            );
+        }
+        let snapshot = state.snapshot(3, 4);
+        assert!(
+            snapshot
+                .timeline
+                .entries
+                .iter()
+                .any(|entry| entry.kind == AgentTimelineKind::Approval),
+            "approvals are recorded at all: {:?}",
+            snapshot.timeline.entries
+        );
+        assert!(snapshot.timeline.entries.len() <= limits.max_events);
+        assert!(snapshot.timeline.retained_bytes <= limits.max_bytes);
+        assert!(
+            snapshot.timeline.dropped_entries > 0,
+            "128 approval entries do not fit in a 3-event budget"
+        );
+        AgentThreadSnapshotDto::from_snapshot(&snapshot)
+            .validate(limits)
+            .expect("approval entries satisfy the DTO's redaction and accounting rules");
+    }
+
+    // -----------------------------------------------------------------
+    // F43: a cancelled approval is not a timeout. `AgentApprovalOutcome`
+    // has no `Cancelled` variant today, so both tests below are expected
+    // to fail to COMPILE until the variant and its label exist.
+    // -----------------------------------------------------------------
+
+    /// The fifth outcome's spelling, and that it is its own word rather than
+    /// a second name for the timeout. Vocabulary pin only, no behaviour.
+    #[test]
+    fn a_cancelled_approval_has_its_own_label_distinct_from_the_timeout() {
+        assert_eq!(AgentApprovalOutcome::Cancelled.label(), "cancelled");
+        assert!(AgentApprovalOutcome::Cancelled.label().is_ascii());
+        assert_ne!(
+            AgentApprovalOutcome::Cancelled.label(),
+            AgentApprovalOutcome::TimedOut.label(),
+            "a human cancellation and an unattended timeout are different facts"
+        );
+        let labels = [
+            AgentApprovalOutcome::AllowedOnce,
+            AgentApprovalOutcome::AllowedAlways,
+            AgentApprovalOutcome::Denied,
+            AgentApprovalOutcome::TimedOut,
+            AgentApprovalOutcome::Cancelled,
+        ]
+        .map(AgentApprovalOutcome::label);
+        let mut unique = labels.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "five outcomes, five spellings: {labels:?}"
+        );
+    }
+
+    /// Every outcome's recorded entry text, pinned by exact equality rather
+    /// than by `contains`, so neither the cancellation nor the timeout can
+    /// be recorded as the other (F41: pin what the output *is*).
+    #[test]
+    fn every_outcome_including_cancellation_records_its_own_exact_entry_text() {
+        for (outcome, expected) in [
+            (
+                AgentApprovalOutcome::AllowedOnce,
+                "approval to write a file allowed once",
+            ),
+            (
+                AgentApprovalOutcome::AllowedAlways,
+                "approval to write a file allowed always",
+            ),
+            (
+                AgentApprovalOutcome::Denied,
+                "approval to write a file denied",
+            ),
+            (
+                AgentApprovalOutcome::TimedOut,
+                "approval to write a file timed out",
+            ),
+            (
+                AgentApprovalOutcome::Cancelled,
+                "approval to write a file cancelled",
+            ),
+        ] {
+            let (mut state, _runtime) =
+                AgentThreadState::new("task", "model", None, AgentThreadLimits::default());
+            assert!(state.block());
+            state.record_approval_request(AgentApprovalKind::WriteFile);
+            state.record_approval_outcome(AgentApprovalKind::WriteFile, outcome);
+            let texts = state
+                .snapshot(1, 1)
+                .timeline
+                .entries
+                .into_iter()
+                .filter(|entry| entry.kind == AgentTimelineKind::Approval)
+                .map(|entry| entry.text)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                texts,
+                vec![
+                    "approval to write a file requested".to_string(),
+                    expected.to_string()
+                ],
+                "{outcome:?} records one request and one outcome, spelled exactly"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // T2-S7: `waiting_for` on the wire. The DTO field exists as a STUB
+    // (`AgentThreadState::snapshot` always publishes `None`) and
+    // `AgentApprovalKind::wire` is a STUB returning "", so the two tests
+    // below that pin content FAIL until the implementer lands the card.
+    // -----------------------------------------------------------------
+
+    /// One machine vocabulary for the three surfaces outside the process.
+    /// `wire()` is what the state file, the hook environment and
+    /// `kitsu agents --json` all carry, and it is the serde spelling too, so a
+    /// reader of any one of them can compare bytes with a reader of another.
+    /// It is deliberately *not* `label()`: that is the English phrase `/jobs`
+    /// prints after "approval to".
+    #[test]
+    fn the_waiting_for_kind_has_one_machine_spelling_shared_with_serde() {
+        for (kind, wire, label) in [
+            (AgentApprovalKind::ReadFile, "read_file", "read a file"),
+            (AgentApprovalKind::WriteFile, "write_file", "write a file"),
+            (
+                AgentApprovalKind::RunCommand,
+                "run_command",
+                "run a command",
+            ),
+        ] {
+            assert_eq!(kind.wire(), wire, "{kind:?} has one machine spelling");
+            assert!(kind.wire().is_ascii(), "{kind:?} reaches a child's environ");
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!("\"{wire}\""),
+                "{kind:?}: the serde spelling is the machine spelling"
+            );
+            assert_eq!(kind.label(), label, "the human phrase is unchanged");
+            assert_ne!(
+                kind.wire(),
+                kind.label(),
+                "{kind:?}: the machine word and the human phrase are distinct"
+            );
+        }
+    }
+
+    /// The F40 guard, stated structurally: `waiting_for` is a closed unit enum,
+    /// so a path or an argv word is not merely absent from it -- it cannot be
+    /// *represented* in it. A foreign writer that put one there produces a DTO
+    /// this binary refuses to decode rather than one it prints.
+    ///
+    /// Not vacuous: the same slot with a real kind decodes, which is asserted
+    /// first, so the refusals below are about the value and not about the
+    /// field, the fixture or the surrounding JSON.
+    #[test]
+    fn a_waiting_for_field_cannot_represent_a_path_or_an_argv_word() {
+        let encode = |waiting_for: serde_json::Value| {
+            let mut dto = serde_json::to_value(AgentThreadSnapshotDto::from_snapshot(
+                &blocked_snapshot(None),
+            ))
+            .unwrap();
+            dto["thread"]["waiting_for"] = waiting_for;
+            dto
+        };
+
+        let good = encode(serde_json::json!("write_file"));
+        let decoded: AgentThreadSnapshotDto =
+            serde_json::from_value(good).expect("a real kind decodes in this slot");
+        assert_eq!(
+            decoded.thread.waiting_for,
+            Some(AgentApprovalKind::WriteFile)
+        );
+
+        for leak in [
+            serde_json::json!("/work/notes.txt"),
+            serde_json::json!("rm -rf /work/tmp"),
+            serde_json::json!("write a file"),
+            serde_json::json!({"write_file": "/work/notes.txt"}),
+        ] {
+            assert!(
+                serde_json::from_value::<AgentThreadSnapshotDto>(encode(leak.clone())).is_err(),
+                "waiting_for must not accept {leak}"
+            );
+        }
+    }
+
+    /// The shape on the wire: the kind's machine word when parked, and the key
+    /// gone entirely when not -- which is what keeps every pre-T2-S7 fixture
+    /// byte-identical.
+    #[test]
+    fn a_blocked_dto_publishes_its_waiting_for_kind_and_omits_it_when_absent() {
+        let mut snapshot = blocked_snapshot(None);
+        snapshot.waiting_for = Some(AgentApprovalKind::WriteFile);
+        let dto = AgentThreadSnapshotDto::from_snapshot(&snapshot);
+        dto.validate(AgentThreadLimits::default())
+            .expect("a parked thread is a valid non-terminal DTO");
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["thread"]["waiting_for"], "write_file");
+        assert_eq!(
+            value["thread"]["waiting_for"],
+            AgentApprovalKind::WriteFile.wire(),
+            "the DTO spelling is `wire()`, not a second vocabulary"
+        );
+        assert_eq!(value["thread"]["phase"], "blocked");
+        let decoded: AgentThreadSnapshotDto = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, dto, "the parked DTO survives a round trip");
+
+        let mut running = blocked_snapshot(None);
+        running.phase = AgentThreadPhase::Running;
+        running.waiting_for = None;
+        let value = serde_json::to_value(AgentThreadSnapshotDto::from_snapshot(&running)).unwrap();
+        assert!(
+            value["thread"].get("waiting_for").is_none(),
+            "an unparked thread carries no waiting_for key at all: {value}"
+        );
     }
 }

@@ -829,9 +829,34 @@ it won't ask again.
   for it, is replaced atomically, refreshes at turn boundaries, and is removed
   on clean exit. Treat it as a hint, never a source of truth: it may be stale,
   absent, or left by a process that died, and writing it never affects a turn.
+- `[agents] blocking` decides what a background agent does when a tool of its
+  own needs permission you have not granted. The default, `fail_closed`, is
+  today's behaviour: the operation is refused and the agent carries on, because
+  a detached agent has nobody to ask. Set it to `ask` and the agent **parks**
+  instead — it reports as `blocked`, appears first in `/jobs view` under
+  `needs input`, and waits for you to answer, after which `allow once` or
+  `allow always` applies exactly the grant the foreground prompt would have
+  applied. Nothing is refused behind your back and no new kind of permission is
+  created.
+
+  `ask` only has an effect where a human could actually answer. Scripted,
+  piped and JSONL runs never reach the question at all — their permission mode
+  short-circuits before the route is consulted — so setting `ask` cannot change
+  what automation does, by construction rather than by policy.
+
+  `[agents] block_timeout_secs` bounds the wait, defaulting to `1800` (thirty
+  minutes). If nobody answers in that time the agent ends as failed-interrupted
+  rather than waiting forever, so an unattended run can never hang on a
+  question. The unit is in the key name on purpose: a bare `block_timeout` is
+  exactly where seconds and minutes get confused, and that spelling is rejected
+  rather than guessed at.
 - `[hooks] on_agent_state` runs a local command on each agent state change,
   exporting `KITSU_AGENT_ID`, `KITSU_AGENT_STATE` and
-  `KITSU_AGENT_WAITING_FOR`. It is executed **directly, never through a shell,
+  `KITSU_AGENT_WAITING_FOR`. A background agent parked on a permission reports
+  `STATE=blocked` and a `WAITING_FOR` of `read_file`, `write_file` or
+  `run_command` — the kind it asked for, **never** the path or command line,
+  since a hook runs an external program. The state file and
+  `kitsu agents --json` use those same three words. It is executed **directly, never through a shell,
   with no expansion**, so config text cannot turn into shell execution; use a
   script, or write `sh -c` yourself. Its output is discarded so it cannot
   disturb kitsu's own rendering, kitsu never waits for it, and a failure,
@@ -932,8 +957,8 @@ Slash commands inside the REPL:
 | `/context [refresh]` | Show detailed context provenance, or refresh unpinned model metadata without discarding the current known window on failure. |
 | `/compact` | Compact eligible older exchanges now and report the actual method and savings. |
 | `/profiles` | List validated background-agent profiles with their instructions, requested reasoning effort, tool grant, and session-grant inheritance. Built-ins are a read-only `reviewer` and tool-free `reasoning` worker; both inherit the invocation's reasoning-effort policy rather than requesting one, so they never add a request field a gateway may reject. |
-| `/agent [list\|show ID\|steer ID TEXT\|stop ID\|close ID]` | Inspect one bounded, redacted agent timeline; steer or stop that thread; acknowledge and close retained results. |
-| `/jobs [list\|view\|explain ID\|show ID\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. `view` groups the same deck by state, agents needing input first, so one row does not hide among many. `explain ID` answers why one agent is in its state, since when, and what it is waiting on, and is read-only: unlike `show` it never acknowledges a ready result, so diagnosing an agent cannot quietly satisfy the unobserved-result exit guard. Steering **restarts** the worker with the correction on a fresh transcript — the receipt reports the elapsed work that discards; completed file changes are kept. `/agents` remains an alias: bare lists, a numeric argument shows that thread, and any other argument is forwarded to `/jobs`. |
+| `/agent [any /jobs subcommand]` | Inspect one bounded, redacted agent timeline; steer or stop that thread; acknowledge and close retained results. |
+| `/jobs [list\|view\|explain ID\|show ID\|reply ID y\|a\|n\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. `view` groups the same deck by state, agents needing input first, so one row does not hide among many. `explain ID` answers why one agent is in its state, since when, and what it is waiting on, and is read-only: unlike `show` it never acknowledges a ready result, so diagnosing an agent cannot quietly satisfy the unobserved-result exit guard. Steering **restarts** the worker with the correction on a fresh transcript — the receipt reports the elapsed work that discards; completed file changes are kept. `/agents` remains an alias: bare lists, a numeric argument shows that thread, and any other argument is forwarded to `/jobs`. |
 | `/artifacts [list\|prune ID\|prune all]` | Inspect aggregate command-artifact quota/usage and explicitly prune retained evidence. Also reports what earlier runs left on disk; reclaim that with the host-only `kitsu artifacts`. |
 | `/queue [list\|add\|remove\|edit\|move\|promote\|clear]` | Inspect and edit the bounded eight-prompt FIFO; `/queue <prompt>` remains shorthand for add. A single word one edit away from a subaction (e.g. `/queue lst`) gets a close-match suggestion instead of being silently queued; `/queue add <word>` queues it verbatim. |
 | `/steer <correction>` | While a response is running on Unix, cancel its partial turn, keep/report completed file effects, and restart it immediately with the correction before queued follow-ups. |

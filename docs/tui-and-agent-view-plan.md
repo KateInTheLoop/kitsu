@@ -51,7 +51,7 @@ Checked on the branch; line numbers are from the current tree.
 | `AgentRegistry` built at `main.rs:15007`; `spawn_agent_bg_tool_with_binder` wired at `:15116` with `quiet = true` (`:15115`); `background_agent_notice` (`:10799`) consumed at `:16423`, `:16496`; `subscribe()` at `subagent.rs:706`; `rename`/`answer`/`tail_timeline` do not exist; private `attach` at `:681` | `main.rs`, `subagent.rs` | T1/T2/T4 registry additions are new methods, not edits. |
 | `AgentRegistrySnapshot` is `Copy + Default`, built by struct literal at `subagent.rs:1185` and in tests `main.rs:21853-21881`; `AgentThreadSnapshot` literals at `thread.rs:700`, `main.rs:20632`; exhaustive matches in `agent_progress_status_label` (`main.rs:10844`), `format_jobs` (`:10909`), `format_agent_thread` (`:11095`) | `subagent.rs`, `thread.rs`, `main.rs` | Adding fields/variants breaks these sites; their files belong in the story's Files column. |
 | Approval gates: `Permissions::resolve` `Mode::Ask` (`permissions.rs:1623`) and `CommandMode::Ask` (`command.rs:1687`), both calling `interactive_prompts_allowed()` (`kitsu-tools/src/lib.rs:61-65`, default `true` when unscoped). `scope_without_interactive_prompts` is used by `subagent.rs:1977` and five `semantic.rs` sites (`:136, :678, :702, :741, :775`); scope tests at `permissions.rs:2064`, `command.rs:3578` | `crates/kitsu-tools` | The prompt route must keep `scope_without_interactive_prompts` ⇒ denied for all seven callers; only the new registry route changes behavior. |
-| `AgentThreadSnapshotDto::validate()` rejects any `schema_version != AGENT_THREAD_SCHEMA_VERSION` (`thread.rs:234-238`) | `thread.rs` | A T2 reader (v2) would reject v1 state files written by a still-running T1 process unless the reader tolerates older versions. |
+| `AgentThreadSnapshotDto::validate()` rejects any `schema_version != AGENT_THREAD_SCHEMA_VERSION` (`thread.rs:234-238`) | `thread.rs` | ~~A T2 reader (v2) would reject v1 state files written by a still-running T1 process~~ — **corrected in T2-S3: this conflated two independent schemas.** `agent_state_file.rs` has its own (`kitsu.agents.v1`) and never embeds the thread DTO, so bumping the thread schema cannot affect state files and there is no cross-process reader of the thread DTO at all. The thread DTO is emitted only in-process, into `/jobs --json`. T1-S5's "reader tolerates `schema_version ≤ current`" refers to the **state file's** schema, not this one. |
 | `ratatui 0.30.2` requires Rust **1.88**; `0.29.0` requires 1.74; `crossterm 0.29` 1.63; `vt100 0.16` 1.70. **Corrected in T0-S2:** `vt100 0.16` is unusable here — it needs `unicode-width ^0.2.1` while `ratatui 0.29` pins `unicode-width =0.2.0` exactly, so the resolver refuses; `vt100 = "0.15"` resolves 0.15.2 with the same `Parser`/`screen` API the tests use. Workspace `resolver = "2"` ignores `rust-version`; MSRV is 1.80 (`Cargo.toml:14`); no 1.80 toolchain installed locally; release builds are `--locked` on linux/macOS/Windows (`release.yml`) | `cargo info`, `Cargo.toml:2,14`, `rustup toolchain list` | Pin `ratatui = "0.29"` and the crossterm it uses (0.28 at the time of writing; confirm one crossterm with `cargo tree -d`), `vt100 = "0.15"` as dev-dep (0.16 conflicts — see the previous cell). **Superseded by finding F9:** the 1.80 gate was never meetable — `clap 4.6`, `zeroize 1.9`, `indexmap 2.14`, `time 0.3.55` and others were already pinned at edition-2024 releases that Cargo 1.80 cannot parse, so the honest gate is that the new crate must not *further* raise the floor, checked against the resolved versions directly. |
 | No `XDG_*`/`dirs` usage anywhere; only `host_home_dir()` (`permissions.rs:552`); roadmap invariants: "Config discovery … performs no implicit … state mutation" and "Optional integrations create no … state write … while disabled" | grep; `docs/roadmap/README.md:68-69, 76` | The state file must be interactive-only by default with explicit opt-in for automation, and needs macOS/Windows directory fallbacks and file permissions. |
 | `SavedSession` (`session.rs:55-70`) persists `messages` plus id/name/model/project_context; no tool receipts or notices | `crates/kitsu/src/session.rs` | Transcript overlay and fullscreen read an in-memory cell ring; slash-command output that bypasses the seam is **not** in the ring (documented limitation until routed). |
@@ -126,7 +126,16 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T0-S16 palette wiring, repaint-all, `on_resize` height, F29 refactor | done | c1aa851 |
 | T0-S17 idle completion ranking, F30 closed | done | 7efe8ae |
 | T0-S18 fork/flock fence race, F28 closed as a production bug | done | this commit |
-| T0-S19 the three remaining flock sites, F32 closed | done | this commit |
+| T0-S19 the three remaining flock sites, F32 closed | done | 187e120 |
+| T2-S1 `PromptRoute` task-local seam | done | c4bd57b |
+| T2-S3 `Blocked` vocabulary + validator + schema v2 | done, **taken before S2** | 68c7e54 |
+| T2-S2 both gates consult the route (absorbs S1's gate half) | done | 14a9c85 |
+| T2-S4 registry parks, answers, times out | done | cdac378 |
+| T2-S5a `agents.blocking` + `block_timeout_secs` + spawn wiring | done | 57a2e90 |
+| T2-S5b `/jobs reply` in all **seven** sites (F38), F2 closed by test | done | 13f12ea |
+| T2-S6 approval entries in `/jobs show` and `/jobs explain`, argument-free by construction (F40) | done | 420be74 |
+| T2-S7 blocked state on the state file, `on_agent_state` and `kitsu agents --json`, one machine vocabulary (F44, F45) | done | 74ae7f3 |
+| F43 fix: a cancelled approval is recorded (was recorded as nothing); five of five resolutions | done | this commit |
 
 With T1-S6 done, **milestone T1 is complete**: kitsu now exposes its
 background agents to the outside three ways — a grouped and explainable deck
@@ -243,6 +252,24 @@ subcommands are additive.
 | Story | Deliverable | First card | Files | Acceptance / req |
 |---|---|---|---|---|
 | T2-S1 | `PromptRoute` task-local (`Foreground\|Denied\|Registry{agent_id, sender}`) in `kitsu-tools`; `interactive_prompts_allowed()` ≡ `route == Foreground`; `scope_without_interactive_prompts` keeps setting `Denied` (all seven callers unchanged); new `scope_with_registry_prompts` | Failing test: `Registry` route in `Permissions::resolve` yields a `Blocked` request and resumes on `AllowOnce` | `kitsu-tools/src/lib.rs:44-62`, `permissions.rs:1623` | `cargo test -p kitsu-tools` whole crate green incl. `permissions.rs:2064`; three-case test (y/a/n) for the fs gate (B1, B2) |
+**Scope note:** the shipped **T2-S1** was *narrower* than this row. The row
+scopes the task-local **and** routing `Permissions::resolve`, with a three-case
+y/a/n test for the fs gate. The commit (`c4bd57b`) delivered only the seam —
+the `PromptRoute` enum, the `interactive_prompts_allowed()` equivalence and the
+scope functions — and deliberately left the `sender` off the `Registry` variant,
+because defining it needs the request and answer types. **T2-S2 therefore
+absorbs this row's gate half**, and does both gates together: they are
+symmetric, they share the request/answer types, and B2 specifies both. Nothing
+regressed in the meantime because nothing in production sets a `Registry` route
+— verified, the only callers of `scope_with_registry_prompts` are tests.
+
+**Order note:** S3 is taken **before** S2. S2 defines the channel an approval
+request travels on, and that channel's destination *is* the `Blocked` state S3
+introduces — building the channel first would mean inventing its destination
+twice. S3 is also fully self-contained (types, validator, schema bump) and
+unblocks nothing else, so moving it earlier costs nothing. The rest of the
+milestone keeps the planned order.
+
 | T2-S2 | Command gate: `CommandMode::Ask` consults the route; `CommandApprovalRequest` travels the same channel; `always` applies the exact argv/cwd grant via existing code; **`Registry`-routed command test** added | Failing three-case command test | `command.rs:1687`, tests near `:3578` | `cargo test -p kitsu-tools` green (B2) |
 | T2-S3 | Three vocabularies + validator in one story: `AgentStatus::Blocked`, `AgentProgressStatus::Blocked`, `AgentThreadPhase::Blocked`; `validate()` rules (`terminal = phase ∉ {Running, Blocked}` …); `AGENT_THREAD_SCHEMA_VERSION = 2`; optional `name`; label functions and struct literals updated | Failing DTO round-trip test for a blocked thread | `subagent.rs`, `thread.rs:153,194,276,700`, `main.rs:10844,10909,11095,20632`, state-file reader (accepts v1 and v2) | `validate_default()` for blocked DTO; `/jobs` JSON `status: "blocked"`; `debug_assert` holds (B5) |
 | T2-S4 | Registry `answer(id, Decision)`; timeout `agents.block_timeout` → `Interrupt` → `AuthorityInputClosed` → `Failed(interrupted)`; `/jobs stop` on a blocked agent resolves `Interrupt` | Failing tokio time-paused timeout test | `subagent.rs`, `config.rs` | Timeout + stop tests (B3) |

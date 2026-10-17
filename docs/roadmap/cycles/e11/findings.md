@@ -1724,3 +1724,759 @@ The one deliberate exception is in `crates/kitsu/tests/cli.rs`, where a test
 takes the lock from the *test* side to simulate a live holder and asserts on the
 raw return value. Wrapping that in the retry would change what it tests, so it
 stays direct.
+
+## F33 — `cargo fmt -p kitsu-tools` rewrites the maintainer's uncommitted work
+
+Found in T2-S1, by an agent that did it, caught it and repaired it — and said
+so, which is the only reason it is recorded rather than discovered later.
+
+`crates/kitsu-tools` is **not rustfmt-clean at HEAD**: with the maintainer's
+uncommitted `fs.rs` work stashed, `cargo fmt -p kitsu-tools -- --check`
+reports **4** violations, two in `builtins/fs.rs` and two in `permissions.rs`.
+That is F1 narrowed to one crate.
+
+The consequence is a trap rather than an inconvenience: `cargo fmt -p` formats
+the **whole crate**, so any card that runs it in `kitsu-tools` reformats those
+four places — and while the maintainer's uncommitted edit-tool changes sit in
+`fs.rs`, it reformats *their* lines too. The agent's repair restored the file
+byte-for-byte (verified: 54 insertions / 20 deletions in three hunks, exactly
+as at session start), but the next card would hit it again.
+
+### My first rule here was wrong, and it caused the second incident
+
+I recorded the rule below after the first occurrence:
+
+> format only the files you changed — `rustfmt --edition 2021 <file>`
+
+**That is unsafe, and the next agent tripped on it doing exactly what I told it
+to.** `rustfmt` in write mode follows the `mod` declarations of the file it is
+given, so pointing it at a **crate root** formats the entire module tree — it
+is equivalent to `cargo fmt -p` for writing purposes. And `lib.rs`, the file
+this card had to change, *is* the crate root. So my "safe" command reformatted
+both pre-existing violations in `builtins/fs.rs` — inside the maintainer's
+blast radius, taking the numstat from 54/20 to 68/25 — and both in
+`permissions.rs`.
+
+It was repaired precisely: the agent reverse-applied **only** the two
+rustfmt-induced hunks in `fs.rs` with `git apply -R`, leaving the maintainer's
+three hunks untouched, and restored `permissions.rs` from HEAD since it had no
+local changes. I verified: numstat back to `54 20`, the same three hunk
+headers, `permissions.rs` clean, and `rustfmt --check` still reporting the same
+4 pre-existing violations — the crate's unclean state preserved exactly as
+found.
+
+Note also that my original diagnosis named the wrong culprit: I blamed
+`cargo fmt -p` for the first incident, but the mechanism is rustfmt following
+`mod` declarations, which both commands trigger.
+
+### The actual working rule for `kitsu-tools`
+
+**Do not run write-mode rustfmt in this crate at all while the maintainer's
+`fs.rs` work is in the tree.**
+
+- `rustfmt --check` and `cargo fmt -p kitsu-tools -- --check` are **read-only
+  and safe** — use them to inspect.
+- To fix formatting in one file, hand-fix it, or format a *copy* elsewhere and
+  diff the result back. This rustfmt has no `--skip-children`.
+- A card's gate is "the file I touched is clean", verified with `--check`, not
+  "the crate is clean" — the crate is not clean, and making it clean is the
+  maintainer's call because their uncommitted work sits in the blast radius.
+- Pointing rustfmt at a **leaf** module file is far safer than at a crate root,
+  since a leaf declares no submodules — but the root is exactly the file most
+  cards need to touch, so the rule above is stated as a flat prohibition rather
+  than a nuance to be remembered under pressure.
+
+Worth noting for F1's eventual fix: the four violations are all pre-existing
+committed code, so formatting them is safe **once the maintainer's `fs.rs`
+work is committed or set aside** — and doing it then removes this trap
+permanently.
+
+## F34 — a blocked agent's deck marker is identical to a running one
+
+Decided in T2-S3, recorded because it is a deliberate gap rather than an
+oversight, and because the agent-view milestone is where it should be closed.
+
+`kitsu-render`'s `DeckState` has no `Blocked` variant, and B5 scopes T2-S3 to
+three vocabularies plus one validator — extending another crate would widen the
+card. So a blocked agent reuses `DeckState::Running`: it is non-terminal and
+still alive, `ResultReady` would imply something to collect, and the terminal
+states are plainly wrong.
+
+**The cost:** in the `/jobs` deck the glyph beside a blocked agent is the same
+as beside a running one. The state is distinguished only by the word `blocked`
+in the row text.
+
+**Why that is tolerable for now, and it is a genuine question rather than an
+assumption.** Three other signals already exist, all built in T1 before
+anything could reach them:
+
+- the live status row renders `[N blocked] `, and **blocked outranks running**
+  in that tag, so the count is the first thing the row reports;
+- `/jobs view` groups blocked agents under `needs input`, which is ordered
+  **first** among the groups;
+- the row text and `/jobs explain` both say `blocked`.
+
+So a user is not relying on the glyph to notice. But the glyph is the densest
+signal in the deck, and "needs your answer" is exactly the state that should be
+scannable — so this should not stay as it is.
+
+**Where it belongs:** milestone T4, the agent view, which is where blocked
+agents get real visual treatment (design A-series and B4). That is a
+`kitsu-render` story: add a `DeckState::Blocked` with its own marker, and the
+only test that changes is T2-S3's `the_blocked_deck_row_is_marked_live_and_reads_blocked`.
+
+### Also recorded from T2-S3
+
+- **`AgentStatus::Blocked` is a unit variant**, unlike `Done(String)` /
+  `Failed(String)` / `Cancelled(String)`. Nothing carries a reason yet, so the
+  smallest honest surface wins — the same call made for T2-S1's route payload.
+  If T2-S4 needs `Blocked(..)` to carry the pending request, that is **one**
+  construction site to change, and it must be called out rather than reshaped
+  silently.
+- **`jobs_snapshot_payload`'s `"blocked"` key is deliberately unpinned.** It is
+  added so the payload keeps mirroring the deck counts key-for-key, but it
+  cannot be exercised until an agent can block, so T2-S4 owns its test. Added
+  rather than omitted, because an inconsistent payload is worse than an untested
+  key.
+- **The plan's "state-file reader accepts v1 and v2" line is moot.**
+  `agent_state_file.rs` has its own independent schema and never embeds
+  `AgentThreadSnapshotDto`, and `kitsu agents --json` (H1) does not exist yet.
+  So there is no cross-process reader of the thread DTO today and no
+  v1-tolerance path to test. T2-S3 pins the strict in-process behaviour instead
+  (schema 1 is rejected, naming the expected version); if a later milestone
+  needs v1 tolerance it must be a deliberate accept-older-version path, and that
+  test revisited on purpose.
+
+
+## F35 — `interactive_prompts_allowed()` is now test-only, deliberately
+
+Recorded in T2-S2 so it is not mistaken for dead code to delete, nor left to
+rot.
+
+Both gates now match the whole `PromptRoute` rather than asking a yes/no
+question, so **no production code calls `interactive_prompts_allowed()` any
+more**. Two pre-existing lib tests do, and the implementer could not touch
+tests, so the function survives behind
+`#[cfg_attr(not(test), allow(dead_code))]`.
+
+That is the right outcome rather than a leftover, and the reason is worth
+stating: the function now *documents an invariant* —
+`interactive_prompts_allowed() ≡ matches!(prompt_route(), Foreground)` — and a
+T2-S1 test pins exactly that equivalence. Keeping it means the equivalence
+stays checked as the route grows variants; deleting it would remove the only
+assertion that a new variant has not quietly become "allowed to prompt".
+
+**For whoever revisits it:** either keep it as the documented equivalence (and
+leave the attribute), or remove it *together with* the two tests that call it —
+but not the function alone, because that silently drops the invariant check. If
+a future variant should permit prompting, the equivalence test is what will
+force that decision to be explicit.
+
+### Correction: the `kitsu-tools` test stub is permanent, not S4's to delete
+
+T2-S2's record said T2-S4 "must delete the `#[cfg(test)] registry_prompt_stub`".
+**That was wrong**, and the reason is the same dependency direction that has
+shaped three decisions in this milestone already: `kitsu-tools` **cannot name a
+type from `kitsu`**, so the real `AgentRegistry` can never be the receiver in
+`kitsu-tools`' own tests. The stub is that crate's permanent test scaffolding,
+not a placeholder.
+
+Worth stating as a pattern, because it keeps recurring: the gate lives in
+`kitsu-tools` and the registry lives in `kitsu`, so **every** seam between them
+is an opaque value (`u64` agent ids, a `PromptRequestSender`, a `Decision`) and
+every test of the lower crate needs its own stand-in. That is a constraint of
+the layering rather than a shortcoming of any card, and it is why the route
+carries an integer instead of an agent handle.
+
+
+## F36 — adding a non-terminal state means revisiting every "is it terminal?" decision
+
+The lesson from T2-S4, and the semantic twin of B5's "three vocabularies must
+change together".
+
+B5 made the *labelling* consequence explicit: a new phase touches three enums
+and one validator, and the compiler finds those because the matches are
+exhaustive. **It said nothing about the behavioural consequence**, which is
+larger and which the compiler cannot find: every place that asks "is this agent
+finished?" by testing `status == Running` now silently answers **wrong** for a
+blocked agent, because such tests are written as a positive match on `Running`
+rather than a negative match on the terminal variants.
+
+The implementer found ten such sites and widened each to `Running | Blocked`:
+cancellation matching, `cancel`'s pre-check **and** its completion-race
+re-check, capacity accounting (a blocked agent still holds a running slot),
+`running()`, two prune paths, a result-acknowledgement guard, and two
+`debug_assert`s.
+
+**One of those was a real leak, found without a test asking for it.** Both prune
+paths treated anything not `Running` as terminal, so a blocked record would have
+been pruned — **discarding its parked reply sender**, leaving the gate awaiting
+an answer that could never arrive. No test in the card covered pruning a blocked
+agent; it was found by enumerating the sites rather than by the suite.
+
+Three guards were deliberately **not** widened, and the reasoning is the useful
+part: `finish_with_telemetry`, `record_progress_event` and `steer` keep their
+`Running`-only checks, because resolution always restores `Running` before the
+gate wakes — so a timed-out agent's own error reaches `finish` through the normal
+path, which is exactly what makes the end-to-end timeout test pass. Widening
+those would have been cargo-culting the pattern.
+
+**Generalisable rule:** when a state machine gains a non-terminal state, grep
+for the *positive* test (`== Running`, `matches!(.., Running)`) rather than
+trusting exhaustive matches — the exhaustive ones are the safe half, and the
+positive tests are where silent misbehaviour lives.
+
+### Also from T2-S4
+
+- **A park token defends a race nothing asked about.** Each parked request
+  carries a monotonic token, so a timer that fires for an already-answered or
+  re-parked request is a no-op instead of spuriously interrupting the *next*
+  question on that agent. Unprompted and correct.
+- **Four disjoint routes guarantee B3's no-hang property**, each resolving the
+  gate's `oneshot` rather than dropping it: the human's answer, the 30-minute
+  timer, cancellation or teardown, and the registry being dropped (the receiver
+  loop breaks and `Drop` on the sender means `Interrupt` by contract). A request
+  that cannot be parked at all — unknown, terminal or already-blocked agent — is
+  resolved `Interrupt` **synchronously**, so no gate can ever wait on a request
+  nobody owns.
+- **`prompt_sender` holds a weak reference**, so handing a sender to a gate can
+  never keep the registry alive.
+- **The declared MSRV was respected even though F9 says it is already
+  unachievable.** `Option::is_none_or` is stable only from 1.82, so the token
+  comparison is a tuple `match`. Adding no *new* MSRV violation while an
+  existing one stands unresolved is the right call: F9 is a release decision for
+  the maintainer, not a licence to drift further.
+
+
+## F37 — two test defects that a green suite would never have shown
+
+Both found in T2-S5a by the implementer, both **proven rather than argued**, and
+both instructive beyond this card.
+
+### A positive assertion that no implementation could satisfy
+
+`test_blocking_ask_parks_a_gated_detached_agent_and_times_it_out` asserts the
+literal `needs input`, but its poll loop typed `/jobs` and `/agents`. Both print
+the **agent deck**; `needs input` is a group heading produced only by
+`format_jobs_view`, reached by **`/jobs view`**. So the assertion was
+unreachable at any timeout.
+
+**I had pre-authorised the wrong fix.** My brief told the implementer to raise
+`block_timeout_secs` from 1 to 2 if the string was ever missed. It declined,
+showed that at 2 seconds the agent sat visibly parked across about six polls and
+the test still failed, and identified the real cause — a one-word change. Then
+it measured: **30 of 30 passing** with `/jobs view` (10 debug at 1s, 10 release
+at 1s, 10 release at 2s), and I reproduced 10 of 10 myself. An authorised
+instruction is not evidence; it was right to override it.
+
+### Two negative assertions that passed vacuously
+
+The same mistake made the *guards* worthless: `!transcript.contains("needs
+input")` in both default-behaviour tests polled a view that can never print the
+string, so they would have passed however broken the feature was. Fixing the
+shared helper tightened all three tests at once.
+
+**The general shape, which is the reusable part:** a negative assertion over
+captured output is only as strong as the command that produced the output. A
+test asserting "X does not appear" must first establish that X *can* appear
+there — otherwise it is a tautology wearing a guard's clothing. This is the
+third vacuity of this family in the project, after F27 (a full repaint repairs
+the damage a partial repaint would reveal) and T0-S19's `probe_lock` (a reader
+that repairs the condition it is meant to catch).
+
+### A byte-identity test that could not pass for any implementation
+
+`test_scripted_and_jsonl_runs_are_byte_identical_under_the_default` compares
+full transcripts of four runs. The JSONL `run_started` event carries
+`provider_route.route.profile` — `profile-v1-` plus a 32-hex digest of the
+**canonicalised config path** — and each run uses a fresh temp home, so that
+field differs by construction. The normaliser collapsed digit runs, which
+cannot help: a hex digest's `a`-`f` survive. The implementer measured two actual
+digests rather than theorising.
+
+Fixed by normalising the digest, not by sharing a config path: the digest is
+**environmental** like `run_id` and `duration_ms`, which that test already
+normalises, and it is not the behaviour under test. The plain half of the
+comparison — which carries no profile field — passed throughout, so the
+feature's byte-identity claim was evidenced even while the JSONL half was
+unprovable.
+
+
+## F38 — adding a `/jobs` subcommand touches seven sites, not three
+
+Enumerated while scoping T2-S5b. The plan says "all three dispatch sites", and
+that phrase has been repeated since T1-S3 — but it counts only the sites that
+**execute** the subcommand. Four more decide whether a user can ever find it,
+and a command that works while being undiscoverable is half-shipped.
+
+**Behaviour (the three the plan means):**
+1. `handle_jobs_command` — the idle path, which also emits a JSON payload
+   carrying an `"action"` field;
+2. `handle_active_jobs_command` — the mid-turn path, a different function with a
+   different return type (`Result<String, String>`);
+3. the `/agents` alias arm, which T1-S3 widened to forward verbatim.
+
+**Discoverability (the four it does not):**
+4. `closest_jobs_subcommand`'s `SUBCOMMANDS` list — the typo suggester. **This is
+   F2**, already recorded as drifting from the registry, and it drifts precisely
+   because it is a hand-maintained list no compiler checks;
+5. the `/jobs` advertised `args:` string, which the help and palette render;
+6. the `/agent` advertised `args:` string — which **already lists fewer
+   subcommands than `/jobs`** (no `view`, `explain`, `stop-all`, `prune`),
+   apparently left behind when T1-S3 widened the alias to forward everything.
+   So the alias accepts commands it does not advertise;
+7. the usage line printed on an unknown subcommand.
+
+**Why this keeps happening:** sites 1-3 are `match` arms, and adding a
+subcommand there is driven by the work itself. Sites 4-7 are **string and array
+literals** that no compiler, test or type checks against the real set — the same
+shape of defect as F2, and the same shape as T2-S3's label table, except that
+one *was* compiler-enforced because the enums were exhaustive.
+
+**The durable fix is not vigilance.** A single source of truth — one table of
+subcommand name, arity and help text that the dispatcher, the suggester, the
+`args:` strings and the usage line all read — would make sites 4-7 impossible to
+forget. That is a refactor worth its own card. Until then, anyone adding a
+subcommand should treat this list of seven as a checklist.
+
+### F2 is closed by a test, not by a checklist
+
+T2-S5b did better than the checklist above. Its test
+`every_jobs_subcommand_is_its_own_nearest_suggestion` requires **all ten**
+dispatched subcommands to be their own nearest suggestion — so the suggester
+table can no longer drift one entry at a time, which is exactly how **F2**
+arose. That converts a vigilance problem into a failing test, and it is why F2
+can be closed rather than carried.
+
+Sites 5-7 remain unguarded by anything but review, so the single-source-of-truth
+refactor is still worth doing; but the worst of the three is now mechanical.
+
+### The alias drift was in THREE places, not one
+
+Scoping this card found `/agent` advertising five of the ten subcommands it
+forwards. The test author fixed the `args:` string in code. Writing the docs I
+found **the README's own command-table row carried the same stale subset**
+(`list|show|steer|stop|close`), and the row's prose describes only those — a
+third copy, in a third file, of a list that is already wrong twice.
+
+I replaced the README row with **`/agent [any /jobs subcommand]`**, which is
+what the `/agents` row already says and which **cannot drift again**, because it
+states the relationship instead of enumerating the set. That is the cheap
+version of the single-source fix: where a list is derived rather than
+authoritative, say so instead of copying it.
+
+## F39 — one unidentified CLI-suite failure, and the capture mistake that lost it
+
+Observed in T2-S5b review. **Status: one failure in seven full-suite runs,
+test unknown.** Recorded rather than dismissed, because this project has twice
+punished the comfortable reading of exactly this situation.
+
+The implementer reported `cargo test -p kitsu --test cli` at 237/0. My own
+verification run returned **236 passed, 1 failed**. Six subsequent runs — three
+immediately, three with logs retained — were all 237/0, and no failure named
+itself in any retained log.
+
+### The mistake is mine and it is the reusable part
+
+When I saw `236 passed; 1 failed`, **I re-ran the suite to find out which test
+it was.** That destroys the evidence: the failing run's output is the only place
+the name exists, and a fresh run that passes prints nothing. I should have
+captured that run's output — or run with output retained from the start, which
+is what I belatedly did.
+
+**Rule: when an intermittent appears, keep the failing run's output before
+doing anything else.** A re-run is not an investigation; it is the deletion of
+the only artefact that identifies the problem.
+
+### Why it is not being dismissed
+
+- **F23**: a pseudo-terminal test in this very suite failed ~7% of the time
+  while appearing green on every manual run, and was found only by measuring
+  against a stashed baseline.
+- **F28**: a transaction flake that three readings called test noise — including
+  mine — turned out to be a **real production bug**, a `fork`/`flock` race that
+  could make a session commit falsely report "already active".
+
+Both times "I ran it again and it passed" was the wrong conclusion. So the
+honest status here is *unidentified*, not *absent*.
+
+### For whoever sees it next
+
+Run `cargo test -p kitsu --test cli > log 2>&1` in a loop and keep every log;
+the suite takes about 43 s, so a dozen runs is ten minutes. The new
+pseudo-terminal tests in this area (`test_jobs_reply_*`,
+`test_blocking_ask_parks_*`) are the most likely candidates, being real
+processes on real terminals with a 600-second block timeout and an exit guard
+in play — but that is a guess, and the point of this finding is that a guess is
+all anyone has until a failing run is captured.
+## F40 — redaction is credential-shaped, and the timeline's real protection was an accident
+
+Established while scoping T2-S6, by reading rather than by assuming.
+
+`docs/functionality.md` states an **absolute** about the agent inspection
+timeline: *"tool arguments/output and partial model bodies are never copied into
+that inspection record."* An approval entry is the first thing in this epic that
+runs straight into it, because a permission request **is** a tool plus its
+arguments — a path, a URL, a command line.
+
+### The protection was not the redaction
+
+`prompt_sender` destructures only `request.agent_id` and `request.reply`;
+**`request.payload` is dropped unread**, and `park_prompt`'s signature is
+`(id, reply)`. So no argument *could* reach the timeline — **not because
+anything removed it, but because the data never arrived.**
+
+That is protection by accident. It holds only while nobody has a reason to
+plumb the payload deeper, and T2-S6 is exactly that reason: recording *what* an
+agent asked for requires the request at the recording site.
+
+### And redaction would not have caught it
+
+The test author proved this rather than reasoning about it:
+`redaction_does_not_remove_a_path_or_an_argv_word` asserts
+`sanitize_and_redact_text(x) == x` for a filesystem path, a workspace path,
+`rm -rf /work/tmp` and a URL path. `sanitize_and_redact_text` strips terminal
+control sequences and **credential forms** — known key prefixes, `key=value`,
+`Bearer`, URL userinfo. Paths and argv words are left **completely untouched**,
+and `format_agent_thread`'s `sanitize_terminal_text` does not touch them either.
+
+So an implementation that formatted a request's arguments into an entry would
+have printed them verbatim at every surface — `/jobs show`, `/jobs explain`,
+and the JSONL snapshot — while passing `validate`, because the DTO's redaction
+check uses the same credential-shaped function.
+
+**The general rule: redaction in this codebase answers "is this a secret?", not
+"is this private?". A path is not a credential, and nothing in the redaction
+path will stop one.**
+
+### What T2-S6 does about it
+
+The entry carries a **kind and nothing else** — `AgentApprovalKind` is a unit
+enum (`ReadFile`, `WriteFile`, `RunCommand`) with no argument-bearing field, so
+the timeline can say *"waiting for permission to write a file"* and cannot say
+which file. The payload is converted to a kind at the boundary and never travels
+further.
+
+The unit enum is the durable part: a future change cannot slip a path into an
+approval entry **without altering a public type**, which is a review-visible
+act rather than a silent one. That is the same move as T2-S3's exhaustive
+`match` — making the compiler, not vigilance, the thing that notices.
+
+### Worth checking elsewhere
+
+Any other place that relies on "the sensitive field simply is not passed here"
+has the same fragility, and the grep for it is not redaction calls but
+**destructuring that drops a field**. Two candidates worth a later look: the
+hook payload assembly and the state-file writer, both of which take narrow
+structs today for reasons that may be incidental rather than designed.
+
+## F41 — a bare substring ban constrains the product instead of protecting it
+
+T2-S6's argv-absence test swept the serialized snapshot for
+`["rm", "-rf", "/work/tmp", "/usr/bin/rm"]`. The implementer's first attempt
+failed it — **on the word "permission"**, which contains `rm`. Nothing had
+leaked; the assertion simply cannot distinguish the command `rm` from the middle
+of an ordinary English word, and it equally forbids *format*, *confirm*,
+*transform* and *firmware*.
+
+The implementer worked around it by choosing wording with no argv substring
+(`"approval to …"`), flagged it rather than hiding it, and correctly did not
+touch the test. But that left the product's user-visible wording **constrained
+by an accident of a test assertion**, which is the wrong way round.
+
+**Fixed at review by making the assertion stronger, not weaker:** the entry text
+is now pinned with `assert_eq!` to the exact expected string. If the text is
+exactly `"approval to run a command requested"` and nothing else, **no argument
+can be inside it, whatever the argv happened to be** — a property a substring
+ban cannot express. The snapshot-wide sweep is kept, because an argument could
+leak into some other field, but with tokens distinctive enough that only a real
+leak matches (`-rf`, `/work/tmp`, `/usr/bin/rm`, `rm -rf`).
+
+Verified rather than assumed: injecting `/work/tmp` into the entry text makes
+the strengthened assertion fail, and removing it makes it pass.
+
+**General rule: to assert that something private is absent, pin what the output
+*is*, not a list of things it is not.** An exact match is both stronger and
+immune to coincidence; a substring blocklist is weaker and fires on innocent
+text. This is the fifth entry in this project's vacuity-and-assertion-quality
+family (F27, F32, F37's two, now this).
+
+## F42 — `git checkout <file>` destroyed uncommitted work, and the mistake was mine
+
+**Recorded because it cost real work and the lesson is operational, not
+intellectual.**
+
+While verifying F41's strengthened assertion, I injected a path into an entry
+text in `crates/kitsu/src/subagent/thread.rs` to prove the assertion failed on a
+real leak. It did. I then reverted that one-line injection with
+`git checkout crates/kitsu/src/subagent/thread.rs`.
+
+That file held **two agents' uncommitted T2-S6 work** — the test author's enums,
+stubs and six tests, and the implementer's wiring on top. `git checkout` reverts
+to the index, and nothing in that file had been staged, so it reverted to HEAD
+and **wiped all of it**. `subagent.rs` (+219) and `main.rs` (+183) survived and
+referenced the now-missing types, leaving 21 compile errors.
+
+Recovery was complete rather than reconstructive, because both agents still held
+their contributions and restored them in sequence — the test author its stubs and
+tests, then the implementer its wiring — so the TDD record stayed honest and
+nothing was rewritten from memory. The cost was time, not work.
+
+**The rules this produces:**
+1. **Never use `git checkout <path>` to undo a deliberate edit in a file that
+   holds uncommitted work.** Re-apply the inverse edit, or make the experiment
+   in a copy under the scratchpad and never in the live file.
+2. **Before any destructive git operation on a path, check
+   `git diff --numstat <path>`** — exactly the discipline already applied all
+   session to the maintainer's `fs.rs`, which stayed untouched at `54 20`
+   throughout. The protection existed; I simply did not extend it two files
+   over.
+3. **Verification experiments belong in a throwaway copy.** Proving an assertion
+   has teeth is valuable (F41 is better for it), but the proof should not
+   require mutating the file under review.
+
+## F43 — CORRECTED: a cancelled approval is recorded as nothing at all
+
+**My original text said a cancelled approval is recorded as "timed out". That is
+wrong, and the truth is worse. The correction and its lesson are below; the
+original reasoning is kept after it so the mistake is legible.**
+
+### What is actually true, verified by reading every call site
+
+**Cancellation never reaches `resolve_prompt`.** There is one cancel path,
+`cancel_matching` — the single implementation behind `cancel`, `cancel_all`,
+`cancel_all_with_reason` and `cancel_started_after*` — and inside the registry
+lock it takes the parked prompt **itself**, calls `thread.unblock()`, sets
+`AgentStatus::Cancelled`, and sends `Decision::Interrupt` straight to the
+waiting gate's channel. It never calls the shared resolution path, so **no
+outcome is recorded at all**.
+
+What a cancelled park actually leaves behind is a **dangling request with no
+outcome**, proven from a real `/jobs show`:
+
+```
+  bounded redacted timeline:
+    [1 +0.0s user_task] cancelled while blocked
+    [2 +0.0s approval] approval to write a file requested
+    [3 +0.0s lifecycle] agent cancelled; result ready for handoff
+```
+
+The agent asked, and the record never says what happened. The still-armed block
+timer that fires later finds no park and records nothing either.
+
+**So T2-S6's claimed invariant — every resolution leaves a record — was already
+broken when I accepted that card**, for one of its five cases. Four of five
+resolutions were recorded; the fifth recorded nothing. And
+`approval_outcome(Decision::Interrupt) => TimedOut` turns out to be *correct*,
+because the only `Interrupt` that reaches `resolve_prompt` really is the timer.
+
+### The lesson, which is about me
+
+I wrote F43 from the implementer's report, which said *"`Interrupt` also arrives
+from a cancellation of a blocked agent, which is likewise recorded as a timeout"*
+— and I recorded that as a finding **without tracing the call path myself**. One
+grep for `pending_prompt` would have shown four touch points and that
+cancellation was not among the recorders.
+
+**A claim about a code path is not verified until the path is read.** I had
+already written F39's rule — a re-run is not an investigation — and then made the
+same class of error one level up: a plausible mechanism, reported confidently by
+an agent whose other work was excellent, propagated into a finding and from
+there into a card brief. The agent that fixed it checked, found the premise
+false, and said so instead of implementing what I asked for.
+
+**Two things follow for the rest of this epic:** when a report explains *why*
+something happens, the mechanism is a hypothesis until someone reads the path;
+and findings written from a report, rather than from code, should say so, so the
+next reader knows what has actually been verified.
+
+### The fix this card takes
+
+Add a fifth `AgentApprovalOutcome::Cancelled` and record it in `cancel_matching`,
+where the parked prompt is already taken under the lock. The shared-path
+guarantee is **not** weakened, because cancellation was never on the shared path
+— it is strengthened, from four of five resolutions recorded to five of five,
+with the two recording sites exhaustive and pinned by a test rather than assumed
+by construction.
+
+**No machine vocabulary is needed**, verified: `AgentApprovalOutcome` derives
+only `Clone, Copy, Debug, Eq, PartialEq` — no `Serialize`, no `wire()`, no DTO
+field of its own — and reaches machine surfaces only as the free text of a
+timeline entry. `AgentApprovalKind` needs `wire()` because that kind *is* a DTO
+field and a hook variable; this outcome is not. Adding `wire()` here would invent
+a machine vocabulary nothing consumes, which **F45**'s own rule forbids.
+
+---
+
+### Original text, kept for the record (premise incorrect)
+
+## F43 (as first written) — a cancelled approval is recorded as "timed out"
+
+Noticed while reviewing T2-S6 and **not fixed in it**, because the fix is a
+design change rather than a line.
+
+`resolve_prompt` is the single resolution path, and `approval_outcome` maps
+`Decision::Interrupt` to `AgentApprovalOutcome::TimedOut`. The B3 timer resolves
+with `Interrupt` — correct. But **cancelling a blocked agent also resolves with
+`Interrupt`**, so a human cancellation is recorded in the timeline as
+`"approval to write a file timed out"`.
+
+The whole purpose of this card is a truthful record of what an agent asked and
+how it was decided, so a record that reports a deliberate human cancellation as
+an unattended timeout is a correctness defect in the record, not a cosmetic one.
+No test pins the cancellation case either way, which is why it passed review
+green.
+
+**Why it is not a one-liner:** the two cases arrive at `resolve_prompt` carrying
+the *same* `Decision` value, so they are indistinguishable at the recording
+site. Fixing it means either a fifth `AgentApprovalOutcome` plus a way to tell
+the caller's intent apart (a parameter, or a distinct `Decision`), or recording
+the outcome at the two call sites instead of in the shared path. That is a small
+card, not a patch — and it should also pin the cancellation case, which nothing
+does today.
+
+### F40 follow-up — the hook path checked, and it is clean today
+
+F40 left two candidates open: the state-file writer and the hook payload
+assembly, both of which "take narrow structs today for reasons that may be
+incidental rather than designed". Checked by reading before T2-S7 was briefed.
+
+**The hook's `KITSU_AGENT_WAITING_FOR` already exists** — this card does not add
+it — and today it is populated from `progress.telemetry.last_activity`, passed
+through `safe_inline_label`.
+
+Two things follow:
+
+1. **There is no pre-existing leak.** Every activity string is built from a tool
+   *name* via a `safe_activity_name` helper, or is a fixed phrase: `"started
+   tool read"`, `"tool read ok"`, `"provider request round 3"`, `"usage
+   updated"`, `"started"`. No argument, path or argv word is ever formatted into
+   one. And the helper's existence suggests this was deliberate rather than
+   accidental — unlike the timeline's protection, which F40 found was an
+   accident of a dropped field.
+2. **But the filter would not stop one.** `safe_inline_label` is
+   `sanitize_and_redact_text` plus whitespace collapsing and truncation, so it
+   inherits exactly F40's limitation: credential-shaped, not privacy-shaped. A
+   path formatted into an activity string would reach the hook's environment
+   **verbatim**, and a hook runs an **external program** — strictly worse
+   exposure than the timeline, where a leak would at least stay inside kitsu's
+   own output.
+
+So the invariant to preserve in T2-S7 is: `waiting_for` may name the permission
+**kind** when an agent is blocked, and must never name its argument. The
+protection has to be the same structural one as T2-S6 — derive from
+`AgentApprovalKind`, never format from the payload — because nothing downstream
+will catch the mistake.
+
+The state-file writer remains unchecked at the time of writing; T2-S7 touches it
+and should answer the same question.
+
+## F44 — F40's two candidates, answered: the hook was the fragile one
+
+T2-S7 touches both places F40 flagged as possibly relying on "the sensitive
+field simply is not passed here". Both were read. The answers differ, and the
+hook's is the one that mattered.
+
+### The hook payload assembly was never narrow
+
+`AgentObservation` and `HookEvent` already carry `waiting_for` as a **free-form
+`String`**, assembled from `progress.telemetry.last_activity` and protected only
+by `safe_inline_label` — bounding, whitespace collapsing, and
+`sanitize_and_redact_text`, which by T2-S6's own test leaves paths and argv words
+**untouched**.
+
+So an argument could have reached an **external program** today **with no type
+change, no signature change and no public API change at all**. An implementer
+writing the natural phrase *"waiting for permission to write
+/work/notes.txt"* would have needed to change nothing, and nothing downstream
+would have caught it. That is F40's "protection by accident", one layer further
+out: the activity label is argument-free only because every call site happens to
+format a tool *name* (via `safe_activity_name`) and nobody ever plumbed
+arguments in.
+
+**This is the highest-risk line in milestone T2**, and it is riskier than the
+timeline it came from, because a hook leaves the process.
+
+**Mitigated structurally rather than by care:** `AgentProgress` and the thread
+snapshot DTO now carry `waiting_for: Option<AgentApprovalKind>` — a **unit
+enum** — so the blocked reason travels to the assembly sites in a type that
+cannot hold an argument, and the assembly only calls `.wire()`. The remaining
+`String` in `AgentObservation` is legitimate (it carries activity labels for
+*running* agents) so the guard there is an exact-equality test.
+
+### The state-file writer is a narrow struct wrapped around a wide one
+
+`AgentStateFile`'s own fields are fixed and safe, but it embeds the full thread
+snapshot, which carries free-form `task`, `model` and every timeline
+`entry.text`. So it is not narrow either; what protects it is one layer down —
+and that protection is **T2-S6's structural guarantee in the timeline**, not the
+wrapper and not `validate`, which runs the same credential-shaped redactor.
+Making the new field a typed kind extends that guarantee rather than leaning on
+the wrapper.
+
+### A real defect this card fixes, found by the tests
+
+A parked agent's `KITSU_AGENT_WAITING_FOR` reads the stale activity label
+**`"started"`** — the hook correctly reports `STATE=blocked` and then gives a
+nonsense reason, because `park_prompt` records no telemetry activity. The
+tempting fix (call `record_activity` with the request) **is the leak path**; the
+reason has to travel as the typed kind instead.
+
+## F45 — one machine vocabulary, one human vocabulary, one source each
+
+The three machine surfaces did **not** agree on how to spell a waiting reason,
+and before T2-S7 the divergence was invisible because only one of them had the
+field at all: the hook's free-form activity string. The state file and
+`kitsu agents --json` had nothing.
+
+Left alone, the natural implementations would have diverged — snake_case serde on
+the DTO side, the English `label()` ("write a file") on the hook side — and the
+mismatch would have been discovered by whoever first wrote a tool against both.
+
+**Resolved and approved at review:**
+- **`AgentApprovalKind::wire()`** → `read_file` / `write_file` / `run_command`
+  is the single **machine** vocabulary, shared by the state file, the hook
+  environment and `kitsu agents --json`, and equal to the serde spelling.
+- **`label()`** → "read a file" / "write a file" / "run a command" stays the
+  **human** text `/jobs` prints.
+
+One source per audience, and a test asserts the DTO spelling *is* `wire()`, so a
+second machine vocabulary cannot appear later. This is the same discipline as
+T2-S3's label table and F2's suggester test: the spelling lives in one place and
+a test fails if a copy appears.
+
+The general point: **a human label and a machine identifier are different
+things, and a surface that needs both should derive each from one source rather
+than reusing whichever exists.** Reusing the human label as a wire value is how
+`"write a file"` ends up in someone's JSON parser.
+
+## F46 — the PTY harness has two opposite polling traps, not one
+
+T2-S5a established: **poll `/jobs view`, never bare `/jobs`**, because
+`needs input` is a heading only `format_jobs_view` emits, and getting that wrong
+made a positive assertion unreachable at any timeout and two negative guards
+vacuous (F37).
+
+T2-S7's end-to-end test hit the **mirror image**. After replying to a parked
+agent, its first run parked correctly, captured both surfaces, replied, released
+the agent — and then died on the harness deadline, because the settle signal
+(`CHILD_SAW`, which proves the released agent's work actually ran) reaches the
+transcript only through the agent **deck**. `/jobs view` never prints a finished
+agent's result, so polling it alone made the completion signal unreachable.
+
+**The rule is therefore two-sided, and both halves are now paid for:**
+
+| what you are waiting for | poll |
+|---|---|
+| an agent to **park** (`needs input`) | `/jobs view` — the deck does not group by state |
+| an agent's **result** after release (`CHILD_SAW`) | the deck (`/agents`) — `/jobs view` omits finished work |
+
+The safe default is to poll **both** (`/jobs view\n/agents\n`), which is what
+the surviving drivers do.
+
+**The deeper point, now three findings old (F37, F39, this):** a pseudo-terminal
+test that "times out" is almost never a timing problem. In every case here it
+was a **surface problem** — the assertion was watching a view that could not
+print the thing it waited for. Raising the timeout would have hidden each one.
+When a PTY test reaches its deadline, the first question is *"can this command
+ever print what I am waiting for?"*, not *"is the machine slow?"*.

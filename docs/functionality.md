@@ -174,7 +174,27 @@ invocation roots and drops runtime grants. Exact command grants are numbered,
 labeled invocation/runtime, and revocable with `/revoke-command <number>`.
 Detached agents share active grants but cannot invoke either interactive
 prompter; ungranted background work fails closed without racing foreground
-stdin.
+stdin. `[agents] blocking` chooses between that and parking: `fail_closed`
+(the default, and the behaviour just described) refuses the operation and lets
+the agent carry on, while `ask` makes the agent report as `blocked` and wait
+for a human answer, which then applies through the same grant code the
+foreground prompter uses — `allow always` installs the identical minimal root
+or exact argv/cwd grant, so no second permission path exists.
+`/jobs reply <id> <y|a|n>` answers a parked agent — allow once, allow always,
+or deny — and works from an idle prompt, during a running turn, and through the
+`/agent` and `/agents` spellings, which forward every `/jobs` subcommand
+verbatim. It accepts exactly the keys the foreground approval prompt accepts
+(`y|yes`, `a|always`, `n|no`, case-insensitively) because it calls that same
+parser, so the two cannot drift. A denial releases the agent to continue with
+the refusal rather than interrupting it, and replying to an agent that is not
+waiting reports that instead of silently succeeding.
+`[agents] block_timeout_secs` bounds that wait at 1800 seconds by default,
+after which the agent ends failed-interrupted rather than waiting forever. The
+unit is in the key name deliberately and a bare `block_timeout` is rejected,
+never interpreted. `ask` cannot affect scripted, piped or JSONL runs: those
+resolve permissions in a mode that returns before the prompt route is
+consulted, so the question is never reached — a structural property, not a
+default.
 
 - `fs_read_file`, `fs_list_dir`, and `repo_grep` inspect granted paths.
   On Unix, `repo_grep` is an always-available in-process UTF-8 content search:
@@ -272,7 +292,16 @@ is read-only and, unlike `/jobs show`, never acknowledges a ready result, so
 diagnosing an agent cannot quietly satisfy the unobserved-result exit guard.
 `/agent show`
 adds a bounded redacted event timeline; tool arguments/output and partial model
-bodies are never copied into that inspection record. Built-in `/profiles`
+bodies are never copied into that inspection record. That timeline also records
+each permission a background agent asked for and how it was decided -- allowed
+once, allowed always, denied, timed out, or cancelled -- so an answered agent
+still shows that it asked, and a cancelled one shows that its request was never
+answered. Those entries name the **kind** of permission and nothing else
+("approval to write a file"), never the path, URL or command line: the request's
+payload is converted to a kind at the boundary and no argument travels to the
+recording site, which is how the sentence above stays true of them. A blocked
+agent's `/jobs explain` reports the pending permission on its `waiting on:`
+line in preference to its last tool activity. Built-in `/profiles`
 select a read-only reviewer or a tool-free reasoning worker, and background
 spawns can name a profile without inheriting broader capabilities. `/agents`
 remains a compatibility alias: a bare call lists, a numeric argument shows
@@ -283,7 +312,13 @@ Background agents run in-process, so nothing outside kitsu can observe them.
 `[agents] state_file` publishes a small advisory JSON hint, one file per running
 process, that an outside tool such as a terminal multiplexer can read to tell
 whether this kitsu is `idle`, `working`, or `blocked`, alongside the same
-redacted thread records `/jobs` shows. `auto` (the default) writes only in an
+redacted thread records `/jobs` shows. A background agent parked on a permission
+raises the process state to `blocked`, is counted in `counts.blocked`, and
+carries a `waiting_for` naming the **kind** of permission it needs --
+`read_file`, `write_file` or `run_command`, the same vocabulary the
+`on_agent_state` hook and `kitsu agents --json` use, and never the path or
+command line. Answering the agent removes the key rather than leaving a stale
+reason for a poller to read. `auto` (the default) writes only in an
 interactive terminal session, so scripted, piped, `ask` and JSONL runs write
 nothing at all; `on` writes regardless of how kitsu was invoked, and `off`
 never writes. The file lives at `$XDG_RUNTIME_DIR/kitsu/<pid>.json`, falling
@@ -297,7 +332,14 @@ that died, and writing it never affects a turn — every failure is silent.
 
 `[hooks] on_agent_state` runs a local command when a background agent changes
 state, with `KITSU_AGENT_ID`, `KITSU_AGENT_STATE` and `KITSU_AGENT_WAITING_FOR`
-added to the inherited environment. The command is split into arguments and
+added to the inherited environment. An agent that parks on a permission reports
+`KITSU_AGENT_STATE=blocked` with `KITSU_AGENT_WAITING_FOR` naming the **kind**
+of permission -- `read_file`, `write_file` or `run_command` -- and never the
+path, URL or command line it asked about; a hook runs an external program, so
+the reason travels as a fixed vocabulary that cannot carry an argument. The same
+three words appear in the state file and in `kitsu agents --json`, so a tool can
+match on one spelling across all three. Releasing the agent fires a second
+transition with its running state and no waiting reason. The command is split into arguments and
 executed **directly — never through a shell, and with no variable expansion**,
 so a stray metacharacter in the config cannot become execution and the
 behaviour does not depend on which shell is installed; point it at a script, or
