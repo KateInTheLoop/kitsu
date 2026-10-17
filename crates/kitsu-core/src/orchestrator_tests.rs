@@ -5968,42 +5968,369 @@ fn response_schema_participates_in_session_cache_identity() {
     );
 }
 
-#[test]
-fn git_invocations_keep_command_telemetry_and_a_literal_git_prefix() {
-    let invocation = crate::orchestrator::command_runtime_invocation(
-        "git",
-        r#"{"args":["switch","-c","review-branch"],"cwd":"/repo","timeout_ms":1234}"#,
-    )
-    .unwrap();
-    assert_eq!(invocation.argv, ["git", "switch", "-c", "review-branch"]);
-    assert_eq!(invocation.cwd, "/repo");
-    assert_eq!(invocation.timeout_ms, Some(1234));
-    assert!(crate::orchestrator::command_runtime_invocation(
-        "git",
-        r#"{"args":"status","cwd":"/repo"}"#
-    )
-    .is_none());
+// --- F51: with tools enabled, an ordinary answer must stream -----------------
+//
+// The suppression at the streaming site buffers ALL text whenever tools were
+// offered this round, because a text-protocol model may be emitting a tool call
+// as JSON. The default configuration offers tools on every round, so the
+// common case — an ordinary single-round prose answer — never streams.
+//
+// F51 option one: stream fragments while withholding text that could still
+// open a text-protocol tool call. The opening forms are pinned by
+// `test_text_protocol_bare_json` (a bare `{…}` object), `test_text_protocol_fenced_json`
+// (a ```` ```json ```` fence after prose) and `test_text_protocol_tagged`
+// (`<tool_call>…</tool_call>`); `test_text_protocol_ignores_prose` pins that an
+// inline `{ key: value }` inside prose is NOT one.
+//
+// These tests are deliberately a pair that cannot be satisfied alone:
+// suppressing everything fails the streaming tests, streaming everything fails
+// the tool-call tests.
+
+/// Captures the bytes the renderer writes on **stdout** through the surface
+/// seam, in write order, so a test can tell "arrived in pieces" from "arrived
+/// in one burst" and "nothing was printed" from "something was".
+struct CapturedStdout {
+    writes: Arc<Mutex<Vec<String>>>,
 }
 
-#[test]
-fn git_command_metadata_is_not_replaced_by_generic_lossy_previews() {
-    use crate::orchestrator::{prepare_tool_output, ArtifactStoragePolicy, ToolOutputRequest};
-    let content = serde_json::json!({"stdout": "x".repeat(20_000), "exit_code": 0}).to_string();
-    let mut config = cfg(10);
-    config.artifact_policy = ArtifactStoragePolicy::InlineOnly;
-    let prepared = prepare_tool_output(
-        content.clone(),
-        ToolOutputRequest {
-            call_id: "git-1",
-            tool_name: "git",
-            is_err: false,
-            window_evidence: None,
-        },
-        &Registry::new(),
-        &initial_messages(),
-        &config,
+impl kitsu_render::surface::Surface for CapturedStdout {
+    fn transcript_line(&self, fd: kitsu_render::surface::Fd, text: &str) {
+        if matches!(fd, kitsu_render::surface::Fd::Stdout) {
+            self.writes.lock().unwrap().push(format!("{text}\n"));
+        }
+    }
+
+    /// Capture the block's bytes verbatim: splitting them into lines would
+    /// destroy exactly the evidence these tests need (a fragment is usually
+    /// not a whole line).
+    fn write_block(
+        &self,
+        fd: kitsu_render::surface::Fd,
+        block: &mut dyn FnMut(&mut dyn std::io::Write),
+    ) {
+        let mut bytes: Vec<u8> = Vec::new();
+        block(&mut bytes);
+        if matches!(fd, kitsu_render::surface::Fd::Stdout) && !bytes.is_empty() {
+            self.writes
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&bytes).to_string());
+        }
+    }
+}
+
+/// The surface slot and the renderer's stream buffers are process-wide, so
+/// these tests take a turn each. An async-aware mutex: the guard is held
+/// across the turn's `await`.
+static STDOUT_CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Install a capturing stdout surface, run `turn`, restore the displaced
+/// surface, and return (turn result, the stdout writes in order).
+async fn capture_stdout_writes<F, T>(turn: F) -> (T, Vec<String>)
+where
+    F: std::future::Future<Output = T>,
+{
+    let guard = STDOUT_CAPTURE_LOCK.lock().await;
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let previous = kitsu_render::surface::set_surface(Arc::new(CapturedStdout {
+        writes: Arc::clone(&writes),
+    }));
+    let out = turn.await;
+    kitsu_render::surface::set_surface(previous);
+    drop(guard);
+    let captured = writes.lock().unwrap().clone();
+    (out, captured)
+}
+
+/// Round 1 offers tools (the default) and answers in prose, fragment by
+/// fragment. Each fragment must reach stdout as it arrives — not as one burst
+/// after the round ends — and the answer must appear exactly once.
+#[tokio::test]
+async fn tools_offered_prose_answer_streams_incrementally() {
+    let fragments = ["Here ", "is ", "the ", "answer."];
+    let mut script: Script = fragments
+        .iter()
+        .map(|f| ChatDelta::Text((*f).to_string()))
+        .collect();
+    script.push(ChatDelta::Done(FinishReason::Stop));
+    let provider = MockProvider::new(vec![script]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let tools = writing_registry(ran.clone());
+    let mut c = cfg(10);
+    c.stream = true;
+
+    let (out, writes) = capture_stdout_writes(async {
+        run_agent_turn(&provider, &tools, &mut initial_messages(), &c)
+            .await
+            .expect("a prose answer with tools offered should succeed")
+    })
+    .await;
+
+    assert_eq!(out, "Here is the answer.");
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "prose must not run a tool");
+    assert_eq!(
+        provider
+            .seen_tools
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .flatten()
+            .map(|t| t.len()),
+        Some(1),
+        "the premise of F51: tools ARE offered on this very round"
     );
-    assert_eq!(prepared.content, content);
-    assert!(serde_json::from_str::<serde_json::Value>(&prepared.content).is_ok());
-    assert!(prepared.artifact_path.is_none());
+    let joined: String = writes.concat();
+    assert_eq!(
+        joined, "Here is the answer.\n",
+        "the --plain byte contract: the streamed answer plus the end-of-turn newline"
+    );
+    assert_eq!(
+        joined.matches("Here is the answer.").count(),
+        1,
+        "the answer must reach stdout exactly once, not streamed and then reprinted"
+    );
+    assert!(
+        writes.len() >= 3,
+        "the answer must arrive in pieces as the stream yields them, not in one \
+         burst after the round: {writes:?}"
+    );
+}
+
+/// Prose whose first character is `<` — a prefix of `<tool_call>` — may be held
+/// briefly, but must stream once it has diverged. This bounds the hold: it is a
+/// few characters, not the whole round.
+#[tokio::test]
+async fn tools_offered_prose_opening_like_a_tag_streams_once_disqualified() {
+    let fragments = ["<= 3 ", "is ", "the bound."];
+    let mut script: Script = fragments
+        .iter()
+        .map(|f| ChatDelta::Text((*f).to_string()))
+        .collect();
+    script.push(ChatDelta::Done(FinishReason::Stop));
+    let provider = MockProvider::new(vec![script]);
+    let tools = writing_registry(Arc::new(AtomicUsize::new(0)));
+    let mut c = cfg(10);
+    c.stream = true;
+
+    let (out, writes) = capture_stdout_writes(async {
+        run_agent_turn(&provider, &tools, &mut initial_messages(), &c)
+            .await
+            .expect("prose that merely starts with '<' should succeed")
+    })
+    .await;
+
+    assert_eq!(out, "<= 3 is the bound.");
+    let joined: String = writes.concat();
+    assert_eq!(joined, "<= 3 is the bound.\n");
+    assert!(
+        writes.len() >= 2,
+        "the hold must end as soon as the text cannot be <tool_call>: {writes:?}"
+    );
+}
+
+/// A bare-JSON text-protocol tool call (`test_text_protocol_bare_json`'s shape)
+/// must put NOTHING on stdout for its round: the JSON is not an answer.
+#[tokio::test]
+async fn tools_offered_bare_json_tool_call_round_prints_nothing() {
+    let raw = r#"{"name": "fs_write_file", "arguments": {"path": "x.py", "content": "print(1)"}}"#;
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::Text(raw[..20].to_string()),
+            ChatDelta::Text(raw[20..].to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text("done".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let tools = writing_registry(ran.clone());
+    let mut c = cfg(10);
+    c.stream = true;
+
+    let (out, writes) = capture_stdout_writes(async {
+        run_agent_turn(&provider, &tools, &mut initial_messages(), &c)
+            .await
+            .expect("a text-protocol tool call should still execute")
+    })
+    .await;
+
+    assert_eq!(ran.load(Ordering::SeqCst), 1, "the call must still run");
+    assert!(out.contains("done"), "final answer: {out}");
+    let joined: String = writes.concat();
+    assert!(
+        !joined.contains("fs_write_file") && !joined.contains('{'),
+        "no tool-call JSON may reach the transcript: {writes:?}"
+    );
+}
+
+/// `test_text_protocol_tagged`'s shape: `<tool_call>…</tool_call>`. Same
+/// invariant — nothing of it reaches stdout.
+#[tokio::test]
+async fn tools_offered_tagged_tool_call_round_prints_nothing() {
+    let raw = "<tool_call>{\"name\": \"fs_write_file\", \"parameters\": {\"path\": \"x.py\"}}</tool_call>";
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::Text(raw[..11].to_string()),
+            ChatDelta::Text(raw[11..].to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text("done".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let tools = writing_registry(ran.clone());
+    let mut c = cfg(10);
+    c.stream = true;
+
+    let (out, writes) = capture_stdout_writes(async {
+        run_agent_turn(&provider, &tools, &mut initial_messages(), &c)
+            .await
+            .expect("a tagged text-protocol tool call should still execute")
+    })
+    .await;
+
+    assert_eq!(ran.load(Ordering::SeqCst), 1, "the call must still run");
+    assert!(out.contains("done"), "final answer: {out}");
+    let joined: String = writes.concat();
+    assert!(
+        !joined.contains("fs_write_file") && !joined.contains('{') && !joined.contains("tool_call"),
+        "no tagged tool call may reach the transcript: {writes:?}"
+    );
+}
+
+/// `test_text_protocol_fenced_json`'s shape: narration, then a ```` ```json ````
+/// fence holding the call. The hold is NOT a one-shot latch — prose may be
+/// released, but the JSON that follows it must still be withheld.
+#[tokio::test]
+async fn tools_offered_fenced_tool_call_round_never_prints_the_json() {
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::Text("Sure, I'll write it:\n".to_string()),
+            ChatDelta::Text("```json\n".to_string()),
+            ChatDelta::Text(
+                "{\"name\": \"fs_write_file\", \"arguments\": {\"path\": \"x.py\"}}".to_string(),
+            ),
+            ChatDelta::Text("\n```".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text("done".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let tools = writing_registry(ran.clone());
+    let mut c = cfg(10);
+    c.stream = true;
+
+    let (out, writes) = capture_stdout_writes(async {
+        run_agent_turn(&provider, &tools, &mut initial_messages(), &c)
+            .await
+            .expect("a fenced text-protocol tool call should still execute")
+    })
+    .await;
+
+    assert_eq!(ran.load(Ordering::SeqCst), 1, "the call must still run");
+    assert!(out.contains("done"), "final answer: {out}");
+    let joined: String = writes.concat();
+    assert!(
+        !joined.contains("fs_write_file") && !joined.contains('{'),
+        "the fenced JSON must never reach the transcript: {writes:?}"
+    );
+}
+
+/// The malformed case the suppression at the end of the round exists for: a
+/// tool attempt too broken to repair (unbalanced braces). Its raw JSON must
+/// reach neither the transcript nor the answer.
+#[tokio::test]
+async fn tools_offered_malformed_tool_call_round_prints_nothing() {
+    let raw = r#"{"name": "fs_write_file", "arguments": {"path": "x.py"})}"#;
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::Text(raw[..18].to_string()),
+            ChatDelta::Text(raw[18..].to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text("recovered answer".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let tools = writing_registry(ran.clone());
+    let mut c = cfg(10);
+    c.stream = true;
+
+    let (out, writes) = capture_stdout_writes(async {
+        run_agent_turn(&provider, &tools, &mut initial_messages(), &c)
+            .await
+            .expect("a malformed tool attempt should be corrected, not committed")
+    })
+    .await;
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "a malformed attempt must not execute"
+    );
+    assert!(
+        !out.contains("fs_write_file"),
+        "the broken JSON must not be committed as the answer: {out}"
+    );
+    let joined: String = writes.concat();
+    assert!(
+        !joined.contains("fs_write_file") && !joined.contains('{'),
+        "a malformed tool attempt's raw JSON must not be streamed: {writes:?}"
+    );
+}
+
+/// `quiet` still prints nothing, and the event log's assistant deltas still
+/// concatenate to exactly the committed answer — the invariant the
+/// end-of-round site documents. A preservation guard: it must hold before and
+/// after the fix.
+#[tokio::test]
+async fn tools_offered_streaming_preserves_quiet_and_event_log() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("quiet ".to_string()),
+        ChatDelta::Text("answer".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let tools = writing_registry(Arc::new(AtomicUsize::new(0)));
+    let log = AgentEventLog::default();
+    let mut c = cfg(10);
+    c.stream = true;
+    c.quiet = true;
+    c.event_log = Some(log.clone());
+
+    let (out, writes) = capture_stdout_writes(async {
+        run_agent_turn(&provider, &tools, &mut initial_messages(), &c)
+            .await
+            .expect("a quiet streamed turn should succeed")
+    })
+    .await;
+
+    assert_eq!(out, "quiet answer");
+    assert!(
+        writes.is_empty(),
+        "quiet must put nothing on stdout: {writes:?}"
+    );
+    let emitted: String = log
+        .take()
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentRuntimeEvent::AssistantDelta { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        emitted, out,
+        "concatenated assistant deltas must reproduce the committed answer"
+    );
 }

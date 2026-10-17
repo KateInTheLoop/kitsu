@@ -5915,3 +5915,103 @@ The duplication is pre-existing and legitimate — the stack push writes differe
 ### A flag whose name now understates it
 
 The turn flag threaded into the cadence is named for **typeahead**, not turns. It is set unconditionally at both turn boundaries, so it is *correct*, but a reader looking for the turn state will not find it by name. **Rename-only follow-up**, recorded rather than taken, since renaming it is not this card's subject.
+
+## F143 — F57-reach ships; **F57's own second failure mode is overstated**; and a card with no failing-first state
+
+Reachability is now structural: two guards drive **every** registry entry and fail by name the instant an arm goes missing. Six things to keep.
+
+### F57's prose is corrected, by measurement
+
+**F57 records that a registered-but-undispatched command typed mid-turn "becomes a future prompt sent to the model."** The author measured the drain and **I verified it**: `main.rs:21503-21512` does `submitted.text.strip_prefix('/')` and calls `handle_slash`. So mid-turn, an unarmed command is **banked as a queue entry that later prints `unknown command`** — it does **not** reach the model, on that drain route as it stands today.
+
+**The defect is real; its worst consequence was overstated.** F57's entry keeps its text (**F109** — point-in-time records are evidence), and this is the correction.
+
+### Reachability mid-turn is a *composition*, which is why one test cannot own it
+
+Two independent properties: **the slash survives the queue verbatim**, and **the name has an arm**. Either half alone lets F57's second mode through — and the author proved it rather than asserting it: under the removed-arm mutation the **mid-turn test still passes**, because the command is still enqueued correctly. So the two guards are not redundant, and neither claims to catch F57 alone. *A failure that needs two properties cannot be guarded by one test, however thorough.*
+
+### Recognition is not separable from execution — measured, and the honest workaround
+
+`handle_slash` is **one `async fn` with 17 live dependencies** and a single `match` whose arms **execute inline**; the mid-turn dispatcher is an if-chain with inline effects. There is no recognise/run split and no return value distinguishing *recognised* from *ran*. The only separable artifact is the fallback's own failure value.
+
+So rather than invent a dispatch path, the author used **process isolation**: the real binary, the real dispatcher, **one command per process in its own temp `HOME`**, through the existing script+JSONL harness. Side effects are real but contained and discarded, and `/quit` cannot hide a later command because no run has one. **49 runs in ~0.86 s.** *Where no in-process seam exists, the honest seam is a process* — the same move as **F108**, reached independently.
+
+### Fifth wrong curated count: 54 → **49**
+
+F57 says "all 54 commands". The registry holds **49**, and the test asserts **no count at all**, reporting the derived length only in its failure message. After **F124**, **F126**, **F131** and **F142**, the pattern is beyond doubt: **any number written in prose is a curated list of one number.**
+
+### A self-proving detector
+
+The sweep derives an unregistered sentinel and requires it to reach `unknown command` **inside each run**. So a green result can never be a harness that never looked — the detector proves itself per-run rather than relying on a mutation I remember to re-run. **This is the anti-vacuity pattern generalised**, and it is strictly better than a mutation ritual: it cannot be forgotten.
+
+### No failing-first state, and that is correct
+
+**Nothing is currently unreachable**, so there was no red state and no implementer step. This card adds a **guard**, not a behaviour. The author drove all 49 entries *before* writing a test, found none broken, and **said so instead of manufacturing a red state** — which a bogus registration would have done at the cost of testing a defect it had itself introduced.
+
+**Satisfiability here means the opposite of usual:** green on unmutated HEAD, red and naming the command the instant an arm is deleted. One precision on the author's own claim: **`/help` *is* typed** — it is the mechanism by which the registry publishes itself for enumeration, since the table is private to the binary. No command is typed as a *subject*, which is the property that matters.
+
+**No user-visible surface changed**, so README, `functionality.md`, the CHANGELOG and `ux-design.md` correctly get nothing — recorded here so the absence is a checked result rather than a skipped step.
+
+## F144 — F67-print ships; **F67's parity premise was wrong too**; and a flagged trap that was only half shut
+
+`/jobs prune` now prints an unread result before discarding the record. Four things to keep.
+
+### The parity target I named in the brief would have preserved the bug
+
+**I told the test author to match what automation receives.** The author measured it and **I verified**: `terminal_agent_status_label` maps **`AgentStatus::Done(_) => "done"`**, so `terminal_job_payload`'s four fields carry **no body at all**.
+
+**So F67's "the result *survives* in the reply" is overstated** — what survives automation is the *fact* of a finished job, not its text. The body was lost on **both** paths; the interactive path merely lost the fact as well. Copying the payload onto stderr would have printed a receipt for data it had just discarded.
+
+The right target was the **exit guard's own printer**, `print_background_results` — *the very surface prune defeats*. It carries the id, task, status-as-rendering **and the body**. **Second recorded premise overstated in two cards** (F143 was the first), and both times the author measured rather than inheriting my framing. *When a card's justification is a claim about another path's behaviour, that claim is a measurement, not a given.*
+
+### The trap I flagged was real and only half shut
+
+I warned that a test asserting *"the result was printed"* would also pass an implementation that **refused to prune** — the option I had rejected. Correct, and **understated**: the author found the *print-then-quietly-refuse* mutation **survived the integration test by fabricating the empty-deck line.** A deck-count assertion now makes the cheat need **two** fabrications, and the in-crate control catches it unconditionally.
+
+The implementer then re-ran that mutation in **three** variants — kept-record-with-`changed: true`, kept-record-with-`changed: false`, and the fabricated-output cli case — and **all three bite**. *Confirmed shut from both sides, which is what "bidirectional" has to mean when the wrong implementation is a near-neighbour of the right one.*
+
+### One predicate, read once, before the remove
+
+The unviewed test is the `x` key's own expression, `handoff_state(id) == Some(Ready)`, **taken once before `close(id)`** — the remove makes it unanswerable afterwards. No `unacknowledged` count, no `thread_snapshot` re-read, no second `handoff_state` call. The F141/F142 shape was named in the brief and avoided.
+
+### A ruling and the gap it leaves
+
+These writes are **not** gated on `--jsonl`, so a scripted machine-readable run now gets the result body on stderr. **I ruled it ungated, following the receipt**: where the receipt goes, the result goes, because gating it would hand exactly those users the receipt **without** the result — the silent loss this card removes. The machine contract is **stdout**; stderr there is already human diagnostics, as the pre-existing receipt on that stream shows.
+
+**The measured gap:** no test covers a slash command in JSONL mode writing to stderr — the only `jsonl.stderr.is_empty()` assertion sits in a run with **no slash commands**. Recorded rather than closed, because asserting the new line would pin a stream contract this card did not decide.
+
+## F145 — F51 resolved: answers stream in the default configuration; an assertion that was load-bearing on the defect; and one new inconsistency recorded
+
+**F51 is closed**, by its first option: stream, withholding only text that could still open a tool call. Five things to keep.
+
+### The defect was "streams least when it matters most"
+
+Suppression was gated on `!tools_were_offered`, and the comment reasoned that *"the final round withholds tools, so final answers still stream live."* True of a round **following** a tool call; false of an ordinary single-round answer, which offers tools in that very round — **the default**. So visible streaming happened only in the uncommon case.
+
+### A test whose assertion was load-bearing on the defect
+
+**F51 recorded that `inline_mode_wide_stream_wraps_and_scrolls_without_touching_the_status_row`'s *name* overstates what it samples. The measurement is worse: one of its *assertions* passed only because nothing streamed.** The fixture samples at "L08 of 12"; with the whole burst arriving at once, all twelve lines were present and the first had scrolled away.
+
+**Verifying it changed my ruling.** The test's *primary* assertion is *"a stream in flight must not reach the pinned status row"* — and **there was no stream in flight**, so that assertion had been checked against a completed burst for its entire life. Moving the sampling point to the end would have bought a green test by **destroying the in-flight case the test exists for.** So the sampling point stayed and only the accidental claim was restated — to the honest mid-stream state **plus** a new scroll anchor (the welcome card's top border, read from the test's *own* pre-stream screen, not hard-coded). **No claim was deleted**, and I verified exactly one assertion's text changed.
+
+*A test can be wrong in a way that only a fix reveals: it passes, it is not vacuous, and it is measuring the defect.*
+
+**The rename F51 asked for is refuted:** the name promises wrap, scroll and an untouched status row, and with streaming restored all three are measured for real. **The finding's suggestion was conditional on the defect it was describing.**
+
+### The predicate, and why it cannot be a latch
+
+A continuous safe-prefix scan: `{` is always a viable opener, so it holds to end of round; `<` and `` ` `` hold only while the remainder is a prefix of `"<tool_call>"` or `"```"`, otherwise the scan continues. **Worst case before the first byte reaches the user is 11 bytes; for ordinary prose it is zero.**
+
+**The fenced case is what forces a continuous rule** — narration precedes the fence, so a one-shot latch would either suppress the narration or leak the fence. And the implementer found the reason the wrapper bytes need holding at all: `extract_json_objects` scans only for `{`, so it finds the JSON *inside* a tag or fence via the brace, while the wrapper bytes themselves would have streamed — and one test asserts the string `tool_call` never appears.
+
+### The duplication risk was the real danger, and it was pinned at the right shape
+
+Once text has streamed, the end-of-round site must print **only the withheld tail**, or the answer appears twice in the default configuration. I escalated this from the author's note to a requirement and asked specifically whether the **prose-then-brace** shape was covered. It was not; it is now. The mutation shows the subtler **head-only** duplication caught, which a whole-message detector would miss.
+
+### Recorded, not fixed: a round that streams prose it then suppresses
+
+A `needs_structured_finalization` round — `defer_response_format_until_final` with a `response_format` — **can now stream its prose head before the round is classified as a provisional handoff and its text suppressed from committed output.** So a user could see text that the transcript does not keep. **No test in either profile detects it.**
+
+Reported by the implementer rather than quietly left. **Judged and accepted:** it is confined to structured-output use, not the default interactive path; the committed output stays correct, so it is a display inconsistency rather than data loss; and it is far outweighed by streaming working at all in the default case. **Carded, not blocked** — an undocumented inconsistency is how findings get rediscovered.
+
+**And F52 is now more pressing**, measured: the new content rides the same `CellRing::push` on the same path, so `[tui] cell_ring_lines` governs it identically — a documented limit, not a new unbounded one — but the ring will carry every ordinary answer instead of only the tool-free ones.

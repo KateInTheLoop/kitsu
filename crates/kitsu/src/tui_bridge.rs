@@ -4746,6 +4746,63 @@ mod tests {
         );
     }
 
+    /// **Test: the fullscreen ring holds a STREAMED answer and cannot hold a
+    /// buffered one — and the line bound is applied on the same path.**
+    ///
+    /// Measured, not reasoned: the ring is fed only from the surface seam, and
+    /// `kitsu_render::print_message` writes straight to the process descriptor
+    /// without consulting `active_surface`, so an answer printed whole at the
+    /// end of a round can never enter it. `print_fragment` routes through
+    /// `write_block`, so a streamed one does.
+    ///
+    /// Why it matters for **F51**: with tools advertised — the default — an
+    /// ordinary answer is buffered, so the fullscreen scrollback has never
+    /// held it (`docs/functionality.md` says so). Once such answers stream,
+    /// they arrive here through `print_fragment` for the first time. This
+    /// test pins the mechanism that makes that true.
+    ///
+    /// The third assertion is for **F52**: the new content is pushed through
+    /// the same `CellRing::push` as everything else, so the ring's **line**
+    /// bound governs it identically — a documented limit, not a new unbounded
+    /// one. The bound is still in lines, so F52's open question about a single
+    /// pathological line is untouched by this.
+    #[test]
+    #[serial]
+    fn the_fullscreen_ring_holds_a_streamed_answer_and_not_a_buffered_one() {
+        let _state = GlobalState::capture();
+        let tap = Arc::new(FullscreenTap {
+            inner: Arc::new(SurfaceSpy::default()),
+            ring: std::sync::Mutex::new(kitsu_tui::cells::CellRing::new(2)),
+        });
+        set_surface(tap.clone());
+
+        kitsu_render::print_fragment("streamed answer\n");
+        kitsu_render::print_message("buffered answer\n");
+
+        let held: Vec<String> = tap.lines().iter().map(|line| line.plain()).collect();
+        assert!(
+            held.iter().any(|line| line.contains("streamed answer")),
+            "a streamed answer reaches the ring through the surface seam: {held:?}"
+        );
+        assert!(
+            !held.iter().any(|line| line.contains("buffered answer")),
+            "a buffered answer bypasses the seam and cannot reach the ring, \
+             which is why the default configuration's answers are missing from \
+             the fullscreen scrollback today: {held:?}"
+        );
+
+        // The bound: this ring holds two lines, so a third streamed line
+        // evicts the oldest exactly as it does for any other content.
+        kitsu_render::print_fragment("second\nthird\n");
+        let held: Vec<String> = tap.lines().iter().map(|line| line.plain()).collect();
+        assert_eq!(
+            held,
+            vec!["second".to_string(), "third".to_string()],
+            "the ring's line bound governs streamed answers on the same path \
+             as everything else: {held:?}"
+        );
+    }
+
     /// **Test: the paging anchor lives on the segment, and the segment's own
     /// `Drop` is the only thing that clears it.**
     ///

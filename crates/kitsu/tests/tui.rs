@@ -2572,8 +2572,22 @@ fn wide_stream_events() -> Vec<String> {
 ///   region does not reach row 24;
 /// * a line wider than the terminal **wraps** rather than being truncated:
 ///   its `END` sentinel is on the row after its `L` sentinel;
-/// * the region really scrolled: `L01` was streamed (it is in the raw bytes)
-///   and is no longer on the screen, so the assertion above is not vacuous.
+/// * the region really scrolled, so the assertions above are not vacuous.
+///
+/// **The third claim was restated for F51.** It used to read "`L01` was
+/// streamed and is no longer on the screen". That held only because of the
+/// defect F51 records: with tools offered — the default — nothing streamed, so
+/// the whole twelve-line burst had already landed by the time this sample is
+/// taken, and `L01` had scrolled past. Once an ordinary answer streams, this
+/// sample is genuinely mid-stream (L08 of 12) and `L01` is still inside the
+/// region, which is also the first time the test's *primary* claim — "a
+/// stream **in flight** must not reach the pinned status row" — is measured
+/// against a stream actually in flight. The scroll is therefore anchored on
+/// what the stream has displaced instead: the welcome card's top border, on
+/// the pre-stream screen and pushed off the region by the wrapped lines. The
+/// sampling point is deliberately unchanged: moving it to the end of the
+/// stream would buy a green test by destroying the in-flight case this test
+/// exists for.
 #[test]
 #[serial]
 fn inline_mode_wide_stream_wraps_and_scrolls_without_touching_the_status_row() {
@@ -2643,17 +2657,45 @@ fn inline_mode_wide_stream_wraps_and_scrolls_without_touching_the_status_row() {
         Session::dump(&screen)
     );
 
-    // The region scrolled, and the check above is therefore about a screen
-    // that really moved: L01 was streamed and has left the screen.
+    // The region scrolled, and the checks above are therefore about a screen
+    // that really moved. RESTATED for F51 (see this test's doc comment): the
+    // claim is no longer "L01 has left the screen", which held only while
+    // tools suppressed streaming and the whole burst had already landed by
+    // this sample. Mid-stream at L08 of 12, L01 is still on the screen — and
+    // the scroll is anchored on what the stream HAS displaced: the welcome
+    // card's top border, present before the stream, pushed off the region by
+    // the wrapped lines.
     assert!(
         session.raw_count("L01-") > 0,
         "L01 must have been streamed at all; raw:\n{}",
         session.raw_text().escape_debug()
     );
+    let before = session.screen_at(0);
+    let card_top = before
+        .iter()
+        .find(|row| row.contains('\u{256d}'))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the welcome card's top border must be on the pre-stream \
+                 screen to anchor the scroll; screen:\n{}",
+                Session::dump(&before)
+            )
+        });
     assert!(
-        !screen.iter().any(|row| row.contains("L01-")),
-        "twelve wrapped lines must have scrolled L01 out of the region; \
-         screen:\n{}",
+        screen.iter().any(|row| row.contains("L01-")),
+        "mid-stream at L08 of 12, L01 is still inside the region: it is the \
+         first of the streamed lines, not yet scrolled past; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        !screen
+            .iter()
+            .any(|row| row.trim_end() == card_top.trim_end()),
+        "the region must really have scrolled: the welcome card's top border \
+         {:?} was on screen before the stream and the wrapped lines must have \
+         pushed it off; screen:\n{}",
+        card_top.trim_end(),
         Session::dump(&screen)
     );
 }
