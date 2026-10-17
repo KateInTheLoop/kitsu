@@ -877,6 +877,27 @@ fn validate_output_last_message_surface(cli: &Cli) -> Result<(), CliError> {
     session::validate_output_file_target(destination).map_err(CliError::user)
 }
 
+/// Refuse `--no-alt-screen` while nothing can honour it (**F62**).
+///
+/// The flag is the argv door onto `[tui] alternate_screen = "never"`, which
+/// the config deserializer refuses for the same reason: there is no
+/// in-viewport overlay path, so the agent view takes the alternate screen
+/// whatever either door says. Refusing only the file would move the lie to
+/// the command line rather than close it.
+///
+/// It fires for every subcommand, `doctor` included, because the flag is
+/// `global = true`: a global flag refused on some subcommands and accepted on
+/// others is a rule the user has to memorise, and `doctor` is exactly where a
+/// silent lie is worst -- it is run to learn whether the setup is sound, and
+/// reporting "all good" while ignoring a flag the user passed is the defect
+/// this refusal exists to close.
+fn validate_no_alt_screen_flag(cli: &Cli) -> Result<(), CliError> {
+    crate::config::TuiConfig::default()
+        .effective_alternate_screen(cli.no_alt_screen)
+        .map(|_| ())
+        .map_err(CliError::user)
+}
+
 fn validate_output_schema_surface(cli: &Cli) -> Result<(), CliError> {
     let Some(path) = cli.output_schema.as_deref() else {
         return Ok(());
@@ -1908,6 +1929,7 @@ fn run() -> Result<(), CliError> {
             .expect("every inference command has an explicit carrier");
         activate_model_command(carrier)?;
     }
+    validate_no_alt_screen_flag(&cli)?;
     validate_output_last_message_surface(&cli)?;
     OUTPUT_LAST_MESSAGE_REQUESTED.store(cli.output_last_message.is_some(), Ordering::Release);
     validate_output_schema_surface(&cli)?;
@@ -5690,7 +5712,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "tui",
         args: "[classic|inline|fullscreen]",
         description: "report or switch the live renderer",
-        details: "Switches the renderer in place: `classic` is the line renderer kitsu has always had, `inline` is the pinned bottom viewport, `fullscreen` takes the terminal's alternate screen and repaints the tail of the transcript the inline viewport retained. The conversation is unchanged by a switch — the transcript already on screen stays exactly where it is, and nothing is replayed, except into fullscreen, where the alternate screen starts blank and the retained tail is painted onto it. In fullscreen, `PgUp` and `PgDn` move the frame back and forward by a window, `Ctrl+Home` moves it to the oldest line the transcript ring still retains and `Ctrl+End` brings it back to the newest and resumes following the output; all four move the frame rather than the caret, and only while fullscreen holds the screen. `Ctrl+O` opens the transcript overlay over the transcript the ring retains, from the inline composer and from fullscreen alike: the same four keys scroll it, and `q` or `Esc` closes it and leaves the frame behind it where it was. Leaving fullscreen gives the screen back untouched. Bare /tui reports the renderer in use. Accepted only between turns; a /tui typed during a turn is refused rather than queued. Persist a choice with `mode = \"inline\"` under `[tui]` in the config or --tui.",
+        details: "Switches the renderer in place: `classic` is the line renderer kitsu has always had, `inline` is the pinned bottom viewport, `fullscreen` takes the terminal's alternate screen and repaints the tail of the transcript the inline viewport retained. The conversation is unchanged by a switch — the transcript already on screen stays exactly where it is, and nothing is replayed, except into fullscreen, where the alternate screen starts blank and the retained tail is painted onto it. In fullscreen, `PgUp` and `PgDn` move the frame back and forward by a window, `Ctrl+Home` moves it to the oldest line the transcript ring still retains and `Ctrl+End` brings it back to the newest and resumes following the output; all four move the frame rather than the caret, and only while fullscreen holds the screen. `Ctrl+O` opens the transcript overlay over the transcript the ring retains, from the inline composer and from fullscreen alike: the same four keys scroll it, and `q` or `Esc` closes it and leaves the frame behind it where it was. `Ctrl+X 1..9` attaches to an agent by the position it is displayed at: `Ctrl+X 3` is the third row you can see, whatever its `#id`, so the nine digits reach the first nine rows and anything below them is the agent view and its arrows. It switches agent when one is already attached; `Ctrl+X 0`, and a digit past the last row, do nothing at all, and the line you have typed is kept either way. Inside the view the digits are ordinary characters. Leaving fullscreen gives the screen back untouched. Bare /tui reports the renderer in use. Accepted only between turns; a /tui typed during a turn is refused rather than queued. Persist a choice with `mode = \"inline\"` under `[tui]` in the config or --tui.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -6504,6 +6526,15 @@ fn read_chat_line_inline(
             carried = apply_inline_detach(attached, draft);
             continue;
         }
+        // Card **T4-S6-ordinal**: `Ctrl+X 1..9`. Sequenced here for the
+        // agent view's and the detach's reason -- the reader is pure -- and
+        // because this is the one place that holds both the registry the
+        // ordinal is resolved against and the session attachment it changes.
+        // The draft comes back through the same replay (**F76**).
+        if let Ok(tui_bridge::InlineRead::AttachOrdinal(ordinal, draft)) = outcome {
+            carried = apply_inline_attach_ordinal(registry, attached, ordinal, draft);
+            continue;
+        }
         // Card **T4-S6b**, requirement A5: while attached, a submitted line
         // is the attached agent's -- a steer, or an answer while it is
         // blocked -- and never a turn. Routed here, before the line can
@@ -6557,6 +6588,11 @@ fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead
         // Requirement **R6**: handled by the caller's loop, like the two
         // outcomes above it. Unreachable from here.
         Ok(tui_bridge::InlineRead::OpenTranscript(_)) => ChatReadline::Eof,
+        // Card **T4-S6-ordinal**: handled by the caller's loop, which is the
+        // only place that holds both the registry the ordinal is resolved
+        // against and the session's attachment -- so this arm is unreachable
+        // from here, like the three above it.
+        Ok(tui_bridge::InlineRead::AttachOrdinal(_, _)) => ChatReadline::Eof,
         Ok(tui_bridge::InlineRead::Interrupted) => {
             // Deliberately NOT re-raising SIGINT here, unlike the during-turn
             // collector. The collector raises because a turn is in flight and
@@ -9184,6 +9220,59 @@ fn apply_agent_view_exit(exit: &AgentViewExit, attached: &mut Option<u64>) {
 fn apply_inline_detach(attached: &mut Option<u64>, draft: String) -> String {
     if let Some(id) = attached.take() {
         replay_foreground_recap(id);
+    }
+    draft
+}
+
+/// Perform one `Ctrl+X 1..9` for the composer loop (card **T4-S6-ordinal**),
+/// and hand back the draft the next read must replay (**F76**).
+///
+/// The digit is a **1-based ordinal over the rows the view would display**,
+/// never an id: ids pass nine after nine spawns, and once `#1` is pruned and
+/// `#11` exists an id read is *wrong* rather than dead. The rows come from
+/// [`overlay_visible_rows`] -- the one place A3's filter is applied -- so the
+/// position the user counted off the screen is the position resolved here,
+/// and `kitsu_tui::agents_view::nth_displayed` owns both the 1-based
+/// convention and the bounds.
+///
+/// A position no row holds -- `0`, an ordinal past the last row, or any digit
+/// at all while the view is empty -- is **inert and silent**, exactly as
+/// `Ctrl+X d` with nothing attached is: a chord is a slip, and attaching to
+/// an agent the user did not count off the screen is worse than doing
+/// nothing. The draft is handed back either way.
+///
+/// Attaching goes through [`apply_agent_view_exit`], which is the one seam
+/// every attach route shares: it ends the previous attachment, replays what
+/// that one buffered under its own agent's header and prints the
+/// `\u{26E9}` milestone, and it does all of that only on a **change** of
+/// binding -- so the chord typed on the agent already attached is a no-op
+/// rather than a second identical milestone, and the chord typed while
+/// attached to another agent *switches*.
+///
+/// A function rather than lines in the arm for [`apply_inline_detach`]'s
+/// reason: the loop around it needs a real tty, so this is the only seam a
+/// test can drive, and there is exactly one of it (**F69**).
+#[cfg(unix)]
+fn apply_inline_attach_ordinal(
+    registry: &subagent::AgentRegistry,
+    attached: &mut Option<u64>,
+    ordinal: usize,
+    draft: String,
+) -> String {
+    // The composer has no filter of its own -- A3's filter line lives in the
+    // overlay and dies with it -- so the state here is the default one, whose
+    // empty filter matches every row. Going through `overlay_visible_rows`
+    // anyway keeps one expression between the registry and what the view
+    // displays, instead of a second path that could come to disagree with it.
+    let rows = overlay_visible_rows(registry, &OverlayState::new());
+    if let Some(id) = kitsu_tui::agents_view::nth_displayed(&rows, ordinal) {
+        apply_agent_view_exit(
+            &AgentViewExit {
+                shown: false,
+                attached: Some(id),
+            },
+            attached,
+        );
     }
     draft
 }
@@ -20268,7 +20357,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // title back, on a renderer switch and on every exit path out of this
     // function alike.
     #[cfg(unix)]
-    let (mut tui_bridge_guard, mut fullscreen_segment) = {
+    let (mut tui_bridge_guard, mut fullscreen_segment, _title_stack_guard) = {
         // T3-S2 resolves the whole `[tui]` table here, at the one point where
         // the renderer is chosen. Only `mode` has a consumer today; the
         // remaining four are resolved and bound so that the alternate-screen
@@ -20286,12 +20375,31 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         });
         // Still resolved here and still without a consumer: the
         // alternate-screen force (the agent view takes the alternate screen
-        // unconditionally today) and the title row. The cell ring is no longer
-        // parked here -- it is handed to `install` below.
-        let _resolved_tui = (
-            setup.tui.effective_alternate_screen(cli.no_alt_screen),
-            setup.tui.title,
-        );
+        // unconditionally today). The cell ring is no longer parked here -- it
+        // is handed to `install` below.
+        // F62: the flag is already refused in argv validation
+        // (`validate_no_alt_screen_flag`), so reaching here means it was not
+        // passed and this resolves to the configured value -- which can only
+        // be `auto` or `always`, the deserializer having refused `never`.
+        let _resolved_alternate_screen = setup
+            .tui
+            .effective_alternate_screen(cli.no_alt_screen)
+            .expect("--no-alt-screen is refused in argv validation (F62)");
+        // Card H2-title: `[tui] title`'s consumer, at last (**F139**). Stored
+        // before `enter_fullscreen` below, because the key gates the title
+        // *stack* that segment pushes as well as the OSC 2 string the turn
+        // boundaries write.
+        tui_bridge::set_title_enabled(setup.tui.title);
+        // Card **H2-stack** (**F140**): the title *stack* is the session's,
+        // not a renderer's. Before this card the one pusher was
+        // `enter_fullscreen`, so a title set in classic or inline was never
+        // pushed and outlived the process -- and the dying-signal restore
+        // popped a stack it had never pushed. Pushed here, under exactly the
+        // gate the OSC 2 string uses, and popped by this guard's `Drop` on
+        // every exit path out of `run_chat`. Created **before**
+        // `enter_fullscreen` below, which is what lets that segment see the
+        // session's push and add none of its own.
+        let title_stack_guard = tui_bridge::TitleStackGuard::new(Box::new(std::io::stderr()));
         let mode = match setup.tui.effective_mode(cli.tui_mode()) {
             crate::config::TuiMode::Classic => tui_bridge::TuiMode::Classic,
             crate::config::TuiMode::Inline => tui_bridge::TuiMode::Inline,
@@ -20345,7 +20453,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 setup.tui.cell_ring_lines,
             )
         });
-        (installed, fullscreen)
+        (installed, fullscreen, title_stack_guard)
     };
     let publish_agent_state = |turn_active: bool| {
         if !agent_state_enabled {
@@ -20360,6 +20468,30 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         );
         let _ = agent_state_file::write(&agent_state_dir, agent_state_pid, &payload);
+    };
+    // Requirement **H2**'s title clause, at the same three boundaries as the
+    // state file above and deliberately not sharing its gate: `[tui] title`
+    // and the state file are independent keys, and a user may want either
+    // alone.
+    //
+    // `agent_state_file::process_state` is the one and only source of the
+    // state word -- the precedence *"blocked outranks working"* stays in its
+    // single home -- and the live count is `running + blocked`, which the
+    // snapshot documents as disjoint tallies; the terminal, failed and
+    // unacknowledged records are finished work and are not live agents.
+    //
+    // Cadence, and its honest limit: these three sites are the session
+    // boundary, the top of the idle loop and the start of a turn. The
+    // registry's `watch` channel is subscribed only behind
+    // `KITSU_LIVE_NOTICES`, so there is no general hook to republish from.
+    // The title is therefore correct at the idle prompt and at turn start,
+    // and goes stale mid-turn.
+    let publish_title = |turn_active: bool| {
+        let snapshot = agent_registry.snapshot();
+        tui_bridge::publish_state_title(
+            agent_state_file::process_state(snapshot.running, snapshot.blocked, turn_active),
+            snapshot.running + snapshot.blocked,
+        );
     };
     // The agent state hook (`[hooks] on_agent_state`, requirement H3). It is
     // independent of the state file above: a user may want the notification
@@ -20384,6 +20516,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // runs. Scripted, piped and one-shot carriers never reach the interactive
     // turn boundaries below, so this is the one hint they publish.
     publish_agent_state(false);
+    publish_title(false);
     fire_agent_state_hooks();
 
     // Scripted mode: run turns from a file non-interactively, then exit. Works
@@ -21272,10 +21405,24 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // opt-in and assistive-gated, which is why a default TUI session had no
     // subscriber at all. Held for the session; the task ends when the
     // registry's sender drops.
+    // Card **H2-cadence**: the same subscriber republishes requirement H2's
+    // terminal title, which the three `publish_title` sites leave stale
+    // mid-turn. The turn flag is the one the turn boundaries already set two
+    // lines from `publish_title(true)`/the turn's end, so the cadence's word
+    // is the word those sites would publish.
+    #[cfg(unix)]
+    let title_turn_active = foreground_typeahead_active.clone();
     #[cfg(unix)]
     let _idle_ambient_cadence = tui_bridge::spawn_idle_ambient_cadence(
         agent_registry.subscribe(),
         |snapshot: &subagent::AgentRegistrySnapshot| (snapshot.blocked, snapshot.running),
+        move |blocked, running| {
+            tui_bridge::publish_cadence_state_title(
+                blocked,
+                running,
+                title_turn_active.load(Ordering::Acquire),
+            );
+        },
     );
     let mut exit_after_queue = false;
     // Session transitions are control-plane actions, not user prompts. They
@@ -21308,6 +21455,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // Turn boundary: the previous turn has ended and nothing is running, so
         // the hint is refreshed as idle before the next prompt is collected.
         publish_agent_state(false);
+        publish_title(false);
         fire_agent_state_hooks();
         let agent_snapshot = agent_registry.snapshot();
         if !agent_notifications_live {
@@ -22174,6 +22322,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // Turn boundary: a turn is now active, so the hint flips to working
         // before any inference begins.
         publish_agent_state(true);
+        publish_title(true);
         fire_agent_state_hooks();
         foreground_typeahead_active.store(true, Ordering::Release);
         // A styled interactive session gets the live raw-mode editor (visible
@@ -32584,6 +32733,91 @@ mod tests {
         }
     }
 
+    /// Card **T4-S6-ordinal**: `Ctrl+X 1..9`'s only advertisement.
+    ///
+    /// Deliberately the shape of the transcript overlay's test above, and for
+    /// its reasons. The chord cannot go in `keys::BINDINGS` -- that table is
+    /// the agent view's, swept over *that* decoder's key space, and this key
+    /// is read by the inline reader on the composer's surfaces -- and the
+    /// view's own footer is only visible once the view is open, which is the
+    /// one place the digits are **not** keys. So the details are the whole of
+    /// what a user is ever told, and **F106** is what happens when they are
+    /// not told there: for `Ctrl+O` every occurrence in the tree was a
+    /// comment or a test string. The rule that applied to it applies here
+    /// (**F82**: a rule applied per-change is not a rule enforced).
+    ///
+    /// The three clauses asserted are the three a reader gets wrong: that the
+    /// digit is a **position** and not an agent number, that **nine** digits
+    /// reach the **first nine** rows and the rest are the view's arrows, and
+    /// that the inert cases are inert while the **draft survives** them.
+    ///
+    /// The second half is the overlay test's negative guard: the details must
+    /// not promise what the chord cannot do. Multi-digit entry and wrapping
+    /// are both decided against, and a user who believed in either would
+    /// address the wrong agent in silence (**F75**: a key that appears to
+    /// work is worse than one that is missing).
+    #[test]
+    fn the_tui_details_advertise_the_ordinal_attach_chord() {
+        let tui = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "tui")
+            .expect("/tui is registered");
+
+        assert!(
+            tui.details.contains("Ctrl+X 1..9"),
+            "the details are where `Ctrl+X 1..9` is advertised: there is no \
+             `keys::BINDINGS` row for it and the agent view's own footer is \
+             only visible once the view is open, which is the one place the \
+             digits are not keys, so a user who is not told here is not told \
+             at all. The details read: {}",
+            tui.details
+        );
+        assert!(
+            tui.details.contains("attach"),
+            "...and the sentence must say what the chord does, not merely \
+             that the keys exist: {}",
+            tui.details
+        );
+        assert!(
+            tui.details.contains("whatever its `#id`"),
+            "...and it must say the digit is a **position**: the one thing a \
+             reader gets wrong is reading `Ctrl+X 3` as agent #3, which is \
+             the agent the chord deliberately does not attach to: {}",
+            tui.details
+        );
+        assert!(
+            tui.details.contains("first nine"),
+            "...and it must say how far the nine digits reach, or a user \
+             with twelve agents is left to discover the tenth row's silence: \
+             {}",
+            tui.details
+        );
+        assert!(
+            tui.details.contains("Ctrl+X 0"),
+            "...and it must say that `Ctrl+X 0` does nothing, because it is \
+             the one digit that looks like it should be the first row: {}",
+            tui.details
+        );
+        assert!(
+            tui.details.contains("kept"),
+            "...and it must say the typed line survives the chord (**F76**): \
+             a user who believes a chord costs them their draft will not use \
+             it with a line typed, which is the case it exists for: {}",
+            tui.details
+        );
+        let lowered = tui.details.to_ascii_lowercase();
+        for unbuilt in ["wrap", "ctrl+x 10", "two digits", "modulo"] {
+            assert!(
+                !lowered.contains(unbuilt),
+                "the details must not promise {unbuilt:?}: multi-digit entry \
+                 and wrapping are both decided against, and a user who \
+                 believed in either would address the wrong agent in \
+                 silence: {}",
+                tui.details
+            );
+        }
+    }
+
     /// **T5-S2.** The two literals `/tui`'s own messages are built from, and
     /// the third renderer request.
     ///
@@ -34251,6 +34485,42 @@ mod tests {
     /// same letters typed as their own reads are still ordinary keys, and
     /// F65's arrow, lone `ESC` and `ESC`-then-key are decoded exactly as
     /// before. A "fix" that simply stops decoding letters fails those.
+    /// Card **T4-S6-ordinal**, the **scope**: `Ctrl+X 1..9` is the
+    /// **composer's** chord, exactly as `Ctrl+X a` and `Ctrl+X d` are, and it
+    /// is not a key in the agent view.
+    ///
+    /// The view's decoder is a different decoder on a different key space
+    /// (`keys.rs:140`), and this pins that the prefix byte is nothing to it:
+    /// a chord cannot reach `handle_overlay_input`, so inside the view a
+    /// digit stays what it is today -- a plain character, which the row list
+    /// ignores through `OverlayKey::Char(_) => {}` and a text prompt takes as
+    /// content. Selecting in the view is the arrow keys; the ordinal is the
+    /// shortcut from *outside* it. No third scope is invented.
+    #[cfg(unix)]
+    #[test]
+    fn the_ordinal_chord_is_the_composers_and_is_not_a_key_in_the_agent_view() {
+        /// The byte a terminal sends for the default `[tui] prefix`.
+        const PREFIX: u8 = 0x18;
+        let mut pending = OverlayPending::None;
+        assert_eq!(
+            decode_overlay_keys(&[PREFIX], &mut pending),
+            Vec::new(),
+            "the chord prefix is not a key in the view: the composer's \
+             decoder is the only one that reads it"
+        );
+        for digit in '1'..='9' {
+            let mut pending = OverlayPending::None;
+            let mut buffer = [0u8; 1];
+            digit.encode_utf8(&mut buffer);
+            assert_eq!(
+                decode_overlay_keys(&[PREFIX, buffer[0]], &mut pending),
+                vec![OverlayKey::Char(digit)],
+                "inside the view the prefix is dropped and {digit:?} is a \
+                 plain character, not an ordinal"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_pasted_chunk_decodes_as_one_paste_and_never_as_action_keys() {

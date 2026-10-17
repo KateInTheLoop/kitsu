@@ -8180,3 +8180,551 @@ fn fullscreen_start_sigterm_restores_termios_and_the_screen() {
         text.escape_debug()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Card H2-title: the OSC terminal title, and `[tui] title` gating it.
+//
+// Requirement **H2**: *"Kitsu MUST set the terminal title (OSC 0/2) to
+// `kitsu · working|blocked|idle|N agents` when `tui.title = true` (default on
+// TTY), so herdr/tmux can classify by title."* **F139** measured the half that
+// exists: the title *stack* is pushed and popped in production without
+// consulting the key, and nothing writes the OSC 2 string at all.
+//
+// FAILING-FIRST against this commit: no session writes `ESC]2;`, and
+// `title = false` pushes the stack anyway.
+// ---------------------------------------------------------------------------
+
+/// The OSC 2 set-window-title introducer, and its ST terminator.
+///
+/// Attributable in these sessions for the reason [`ALT_SCREEN_ON`] is: the
+/// only other writer of this sequence in the workspace is
+/// `kitsu_tui::TuiRuntime::enter`, which has no non-test caller (**F139**),
+/// and no script below reaches one.
+const OSC_TITLE_OPEN: &str = "\x1b]2;";
+
+/// The title a styled session with no background agents must be carrying: the
+/// state word is `agent_state_file::process_state`'s own, and the count is
+/// always present.
+const IDLE_TITLE: &str = "\x1b]2;kitsu · idle · 0 agents";
+
+/// **The title is actually set, in a real session, with the default key.**
+///
+/// The end-to-end half: a unit test over `state_title` pins the string, and
+/// this pins that a session *writes* it. One styled fullscreen session that
+/// reaches the idle prompt must carry the idle title at least once.
+#[test]
+#[serial]
+fn tui_title_sets_the_osc_state_title_in_a_styled_session() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("fullscreen"),
+        &fullscreen_start_then_classic(),
+    );
+    let text = session.raw_text();
+
+    assert!(
+        text.contains(IDLE_TITLE),
+        "requirement H2: a styled session with `[tui] title` at its default \
+         must set the terminal title to {IDLE_TITLE:?}; raw:\n{}",
+        text.escape_debug()
+    );
+    // NON-VACUOUS: the session genuinely reached the fullscreen segment and
+    // genuinely exited, so the title above was written by a live session and
+    // not by a startup probe that then failed.
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "one fullscreen segment; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "the session must still exit cleanly, but exited {:?}; raw:\n{}",
+        session.status,
+        text.escape_debug()
+    );
+}
+
+/// **`[tui] title = false` sets no title AND pushes no title stack.**
+///
+/// **F139**'s half-built mechanism, closed from the user's side: the key must
+/// gate both clauses. The alternate-screen counts are the non-vacuity anchor
+/// — the segment still runs, takes the screen and gives it back, so the three
+/// absent title sequences are the key's doing and not a session that never
+/// started.
+#[test]
+#[serial]
+fn tui_title_false_sets_no_title_and_pushes_no_title_stack() {
+    let home = TempDir::new().expect("temp home");
+    write_config_with_tui(home.path(), "title = false");
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("fullscreen"),
+        &fullscreen_start_then_classic(),
+    );
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "NON-VACUOUS: the fullscreen segment still takes the alternate \
+         screen; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_OFF),
+        1,
+        "NON-VACUOUS: ...and gives it back; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(OSC_TITLE_OPEN),
+        0,
+        "`title = false` must set no terminal title; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TITLE_PUSH),
+        0,
+        "`title = false` must not push the title stack either — the half \
+         F139 measured as ungated; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TITLE_POP),
+        0,
+        "...and must not pop a stack it never pushed; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "the session must still exit cleanly, but exited {:?}; raw:\n{}",
+        session.status,
+        text.escape_debug()
+    );
+}
+
+/// **Requirement N1: the title's control bytes reach neither the plain nor the
+/// assistive surface, and today's bytes are otherwise untouched.**
+///
+/// The title is control bytes on **stderr**, so N1 applies per descriptor
+/// (F120/F122): `--plain`, `NO_COLOR` and `--screen-reader` all fold into
+/// `kitsu_render::plain_mode`, and that surface must stay byte-identical to
+/// today.
+///
+/// Which makes the second half of each case the load-bearing one: the title
+/// **stack** is pushed and popped on these surfaces **today**, with the key at
+/// its default, so suppressing those two sequences here would be the N1
+/// violation rather than the fix. The negative is the OSC 2 string alone.
+#[test]
+#[serial]
+fn tui_title_is_not_set_on_the_plain_or_assistive_surfaces() {
+    for flag in ["--plain", "--screen-reader"] {
+        let home = TempDir::new().expect("temp home");
+        write_config(home.path());
+        let session = run_styled_chat_pty_core(
+            home.path(),
+            Some("fullscreen"),
+            &fullscreen_start_then_classic(),
+            Options::default(),
+            &[flag.to_string()],
+        );
+        let text = session.raw_text();
+
+        assert_eq!(
+            session.raw_count(OSC_TITLE_OPEN),
+            0,
+            "{flag} must receive no OSC title (N1, per descriptor); raw:\n{}",
+            text.escape_debug()
+        );
+        assert_eq!(
+            session.raw_count(TITLE_PUSH),
+            1,
+            "NON-VACUOUS, and N1 in the other direction: {flag} pushes the \
+             title stack today with the key at its default, and must keep \
+             doing so; raw:\n{}",
+            text.escape_debug()
+        );
+        assert_eq!(
+            session.raw_count(TITLE_POP),
+            1,
+            "...and pops it, exactly as today; raw:\n{}",
+            text.escape_debug()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Card H2-stack: the title *stack*, pushed at session start rather than only
+// in fullscreen.
+//
+// F140 and H2's amendment measured it: `PUSH_TITLE` has exactly one
+// production site, `enter_fullscreen`, so a title set in `classic` or
+// `inline` is never pushed and never popped and **survives kitsu's exit on
+// every terminal**; and an inline session killed by a signal writes a pop
+// having never pushed, because `SIGNAL_RESTORE` carries `ESC[23;2t`
+// unconditionally.
+//
+// The decision pinned below:
+//
+// * The stack is pushed **once per session**, at session start, under
+//   exactly the gate the OSC 2 string itself uses -- `title_enabled() &&
+//   title_surface_allows_osc()` -- so the plain and assistive surfaces and a
+//   non-TTY stderr keep today's byte stream (requirement **N1**, pinned by
+//   `tui_title_is_not_set_on_the_plain_or_assistive_surfaces` and by
+//   `tests/cli.rs`'s `test_tui_title_is_not_written_to_a_non_tty_stderr`).
+// * **No double push.** A fullscreen segment pushes only when the session
+//   start did not, and pops only what it pushed. Two pushes and two pops
+//   would also balance, but it is not an option here: a styled fullscreen
+//   session's counts are already pinned at exactly one each by
+//   `tui_switch_from_fullscreen_into_classic_restores_the_screen_and_the_title`,
+//   which this card does not touch.
+// * **Balance across a whole session** is the property that matters, and it
+//   is asserted as a pair of exact counts rather than as `push == pop`: at
+//   today's zero-for-zero, equality alone is vacuous (**F99/F100**).
+// ---------------------------------------------------------------------------
+
+/// Inline, into fullscreen, back to inline, into fullscreen again, then
+/// `/quit`: **two complete fullscreen segments in one session**, which is the
+/// script the double-push decision is pinned against.
+///
+/// The last three steps share `TUI_MARK_1` as their trigger because
+/// `TUI_SWITCHED_TO_FULLSCREEN` has already been seen by then and would fire
+/// instantly; the `pause` between them is what lets the second segment's
+/// entry bytes land before `/quit` is written.
+fn fullscreen_twice_then_quit() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/tui fullscreen\r"),
+        send(TUI_SWITCHED_TO_FULLSCREEN, "/tui inline\r"),
+        send(TUI_SWITCHED_TO_INLINE, "/theme zz1\r"),
+        send(TUI_MARK_1, "/tui fullscreen\r"),
+        pause(TUI_MARK_1, 800),
+        send(TUI_MARK_1, "/quit\r"),
+    ]
+}
+
+/// **A styled classic session pushes the title stack and pops it.**
+///
+/// The defect itself, from the user's side: classic reaches no fullscreen
+/// segment, so today it sets a title (`ESC]2;`) and pushes nothing, and the
+/// title the user is left with outlives the process.
+#[test]
+#[serial]
+fn tui_title_stack_is_pushed_at_session_start_in_a_styled_classic_session() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), None, &help_then_quit());
+    let text = session.raw_text();
+
+    // NON-VACUOUS: the session ran a real transcript, set a real title and
+    // exited cleanly, and it never went near a fullscreen segment -- so the
+    // push counted below can only be the session's own.
+    assert_eq!(
+        session.raw_count("/help <command> explains one command in detail"),
+        1,
+        "the session must have printed its transcript; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        text.contains(IDLE_TITLE),
+        "a styled classic session sets the title today, which is what makes \
+         pushing the stack owed; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        0,
+        "NON-VACUOUS: classic takes no alternate screen, so no fullscreen \
+         segment can be the pusher; raw:\n{}",
+        text.escape_debug()
+    );
+
+    assert_eq!(
+        session.raw_count(TITLE_PUSH),
+        1,
+        "F140: a session that sets the title must push the title stack once \
+         at session start, or the title outlives the process; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TITLE_POP),
+        1,
+        "...and pop it exactly once on the way out -- balance across the \
+         whole session; raw:\n{}",
+        text.escape_debug()
+    );
+    let pushed_at = text.find(TITLE_PUSH).expect("the push was just counted");
+    let popped_at = text.find(TITLE_POP).expect("the pop was just counted");
+    assert!(
+        pushed_at < popped_at,
+        "pushed before popped, or the stack is unbalanced; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "the session must still exit cleanly, but exited {:?}; raw:\n{}",
+        session.status,
+        text.escape_debug()
+    );
+}
+
+/// **A styled inline session pushes once and pops once, across two renderer
+/// switches.**
+///
+/// The second half of the defect, and the reason the push belongs to the
+/// *session* rather than to a renderer: `switch_both_directions` installs
+/// three segments and none of them is fullscreen, so the counts must stay at
+/// one no matter how many times the renderer is rebuilt.
+#[test]
+#[serial]
+fn tui_title_stack_is_pushed_once_per_session_across_inline_switches() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &switch_both_directions());
+    let text = session.raw_text();
+
+    // NON-VACUOUS: all three segments ran, and no alternate screen was taken.
+    for mark in [TUI_MARK_1, TUI_MARK_2, TUI_MARK_3] {
+        assert_eq!(
+            session.raw_count(mark),
+            1,
+            "NON-VACUOUS: every segment must have printed its marker; \
+             raw:\n{}",
+            text.escape_debug()
+        );
+    }
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        0,
+        "NON-VACUOUS: no fullscreen segment in this script; raw:\n{}",
+        text.escape_debug()
+    );
+
+    assert_eq!(
+        session.raw_count(TITLE_PUSH),
+        1,
+        "one session, one push -- a renderer switch is not a session; \
+         raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TITLE_POP),
+        1,
+        "...and one pop; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "the session must still exit cleanly, but exited {:?}; raw:\n{}",
+        session.status,
+        text.escape_debug()
+    );
+}
+
+/// **No double push: two fullscreen segments in one styled session still
+/// push once and pop once.**
+///
+/// This is the decision, pinned. Today each `enter_fullscreen` pushes and
+/// each `leave` pops, so this script measures two of each; after the session
+/// start owns the push, the segments must add none.
+#[test]
+#[serial]
+fn tui_title_stack_is_pushed_once_across_two_fullscreen_segments() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &fullscreen_twice_then_quit());
+    let text = session.raw_text();
+
+    // NON-VACUOUS: two segments really took and gave back the screen. This is
+    // the anchor that makes "one push" a decision rather than a session that
+    // never reached fullscreen at all.
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        2,
+        "NON-VACUOUS: two fullscreen segments must each take the alternate \
+         screen; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_OFF),
+        2,
+        "NON-VACUOUS: ...and each give it back; raw:\n{}",
+        text.escape_debug()
+    );
+
+    assert_eq!(
+        session.raw_count(TITLE_PUSH),
+        1,
+        "the session owns the push; a fullscreen segment entered while the \
+         session has already pushed must add none; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TITLE_POP),
+        1,
+        "...and must pop nothing either, or the stack underflows by one per \
+         segment; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "the session must still exit cleanly, but exited {:?}; raw:\n{}",
+        session.status,
+        text.escape_debug()
+    );
+}
+
+/// **The dying-signal exit path: the push is popped by `SIGNAL_RESTORE`, and
+/// that pop stops being a stray one.**
+///
+/// `SIGNAL_RESTORE` already carries `ESC[23;2t` unconditionally, which is
+/// today's bug in the other direction -- an inline session killed by a signal
+/// pops a stack it never pushed. Balance is what fixes it: one push at
+/// session start, one pop in the handler.
+#[test]
+#[serial]
+fn tui_title_stack_pushed_at_session_start_is_popped_by_the_dying_signal() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &switch_twice_then_sigterm());
+    let text = session.raw_text();
+
+    // NON-VACUOUS: the handler genuinely ran -- its own byte string is in the
+    // stream and the session died of the signal.
+    assert!(
+        text.contains("\x1b[r\x1b[?25h\x1b[?2004l\x1b[23;2t"),
+        "NON-VACUOUS: the dying-signal restore must have run; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        !session.status.success(),
+        "a signalled session does not exit successfully; it exited {:?}",
+        session.status
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        0,
+        "NON-VACUOUS: no fullscreen segment in this script; raw:\n{}",
+        text.escape_debug()
+    );
+
+    assert_eq!(
+        session.raw_count(TITLE_PUSH),
+        1,
+        "the session must have pushed the stack the handler's pop gives \
+         back; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TITLE_POP),
+        1,
+        "one pop, the handler's own -- balanced rather than stray; raw:\n{}",
+        text.escape_debug()
+    );
+    let pushed_at = text.find(TITLE_PUSH).expect("the push was just counted");
+    let popped_at = text.find(TITLE_POP).expect("the pop was just counted");
+    assert!(
+        pushed_at < popped_at,
+        "pushed before popped; raw:\n{}",
+        text.escape_debug()
+    );
+}
+
+/// **`[tui] title = false` pushes nothing in classic either.**
+///
+/// The key owns the stack as well as the string (**F139**), and classic is
+/// the surface where that was never testable before this card.
+#[test]
+#[serial]
+fn tui_title_false_pushes_no_title_stack_in_a_classic_session() {
+    let home = TempDir::new().expect("temp home");
+    write_config_with_tui(home.path(), "title = false");
+    let session = run_styled_chat_pty(home.path(), None, &help_then_quit());
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count("/help <command> explains one command in detail"),
+        1,
+        "NON-VACUOUS: the session ran a real transcript; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(OSC_TITLE_OPEN),
+        0,
+        "`title = false` sets no title; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TITLE_PUSH),
+        0,
+        "...so it must push no stack at session start either; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TITLE_POP),
+        0,
+        "...and pop none; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "the session must still exit cleanly, but exited {:?}; raw:\n{}",
+        session.status,
+        text.escape_debug()
+    );
+}
+
+/// **The N1 guard this card could most easily break: the plain and assistive
+/// surfaces, in classic, still push nothing.**
+///
+/// This test **passes before the implementation exists**, like
+/// `classic_session_that_never_switches_emits_no_viewport_bytes`: it is the
+/// one that says the session-start push was gated on
+/// `title_enabled() && title_surface_allows_osc()` and not on the key alone.
+/// `tui_title_is_not_set_on_the_plain_or_assistive_surfaces` pins the
+/// fullscreen half of the same claim at one push and one pop; this pins the
+/// classic half at zero, where a key-only gate would put one.
+#[test]
+#[serial]
+fn tui_title_stack_is_not_pushed_on_the_plain_or_assistive_classic_surfaces() {
+    for flag in ["--plain", "--screen-reader"] {
+        let home = TempDir::new().expect("temp home");
+        write_config(home.path());
+        let session = run_styled_chat_pty_core(
+            home.path(),
+            None,
+            &help_then_quit(),
+            Options::default(),
+            &[flag.to_string()],
+        );
+        let text = session.raw_text();
+
+        assert_eq!(
+            session.raw_count("/help <command> explains one command in detail"),
+            1,
+            "NON-VACUOUS: {flag} ran a real transcript; raw:\n{}",
+            text.escape_debug()
+        );
+        assert_eq!(
+            session.raw_count(OSC_TITLE_OPEN),
+            0,
+            "{flag} receives no OSC title (N1, per descriptor); raw:\n{}",
+            text.escape_debug()
+        );
+        assert_eq!(
+            session.raw_count(TITLE_PUSH),
+            0,
+            "and no session-start push: {flag} in classic pushes nothing \
+             today and must keep pushing nothing (N1); raw:\n{}",
+            text.escape_debug()
+        );
+        assert_eq!(
+            session.raw_count(TITLE_POP),
+            0,
+            "...and pops nothing; raw:\n{}",
+            text.escape_debug()
+        );
+    }
+}

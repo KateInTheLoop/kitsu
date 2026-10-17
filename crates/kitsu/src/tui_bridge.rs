@@ -255,6 +255,244 @@ const PUSH_TITLE: &[u8] = b"\x1b[22;2t";
 /// See [`PUSH_TITLE`].
 const POP_TITLE: &[u8] = b"\x1b[23;2t";
 
+// ---------------------------------------------------------------------------
+// Requirement **H2**'s title clause (card H2-title).
+//
+// `run_chat` resolves `[tui] title` once into the global below, calls
+// `publish_state_title` at the three state-publishing boundaries, and the
+// fullscreen segment consults `title_enabled` before it touches the title
+// stack.
+// ---------------------------------------------------------------------------
+
+/// Whether `[tui] title` is honoured this run.
+///
+/// Process-global for the same reason [`INLINE_INSTALLED`] is: the title is a
+/// property of the terminal this process holds, and the writers that set it
+/// (the fullscreen segment, and the turn boundary in `run_chat`) hold no
+/// common handle. Defaults to `true`, matching `TuiConfig::default`, so a
+/// surface that never resolves the table behaves exactly as it does today.
+static TITLE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Publish `[tui] title` for this run. Called once, where the rest of the
+/// `[tui]` table is resolved.
+pub(crate) fn set_title_enabled(on: bool) {
+    TITLE_ENABLED.store(on, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether the terminal title — the OSC 2 string *and* the title stack — is
+/// this run's to touch.
+pub(crate) fn title_enabled() -> bool {
+    TITLE_ENABLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether **this session** has already pushed the terminal's title stack.
+///
+/// Process-global for the same reason [`TITLE_ENABLED`] is: the session's
+/// push and a fullscreen segment's push have no common handle, and the stack
+/// they would both push is a property of the terminal this process holds.
+///
+/// Card **H2-stack**, finding **F140**: before this card `PUSH_TITLE` had one
+/// production site, `enter_fullscreen`, so a title set in `classic` or
+/// `inline` was never pushed and never popped and **outlived kitsu's exit on
+/// every terminal** -- while the dying-signal restore wrote the pop
+/// unconditionally, so an inline session popped a stack it never pushed. The
+/// stack is therefore pushed **once per session**, by
+/// [`TitleStackGuard::new`], and a fullscreen segment pushes only when the
+/// session has not.
+static TITLE_STACK_PUSHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the session-start push has happened. See [`TITLE_STACK_PUSHED`].
+pub(crate) fn title_stack_pushed() -> bool {
+    TITLE_STACK_PUSHED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The session's one push of the terminal title stack, popped when this is
+/// dropped.
+///
+/// A guard rather than an enter/leave pair, for the reason [`BridgeGuard`]
+/// and [`FullscreenSegment`] are guards: every exit path out of `run_chat`
+/// drops it -- `/quit`, `Ctrl+D`, an error return, an unwinding panic -- and
+/// a second teardown path is how one of them comes to differ from the other.
+///
+/// The gate is `title_enabled() && title_surface_allows_osc()`: **exactly**
+/// the condition [`publish_state_title`] applies to the OSC 2 string itself.
+/// A session that writes no title must push no stack, so the plain and
+/// assistive surfaces and a non-TTY stderr keep today's byte stream
+/// (requirement **N1**). Gating on the key alone would push one on the plain
+/// classic surface, which is the mutation
+/// `tui_title_stack_is_not_pushed_on_the_plain_or_assistive_classic_surfaces`
+/// exists to catch.
+///
+/// The dying-signal restore's pop stays **unconditional** (`SIGNAL_RESTORE`
+/// is byte-pinned): after this push it is correct for every session that set
+/// a title, and for a session that set none it is a pop against an empty
+/// stack, which no terminal distinguishes.
+pub(crate) struct TitleStackGuard {
+    /// Where the push went, so the pop goes to the same sink.
+    err: Box<dyn std::io::Write + Send>,
+    /// Whether the gate was open and this guard really pushed, so `Drop` pops
+    /// exactly what was pushed and nothing else.
+    pushed: bool,
+}
+
+impl TitleStackGuard {
+    /// Push the title stack for this session, when the title is this run's to
+    /// touch at all.
+    pub(crate) fn new(err: Box<dyn std::io::Write + Send>) -> Self {
+        let mut err = err;
+        let pushed = title_enabled() && title_surface_allows_osc();
+        if pushed {
+            let _ = err.write_all(PUSH_TITLE);
+            let _ = err.flush();
+            TITLE_STACK_PUSHED.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Self { err, pushed }
+    }
+}
+
+impl Drop for TitleStackGuard {
+    fn drop(&mut self) {
+        if !self.pushed {
+            return;
+        }
+        self.pushed = false;
+        TITLE_STACK_PUSHED.store(false, std::sync::atomic::Ordering::Release);
+        let _ = self.err.write_all(POP_TITLE);
+        let _ = self.err.flush();
+    }
+}
+
+/// The title requirement **H2** names, rendered.
+///
+/// `state` is [`crate::agent_state_file::process_state`]'s own word — this
+/// function never recomputes it, so "blocked outranks working" has exactly
+/// one home — and `agents` is the live agent count (`running + blocked`,
+/// which that snapshot documents as disjoint).
+///
+/// The rendering H2 left open, decided here:
+///
+/// * **The count is always present**, `0 agents` included. A title a herder
+///   parses is worth more predictable than short.
+/// * **Singular at one**, `1 agent`, because the title is read by people too
+///   and `(\d+) agents?` is no harder to parse than `(\d+) agents`.
+/// * **Sanitised**, via `kitsu_tui::sanitize_title`, because the state word
+///   and the count are the only parts that are kitsu's own today and the
+///   boundary belongs here rather than at the next caller that is not.
+pub(crate) fn state_title(state: &str, agents: usize) -> String {
+    let unit = if agents == 1 { "agent" } else { "agents" };
+    kitsu_tui::sanitize_title(&format!("kitsu \u{b7} {state} \u{b7} {agents} {unit}"))
+}
+
+/// Write the OSC 2 title onto `out`, or nothing at all when `enabled` is
+/// false.
+///
+/// `enabled` is the *whole* decision — `[tui] title` and the surface gate
+/// below — passed in rather than read, so this is testable against a buffer
+/// and the gate has one evaluation point.
+pub(crate) fn write_state_title(
+    out: &mut dyn std::io::Write,
+    enabled: bool,
+    state: &str,
+    agents: usize,
+) {
+    if !enabled {
+        return;
+    }
+    let _ = write!(out, "\x1b]2;{}\x1b\\", state_title(state, agents));
+    let _ = out.flush();
+}
+
+/// Whether this surface may receive the title's control bytes at all
+/// (requirement **N1**, as F120/F122 settled it: per descriptor).
+///
+/// The same gate F122 shipped for its human line, and for its reason: the
+/// title goes to **stderr**, so a non-terminal stderr must not receive it,
+/// and `--plain`/`NO_COLOR`/`--screen-reader` all fold into `plain_mode`. A
+/// terminal stdout is required as well, which is stricter than the minimum:
+/// a run whose stdout is redirected is being consumed by something. JSONL is
+/// unaffected by construction — its stream is stdout and the title is never
+/// written there.
+pub(crate) fn title_surface_allows_osc() -> bool {
+    kitsu_render::stderr_styled() && kitsu_render::is_tty()
+}
+
+/// Set the terminal title from the state the state file publishes, on the one
+/// sink the title's other bytes already go to.
+pub(crate) fn publish_state_title(state: &str, agents: usize) {
+    let enabled = title_enabled() && title_surface_allows_osc();
+    write_state_title(&mut std::io::stderr(), enabled, state, agents);
+}
+
+/// The idle ambient cadence's title write: card **H2-cadence**, the last
+/// recorded deviation from requirement **H2**'s cadence clause.
+///
+/// The three `run_chat` publish sites are the session boundary, the top of
+/// the idle loop and the start of a turn, so the title is correct at the
+/// prompt and at turn start and **goes stale during a turn**. The registry's
+/// `watch` channel already has an ungated, session-long subscriber --
+/// [`spawn_idle_ambient_cadence`], which dedupes on `(blocked, running)`,
+/// *precisely the title's own count inputs*, and has no turn gate, so it
+/// fires mid-turn -- and this is the function it publishes through.
+///
+/// **Why the counts are not the whole story.** Mid-turn `turn_active` is
+/// `true`, so the word is `blocked > 0 ? "blocked" : "working"`. The one
+/// transition the three sites cannot cover and the counts alone cannot
+/// render is an agent **finishing** mid-turn into `(0, 0)`: the true word is
+/// `"working"` and a cadence that assumed `turn_active = false` would write
+/// `"idle"`. So the flag is plumbed rather than guessed, and the word still
+/// comes from [`crate::agent_state_file::process_state`] -- never a second
+/// computation of the precedence.
+///
+/// `enabled` is the whole gate, passed in exactly as [`write_state_title`]
+/// takes it, so this is testable against a buffer.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn write_cadence_state_title(
+    out: &mut dyn std::io::Write,
+    enabled: bool,
+    blocked: usize,
+    running: usize,
+    turn_active: bool,
+) {
+    // Through `cadence_title_parts` so the word and the count keep one
+    // derivation with the production publish point.
+    let (state, agents) = cadence_title_parts(blocked, running, turn_active);
+    write_state_title(out, enabled, state, agents);
+}
+
+/// The word and the count a cadence wake's `(blocked, running)` pair renders
+/// to: the state word from [`crate::agent_state_file::process_state`], so the
+/// precedence *"blocked outranks working"* keeps its single home, and the
+/// live count `blocked + running`, the two tallies that snapshot documents as
+/// disjoint.
+///
+/// Extracted so the buffer-testable writer above and the production publish
+/// point below share **one** derivation: the mismatch F141 is about -- a
+/// second path that a test cannot see -- has nowhere to appear.
+pub(crate) fn cadence_title_parts(
+    blocked: usize,
+    running: usize,
+    turn_active: bool,
+) -> (&'static str, usize) {
+    (
+        crate::agent_state_file::process_state(running, blocked, turn_active),
+        blocked + running,
+    )
+}
+
+/// Publish the cadence's title on the one sink the title's other bytes go to.
+///
+/// **Beside the repaint, not inside it.** [`repaint_status_row`] is inert in
+/// classic mode and in any session that never enabled a live status row --
+/// *"what keeps the classic byte stream identical"* -- so a title riding
+/// inside it would inherit that inertness and a styled `classic` session
+/// would still go stale. The title goes straight to stderr, under the same
+/// surface gate as the other three sites.
+pub(crate) fn publish_cadence_state_title(blocked: usize, running: usize, turn_active: bool) {
+    let (state, agents) = cadence_title_parts(blocked, running, turn_active);
+    publish_state_title(state, agents);
+}
+
 /// A live fullscreen segment: the alternate screen and the pushed title, given
 /// back when this is dropped.
 ///
@@ -285,6 +523,11 @@ pub(crate) struct FullscreenSegment {
     /// prompt that follows no new output repaints nothing and the byte stream
     /// of an idle fullscreen session is the one it was before this card.
     painted_tap_lines: usize,
+    /// Whether *this segment* pushed the title stack, and therefore owes a
+    /// pop (card **H2-stack**). False when `[tui] title = false`, and false
+    /// when the session already pushed its own at start -- the counts are one
+    /// push and one pop per session either way.
+    pushed_title: bool,
     /// Where the frame is anchored: the paging state, and the only state the
     /// four paging keys add.
     ///
@@ -634,7 +877,14 @@ impl FullscreenSegment {
             set_surface(self.previous_surface.clone());
         }
         let _ = self.err.write_all(LEAVE_ALT_SCREEN);
-        let _ = self.err.write_all(POP_TITLE);
+        // The mirror of `enter_fullscreen`'s gate (cards H2-title and
+        // H2-stack): a segment pops exactly what *it* pushed. A run with
+        // `title = false` pushed none, and a session that pushed its own at
+        // start owns that one -- popping it here would underflow the stack by
+        // one per segment.
+        if self.pushed_title {
+            let _ = self.err.write_all(POP_TITLE);
+        }
         let _ = self.err.flush();
         // Card F94, and the mirror of `enter_fullscreen`'s store: after the
         // bytes, so no exit path can read "free" while the screen is still
@@ -702,7 +952,20 @@ pub(crate) fn enter_fullscreen(
     // window leaves the user on the alternate screen, which is the defect
     // itself.
     kitsu_tui::note_alternate_screen(true);
-    let _ = err.write_all(PUSH_TITLE);
+    // Card H2-title: `[tui] title = false` owns the title *stack* as well as
+    // the OSC 2 string (**F139** measured this half as ungated). The surface
+    // gate is deliberately not consulted here: these two sequences reach the
+    // plain and assistive surfaces today and requirement N1 is satisfied by
+    // leaving them byte-identical.
+    //
+    // Card **H2-stack**: and only when the *session* has not pushed already.
+    // One push and one pop per session is not a free choice -- a styled
+    // fullscreen session's counts are pinned at exactly one each by
+    // `tui_switch_from_fullscreen_into_classic_restores_the_screen_and_the_title`.
+    let pushed_title = title_enabled() && !title_stack_pushed();
+    if pushed_title {
+        let _ = err.write_all(PUSH_TITLE);
+    }
     let _ = err.write_all(ENTER_ALT_SCREEN);
     for row in &frame {
         let _ = err.write_all(row.as_bytes());
@@ -732,6 +995,7 @@ pub(crate) fn enter_fullscreen(
         tap,
         previous_surface,
         painted_tap_lines: 0,
+        pushed_title,
         view: kitsu_tui::fullscreen::FullscreenView::new(),
     }
 }
@@ -1219,13 +1483,15 @@ const IDLE_AMBIENT_REFRESH_INTERVAL: std::time::Duration = STATUS_FRAME_INTERVAL
 /// Nothing in here touches stdin, the decoder or the editor's byte bypass
 /// (findings **F72**/**F68**): the composer stays blocked in `read()`, and
 /// the row is repainted around it from the pull the painter already does.
-pub(crate) async fn idle_ambient_cadence_step<T, F>(
+pub(crate) async fn idle_ambient_cadence_step<T, F, H>(
     changes: &mut tokio::sync::watch::Receiver<T>,
     counts: &F,
     seen: &mut (usize, usize),
+    title: &H,
 ) -> bool
 where
     F: Fn(&T) -> (usize, usize),
+    H: Fn(usize, usize),
 {
     if changes.changed().await.is_err() {
         return false;
@@ -1236,6 +1502,10 @@ where
         return true;
     }
     *seen = current;
+    // Card **H2-cadence**: the title is published here, beside the repaint
+    // rather than inside it, and **once**: the N3 retry below is the
+    // painter's, and the title has no coalescing window to retry past.
+    title(current.0, current.1);
     repaint_status_row();
     // Note **N3**: a paint inside the 1/60 s window returns *without*
     // recording the key, so the change would otherwise wait for the next
@@ -1259,17 +1529,19 @@ where
 /// keeps the classic byte stream identical.
 ///
 /// The task ends on its own when the registry's sender drops.
-pub(crate) fn spawn_idle_ambient_cadence<T, F>(
+pub(crate) fn spawn_idle_ambient_cadence<T, F, H>(
     mut changes: tokio::sync::watch::Receiver<T>,
     counts: F,
+    title: H,
 ) -> tokio::task::JoinHandle<()>
 where
     T: Send + Sync + 'static,
     F: Fn(&T) -> (usize, usize) + Send + Sync + 'static,
+    H: Fn(usize, usize) + Send + Sync + 'static,
 {
     tokio::spawn(async move {
         let mut seen = counts(&changes.borrow_and_update());
-        while idle_ambient_cadence_step(&mut changes, &counts, &mut seen).await {}
+        while idle_ambient_cadence_step(&mut changes, &counts, &mut seen, &title).await {}
     })
 }
 
@@ -2159,6 +2431,19 @@ enum KeyItem {
     /// move the caret. Only produced when the reader was given a paging sink
     /// ([`KeyFilter::pages`]).
     Page(kitsu_tui::fullscreen::Page),
+    /// `<prefix> 1..9`: attach to the agent at that **1-based ordinal over
+    /// A2's display order** (card **T4-S6-ordinal**, design §4.7's
+    /// "attach agent N").
+    ///
+    /// The payload is the **ordinal**, never an id: ids pass 9 after nine
+    /// spawns and go *wrong* rather than dead once `#1` is pruned and `#11`
+    /// exists. Resolving the ordinal needs the registry, which this filter
+    /// does not have and must not grow -- so it is carried out to the caller
+    /// exactly as [`KeyItem::Open`] carries the decision about the overlay.
+    ///
+    /// `<prefix> 0` is **not** this item: the ordinal is 1-based, so `0` is
+    /// inert like any other chord letter.
+    Attach(usize),
     /// `Ctrl+O`: open the transcript overlay (requirement **R6**).
     ///
     /// Lifted out for [`KeyItem::Open`]'s reason, and a **literal** control
@@ -2258,6 +2543,14 @@ impl KeyFilter {
                 if let Some(item) = match data[index] {
                     AGENT_VIEW_CHORD_KEY => Some(KeyItem::Open),
                     DETACH_CHORD_KEY => Some(KeyItem::Detach),
+                    // Card **T4-S6-ordinal**: the nine digits, each the
+                    // **ordinal** it spells. `b'0'` is deliberately not in
+                    // the range: the ordinal is 1-based, so `0` names no
+                    // position, and it falls to the inert arm below rather
+                    // than becoming either an alias for the first row or the
+                    // first half of a multi-digit entry whose meaning would
+                    // be invisible until the next keystroke (**F75**).
+                    digit @ b'1'..=b'9' => Some(KeyItem::Attach(usize::from(digit - b'0'))),
                     _ => None,
                 } {
                     if !bytes.is_empty() {
@@ -2426,6 +2719,23 @@ pub(crate) enum InlineRead {
     /// -- "only ever reached on an empty one" -- was true of `\u{2190}`
     /// alone and became wrong when the chord was given the same variant.
     Detached(String),
+
+    /// Card **T4-S6-ordinal**: `<prefix> 1..9`, the chord that attaches to
+    /// the agent at a **1-based ordinal over A2's display order**.
+    ///
+    /// Carries the ordinal and the draft. The reader stays **pure** for
+    /// [`InlineRead::OpenAgentView`]'s reason, and here it is not merely
+    /// tidiness: resolving an ordinal needs the **registry**, which the
+    /// reader has no business holding -- design §4.7 names exactly this
+    /// coupling as the card's difficulty. So the keystroke is reported, and
+    /// the caller resolves it against the rows the view would display
+    /// (`kitsu_tui::agents_view::nth_displayed` over the **filtered** set)
+    /// and attaches, or does nothing at all when no row holds that position.
+    ///
+    /// The draft is carried for **F76**'s reason: the chord has no
+    /// empty-composer precondition, so it must not cost the user the line
+    /// they typed.
+    AttachOrdinal(usize, String),
 
     /// `Ctrl+O`: open the transcript overlay over the cell ring (requirement
     /// **R6**).
@@ -2722,6 +3032,21 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
                     // only thing that can put the row back -- the same reason
                     // Ctrl+L's `Redraw` arm sets it.
                     changed = true;
+                }
+                // Card **T4-S6-ordinal**: `<prefix> 1..9`. The reader stays
+                // pure for `KeyItem::OpenTranscript`'s reason, and here it is
+                // not merely tidiness: resolving a position needs the
+                // registry, which this reader has no business holding. So the
+                // **ordinal** is reported and the draft handed back (**F76**:
+                // the chord has no empty-composer precondition), returning
+                // *at* this item so bytes typed after it belong to the next
+                // read. No disarm of the `\u{2190}\u{2190}` count, like the
+                // transcript arm: this returns, so the reader's state dies
+                // with it. There is no attachment precondition either --
+                // unlike `KeyItem::Detach` -- because while attached the
+                // chord *switches* agent.
+                KeyItem::Attach(ordinal) => {
+                    return Ok(InlineRead::AttachOrdinal(ordinal, editor.buffer_string()));
                 }
                 KeyItem::Detach => {
                     left_presses = 0;
@@ -8454,6 +8779,150 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Card **T4-S6-ordinal**: `Ctrl+X 1..9`.
+    //
+    // **Measured first (F99/F100).** Today a digit after the prefix produces
+    // **no `KeyItem` at all**: `KeyFilter::feed(b"\x181")` is empty, and the
+    // reader's outcome for `\x181hi\r` is `Submitted("hi")` -- the digit is
+    // swallowed by the "any other letter is inert" arm, so it does not even
+    // reach the draft. The chord is therefore inert and silent today, and
+    // every assertion below is on behaviour that does not exist yet.
+    //
+    // **Scope.** The chord is the **composer's**, exactly as `Ctrl+X a` and
+    // `Ctrl+X d` are: this filter is where the prefix is a key at all. Inside
+    // the agent view the overlay's own decoder never sees `0x18` as a prefix
+    // (its `plain()` admits `0x20..=0x7e` only) and a bare digit falls into
+    // `handle_overlay_input`'s `OverlayKey::Char(_) => {}` catch-all, so the
+    // view keeps selecting with `↑`/`↓`. No third scope is invented.
+    // ------------------------------------------------------------------
+
+    /// **`Ctrl+X 1..9`.** Nine digits, each lifted out of the byte stream as
+    /// the **ordinal** it is, through the same filter that already lifts
+    /// `Ctrl+X a` and `Ctrl+X d` (**F69**: this is the real decoder, not a
+    /// predicate beside it).
+    ///
+    /// The controls are the rules the new digits must not break (**F68** and
+    /// T4-S2's): a bare digit is content, a chord split across two reads is
+    /// still one keystroke, a chord inside a bracketed paste is text, and the
+    /// two letters that already route still route.
+    #[test]
+    fn the_key_filter_lifts_the_ordinal_chord_digits_one_through_nine() {
+        for ordinal in 1usize..=9 {
+            let chord = format!("\x18{ordinal}");
+            assert_eq!(
+                KeyFilter::new(attach_keys()).feed(chord.as_bytes()),
+                vec![KeyItem::Attach(ordinal)],
+                "design \u{00a7}4.7: `Ctrl+X {ordinal}` carries the ordinal \
+                 {ordinal}, which is a position and never an id"
+            );
+        }
+        // Split across two reads, as two keystrokes routinely are.
+        let mut split = KeyFilter::new(attach_keys());
+        assert_eq!(
+            split.feed(b"\x18"),
+            Vec::new(),
+            "the prefix alone yields nothing"
+        );
+        assert_eq!(
+            split.feed(b"4"),
+            vec![KeyItem::Attach(4)],
+            "and the digit in the next read completes the chord"
+        );
+        // **`Ctrl+X 0`: decided inert.** The ordinal is 1-based, so `0` names
+        // no position; it is not an alias for the first row (that is `1`) and
+        // not a prefix of `10` (which would make `Ctrl+X 1` ambiguous until
+        // the next keystroke -- **F75**'s shape, invisible at the keypress).
+        // It is dropped exactly as any other non-chord letter is, so it does
+        // not reach the draft either.
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"\x180"),
+            Vec::new(),
+            "`Ctrl+X 0` is inert: 0 is not an ordinal, and the digit is \
+             dropped rather than typed"
+        );
+        // CONTROL: a bare digit is a character in the draft.
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"3"),
+            vec![KeyItem::Bytes(b"3".to_vec())],
+            "NON-VACUOUS: without the prefix, `3` is content"
+        );
+        // CONTROL: inside a bracketed paste the same two bytes are text.
+        let pasted = b"\x1b[200~\x183\x1b[201~";
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(pasted),
+            vec![KeyItem::Bytes(pasted.to_vec())],
+            "a pasted chord is pasted text, not a chord"
+        );
+        // CONTROL: the two letters that already route are unchanged.
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"\x18a"),
+            vec![KeyItem::Open],
+            "`Ctrl+X a` is unchanged by the digits"
+        );
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"\x18d"),
+            vec![KeyItem::Detach],
+            "`Ctrl+X d` is unchanged by the digits"
+        );
+    }
+
+    /// The reader reports the ordinal and **carries the draft** (**F76**: the
+    /// chord has no empty-composer precondition, so it must not cost the user
+    /// the line they typed), returning *at* the chord so bytes typed after it
+    /// belong to the next read.
+    ///
+    /// It reports the **ordinal** and not an agent, and that is the card's
+    /// whole shape: resolving a position needs the registry, and the reader
+    /// has none -- design §4.7 names exactly that coupling.
+    #[test]
+    fn the_ordinal_chord_reports_the_ordinal_and_carries_the_draft() {
+        assert_eq!(
+            read_attached(
+                Chunks::new([b"typed".as_slice(), b"\x183", b"later\r"]),
+                attach_keys(),
+                None,
+            ),
+            InlineRead::AttachOrdinal(3, "typed".to_string()),
+            "the chord reports ordinal 3 and hands the draft back, and the \
+             bytes after it belong to the next read"
+        );
+        // Attaching is reached from **both** states: with nothing attached it
+        // is how the user attaches, and while attached it is how they switch.
+        assert_eq!(
+            read_attached(
+                Chunks::new([b"\x187".as_slice(), b"\r"]),
+                attach_keys(),
+                Some(42),
+            ),
+            InlineRead::AttachOrdinal(7, String::new()),
+            "the chord has no attachment precondition: while attached it \
+             switches agent"
+        );
+        // CONTROL, and today's measured behaviour preserved: `Ctrl+X 0` is no
+        // route, and its digit does not reach the draft.
+        assert_eq!(
+            read_attached(
+                Chunks::new([b"\x180".as_slice(), b"\r"]),
+                attach_keys(),
+                Some(42),
+            ),
+            InlineRead::Submitted(String::new()),
+            "NON-VACUOUS: `Ctrl+X 0` is inert, and its digit is not typed \
+             into the draft"
+        );
+        // CONTROL: a bare digit is typed.
+        assert_eq!(
+            read_attached(
+                Chunks::new([b"3".as_slice(), b"\r"]),
+                attach_keys(),
+                Some(42),
+            ),
+            InlineRead::Submitted("3".to_string()),
+            "NON-VACUOUS: without the prefix the digit is just a character"
+        );
+    }
+
     /// **`Ctrl+X d`.** The chord is lifted out of the byte stream by the one
     /// filter that already lifts `Ctrl+X a`, so the letter can never reach the
     /// draft and the *decision* about whether anything is attached stays in
@@ -8569,6 +9038,17 @@ mod tests {
         source.set_usage("example-model-v1", 1_000, 100_000);
         guard.enable_live_status(source.clone());
         (guard, err, source, blocked)
+    }
+
+    /// The inert title publisher the cadence's **pre-existing** tests pass:
+    /// they assert the painted row and nothing about the title, so the
+    /// publisher they hand the step must do nothing and their assertions are
+    /// unchanged. Card **H2-cadence** added the parameter; the publisher is a
+    /// generic so the compiler forces the one production caller to supply a
+    /// real one, which is what keeps `publish_cadence_state_title` from being
+    /// a function nothing drives (finding **F50**).
+    fn no_cadence_title() -> impl Fn(usize, usize) {
+        |_, _| {}
     }
 
     /// **The acceptance test, and it is red.** The idle composer must have an
@@ -8742,7 +9222,8 @@ mod tests {
             runtime.block_on(super::idle_ambient_cadence_step(
                 &mut changes,
                 &counts,
-                &mut seen
+                &mut seen,
+                &no_cadence_title(),
             )),
             "the cadence keeps running while the registry is alive"
         );
@@ -8762,7 +9243,8 @@ mod tests {
         assert!(runtime.block_on(super::idle_ambient_cadence_step(
             &mut changes,
             &counts,
-            &mut seen
+            &mut seen,
+            &no_cadence_title(),
         )));
         let tail = err.text()[before..].to_string();
         assert_eq!(
@@ -8795,10 +9277,450 @@ mod tests {
             !runtime.block_on(super::idle_ambient_cadence_step(
                 &mut changes,
                 &counts,
-                &mut seen
+                &mut seen,
+                &no_cadence_title(),
             )),
             "a closed registry ends the cadence"
         );
         drop(guard);
+    }
+
+    // -----------------------------------------------------------------------
+    // Card H2-title: the OSC terminal title, and `[tui] title` gating it.
+    //
+    // FAILING-FIRST. `state_title` returns the empty string and
+    // `write_state_title` writes nothing, so every assertion below fails on
+    // this commit; the fullscreen pair fails in the `title = false`
+    // direction, where the stack is pushed and popped today regardless of the
+    // key (**F139**).
+    // -----------------------------------------------------------------------
+
+    /// Restores `[tui] title`'s process-global on the way out, so a test that
+    /// turns it off cannot leave it off for the next one. The same discipline
+    /// [`GlobalState`] applies to the surface slot, and the reason these two
+    /// tests are `#[serial]` as well.
+    struct TitleGate(bool);
+
+    impl TitleGate {
+        fn set(on: bool) -> Self {
+            let was = super::title_enabled();
+            super::set_title_enabled(on);
+            Self(was)
+        }
+    }
+
+    impl Drop for TitleGate {
+        fn drop(&mut self) {
+            super::set_title_enabled(self.0);
+        }
+    }
+
+    /// **The state word is the state file's, and the count is rendered the one
+    /// way H2 left open.**
+    ///
+    /// `process_state` already owns the precedence — *"blocked outranks
+    /// working"* — and it is already tested where it lives. So the state word
+    /// is never spelled out here: each expectation is built **from**
+    /// `process_state`'s own return, which is what makes a second, divergent
+    /// state computation in `state_title` fail this test rather than pass it.
+    ///
+    /// The rendering decisions, pinned because H2 specifies the alternation
+    /// and not the layout: the count is always present (`0 agents`, never
+    /// omitted), and it is singular at exactly one.
+    #[test]
+    fn the_state_title_takes_its_word_from_process_state_and_always_carries_a_count() {
+        use super::state_title;
+        use crate::agent_state_file::process_state;
+
+        // (running, blocked, turn_active, live agents, expected count text)
+        let cases = [
+            (0usize, 0usize, false, 0usize, "0 agents"),
+            (1, 0, false, 1, "1 agent"),
+            (0, 0, true, 0, "0 agents"),
+            (2, 1, true, 3, "3 agents"),
+            (0, 2, false, 2, "2 agents"),
+        ];
+        for (running, blocked, turn_active, agents, count) in cases {
+            let word = process_state(running, blocked, turn_active);
+            let title = state_title(word, agents);
+            assert_eq!(
+                title,
+                format!("kitsu · {word} · {count}"),
+                "the title is `kitsu · <state> · <N agent(s)>` with the state \
+                 word `process_state` returned for ({running}, {blocked}, \
+                 {turn_active}) and never a second computation of it"
+            );
+        }
+
+        // NON-VACUOUS, and the half that would survive a `state_title` that
+        // ignored its argument: the three words are distinguishable, and the
+        // blocked case above is one `process_state` only returns because
+        // blocked outranks a running agent and an active turn at once.
+        assert_eq!(process_state(2, 1, true), "blocked");
+        assert_ne!(
+            state_title(process_state(2, 1, true), 3),
+            state_title(process_state(2, 0, true), 3),
+            "a blocked process and a working one must not read the same"
+        );
+    }
+
+    /// **The OSC 2 sequence, and `[tui] title = false` writing no bytes at
+    /// all.**
+    ///
+    /// Bidirectional by mutation, because there are two failure modes: a
+    /// title that is never written, and a title written on a run that asked
+    /// for none.
+    ///
+    /// The hostile state word pins that `kitsu_tui::sanitize_title` is
+    /// **used** — it is already tested where it lives, including that it
+    /// cannot escape its own OSC sequence, so what is asserted here is that
+    /// the boundary is crossed on this path and not what the sanitiser does.
+    #[test]
+    fn the_osc_title_is_written_once_when_enabled_and_never_when_the_key_is_off() {
+        use super::{state_title, write_state_title};
+
+        let mut on: Vec<u8> = Vec::new();
+        write_state_title(&mut on, true, "working", 2);
+        assert_eq!(
+            String::from_utf8_lossy(&on),
+            format!("\x1b]2;{}\x1b\\", state_title("working", 2)),
+            "one OSC 2 sequence, ST-terminated, carrying exactly the title \
+             `state_title` renders"
+        );
+
+        let mut off: Vec<u8> = Vec::new();
+        write_state_title(&mut off, false, "working", 2);
+        assert!(
+            off.is_empty(),
+            "`[tui] title = false` writes no bytes at all, but wrote {:?}",
+            String::from_utf8_lossy(&off)
+        );
+
+        let mut hostile: Vec<u8> = Vec::new();
+        write_state_title(&mut hostile, true, "idle\x1b]0;pwned\x07", 0);
+        let text = String::from_utf8_lossy(&hostile).into_owned();
+        let payload = text
+            .strip_prefix("\x1b]2;")
+            .and_then(|rest| rest.strip_suffix("\x1b\\"))
+            .unwrap_or_else(|| panic!("one OSC 2 sequence, but wrote {:?}", text));
+        assert!(
+            !payload.contains('\x1b') && !payload.contains('\x07'),
+            "the title must go through `sanitize_title`, so no control byte \
+             can reach the terminal inside it; payload {:?}",
+            payload
+        );
+    }
+
+    /// **`[tui] title = false` suppresses the title *stack* too.**
+    ///
+    /// **F139**'s measurement: `enter_fullscreen` pushes `CSI 22;2t` and the
+    /// segment's `Drop` pops `CSI 23;2t` in production **without consulting
+    /// the key**, so a user who set `title = false` gets the stack pushed
+    /// anyway. Both directions are asserted over the same geometry, and the
+    /// alternate screen is checked in the off case as the non-vacuity anchor:
+    /// the segment must still have run and still have taken the screen, or
+    /// the absence of the title bytes would prove nothing.
+    #[test]
+    #[serial]
+    fn a_fullscreen_segment_pushes_the_title_stack_only_when_the_title_key_is_on() {
+        let _state = GlobalState::capture();
+
+        let push = String::from_utf8_lossy(super::PUSH_TITLE).into_owned();
+        let pop = String::from_utf8_lossy(super::POP_TITLE).into_owned();
+
+        {
+            let _gate = TitleGate::set(true);
+            let sink = SharedSink::new();
+            let segment = enter_fullscreen(Box::new(sink.clone()), &[], 24, 80, 16);
+            assert!(
+                sink.text().contains(&push),
+                "with `title = true` the segment pushes the title stack, as \
+                 it does today; it wrote:\n{}",
+                sink.text().escape_debug()
+            );
+            drop(segment);
+            assert!(
+                sink.text().contains(&pop),
+                "...and pops it on the way out; it wrote:\n{}",
+                sink.text().escape_debug()
+            );
+        }
+
+        {
+            let _gate = TitleGate::set(false);
+            let sink = SharedSink::new();
+            let segment = enter_fullscreen(Box::new(sink.clone()), &[], 24, 80, 16);
+            drop(segment);
+            let text = sink.text();
+            assert!(
+                text.contains("\x1b[?1049h") && text.contains("\x1b[?1049l"),
+                "NON-VACUOUS: the segment still ran and still took the \
+                 alternate screen, so the missing title bytes below are the \
+                 key's doing; it wrote:\n{}",
+                text.escape_debug()
+            );
+            assert!(
+                !text.contains(&push) && !text.contains(&pop),
+                "`title = false` must push and pop no title stack (F139); it \
+                 wrote:\n{}",
+                text.escape_debug()
+            );
+            assert!(
+                !text.contains("\x1b]2;"),
+                "...and set no title either; it wrote:\n{}",
+                text.escape_debug()
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Card **H2-cadence**: the state title goes stale mid-turn.
+    //
+    // FAILING-FIRST. `write_cadence_state_title` writes nothing and
+    // `idle_ambient_cadence_step` never calls the publisher it is handed, so
+    // both tests below fail on this commit.
+    //
+    // **The premise this card rests on, confirmed by name rather than
+    // assumed** (the shipped docs said the opposite, finding **F64**):
+    // `spawn_idle_ambient_cadence` is *"deliberately ungated"* per its own
+    // rustdoc, its one production caller sits beside the session's
+    // `StatusSource`, the step dedupes on `(blocked, running)` -- the title's
+    // own count inputs -- and nothing in it consults a turn flag, so it fires
+    // mid-turn. There **is** a general change hook in a chat session.
+    // -----------------------------------------------------------------------
+
+    /// **The word, and the one transition the three publish sites cannot
+    /// cover.**
+    ///
+    /// Measured rather than assumed. Mid-turn `turn_active` is `true`, so the
+    /// word is `blocked > 0 ? "blocked" : "working"` and the counts alone
+    /// determine it in every case **but one**: an agent finishing mid-turn
+    /// into `(0, 0)`, where the true word is `"working"` and a cadence that
+    /// assumed `turn_active = false` writes `"idle"`. That is the card's own
+    /// symptom, so the flag is plumbed and this test is what pins it -- the
+    /// first case below is red against a publisher that ignores the flag,
+    /// which is the bidirectional mutation for this decision.
+    ///
+    /// The word is never spelled out: each expectation is built **from**
+    /// `process_state`'s return, so a second computation of *"blocked
+    /// outranks working"* inside the cadence fails this rather than passing.
+    /// Note the argument order -- the cadence's pair is `(blocked, running)`,
+    /// `process_state` takes `(running, blocked, ..)`, and a transposition is
+    /// exactly what the asymmetric cases here catch.
+    #[test]
+    fn the_cadence_title_carries_the_turns_word_and_is_suppressed_by_the_gate() {
+        use super::{state_title, write_cadence_state_title};
+        use crate::agent_state_file::process_state;
+
+        // (blocked, running, turn_active)
+        let cases = [
+            // The transition the three sites miss: nothing live, turn active.
+            (0usize, 0usize, true),
+            // The same counts at the idle prompt, which must read `idle`.
+            (0, 0, false),
+            // An agent blocks mid-turn: `blocked` outranks the active turn.
+            (1, 0, true),
+            // Asymmetric, so a transposed pair cannot pass: one running.
+            (0, 1, true),
+            (0, 1, false),
+            (2, 1, true),
+        ];
+        for (blocked, running, turn_active) in cases {
+            let mut buffer: Vec<u8> = Vec::new();
+            write_cadence_state_title(&mut buffer, true, blocked, running, turn_active);
+            let word = process_state(running, blocked, turn_active);
+            assert_eq!(
+                String::from_utf8_lossy(&buffer),
+                format!("\x1b]2;{}\x1b\\", state_title(word, blocked + running)),
+                "the cadence writes the same OSC 2 title the three publish \
+                 sites do, with `process_state`'s word for (running {running}, \
+                 blocked {blocked}, turn_active {turn_active}) and the live \
+                 count `blocked + running`"
+            );
+        }
+
+        // NON-VACUOUS, and the half that fails a cadence which drops the turn
+        // flag: at `(0, 0)` the mid-turn title and the idle one must differ,
+        // and the difference is exactly `working` against `idle`.
+        assert_eq!(process_state(0, 0, true), "working");
+        assert_eq!(process_state(0, 0, false), "idle");
+        let mut mid: Vec<u8> = Vec::new();
+        let mut idle: Vec<u8> = Vec::new();
+        write_cadence_state_title(&mut mid, true, 0, 0, true);
+        write_cadence_state_title(&mut idle, true, 0, 0, false);
+        assert_ne!(
+            mid, idle,
+            "an agent finishing mid-turn must not leave the title reading \
+             `idle` while the turn is still running"
+        );
+
+        // The gate, the other direction: `[tui] title = false` or any surface
+        // the title may not touch writes **no bytes at all** from this new
+        // publish point either (requirement N1). The gate itself stays
+        // `title_enabled() && title_surface_allows_osc()` and is evaluated in
+        // `publish_cadence_state_title`; this pins that the writer honours it.
+        let mut off: Vec<u8> = Vec::new();
+        write_cadence_state_title(&mut off, false, 1, 2, true);
+        assert!(
+            off.is_empty(),
+            "a disallowed surface must receive nothing, but received {:?}",
+            String::from_utf8_lossy(&off)
+        );
+    }
+
+    /// **The cadence publishes the title once per real change, beside the
+    /// repaint.**
+    ///
+    /// Drives the real [`idle_ambient_cadence_step`], the same function the
+    /// session's one `spawn_idle_ambient_cadence` call runs for the life of
+    /// the session, and asserts three decisions this card had to pin:
+    ///
+    /// * **A bare wake publishes nothing.** The step's dedupe is on
+    ///   `(blocked, running)`, the title's own inputs, so a wake that moves
+    ///   the registry's generation and nothing the title shows must not write
+    ///   a title either.
+    /// * **Once per change, not twice.** The step repaints twice -- note
+    ///   **N3**'s retry, because a paint inside the 1/60 s window returns
+    ///   without recording the key. The title has no such window: it is an
+    ///   unconditional write, so a second one is pure duplicate bytes. The
+    ///   count is pinned at exactly one.
+    /// * **Beside the repaint, not inside it.** The painted row is asserted
+    ///   on the same wake, so the title cannot have been folded into
+    ///   `repaint_status_row` -- which is inert in classic mode and in any
+    ///   session that never enabled a live status row, and would therefore
+    ///   leave a styled `classic` session exactly as stale as before.
+    #[test]
+    #[serial]
+    fn the_idle_ambient_cadence_publishes_the_state_title_once_per_change() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, _source, blocked) = idle_ambient_fixture();
+        let cols = live::terminal_columns();
+
+        let published: Arc<std::sync::Mutex<Vec<(usize, usize)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = {
+            let published = published.clone();
+            move |blocked: usize, running: usize| {
+                published
+                    .lock()
+                    .expect("the recorded publishes")
+                    .push((blocked, running));
+            }
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a current-thread runtime for the cadence step");
+        let (sender, mut changes) = tokio::sync::watch::channel((0usize, 0usize));
+        let counts = |pair: &(usize, usize)| *pair;
+        let mut seen = *changes.borrow_and_update();
+        past_the_frame_budget();
+
+        // A bare wake: the registry published, the title's inputs did not
+        // move. No title, and no frame.
+        let before = err.text().len();
+        sender.send((0, 0)).expect("the cadence is subscribed");
+        assert!(runtime.block_on(super::idle_ambient_cadence_step(
+            &mut changes,
+            &counts,
+            &mut seen,
+            &recorder,
+        )));
+        assert!(
+            published.lock().expect("the recorded publishes").is_empty(),
+            "a bare wake must publish no title: {:?}",
+            published.lock().expect("the recorded publishes")
+        );
+        assert_eq!(
+            err.text().len(),
+            before,
+            "NON-VACUOUS control: a bare wake paints no frame either, so the \
+             step really did take its dedupe path"
+        );
+
+        // A real change: an agent blocks while a turn is running.
+        blocked.store(1, Ordering::Relaxed);
+        sender.send((1, 0)).expect("the cadence is subscribed");
+        let before = err.text().len();
+        assert!(runtime.block_on(super::idle_ambient_cadence_step(
+            &mut changes,
+            &counts,
+            &mut seen,
+            &recorder,
+        )));
+
+        assert_eq!(
+            *published.lock().expect("the recorded publishes"),
+            vec![(1usize, 0usize)],
+            "the cadence publishes the title **exactly once** for one change, \
+             carrying the `(blocked, running)` pair it deduped on -- not twice, \
+             although it repaints twice for note N3's retry"
+        );
+
+        // And beside the repaint, not inside it: the row the cadence paints
+        // is unchanged by the title riding along.
+        let tail = err.text()[before..].to_string();
+        assert_eq!(
+            tail,
+            expected_status_paint(
+                T3_S12_ROWS,
+                T3_S12_VIEWPORT_ROWS,
+                &live::compose_status_row(
+                    &live::StatusFields {
+                        model: "example-model-v1".to_string(),
+                        used: 1_000,
+                        effective: 100_000,
+                        elapsed: None,
+                        blocked: 1,
+                        ..Default::default()
+                    },
+                    cols,
+                ),
+            ),
+            "the cadence still paints the row the registry describes, so the \
+             title is published **beside** `repaint_status_row` and has not \
+             been folded into it -- which would be inert in classic mode"
+        );
+        assert!(
+            !tail.contains("\x1b]2;"),
+            "...and the title is not written onto the viewport's own surface, \
+             which a classic session never installs; it wrote:\n{}",
+            tail.escape_debug()
+        );
+
+        // **The inertness trap, pinned.** With the viewport released there is
+        // no installed status painter, which is the state a `classic` session
+        // is in for its whole life -- and `repaint_status_row` is inert there
+        // *"to keep the classic byte stream identical."* A title folded into
+        // the repaint would inherit that inertness and a styled `classic`
+        // session would still go stale mid-turn, which is the trap this
+        // section exists to catch: the publish must still happen, and the
+        // surface must still receive nothing.
+        drop(guard);
+        let before = err.text().len();
+        sender.send((2, 0)).expect("the cadence is subscribed");
+        assert!(runtime.block_on(super::idle_ambient_cadence_step(
+            &mut changes,
+            &counts,
+            &mut seen,
+            &recorder,
+        )));
+        assert_eq!(
+            *published.lock().expect("the recorded publishes"),
+            vec![(1usize, 0usize), (2usize, 0usize)],
+            "with no live status row -- a `classic` session -- the title is \
+             still published, because it rides beside the repaint and not \
+             inside it"
+        );
+        assert_eq!(
+            err.text().len(),
+            before,
+            "NON-VACUOUS: and the painter really was inert, so the publish \
+             above cannot have come from it"
+        );
+
+        drop(sender);
     }
 }

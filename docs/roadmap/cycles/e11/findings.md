@@ -5699,3 +5699,219 @@ Three resolutions were offered and **I rejected two**:
 **It re-ran the mutation after switching discriminators**, *"since the guard is no longer the one I first tested."* Exactly right: the earlier mutation proved the **old** guard, and swapping the condition invalidates the proof. Nobody asked for that.
 
 **It declined to run the release profile** while the discriminator was still in question, rather than burning two minutes of pty suites on code that might change — and said so, which beats both quietly doing it and quietly skipping it.
+
+## F137 — T4-S6-ordinal shipped, and F106's defect recurred exactly
+
+**`Ctrl+X 1..9` attaches by displayed position, never by id.** The last fully-buildable plan row; everything else remaining is gated on a human decision, an external spec, or the live terminal matrix.
+
+### Rejected once, for the same reason as `Ctrl+O`
+
+The implementation was complete and green — and the chord was **advertised nowhere a user could see.** All three occurrences in `main.rs` were a code comment, a function doc comment, and a test's doc comment. **`/tui`'s `details` string had zero mentions**, confirmed by the new test's first failure echoing the entire pre-change string.
+
+**That is F106 verbatim**, and the second time this epic a working chord reached acceptance unannounced. **F82**'s rule — *a rule applied per-change is not a rule enforced* — was itself applied per-change and not enforced.
+
+**And the error was partly mine:** I told the agent I would write the advertisement. Wrong. **The string is production code, and when `Ctrl+O` shipped it came with a test**; an unguarded string drifts, which is the whole reason that test exists. Corrected by handing it back for test-then-string.
+
+**The new test asserts the negative too**, over `["wrap", "ctrl+x 10", "two digits", "modulo"]` — because *"a user who believed in either would address the wrong agent in silence."* Multi-digit and wrapping are both decided against, so the advertisement must not imply them.
+
+### The design decisions worth keeping
+
+**`nth_displayed(rows, ordinal)` rather than a public `display_order() -> Vec`.** Handing out the vector hands out **a second indexing convention**: every call site would decide for itself whether the user's `1` means `[0]`, and whether out-of-range clamps, wraps or does nothing. One function owns the 1-based convention and the bounds — `checked_sub` answers `0` *before* the subtraction, and `get` rather than an index makes past-the-end `None` instead of a clamp or a panic.
+
+**It is built over the existing private `display_order`, the same one `sync`/`move_by` walk** (4 call sites, verified). That is load-bearing: **the ordinal can never disagree with the row the selection mark sits on**, and a test drives `AgentSelection` itself to prove it rather than comparing against a copy of the order.
+
+**My brief said no display-order accessor existed. One did** — twenty-seventh wrong brief, and the correction improved the design.
+
+### The reasons behind the inert cases, which outlive the card
+
+- **`Ctrl+X 0` is inert and the digit stays undrafted.** Not an alias for the first row (a second spelling of one action wastes a key) and **not a prefix of `10`** — multi-digit entry would make `Ctrl+X 1`'s meaning **wait for the next keystroke**, which is **F75**'s invisible-at-the-keypress shape, the defect that got a card's answer overruled earlier this epic.
+- **Past the end is `None` and must not clamp:** *"acting on an agent the user did not count off the screen is worse than doing nothing."*
+- **Twelve agents get nine digits, with no wrap and no modulo**, both of which attach to the wrong agent in silence. **The cap lives in the key decoder, not the accessor** — my ruling: nine-wide is a property of *the chord*, there being nine digits, not of display order, and a future caller wanting position twelve should not work around a keyboard limit encoded in a data accessor.
+
+### Two things the author did unasked
+
+**It refined its own mutation claim downward.** A *partial* id-first-then-position mutation fails only **three** of the four tests, because the twelve-agent fixture uses ids `100..` so no id can equal an ordinal and it falls through to correct behaviour. **That exposes a real gap in that test's discriminating power**, and reporting it stops a future reader over-trusting the suite.
+
+**It made re-attaching idempotent**, by routing the switch through the existing `apply_agent_view_exit` seam, which acts only on a **change** of binding — so the chord typed on the already-attached agent is a no-op rather than a duplicate milestone. I asked only whether switching worked.
+
+**And the fixture is the anti-vacuity shape I asked for, exceeded:** ids `7, 3, 11, 2, 5, 9`, a filter leaving four, display order `#3, #7, #11, #5` — so **ordinal 1 selects id 3**, **id 2 exists but is filtered out**, and the test asserts *"no ordinal equals the id it selects"* **first**, with `assert_ne!`, before any behaviour.
+
+## F138 — writing the decision records found a decision that had been made and never closed
+
+**T5-S8 shipped**: three ADRs in `decisions.md`, and a **derived** requirement-traceability table appended to the design. **No test phase — the deliverable is prose, and saying so beats inventing an assertion.**
+
+### The catch: open question 7 was decided and still labelled open
+
+The design **stated the decision in one place** — *"(`background_blocked`), never as a new `status` value"* — and **still called it "(open question 7)" in another.** Two sentences disagreeing about whether a decision existed.
+
+**And the decision was right for a reason the epic later re-derived independently.** ADR-2's argument is that a new `status` value mutates a shape every consumer already parses, while a new event type leaves existing events byte-identical — **which is exactly the reasoning F120 applied to `tool_results_dropped` months of cards later**, arrived at from scratch. The decision was sound and its rationale was *in the file*; what was missing was the one word that said it was settled.
+
+**The lesson generalises past this epic:** a decision recorded in prose beside the thing it governs, but never **marked closed**, is **indistinguishable from an open one** to every later reader. Closing it is not bookkeeping — it is the difference between a reader applying the decision and re-litigating it. Now closed, pointing at ADR-2.
+
+### The traceability table, and the column I refused to add
+
+Derived by matching each requirement id the design **defines** (35) against every plan row that **cites** it. **All 35 are cited** — a clean negative, and the kind of result worth having explicitly.
+
+**I tried to add a "shipped" column and it was a fabrication.** A regex over the plan's prose reported **17 requirements unshipped**, including `B1`–`B5`, `H1`–`H3`, `R4` and `R8`. False, for two compounding reasons found by checking one case:
+
+1. **The plan has two tables.** Statuses live in a summary row (`T2-S1 … | done | c4bd57b`); requirement citations live in a detail row hundreds of lines away. Matching within a row can never see both.
+2. **The status vocabulary collides with the domain vocabulary.** `T2-S1`'s detail row contains the word **"Blocked"** — as a *request state*, `Registry{agent_id, sender}`'s sibling — and my exclusion treated it as a status marker.
+
+**So requirement→row is derivable; requirement→status is not.** I shipped the table without the column and said why, in the table. **This is the fourth time this session a derived artefact beat a curated one and the first time a derivation had to be abandoned** — which is the honest other half of F124's lesson: *derive rather than curate, and when the derivation cannot be trusted, publish the part that can and name the part that cannot.*
+
+### The ADRs record two things that are not "we decided X"
+
+**ADR-1** records a decision that is **accepted and unexecuted**: R1's renderer flip was never a question of *whether*, only *when*, and the answer is a release boundary. What blocks it is **Q1's live terminal matrix**, which no agent can produce. Worth stating plainly: **the flip is not blocked on engineering.**
+
+**ADR-3** records a **deferral with its reopening condition** — no socket API, because the state file and `agent_wait` already serve the integration, and **H4 is itself blocked on herdr's manifest spec**, so designing a socket against an unknown consumer is how a second control surface outlives its reason. *"Until one exists, the state file is the contract."*
+
+### F62's doc sweep: ten sites, not three — and two of them disagree about what the flag does
+
+The test author named three documentation sites for `--no-alt-screen` / `alternate_screen`. **Sweeping every live document found ten**, which is the F110 discipline paying off again: *fix the siblings, not the sites you were handed.*
+
+**User-facing:** `README.md:663` (the flag row), `README.md:1173` (the key row), `docs/functionality.md:573-574` (the prose), `CHANGELOG.md:380` (a key list).
+**Design:** `:132`, `:173`, `:480-481`, `:1408`, `:1561`, `:1896`, `:2041`.
+
+### Two of them describe the flag differently
+
+- **`README.md:663`** — *"Force `[tui] alternate_screen` to **`never`**"*
+- **`docs/tui-and-agent-view-design.md:1408`** — *"`--no-alt-screen` forces **`inline`**"*
+
+**One says the flag sets a screen value; the other says it sets a renderer mode.** Those are different claims about the same switch, and they have coexisted long enough that the flag's own doc comment (*"a one-way force: it beats any `[tui] alternate_screen` value"*) matches only the first. **Neither is currently true**, since the flag is honoured by nothing — but when the in-viewport path exists, somebody will have to pick, and the two sentences will not pick the same thing.
+
+**Worth noting which is more defensible:** `inline` is a **renderer**, and forcing it would also disable fullscreen, which is a much larger claim than *"do not take the alternate screen"*. The screen-value reading is the narrower and more likely intent. **Recorded, not resolved** — T5-S4 owns the fallback and should settle it.
+
+### And the design already recorded the gap honestly
+
+`:480-481` has said all along: *"`[tui] alternate_screen = never` does not yet get the in-viewport overlay this design describes elsewhere. That path is unexercised and `alternate_screen` remains a key without a consumer."*
+
+**So the design was honest and the README was not.** The gap was documented where implementers read and promised where users read — which is the worse direction, and exactly the asymmetry **F114** found with the undocumented overlay, inverted: there the capability existed and the README omitted it; here it does not exist and the README promises it.
+
+**The use case makes it sharper.** README:663 names the scenario: *"for multiplexers where the alternate screen misbehaves."* So the user most misled is the one the row was written for — in tmux, watching the alternate screen misbehave, passing the flag, and getting nothing. **A promise is most costly to the reader who needs it most.**
+
+### F62 closed by refusal — and the implementer kept the variant for F90's reason
+
+Shipped as ruled: both doors refused, `auto`/`always` untouched. Two details worth keeping.
+
+**It avoided a substring to keep an existing test honest.** The argv message deliberately does **not** contain `invalid value`, because `test_no_alt_screen_is_a_bare_switch_that_composes_with_tui` asserts stderr carries neither `unexpected argument` nor `invalid value` for that flag. So **the refusal fires and that test still passes untouched** — the flag still *parses*, it is then refused, which is exactly the distinction the older test was written to protect.
+
+**And it hit the consequence I had only recorded, then reasoned past it correctly.** Once nothing constructs `AlternateScreen::Never`, the compiler warns and `-D warnings` fails. The obvious fix is to delete the variant. **It kept the variant with a dead-code allowance instead**, on the grounds that deleting it would turn *"recognised, not yet available"* into *"not a value"* — **F90's inversion, applied unprompted to a type rather than to prose.** That is the difference between a user being told to wait and a user being told they imagined the feature.
+
+**The practice that made this card cheap** was the test author proving mutation A — *the intended refusal makes all five file-side tests green* — **before** hand-off. Eleven unsatisfiable assertions this epic were found in review or by an implementer hitting a wall; this is the first card where reachability was demonstrated in advance. **Worth making standard: a test author who has built the fix once knows the tests are satisfiable, and nobody else can know it as cheaply.**
+
+## F139 — a key with no consumer is not a diagnosis; whether its referent was specified is
+
+**My card was refuted and the refutation is worth more than the card would have been.** I took F62's sibling — `[tui] title`, the last key without a consumer — and briefed it as F62's twin: refuse the unbuildable value. **The premise was wrong in exactly the way my own brief told the agent to stop on.**
+
+### `title` is the window-title key, and one doc comment said otherwise
+
+**H2, a MUST:** *"Kitsu MUST set the terminal title (OSC 0/2) to `kitsu · working|blocked|idle|N agents` when `tui.title = true` (default on TTY), so herdr/tmux can classify by title."* Corroborated by the design's file map (`src/title.rs  OSC title + state file (H2)`), §4.8's sample config, the plan's T1-S4 (*"OSC title (`tui.title`…)"*) and **`README.md:1175`** (*"set and restore the terminal window title"*).
+
+**The single outlier in the entire repository was `config.rs`'s doc comment: *"Whether the viewport paints its title row."*** No viewport title row exists anywhere — I verified that myself, and it is what made the comment plausible. **That one sentence produced a brief that would have refused a MUST requirement's designed default.**
+
+### The two keys are opposite kinds, which corrects F62's own framing
+
+F62 recorded `title` and `alternate_screen` as the same defect — *"a key without a consumer"*. **They are not the same kind at all:**
+
+- **`alternate_screen = never`** had **no specified referent**. Nothing said what an in-viewport overlay should be, so refusing it was right: *"the value is a coherent thing to want"*, and the refusal told the user to wait.
+- **`title = true`** has a **fully specified referent in a MUST**, with **half its mechanism already running ungated in production**. It is an **unimplemented requirement wearing a config key** — and refusing it would be **F90's error in a third direction**: turning *"we promised this and have not built it"* into *"you may not ask for it."*
+
+**So: a key with no consumer is not a diagnosis. Whether its referent was ever specified is the diagnosis.** That distinction is the card's real output, and it is the one F62 was missing.
+
+### The mechanism, measured
+
+**H2 has two clauses and the key gates neither.** `tui_bridge` writes `PUSH_TITLE`/`POP_TITLE` in **production** without consulting `setup.tui.title`. And `TuiRuntime::enter(title)`, the only code that would write the **OSC 2 string**, **has no non-test caller** — verified. So the title *stack* is pushed and popped while the title is **never set**. A user who set `title = false` gets the stack pushed anyway, which is *"accidentally correct in effect but not honoured in mechanism"* — weaker than the analogy I drew.
+
+### And my proposed fix was independently unsatisfiable
+
+Flipping the default to `false` falsifies **three** assertions in three named tests — `tui_table_parses_all_six_keys` (where `assert!(default.title)` is the *stated* non-vacuity anchor), `tui_table_defaults_are_identical_absent_empty_and_through_unwrap_or_default`, and `tui_keys_default_independently_of_one_another`. The agent was forbidden to edit tests and **stopped on exactly the shape F62's author stopped on**. So option 1 was dead twice over: wrong premise *and* unsatisfiable.
+
+### What shipped, and what is carded
+
+**Shipped: the doc comment, corrected in place** — one line of source, no behaviour, **and no test, which is the honest answer rather than an invented assertion.** It records what the key is, that it was the repository's only dissenting voice, and that H2 is half-built.
+
+**Carded: H2 proper** — gate `tui_bridge`'s push/pop on the key and write the OSC 2 state title, fed from the registry. It has a written spec, a named file in the design's map, and `sanitize_title` already built and tested (including that it *"cannot escape its own OSC sequence"*). **To be scoped against T5-S4 and H2's state-file half before anyone is handed it** — the agent's own recommendation, and right.
+
+## F140 — H2's title shipped; a doc claim that was *vacuous* rather than false; and a third fmt debt
+
+**H2-title is done** — the requirement had been specified since this epic began and never built. Three things are worth keeping.
+
+### A documentation failure mode I had not met: the idle claim
+
+Every drift this session has been a document that **became false** when behaviour changed. The CHANGELOG held the opposite: *"gives the screen and your window title back when you switch away."* The pop **did** run, so the sentence was **true** — and **meaningless**, because nothing had ever set a title. It restored something unchanged.
+
+**So a sweep for false claims cannot be the only check.** A claim can be **idle**: trivially satisfied because the feature it describes does not exist, and indistinguishable from a working one by inspection. This card made it true for the first time. **F110's phrase sweep would never have flagged it, and neither would F101's reference check** — only implementing the feature revealed that the sentence had been describing nothing.
+
+### An absence the positive check caught
+
+**`docs/functionality.md` described the title nowhere** — a `MUST` requirement with a user-facing config key had **no user prose at all**, only a README table row. That is **F114**'s shape exactly: absence is what phrase sweeps structurally cannot find, and the positive check (*for every key a card touches, grep the docs by name and confirm a description exists*) is what finds it. Now documented, including both limits.
+
+### The two deviations, stated rather than hidden
+
+**Cadence:** H2 says the *state file* updates on every registry generation change. The **title does not** — the registry's watch channel is subscribed only behind an off-by-default variable, so there is no general change hook in a chat session. The title rides three publish sites and is **accurate at the prompt and at turn start, stale during a long turn.** The author measured that before deciding, and reported it as a limit rather than quietly shipping a title that looks live.
+
+**Outliving the process:** only `enter_fullscreen` pushes the title stack, so a title set in `classic` or `inline` is **never popped and survives kitsu's exit on every terminal** — not just multiplexers, which is what the module note had said. And the asymmetry predates this card in the opposite direction: the dying-signal restore already contains the **pop**, so an inline session writes a pop having never pushed. **Carded as H2-stack, deliberately undecided** — the author declined to pin a decision I had not made, which is the third time this epic an agent has refused to decide for me and been right.
+
+### A third fmt debt, and the pattern is now clear
+
+`cargo fmt -p kitsu --check` reported **six** diffs at hand-off: one the author declined to fix **by rule** (it was in the *test author's* code, and implementers do not touch tests) and five from the two preceding cards. **F129 was exactly this, and I fixed it then.** It has recurred.
+
+Verified inert before accepting, as in F129: `config.rs` and `tests/cli.rs` are identical ignoring whitespace and commas; `tui_bridge.rs` differed, and inspecting every non-whitespace change found exactly three — **an import reorder, a match arm collapsed from a block to an expression, and a multi-line call joined.** All reflow, no logic. All suites green afterwards.
+
+**The structural cause, now that it has happened three times:** formatting is checked by whoever runs the gate **before** the last edit, and the last edit is often a test author's or a reviewer's. **The rule F129 derived still holds and still is not enough: fmt belongs after the suites, and it belongs to whoever commits** — which is me, every time.
+
+## F141 — H2-stack; a trap every pre-existing test was blind to; and the fastest doc drift yet
+
+**H2-stack is done.** The title stack now belongs to the session: one push when a session first sets a title, one pop when it ends, `enter_fullscreen` pushing only when the session has not. Four things are worth keeping.
+
+### A correct warning that pointed at the wrong detector
+
+I flagged the N1 trap in the brief — a session-start push must not reach the plain and assistive surfaces — and **I pointed at the wrong tests to catch it.** The author ran the trap mutation (gating on the key alone, without the surface gate) and **every pre-existing negative passed.** The reason is worth stating exactly: on a plain *fullscreen* surface a session push merely **replaces** the segment push, so the count stays `1` and the trap is **invisible to a counting assertion**. It took a **new classic-surface guard** to make it visible at all.
+
+**So "I warned about the trap" and "the suite can detect the trap" are different claims**, and I conflated them. The warning was right, the detection did not exist, and the only reason it exists now is that the author built the guard and then **measured the mutation against the whole `tui_title*` family** rather than against the tests I named.
+
+### "Either is defensible" was wrong — the design was forced
+
+I offered the double-push question as a free choice. It was not: an existing test pins `PUSH == 1` **and** `POP == 1` across a fullscreen→classic switch, so a session push plus an unconditional fullscreen push is two and two and **fails a test the implementer may not edit.** The author found this by mutation and said so plainly. **Thirty-second brief error** (F64), and the second in two cards where the agent's measurement corrected my framing rather than just my facts.
+
+### My own text, falsified two commits later
+
+H2-title shipped with *"a title set in `classic` or `inline` outlives the process"* in **four live documents** — README's key row, `functionality.md`, the CHANGELOG, and H2's own amendment. This card falsified all four. **That is the fastest drift recorded this epic**: not stale documentation, but text I wrote two commits ago, falsified by the card that text itself opened.
+
+**And the correction could not be a deletion**, which is the part worth keeping. The fix is genuinely partial, so all four now carve out the two residuals: a **multiplexer** drops the title-stack sequences entirely (and OSC 2 has no query form, so the old title cannot be read back), and a styled **`classic` session killed by a signal** still leaks, because classic installs no dying-signal handler — deliberately, pinned by a test asserting a classic session emits no viewport bytes. **Closing that would trade a guarantee for a cosmetic one.**
+
+### Simpler was also right, and measured to be
+
+The author's answer on `SIGNAL_RESTORE`'s unconditional pop was **leave it**: after a session push it is correct for every session that sets a title, and for one that does not it is a pop against an empty stack with **no observable difference** — while making it conditional would break a byte-identity pin on the const and the prefix relationship with `SIGNAL_RESTORE_WITH_SCREEN`. A measured "do nothing" is a result, not an omission.
+
+**Also unpinned, and reported rather than hidden:** tuple bindings drop in reverse declaration order, so on a styled exit *from* fullscreen the session pop is written before the segment's leave-alt-screen. The segment's own pop is suppressed, so the counts hold, and **no test pins that interleaving.**
+
+## F142 — H2-cadence; **F140's cadence paragraph is retracted**; and a design that makes an undetectable mutation detectable
+
+**H2-cadence is done** — the title now follows the agent registry and keeps up during a turn. **H2 has no remaining deviations.** Four things to keep.
+
+### The retraction, and it was wrong in shipped documentation
+
+**F140 recorded, and H2's amendment shipped, that *"the registry's watch channel is subscribed only behind `KITSU_LIVE_NOTICES`, so there is no general change hook in a chat session."* That is false.** It was repeated across two cards, two cycle records and two commit messages.
+
+There **is** an ungated, session-long registry change subscriber — the idle composer's ambient cadence — whose own rustdoc says it is *deliberately* ungated, **explicitly contrasting itself with the opt-in notifier my claim had generalised from**. It already deduped on `(blocked, running)` — the title's own count inputs — and carries **no turn gate**. It even holds a comment about a change that would otherwise *"wait for the next registry event, which may never come while an agent sits blocked"*: the same staleness problem, already solved once, one layer down.
+
+**The mechanism of the error is the one my own rule names.** I measured **one** subscription site and generalised to *"no hook exists"*. Enumerating found **four**. *Enumerate, do not curate* — and the corollary this adds: **a negative claim derived from a single sample is a curated list of size one.** Sixth time an absence claim has been wrong this epic (F116, F120, F126, F114's inverse, F141's detector, this).
+
+**The living documents are corrected; this entry and the two cycle records keep their text.** A point-in-time record rewritten to match later knowledge stops being evidence (**F109**).
+
+### A design that converts an undetectable mutation into a detectable one
+
+The implementer ran **eight** mutations, and the two that escaped are the interesting ones. Dropping the turn flag **at the production closure**, and dropping the gate **inside `publish_state_title`**, are both **in-process-undetectable** — catching either needs a registry change in a non-tty session, and no harness can drive one, because the test gateway is deliberately an invalid host.
+
+But dropping the flag **in the shared derivation** and ignoring the gate **in the writer** are both **caught**. That is not luck: it is what funnelling buys. `cadence_title_parts` gives the buffer-testable writer and the production publish point **one** derivation of word and count, and the new publish point delegates to the **single** gate evaluation. **The mutations are detectable exactly where the design made the path single** — so the F141 response ("delete the second site rather than add a test that cannot fail") did not merely remove a risk, it **moved a whole mutation class inside the reach of the suite.**
+
+### One gate expression, two code sites — a latent F141 shape
+
+The implementer reported *"the only gate expression remains inside `publish_state_title`"*. **Imprecise:** there are **two** code evaluations of `title_enabled() && title_surface_allows_osc()` — the title write, and **H2-stack's stack-push guard** from the previous card. Its *action* was right (it added none), but the claim was not.
+
+The duplication is pre-existing and legitimate — the stack push writes different bytes and cannot delegate to the title's publisher — but it is a **latent F141 shape**: a change to the gate must reach both sites, and the trap mutation at **either** is undetectable in-process. **Worth a follow-up to share one predicate.**
+
+### A flag whose name now understates it
+
+The turn flag threaded into the cadence is named for **typeahead**, not turns. It is set unconditionally at both turn boundaries, so it is *correct*, but a reader looking for the turn state will not find it by name. **Rename-only follow-up**, recorded rather than taken, since renaming it is not this card's subject.
