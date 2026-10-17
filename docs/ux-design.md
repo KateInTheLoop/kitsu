@@ -65,7 +65,59 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
 - **Live status row** (`kitsu-render::live`): during a foreground turn on a
   styled interactive TTY, one rewritable stderr row at the transcript bottom
   holds the spinner segment, two dimmed ambient tags, and a live type-ahead
-  draft — `kitsu> <text>` with a real terminal cursor. The tags sit leftmost
+  draft — `kitsu> <text>` with a real terminal cursor.
+
+  **The row's positioning is relative, and that is a load-bearing invariant.**
+  Every painter writes `\r\x1b[2K` (and `\x1b[1A\x1b[2K` per extra row) with
+  **no absolute cursor positioning**, so each one acts on whatever row the
+  cursor currently occupies. The contract this depends on is: *when the region
+  takes a fresh row, the cursor is at column 0 of a row the region owns, never
+  inside a row holding transcript text.* "At the transcript bottom" is
+  therefore literal — the region must never occupy a row that already holds
+  output.
+
+  **The row's content is composed once, in `kitsu-render`, for both
+  renderers** (T3-S5). `live::compose_status_row` builds the persistent row —
+  model, context meter, elapsed, `[N queued]`, ambient tag — and
+  `live::compose_stack_rows` the queue preview rows; `live::agents_tag` and
+  `live::queued_tag` are the single source for those two tags, called by the
+  classic row and the status row alike. The composer **must** live here rather
+  than in `kitsu-tui`, because `kitsu-render` cannot depend on `kitsu-tui` and
+  the classic row needs the same content: a composer in the viewport crate
+  could never serve both. `kitsu-tui/src/status.rs` is a **caller** that
+  composes nothing. The drop order when the row cannot fit is a requirement, not
+  a rendering detail, and is stated in **R5** of
+  `docs/tui-and-agent-view-design.md`.
+
+  **The row is live, not a captured string** (wired after T3-S5). The viewport's
+  guard re-reads its fields on every paint, and three kinds of field change at
+  three different cadences: model and usage are **pushed** at turn boundaries by
+  the code that owns the message history; the turn's start instant is set and
+  cleared at those boundaries; and queue depth and agent counts are **pulled**
+  through a closure on every paint, because the main loop drains the queue
+  *between* turns — a captured depth would be stale at exactly the moment the
+  idle row is painted. The refresh rides the existing 50 ms input poll tick, the
+  same one that keeps the ambient counter inside A8's 250 ms budget, so there is
+  no second timer and no new thread. An unchanged row emits **no bytes**, the
+  rule the ambient counter already follows; without it a 50 ms tick would write
+  twenty identical rows a second.
+
+  The meter reads the **same** session usage and effective budget `/context`
+  renders, so the row and the command cannot disagree. It is **8 cells** here
+  against `/context`'s sixteen, because a one-line row shares its width with four
+  other segments. It degrades to ASCII
+  in `--plain` for free, since the structural-marker mapping already handles
+  those glyphs — though the inline viewport never runs in plain mode, so nothing
+  depends on that today.
+
+  A writer that leaves the cursor **mid-row** breaks that contract, and the
+  consequence is silent: the next repaint erases the transcript text sharing
+  that row. This is not hypothetical — it is exactly how a streamed answer's
+  final unterminated line was being destroyed before T3-S1 (see
+  `docs/roadmap/cycles/e11/findings.md` **F47**). Writers that may end mid-row
+  therefore declare it, and the region steps down one row before taking
+  ownership. **Any new writer that can finish without a trailing newline must
+  do the same**, because the painters cannot discover it for themselves. The tags sit leftmost
   in the order background agents then queue: `[N blocked]` or `[N agent(s)]`
   (blocked outranks running, hidden when both are zero, refreshed from the
   registry watch once per input poll tick) followed by `[N queued]`. Both tag
@@ -97,7 +149,9 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   carried into the next live editor or pre-filled into the next idle prompt.
   Non-TTY, `--plain`, and assistive sessions keep the canonical
   line-collector loop with byte-identical output.
-- **Inline viewport** (`kitsu-tui`, preview, gated behind `KITSU_TUI=inline`):
+- **Inline viewport** (`kitsu-tui`, preview, selected by `--tui inline` or
+  `[tui] mode = "inline"`; flag, then config, then the `classic` default, and no
+  environment variable):
   an alternative to the live status row that keeps its rows **outside** a DEC
   scroll region instead of repainting one row at the transcript bottom. On
   entry it sets the region to rows `1..=height - viewport_rows`, parks the

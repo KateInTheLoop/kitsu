@@ -1177,22 +1177,47 @@ retains the rich Rustyline editor, including history, completion, and bracketed
 multi-line paste. Pass `--reduced-motion` or set `KITSU_REDUCED_MOTION=1` to
 replace the animated wait indicator with a visible static status.
 
-Set `KITSU_TUI=inline` to opt into the **inline viewport**, a preview renderer
-that pins a status row to the bottom of the terminal and lets the transcript
-scroll above it, instead of repainting one status row in place. The value is
-matched exactly: only `inline` selects it, so `INLINE`, `Inline` or a stray
-trailing space leave you in the renderer you already had. The variable is
-unset by default and a session without it is byte-identical to one from before
-the viewport existed.
+Pass `--tui inline`, or set `[tui] mode = "inline"` in your config, to opt into
+the **inline viewport**: a preview renderer that pins a status row to the bottom
+of the terminal and lets the transcript scroll above it, instead of repainting
+one status row in place. The flag wins over the config key, and the config key
+wins over the default — **no environment variable selects it**. The default is
+`classic`, and a session that does not ask for the viewport is byte-identical to
+one from before it existed.
+
+A mistyped mode is an error that names the key and lists what it accepts, rather
+than quietly falling back to classic; `fullscreen` is named in the design but is
+**not accepted yet**. The rest of the `[tui]` table:
+
+| key | default | meaning |
+|---|---|---|
+| `mode` | `classic` | `classic` or `inline`; `--tui` overrides it |
+| `alternate_screen` | `auto` | `auto`, `always` or `never`; `--no-alt-screen` forces `never` |
+| `prefix` | `"ctrl+x"` | the chord prefix for viewport commands |
+| `title` | `true` | set and restore the terminal window title |
+| `left_arrow_opens_agents` | `true` | ← opens the agent pane when the composer is empty |
+| `cell_ring_lines` | `10000` | scrollback the viewport retains, `1`–`1000000` |
+
+Keys not yet consumed by a shipped surface are parsed and validated now so the
+spelling cannot change under you later. Note that adding a `[tui]` table makes
+**older** kitsu builds reject the config file, since they do not know the key.
 
 It is a preview, but the idle prompt inside it now has most of what the classic
 one does, built on kitsu's own editor rather than Rustyline: command history
 persists across sessions, Ctrl+R reverse search works, Tab completes a slash
 command from the hint beside your draft, and typing a slash prefix opens the
 **bordered command palette** above the composer — it grows and narrows as you
-type, shrinks to fit a short window, and closes when the prefix does. Still
-missing: `@file` path completion, and syntax highlighting of the draft. What it
-does have:
+type, shrinks to fit a short window, and closes when the prefix does. The pinned row itself is a live status row — model, an eight-cell context meter
+with its percentage, elapsed turn time, `[N queued]`, and the background-agent
+tag — refreshed while a turn runs and never wrapping, at any width from 40 to 200
+columns. When the terminal is too narrow for all of it, segments drop in a fixed
+order: the meter goes first, then elapsed, then the model (truncated before it is
+dropped), then `[N queued]`, and the agent tag is last to go, because a blocked
+agent is the one thing there you have to act on. `@file`
+path completion works here too, offering the same candidates in the same order
+as the classic prompt — both read from one completion source, so they cannot
+drift apart. Still missing: syntax highlighting of the draft. What it does
+have:
 insertion and cursor motion, Home/End, Backspace/Delete, the Ctrl+U/K/W kills,
 Up/Down through the current session's history, bracketed paste kept as one
 draft, resizing the window (the pinned row follows, and the viewport steps

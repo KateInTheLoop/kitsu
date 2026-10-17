@@ -4534,6 +4534,11 @@ struct ChatSetup {
     /// (requirement H3). `None` when absent, empty, or unsplittable, so an
     /// unusable command is a no-op rather than a per-boundary parse attempt.
     agent_state_hook: Option<Vec<String>>,
+    /// The config-level `[tui]` table (design §4.8), already defaulted. Held
+    /// whole rather than as a resolved mode: the flags that override it are
+    /// read where the renderer is installed, so there is one resolution point
+    /// instead of one per key.
+    tui: crate::config::TuiConfig,
     /// Effective run-level policy for Kitsu-created automatic output
     /// artifacts. This never changes explicit session, credential, `-o`, or
     /// model filesystem destinations.
@@ -5683,12 +5688,118 @@ fn slash_help(model: &str, styled: bool) -> String {
     out
 }
 
+/// The **one** composer completion source, used by both hosts.
+///
+/// The classic Rustyline `ChatHelper` and the inline composer's
+/// `kitsu_tui::composer::CompletionSource` implementation in
+/// [`tui_bridge`](crate::tui_bridge) both call
+/// [`candidates`](ComposerCompletion::candidates) and neither computes
+/// anything of its own. This is the F2/F38/F45 lesson applied up front: two
+/// implementations that happen to agree are worth much less than one that
+/// cannot disagree.
+///
+/// The launch directory is held explicitly rather than read from
+/// `std::env::current_dir` inside the call, so the candidate list is a pure
+/// function of its inputs and both hosts can be compared in a unit test.
+pub(crate) struct ComposerCompletion {
+    permissions: std::sync::Arc<Permissions>,
+    /// The directory relative `@file` mentions resolve against.
+    base: std::path::PathBuf,
+}
+
+impl ComposerCompletion {
+    pub(crate) fn new(permissions: std::sync::Arc<Permissions>, base: std::path::PathBuf) -> Self {
+        Self { permissions, base }
+    }
+
+    /// The production construction: attachments resolve from the process
+    /// launch directory. This is the only place that directory is read, which
+    /// is why `attachments` exposes only the explicit-base
+    /// [`complete_from`](attachments::complete_from).
+    pub(crate) fn at_launch_directory(permissions: std::sync::Arc<Permissions>) -> Self {
+        Self::new(
+            permissions,
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        )
+    }
+
+    /// Candidates for `line` with the cursor at byte offset `pos`.
+    ///
+    /// `start` is the byte offset the replacement begins at, exactly
+    /// Rustyline's contract, so the inline composer splices `start..pos`.
+    pub(crate) fn candidates(&self, line: &str, pos: usize) -> kitsu_tui::composer::Completion {
+        use kitsu_tui::composer::{Candidate, Completion};
+
+        let Some(typed) = line.get(..pos).and_then(|text| text.strip_prefix('/')) else {
+            // Not a slash line: the cursor may sit in an `@path` mention.
+            let Some((start, candidates)) =
+                attachments::complete_from(line, pos, &self.base, self.permissions.as_ref())
+            else {
+                return Completion::none();
+            };
+            if candidates.is_empty() {
+                // Nothing to offer carries no start, so two hosts with
+                // nothing to offer compare equal.
+                return Completion::none();
+            }
+            return Completion {
+                start,
+                candidates: candidates
+                    .into_iter()
+                    .map(|(display, replacement)| Candidate::new(display, replacement))
+                    .collect(),
+            };
+        };
+        if typed.chars().any(char::is_whitespace) {
+            // The command is already complete; its arguments are not ours.
+            return Completion::none();
+        }
+        Completion {
+            // A slash candidate is the whole line.
+            start: 0,
+            candidates: matching_slash_commands(typed)
+                .into_iter()
+                .map(|spec| {
+                    Candidate::new(
+                        format!("{:<24} {}", spec.syntax(), spec.description),
+                        format!(
+                            "/{}{}",
+                            spec.name,
+                            if spec.args.is_empty() { "" } else { " " }
+                        ),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The one styling pass for the composer's hint, shared by the classic
+/// Rustyline `Highlighter` and the inline composer's re-hosted one.
+///
+/// Styling must preserve the display width Rustyline computed from the
+/// unstyled hint, which is why there is one function and not two.
+pub(crate) fn highlight_composer_hint(hint: &str, rich: bool) -> String {
+    if !rich {
+        return hint.to_string();
+    }
+    // Bright cyan separates the transient command deck; the persistent
+    // model/directory footer is dimmer. Styling preserves the display width
+    // Rustyline calculated from the unstyled hint.
+    hint.rsplit_once('\n').map_or_else(
+        || format!("\x1b[2;36m{hint}\x1b[0m"),
+        |(deck, status)| format!("\x1b[1;96m{deck}\x1b[0m\n\x1b[2;36m{status}\x1b[0m"),
+    )
+}
+
 /// Rustyline helper for slash-command completion. Multi-line paste is kept
 /// verbatim: shortening it from a highlighter corrupts Rustyline's cursor-width
 /// accounting (especially for Unicode), so visual collapsing belongs in a
 /// future editor renderer that can preserve buffer geometry.
 struct ChatHelper {
-    permissions: Arc<Permissions>,
+    /// The shared completion source. `impl Completer` must route through this
+    /// and keep only the mapping to `rustyline::completion::Pair`.
+    completion: ComposerCompletion,
     /// Rich terminals get Unicode borders plus color. `NO_COLOR` keeps the
     /// Rustyline editor but selects an unstyled ASCII palette; explicit
     /// plain/screen-reader modes bypass Rustyline entirely.
@@ -6288,38 +6399,21 @@ impl rustyline::completion::Completer for ChatHelper {
         pos: usize,
         _ctx: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let Some(typed) = line.get(..pos).and_then(|text| text.strip_prefix('/')) else {
-            if let Some((start, candidates)) =
-                attachments::complete(line, pos, self.permissions.as_ref())
-            {
-                return Ok((
-                    start,
-                    candidates
-                        .into_iter()
-                        .map(|(display, replacement)| rustyline::completion::Pair {
-                            display,
-                            replacement,
-                        })
-                        .collect(),
-                ));
-            }
-            return Ok((0, Vec::new()));
-        };
-        if typed.chars().any(char::is_whitespace) {
-            return Ok((0, Vec::new()));
-        }
-        let candidates = matching_slash_commands(typed)
-            .into_iter()
-            .map(|spec| rustyline::completion::Pair {
-                display: format!("{:<24} {}", spec.syntax(), spec.description),
-                replacement: format!(
-                    "/{}{}",
-                    spec.name,
-                    if spec.args.is_empty() { "" } else { " " }
-                ),
-            })
-            .collect();
-        Ok((0, candidates))
+        // Nothing is chosen here: every candidate comes from the one shared
+        // source, and all that is left is the mapping to Rustyline's own
+        // `Pair`. There is deliberately no second completion implementation.
+        let offered = self.completion.candidates(line, pos);
+        Ok((
+            offered.start,
+            offered
+                .candidates
+                .into_iter()
+                .map(|candidate| rustyline::completion::Pair {
+                    display: candidate.display,
+                    replacement: candidate.replacement,
+                })
+                .collect(),
+        ))
     }
 }
 impl rustyline::hint::Hinter for ChatHelper {
@@ -6354,14 +6448,9 @@ impl rustyline::Helper for ChatHelper {}
 impl rustyline::highlight::Highlighter for ChatHelper {
     fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
         if self.rich_palette {
-            // Bright cyan separates the transient command deck; the persistent
-            // model/directory footer is dimmer. Styling preserves the display
-            // width Rustyline calculated from the unstyled hint.
-            let styled = hint.rsplit_once('\n').map_or_else(
-                || format!("\x1b[2;36m{hint}\x1b[0m"),
-                |(deck, status)| format!("\x1b[1;96m{deck}\x1b[0m\n\x1b[2;36m{status}\x1b[0m"),
-            );
-            std::borrow::Cow::Owned(styled)
+            // One styling pass, shared with the inline composer's re-hosted
+            // highlighter; there is deliberately no second one.
+            std::borrow::Cow::Owned(highlight_composer_hint(hint, true))
         } else {
             std::borrow::Cow::Borrowed(hint)
         }
@@ -8752,6 +8841,34 @@ fn session_context_used(
     (used, estimated)
 }
 
+/// Push the model and the context meter's numbers onto the inline status
+/// row's live fields (requirement **R5**).
+///
+/// It reads the *same* `session_context_used` and `ContextBudget::effective`
+/// that `/context` renders, so the row's meter and the command can never
+/// disagree -- the cycle-23 audit's lesson, applied before a second reader
+/// exists rather than after.
+///
+/// Called at both turn boundaries rather than per paint: the numbers only
+/// change when the history does, and the paint runs on another thread that
+/// cannot borrow the history at all.
+#[cfg(unix)]
+fn refresh_status_usage(
+    source: Option<&Arc<tui_bridge::StatusSource>>,
+    model: &str,
+    messages: &[ChatMessage],
+    session: &SessionInfo,
+    state: &kitsu_core::AgentSessionState,
+) {
+    let Some(source) = source else {
+        return;
+    };
+    let (used, _) = session_context_used(messages, session, state);
+    let window = session.window.get().unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let effective = ContextBudget::new(window, session.max_tokens).effective;
+    source.set_usage(model, used, effective);
+}
+
 fn render_context_command(
     model: &str,
     messages: &[ChatMessage],
@@ -9735,6 +9852,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
             .on_agent_state
             .as_deref()
             .and_then(agent_hook::split_command),
+        tui: config.tui.unwrap_or_default(),
         artifact_policy,
         artifact_policy_source,
         context_window,
@@ -15026,6 +15144,9 @@ fn run_live_typeahead(
     // agent counts are synced ahead of the first paint for the same reason.
     sync_queue_depth(dispatcher);
     sync_agent_counts(dispatcher);
+    // The turn's first frame, before the first poll: the row must show the
+    // turn it is in, not the idle row the reader left behind.
+    tui_bridge::repaint_status_row();
     live::live_input_begin(prompt.clone());
     update_live_row(&editor);
     while !stop.load(Ordering::Acquire) {
@@ -15065,6 +15186,12 @@ fn run_live_typeahead(
         // work happens while the approval reader owns the terminal and the
         // row is torn down.
         sync_agent_counts(dispatcher);
+        // ...and repaint R5's status row on the same tick (card T3-S5's
+        // deferred wiring). This is the row's whole cadence: elapsed ticks
+        // every second and 50 ms is twenty times finer, so the row is never
+        // more than a tick stale. `repaint_status_row` paints nothing when
+        // the composed row is unchanged, and nothing at all in classic mode.
+        tui_bridge::repaint_status_row();
 
         let mut descriptor = libc::pollfd {
             fd: libc::STDIN_FILENO,
@@ -16566,13 +16693,30 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let _agent_state_guard = agent_state_enabled
         .then(|| agent_state_file::StateFileGuard::new(agent_state_dir.clone(), agent_state_pid));
 
-    // The inline viewport preview (`KITSU_TUI=inline`, T0-S5a). Held for the
-    // whole session so the scroll region is released on every exit path. With
-    // the variable unset the mode is classic, `install` writes nothing and
-    // touches no global state, so the session is byte-identical.
+    // The inline viewport preview (`--tui inline` or `[tui] mode = "inline"`,
+    // T0-S5a/T3-S2). Held for the whole session so the scroll region is
+    // released on every exit path. In classic mode — the default — `install`
+    // writes nothing and touches no global state, so the session is
+    // byte-identical.
     #[cfg(unix)]
     let tui_bridge_guard = {
-        let mode = tui_bridge::mode_from_value(std::env::var_os("KITSU_TUI").as_deref());
+        // T3-S2 resolves the whole `[tui]` table here, at the one point where
+        // the renderer is chosen. Only `mode` has a consumer today; the
+        // remaining four are resolved and bound so that the alternate-screen
+        // force, the chord prefix (T4), the title row, the left-arrow binding
+        // and the cell ring (T3-S6) each arrive at their renderer already
+        // decided, rather than growing a second resolution point per card.
+        let _resolved_tui = (
+            setup.tui.effective_alternate_screen(cli.no_alt_screen),
+            setup.tui.prefix.as_str(),
+            setup.tui.title,
+            setup.tui.left_arrow_opens_agents,
+            setup.tui.cell_ring_lines,
+        );
+        let mode = match setup.tui.effective_mode(cli.tui_mode()) {
+            crate::config::TuiMode::Classic => tui_bridge::TuiMode::Classic,
+            crate::config::TuiMode::Inline => tui_bridge::TuiMode::Inline,
+        };
         // A failed geometry probe (not a terminal, or an ioctl refusal) falls
         // back to the conventional 80x24, the same fallback the renderer's own
         // width probe uses.
@@ -17374,7 +17518,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .map_err(|e| CliError::user(format!("failed to start input editor: {e}")))?;
     // Complete slash commands without changing the visible input-buffer width.
     rl.set_helper(Some(ChatHelper {
-        permissions: perms.clone(),
+        completion: ComposerCompletion::at_launch_directory(perms.clone()),
         rich_palette: !kitsu_render::plain_mode(),
         live_model_window: live_mw.clone(),
         directory: shorten_home(&session.directory),
@@ -17461,6 +17605,27 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .enqueue(first)
             .expect("the initial prompt fits an empty queue");
     }
+    // Requirement **R5**: the inline viewport's pinned row becomes the
+    // composed status row now that everything it counts exists. The queue and
+    // the registry are read through a closure rather than copied in, because
+    // the main loop drains the queue *between* turns -- a depth captured here
+    // would be stale exactly when the idle row is painted.
+    #[cfg(unix)]
+    let status_source = tui_bridge_guard.as_ref().map(|guard| {
+        let queue = prompt_queue.clone();
+        let registry = agent_registry.clone();
+        let source = tui_bridge::StatusSource::new(Box::new(move || {
+            let agents = registry.snapshot();
+            tui_bridge::StatusCounts {
+                queued: queue.lock().expect("prompt queue").status().queued,
+                blocked: agents.blocked,
+                running: agents.running,
+            }
+        }));
+        refresh_status_usage(Some(&source), &model, &messages, &session, &session_state);
+        guard.enable_live_status(source.clone());
+        source
+    });
     let mut exit_after_queue = false;
     // Session transitions are control-plane actions, not user prompts. They
     // always run before queued model work and never consume bounded queue
@@ -17533,6 +17698,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             }
             (None, None) => {
                 let initial = std::mem::take(&mut pending_draft);
+                // The idle row's meter reflects the history as it stands now,
+                // after the previous turn committed or rolled back.
+                #[cfg(unix)]
+                refresh_status_usage(
+                    status_source.as_ref(),
+                    &model,
+                    &messages,
+                    &session,
+                    &session_state,
+                );
                 // Inline mode replaces rustyline on this path rather than
                 // adding to it: two composers drawing a draft at once would
                 // put one copy inside the scroll region and one on the pinned
@@ -18110,6 +18285,22 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             (!assistive_input && kitsu_render::stdin_is_tty() && kitsu_render::stderr_styled())
                 .then(kitsu_render::prompt_string);
         let typeahead_history: Vec<String> = rl.history().iter().cloned().collect();
+        // The turn is now running, so R5's elapsed segment starts counting
+        // and the row's meter picks up the prompt just pushed. Both before
+        // the collector starts, because its first poll tick paints the row.
+        #[cfg(unix)]
+        {
+            refresh_status_usage(
+                status_source.as_ref(),
+                &model,
+                &messages,
+                &session,
+                &session_state,
+            );
+            if let Some(source) = status_source.as_ref() {
+                source.begin_turn();
+            }
+        }
         let typeahead = TypeaheadCollector::start(
             prompt_queue.clone(),
             steering.clone(),
@@ -18134,6 +18325,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             )
             .await;
         let captured = typeahead.finish();
+        // Between turns `elapsed` is `None`: the idle row carries no elapsed
+        // segment, so it has nothing to tick and needs no cadence.
+        #[cfg(unix)]
+        if let Some(source) = status_source.as_ref() {
+            source.end_turn();
+        }
         foreground_typeahead_active.store(false, Ordering::Release);
         pending_draft = captured.pending_draft;
         while let Ok(notice) = deferred_notice_receiver.try_recv() {
@@ -21422,8 +21619,20 @@ mod tests {
     }
 
     fn chat_helper() -> ChatHelper {
+        chat_helper_completing_in(
+            Arc::new(Permissions::for_roots(&[], &[]).unwrap()),
+            std::env::current_dir().unwrap(),
+        )
+    }
+
+    /// `chat_helper` with the completion source's launch directory chosen, so
+    /// the `@file` half of the parity test needs no `set_current_dir`.
+    fn chat_helper_completing_in(
+        permissions: Arc<Permissions>,
+        base: std::path::PathBuf,
+    ) -> ChatHelper {
         ChatHelper {
-            permissions: Arc::new(Permissions::for_roots(&[], &[]).unwrap()),
+            completion: ComposerCompletion::new(permissions, base),
             rich_palette: true,
             live_model_window: Arc::new(std::sync::Mutex::new((
                 "test-model".to_string(),
@@ -21431,6 +21640,492 @@ mod tests {
             ))),
             directory: "~/project".to_string(),
         }
+    }
+
+    /// The classic host's answer, in the shared vocabulary.
+    ///
+    /// Everything here is the Rustyline *mapping* -- building a `Context` and
+    /// turning `Pair` back into `Candidate`. No candidate is chosen here.
+    fn classic_candidates(
+        helper: &ChatHelper,
+        line: &str,
+        pos: usize,
+    ) -> kitsu_tui::composer::Completion {
+        use rustyline::completion::Completer as _;
+
+        let history = rustyline::history::DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let (start, pairs) = helper.complete(line, pos, &ctx).unwrap();
+        kitsu_tui::composer::Completion {
+            start,
+            candidates: pairs
+                .into_iter()
+                .map(|pair| kitsu_tui::composer::Candidate::new(pair.display, pair.replacement))
+                .collect(),
+        }
+    }
+
+    /// The inline host's answer.
+    fn inline_candidates(
+        permissions: Arc<Permissions>,
+        base: std::path::PathBuf,
+        line: &str,
+        pos: usize,
+    ) -> kitsu_tui::composer::Completion {
+        use kitsu_tui::composer::CompletionSource as _;
+
+        tui_bridge::InlineComposerHost::new(ComposerCompletion::new(permissions, base), true)
+            .complete(line, pos)
+    }
+
+    /// Card T3-S3, the acceptance test the plan names, slash half: the same
+    /// candidates in the same order from both hosts for `/st`.
+    ///
+    /// The third assertion is what keeps the first two from being vacuous:
+    /// the shared list is also the live registry's own answer, so an empty or
+    /// invented list fails even if both hosts produced it.
+    #[test]
+    fn both_hosts_offer_the_same_slash_candidates_for_st() {
+        let permissions = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let base = std::env::current_dir().unwrap();
+        let helper = chat_helper_completing_in(permissions.clone(), base.clone());
+
+        let shared = helper.completion.candidates("/st", 3);
+        let classic = classic_candidates(&helper, "/st", 3);
+        let inline = inline_candidates(permissions, base, "/st", 3);
+
+        assert_eq!(classic, inline, "the two hosts must agree on `/st`");
+        assert_eq!(classic, shared, "the classic host adds nothing of its own");
+        assert_eq!(inline, shared, "the inline host adds nothing of its own");
+
+        let expected_replacements: Vec<String> = matching_slash_commands("st")
+            .into_iter()
+            .map(|spec| {
+                format!(
+                    "/{}{}",
+                    spec.name,
+                    if spec.args.is_empty() { "" } else { " " }
+                )
+            })
+            .collect();
+        assert!(
+            !expected_replacements.is_empty(),
+            "the registry must have at least one `st` command for this test to mean anything"
+        );
+        assert_eq!(shared.start, 0, "a slash candidate replaces the whole line");
+        assert_eq!(
+            shared
+                .candidates
+                .iter()
+                .map(|candidate| candidate.replacement.clone())
+                .collect::<Vec<_>>(),
+            expected_replacements,
+            "the shared source is the registry's answer, in registry order"
+        );
+    }
+
+    /// Card T3-S3, the acceptance test's `@file` half -- the user-visible
+    /// part, since the inline composer has never had path completion (R4,
+    /// finding F20).
+    ///
+    /// The launch directory is passed in rather than set process-wide, so the
+    /// test is pure and parallel-safe.
+    #[cfg(unix)]
+    #[test]
+    fn both_hosts_offer_the_same_at_file_candidates_for_fi() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file_one.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.path().join("fish.txt"), "x\n").unwrap();
+        std::fs::create_dir(root.path().join("figures")).unwrap();
+        std::fs::write(root.path().join("other.md"), "x\n").unwrap();
+        let permissions = Arc::new(
+            Permissions::for_roots(&[root.path().to_string_lossy().to_string()], &[]).unwrap(),
+        );
+        let base = root.path().to_path_buf();
+        let helper = chat_helper_completing_in(permissions.clone(), base.clone());
+        let line = "look at @fi";
+        let pos = line.len();
+
+        let shared = helper.completion.candidates(line, pos);
+        let classic = classic_candidates(&helper, line, pos);
+        let inline = inline_candidates(permissions, base, line, pos);
+
+        assert_eq!(classic, inline, "the two hosts must agree on `@fi`");
+        assert_eq!(classic, shared, "the classic host adds nothing of its own");
+        assert_eq!(inline, shared, "the inline host adds nothing of its own");
+
+        // Non-vacuity, and the replacement range: `@fi` starts at byte 8.
+        assert_eq!(shared.start, 8);
+        assert_eq!(
+            shared
+                .candidates
+                .iter()
+                .map(|candidate| (candidate.display.as_str(), candidate.replacement.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("@figures/", "@figures/"),
+                ("@file_one.rs", "@file_one.rs "),
+                ("@fish.txt", "@fish.txt "),
+            ],
+            "sorted, directories keep their slash, files gain a trailing space, \
+             and `other.md` is not a `fi` match"
+        );
+    }
+
+    /// The anti-fork test: for **every** prefix of **every** registered
+    /// command, each host's answer is exactly the shared source's answer.
+    ///
+    /// A fork cannot survive by agreeing on the two sampled inputs above; it
+    /// would have to reproduce the registry traversal over its whole domain,
+    /// which is the duplication this card exists to prevent.
+    #[test]
+    fn both_hosts_are_exactly_the_shared_source_for_every_slash_prefix() {
+        let permissions = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let base = std::env::current_dir().unwrap();
+        let helper = chat_helper_completing_in(permissions.clone(), base.clone());
+
+        let mut checked = 0usize;
+        for spec in SLASH_COMMANDS.iter() {
+            for end in 0..=spec.name.len() {
+                if !spec.name.is_char_boundary(end) {
+                    continue;
+                }
+                let line = format!("/{}", &spec.name[..end]);
+                let pos = line.len();
+                let shared = helper.completion.candidates(&line, pos);
+                assert_eq!(
+                    classic_candidates(&helper, &line, pos),
+                    shared,
+                    "classic host forked at {line:?}"
+                );
+                assert_eq!(
+                    inline_candidates(permissions.clone(), base.clone(), &line, pos),
+                    shared,
+                    "inline host forked at {line:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= SLASH_COMMANDS.len(),
+            "the sweep must visit at least one prefix per command, visited {checked}"
+        );
+    }
+
+    /// The re-hosted highlighter: one styling function, two hosts. Rustyline
+    /// computes the hint's display width from the unstyled text, so a second
+    /// styling pass that differed would corrupt the classic row -- which is
+    /// why this is pinned rather than left to agree by accident.
+    #[test]
+    fn both_hosts_style_the_composer_hint_through_one_function() {
+        use kitsu_tui::composer::ComposerDecoration as _;
+        use rustyline::highlight::Highlighter as _;
+
+        let permissions = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let base = std::env::current_dir().unwrap();
+        let helper = chat_helper_completing_in(permissions.clone(), base.clone());
+        let hint = "deck row\nmodel: test-model";
+
+        let shared = highlight_composer_hint(hint, true);
+        let inline =
+            tui_bridge::InlineComposerHost::new(ComposerCompletion::new(permissions, base), true)
+                .highlight_hint(hint);
+
+        assert_eq!(helper.highlight_hint(hint).as_ref(), shared.as_str());
+        assert_eq!(inline, shared);
+        assert_ne!(
+            shared, hint,
+            "a rich terminal really is styled, so the equalities above are not \
+             two pass-throughs agreeing on nothing"
+        );
+    }
+
+    /// The inline row's hint is the row suffix, not the classic multi-row
+    /// deck -- F20's second correction. Pinned so "parity" is not read as
+    /// "the hosts return the same hint string", which would be wrong.
+    #[test]
+    fn the_inline_rows_hint_is_the_shared_row_hint() {
+        use kitsu_tui::composer::ComposerDecoration as _;
+
+        let permissions = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let base = std::env::current_dir().unwrap();
+        let host =
+            tui_bridge::InlineComposerHost::new(ComposerCompletion::new(permissions, base), true);
+
+        for line in ["/st", "/", "", "hello", "/steer now"] {
+            assert_eq!(
+                host.hint(line),
+                idle_slash_hint(line),
+                "the inline hint for {line:?} is the shared row hint"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Card T3-S4: the history file, shared between the two renderers.
+    //
+    // There is exactly one history implementation and exactly one owner of the
+    // file: rustyline's `FileHistory`. `main.rs:17435` loads it,
+    // `main.rs:17576` adds every submitted line on the path common to both
+    // readers, and `main.rs:18412` saves it. The inline reader does not parse
+    // or write the file at all -- `read_idle_chat_line` (`main.rs:6155`) hands
+    // it `editor.history().iter().cloned().collect()`, a snapshot taken afresh
+    // on every read.
+    //
+    // So "shared" here is a *delegation* claim, and these tests pin it as one:
+    // the bytes on disk are rustyline's, and the list the inline reader walks
+    // is the list rustyline would have walked itself.
+    // -----------------------------------------------------------------------
+
+    /// The list `read_idle_chat_line` hands the inline reader, taken the same
+    /// way production takes it (`main.rs:6155`).
+    #[cfg(unix)]
+    fn inline_history_snapshot(history: &rustyline::history::DefaultHistory) -> Vec<String> {
+        history.iter().cloned().collect()
+    }
+
+    /// The classic renderer's ↑/↓ walk, over rustyline's own history.
+    ///
+    /// This mirrors `rustyline::edit::State::edit_history_next`: the index
+    /// starts at `len()` (the live draft), ↑ decrements and reads
+    /// `get(idx, SearchDirection::Reverse)`, ↑ at index 0 is a no-op, and ↓
+    /// past the newest entry restores the backed-up draft. `ups` Ups are
+    /// followed by `downs` Downs; the visible draft is returned after each
+    /// keystroke.
+    ///
+    /// **Fidelity limit, deliberate.** Up is bound to
+    /// `Cmd::LineUpOrPreviousHistory`, which tries `edit_move_line_up` first
+    /// and only walks history when that fails -- i.e. when the draft has no
+    /// line above the cursor. This helper models the walk, so every draft it
+    /// is given must be single-line at the moment the key arrives. Callers
+    /// keep to that; a multi-line draft is where the two renderers genuinely
+    /// part company (the editor has no intra-draft line motion) and that
+    /// belongs with the multi-row composer, not here.
+    #[cfg(unix)]
+    fn classic_history_walk(
+        history: &rustyline::history::DefaultHistory,
+        draft: &str,
+        ups: usize,
+        downs: usize,
+    ) -> Vec<String> {
+        use rustyline::history::{History as _, SearchDirection};
+
+        let mut index = history.len();
+        let mut backup = String::new();
+        let mut line = draft.to_string();
+        let mut seen = Vec::new();
+        for _ in 0..ups {
+            if history.is_empty() || index == 0 {
+                seen.push(line.clone());
+                continue;
+            }
+            if index == history.len() {
+                backup = line.clone();
+            }
+            index -= 1;
+            if let Some(found) = history.get(index, SearchDirection::Reverse).unwrap() {
+                index = found.idx;
+                line = found.entry.into_owned();
+            }
+            seen.push(line.clone());
+        }
+        for _ in 0..downs {
+            if history.is_empty() || index == history.len() {
+                seen.push(line.clone());
+                continue;
+            }
+            index += 1;
+            if index < history.len() {
+                if let Some(found) = history.get(index, SearchDirection::Forward).unwrap() {
+                    index = found.idx;
+                    line = found.entry.into_owned();
+                }
+            } else {
+                line = backup.clone();
+            }
+            seen.push(line.clone());
+        }
+        seen
+    }
+
+    /// The inline renderer's ↑/↓ walk, over the snapshot it is handed.
+    ///
+    /// The `RecallRequest` arm mirrors `tui_bridge.rs:651`: at the idle prompt
+    /// there is no prompt queue, so the reader declines the recall point and
+    /// takes the plain walk. Without that arm the first Up at an idle inline
+    /// prompt would do nothing, and the two renderers would not agree.
+    #[cfg(unix)]
+    fn inline_history_walk(
+        snapshot: &[String],
+        draft: &str,
+        ups: usize,
+        downs: usize,
+    ) -> Vec<String> {
+        let mut editor =
+            kitsu_editor::TypeaheadEditor::with_draft(snapshot.to_vec(), draft.to_string());
+        let mut seen = Vec::new();
+        for bytes in std::iter::repeat_n(&b"\x1b[A"[..], ups)
+            .chain(std::iter::repeat_n(&b"\x1b[B"[..], downs))
+        {
+            let outcome = editor.feed(bytes);
+            for action in &outcome.actions {
+                if *action == kitsu_editor::EditorAction::RecallRequest {
+                    let mut forced = kitsu_editor::FeedOutcome::default();
+                    editor.history_prev_forced(&mut forced);
+                }
+            }
+            seen.push(editor.buffer_string());
+        }
+        seen
+    }
+
+    /// Card T3-S4's risk gate (R4): **↑ walks the same entries in both
+    /// renderers.**
+    ///
+    /// Not vacuous, and the first three assertions are what make it so: the
+    /// agreement is asserted against a *named, non-empty* expected sequence,
+    /// so two renderers that both walked nothing, or both walked the list in
+    /// the wrong direction, fail. The entries are the ones rustyline accepted
+    /// through the very call `main.rs:17576` makes, so the list is also not an
+    /// invention of the test.
+    #[cfg(unix)]
+    #[test]
+    fn up_walks_the_same_entries_in_both_renderers() {
+        use rustyline::history::History as _;
+
+        // Built exactly as `main.rs:17364` builds it, so the history's
+        // duplicate and size policy is production's.
+        let config = rustyline::Config::builder()
+            .bracketed_paste(true)
+            .completion_type(rustyline::CompletionType::List)
+            .build();
+        let mut history = rustyline::history::DefaultHistory::with_config(config);
+        // `main.rs:17576` adds the *trimmed* line, and only a non-empty one.
+        for line in ["/status", "write the readme", "write the readme", "/quit"] {
+            history.add(line).unwrap();
+        }
+
+        // Non-vacuity, part 1: there is something to agree about, and it is
+        // the de-duplicated list -- the consecutive repeat collapsed.
+        let snapshot = inline_history_snapshot(&history);
+        assert_eq!(
+            snapshot,
+            vec![
+                "/status".to_string(),
+                "write the readme".to_string(),
+                "/quit".to_string(),
+            ],
+            "the snapshot handed to the inline reader is rustyline's list, oldest first"
+        );
+
+        // Non-vacuity, part 2: the expected walk is spelled out, newest first,
+        // then one step past the oldest (which must not move), then back down
+        // through the list to the draft that was stashed.
+        let expected = vec![
+            "/quit".to_string(),
+            "write the readme".to_string(),
+            "/status".to_string(),
+            "/status".to_string(),
+            "write the readme".to_string(),
+            "/quit".to_string(),
+            "half-typed".to_string(),
+        ];
+        let classic = classic_history_walk(&history, "half-typed", 4, 3);
+        let inline = inline_history_walk(&snapshot, "half-typed", 4, 3);
+
+        assert_eq!(classic, expected, "the classic renderer's ↑/↓ walk");
+        assert_eq!(inline, expected, "the inline renderer's ↑/↓ walk");
+        assert_eq!(inline, classic, "R4: the same entries in both renderers");
+    }
+
+    /// Card T3-S4's acceptance: a round trip over a **fixture history file on
+    /// disk**, in rustyline's own format.
+    ///
+    /// The fixture exercises every part of that format kitsu can produce: the
+    /// `#V2` header, an escaped line feed (reachable here -- a bracketed paste
+    /// at the inline prompt submits a multi-line draft), an escaped backslash,
+    /// and a blank line, which the loader skips.
+    #[cfg(unix)]
+    #[test]
+    fn the_history_file_round_trips_into_both_renderers() {
+        use rustyline::history::History as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        std::fs::write(
+            &path,
+            "#V2\n/status\nfirst line\\nsecond line\nC:\\\\temp\n\n/quit\n",
+        )
+        .unwrap();
+
+        let config = rustyline::Config::builder()
+            .bracketed_paste(true)
+            .completion_type(rustyline::CompletionType::List)
+            .build();
+        let mut history = rustyline::history::DefaultHistory::with_config(config);
+        history.load(&path).unwrap();
+
+        // Read back: the escapes are undone and the blank line is gone.
+        let loaded = inline_history_snapshot(&history);
+        assert_eq!(
+            loaded,
+            vec![
+                "/status".to_string(),
+                "first line\nsecond line".to_string(),
+                "C:\\temp".to_string(),
+                "/quit".to_string(),
+            ],
+            "the fixture file's entries, as both renderers receive them"
+        );
+
+        // Both renderers walk those entries, the multi-line one included.
+        // Non-vacuous: the expected first two Ups are named, and the list
+        // above is already pinned non-empty.
+        let expected = vec![
+            "/quit".to_string(),
+            "C:\\temp".to_string(),
+            "first line\nsecond line".to_string(),
+        ];
+        // Three Ups and no more: each of these arrives on a draft that is
+        // single-line at the time (empty, then "/quit", then "C:\\temp"), so
+        // the classic model above is faithful. A fourth Up would arrive on the
+        // recalled multi-line draft, where rustyline moves the cursor up
+        // inside it instead of walking -- see `classic_history_walk`.
+        assert_eq!(classic_history_walk(&history, "", 3, 0), expected);
+        assert_eq!(inline_history_walk(&loaded, "", 3, 0), expected);
+
+        // Write back: a line submitted at either prompt reaches the file, and
+        // the file is still the format the fixture was written in. Pinned as
+        // the whole text rather than a substring (F41).
+        history.add("ship it \\ now").unwrap();
+        history.save(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "#V2\n/status\nfirst line\\nsecond line\nC:\\\\temp\n/quit\nship it \\\\ now\n",
+            "the saved file is rustyline's V2 format, re-escaped"
+        );
+
+        // And it round-trips: a fresh load sees what was saved.
+        let mut reloaded =
+            rustyline::history::DefaultHistory::with_config(rustyline::Config::builder().build());
+        reloaded.load(&path).unwrap();
+        let reloaded = inline_history_snapshot(&reloaded);
+        assert_eq!(
+            reloaded,
+            vec![
+                "/status".to_string(),
+                "first line\nsecond line".to_string(),
+                "C:\\temp".to_string(),
+                "/quit".to_string(),
+                "ship it \\ now".to_string(),
+            ],
+            "the round trip adds the new entry and changes nothing else"
+        );
+        assert_eq!(
+            inline_history_walk(&reloaded, "", 1, 0),
+            vec!["ship it \\ now".to_string()],
+            "the inline reader's first Up is the entry the save round-tripped"
+        );
     }
 
     #[cfg(unix)]

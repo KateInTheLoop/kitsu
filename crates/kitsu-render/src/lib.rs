@@ -392,10 +392,15 @@ pub fn print_fragment(s: &str) {
         // count `push` returns is computed from the formatted text rather
         // than from what the writer actually accepted.
         active_surface().write_block(Fd::Stdout, &mut |out| {
-            stream_buffer()
+            let written = stream_buffer()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(out, &sanitized);
+            // `push` emits only newline-terminated lines, so anything it wrote
+            // leaves the cursor at column 0 of a fresh row.
+            if written > 0 {
+                live::set_partial_line(false);
+            }
         });
     } else {
         // Non-TTY or plain: use existing sanitizer path (byte-identical)
@@ -436,7 +441,13 @@ pub fn print_message(s: &str) {
             let _ = out.write_all(b"\n");
         }
         let _ = out.flush();
-        ASSISTANT_OUTPUT_WRITTEN.store(false, Ordering::Release);
+        if stdout_style() {
+            // A message whose last line has no terminating newline leaves the
+            // cursor mid-row on a row holding assistant text. The live row is
+            // painted wherever the cursor stands, so tell it to step down
+            // first or the repaint this suspension ends with erases that line.
+            live::set_partial_line(!rendered.is_empty() && !rendered.ends_with('\n'));
+        }
     });
 }
 
@@ -1632,7 +1643,7 @@ pub fn finish_line() {
     active_surface().write_block(Fd::Stdout, &mut |out| {
         // Flush any partial line from the streaming buffer UNSTYLED
         // and reset its fence state.
-        stream_buffer()
+        let flushed = stream_buffer()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .flush_unstyled(out);
@@ -1644,10 +1655,20 @@ pub fn finish_line() {
             .reset();
 
         if !ASSISTANT_OUTPUT_WRITTEN.swap(false, Ordering::AcqRel) {
+            // The flushed partial line, if there was one, is now the row the
+            // cursor sits on and nothing has terminated it.
+            if stdout_style() && flushed > 0 {
+                live::set_partial_line(true);
+            }
             return;
         }
         let _ = out.write_all(b"\n");
         let _ = io::stdout().flush();
+        if stdout_style() {
+            // The line is terminated: the cursor is back at column 0 of a
+            // fresh row and the live row may paint there.
+            live::set_partial_line(false);
+        }
     });
 }
 
@@ -3649,6 +3670,7 @@ mod tests {
         }
     }
 }
+
 
 
 

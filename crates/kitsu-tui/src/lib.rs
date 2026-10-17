@@ -34,6 +34,8 @@
 //! activity labels derived from model-driven work, so this is the boundary at
 //! which an escape sequence could otherwise reach the user's terminal.
 
+pub mod composer;
+pub mod status;
 pub mod viewport;
 
 use std::io::{IsTerminal, Write};

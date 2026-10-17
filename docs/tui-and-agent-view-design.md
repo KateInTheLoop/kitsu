@@ -233,6 +233,22 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   mode MAY adopt `← N agents` once A1's left-arrow affordance exists, and
   not before. Promising a key that does nothing is the kind of dishonest
   decoration the rest of this design avoids.
+
+  **Drop order, added in T3-S5 because R5 did not state one.** When the row
+  cannot fit, segments are dropped in this order, first to go listed first:
+  **context meter, elapsed, model, `[N queued]`, ambient tag.** The model is
+  **truncated before it is dropped**. The reasoning, so an edge case can be
+  judged rather than guessed: decoration yields to content, as the spinner
+  already yields to the draft; the meter goes first because `/context` renders
+  it on demand; elapsed follows because the spinner itself carries elapsed past
+  five seconds; the model is long and static; and the ambient tag is last
+  standing because a blocked agent is the one thing in the row the user must
+  act on.
+
+  This order was derived from the classic row's precedent in T3-S5 and labelled
+  an inference at the time rather than passed off as a requirement. It is stated
+  here because a drop order that lives only in a test's doc comment is at the
+  wrong altitude for something every implementer of this row must honour.
 - **R6** Transcript overlay (`Ctrl+O`): scroll, `/` search, `n`/`N`, `{`/`}`
   prompt jumps, `[` dump the cell ring to native scrollback (fullscreen only),
   `v` open in `$EDITOR`, `q`/`Esc` close.
@@ -558,6 +574,17 @@ re-hosted in `composer.rs` on top of the editor's `CompleteRequest` action,
 which today only accepts the inline slash hint. The idle prompt stops using
 rustyline in TUI modes (rustyline keeps `classic`); the history file format is
 shared.
+
+**Amended in T3-S4, because "shared" was read as "reimplemented".** The history
+file **and its implementation** stay rustyline's. In `inline`, rustyline's
+*composer* never runs but its *history* still does: it loads the file, the inline
+reader is handed a snapshot of the loaded entries (re-taken on every read, so it
+is fresh each turn), every submitted line is recorded on the path common to both
+readers, and rustyline writes the file. That is why cross-session history works
+in the viewport — a thing F20 twice recorded as missing when it never was — and
+why **nothing in `kitsu-tui` needs to know the file exists**. A loader there
+would be a second parser for a format rustyline owns and a second writer for one
+file; see **F49**.
 
 ### 4.4 Agent view and blocked agents
 

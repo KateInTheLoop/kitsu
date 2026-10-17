@@ -309,6 +309,28 @@ that thread, and any other argument is forwarded verbatim to `/jobs`, so every
 subcommand is reachable through either name.
 
 Background agents run in-process, so nothing outside kitsu can observe them.
+In the inline viewport the pinned bottom row carries the model, a compact
+context meter, the elapsed time in the current turn, `[N queued]` and the
+background-agent tag, refreshed on the same 50 ms input tick that keeps the
+ambient counter current, and deduplicated so an unchanged row writes no bytes.
+The meter reads the same session usage and effective budget `/context` reports,
+so the two cannot disagree. It never wraps between 40 and 200 columns and sheds
+segments in the order R5 documents.
+In the inline viewport the composer offers `@file` path completion and slash
+completion with the **same candidates, in the same order**, as the classic
+prompt: both hosts call one completion source, and a test sweeps every prefix of
+every registered command requiring all three to agree, so the two cannot drift.
+`--tui <classic|inline>` and the `[tui]` table select the renderer: `mode`
+(default `classic`), `alternate_screen` (`auto|always|never`, forced to `never`
+by `--no-alt-screen`), `prefix` (default `ctrl+x`), `title`,
+`left_arrow_opens_agents`, and `cell_ring_lines` (default 10000, range
+1-1000000). The flag wins over the config key, the config key over the default,
+and **no environment variable participates**. A misspelled key or an invalid
+value is a startup error that names the key and lists what it accepts -- never a
+silent fallback -- and `kitsu doctor` reports it as a blocking issue. The error
+names the key and the permitted values but never echoes the offending value,
+because a config file can hold credentials. `fullscreen` appears in the design
+but is not accepted yet.
 `[agents] state_file` publishes a small advisory JSON hint, one file per running
 process, that an outside tool such as a terminal multiplexer can read to tell
 whether this kitsu is `idle`, `working`, or `blocked`, alongside the same
