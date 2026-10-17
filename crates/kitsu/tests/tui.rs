@@ -377,6 +377,13 @@ struct Options {
     /// the retired variable has no effect, and every other session in this
     /// file keeps the variable removed.
     legacy_env_gate: bool,
+    /// The PTY geometry, pinned before the spawn. Defaults to [`ROWS`]x[`COLS`].
+    ///
+    /// Carried because a terminal that is short *from the start* is not the
+    /// same case as one resized mid-session: the tail-preservation test needs
+    /// the child's first `TIOCGWINSZ` probe to already report the short
+    /// geometry, which a [`Action::Resize`] step cannot arrange.
+    size: (u16, u16),
 }
 
 impl Default for Options {
@@ -385,6 +392,7 @@ impl Default for Options {
             no_session: true,
             resume_on_stop: false,
             legacy_env_gate: false,
+            size: (ROWS, COLS),
         }
     }
 }
@@ -449,7 +457,7 @@ fn run_styled_chat_pty_core(
     // probe (`crossterm::terminal::size`) reports this and the viewport's
     // arithmetic is deterministic rather than inherited from the test runner's
     // terminal (or absent, falling back to 80x24 by accident).
-    set_window_size(master, ROWS, COLS);
+    set_window_size(master, options.size.0, options.size.1);
 
     // SAFETY: the master descriptor stays owned here; non-blocking reads let
     // the driver poll for triggers instead of hanging.
@@ -8768,5 +8776,65 @@ fn tui_title_stack_is_not_pushed_on_the_plain_or_assistive_classic_surfaces() {
             "...and pops nothing; raw:\n{}",
             text.escape_debug()
         );
+    }
+}
+
+/// A real provider response taller than the terminal must retain its final
+/// unterminated line when the live editor resumes and the tool receipt prints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn long_wrapped_response_preserves_its_tail_on_short_terminals() {
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+    let server = MockServer::start().await;
+    let text = format!(
+        "{}\nFINAL_TAIL_NO_NEWLINE",
+        "a long paragraph that wraps in a narrow terminal ".repeat(150)
+    );
+    let chunk =
+        serde_json::json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]});
+    let done = serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":200,"completion_tokens":500,"total_tokens":700}});
+    let response = format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(response, "text/event-stream"))
+        .mount(&server)
+        .await;
+    for mode in [None, Some("inline")] {
+        for (rows, cols) in [(8, 32), (24, 80)] {
+            let home = TempDir::new().unwrap();
+            write_config(home.path());
+            let config = home.path().join(".kitsu/config.toml");
+            fs::write(
+                &config,
+                fs::read_to_string(&config)
+                    .unwrap()
+                    .replace("https://gateway.invalid", &server.uri()),
+            )
+            .unwrap();
+            let steps = [
+                send(RAW_MODE_MARKER, "say a long paragraph\r"),
+                send("500 output", "/quit\r"),
+            ];
+            let session = run_styled_chat_pty_with(
+                home.path(),
+                mode,
+                &steps,
+                Options {
+                    size: (rows, cols),
+                    ..Options::default()
+                },
+            );
+            assert!(session.status.success(), "{}", session.raw_text());
+            let mut parser = vt100::Parser::new(rows, cols, 1000);
+            parser.process(&session.raw[..session.marks[1]]);
+            assert!(
+                parser.screen().contents().contains("FINAL_TAIL_NO_NEWLINE"),
+                "tail lost in {mode:?} at {cols}x{rows}: {}",
+                parser.screen().contents()
+            );
+        }
     }
 }

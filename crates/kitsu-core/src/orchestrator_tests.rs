@@ -6334,3 +6334,43 @@ async fn tools_offered_streaming_preserves_quiet_and_event_log() {
         "concatenated assistant deltas must reproduce the committed answer"
     );
 }
+
+#[test]
+fn git_invocations_keep_command_telemetry_and_a_literal_git_prefix() {
+    let invocation = crate::orchestrator::command_runtime_invocation(
+        "git",
+        r#"{"args":["switch","-c","review-branch"],"cwd":"/repo","timeout_ms":1234}"#,
+    )
+    .unwrap();
+    assert_eq!(invocation.argv, ["git", "switch", "-c", "review-branch"]);
+    assert_eq!(invocation.cwd, "/repo");
+    assert_eq!(invocation.timeout_ms, Some(1234));
+    assert!(crate::orchestrator::command_runtime_invocation(
+        "git",
+        r#"{"args":"status","cwd":"/repo"}"#
+    )
+    .is_none());
+}
+
+#[test]
+fn git_command_metadata_is_not_replaced_by_generic_lossy_previews() {
+    use crate::orchestrator::{prepare_tool_output, ArtifactStoragePolicy, ToolOutputRequest};
+    let content = serde_json::json!({"stdout": "x".repeat(20_000), "exit_code": 0}).to_string();
+    let mut config = cfg(10);
+    config.artifact_policy = ArtifactStoragePolicy::InlineOnly;
+    let prepared = prepare_tool_output(
+        content.clone(),
+        ToolOutputRequest {
+            call_id: "git-1",
+            tool_name: "git",
+            is_err: false,
+            window_evidence: None,
+        },
+        &Registry::new(),
+        &initial_messages(),
+        &config,
+    );
+    assert_eq!(prepared.content, content);
+    assert!(serde_json::from_str::<serde_json::Value>(&prepared.content).is_ok());
+    assert!(prepared.artifact_path.is_none());
+}
