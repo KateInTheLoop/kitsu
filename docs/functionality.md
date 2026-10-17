@@ -285,7 +285,129 @@ oldest verified artifact. `/artifacts` lists usage and prunes by ID or all.
 usage, tool/write counts, safe recent activity, failure class, terminal result
 handoff, targeted steering, joined cancellation, and pruning. `/jobs view`
 presents the same deck grouped by state, with agents needing input first and
-empty groups omitted. `/jobs explain <id>` answers why one agent is in its
+empty groups omitted. **In the inline viewport `/jobs view` opens an overlay
+instead of printing that deck** -- the same grouping, on the alternate screen,
+with `?` for the key list and `Esc` to close; `Ctrl+X a` (following
+`[tui] prefix`) and pressing left twice on an empty composer open it too, the
+first press only hinting so it cannot open by accident. Left on a non-empty
+draft still moves the cursor, and up-arrow history recall is untouched.
+`[tui] left_arrow_opens_agents = false` disables the left-arrow route alone.
+`Up`/`Down` move the selection, which follows the agent rather than the row
+position -- an agent finishing re-groups the rows, and a position-keyed cursor
+would silently move your next keystroke onto a different agent. The selection
+clamps at the ends instead of wrapping, moving it never collects a result, and
+if the selected agent is pruned the selection falls to the row that took its
+place.
+
+`Enter` or `→` attaches the selected agent and closes the view. While attached
+the composer prompt names the agent (`agent 3>`), so the line you are typing has
+a visible destination. `←` on an empty composer detaches on the first press --
+it does not wait for the two-press agent-view chord, and it is not affected by
+`[tui] left_arrow_opens_agents`; with text typed, `←` is still cursor movement.
+`Ctrl+X d` and `/detach` also detach. **`Ctrl+X d` works with a line in
+progress and keeps what you typed** -- that is the case it exists for, because
+with text typed `←` is cursor movement rather than a detach, so the chord is the
+only route a half-written line has. The two keys are silent, because the
+prompt label changing back under your caret is the feedback; `/detach` answers
+`detached from agent N; it keeps running` and records
+`{"kind":"detach","agent":N}` for automation, because a submitted line has
+somewhere to put a reply and it is the last moment to tell a user who read
+`/detach` as "cancel the agent" otherwise. With nothing attached it answers
+`not attached to a background agent`. Detaching stops nothing: stopping is `x`
+in the view or `/jobs stop <id>`. Attaching a finished agent collects its result
+just as `Space` does, and closing the view with `q` or `Esc` does not detach.
+
+`n` opens a rename line that accepts any name the registry does -- including
+non-ASCII, which it previously dropped without saying so. A refused name (empty,
+longer than the limit, or carrying control characters) is reported on the rename
+line itself and leaves what you typed in place to be corrected; `Esc` cancels
+without renaming.
+
+While you are attached, the foreground turn keeps running and its output is held
+back rather than interleaved, then replayed when you detach under a
+`⛩ detached from agent N — recap:` header. The buffer holds 64 KiB; if it has
+to drop anything it says how many lines, at the top of the recap, so a gap is
+never silent. A detach with nothing buffered prints nothing at all. Attaching
+straight to another agent replays the first one's recap before announcing the
+new attachment.
+
+While you are attached, a line you submit belongs to that agent: it steers the
+agent, or -- if the agent is blocked waiting on a permission -- answers it with
+`y`, `a` or `n` (the same spellings `/jobs reply` takes). Which one happens is
+decided when you press `Enter`, not when you started typing, and the registry has
+the last word: if the agent finished, stopped, or blocked while you were typing,
+nothing is sent, the agent's own refusal is printed, and **your line stays in the
+composer**. Slash commands are still commands while attached, so `/detach` always
+works.
+
+`?` lists every key the view binds, and `/help keys` prints the same list
+without opening the view -- both render one table, so neither can drift from the
+other or from what the keys actually do. `Enter` or `→` attaches to the selected
+agent, `q` closes the view, and `Esc` leaves whatever line or panel is open
+before closing it.
+
+The status row's background-agent counter follows the registry while you are at
+the prompt, not only while a turn is running -- so an agent that parks on a
+permission shows up without you having to touch the keyboard. A registry change
+with nothing new to show paints nothing, so the row stays still when the state
+does.
+
+`+` opens a dispatch line: type a task to start a background agent on the
+default profile, or `@<profile> <task>` to choose one. `Enter` starts it, `Esc`
+cancels and starts nothing. Refusals -- a line it cannot read, an unknown
+profile, or the registry already at `max_running` or `max_records` -- are
+reported on the dispatch line and leave what you typed in place. Dispatches from
+the view are admitted by the registry's own ceilings, **not** by the model's
+per-turn spawn cap, which exists to stop a model storming agents within one turn.
+Starting an agent leaves the selection where it was.
+
+`/` opens a filter line: `s:<state> n:<text> o:<text> p:<profile>`, each term
+confined to its own field, so a name filter cannot match a task. A term it
+cannot read is refused with the key it did not recognise, and what you typed
+stays in the line so one wrong character can be corrected rather than retyped;
+an empty filter clears it. `Esc` abandons a half-typed term without clearing the
+filter already in force.
+
+The filter decides which agents the keys act on, not just what you see: if it
+hides the selected agent the selection moves to a visible row, and if it matches
+nothing there is no selection for `x`, `r`, `n` or `p` to act on. The filter
+survives an agent finishing and the rows re-grouping, and closing the view
+clears it -- the view always opens showing everything.
+
+`s` steers the selected agent, opening an editable line with a caret that
+windows around the cursor so a correction longer than the terminal still shows
+where you are typing. `Enter` sends it; `Esc` cancels and sends nothing; an
+empty correction is refused. A pasted multi-line correction is content, not a
+submission -- the line waits for your own `Enter`.
+
+`r` replies to a blocked agent (a single key -- `y`, `a` or `n` -- read through
+the same parser `/jobs reply` uses, not a line of text), `x` stops it (press
+twice; on an agent that has already finished, the second press prunes it), `n`
+renames it, and `p` marks its result collected. Every one of them names its
+outcome, names its refusals, and says so when nothing is selected.
+
+`x` will not prune an agent whose result nobody has read: it says the result is
+waiting, and the same keystroke prunes once you have peeked with `Space` or
+collected with `p`. This is deliberately stricter than `/jobs prune <id>`, which
+names an id explicitly and whose JSON reply carries the result; the second press
+of a keystroke is neither.
+
+Pasted text is never keystrokes here. In a name or correction line a paste is
+content, newlines included, and the line stays open for you to submit it.
+Anywhere else it is ignored with a line saying how many characters were skipped
+-- the text is never echoed back, because a clipboard may hold a secret.
+
+`Space` peeks the selected agent -- the same bounded redacted timeline
+`/jobs show` prints, the permission kind it waits on if blocked, and its result
+or failure if finished. Peeking takes custody of the result exactly as
+`/jobs show` does, so a peeked result is not surfaced again at exit while an
+unviewed one is; peeking a blocked agent takes custody of nothing, and opening
+the view takes custody of nothing. The
+deck is not also printed in inline mode, since it would scroll the transcript
+beneath the overlay unseen. A blocked agent carries its own marker -- `◉`, or `[blk]`
+under `--plain` -- in every agent surface, so the one waiting on an answer is
+distinguishable from the ones merely working; the marker vocabulary is shared
+with the deck rather than duplicated. `/jobs explain <id>` answers why one agent is in its
 state, since when, and what it is waiting on, drawn from the phase, elapsed
 time, last activity, failure class, steering and handoff already recorded; it
 is read-only and, unlike `/jobs show`, never acknowledges a ready result, so

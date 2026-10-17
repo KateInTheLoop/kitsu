@@ -93,6 +93,120 @@ shapes may change in any minor release.
 
 #### Terminal UI (preview)
 
+- **Attach to a background agent from the agent view.** `Enter` or `→` on the
+  selected row attaches and closes the view; the composer prompt then names the
+  agent, so you can see what your next line is aimed at. `←` on an empty
+  composer, `Ctrl+X d`, or **`/detach`** returns you to the session. The two keys
+  are not interchangeable: `←` needs an empty composer, while **`Ctrl+X d` works
+  with a line in progress and keeps what you had typed** -- which is the case it
+  exists for, since with text typed `←` is cursor movement. The keys are
+  silent, because the prompt label changing back is the answer; `/detach` says
+  `detached from agent N; it keeps running`, since a typed command deserves a
+  reply and that is the last moment to say that detaching is not stopping.
+  Attaching works from **either** route into the view — the `Ctrl+X a` chord, the
+  double `←`, or `/jobs view`.
+  Attaching a finished agent counts as collecting its result, exactly as `Space`
+  does. Detaching stops nothing. Leaving the view with `q` or `Esc` does not
+  detach.
+- **Fixed:** in the agent view, `n` silently dropped non-ASCII characters from a
+  name — typing `café` named the agent `caf`, even though `/jobs` would accept
+  the full name. The rename line now takes any name the agent registry accepts,
+  including one whose characters arrive split across reads, and a refused name
+  stays on screen with the message so the one wrong character can be corrected
+  rather than the whole name retyped.
+- **Attaching no longer loses the foreground's output.** While you are attached,
+  whatever your main turn prints is held back and replayed when you return, under
+  a `⛩ detached from agent 3 — recap:` header — so attaching to watch a
+  background agent does not cost you the transcript of what you were already
+  doing. The buffer is bounded at 64 KiB and **says how many lines it dropped**
+  rather than quietly losing them; a detach with nothing to replay prints
+  nothing. Switching straight from one agent to another replays the first one's
+  recap first, under its own header, so no agent's output is attributed to
+  another.
+- **While attached to an agent, what you type goes to that agent.** A line steers
+  it; if it is blocked waiting on a permission, `y`, `a` or `n` answers it. Attaching
+  now announces this (`⛩ attached to agent 3; your next line steers it, or answers
+  it while it is blocked`), because the route changes what `Enter` does without
+  adding a key to find in the help. Slash commands still work while attached, so
+  `/detach` always gets you out.
+  **A refusal never eats your line:** if the agent finished, stopped, or blocked
+  while you were typing, nothing is sent, you are told why in the agent's own
+  words, and your text is still in the composer.
+- **`/help keys`** prints the agent view's key bindings without opening the view,
+  and the view's own `?` help now prints the same rows from the same table — so
+  the two can no longer disagree about what a key does.
+- **Fixed:** three keys the agent view has always accepted were advertised
+  nowhere: **`q`** closes the view, and **`Enter`** or **`→`** attaches to the
+  selected agent. All three are now in the help, and a test presses **every** key
+  the view can receive and fails if any of them does something while being
+  undocumented — or is documented while doing nothing.
+- **Fixed:** the background-agent counter on the status row went stale while you
+  sat at the prompt. It only refreshed while a turn was running, so an agent that
+  blocked waiting for your permission could sit there invisibly until you typed
+  something, resized the window, or submitted a line -- which is the one moment
+  you most need to be told. The row now follows the registry as it changes, and a
+  change with nothing new to show still paints nothing.
+- **Start a background agent from the agent view with `+`.** Type a task for the
+  default profile, or `@<profile> <task>` to pick one; `Enter` starts it, `Esc`
+  cancels. A refusal -- an unreadable line, an unknown profile, or the registry at
+  its ceiling -- is reported on the dispatch line itself and **leaves your task
+  there to be corrected** rather than making you retype it. A dispatch you start
+  this way is admitted by kitsu's own limits (8 running / 128 records by default),
+  **not** by the per-turn cap that stops a model spawning agents in a loop -- that
+  cap exists for models, and you are not one. Starting an agent does not move the
+  selection, so your next keystroke still acts on the row you chose.
+- In the agent view, **`/` filters the rows** — `s:<state>`, `n:<text>`,
+  `o:<text>` and `p:<profile>`, each confined to its own field. A term it cannot
+  read is refused on the spot, naming the key it did not recognise and leaving
+  what you typed in place to be corrected; an empty filter clears it. **The
+  filter also governs which agent the keys act on**, so a filter that hides the
+  selected agent moves the selection to one you can see, and a filter matching
+  nothing leaves nothing for `x` or `p` to act on. The filter survives agents
+  finishing and re-grouping, and the view always opens showing everything.
+- In the agent view, **`s` steers the selected agent**: a real editable line
+  with a caret, which windows around the cursor so a long correction still shows
+  where you are typing. `Enter` sends it, `Esc` cancels and sends nothing, and a
+  pasted multi-line correction is content rather than a submission — the line
+  waits for you to press `Enter` yourself.
+- In the agent view, **`r` replies to a blocked agent, `x` stops it (twice; on
+  an already-finished agent the second press prunes it), `n` renames it and `p`
+  marks its result collected.** Each names its outcome, including the failures —
+  replying to an agent that is not blocked, stopping one already finished,
+  acknowledging one with nothing to acknowledge, or an illegal name — and each
+  says so when nothing is selected rather than doing nothing silently.
+- **`x` refuses to prune an agent whose result nobody has read**, tells you the
+  result is waiting, and prunes on the same keystroke once you have peeked it
+  with `Space` or collected it with `p`.
+- **Pasted text is never treated as keystrokes in the agent view.** Inside a
+  name or correction line a paste is content, newlines included, and the line
+  stays open for you to submit. Elsewhere it is ignored, with a line saying how
+  many characters were skipped and how to open a field for them — the text
+  itself is never echoed, since a clipboard may hold a secret.
+- In the agent view, **`↑`/`↓` move the selection**, which now actually works:
+  the arrow keys used to close the view and leak their escape sequence into the
+  prompt underneath. The selection follows **the agent**, not the row position,
+  so an agent finishing and re-grouping can never silently move your next
+  keystroke onto a different one; it clamps at both ends rather than wrapping,
+  and moving it never collects a result.
+- In the agent view, **`Space` peeks** the selected agent: its bounded redacted
+  timeline, the permission it is waiting on if blocked, and its result or failure
+  if finished. Peeking counts as collecting the result, exactly as `/jobs show`
+  does, so a peeked result is not reprinted when you exit — while one you never
+  looked at still is. Peeking a blocked agent collects nothing, and merely
+  opening the view collects nothing.
+- **The agent view opens.** In the inline viewport, `Ctrl+X a`, `/jobs view` (or
+  `/agents view`), or pressing **←** twice on an empty composer opens an overlay
+  listing your background agents grouped by state — agents needing input first —
+  with `?` for keys and `Esc` to close. The chord follows `[tui] prefix`, and
+  `[tui] left_arrow_opens_agents = false` turns off the ← route while leaving the
+  chord. The first ← only hints, so it cannot open by accident, and ← on a
+  non-empty draft still just moves the cursor. `↑` history recall is unchanged.
+  In classic mode `/jobs view` keeps printing the text deck as before.
+- A background agent that is **waiting for your answer now has its own marker**
+  in `/jobs list`, `/jobs view`, `/jobs show` and `/jobs explain` — `◉`, or
+  `[blk]` under `--plain`. It previously shared the busy agent's marker, so the
+  one agent needing you looked exactly like the ones that did not. No other
+  state's marker changed.
 - `--reduced-motion` (and `KITSU_REDUCED_MOTION=1`) now affects the inline
   viewport, not just the wait indicator: the status row stops repainting just
   because the clock moved. It still updates the moment something actually

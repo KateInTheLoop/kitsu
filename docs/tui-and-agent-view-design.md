@@ -333,44 +333,565 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
 
 ### 3.2 Functional — agent view (A)
 
-- **A1** `Ctrl+X a` or `/jobs view` MUST open the agent view overlay (the
-  `/agents` alias arm, which today forwards only an empty or numeric
-  argument, is widened to forward `view|explain|reply`; mid-turn `/jobs` has
-  its own handler, `handle_active_jobs_command`, which gains the same
-  subcommands); `←` on an empty composer MUST open
-  it too (first press shows a hint, second opens), configurable off. `←` is
-  distinct from the existing `↑`-on-empty queue recall and never consumes a
-  draft.
+- **A1** `Ctrl+X a` or `/jobs view` MUST open the agent view overlay; `←` on an
+  empty composer MUST open it too (first press shows a hint, second opens),
+  configurable off. `←` is distinct from the existing `↑`-on-empty queue recall
+  and never consumes a draft.
+
+  **Corrected in T4-S2: two of this requirement's clauses described work that
+  had already shipped.** It used to say the `/agents` alias "today forwards only
+  an empty or numeric argument" and that `handle_active_jobs_command` "gains the
+  same subcommands". Verified false on both counts — the alias maps empty to
+  `list`, a number to `show <n>`, and **everything else verbatim**, with a
+  comment saying `/jobs` owns the suggester; and the mid-turn handler already had
+  `view`, `explain` and `reply`, with tests. The widening was a **no-op**, and the
+  only missing piece was the overlay at the far end. Dispatch was therefore not
+  restructured.
+
+  **The chord is read from `[tui] prefix`**, not hard-coded: a configured
+  `ctrl+t` leaves the default `Ctrl+X a` inert, and an unrecognisable spelling
+  yields **no chord route** rather than a silent rebinding. `←` is gated by
+  `[tui] left_arrow_opens_agents`, which disables that route alone.
+
+  **The two-press `←` disarms on any other keystroke.** The armed state belongs
+  to an uninterrupted run of `←`s on an untouched empty composer, so typing and
+  deleting back to empty requires two presses again. The alternative — arming
+  until the view opens — would make a keystroke's meaning depend on something the
+  user did minutes ago and can no longer see.
+
+  **How `↑` is protected.** The arming state is a single local in the inline
+  reader, not an editor action and not derived from the editor's empty-buffer
+  predicate; `crates/kitsu-editor` was **not modified at all**, so
+  `RecallRequest` and the deliberate decline that makes `↑` walk history are
+  byte-for-byte unchanged. A byte filter between the read and the editor
+  recognises only the prefix byte, `ESC[D` and the two bracketed-paste
+  delimiters, forwarding everything else — and it tracks the paste delimiters
+  precisely so a `0x18` or an `ESC[D` **inside pasted text arrives as content,
+  not as a chord**. A sequence split across two reads is held and released in
+  front of the next chunk, so the editor sees the same byte stream either way.
+
+  **`/jobs view` now differs by renderer:** the overlay in a TUI mode, the text
+  deck in `classic`. The deck is **not** also printed in inline mode — it would
+  land in the transcript beneath the overlay, unseen but still scrolling the
+  user's history.
+
+  **Known gap:** the overlay takes the **alternate screen unconditionally**, so
+  `[tui] alternate_screen = never` does not yet get the in-viewport overlay this
+  design describes elsewhere. That path is unexercised and `alternate_screen`
+  remains a key without a consumer.
 - **A2** Rows MUST be grouped by state in this order: *Needs input*, *Working*,
   *Done (unviewed)*, *Done (viewed)*, *Failed*, *Cancelled*. Each row: state
   label, id, name or task head, model/profile, last activity + age, tokens.
-- **A3** Keys: `↑/↓` move, `Enter`/`→` attach, `Space` peek, `s` steer
+
+  **Amended in T4-S1 on two points, both found by implementing it.**
+
+  **(a) A row cannot be built from the thread snapshot alone.** Verified: the
+  snapshot carries **neither tokens nor last activity** — those live on the
+  telemetry, reached through `AgentProgress`, which the thread DTO deliberately
+  does not embed. So a row is assembled from the snapshot **plus**
+  `AgentProgress`, and the three fields the snapshot cannot supply are
+  **`Option`, returning `None` rather than a zero**. A zero would be a lie: it
+  reads as "no tokens used" rather than "not known here", and in a view whose
+  job is telling you which agent needs attention, a confident wrong number is
+  worse than an absent one.
+
+  **(b) The order is a single source, and the labels deliberately differ from
+  `/jobs view`'s.** `AgentViewState` in `kitsu-render` owns the order —
+  `rank()` is read *out of* `order()` rather than restated — and it lives in
+  that crate rather than the viewport crate because the existing `DeckState` is
+  there and the new enum is a **refinement** of it (four glyph levels to six
+  groups). `/jobs view` keeps its own wording (`done, result ready` versus this
+  view's `done (unviewed)`); what a test enforces is that both surfaces agree on
+  **which** groups exist and **in what order**, by looking up each of
+  `/jobs view`'s own headings and comparing its index with `rank()`. Empty
+  groups are omitted, matching `/jobs view` — one behaviour, not two.
+
+  "Viewed" versus "unviewed" is the existing `AgentHandoffState`: `Ready` means
+  nobody has looked, `Acknowledged` means somebody has. `Unavailable` on a done
+  thread means there is nothing left to observe and is treated as viewed —
+  though note it is **not a representable DTO** (see **F61**), so that arm is
+  defensive rather than reachable.
+- **A3** Keys: `↑/↓` move, `Enter`/`→` attach, `Space` peek, `+` dispatch (**added in T4-S7**; A6 named no key and this list was full — see A6 for why `+`), `s` steer
   (prompt for text), `r` reply (only when blocked), `x` stop (twice to prune),
   `n` rename, `p` mark result acknowledged, `/` filter, `?` help, `Esc`
   close. Filter grammar: `s:<state> n:<text> o:<text> p:<profile>`.
+
+  **`↑/↓ move` was under-specified; T4-S4a decided these points and pinned each.
+  The first is a safety property, not a preference.**
+
+  - **The selection is an agent, not a row index.** Rows re-group constantly: an
+    agent finishing moves from `working` to `done (unviewed)`, which in A2's
+    order is a *later* group, so an index-keyed selection would silently
+    retarget the user's next `x` or `p` onto a **different agent**. Keying on the
+    agent id makes that impossible, and a test pins a regroup that really
+    reorders so an index-keyed model lands on the wrong agent and fails.
+  - **The selection clamps; it does not wrap.** `↑` on the first row stays.
+    Wrapping would carry the cursor from `needs input` — the group that needs
+    you — to `cancelled` in one keystroke, possibly while a stop is armed on the
+    row left behind. With no rows nothing is selected, and neither key invents a
+    selection.
+  - **When the selected agent vanishes** (pruned), the selection falls to
+    whatever row now holds its old display index, clamped to the new last row,
+    and is `None` only when the list empties. That is where the user's eye
+    already is; `None` would make the next keystroke a silent no-op.
+  - **`x` is two presses per row, and moving the selection disarms it.** This
+    extends T4-S2's rule for the two-press `←` to the case T4-S2 did not have:
+    an `x` armed on one agent and firing on another after a `↓` is the one way
+    this affordance stops an agent nobody asked to stop. A **repaint keeps** the
+    arming — a repaint is not a keystroke, and an agent finishing under the
+    cursor must not cancel a half-typed stop — but a repaint that **loses** the
+    armed agent disarms.
+  - **Moving the selection acknowledges nothing.** T4-S3 made peek the single
+    call site that takes custody of a result; selection must not become a
+    second one, or the guard on unviewed results stops meaning anything. Pinned
+    in both directions, with `p` on a row just moved over as the positive
+    control.
+  - **`r` is not a text prompt, and `s` is.** `AgentRegistry::answer` takes a
+    `Decision`, so `r` reads a decision through the **one** shared
+    `parse_permission_answer` (the parser **F45** was closed by consolidating);
+    only `s` needs a line of text. The row's `s` *(prompt for text)* applies to
+    `s` alone.
+  - **`n` rename legality**, which this requirement did not state: the name is
+    trimmed, must be non-empty, at most `AgentRegistry::NAME_MAX_CHARS`, and may
+    contain **no control characters**; **non-ASCII is legal** — the rule is
+    control characters, not ASCII-only. **Any phase is renameable**, terminal
+    included, since the agent whose result you are about to read is the one worth
+    labelling. Each refusal is **distinct** (`Empty`, `TooLong`, `Unprintable`,
+    `NotFound`), and a refused rename leaves the previous name intact.
+    Deliberately **not** `safe_inline_label`: that helper coerces empty to
+    `"unknown"` and truncates with an ellipsis, which is right for a
+    model-produced label and is exactly the silent rejection this project
+    refuses for a name a human just typed.
+
+    **`n` only became able to honour "non-ASCII is legal" in F70's card.** The
+    rule was stated here, the registry implemented it and its own tests pinned
+    it — but the key read its draft through the **ASCII-only**
+    `OverlayKey::Char`, so typing `café` renamed the agent to `caf`,
+    **silently**. The rule and its enforcement agreed; nothing checked whether
+    the only path a user has could reach it. **A validation rule is only as wide
+    as the narrowest input path that feeds it** (**F70**) — the third time this
+    epic paid for that blind spot, after **F57** and **F69**.
+
+    `n` now reads its line through `kitsu-editor` on the same bypass as `s` and
+    `/`, which makes the rename line an **innermost frame**: `Esc` steps out of
+    it first, and **a refused rename is painted on that frame and leaves the line
+    open carrying the text** — the same contract `/`'s refused term has, so the
+    message and the text it is about are on screen together and one wrong
+    character is corrected rather than a 48-character name retyped. Painting it
+    anywhere else would repeat **F71**, a message the test can read and the user
+    can never see.
+
+  **`x` was under-specified, and T4-S4b settled it against a hazard this
+  requirement did not anticipate.**
+
+  - **The reading.** `x` arms; the **second press stops a live agent and prunes
+    an already-terminal one.** That is how "stop (twice to prune)" is satisfied
+    without a third press and without changing T4-S4a's arming. The premise was
+    verified rather than assumed: `cancel`'s terminal predicate and `prune`'s
+    `Running` predicate are the **exact complement** (both `Running | Blocked`),
+    so "stop would answer `AlreadyTerminal`" and "prune would answer `Pruned`"
+    describe the same set. The implementation **sequences** the stop and then the
+    prune rather than reading a phase and then calling, so nothing can finish in
+    the gap.
+  - **`x` refuses to prune a terminal agent whose result is still unviewed**,
+    reports that the result is waiting, and prunes on the identical press once
+    `Space` or `p` has collected it. The reason is **F67**: `prune` removes the
+    record, and the guard that surfaces unviewed results can only iterate records
+    that still exist — so pruning discards the result **and the guard cannot
+    know**.
+  - **This is deliberately asymmetric with `/jobs prune <id>`,** which does
+    discard such a result today. That is an explicit command naming a specific
+    id, and its JSON path returns the terminal payload, so automation keeps the
+    result; only the interactive path loses it. **The second press of an arming
+    is neither explicit nor id-naming.** The asymmetry is the point: *the same
+    registry call is safe behind a typed id and unsafe behind a keystroke.*
+    Whether `/jobs prune` should also print the result before discarding it is an
+    open product question recorded in **F67**, not something the key works
+    around.
+  - **Every action key has a no-selection report**, never silence — the same
+    reasoning that gave T4-S4a's `press_stop` a `NoSelection` answer rather than
+    a silent `Armed`. Likewise every failure case is **distinguishable** (`r` on
+    an agent that is not blocked, `x` on an already-terminal one, `p` with
+    nothing to acknowledge, `n` with an illegal name), because a human typing
+    into a racy world must be able to tell *nothing happened* from *it worked*.
+  - **Nothing in a paste is ever a key (F68).** This is a **safety** clause, not
+    a convenience one. The overlay reads raw bytes and processes a whole chunk
+    at once, and it never asked the terminal to bracket pastes — so before this
+    rule a paste was indistinguishable from typing, and **one pasted line of
+    prose was shown to approve a parked filesystem write and then stop the
+    agent** (`allow_once`, 34 keys from one chunk). Pasted text must never
+    become a privileged action.
+
+    - **Inside a text prompt** (`n`'s name, `s`'s correction, `/`'s filter) the
+      whole payload is content, **newlines included**; the prompt stays open and
+      the user presses `Enter` themselves. This keeps **one** answer to "what is
+      a byte inside a paste?" across the binary: `kitsu-editor` already holds
+      that a bracketed paste never submits, and T4-S2 decided a prefix byte
+      inside a paste is content.
+
+      **This clause holds only where the terminal brackets pastes — see F72.**
+      All three lines read their bytes through `kitsu-editor` on a bypass that
+      skips the decoder, for three good reasons (a non-ASCII value is legal and
+      `OverlayKey::Char` is ASCII-only, a bracketed paste must not submit, and a
+      multi-byte character really arrives split across reads). But the
+      **unbracketed-burst** fallback F68 added lives in the **decoder**, so these
+      lines do not get it: on a terminal that does not report pastes the editor
+      submits at the paste's first newline and the rest stays in the line. **The
+      fix for one hazard removed the mitigation for another**, which is worth
+      saying rather than leaving the clause looking unconditional.
+
+      **The safety half is unaffected, verified by reading:** an open line's
+      branch in `overlay_feed_chunk` ends with `return false`, so the **whole
+      chunk** is consumed by the line and the decoder is never reached — a
+      mid-chunk submit's tail **cannot** become keys, and F68's `r`+`y` and
+      double-`x` hazards stay closed. The residual gap is early submission, not
+      privileged action.
+    - **Over the row list, and inside `r`'s decision read, a paste is dropped
+      entirely** — never an action, and the decision read stays open rather than
+      resolving to a pasted letter.
+    - **Detection is two-sided**, because one side is not always available: the
+      overlay emits `ESC[?2004h` itself (it owns the terminal, as
+      `tui_bridge::KeyFilter` does without rustyline), **and** treats a chunk
+      yielding more than one printable key as a burst rather than typing — the
+      latter is what protects a terminal that does not report pastes at all.
+    - **The burst rule is a heuristic and fails safe:** a fast typist, or a
+      terminal that batches bytes, can have two quick presses read as one burst
+      and dropped. That direction is deliberate, but it meets T2-S5b's rule that
+      a human must be able to tell *nothing happened* from *it worked*, so a
+      swallowed burst **says so**, names how many characters it ignored, and
+      says how to make a paste mean something (`n` opens a name, `s` a
+      correction).
+    - **It reports the count and never the text.** The payload is the user's
+      clipboard and may hold a secret, so painting it into the frame would be a
+      new disclosure — the same reasoning as **F40**, where the timeline's
+      protection had to become structural rather than accidental. Inside `r`'s
+      decision read the paste is silent **by construction**: an open prompt owns
+      the report row, and the read's own `y allow once, a allow always, n deny`
+      line is the honest thing to show while it is still open.
+    - **The overlay enables bracketed paste but does not disable it on exit**,
+      deliberately. `RawStdinGuard` owns that pair (`engage` writes `?2004h`,
+      `Drop` writes `?2004l`). At the inline idle reader the overlay runs
+      *inside* the caller's still-live guard, so writing `?2004l` on close would
+      strip bracketed paste from the composer underneath **for the rest of the
+      session** — a regression in the surface that needs it most. The enable is
+      belt-and-braces by the surface that depends on it; the disable stays with
+      the owner.
+
+    **F65 and F68 are one root with opposite signs**, and both belong in any
+    future key work: *an arrow key is not one byte*, and *a chunk of bytes is
+    not a sequence of intentions*. A loop that treats every decoded key as a
+    deliberate keystroke is safe only while no key does anything.
+
+  - **`s`'s text sub-mode (T4-S4b-ii, shipped).** `s` opens a real editable line
+    over the existing `kitsu-editor`, not a second line editor — **F45** was
+    closed by removing a duplicate parser of the same bytes, and this is the
+    same rule. `kitsu-tui` paints it (`steer_prompt_rows`) and cannot reach the
+    editor; `main.rs`, where the loop runs, can.
+    - **`ESC` cancels the line and sends nothing**, under the same 50 ms grace
+      **F65** introduced. Inside this overlay `Esc` already means *step back out
+      of the frame you are in*, and the steer line is one more frame; two
+      meanings for `ESC` on one surface is the F65 ambiguity itself. Only one
+      surface resolves a held `ESC` at a time, and the grace is **spent only
+      when an `ESC` is actually held**, so an idle line costs no repaint spin.
+    - **While the line is open it reads the raw bytes itself, bypassing the
+      overlay decoder** — so the editor sees the terminal's real
+      `ESC[200~`/`ESC[201~` and enforces *a bracketed paste never submits* as
+      the one parser that owns that rule. This is the deliberate answer to a
+      hazard: F68's decoder **strips** the delimiters and yields plain text, so
+      feeding that text back through the editor would let an **unbracketed**
+      newline reach the submit path — F68 re-entering one layer down. A second
+      reason seals it: `OverlayKey::Char` is **ASCII-only by construction**, so
+      routing the line through the decoder would discard exactly the split-UTF-8
+      handling that justified reusing the editor.
+    - **Opening the line mid-chunk drops the rest of that read.** Those bytes
+      were decoded as keys before the line existed, and letting them fall
+      through to the row list could run `x`. A normal read carries one
+      keystroke.
+    - **An empty correction is refused.** The guard is key-level but constructs
+      the registry's own `Empty` error, so the wording is identical to
+      `/jobs steer`'s.
+    - **The echo flattens control characters one-for-one and windows around the
+      caret**, so a pasted newline cannot paint an unbudgeted row and a
+      correction longer than the terminal still shows the cursor instead of
+      pushing it off the edge. Its decisions
+    are pinned by tests but not implemented: `ESC` cancels the line under the
+    same 50 ms grace T4-S4a introduced, a newline **inside a paste is content**
+    (consistent with T4-S2's prefix-byte rule), and an empty correction is the
+    registry's own `Empty` refusal rather than a key-level guard. The input is
+    the existing `kitsu-editor` line editor, reached from `main.rs` where the
+    overlay loop runs — `kitsu-tui` depends on `kitsu-render` only and cannot
+    reach it, and a second line editor there would be a second parser of the
+    same bytes, which is what **F45** was closed by removing.
+
+  **`/` was listed and unbound until T4-S5, which decided these four points.**
+
+  - **The filter's rows are the selection's rows. This is a safety property.**
+    The selection is keyed on an agent id, and a filter **hides rows without the
+    agents going away** — so `AgentSelection::sync` is handed the **filtered**
+    rows. Handed the full rows it would leave the selection on a **hidden**
+    agent, and the dispatch would then let `x`, `r`, `n` or `p` act on an agent
+    **not on screen**: the **F68** family exactly, a privileged action with no
+    visible intent. Consequences, each pinned: a filter that hides the selected
+    agent **moves the selection to a visible row**; a filter matching nothing
+    leaves **no** selection, so `x` reports the no-selection line rather than
+    stopping the agent that *used* to be selected. **Clearing the filter does not
+    restore the old selection** — a remembered-and-restored selection is hidden
+    state steering a destructive key, which is the same hazard with one more
+    step.
+  - **The filter line reads raw bytes through `kitsu-editor`**, joining `s`'s
+    bypass, rather than the decoded text prompt. `n:café` is a plausible **and
+    legal** filter, and `OverlayKey::Char` is **ASCII-only by construction**, so
+    a decoded-key prompt cannot express it — see **F70**, where that same gap is
+    a live defect in the `n` key. The editor also brings the paste rule in the
+    same place as every other text field (**F68** satisfied without a second
+    decision) and handles a multi-byte character **split across reads**, which
+    byte-by-byte typing really produces. **F45**: a second line editor here
+    would be a second parser of the same bytes.
+  - **An invalid term is refused, the rows are left alone, and the line stays
+    open**, reporting **the parser's own message**. The two rejected readings:
+    *filtering to nothing* shows an empty view with nothing saying why — and in
+    this view an empty view can mean failing to show the agent waiting on an
+    answer; *closing the line* makes the user retype a filter that is one
+    character wrong. An **empty** line clears the filter, since the empty filter
+    already matches everything.
+  - **The filter survives a regroup and does not survive a close.** It lives in
+    the overlay's state, so repaints and an agent finishing keep it in force; a
+    reopen starts fresh, so the view always opens showing everything — a filter
+    outliving its screen would hide agents for a reason nothing on screen
+    explains, and the keys would act inside that hidden state. **`Esc` cancels
+    the line and leaves a filter already in force untouched:** cancelling is not
+    clearing, or `Esc` would do two things at once and abandoning a half-typed
+    term would lose the view you set up.
+
+  **The filter grammar was under-specified; T4-S1 decided these four points and
+  pinned each to an exact message.**
+  - **`o:` was never defined here.** It matches the **task/objective**
+    substring, while `n:` matches the **name** — each confined to its own field,
+    asserted in both directions, so a name filter cannot match a task.
+  - **`s:` had no vocabulary.** It is `needs-input`, `working`, `done-unviewed`,
+    `done-viewed`, `failed`, `cancelled`, read back off the states' own wire
+    spellings. `s:done` is an **error listing all six** rather than an alias for
+    both done groups — strict plus discoverable, chosen to minimise invention; a
+    friendlier alias is a defensible amendment.
+  - **A malformed filter is an error, never ignored.** Unknown key, unkeyed bare
+    text, a key with no value, an unknown state, and a repeated key are all
+    rejected by name. The reasoning is specific to this view: a silently dropped
+    term shows the **wrong agents**, and here that means failing to show the one
+    waiting on an answer. Empty input matches everything.
+  - **A repeated key is an error**, not last-wins.
 - **A4** Peek panel MUST show the bounded redacted timeline that `/jobs show`
   shows today, the pending approval request if blocked, and the result if
   done. It MUST never show tool arguments or raw tool output (existing
   redaction rule).
+
+  **Satisfied by construction, confirmed in T4-S3 — this is not a filter.** The
+  snapshot's `waiting_for` is an `AgentApprovalKind`, a **unit enum**, so a path
+  or argv word is **not representable**; timeline text is redacted at the source
+  and the DTO's `validate` **rejects** any entry whose text is not already
+  redacted; and approval entries are written as `approval to <kind> …`, kind
+  only. So rendering the same snapshot satisfies the clause, and the panel reuses
+  `/jobs show`'s own renderers — `format_agent_thread`, `pending_approval_request`,
+  `peek_result` and `sanitize_terminal_text` — in the same order, rather than a
+  second renderer that could drift. See **F40** for why the protection had to be
+  made structural, and **F52**/**F47** for what the ring does and does not hold.
+
+  A later reader should not add a scrubbing filter here: redaction deliberately
+  leaves paths untouched, so a panel that scrubbed them wholesale would hide a
+  legitimate result, and a test pins exactly that by requiring a result
+  containing a path to show it.
 - **A5** Attach MUST stream the agent's timeline live into the main viewport
   with an `⛩ attached to agent N` milestone, let the composer send steering
   (or an approval answer when blocked), and `←` on an empty composer or
   `/detach` return with a recap of events that happened while attached.
   Attaching never pauses the foreground turn; the foreground turn's output is
   buffered and replayed on detach.
+
+  **The routed composer (T4-S6b, shipped) routes on submit-time state, with the
+  registry as final adjudicator and no refusal that destroys text.**
+  - **Blocked at submit → answer**, through the **one** shared
+    `parse_permission_answer` (**F45** was closed by retiring a second answer
+    parser; `r`'s decision read uses the same one). A line that parser rejects is
+    **refused with nothing sent** — the agent stays blocked, which is the one
+    state it can still be answered correctly from.
+  - **Anything else → steer**, and `AgentRegistry::steer` adjudicates: an agent
+    that blocked or finished in the gap refuses **in its own words** rather than
+    being corrected or answered off a stale read.
+  - **Every refusal sends nothing and hands the line back** as the next read's
+    draft (**F76**), with the reason painted through the renderer's surface
+    (**F71**). In the implementation "refused" and "keeps the line" are the
+    **same boolean**, so they cannot drift.
+  - **Open-time routing was rejected** because it can only ever be wrong — a
+    steer the registry must refuse, or an answer taken from a stale block.
+    Submit-time plus "a refusal keeps the text" makes the user's worst case **one
+    extra keystroke with their words intact**, which is what stops the race being
+    a design problem.
+  - **A slash command stays a command while attached** (and a blank line stays
+    blank). Otherwise an attached session could never leave by `/detach`.
+  - **No new wording except the milestone**: `/jobs reply`'s own receipt on an
+    answer, `/jobs steer`'s own on a steer, `r`'s own refusal when a correction
+    reaches a blocked agent, and the registry's own `Display` for steer refusals.
+
+  **The `⛩` attach milestone is painted here**, in the one seam both attach
+  routes pass through, once per **change** of binding — nothing on a declined
+  exit, nothing on a re-attach to the same agent. Its text **names the route**,
+  not just the agent: *attached to agent N; your next line steers it, or answers
+  it while it is blocked*. The reason is **F82**: this route adds **no key** — it
+  changes what `Enter` means — so **the only thing that can enumerate it is the
+  moment it begins.** A key table cannot advertise a route that has no key.
+
+  **The inline composer does not share F72's unbracketed-paste gap** — checked,
+  not assumed. `KeyFilter` owns the bracketed-paste state machine, so a paste
+  arrives as **one draft** and a pasted multi-line correction routes as one
+  line; F72 applies to the overlay's four bypass lines only. `parse_permission_answer`
+  also strips paste markers, so a pasted `y` still answers.
+
+  **T4-S6 was split into three, and A5 therefore lands in three pieces.**
+  **T4-S6a** (shipped) is attachment itself and the keys that enter and leave
+  it; **T4-S6b** is the routed composer, which needs a live thread with an open
+  correction channel — the fixture problem that split T4-S4b; **T4-S6c** is the
+  64 KiB buffer and the recap replay, a disjoint surface (the output sink, not
+  key routing). The `⛩` milestones were deliberately **not** given a card of
+  their own: over an existing `milestone_line` helper that would pin two format
+  strings and prove nothing, and **F71** requires a visibility claim to go
+  through the surface that paints it — so the attach milestone belongs with (b),
+  where something can attach, and the recap milestone is (c)'s header.
+
+  **`←` detaches on the first press, on an empty composer, and is not gated by
+  `[tui] left_arrow_opens_agents`.** T4-S2 refused a durable armed state because
+  it makes a keystroke's meaning depend on something the user did minutes ago
+  **and can no longer see**; attachment is the opposite — it is on screen in
+  front of the caret for as long as it lasts, so **the context is legible at the
+  moment of the press.** The costs are asymmetric too: opening a full-screen
+  overlay by accident interrupts you, while detaching by accident costs one
+  keystroke and **stops nothing**. A non-empty draft keeps `←` as cursor
+  movement. The config key is not consulted because A1 scopes it to "that route
+  alone" — the agent view's — while this clause names `←` as the return path
+  unconditionally. **`←←` in a single read is one detach and no view**: an
+  implementation that counts presses before asking about attachment gets that
+  wrong, and a test is named for it.
+
+  **With nothing attached, `Ctrl+X d` is inert and silent while `/detach` is
+  answered.** A chord is a slip; a submitted line is an intention with somewhere
+  to put the answer (T2-S5b).
+
+  **`Ctrl+X 1..9` is not shipped, and the reason is a constraint, not a
+  schedule.** §4.7 says "attach agent N", but the digit **cannot be an id**:
+  ids pass 9 after nine spawns, so a digit-keyed id binding would be dead for
+  `#10` and — worse — **wrong** rather than dead once `#1` is pruned and `#11`
+  exists. It must therefore be a **1-based ordinal over A2's display order**,
+  which means resolving it against the registry at the composer's byte filter, a
+  point that has no registry. That coupling is its own card.
 - **A6** Dispatch from the agent view composer: plain text spawns a background
   agent with the default profile; `@<profile> <task>` selects a profile.
   Dispatch is admitted by the registry limits (`AgentRegistryLimits`,
   default 8 running / 128 records), **not** by the model's per-turn
   `SpawnBudget`, which exists to stop storming models.
+
+  **Two things this clause got wrong, corrected in T4-S7.** It says *composer*,
+  and the view has no composer — it has **modal edited lines**, so the dispatch
+  is the view's **fourth** (beside `s`'s correction, `n`'s name and `/`'s
+  filter). And it names **no key**, while A3's list was full, so one was chosen
+  here: **`+`**.
+
+  **`+` was picked for a property, not for taste.** It is `0x2b`, **outside the
+  CSI final-byte range `0x40..=0x7e`** — the same property `/` was chosen for,
+  and one that `r`, `s`, `n`, `p` and `x` do not have. That is **F65** (*an arrow
+  key is not one byte*) applied to a new binding instead of rediscovered by it.
+  The key is exported as `DISPATCH_KEY` so the help row, the overlay arm and the
+  tests read one letter and no test spells the character.
+
+  **The dispatch line inherits F72** with the other three: these lines take raw
+  bytes on the byte bypass, so the decoder's unbracketed-burst fallback does not
+  protect them, and on a terminal that does not bracket pastes a pasted task
+  submits at its first newline. Recorded, not fixed here.
+
+  **A dispatch does not move the selection**, on T4-S4a's safety argument: a
+  silent move would repoint the next `x` or `p` at an agent the user never chose.
+
+  **How "not the `SpawnBudget`" is actually satisfied:** by **not plumbing it**.
+  All twelve of its references were enumerated, and **every consumer is a
+  model-facing tool family calling `admit` as its first act** — nothing else in
+  the tree consults it. So `view_dispatcher`'s signature is
+  `spawn_agent_bg_tool_with_binder`'s **minus the budget**, and the claim is
+  pinned in the **positive** form rather than by omission: one budget and one
+  registry, where the model's spawn spends the turn's only credit, **the same
+  handler is then refused**, and the view's dispatch still succeeds with the
+  budget untouched.
+
+  **The over-capacity refusal is painted on the dispatch frame** and the line
+  stays open carrying the task, exactly as `n`'s and `/`'s refusals are
+  (**F71**) — a refusal painted under the row list would be off-screen while a
+  line is open.
 - **A7** Viewing a done agent (peek or attach) MUST transition its handoff to
   `Acknowledged`, exactly as `/jobs show` does (`peek_result` +
   `acknowledge_result`), so the exit guard and strict-automation rules are
   unchanged.
+
+  **Clarified in T4-S3, because "the exit guard" invites a wrong inference.**
+  The guard on unviewed results **surfaces** them, it does not refuse the exit:
+  on the way out the session prints `~ surfaced N previously unopened
+  background result(s) before exit`. Only **running or blocked** agents refuse
+  `/quit` (`exit blocked: N background agent(s) still running`). So peeking a
+  done agent means its result is **not reprinted at exit**, and an unviewed one
+  still is — that is the round trip, and it is what the tests pin. See **F64**:
+  the name is accurate and long-established, but it implies refusal, and both a
+  plan row and one of my briefs inferred refusal from it.
+
+  **Peeking a blocked agent acknowledges nothing**, because there is no result
+  to take custody of: `acknowledge_result` returns `NotReady` for a handoff of
+  `Unavailable` and does not mutate. **Opening the view, and repainting its
+  rows, acknowledge nothing either** — the peek is the single acknowledging call
+  site. Whoever adds selection state must preserve that: moving over a row must
+  not take custody of its result, or the guard stops meaning anything.
+
+  **A failed agent is not exempt.** `AgentThreadState::finish` sets
+  `handoff = Ready` for `Failed` and `Cancelled` exactly as for `Done`, and the
+  guard keys on the **handoff**, never the phase.
 - **A8** The ambient counter (R5) MUST update within 250 ms of a registry
   change in TUI modes. In `classic` it refreshes on the live status row once
   per input poll tick while a turn runs, and the idle prompt keeps reporting
   at the next prompt cycle, which is the pre-existing notice behavior.
+
+  **This clause was violated at the TUI idle composer until T4-S8, and the
+  carve-out in its second sentence is why nobody noticed.** That latitude is
+  granted to **`classic`** by its own wording; the TUI idle composer never had
+  it. Yet `sync_agent_counts` and `repaint_status_row` were called from **one
+  loop only** — the *during-a-turn* typeahead — while the idle read blocks with
+  **no timeout**, waking only on a resize and then explicitly retrying *without
+  a frame*. The idle row **does** carry the ambient tag, so **a background agent
+  that blocked while the user sat at the prompt changed nothing on screen until
+  a keystroke.** That is what R5 and the whole T2 blocked-agent surfacing exist
+  to prevent.
+
+  **The argument against it was already in the tree**, which is the part worth
+  remembering. The recorded rationale for having no idle cadence says the idle
+  prompt *"has nothing to tick"* — **true of the elapsed clock, false of the
+  ambient tag** — while the reduced-motion logic states the opposite case
+  exactly: these tags stay visible *"because they are state and not animation:
+  freezing them would hide a blocked agent."* Same reasoning, same segment,
+  applied to reduced motion and not to idle. **A justification true of one
+  segment is not true of the row.**
+
+  **The fix is a subscriber, not a poll.** `registry.subscribe()` wakes a task
+  that repaints the row; the counts are already a pull, so nothing is pushed and
+  the composer stays blocked in `read()`. A read timeout was rejected because
+  `read_line_inline_with_keys` is generic over `R: Read` and driven by in-memory
+  cursors in tests, so giving it an fd would mean changing the signature of the
+  one function that owns the decoder and the editor lines' byte bypass (**F68**,
+  **F72**). **A bare wake paints no frame**: the step compares the projected
+  counts against what it last showed and returns without painting when they
+  match, so reduced motion and N3's 1/60 s budget are untouched.
+
+  **`AMBIENT_TICK_POLL_MS` and `AMBIENT_LATENCY_BUDGET` now put A8's numbers in
+  the suite**, so raising the during-turn tick past 250 ms **fails by name** —
+  **F50**'s loud guard, which that finding proposed against a constant that did
+  not yet exist.
+
+  **Still open (not A8's fault, but adjacent):** mid-turn, the approval arm
+  `continue`s **before** the counts are re-pulled, so while an approval modal is
+  up the counter freezes and that modal's own row shows a stale count. Carded,
+  and deliberately untested: the new cadence may refresh it **incidentally**, and
+  an accidental fix is not a tested one.
 
 ### 3.3 Functional — blocked agents (B)
 
@@ -833,12 +1354,40 @@ Backed mostly by existing data: `AgentRegistry::snapshot()`,
   functions over DTOs so they are unit-testable without a terminal.
 - **Row indicators.** Rows use the state **word** (`blocked`, `working`,
   `done`, `viewed`, `failed`, `cancelled`) as the primary indicator, exactly as
-  the `/jobs` deck does, tinted per theme. The only row glyph is `◉` for
-  *blocked* (it is the approval glyph; plain maps it to `o`). `◆`/`◇` keep
-  their `/profiles` capability meaning and `◈` stays the deck/section header;
-  none of them is reused as a row-state glyph, so plain mode never renders a
-  row as `tool>` or `result>`. Any new glyph must be added to
-  `docs/ux-design.md` and `ascii_structural_markers` in the same change.
+  the `/jobs` deck does, tinted per theme. `◉` is the glyph for *blocked* (it is
+  the approval glyph, and a blocked agent **is** a pending approval; plain maps
+  it to `o`).
+
+  **Amended in the marker story, which closes F34 and F3.** This paragraph used
+  to forbid reusing `◆`/`◇`/`◈` as row-state glyphs, "so plain mode never
+  renders a row as `tool>` or `result>`" — a real hazard, since
+  `ascii_structural_markers` maps `◆→*`, `◇→>`, `◈→#`, and `#` is exactly what
+  a plain section header prints.
+
+  **But the ban was the wrong instrument, and the shipped deck had already
+  broken it**: `/jobs` has used `◈` for result-ready rows since D1. The hazard
+  **cannot occur through `deck_marker`**, because it checks `plain` **first**
+  and returns a bracketed ASCII token (`[blk]`, `[run]`, `[rdy]`, `[err]`,
+  `[stp]`) — so a row glyph never reaches the mapper at all. The rule is
+  enforced **structurally** rather than by prohibition.
+
+  So the agent view and the `/jobs` deck share **one** marker vocabulary,
+  `kitsu_render::deck_marker`, which the view reaches through
+  `AgentViewState::deck_state()` — **one function, not two tables that agree
+  today**, because two vocabularies for the same data is the drift this epic has
+  five findings about. `◈` is consequently shared between a section header and a
+  *done (unviewed)* row in the glyph tiers, deliberately, and disambiguated
+  structurally: a header is unindented and word-only, a row is indented and
+  starts `#<id>`.
+
+  `DeckState::Blocked` exists as of that story — this paragraph previously
+  asserted `kitsu-render` had no blocked state, which is no longer true — so a
+  blocked agent is no longer rendered identically to a busy one. All four
+  surfaces agree: `/jobs list`, `/jobs view`, `/jobs show` and `/jobs explain`
+  print `◉` or `[blk]`.
+
+  Any new glyph must still be added to `docs/ux-design.md` and
+  `ascii_structural_markers` in the same change.
 
 ### 4.5 Attach semantics
 
@@ -849,10 +1398,147 @@ Attach does not move the agent to the foreground or take its stdin; it is a
   offers the option keys first (`y/a/n`) and free text as a steering message.
 - foreground orchestrator output is buffered (bounded, 64 KiB; overflow noted)
   and replayed with a `⛩ detached from agent N — recap:` milestone on return.
+
+  **T4-S6c settled three things this clause left open, and completes A5.**
+
+  - **The milestone is the recap's *header*, and is suppressed when nothing was
+    buffered.** A detach with an empty buffer paints **nothing at all** — not a
+    bare header. Three reasons: the clause itself makes the milestone the thing
+    the recap is *"replayed with"*; §4.5 separately settles that **the two keys
+    are silent and the command answers**, so a bare milestone on `←`/`Ctrl+X d`
+    would break that silence rule; and a header ending in a colon with nothing
+    under it reads as a bug. The code returns before painting the header, so the
+    naive "header, then lines" shape does not exist.
+  - **The bound is bytes, and deliberately NOT the line-bounded cell ring.**
+    **F52** is the finding that *"N4 said memory and specified lines; a single
+    huge line is still unbounded"*, and the ring has no byte accounting anywhere.
+    A **structural** reason settles it independently: the buffer decorates
+    `Surface`, which lives in `kitsu-render`, while `CellRing` lives in
+    `kitsu-tui` — and **`kitsu-render` does not depend on `kitsu-tui`**, so the
+    ring is unreachable from it however it is bounded. **`cell_ring_lines` still
+    has no reader and F52 stays open** for the overlay and the `[` dump; it is
+    decided only for this buffer.
+  - **Overflow is *marked*, not merely bounded.** The note is the recap's
+    **first** entry and **counts the lines the bound cost**; eviction is
+    oldest-first, so the gap is at the top where the note sits and F52's
+    "silently eats the middle" cannot happen. Pinned at **two** levels, and the
+    painted one is the point (**F71**): *a recap that computed the note and
+    replayed only the survivors would pass every unit test and still show the
+    user an unmarked hole.*
+  - **A clamped styled line is cut on a `char` boundary and ends with a reset** —
+    F52's *second* caution, which a **byte** bound makes real for the first time
+    in this epic. It is `fit_row`'s existing rule. The test caught a prototype
+    that cut on a boundary without resetting, which would have coloured the rest
+    of the session.
+
+  **A fourth way an attachment ends, which no key triggers (F84).** The clause
+  names `←` and `/detach`, and `Ctrl+X d` arrived in T4-S6a — but **re-binding to
+  a different agent through the view ends an attachment with no detach key at
+  all.** The previous agent's recap is replayed **under that agent's own header,
+  before the new agent's attach milestone**, and **order is the assertion**: the
+  other order **attributes one agent's turn to another**. All four transitions
+  call one replay.
+
+  **Attaching never pauses the foreground turn**, and the buffer cannot make it:
+  the bound is held by **evicting**, never by refusing a write; there is no
+  channel to signal "wait" through (`transcript_line` returns `()`); and the
+  displaced surface is never called from any `Surface` method.
 - `Ctrl+C` keeps the existing editor rule: a non-empty draft is cleared; on an
   empty draft it **detaches** (it never stops the agent — stopping is explicit
   via `x` in the view or `/jobs stop`). `Ctrl+Z` keeps its existing meaning
   (suspend kitsu) and is not a detach key.
+
+  **`Ctrl+X d` carries the draft; `←` does not need to (F76).** The two routes
+  are **not interchangeable**, and the asymmetry is the point: `←` detaches only
+  on an **empty** composer, so with text typed it is cursor movement and the
+  chord is the **only** route a half-written line has. `InlineRead::Detached`
+  therefore carries the composer's contents, and the loop replays them into the
+  next read.
+
+  The variant's doc comment used to say the draft was not carried back *"because
+  this outcome is only ever reached on an empty one"* — **true of `←`, false of
+  the chord.** A variant documented by the narrowest route that reaches it: the
+  comment was accurate when written and became wrong when a second caller
+  arrived, which is **F69**'s and **F70**'s mechanism one level down, in the type
+  system. The cheap alternative — giving the chord an empty-composer precondition
+  so the comment became true — was **rejected**, because with an empty composer
+  the chord is **already** redundant (`←` detaches on the first press and is not
+  gated by `[tui] left_arrow_opens_agents`), so narrowing it would have left the
+  chord with no case of its own and the non-empty case with no route at all.
+
+  **`/detach` is wired (F77, F79).** It answers `detached from agent N; it keeps
+  running` and records `{"kind":"detach","agent":N}`; with nothing attached it
+  answers `not attached to a background agent` as an error. **The division is
+  deliberate: the two keys are silent and the command answers.** `←` and
+  `Ctrl+X d` deliver their feedback where the eye already is — the prompt label
+  changing under the caret — while a submitted line moves the eye into the scroll
+  region, which is the surface with somewhere to put a reply (T2-S5b). The
+  success line repeats the "stops nothing" clause because it is the last moment
+  a user who read `/detach` as "cancel the agent" can be told otherwise.
+
+  **F79, fixed in the same card:** `/jobs view` kept only the overlay's `shown`
+  and **discarded the attachment**, so attaching from that route silently
+  attached to nothing while the chord and arrow routes worked. Attachment now
+  works from every route into the view. The lesson is recorded in F79: **when a
+  function starts returning something new, every caller is a suspect, and callers
+  are enumerable** — this one changed from `-> bool` to `-> AgentViewExit` and
+  had exactly two callers.
+
+  **Superseded note (F77, kept for the record):** Its arm is
+  unconditional — it always answers `not attached to a background agent` —
+  because the slash dispatcher has no access to the composer's session binding.
+  The arm's own comment says *"nothing in this card can attach"*, which was
+  **true when written**, before the rework that made attachment work; it was
+  never revisited. Wiring it means threading that binding through
+  `handle_slash_command`'s call sites, which is a signature change and its own
+  card. `←` on an empty composer and `Ctrl+X d` both work today. **The lesson,
+  recorded in F77: when a rework makes something possible that was previously
+  impossible, every arm written while it was impossible is suspect.**
+
+  **The detach half of the `Ctrl+C` clause is deliberately NOT shipped, pending F54.**
+  The clear-draft half already exists in `kitsu-editor` (`0x03` clears a
+  non-empty buffer and emits `Interrupt` on an empty one) and is untouched. But
+  **F54** records that "`Ctrl+C` is swallowed at an approval prompt" is
+  **measured and unexplained** — most likely a harness artefact, since the child
+  is probably not in the pty's foreground process group, and an echoed `^C` with
+  no signal delivered is exactly that signature, while the code comment at the
+  approval handoff says `ISIG` is restored. **Binding the detach half would mean
+  writing product behaviour on top of an unresolved measurement of the one byte
+  whose signal path is in doubt.** One minute in a real terminal settles it;
+  until someone has that minute, this clause describes an intention and not the
+  product. Two cards in a row were told not to map `\x03`, and did not.
+- **T4-S6-status settled four things §4.5 did not state.**
+  - **Position:** the attachment is the **leftmost content segment** —
+    `attached · agent N · <model> · <meter> · <elapsed> [queued] [tag]`.
+  - **Claim priority: second**, right after the ambient tag and above the queue
+    tag, the model, elapsed and the meter. The full drop order is now
+    `meter, elapsed, model, [N queued], attached · agent N, ambient tag`.
+  - **A repaint keeps it.** The row is recomposed from the source on every paint
+    and never remembered, so a segment lost on the next frame would make this
+    section's legibility argument for `←` hold only until the next keystroke.
+    Pinned both ways: a repaint caused by *something else* (the queue depth
+    moving) must still carry the attachment, and composing twice from the same
+    binding yields the same row — **composed, not consumed**.
+  - **An agent finishing while attached does NOT detach.** The segment is
+    derived from the user's binding and the registry is never consulted, which
+    follows A5's ruling that leaving the view is not detaching. The alternative
+    is worse: the prompt label comes off the **same** binding, so a
+    self-detaching row would disagree with the caret in front of the user.
+
+  **The segment is derived at paint time, never cached** (**F75**'s lesson):
+  `StatusSource::fields()` pulls it through the same closure as the queue and
+  blocked counts, so a detach needs no notification — clearing the composer's
+  binding *is* the whole of it, and the next composition reads nothing. A
+  snapshot stored anywhere would need telling on detach, and the detach path
+  offers **no publication point** to tell it from.
+
+  **F78: the row's drop order is not monotonic in width.** A clipped model
+  segment **reappears at 44–42 columns** once the row is busier, because each
+  segment is offered what the higher-ranked ones left and dropping the
+  thirteen-column queue tag frees room. No special case was added to "fix" this,
+  and **no future card should assert a prefix or no-revive property on this
+  row.**
+
 - the prompt label changes to `agent 3>` and the status row shows
   `attached · agent 3`.
 
@@ -894,6 +1580,24 @@ default map.
 Everything else keeps today's editor keymap (`Ctrl+Z` suspend, `Ctrl+\` quit,
 `Ctrl+C` draft-aware, `↑` recall). Bindings are declared in one table consumed
 by the help overlay and `/help keys` so docs cannot drift.
+
+**Three bindings this section promises do not exist (recorded in T4-S10).** There
+is no `Ctrl+X o`, no `Ctrl+X ?` and no `Ctrl+X 1..9`: the composer's chord
+decoder binds exactly **two** letters, `a` (open the agent view) and `d`
+(detach). `Ctrl+X 1..9` is carded separately and cannot be an id — ids pass 9,
+and go *wrong* rather than dead once early agents are pruned — so it must be an
+ordinal over the display order. **`Ctrl+L` does exist**, in both halves, citing
+R8.
+
+So this section's sentence about one table consumed by the help overlay and
+`/help keys` is satisfied today by **exactly those two readers**, and should not
+be read as promising a third surface. **The chords are deliberately not in that
+table yet**: they never reach the overlay's dispatch — a different decoder on a
+different surface — so T4-S10's keyboard sweep, which is the only thing making
+the table more than a literal, cannot reach them. Their labels are also not
+static, since the prefix is configurable, so a chord row's key column is
+computed rather than written. Folding them in would buy one table and lose the
+guard on half of it.
 
 ### 4.8 Configuration
 

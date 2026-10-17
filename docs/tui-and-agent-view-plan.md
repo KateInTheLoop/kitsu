@@ -150,7 +150,19 @@ record under `docs/roadmap/cycles/e11/`; out-of-scope discoveries are in
 | T3-S10 census answered (421, triaged); **`write_block` ring gap fixed**; F17 corrected, N4 limitation list | done | 4d567bf |
 | T3-S11 Windows half measured (renderer crates clean; F59 corrects the premise); **matrix still needs a human** | partial | 6d22d79 |
 | T3-S12 reduced motion reaches the viewport; 60 fps enforced **in the painter** (was ~109k-400k fps); sync output deferred with reason | done | eeaa51e |
-| T3-S13 N2 measured (**5 ms vs 100 ms budget**); exit gate run clause by clause, **one clause has no test (F60)**; doc sweep | done | this commit |
+| T3-S13 N2 measured (**5 ms vs 100 ms budget**); exit gate run clause by clause, **one clause has no test (F60)**; doc sweep | done | aae5874 |
+| **T3 complete.** T4-S1 agent-view model: `AgentViewState` single source, filter grammar, DTO mapping; A2/A3 amended; F61 | done | 76bfc7c |
+| marker story (between T4-S1 and T4-S2): `DeckState::Blocked`, one vocabulary via `deck_state()`; **F34 and F3 closed**, §4.4 amended | done | bd9d845 |
+| T4-S2 agent view overlay opens/closes; `[tui] prefix` + `left_arrow_opens_agents` get their first consumer; A1's two stale clauses corrected | done | e791fa2 |
+| T4-S3 peek (`Space`) reusing `/jobs show`'s renderers; A4 shown satisfied by construction, A7 clarified; **F64** (my second unverified premise) | done | 7da0ce8 |
+| T4-S4a selection keyed on the agent, `↑/↓` clamping, `x` arming, `AgentRegistry::rename`, `p`'s taxonomy; A3 amended; **F65**, **F66** | done | this commit |
+| T4-S4b-i action keys `r`/`x`/`n`/`p`; **rejected once for F68** (a paste executed itself as keys) and reworked with a paste-aware decoder | done | this commit |
+| T4-S4b-ii `s`'s text sub-mode over `kitsu-editor`; the open line bypasses the overlay decoder so the editor's own paste rule applies; **F69** | done | this commit |
+| F69 follow-up: the loop's input dispatch extracted to one `handle_overlay_input` the tests call; the mirror retired, `OverlayTextPrompt::Steer` deleted; **three** silent divergences erased | done | this commit |
+| **F39 resolved** — the byte-identity flake made deterministic (11/20 failures standalone → 50 green runs), with a guard that fails loudly if the ordering ever inverts | done | this commit |
+| T4-S5 the filter line (`/`) over `kitsu-editor`; the filter governs the selection's rows (a safety property); **F71** | done | this commit |
+| **F70 fixed**: `n` reads its line through `kitsu-editor`; `OverlayPrompt::Text` and `OverlayTextPrompt` deleted, so no decoded key can fill a name; **F72** recorded | done | this commit |
+| **F72**: an unbracketed paste submits early in all three editor lines (`s`, `/`, `n`) — the decoder's burst fallback does not reach them | **not started** | — |
 
 > **`KITSU_TUI` is retired as of T3-S2.** Mentions of it in the T0-T2 rows and
 > requirement text below are **historical** — they record how the preview was
@@ -345,14 +357,22 @@ fixtures byte-identical in classic/plain/JSONL; both profiles; `cargo test
 |---|---|---|---|---|
 | T4-S1 | Pure model in `kitsu-tui`: `AgentRow`/`AgentGroup` plain structs, grouping, ordering, filter grammar; `tui_bridge.rs` maps `AgentThreadSnapshotDto` → `AgentRow` | Failing table-driven grouping test | `kitsu-tui/src/agents_view.rs`, `tui_bridge.rs` | (A2, A3 filter) |
 | T4-S2 | Overlay: list, `↑/↓`, `?`, `Esc`; opened by `Ctrl+X a`, `/jobs view` (TUI mode), `←`-twice on empty composer (config); `←` never consumes a draft; `↑` recall untouched | Failing PTY open/close test | `overlay/agents.rs`, `tui_bridge.rs` | (A1) |
-| T4-S3 | Peek (`Space`): redacted timeline, pending request, result; viewing acknowledges via `peek_result` + `acknowledge_result` | Failing exit-guard test (unviewed failed agent still refuses) | `overlay/agents.rs` | (A4, A7) |
+| T4-S3 | Peek (`Space`): redacted timeline, pending request, result; viewing acknowledges via `peek_result` + `acknowledge_result` | Failing test: **a peeked result is not surfaced at exit, an unviewed one still is** — *amended in T4-S3: the original read "unviewed failed agent still refuses", but nothing refuses `/quit` for a finished agent; only `Running`/`Blocked` block it, and unviewed results are **surfaced** at exit, not refused (**F64**)* | `overlay/agents.rs` | (A4, A7) |
 | T4-S4 | Keys → registry calls: `r` reply, `s` steer, `x` stop/prune, `n` rename (new `AgentRegistry::rename`), `p` acknowledge | Failing outcome tests | `subagent.rs`, overlay | (A3) |
 | T4-S5 | `tail_timeline(id) -> broadcast::Receiver` (cap 256; lag → "n skipped") | Failing lag test | `subagent.rs`, `thread.rs` | Timeline bounds unchanged |
-| T4-S6 | Attach/detach: `⛩` milestones, routed composer (`steer`, `y/a/n` when blocked), 64 KiB foreground buffer replayed with recap; `Ctrl+X d`, `←`, `/detach`; `Ctrl+C` = clear draft / detach | Failing fake-provider integration test | `tui_bridge.rs`, overlay, `status.rs` | (A5) |
-| T4-S7 | Dispatch from the view composer (`@profile task`) admitted by `AgentRegistryLimits`, not `SpawnBudget` | Failing over-capacity test | `tui_bridge.rs`, `subagent.rs` | (A6) |
-| T4-S8 | Ambient counter ≤ 250 ms (watch-driven) in TUI; classic tag from T1-S2 documented | Failing paused-clock timing test | `status.rs` | (A8) |
+| T4-S6a | Attachment and the keys that enter and leave it: `Enter`/`→`, `←`, `Ctrl+X d`, `/detach`; **rejected once for F75** (the attachment had no reader) and reworked with a carrier out of the overlay | done | this commit |
+| T4-S6b | The routed composer, on **submit-time** state with the registry adjudicating and **no refusal that destroys text**; the `⛩` attach milestone naming the route | done, this commit — the fixture problem dissolved: a steerable agent was already reachable in `subagent.rs`'s own test module | — |
+| T4-S6c | The byte-bounded 64 KiB foreground buffer in `kitsu-render/src/surface.rs` and the recap replay; **F84**'s fourth transition (a re-bind) replays too | done, this commit — **A5 complete**; it did **not** need R6: a `Surface` decorator cannot reach the cell ring (wrong dependency direction) and the ring is line-bounded (**F52**) | — |
+| **F76 fixed** | `InlineRead::Detached` carries the draft and `Ctrl+X d` keeps a line in progress; the cheap narrowing was rejected because the chord's only non-redundant case is exactly that one | done | this commit |
+| T4-S6-status | The `attached · agent N` status segment, derived at paint time; **F74** corrected (nine constructions, three exhaustive, `Default` already derived), **F78** measured | done | this commit |
+| **F77 + F79 fixed** | `/detach` wired through a 17th `&mut Option<u64>` on `handle_slash`; `/jobs view` no longer discards the attachment (**F79**, the third consumer of the same exit value); a `#[cfg(test)]` shim removed on review | done | this commit |
+| T4-S6-ordinal | `Ctrl+X 1..9` as a **1-based ordinal over A2's display order**, never an id | **not started** | — |
+| ~~T4-S6~~ | Attach/detach: `⛩` milestones, routed composer (`steer`, `y/a/n` when blocked), 64 KiB foreground buffer replayed with recap; `Ctrl+X d`, `←`, `/detach`; `Ctrl+C` = clear draft / detach | Failing fake-provider integration test | `tui_bridge.rs`, overlay, `status.rs` | (A5) |
+| T4-S7 | Dispatch from the agent view with `+` (`task` or `@profile task`), admitted by `AgentRegistryLimits`, **not** `SpawnBudget` — the view's **fourth** edited line | done, this commit | `main.rs`, `kitsu-tui/src/agents_view.rs`, `subagent.rs` — *corrected in T4-S7: the row named `tui_bridge.rs`, which is the **inline** composer and is untouched here; T4-S6b is the card that lands there* | (A6) |
+| T4-S8 | Ambient counter ≤ 250 ms in TUI — **A8 was violated at the idle composer**, now driven by `registry.subscribe()`; **F81** | done, this commit | `main.rs`, `tui_bridge.rs` — *corrected: `status.rs` holds no timing, and no "paused clock" exists to pause* | (A8) |
+| **F81 residual** | Mid-turn the approval arm `continue`s before the counts are re-pulled, so the counter freezes while an approval modal is up | **not started** — adjacent to **F54** | — |
 | T4-S9 | Transcript overlay (`Ctrl+O`): scroll, `/`, `n/N`, `{ }`, `v`, `q` over the cell ring | Failing search/jump unit test | `overlay/transcript.rs` | (R6) |
-| T4-S10 | Single bindings table → help overlay + `/help keys`; docs (`ux-design.md` glyph `◉` row rule, `functionality.md`) | Failing bindings-table test | `kitsu-tui/src/keys.rs`, `docs/` | (§4.7) |
+| T4-S10 | One bindings table in `kitsu-tui/src/keys.rs`, rendered by both the overlay help and `/help keys`; the guard is a **total keyboard sweep**, which found `q`, `Enter` and `→` dispatched and advertised nowhere | done, this commit | `kitsu-tui/src/keys.rs`, `agents_view.rs`, `main.rs`, `docs/` | (§4.7) |
 
 **Exit gate:** fake-provider integration (two agents, one blocks, view shows
 it first, reply, attach, detach, acknowledged); exit guard unchanged; both

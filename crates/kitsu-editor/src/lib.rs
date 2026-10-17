@@ -283,6 +283,20 @@ impl TypeaheadEditor {
         true
     }
 
+    /// Whether a lone `ESC` is being held, waiting for the byte that would
+    /// make it a sequence.
+    ///
+    /// Added for the agent view's steer line (card T4-S4b), which must tell a
+    /// real `Esc` keypress from the first byte of an arrow on a quiet tick —
+    /// finding **F65**, met again by a sub-mode that reads arbitrary bytes.
+    /// [`TypeaheadEditor::resolve_lone_escape`] cannot answer that question:
+    /// it reports whether the *draft changed*, so it returns `false` for an
+    /// `Esc` resolved on an already-empty line. `false` mid-paste, for the
+    /// same reason `resolve_lone_escape` never fires there.
+    pub fn escape_pending(&self) -> bool {
+        self.pending == Pending::Escape && !self.in_paste
+    }
+
     /// Drop all transient input state (paste mode, partial escape/UTF-8
     /// sequences). Called when the editor loses stdin mid-stream — e.g. an
     /// approval prompt takes over and may consume a paste's terminator — so
@@ -1298,5 +1312,78 @@ mod tests {
         bytes.extend(b"\nr\x1b[201~");
         editor.feed(&bytes);
         assert_eq!(editor.buffer_string(), "fé\nr");
+    }
+
+    /// Card T4-S4b. **A held `ESC` is observable**, so a collector can tell a
+    /// real `Esc` from the first byte of an arrow on a quiet tick.
+    ///
+    /// The agent view's steer line needs exactly this and cannot get it from
+    /// `resolve_lone_escape`, whose `bool` is "the draft changed": on an empty
+    /// line an `Esc` resolves and it still answers `false`. That case is the
+    /// fourth assertion here, and it is the whole reason this accessor exists.
+    #[test]
+    fn a_held_escape_is_observable_and_a_sequence_or_a_paste_is_not() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        assert!(
+            !editor.escape_pending(),
+            "nothing is held before anything is fed"
+        );
+
+        editor.feed(b"ab");
+        assert!(
+            !editor.escape_pending(),
+            "ordinary text holds no escape: {:?}",
+            editor.buffer_string()
+        );
+
+        editor.feed(b"\x1b");
+        assert!(
+            editor.escape_pending(),
+            "a chunk that ends in a bare ESC is still ambiguous"
+        );
+        assert!(editor.resolve_lone_escape());
+        assert!(!editor.escape_pending(), "resolving it clears the hold");
+
+        // The case `resolve_lone_escape` cannot report: the same keypress on
+        // an empty draft answers `false`, so its bool is not an `Esc`
+        // detector.
+        let mut empty = TypeaheadEditor::new(Vec::new());
+        empty.feed(b"\x1b");
+        assert!(empty.escape_pending());
+        assert!(
+            !empty.resolve_lone_escape(),
+            "NON-VACUOUS: the same keypress on an empty draft answers `false`, \
+             so `escape_pending` is the only way to see it"
+        );
+
+        // An arrow: the `ESC` is spoken for by the byte after it, and the
+        // sequence's final byte leaves nothing held.
+        let mut arrow = TypeaheadEditor::new(Vec::new());
+        arrow.feed(b"\x1b");
+        assert!(arrow.escape_pending());
+        arrow.feed(b"[");
+        assert!(
+            !arrow.escape_pending(),
+            "`ESC [` is a CSI sequence, not an `Esc` key"
+        );
+        arrow.feed(b"D");
+        assert!(!arrow.escape_pending());
+
+        // Mid-paste, a stalled terminator is not an `Esc`: the guard
+        // `resolve_lone_escape` already documents, reported rather than
+        // silently diverging from it.
+        let mut pasting = TypeaheadEditor::new(Vec::new());
+        pasting.feed(b"\x1b[200~pasted\x1b");
+        assert!(
+            !pasting.escape_pending(),
+            "a paste stalling between its ESC and the rest of the terminator \
+             must not read as an `Esc`; draft: {:?}",
+            pasting.buffer_string()
+        );
+        assert_eq!(
+            pasting.buffer_string(),
+            "pasted",
+            "NON-VACUOUS: the paste really is open and really did arrive"
+        );
     }
 }

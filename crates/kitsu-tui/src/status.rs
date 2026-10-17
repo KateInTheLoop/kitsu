@@ -103,6 +103,7 @@ mod tests {
             queued: 4,
             blocked: 2,
             running: 5,
+            ..Default::default()
         }
     }
 
@@ -133,9 +134,8 @@ mod tests {
                 used: 0,
                 effective: 8_192,
                 elapsed: None,
-                queued: 0,
-                blocked: 0,
                 running: 1,
+                ..Default::default()
             },
         ];
         for cols in 40usize..=200 {
@@ -314,6 +314,211 @@ mod tests {
         let tag = agents_tag(0, 3).expect("three running agents carry a tag");
         assert_eq!(tag, "[3 agents] ");
         assert!(row.contains(tag.trim_end()), "{row:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Card **T4-S6-status**, requirement A5 / design §4.5: the
+    // `attached · agent N` segment.
+    //
+    // **FAILING-FIRST.** `StatusFields::attached` exists (the field is this
+    // card's authorised production edit) and `compose_status_row` ignores it,
+    // so every test below is red until the segment is composed.
+    //
+    // Every assertion goes through a **painting** surface — `paint_status`,
+    // which is the only thing in this crate that puts the row in front of a
+    // user, and `compose_status_row`, which is the string it paints. Finding
+    // **F71**: a test that reads the attachment back off `StatusFields` would
+    // pass against a row that never mentions it.
+    //
+    // The row's form is pinned as a **derivation** of the detached row rather
+    // than a retyped literal (F41): the attached row is the detached row with
+    // one segment in front of it, so the expectation cannot drift from the
+    // other four segments and the segment's position is pinned too.
+    // -----------------------------------------------------------------------
+
+    /// What a user sees: the bytes `paint_status` hands the surface.
+    ///
+    /// The row goes out as a `transcript_line` on stderr (`paint_status`), so
+    /// this is the one line of the painted pair that is the status row.
+    fn painted_row(fields: &StatusFields, cols: usize) -> String {
+        let backend = LineBackend::new();
+        paint_status(&backend, fields, &[], cols);
+        let lines = backend.lines();
+        assert_eq!(lines.len(), 1, "paint_status paints exactly one row");
+        assert_eq!(lines[0].0, Fd::Stderr, "the status row is a stderr row");
+        plain(&lines[0].1)
+    }
+
+    /// The segment is **painted**, and it **names the agent** — so a user
+    /// attached to one of several can tell which (design §4.5).
+    ///
+    /// Pinned as what the painted row *is*: the row composed from the same
+    /// fields with nothing attached, with `attached · agent N` in front of
+    /// it. Two different ids, because an assertion that passes for any id
+    /// has not pinned that the row names *this* one.
+    #[test]
+    fn paint_status_paints_the_attachment_segment_naming_the_agent() {
+        let detached = painted_row(&busy(), 200);
+        assert!(
+            detached.contains("claude-sonnet-4-5-20250929") && detached.contains("[2 blocked]"),
+            "the baseline row must be the whole row, or the derivation below \
+             compares nothing: {detached:?}"
+        );
+        for id in [7u64, 12] {
+            let fields = StatusFields {
+                attached: Some(id),
+                ..busy()
+            };
+            assert_eq!(
+                painted_row(&fields, 200),
+                format!("attached \u{b7} agent {id} \u{b7} {detached}"),
+                "design §4.5: the status row shows `attached \u{b7} agent {id}`, \
+                 leftmost, ahead of the row it already painted"
+            );
+        }
+    }
+
+    /// Absent when nothing is attached — with the positive control that makes
+    /// the absence non-vacuous: the row still renders, and still carries its
+    /// other four segments.
+    ///
+    /// Stated as an equality against the whole row rather than a substring
+    /// ban (F41): there is no id, no `agent` and no `attached` anywhere in it
+    /// because the row *is* exactly the four-segment row.
+    #[test]
+    fn the_attachment_segment_is_absent_when_nothing_is_attached() {
+        let fields = busy();
+        assert_eq!(fields.attached, None, "the fixture is the detached case");
+        let row = painted_row(&fields, 200);
+        // The control: the row is painted and complete.
+        assert!(row.contains("claude-sonnet-4-5-20250929"), "model: {row:?}");
+        assert!(row.contains("65%"), "meter: {row:?}");
+        assert!(row.contains("1m35s"), "elapsed: {row:?}");
+        assert!(row.contains("[4 queued]"), "queue tag: {row:?}");
+        assert!(row.contains("[2 blocked]"), "ambient tag: {row:?}");
+        // And the segment is not in it: the detached row equals the attached
+        // row with the segment and its separator removed, so nothing of it
+        // can be hiding elsewhere in the row.
+        let attached = painted_row(
+            &StatusFields {
+                attached: Some(7),
+                ..busy()
+            },
+            200,
+        );
+        assert_eq!(
+            attached
+                .strip_prefix("attached \u{b7} agent 7 \u{b7} ")
+                .expect("the attached row carries the segment"),
+            row,
+            "detaching removes the segment and nothing else"
+        );
+    }
+
+    /// Where the segment sits in the row's priority, which **design §4.5 does
+    /// not state**. Decided here, and the reasoning is the card's own:
+    ///
+    /// - it **outranks `[N queued]`**, the model, elapsed and the meter,
+    ///   because the `←`-detaches-on-the-first-press rule rests on the
+    ///   attachment being legible *at the moment of the press* (§4.5's
+    ///   amendment), and a segment a narrow terminal drops takes that
+    ///   argument with it;
+    /// - it **yields to the ambient tag**, which stays last standing: a
+    ///   blocked agent is the thing the user must act on (`agents_tag`),
+    ///   while losing the label costs one keystroke and stops nothing.
+    ///
+    /// So the row claims room for it **second**, right after the ambient tag,
+    /// and that is what the exact assertion below pins: with the ambient tag
+    /// present, the attachment is painted at exactly the widths where the tag
+    /// plus a separator plus the label fit, and at no others. Nothing
+    /// lower-ranked can take its room, and it can never outlive the tag.
+    ///
+    /// # Why it is pinned that way and not as the prefix property
+    ///
+    /// `status_row_drops_segments_in_the_documented_order` pins the drop set
+    /// as a prefix of the order and bans revivals. Neither that nor a
+    /// per-width "if the queue tag survives, so does the attachment" is
+    /// **satisfiable** here, and the reason is pre-existing rather than this
+    /// segment's: each segment is offered what the higher-ranked ones left,
+    /// so a *narrower* low-ranked segment can fit where a wider high-ranked
+    /// one could not. Measured against a prototype of this row: dropping
+    /// `[4 queued]` at 44 columns frees thirteen columns and a **clipped
+    /// model reappears**, and below 32 columns the ten-column queue tag is
+    /// painted where the eighteen-column attachment cannot be. Asserting
+    /// either of those away would be an unsatisfiable assertion (F61), so
+    /// this test pins the claim order instead — exactly — and says nothing
+    /// about the model's revival in either direction.
+    ///
+    /// The sweep runs from 20 columns, not 40, so it covers widths where the
+    /// attachment itself is dropped; otherwise "it yields to the ambient tag"
+    /// would be vacuous.
+    #[test]
+    fn the_attachment_segment_claims_room_second_after_the_ambient_tag() {
+        const ID: u64 = 7;
+        let fields = StatusFields {
+            attached: Some(ID),
+            ..busy()
+        };
+        let label = format!("attached \u{b7} agent {ID}");
+        let tag = agents_tag(fields.blocked, fields.running)
+            .expect("the fixture has blocked agents")
+            .trim_end()
+            .to_string();
+        // `STATUS_SEP` is private to `kitsu_render::live`; the row joins any
+        // two pieces with it and charges three columns for the join.
+        let sep = " \u{b7} ".chars().count();
+        let needed = tag.chars().count() + sep + label.chars().count();
+        let mut kept = 0usize;
+        let mut dropped = 0usize;
+        let mut took_the_queue_tags_room = 0usize;
+        for cols in (20usize..=200).rev() {
+            let row = painted_row(&fields, cols);
+            let width = visible_cols(&row);
+            assert!(
+                width <= cols,
+                "the attached row is {width} cols wide at {cols} cols: {row:?}"
+            );
+            assert!(
+                width > 0,
+                "a status row must render something at {cols} cols: {row:?}"
+            );
+            let painted = row.contains(&label);
+            assert_eq!(
+                painted,
+                cols >= needed,
+                "at {cols} cols the attachment must be painted exactly when \
+                 the ambient tag, a separator and the label fit ({needed} \
+                 cols): it claims room second and nothing lower-ranked can \
+                 take it: {row:?}"
+            );
+            if painted {
+                assert!(
+                    row.contains(&tag),
+                    "and it can never outlive the ambient tag: {row:?}"
+                );
+                kept += 1;
+                // The displacement that makes "outranks" observable: this
+                // width has room for the queue tag without the attachment,
+                // and the attachment has it instead.
+                let without = painted_row(&busy(), cols);
+                if without.contains("[4 queued]") && !row.contains("[4 queued]") {
+                    took_the_queue_tags_room += 1;
+                }
+            } else {
+                dropped += 1;
+            }
+        }
+        // Non-vacuous three ways: widths that keep it, widths that drop it
+        // (so the equality is a real boundary and not a constant), and at
+        // least one width where it is painted *instead of* the queue tag.
+        assert!(kept > 0, "no width in the sweep painted the attachment");
+        assert!(dropped > 0, "no width in the sweep dropped it");
+        assert!(
+            took_the_queue_tags_room > 0,
+            "no width showed the attachment taking room the queue tag would \
+             otherwise have had, so the ranking between them was never \
+             exercised"
+        );
     }
 
     // -----------------------------------------------------------------------

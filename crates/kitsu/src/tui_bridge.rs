@@ -47,6 +47,7 @@
 
 use std::sync::Arc;
 
+use crate::subagent::thread;
 use kitsu_render::live;
 use kitsu_render::surface::{set_surface, Surface};
 use kitsu_tui::viewport::{
@@ -114,7 +115,7 @@ pub(crate) struct BridgeGuard {
     /// Requirement **R5**'s live status row, once a session has one.
     ///
     /// `RefCell` because the guard is held by shared reference everywhere
-    /// (exactly as the pane's latched geometry is a `Cell`) and the session that owns
+    /// (exactly as [`rows`](Self::rows) is a `Cell`) and the session that owns
     /// the fields does not exist yet when `install` runs: the viewport is
     /// installed before the prompt queue the queue tag counts.
     live_status: std::cell::RefCell<Option<Arc<StatusSource>>>,
@@ -258,6 +259,11 @@ pub(crate) struct StatusCounts {
     pub(crate) queued: usize,
     pub(crate) blocked: usize,
     pub(crate) running: usize,
+    /// The agent the composer is attached to, read off the session binding at
+    /// paint time -- a pull, like the two counts above, because the binding
+    /// moves between paints and a value copied in would be stale exactly when
+    /// the user looks (card **T4-S6-status**).
+    pub(crate) attached: Option<u64>,
 }
 
 impl StatusSource {
@@ -304,12 +310,17 @@ impl StatusSource {
             queued: counts.queued,
             blocked: counts.blocked,
             running: counts.running,
+            // The attachment is pulled with the counts, so the row the
+            // painter composes on the cadence tick is derived from the
+            // composer's session binding as it stands at paint time -- never
+            // a copy taken when the source was built (card **T4-S6-status**).
+            attached: counts.attached,
         }
     }
 
     /// Compose the row at `cols`. Nothing is cached: the point of the type is
     /// that the row is built from the fields as they stand.
-    fn compose(&self, cols: usize) -> String {
+    pub(crate) fn compose(&self, cols: usize) -> String {
         live::compose_status_row(&self.fields(), cols)
     }
 
@@ -478,6 +489,146 @@ pub(crate) fn repaint_status_row() {
 
 /// Note **N3**'s coalescing window: one row paint per 1/60 s.
 const STATUS_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
+
+/// Requirement **A8**'s budget: the ambient background-agent counter must
+/// update within 250 ms of a registry change in TUI modes.
+///
+/// Named, and asserted against, so that raising a cadence past it fails
+/// loudly rather than silently breaking a numbered requirement — finding
+/// **F50**: "a requirement whose number appears nowhere in the test suite is
+/// a requirement nobody is holding."
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const AMBIENT_LATENCY_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// Card **T4-S8**, requirement **A8**: the **idle** composer's ambient
+/// staleness bound -- the longest a registry change can go unpainted between
+/// turns -- or `None` if it has no cadence at all.
+///
+/// # Why this seam exists
+///
+/// The during-turn half of A8 was already met: `run_live_typeahead` syncs the counts
+/// and calls [`repaint_status_row`] once per `AMBIENT_TICK_POLL_MS`
+/// (`main.rs`) tick, for the whole of every foreground turn. The **idle**
+/// half was not, until this cadence. `read_line_inline_with_keys` blocks in `read()` with no
+/// timeout and nothing else repaints between turns, so a background agent
+/// that blocks while the user is sitting at the composer changes the registry
+/// and changes **nothing on screen** until the user presses a key, resizes
+/// the terminal or submits a line. A8 grants the "next prompt cycle"
+/// carve-out to `classic` only.
+///
+/// The counts are already a **pull** ([`StatusCounts`], read through
+/// `StatusSource`'s closure at paint time), so nothing has to be pushed
+/// anywhere: the whole gap is that at idle **nobody calls paint**. Closing it
+/// needs a cadence, and this is the interval that cadence runs at.
+///
+/// # What drives it
+///
+/// [`spawn_idle_ambient_cadence`] (one production call site, `main.rs`, right
+/// where the session's [`StatusSource`] is built) subscribes to
+/// `AgentRegistry::subscribe` and runs [`idle_ambient_cadence_step`] for the
+/// life of the session. A registry change wakes the step, which calls
+/// [`repaint_status_row`] — the counts are a pull, so a subscriber only has
+/// to trigger a paint — and then, one
+/// [`IDLE_AMBIENT_REFRESH_INTERVAL`] later, calls it again, because note
+/// **N3**'s coalescing window drops a paint inside 1/60 s of the previous one
+/// *without recording it*. That retry is the only thing that can defer the
+/// cadence's paint, so it is the interval reported here.
+///
+/// A wake whose counts are unchanged is a **bare wake**: the step returns
+/// having painted nothing, so reduced motion and N3's budget are untouched.
+///
+/// **The value is only honest because the cadence uses this same constant and
+/// `the_idle_ambient_cadence_paints_a_registry_change_with_no_byte_read`
+/// drives the real step through the painting surface.** A constant returned
+/// by a function nothing drives would be exactly the vacuous pass F50 is
+/// about.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn idle_ambient_refresh_interval() -> Option<std::time::Duration> {
+    Some(IDLE_AMBIENT_REFRESH_INTERVAL)
+}
+
+/// How long a registry change can sit unseen once the idle cadence has been
+/// woken by it: note **N3**'s coalescing window, the one and only thing that
+/// can defer [`idle_ambient_cadence_step`]'s paint, and twelve times finer
+/// than requirement **A8**'s 250 ms budget.
+///
+/// Deliberately *not* a polling period: the cadence is woken by the
+/// registry's `watch` channel, so an idle session with no background agents
+/// does no work at all.
+const IDLE_AMBIENT_REFRESH_INTERVAL: std::time::Duration = STATUS_FRAME_INTERVAL;
+
+/// One wake of the idle ambient cadence: wait for the next registry change
+/// and, if it changed anything the row shows, repaint. Returns `false` once
+/// the registry is gone and the cadence should stop.
+///
+/// Generic over the watched value and the counts projection so the step can be
+/// driven by a plain `watch` channel in a test — the production projection is
+/// `|snapshot| (snapshot.blocked, snapshot.running)`, the two numbers
+/// requirement **A8**'s ambient tag is composed from.
+///
+/// `seen` is the pair the cadence last painted. When a wake carries the same
+/// pair it is a **bare wake** (the registry's generation moved, the tag did
+/// not) and **no frame is painted** — the rule
+/// `read_line_inline_with_keys` applies to a resize-less `SIGWINCH` wake,
+/// applied here.
+///
+/// Nothing in here touches stdin, the decoder or the editor's byte bypass
+/// (findings **F72**/**F68**): the composer stays blocked in `read()`, and
+/// the row is repainted around it from the pull the painter already does.
+pub(crate) async fn idle_ambient_cadence_step<T, F>(
+    changes: &mut tokio::sync::watch::Receiver<T>,
+    counts: &F,
+    seen: &mut (usize, usize),
+) -> bool
+where
+    F: Fn(&T) -> (usize, usize),
+{
+    if changes.changed().await.is_err() {
+        return false;
+    }
+    let current = counts(&changes.borrow_and_update());
+    if *seen == current {
+        // A bare wake: nothing the row shows moved, so no frame.
+        return true;
+    }
+    *seen = current;
+    repaint_status_row();
+    // Note **N3**: a paint inside the 1/60 s window returns *without*
+    // recording the key, so the change would otherwise wait for the next
+    // registry event -- which may never come while an agent sits blocked.
+    // One retry past the window closes that, and the dedupe makes it free
+    // when the first call landed.
+    tokio::time::sleep(IDLE_AMBIENT_REFRESH_INTERVAL).await;
+    repaint_status_row();
+    true
+}
+
+/// Install the idle composer's ambient cadence for the session: card
+/// **T4-S8**, requirement **A8**.
+///
+/// The **one** production caller is `main.rs`, beside the session's
+/// [`StatusSource`]. Deliberately ungated — unlike the classic-mode
+/// external-printer notifier, which is behind `KITSU_LIVE_NOTICES` and an
+/// assistive-input check and therefore leaves a default TUI session with no
+/// subscriber at all. Inert in classic mode and in any session that never
+/// enabled a live status row, because [`repaint_status_row`] is: that is what
+/// keeps the classic byte stream identical.
+///
+/// The task ends on its own when the registry's sender drops.
+pub(crate) fn spawn_idle_ambient_cadence<T, F>(
+    mut changes: tokio::sync::watch::Receiver<T>,
+    counts: F,
+) -> tokio::task::JoinHandle<()>
+where
+    T: Send + Sync + 'static,
+    F: Fn(&T) -> (usize, usize) + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        let mut seen = counts(&changes.borrow_and_update());
+        while idle_ambient_cadence_step(&mut changes, &counts, &mut seen).await {}
+    })
+}
 
 impl BridgeGuard {
     /// Hand the guard requirement **R5**'s live fields, replacing the fixed
@@ -1168,6 +1319,246 @@ impl Drop for BridgeGuard {
     }
 }
 
+/// Which keys the inline reader answers **itself**, rather than handing to the
+/// editor (card T4-S2).
+///
+/// Resolved once, where `[tui]` is resolved, and published through
+/// [`set_inline_keys`]: the reader is reached through two call frames that
+/// carry no configuration, and threading a copy down each of them would make
+/// the chord prefix a parameter of functions that have no other business with
+/// it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct InlineKeys {
+    /// The control byte `[tui] prefix` names, or `None` when the spelling is
+    /// not one this reader can recognise — in which case the chord route is
+    /// simply absent rather than silently bound to something else.
+    pub(crate) prefix: Option<u8>,
+    /// `[tui] left_arrow_opens_agents`: whether the two-press `←` route exists
+    /// at all. It is a *route* switch, not a feature switch — the chord keeps
+    /// working with it off.
+    pub(crate) left_arrow_opens_agents: bool,
+}
+
+impl InlineKeys {
+    /// No chord prefix and no `←` route: what the reader's own unit tests run
+    /// under, so every keystroke they feed reaches the editor exactly as it
+    /// did before this card.
+    pub(crate) fn disabled() -> Self {
+        Self::default()
+    }
+}
+
+/// The published [`InlineKeys`], or `None` before `[tui]` has been resolved.
+static INLINE_KEYS: std::sync::Mutex<Option<InlineKeys>> = std::sync::Mutex::new(None);
+
+/// Publish the resolved key configuration for the inline reader.
+pub(crate) fn set_inline_keys(keys: InlineKeys) {
+    *lock(&INLINE_KEYS) = Some(keys);
+}
+
+/// The published key configuration, or [`InlineKeys::disabled`] when `[tui]`
+/// was never resolved (a non-unix build, or a carrier that never installs a
+/// renderer). Defaulting to *disabled* rather than to the shipped defaults is
+/// deliberate: an unresolved config must not conjure a binding the user's
+/// config file could have turned off.
+pub(crate) fn inline_keys() -> InlineKeys {
+    lock(&INLINE_KEYS).unwrap_or_else(InlineKeys::disabled)
+}
+
+/// The control byte a `ctrl+<letter>` key spelling sends.
+///
+/// `[tui] prefix` is prose (`"ctrl+x"`), and a terminal sends one byte, so one
+/// of the two has to be translated. Only the `ctrl+<letter>` family is
+/// accepted, because that is the only family whose byte is unambiguous: a
+/// function key or an `alt+` combination arrives as an escape *sequence*, and
+/// answering one would mean a second escape-sequence parser beside the
+/// editor's.
+pub(crate) fn chord_prefix_byte(spelling: &str) -> Option<u8> {
+    let lowered = spelling.trim().to_ascii_lowercase();
+    let letter = lowered
+        .strip_prefix("ctrl+")
+        .or_else(|| lowered.strip_prefix("ctrl-"))
+        .or_else(|| lowered.strip_prefix("c-"))
+        .or_else(|| lowered.strip_prefix("^"))?;
+    let mut chars = letter.chars();
+    let key = chars.next()?;
+    if chars.next().is_some() || !key.is_ascii_lowercase() {
+        return None;
+    }
+    // `ctrl+a` is 0x01, so the byte is the letter's position in the alphabet.
+    Some(key as u8 - b'a' + 1)
+}
+
+/// The letter that, after the chord prefix, opens the agent view (A1).
+const AGENT_VIEW_CHORD_KEY: u8 = b'a';
+
+/// `<prefix> d`: detach from the attached agent (card **T4-S6a**, design
+/// \u{00a7}4.7). It sits beside [`AGENT_VIEW_CHORD_KEY`] because the filter
+/// treats the two the same way: the letter is lifted out of the byte stream,
+/// and what it *means* is the reader's to decide.
+const DETACH_CHORD_KEY: u8 = b'd';
+
+/// `ESC [ D`, the left arrow as every terminal sends it, and what the editor
+/// reads as backward-char.
+const LEFT_ARROW: &[u8] = b"\x1b[D";
+/// The bracketed-paste opening delimiter.
+const PASTE_START: &[u8] = b"\x1b[200~";
+/// The bracketed-paste closing delimiter.
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// One thing the key filter found in a chunk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum KeyItem {
+    /// Bytes for the editor, verbatim and in order.
+    Bytes(Vec<u8>),
+    /// One left-arrow keystroke, lifted out so the reader can ask whether the
+    /// composer is empty *at this point in the chunk* before deciding whether
+    /// it is cursor movement or half of the two-press affordance.
+    Left,
+    /// `<prefix> a`: open the agent view.
+    Open,
+    /// `<prefix> d`: detach from the attached agent (card **T4-S6a**,
+    /// design §4.7). Lifted out for `Open`'s reason: the letter must not
+    /// reach the draft, and the *decision* about whether anything is attached
+    /// belongs to the reader and not to this filter.
+    Detach,
+}
+
+/// Splits a read chunk into [`KeyItem`]s: the chord prefix and its letter are
+/// taken out of the stream, left arrows are lifted out, and everything else is
+/// passed through untouched.
+///
+/// # Why this is not a second keymap
+///
+/// It recognises exactly three things — the prefix byte, `ESC [ D`, and the
+/// two bracketed-paste delimiters — and forwards every other byte to the
+/// editor, which remains the only keymap. The paste delimiters are tracked for
+/// one reason: inside a paste the payload is *text*, so a `0x18` or an
+/// `ESC [ D` in pasted content must reach the editor as content and not be
+/// read as a chord.
+///
+/// A chunk that ends part-way through one of those sequences **holds** the
+/// partial bytes until the next read, so a left arrow split across two reads
+/// is still one keystroke. The held bytes are released in front of the next
+/// chunk, so the editor sees the same byte stream either way.
+struct KeyFilter {
+    keys: InlineKeys,
+    /// The prefix byte has arrived and the next byte is its chord letter.
+    /// Carried across reads, because a user's two keystrokes are routinely two
+    /// chunks.
+    pending_prefix: bool,
+    /// Inside a bracketed-paste block.
+    in_paste: bool,
+    /// A partial sequence held back from the end of the previous chunk.
+    held: Vec<u8>,
+}
+
+impl KeyFilter {
+    fn new(keys: InlineKeys) -> Self {
+        Self {
+            keys,
+            pending_prefix: false,
+            in_paste: false,
+            held: Vec::new(),
+        }
+    }
+
+    /// Whether `data` is a strict, non-empty prefix of `pattern`: the chunk
+    /// ran out mid-sequence and the rest may still arrive.
+    fn is_partial(data: &[u8], pattern: &[u8]) -> bool {
+        data.len() < pattern.len() && pattern.starts_with(data)
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Vec<KeyItem> {
+        let mut data = std::mem::take(&mut self.held);
+        data.extend_from_slice(chunk);
+        let mut items: Vec<KeyItem> = Vec::new();
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut index = 0usize;
+        while index < data.len() {
+            let rest = &data[index..];
+            if self.in_paste {
+                if rest.starts_with(PASTE_END) {
+                    self.in_paste = false;
+                    bytes.extend_from_slice(PASTE_END);
+                    index += PASTE_END.len();
+                } else if Self::is_partial(rest, PASTE_END) {
+                    self.held = rest.to_vec();
+                    break;
+                } else {
+                    bytes.push(data[index]);
+                    index += 1;
+                }
+                continue;
+            }
+            if self.pending_prefix {
+                self.pending_prefix = false;
+                if let Some(item) = match data[index] {
+                    AGENT_VIEW_CHORD_KEY => Some(KeyItem::Open),
+                    DETACH_CHORD_KEY => Some(KeyItem::Detach),
+                    _ => None,
+                } {
+                    if !bytes.is_empty() {
+                        items.push(KeyItem::Bytes(std::mem::take(&mut bytes)));
+                    }
+                    items.push(item);
+                }
+                // Any other letter is inert. Dropping it rather than typing it
+                // into the draft is what makes a mistyped chord a no-op
+                // instead of a stray character in the user's prompt.
+                index += 1;
+                continue;
+            }
+            if Some(data[index]) == self.keys.prefix {
+                self.pending_prefix = true;
+                index += 1;
+                continue;
+            }
+            if data[index] == 0x1b {
+                if rest.starts_with(PASTE_START) {
+                    self.in_paste = true;
+                    bytes.extend_from_slice(PASTE_START);
+                    index += PASTE_START.len();
+                    continue;
+                }
+                if rest.starts_with(LEFT_ARROW) {
+                    if !bytes.is_empty() {
+                        items.push(KeyItem::Bytes(std::mem::take(&mut bytes)));
+                    }
+                    items.push(KeyItem::Left);
+                    index += LEFT_ARROW.len();
+                    continue;
+                }
+                if Self::is_partial(rest, PASTE_START) || Self::is_partial(rest, LEFT_ARROW) {
+                    self.held = rest.to_vec();
+                    break;
+                }
+            }
+            bytes.push(data[index]);
+            index += 1;
+        }
+        if !bytes.is_empty() {
+            items.push(KeyItem::Bytes(bytes));
+        }
+        items
+    }
+}
+
+/// Re-pin the DECSTBM region and repaint the status row, for a full-screen
+/// surface that has just handed the terminal back (card T4-S2's overlay).
+///
+/// Only control bytes and the pinned row are written, so the transcript region
+/// is left exactly as the alternate-screen restore found it. It goes through
+/// the published pane for [`paint_approval_modal`]'s reason: the caller may
+/// hold no [`BridgeGuard`].
+pub(crate) fn reinstall_pinned_region() {
+    let Some(pane) = lock(&MODAL_PANE).clone() else {
+        return;
+    };
+    pane.viewport.show(pane.rows(), pane.viewport_rows());
+    repaint_status_row();
+}
+
 /// How one inline idle-prompt read ended.
 ///
 /// T0-S5b. The reader is the inline mode's answer to rustyline: with the
@@ -1184,6 +1575,16 @@ pub(crate) enum InlineRead {
     /// Ctrl+C on an empty draft. A non-empty draft is cleared instead and the
     /// read continues, which is what the editor already does.
     Interrupted,
+    /// Card **T4-S2**: the agent view overlay was asked for, by the chord
+    /// `<prefix> a` or by a second `\u{2190}` on an untouched empty composer,
+    /// with the draft as it stood.
+    ///
+    /// The reader stays **pure** for exactly [`InlineRead::Suspended`]'s
+    /// reason: the overlay owns the terminal, the alternate screen and its own
+    /// key loop, none of which belong in a function whose whole value is being
+    /// testable without one. So the keystroke is reported and the draft handed
+    /// back, and the caller re-enters the reader with it afterwards.
+    OpenAgentView(String),
     /// Ctrl+Z (finding F21): the draft as it stood when the byte arrived.
     ///
     /// The reader stays **pure** — it raises no signal and touches no
@@ -1192,6 +1593,25 @@ pub(crate) enum InlineRead {
     /// this draft as its `initial`, which is why typing survives a
     /// suspend/resume cycle.
     Suspended(String),
+    /// Card **T4-S6a**: `\u{2190}` on an empty composer **while attached**, the
+    /// return path requirement A5 names beside `/detach`.
+    ///
+    /// The reader stays pure for [`InlineRead::Suspended`]'s reason: leaving
+    /// attachment prints a milestone, replays a recap and re-labels the
+    /// composer, none of which belong in a function whose value is being
+    /// testable without a terminal.
+    ///
+    /// The draft **is** carried back, exactly as [`InlineRead::Suspended`]
+    /// and [`InlineRead::OpenAgentView`] carry it, and the caller replays it
+    /// into the next read. Finding **F76**: this variant has two routes, and
+    /// only one of them has an empty-composer precondition. `\u{2190}` is
+    /// reached only on an empty draft, so its payload is empty; `Ctrl+X d`
+    /// has no such precondition and exists *because* `\u{2190}` is cursor
+    /// movement once there is text to move over, so detaching with the chord
+    /// must not cost the user the line they typed. The earlier comment here
+    /// -- "only ever reached on an empty one" -- was true of `\u{2190}`
+    /// alone and became wrong when the chord was given the same variant.
+    Detached(String),
 }
 
 /// Read one line from `input` through the shared editor, repainting through
@@ -1210,11 +1630,83 @@ pub(crate) enum InlineRead {
 /// `kitsu_render::live::live_input_update`, so the inline row and the classic
 /// live row cannot drift in *what* they are told about a draft.
 /// `history` seeds the up/down walk.
+// The reader's own unit tests are its only callers now: production resolves
+// `[tui]` and goes through `read_line_inline_with_keys`. Kept as the
+// routes-off entry point, which is what makes those tests measure the editor's
+// keymap and nothing this card added.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn read_line_inline<R: std::io::Read>(
     input: &mut R,
     paint: &mut dyn FnMut(&str, usize, &str, bool),
     history: &[String],
     on_resize: &mut dyn FnMut(),
+) -> std::io::Result<InlineRead> {
+    read_line_inline_with_keys(
+        input,
+        paint,
+        history,
+        on_resize,
+        InlineKeys::disabled(),
+        None,
+    )
+}
+
+/// What the **first** `\u{2190}` on an untouched empty composer puts in the hint
+/// slot: that another press is needed, and what it would open.
+///
+/// A two-press key whose first press is silent is a key that did nothing, so
+/// this is the affordance rather than decoration. Plain ASCII words, not an
+/// arrow glyph: the slot is text on a row whose styling tier is the
+/// renderer's, and the hint has to read the same in all of them.
+const LEFT_ARM_HINT: &str = "  press left again for the agent view";
+
+/// The composer's prompt label, given the session's base prompt and the agent
+/// it is attached to (card **T4-S6a**, design §4.5: “the prompt label changes
+/// to `agent 3>`”).
+///
+/// One function because the label is the **only** standing evidence that a
+/// submitted line goes to a background agent rather than to the model, and
+/// that evidence is what makes `\u{2190}` safe to overload (see
+/// [`read_line_inline_with_keys`]): the context the keystroke depends on is on
+/// screen in front of the caret, not something the user did minutes ago.
+///
+/// It **replaces** the base rather than decorating it: the base prompt is
+/// configurable and `agent 3> kitsu> ` would be absurd.
+///
+/// Returns the base unchanged while detached, which is all this card ships;
+/// the attached arm is what T4-S6a's test pins.
+pub(crate) fn composer_prompt(base: &str, attached: Option<u64>) -> String {
+    match attached {
+        Some(id) => format!("agent {id}> "),
+        None => base.to_string(),
+    }
+}
+
+/// [`read_line_inline`] with card T4-S2's key routes live.
+///
+/// The two routes are kept out of the editor entirely, and that separation is
+/// the point rather than tidiness. `kitsu-editor`'s `history_prev` emits
+/// `EditorAction::RecallRequest` only on an *empty, walk-free* buffer, and the
+/// arm below declines it so `\u{2191}` walks history at the idle prompt. If the
+/// `\u{2190}` route shared that empty-draft or recall state — by arming through
+/// an editor action, or by consuming the key that follows — the first `\u{2191}`
+/// would stop walking history, which is the regression a user notices
+/// immediately. So the arming state is one local counter in *this* loop, fed
+/// by [`KeyFilter`] from the raw byte stream, and the editor is never told that
+/// a left arrow happened at all when the composer is empty (where backward-char
+/// is a no-op anyway).
+///
+/// The counter is reset by **any** other item in the chunk, so the armed state
+/// belongs to an uninterrupted run of `\u{2190}`s on an untouched empty
+/// composer. Arming until the view opens would make a keystroke's meaning
+/// depend on something the user did minutes ago and can no longer see.
+pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
+    input: &mut R,
+    paint: &mut dyn FnMut(&str, usize, &str, bool),
+    history: &[String],
+    on_resize: &mut dyn FnMut(),
+    keys: InlineKeys,
+    attached: Option<u64>,
 ) -> std::io::Result<InlineRead> {
     use kitsu_editor::{EditorAction, FeedOutcome, TypeaheadEditor};
 
@@ -1225,7 +1717,13 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
     ///
     /// `search_status` already carries its own two-space separator, so the
     /// renderer must not add another one.
-    fn hint_of(editor: &TypeaheadEditor) -> (String, bool) {
+    ///
+    /// `armed` — one `\u{2190}` seen and the next one would open the agent view
+    /// — takes the slot, reserved, so the affordance keeps its columns.
+    fn hint_of(editor: &TypeaheadEditor, armed: bool) -> (String, bool) {
+        if armed {
+            return (LEFT_ARM_HINT.to_string(), true);
+        }
         let search_status = editor.search_status();
         let hint_reserved = search_status.is_some();
         let hint = search_status.unwrap_or_else(|| crate::idle_slash_hint(&editor.buffer_string()));
@@ -1233,9 +1731,14 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
     }
 
     let mut editor = TypeaheadEditor::new(history.to_vec());
+    let mut filter = KeyFilter::new(keys);
+    // How many `\u{2190}`s of the current uninterrupted run have been seen. A
+    // fresh read starts disarmed, so a press that opened the view cannot leak
+    // into the next line.
+    let mut left_presses = 0u8;
     // The first frame, before any byte arrives: the row must show the (possibly
     // empty) draft rather than whatever the previous paint left there.
-    let (mut last_hint, mut last_reserved) = hint_of(&editor);
+    let (mut last_hint, mut last_reserved) = hint_of(&editor, false);
     paint(
         &editor.buffer_string(),
         editor.cursor(),
@@ -1260,7 +1763,7 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
                     // The row's content is the live draft, not the status: the
                     // resize deliberately painted nothing, so the first frame
                     // at the new geometry is drawn here.
-                    let (hint, hint_reserved) = hint_of(&editor);
+                    let (hint, hint_reserved) = hint_of(&editor, left_presses == 1);
                     paint(
                         &editor.buffer_string(),
                         editor.cursor(),
@@ -1274,12 +1777,89 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
             }
             Err(error) => return Err(error),
         };
-        // Fed verbatim: the editor owns the keymap, the escape-sequence state
-        // machine and the bracketed-paste block, so the reader must not look
-        // for terminators itself (that would split a paste at its newlines).
-        let outcome = editor.feed(&buffer[..count]);
-        let mut changed = outcome.changed;
-        for action in outcome.actions {
+        // Fed verbatim *within each item*: the editor owns the keymap, the
+        // escape-sequence state machine and the bracketed-paste block, so the
+        // reader must not look for terminators itself (that would split a
+        // paste at its newlines). With both routes off, `KeyFilter` yields one
+        // `Bytes` item holding the whole chunk, so this is the pre-T4-S2 call.
+        let mut changed = false;
+        let mut actions: Vec<EditorAction> = Vec::new();
+        let mut open_agent_view = false;
+        for item in filter.feed(&buffer[..count]) {
+            match item {
+                KeyItem::Bytes(bytes) => {
+                    // Any keystroke that is not a `\u{2190}` disarms.
+                    left_presses = 0;
+                    let outcome = editor.feed(&bytes);
+                    changed |= outcome.changed;
+                    actions.extend(outcome.actions);
+                }
+                KeyItem::Left => {
+                    // Card **T4-S6a**: attachment is asked **before** the
+                    // press count, and that order is the whole decision. A5
+                    // makes `\u{2190}` on an empty composer the return path,
+                    // and an implementation that counted presses first would
+                    // turn `\u{2190}\u{2190}` in one read into a detach *and*
+                    // a view. The rule is deliberately not gated by
+                    // `left_arrow_opens_agents`: A1 scopes that key to the
+                    // agent view's route alone, and A5 names this one with no
+                    // condition. The carried draft is empty because this arm
+                    // is only reached on an empty one -- which is true here
+                    // and is *not* true of the chord below (finding F76).
+                    if attached.is_some() && editor.buffer_string().is_empty() {
+                        return Ok(InlineRead::Detached(String::new()));
+                    }
+                    // The composer's emptiness is asked *here*, after every
+                    // earlier item in the chunk has been applied, so a
+                    // `x<BS><left><left>` chunk is judged on the draft the
+                    // backspace left behind and not on the one the chunk
+                    // started with.
+                    if keys.left_arrow_opens_agents && editor.buffer_string().is_empty() {
+                        left_presses = left_presses.saturating_add(1);
+                        if left_presses >= 2 {
+                            left_presses = 0;
+                            open_agent_view = true;
+                            break;
+                        }
+                        // Nothing about the draft changed; the hint slot did,
+                        // and the repaint below is driven off that.
+                    } else {
+                        // A non-empty draft: this is cursor movement and
+                        // nothing else, so the bytes go to the editor exactly
+                        // as they arrived and the affordance disarms.
+                        left_presses = 0;
+                        let outcome = editor.feed(LEFT_ARROW);
+                        changed |= outcome.changed;
+                        actions.extend(outcome.actions);
+                    }
+                }
+                KeyItem::Open => {
+                    left_presses = 0;
+                    open_agent_view = true;
+                    break;
+                }
+                // Card **T4-S6a**: `<prefix> d`. With an agent attached this
+                // is the detach route (`InlineRead::Detached`); with nothing
+                // attached it is **inert and silent**, exactly as every other
+                // chord letter is today -- a chord is a slip, and `/detach` is
+                // where a deliberate detach gets an answer.
+                KeyItem::Detach => {
+                    left_presses = 0;
+                    if attached.is_some() {
+                        // Finding **F76**: the chord has no empty-composer
+                        // precondition, so whatever is typed is carried back
+                        // for the loop to replay -- `buffer_string` is the
+                        // draft the next read starts from, exactly as the
+                        // agent-view route below carries it.
+                        return Ok(InlineRead::Detached(editor.buffer_string()));
+                    }
+                }
+            }
+        }
+        if open_agent_view {
+            return Ok(InlineRead::OpenAgentView(editor.buffer_string()));
+        }
+        for action in actions {
             match action {
                 EditorAction::Submit(line) => return Ok(InlineRead::Submitted(line)),
                 EditorAction::Eof => return Ok(InlineRead::Eof),
@@ -1352,7 +1932,7 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
         // the painted `(hint, hint_reserved)` pair against the last one makes
         // the row's hint a function of editor state rather than of which
         // transitions the editor chooses to report.
-        let (hint, hint_reserved) = hint_of(&editor);
+        let (hint, hint_reserved) = hint_of(&editor, left_presses == 1);
         if changed || hint != last_hint || hint_reserved != last_reserved {
             paint(
                 &editor.buffer_string(),
@@ -1509,18 +2089,84 @@ impl kitsu_tui::composer::ComposerDecoration for InlineComposerHost {
     }
 }
 
+/// Classify one agent thread into the agent view's A2 group.
+///
+/// This is the **only** mapping from the thread lifecycle onto
+/// [`AgentViewState`]: `Blocked` is the group that needs you, `Done` splits on
+/// whether its handoff is still `Ready` (nobody has looked) and the two
+/// terminal failures stay distinct. The order comes from
+/// [`AgentViewState::order`] and is never restated here.
+// T4-S2's overlay is this mapping's first non-test caller, so the deliberate
+// `allow(dead_code)` the T2-S3 lifecycle used is gone with this card.
+pub(crate) fn agent_view_state_of(
+    phase: thread::AgentThreadPhase,
+    handoff: thread::AgentHandoffState,
+) -> kitsu_render::AgentViewState {
+    use kitsu_render::AgentViewState;
+    match phase {
+        thread::AgentThreadPhase::Blocked => AgentViewState::NeedsInput,
+        thread::AgentThreadPhase::Running => AgentViewState::Working,
+        thread::AgentThreadPhase::Done => match handoff {
+            // `Ready` is the one case where a result is still waiting to be
+            // read. `Unavailable` is not an unviewed result: there is nothing
+            // left to observe, so it joins the viewed group.
+            thread::AgentHandoffState::Ready => AgentViewState::DoneUnviewed,
+            thread::AgentHandoffState::Acknowledged | thread::AgentHandoffState::Unavailable => {
+                AgentViewState::DoneViewed
+            }
+        },
+        thread::AgentThreadPhase::Failed => AgentViewState::Failed,
+        thread::AgentThreadPhase::Cancelled => AgentViewState::Cancelled,
+    }
+}
+
+/// Map a validated agent-thread DTO onto one agent-view row (T4-S1).
+///
+/// **What the DTO cannot supply.** `AgentThreadSnapshot` carries no token
+/// counts and no activity label — those live on `AgentTelemetry`, reached
+/// through `AgentProgress`, which the DTO deliberately does not embed. So this
+/// mapping leaves `tokens`, `last_activity` and `last_activity_age` as `None`
+/// rather than inventing a zero, and a caller that has the telemetry fills
+/// them in afterwards.
+// T4-S2's overlay is this mapping's first non-test caller, so the deliberate
+// `allow(dead_code)` the T2-S3 lifecycle used is gone with this card.
+pub(crate) fn agent_row_from_thread_dto(
+    dto: &thread::AgentThreadSnapshotDto,
+) -> kitsu_tui::agents_view::AgentRow {
+    let thread = &dto.thread;
+    kitsu_tui::agents_view::AgentRow {
+        state: agent_view_state_of(thread.phase, thread.handoff),
+        id: thread.id,
+        name: thread.name.clone(),
+        task: thread.task.clone(),
+        model: thread.model.clone(),
+        profile: thread.profile.clone(),
+        // Absent, not zero: a zero here would read as "no tokens used" and
+        // "no activity", which is a different claim from "not known here".
+        last_activity: None,
+        last_activity_age: None,
+        tokens: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
+    use crate::subagent::thread;
     use kitsu_render::live;
     use kitsu_render::surface::{active_surface, set_surface, Surface};
     use serial_test::serial;
 
     use super::{
-        install, palette_rows, suspend_and_resume, BridgeGuard, SuspendEffects,
-        TuiMode, PALETTE_MIN_ROWS, SIGNAL_RESTORE,
+        install, palette_rows, suspend_and_resume, BridgeGuard, SuspendEffects, TuiMode,
+        PALETTE_MIN_ROWS, SIGNAL_RESTORE,
+    };
+    // Card T4-S6a's surfaces, in their own `use` so the list above is the
+    // one the earlier cards wrote.
+    use super::{
+        composer_prompt, read_line_inline_with_keys, InlineKeys, KeyFilter, KeyItem, LEFT_ARROW,
     };
 
     /// A sink whose buffer outlives the surface that owns it, so bytes written
@@ -4805,7 +5451,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{repaint_status_row, StatusCounts, StatusSource};
+    use super::{repaint_status_row, StatusCounts, StatusSource, STATUS_FRAME_INTERVAL};
 
     /// Process-wide reduced-motion override, restored on the way out.
     ///
@@ -4869,8 +5515,7 @@ mod tests {
         let cell = queued.clone();
         let source = StatusSource::new(Box::new(move || StatusCounts {
             queued: cell.load(Ordering::Relaxed),
-            blocked: 0,
-            running: 0,
+            ..Default::default()
         }));
         source.set_usage("example-model-v1", 1_000, 100_000);
         guard.enable_live_status(source.clone());
@@ -5078,6 +5723,1063 @@ mod tests {
                 text.escape_debug().to_string()
             );
         }
+        drop(guard);
+    }
+
+    // ---------------------------------------------------------------------
+    // Card **T4-S6-status**, requirement A5 / design §4.5: the
+    // `attached · agent N` segment, measured in the bytes the painter writes.
+    //
+    // **FAILING-FIRST.** `StatusFields::attached` and `StatusCounts::attached`
+    // exist (this card's authorised production edits) and nothing composes or
+    // forwards them, so both tests below are red.
+    //
+    // The surface is `repaint_status_row` -> `InlineSurface::paint` -> stderr:
+    // the same path the 50 ms cadence paints the pinned row on, so what these
+    // tests read is what reaches the terminal. Finding **F71**: reading the
+    // attachment back off `StatusSource::fields` would pass against a row
+    // that never mentions it.
+    // ---------------------------------------------------------------------
+
+    /// The fixture of [`live_status_fixture`] plus the **session binding** the
+    /// composer loop owns, behind the handle the counts closure reads.
+    ///
+    /// The closure is a *pull*: the attachment is read at paint time from the
+    /// one cell, never copied into the source, which is why a detach needs no
+    /// second notification and the row cannot drift from the prompt label
+    /// (**F75**).
+    #[allow(clippy::type_complexity)]
+    fn live_status_fixture_attached() -> (
+        BridgeGuard,
+        SharedSink,
+        Arc<StatusSource>,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Option<u64>>>,
+    ) {
+        let (guard, _out, err) = install_inline(T3_S12_ROWS, T3_S12_VIEWPORT_ROWS, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let queued = Arc::new(AtomicUsize::new(0));
+        let attached: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
+        let (queue_cell, attach_cell) = (queued.clone(), attached.clone());
+        let source = StatusSource::new(Box::new(move || StatusCounts {
+            queued: queue_cell.load(Ordering::Relaxed),
+            attached: *attach_cell.lock().expect("the session binding"),
+            ..Default::default()
+        }));
+        source.set_usage("example-model-v1", 1_000, 100_000);
+        guard.enable_live_status(source.clone());
+        source.begin_turn();
+        (guard, err, source, queued, attached)
+    }
+
+    /// Past the painter's frame budget (N3), so the next `repaint_status_row`
+    /// is not swallowed by it.
+    fn past_the_frame_budget() {
+        std::thread::sleep(STATUS_FRAME_INTERVAL * 3);
+    }
+
+    /// The segment is **painted**, it **names the agent**, and it **tracks
+    /// the binding in both directions** — attach paints it, detach takes it
+    /// away. Nothing between the binding and the bytes but production.
+    ///
+    /// The detach half is deliberately driven by clearing the binding and
+    /// nothing else, because that is the whole of what the composer loop's
+    /// detach arm does (`main.rs`, `InlineRead::Detached`: `*attached = None`)
+    /// — so if the row needed telling separately, it would be a second copy
+    /// and this test would stay red.
+    #[test]
+    #[serial]
+    fn the_status_row_paints_the_attachment_and_stops_when_the_binding_is_cleared() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, _source, _queued, attached) = live_status_fixture_attached();
+
+        // Detached: the row is painted, and it is the whole row.
+        repaint_status_row();
+        let visible = kitsu_render::sanitize_terminal_text(&err.text());
+        assert!(
+            visible.contains("example-model-v1"),
+            "control: the detached row must be painted, got {visible:?}"
+        );
+        assert!(
+            !visible.contains("attached"),
+            "nothing is attached, so the row must not say so, got {visible:?}"
+        );
+
+        // Attach: the binding moves and nothing else is told.
+        *attached.lock().expect("the session binding") = Some(3);
+        let before = err.text().len();
+        past_the_frame_budget();
+        repaint_status_row();
+        let window = err.text()[before..].to_string();
+        let visible = kitsu_render::sanitize_terminal_text(&window);
+        assert_eq!(
+            row_paints(&window),
+            1,
+            "attaching is state, not animation, and must paint once, got {:?}",
+            window.escape_debug().to_string()
+        );
+        assert!(
+            visible.contains("attached \u{b7} agent 3"),
+            "design §4.5: the status row shows `attached \u{b7} agent 3`, got \
+             {visible:?}"
+        );
+        assert!(
+            visible.contains("example-model-v1"),
+            "and it is still the status row, got {visible:?}"
+        );
+
+        // A second agent: the row names *which*, so the segment cannot be a
+        // fixed "attached" with the id painted from somewhere else.
+        *attached.lock().expect("the session binding") = Some(11);
+        let before = err.text().len();
+        past_the_frame_budget();
+        repaint_status_row();
+        let visible = kitsu_render::sanitize_terminal_text(&err.text()[before..]);
+        assert!(
+            visible.contains("attached \u{b7} agent 11") && !visible.contains("agent 3"),
+            "the segment names the agent the binding holds, got {visible:?}"
+        );
+
+        // Detach: clearing the binding is the whole of the composer loop's
+        // detach arm, and the segment must go with it.
+        *attached.lock().expect("the session binding") = None;
+        let before = err.text().len();
+        past_the_frame_budget();
+        repaint_status_row();
+        let window = err.text()[before..].to_string();
+        let visible = kitsu_render::sanitize_terminal_text(&window);
+        assert_eq!(
+            row_paints(&window),
+            1,
+            "detaching must repaint the row, got {:?}",
+            window.escape_debug().to_string()
+        );
+        assert!(
+            !visible.contains("attached"),
+            "A5: after a detach the row must not claim an attachment, got \
+             {visible:?}"
+        );
+        assert!(
+            visible.contains("example-model-v1"),
+            "and the row that comes back is the whole row, not an empty one, \
+             got {visible:?}"
+        );
+        drop(guard);
+    }
+
+    /// **Decided here, because §4.5 does not say: the segment survives a
+    /// repaint, and survives the attached agent finishing.**
+    ///
+    /// *Repaint.* The row is recomposed from the source on every paint
+    /// (`repaint_status_row`, `clear_approval_modal`), never remembered, so a
+    /// repaint triggered by something else entirely — here a queue-depth
+    /// change — must still carry the attachment. A segment that was painted
+    /// once and lost on the next frame would make §4.5's legibility argument
+    /// for `←` hold only until the next keystroke.
+    ///
+    /// *The agent finishing.* The attachment is the **user's**, not the
+    /// agent's: it is derived from the composer's session binding and the
+    /// registry is not consulted, so an agent reaching a terminal state while
+    /// attached does **not** silently detach. The precedent is T4-S6a's own
+    /// ruling that leaving the agent view is not detaching — only `←`,
+    /// `Ctrl+X d` and `/detach` are — and the alternative is worse: the
+    /// prompt label is derived from the same binding, so a row that dropped
+    /// the segment on its own would disagree with the caret in front of the
+    /// user. This test pins it at the only place that can be pinned here: the
+    /// row's content depends on the binding and on nothing about the agent,
+    /// so no registry state can take the segment away. The registry's side of
+    /// it belongs to T4-S6b/c, which own the stream and the recap.
+    #[test]
+    #[serial]
+    fn the_attachment_segment_survives_a_repaint_caused_by_anything_else() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, source, queued, attached) = live_status_fixture_attached();
+
+        *attached.lock().expect("the session binding") = Some(4);
+        repaint_status_row();
+        let visible = kitsu_render::sanitize_terminal_text(&err.text());
+        assert!(
+            visible.contains("attached \u{b7} agent 4"),
+            "control: the attachment must reach the first paint, got {visible:?}"
+        );
+
+        // A repaint caused by an unrelated state change, with the binding
+        // untouched.
+        queued.store(2, Ordering::Relaxed);
+        let before = err.text().len();
+        past_the_frame_budget();
+        repaint_status_row();
+        let window = err.text()[before..].to_string();
+        let visible = kitsu_render::sanitize_terminal_text(&window);
+        assert_eq!(
+            row_paints(&window),
+            1,
+            "control: the queue depth moved, so the row must repaint, got {:?}",
+            window.escape_debug().to_string()
+        );
+        assert!(
+            visible.contains("[2 queued]"),
+            "control: carrying the new depth, got {visible:?}"
+        );
+        assert!(
+            visible.contains("attached \u{b7} agent 4"),
+            "and the attachment survives a repaint it did not cause, got \
+             {visible:?}"
+        );
+
+        // And the composed row is a function of the binding alone: the same
+        // binding composes the same segment however many times it is asked,
+        // which is what "recomposed, never remembered" means.
+        let cols = live::terminal_columns();
+        let once = kitsu_render::sanitize_terminal_text(&source.compose(cols));
+        let twice = kitsu_render::sanitize_terminal_text(&source.compose(cols));
+        assert_eq!(once, twice, "the row is composed, not consumed");
+        assert!(
+            once.contains("attached \u{b7} agent 4"),
+            "and composing it again still names the agent, got {once:?}"
+        );
+        drop(guard);
+    }
+
+    // ---- T4-S1: the agent view's pure model, across the crate boundary ----
+
+    /// A valid thread DTO, built from `thread.rs`'s own `blocked_snapshot`
+    /// fixture so its `retained_bytes` accounting is real rather than guessed;
+    /// `validate_default` is asserted below, which proves it.
+    fn thread_dto(
+        phase: thread::AgentThreadPhase,
+        handoff: thread::AgentHandoffState,
+    ) -> thread::AgentThreadSnapshotDto {
+        let terminal = !matches!(
+            phase,
+            thread::AgentThreadPhase::Running | thread::AgentThreadPhase::Blocked
+        );
+        thread::AgentThreadSnapshotDto::from_snapshot(&thread::AgentThreadSnapshot {
+            id: 7,
+            task: "summarize the crate".to_string(),
+            model: "qwen2.5-coder".to_string(),
+            profile: Some("reviewer".to_string()),
+            name: None,
+            phase,
+            waiting_for: None,
+            handoff,
+            elapsed_ms: 12_500,
+            result_bytes: None,
+            // Derived from the phase, not fixed: `validate` requires
+            // `terminal == timeline.closed` and forbids open steering once
+            // terminal, so a fixture with these hard-coded is only a valid DTO
+            // for non-terminal phases. Corrected at review in T4-S1.
+            steering_open: !terminal,
+            pending_steering: 0,
+            timeline: thread::AgentTimelineSnapshot {
+                entries: vec![thread::AgentTimelineEntry {
+                    sequence: 1,
+                    elapsed_ms: 10,
+                    kind: thread::AgentTimelineKind::UserTask,
+                    round: None,
+                    text: "summarize the crate".to_string(),
+                    truncated: false,
+                }],
+                dropped_entries: 0,
+                retained_bytes: 19,
+                closed: terminal,
+            },
+        })
+    }
+
+    /// Every `(phase, handoff)` pair maps onto exactly one A2 group, and the
+    /// viewed/unviewed split is driven by the handoff and nothing else.
+    #[test]
+    fn the_thread_dto_maps_every_phase_and_handoff_pair_to_one_agent_view_state() {
+        use kitsu_render::AgentViewState;
+        use thread::AgentHandoffState::{Acknowledged, Ready, Unavailable};
+        use thread::AgentThreadPhase::{Blocked, Cancelled, Done, Failed, Running};
+
+        let expected: [(
+            thread::AgentThreadPhase,
+            thread::AgentHandoffState,
+            AgentViewState,
+        ); 15] = [
+            (Blocked, Unavailable, AgentViewState::NeedsInput),
+            (Blocked, Ready, AgentViewState::NeedsInput),
+            (Blocked, Acknowledged, AgentViewState::NeedsInput),
+            (Running, Unavailable, AgentViewState::Working),
+            (Running, Ready, AgentViewState::Working),
+            (Running, Acknowledged, AgentViewState::Working),
+            // The split A2 asks for: `Ready` means nobody has looked yet.
+            (Done, Ready, AgentViewState::DoneUnviewed),
+            (Done, Acknowledged, AgentViewState::DoneViewed),
+            // Nothing to observe at all is not an unviewed result.
+            (Done, Unavailable, AgentViewState::DoneViewed),
+            (Failed, Unavailable, AgentViewState::Failed),
+            (Failed, Ready, AgentViewState::Failed),
+            (Failed, Acknowledged, AgentViewState::Failed),
+            (Cancelled, Unavailable, AgentViewState::Cancelled),
+            (Cancelled, Ready, AgentViewState::Cancelled),
+            (Cancelled, Acknowledged, AgentViewState::Cancelled),
+        ];
+
+        let mut checked_dtos = 0_usize;
+        for (phase, handoff, state) in expected {
+            assert_eq!(
+                super::agent_view_state_of(phase, handoff),
+                state,
+                "phase {} + handoff {}",
+                phase.label(),
+                handoff.label()
+            );
+            // The classifier is asserted over all fifteen pairs above, because
+            // it is a total function over two enums and defensive totality is
+            // correct there. The DTO, however, *forbids* seven of them:
+            // `validate` requires `terminal == timeline.closed`, a handoff iff
+            // terminal, and no open steering once terminal. So a non-terminal
+            // phase with a handoff, and a terminal phase with none, are states
+            // the DTO declares unrepresentable -- and an existing test,
+            // `thread::tests::validate_treats_blocked_as_non_terminal`, pins
+            // exactly that ("a blocked thread has no handoff").
+            //
+            // Asserting a fixture is valid for those seven would require
+            // loosening an invariant another test holds. The row mapping is
+            // therefore exercised only over the eight representable pairs,
+            // and the count is asserted below so this guard cannot silently
+            // skip everything. Corrected at review in T4-S1; the implementer
+            // stopped here rather than edit a test or an invariant.
+            let terminal = !matches!(phase, Blocked | Running);
+            let representable = terminal != (handoff == Unavailable);
+            if !representable {
+                continue;
+            }
+            checked_dtos += 1;
+            let dto = thread_dto(phase, handoff);
+            dto.validate_default()
+                .expect("the fixture must be a valid DTO");
+            assert_eq!(
+                super::agent_row_from_thread_dto(&dto).state,
+                state,
+                "the row's state must agree with the classifier"
+            );
+        }
+
+        assert_eq!(
+            checked_dtos, 8,
+            "exactly eight of the fifteen pairs are representable DTOs; a guard \
+             that skipped more would stop exercising the row mapping"
+        );
+
+        // Non-vacuous: all six A2 groups are actually produced by the table.
+        let produced = expected
+            .iter()
+            .map(|(_, _, state)| *state)
+            .collect::<std::collections::HashSet<AgentViewState>>();
+        assert_eq!(produced.len(), 6, "every A2 group must be reachable");
+
+        // And reachable through a *valid* DTO, not merely through the
+        // classifier: the eight representable pairs must still cover all six.
+        let through_dtos = expected
+            .iter()
+            .filter(|(phase, handoff, _)| {
+                let terminal = !matches!(phase, Blocked | Running);
+                terminal != (*handoff == Unavailable)
+            })
+            .map(|(_, _, state)| *state)
+            .collect::<std::collections::HashSet<AgentViewState>>();
+        assert_eq!(
+            through_dtos.len(),
+            6,
+            "every A2 group must be reachable through a DTO the validator accepts"
+        );
+    }
+
+    /// The DTO → row mapping: what the DTO has travels, and what it cannot
+    /// supply stays absent.
+    #[test]
+    fn an_agent_row_from_a_thread_dto_carries_its_fields_and_leaves_telemetry_absent() {
+        let dto = thread_dto(
+            thread::AgentThreadPhase::Running,
+            thread::AgentHandoffState::Unavailable,
+        );
+        dto.validate_default().expect("valid fixture");
+        let row = super::agent_row_from_thread_dto(&dto);
+        assert_eq!(row.id, 7);
+        assert_eq!(row.task, "summarize the crate");
+        assert_eq!(row.model, "qwen2.5-coder");
+        assert_eq!(row.profile.as_deref(), Some("reviewer"));
+        assert_eq!(row.name, None);
+        assert_eq!(
+            row.head(),
+            "summarize the crate",
+            "with no name the head is the task"
+        );
+        // `AgentThreadSnapshot` has no token counts and no activity label, so
+        // the mapping must leave them absent rather than report a zero.
+        assert_eq!(row.tokens, None, "the DTO cannot supply token counts");
+        assert_eq!(row.last_activity, None, "the DTO cannot supply an activity");
+        assert_eq!(row.last_activity_age, None);
+
+        // A named agent's name reaches the row and wins the head.
+        let mut named = dto.thread.clone();
+        named.name = Some("crate-reviewer".to_string());
+        let row = super::agent_row_from_thread_dto(&thread::AgentThreadSnapshotDto::from_snapshot(
+            &named,
+        ));
+        assert_eq!(row.name.as_deref(), Some("crate-reviewer"));
+        assert_eq!(row.head(), "crate-reviewer");
+    }
+
+    /// **Anti-fork (F2/F38/F45/F57).** `/jobs view` and the agent view print
+    /// different words — A2 says "done (unviewed)", the text deck says
+    /// "done, result ready" — but they must not disagree about *which* groups
+    /// exist or *what order* they come in. The headings below are the literal
+    /// `GROUPS` array in `format_jobs_view`; this asserts each one's position
+    /// equals the shared `AgentViewState::rank`.
+    #[test]
+    fn the_jobs_view_group_order_cannot_fork_from_the_shared_agent_view_order() {
+        use crate::subagent::{AgentProgress, AgentProgressStatus, AgentTelemetry};
+        use kitsu_render::AgentViewState;
+
+        // Read from `format_jobs_view`, not invented.
+        const JOBS_VIEW_GROUPS: [&str; 6] = [
+            "needs input",
+            "working",
+            "done, result ready",
+            "done, collected",
+            "failed",
+            "cancelled",
+        ];
+        assert_eq!(
+            JOBS_VIEW_GROUPS.len(),
+            AgentViewState::order().len(),
+            "the two surfaces must have the same number of groups"
+        );
+
+        let progress = |status: AgentProgressStatus| AgentProgress {
+            id: 1,
+            task: "summarize the crate".to_string(),
+            profile: None,
+            status,
+            waiting_for: None,
+            elapsed_ms: 0,
+            result_bytes: None,
+            last_activity_ms_ago: None,
+            telemetry: AgentTelemetry::default(),
+        };
+
+        // Every case `jobs_view_group` can produce, and the A2 group it is.
+        let cases: [(AgentProgressStatus, bool, AgentViewState); 6] = [
+            (
+                AgentProgressStatus::Blocked,
+                true,
+                AgentViewState::NeedsInput,
+            ),
+            (AgentProgressStatus::Running, true, AgentViewState::Working),
+            (
+                AgentProgressStatus::Done,
+                false,
+                AgentViewState::DoneUnviewed,
+            ),
+            (AgentProgressStatus::Done, true, AgentViewState::DoneViewed),
+            (AgentProgressStatus::Failed, true, AgentViewState::Failed),
+            (
+                AgentProgressStatus::Cancelled,
+                true,
+                AgentViewState::Cancelled,
+            ),
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for (status, collected, state) in cases {
+            let heading = crate::jobs_view_group(&progress(status), collected);
+            let position = JOBS_VIEW_GROUPS
+                .iter()
+                .position(|group| *group == heading)
+                .unwrap_or_else(|| panic!("`{heading}` is not one of the known /jobs view groups"));
+            assert_eq!(
+                state.rank(),
+                position,
+                "`{heading}` sits at {position} in /jobs view but ranks {} in the agent view",
+                state.rank()
+            );
+            assert!(seen.insert(heading), "`{heading}` was produced twice");
+        }
+        assert_eq!(
+            seen.len(),
+            JOBS_VIEW_GROUPS.len(),
+            "the table must cover every /jobs view group, or a reorder could hide here"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Card T4-S6a: **attach/detach -- what attachment is, and the keys
+    // that enter and leave it.** Requirement A5, design §4.5 and §4.7.
+    //
+    // Every test under this banner FAILS today: `KeyFilter` does not know
+    // the detach letter, the reader does not know what `attached` means,
+    // and `composer_prompt` returns the base prompt whatever it is given.
+    //
+    // **The `←` rule this card settles.** T4-S2 bound `←` on an empty
+    // composer to the agent view, two presses, and decided that any other
+    // keystroke disarms the chord. A5 now wants `←` to *detach*. The rule
+    // pinned here:
+    //
+    // * **While attached, the first `←` on an empty composer detaches**, and
+    //   never reaches the two-press count. Two reasons, and the first is the
+    //   one T4-S2 made the two-press rule for. T4-S2's objection to a durable
+    //   armed state was that it makes a keystroke's meaning depend on
+    //   something the user did minutes ago *and can no longer see*;
+    //   attachment is the opposite case -- it is on screen in front of the
+    //   caret for as long as it lasts (`composer_prompt`, pinned below, and
+    //   the status row's `attached · agent N`), so the context that decides
+    //   this keystroke is legible at the moment it is pressed. Second, the
+    //   two costs are not comparable: opening a full-screen overlay by
+    //   accident interrupts you, while detaching by accident costs one
+    //   keystroke to undo and **stops nothing** (§4.5: stopping is `x` or
+    //   `/jobs stop`, never a detach).
+    // * A **non-empty** draft keeps `←` as cursor movement while attached,
+    //   exactly as detached. A draft is content; this is unchanged.
+    // * The rule does **not** consult `[tui] left_arrow_opens_agents`. A1
+    //   says that key "disables that route alone", and the route it names is
+    //   the agent view's; A5 names `←` as the return path without
+    //   conditioning it. With the key off and nothing attached, `←` on an
+    //   empty composer stays plain backward-char -- a no-op at column 0.
+    //
+    // **`Ctrl+C` is deliberately absent.** §4.5 asks for `Ctrl+C` =
+    // clear draft / detach, and finding **F54** records that "`Ctrl+C` is
+    // swallowed at an approval prompt" is measured but *unexplained* -- the
+    // cause is probably the harness rather than the code. The clear-draft
+    // half already ships in `kitsu-editor` (`0x03` clears a non-empty
+    // buffer, `lib.rs:529`) and is not this card's to re-pin; the detach
+    // half would bind the one byte whose signal behaviour is unresolved, so
+    // it waits for a human with a real terminal.
+    // ------------------------------------------------------------------
+
+    /// The default `[tui] prefix` as the byte a terminal sends for it.
+    const DETACH_PREFIX: u8 = 0x18;
+
+    /// Both routes live, as a shipped default configuration has them.
+    fn attach_keys() -> InlineKeys {
+        InlineKeys {
+            prefix: Some(DETACH_PREFIX),
+            left_arrow_opens_agents: true,
+        }
+    }
+
+    /// Drive the reader with the key routes live and a stated attachment.
+    fn read_attached(input: Chunks, keys: InlineKeys, attached: Option<u64>) -> InlineRead {
+        let mut input = input;
+        let mut paint = |_: &str, _: usize, _: &str, _: bool| {};
+        read_line_inline_with_keys(&mut input, &mut paint, &[], &mut || {}, keys, attached)
+            .expect("inline read")
+    }
+
+    /// **The `←` rule, positive half.** One `←` on an empty composer while
+    /// attached detaches; it does not arm anything and it does not wait for a
+    /// second press.
+    ///
+    /// Both controls are in this test rather than beside it, because each is
+    /// what stops the claim being vacuous in one direction: a reader that
+    /// returned `Detached` for every `←` would pass the first assertion and
+    /// fail the other two.
+    #[test]
+    fn left_arrow_detaches_on_the_first_press_while_attached() {
+        assert_eq!(
+            read_attached(Chunks::bytewise(LEFT_ARROW), attach_keys(), Some(3)),
+            InlineRead::Detached(String::new()),
+            "A5: `\u{2190}` on an empty composer returns from an attached agent, \
+             on the first press"
+        );
+        // CONTROL 1: a non-empty draft keeps the arrow as cursor movement,
+        // attached or not. `ac` then `\u{2190}` then `B` submits `aBc` only if
+        // the cursor really moved.
+        assert_eq!(
+            submitted(&read_attached(
+                Chunks::bytewise(b"ac\x1b[DB\r"),
+                attach_keys(),
+                Some(3),
+            )),
+            "aBc",
+            "a draft is content: `\u{2190}` in a non-empty draft is backward-char \
+             while attached too"
+        );
+        // CONTROL 2: with nothing attached the same single press detaches
+        // nothing -- it arms T4-S2's affordance and the read continues, so the
+        // drained reader reports EOF.
+        assert_eq!(
+            read_attached(Chunks::bytewise(LEFT_ARROW), attach_keys(), None),
+            InlineRead::Eof,
+            "NON-VACUOUS: one `\u{2190}` with nothing attached is still T4-S2's \
+             first press and nothing else"
+        );
+    }
+
+    /// **The binding conflict, settled.** Two `←`s in one read while attached
+    /// are a detach and **not** the agent view: the first press consumed the
+    /// keystroke, so there is no second press to count.
+    ///
+    /// This is the case T4-S2's `LEFT_TWICE` constant exists for -- the whole
+    /// affordance inside a single `read` -- and the one an implementation that
+    /// counted presses before asking about attachment would get wrong.
+    #[test]
+    fn two_left_arrows_in_one_read_detach_rather_than_opening_the_agent_view() {
+        assert_eq!(
+            read_attached(Chunks::new([b"\x1b[D\x1b[D"]), attach_keys(), Some(5),),
+            InlineRead::Detached(String::new()),
+            "attached, `\u{2190}\u{2190}` is one detach and no view"
+        );
+        // NON-VACUOUS: the same two bytes with nothing attached still open the
+        // view, so this test measures the attachment and not the chunking.
+        assert_eq!(
+            read_attached(Chunks::new([b"\x1b[D\x1b[D"]), attach_keys(), None),
+            InlineRead::OpenAgentView(String::new()),
+            "detached, `\u{2190}\u{2190}` is still T4-S2's agent view"
+        );
+    }
+
+    /// **`left_arrow_opens_agents = false` does not disable the return path.**
+    /// A1 scopes that key to the agent view's route; A5 names `←` as the way
+    /// back with no condition on it.
+    #[test]
+    fn left_arrow_detaches_while_attached_even_with_the_agent_view_route_off() {
+        let route_off = InlineKeys {
+            prefix: Some(DETACH_PREFIX),
+            left_arrow_opens_agents: false,
+        };
+        assert_eq!(
+            read_attached(Chunks::bytewise(LEFT_ARROW), route_off, Some(7)),
+            InlineRead::Detached(String::new()),
+            "A5's return path is not the agent view's route and is not gated \
+             by its switch"
+        );
+        // NON-VACUOUS: with the route off and nothing attached the arrow is
+        // plain backward-char, which `ab` + `\u{2190}` + `c` proves by order.
+        assert_eq!(
+            submitted(&read_attached(
+                Chunks::bytewise(b"ab\x1b[Dc\r"),
+                route_off,
+                None,
+            )),
+            "acb",
+            "with the route off the arrow reaches the editor as before"
+        );
+    }
+
+    /// Finding **F76**: **`Ctrl+X d` with text typed detaches and keeps the
+    /// line.**
+    ///
+    /// `InlineRead::Detached` was a unit variant documented as "only ever
+    /// reached on an empty" composer, which is `\u{2190}`'s precondition and
+    /// not the chord's. The chord exists *because* `\u{2190}` is cursor
+    /// movement once there is something to move over -- so it is the only
+    /// detach route a non-empty draft has, and discarding the draft is the
+    /// one thing it must not do.
+    #[test]
+    fn the_detach_chord_carries_a_non_empty_draft_back() {
+        assert_eq!(
+            read_attached(Chunks::bytewise(b"keep me\x18d"), attach_keys(), Some(3)),
+            InlineRead::Detached("keep me".to_string()),
+            "F76: `Ctrl+X d` with a draft typed detaches and carries the draft"
+        );
+        // The cursor need not be at the end: the chord carries the *draft*,
+        // not the tail after the caret.
+        assert_eq!(
+            read_attached(Chunks::bytewise(b"ab\x1b[D\x18d"), attach_keys(), Some(3)),
+            InlineRead::Detached("ab".to_string()),
+            "the whole draft survives, wherever the caret was left"
+        );
+        // NON-VACUOUS: the payload is the draft and not a constant -- an
+        // empty composer still detaches with an empty one.
+        assert_eq!(
+            read_attached(Chunks::bytewise(b"\x18d"), attach_keys(), Some(3)),
+            InlineRead::Detached(String::new()),
+            "NON-VACUOUS: on an empty composer the chord carries nothing back"
+        );
+        // NON-VACUOUS, the other way: with nothing attached the same bytes
+        // are inert, so this measures the chord and not the typing -- the
+        // draft stays a draft and the drained reader reports EOF.
+        assert_eq!(
+            read_attached(Chunks::bytewise(b"keep me\x18d"), attach_keys(), None),
+            InlineRead::Eof,
+            "NON-VACUOUS: unattached, `Ctrl+X d` detaches nothing"
+        );
+    }
+
+    /// Finding **F76** with **F72**'s caution: a **pasted, multi-byte** draft
+    /// survives the chord too.
+    ///
+    /// The composer is not one of the editor lines that bypass the decoder,
+    /// so a bracketed paste reaches the draft as text (the filter's own test
+    /// above pins that), and the payload must be the same bytes back -- a
+    /// `char`-indexed truncation or a lossy re-encode would show here and
+    /// nowhere else.
+    #[test]
+    fn the_detach_chord_carries_a_pasted_multi_byte_draft_back() {
+        const PASTE: &[u8] = "\x1b[200~caf\u{e9} \u{2014} \u{3088}\x1b[201~".as_bytes();
+        const DRAFT: &str = "caf\u{e9} \u{2014} \u{3088}";
+        assert_eq!(
+            read_attached(Chunks::new([PASTE, b"\x18d"]), attach_keys(), Some(4)),
+            InlineRead::Detached(DRAFT.to_string()),
+            "F76/F72: a pasted multi-byte draft comes back byte for byte"
+        );
+        // NON-VACUOUS: the same paste submitted is the same string, so the
+        // claim above is about the detach payload and not about the paste
+        // having arrived intact.
+        assert_eq!(
+            submitted(&read_attached(
+                Chunks::new([PASTE, b"\r"]),
+                attach_keys(),
+                Some(4),
+            )),
+            DRAFT,
+            "NON-VACUOUS: the paste itself reaches the draft intact"
+        );
+    }
+
+    /// **`Ctrl+X d`.** The chord is lifted out of the byte stream by the one
+    /// filter that already lifts `Ctrl+X a`, so the letter can never reach the
+    /// draft and the *decision* about whether anything is attached stays in
+    /// the reader.
+    ///
+    /// The three controls are the rules this new letter must not break
+    /// (**F68** and T4-S2's): a bare `d` is content, a chord split across two
+    /// reads is still one keystroke, and `Ctrl+X d` **inside a bracketed
+    /// paste** is text.
+    #[test]
+    fn the_key_filter_lifts_the_detach_chord_out_of_the_byte_stream() {
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"\x18d"),
+            vec![KeyItem::Detach],
+            "design \u{00a7}4.7: `Ctrl+X d` detaches, so the filter must lift it"
+        );
+        // Split across two reads, as two keystrokes routinely are.
+        let mut split = KeyFilter::new(attach_keys());
+        assert_eq!(
+            split.feed(b"\x18"),
+            Vec::new(),
+            "the prefix alone yields nothing"
+        );
+        assert_eq!(
+            split.feed(b"d"),
+            vec![KeyItem::Detach],
+            "and the letter in the next read completes the chord"
+        );
+        // CONTROL: a bare `d` is a character in the draft.
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"d"),
+            vec![KeyItem::Bytes(b"d".to_vec())],
+            "NON-VACUOUS: without the prefix, `d` is content"
+        );
+        // CONTROL: inside a bracketed paste the same two bytes are text
+        // (**F68**: a chunk of bytes is not a sequence of intentions).
+        let pasted = b"\x1b[200~\x18d\x1b[201~";
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(pasted),
+            vec![KeyItem::Bytes(pasted.to_vec())],
+            "a pasted chord is pasted text, not a chord"
+        );
+        // CONTROL: the letter that already existed still routes.
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"\x18a"),
+            vec![KeyItem::Open],
+            "`Ctrl+X a` is unchanged by a second chord letter"
+        );
+    }
+
+    /// **The prompt label is the standing evidence of attachment** (design
+    /// §4.5), and it is what makes the `←` rule above legible rather than
+    /// modal: the context the keystroke depends on is in front of the caret.
+    ///
+    /// The label **replaces** the base prompt rather than decorating it: the
+    /// base is configurable and `agent 12> kitsu> ` would be absurd.
+    #[test]
+    fn the_composer_prompt_names_the_attached_agent() {
+        assert_eq!(
+            composer_prompt("> ", Some(3)),
+            "agent 3> ",
+            "design \u{00a7}4.5: the prompt label changes to `agent 3>`"
+        );
+        assert_eq!(
+            composer_prompt("kitsu> ", Some(12)),
+            "agent 12> ",
+            "the label replaces the base prompt, and an id is not one digit"
+        );
+        // NON-VACUOUS: detached, the base prompt is handed back untouched, so
+        // the label cannot be a constant.
+        assert_eq!(
+            composer_prompt("kitsu> ", None),
+            "kitsu> ",
+            "detached, the composer is the session's own prompt"
+        );
+    }
+
+    // =====================================================================
+    // Card **T4-S8**, requirement **A8**: the ambient counter's latency.
+    //
+    // **FAILING-FIRST.** A8 gives the ambient background-agent counter 250 ms
+    // from a registry change "in TUI modes". During a turn that is met:
+    // `run_live_typeahead` re-pulls the counts and repaints once per
+    // `AMBIENT_TICK_POLL_MS` tick. At the **idle composer** it is not met at
+    // all: `read_line_inline_with_keys` blocks in `read()` with no timeout,
+    // and nothing else repaints between turns, so a registry change while the
+    // user sits at the prompt reaches the screen only when the user types,
+    // resizes or submits. A8's "next prompt cycle" carve-out is granted to
+    // `classic` and not to the TUI.
+    //
+    // **No clock is paused and nothing sleeps**, deliberately: there are four
+    // open flakes in this tree and a timing test that measures elapsed time is
+    // the fifth. Both halves below are structural. The latency is governed by
+    // *when a paint happens*, not by any clock inside the composer — the
+    // counts are a pull, read through `StatusSource`'s closure at paint time
+    // — so the cadence's interval, named, is the whole of what A8 constrains.
+    // =====================================================================
+
+    /// An **idle** live-status fixture: the same wiring as
+    /// [`live_status_fixture`] with no `begin_turn`, so `elapsed` is `None`
+    /// and the row is the between-turns row A8's TUI half is about. The cell
+    /// stands in for the registry's `blocked` count, exactly as
+    /// `live_status_fixture`'s cell stands in for the queue depth.
+    fn idle_ambient_fixture() -> (BridgeGuard, SharedSink, Arc<StatusSource>, Arc<AtomicUsize>) {
+        let (guard, _out, err) = install_inline(T3_S12_ROWS, T3_S12_VIEWPORT_ROWS, "status: idle");
+        let guard = guard.expect("inline mode installs a guard");
+        let blocked = Arc::new(AtomicUsize::new(0));
+        let cell = blocked.clone();
+        let source = StatusSource::new(Box::new(move || StatusCounts {
+            blocked: cell.load(Ordering::Relaxed),
+            ..Default::default()
+        }));
+        source.set_usage("example-model-v1", 1_000, 100_000);
+        guard.enable_live_status(source.clone());
+        (guard, err, source, blocked)
+    }
+
+    /// **The acceptance test, and it is red.** The idle composer must have an
+    /// ambient cadence, and that cadence must fit A8's 250 ms.
+    ///
+    /// Half 1 is the **non-vacuity control** and passes today: with a cadence
+    /// tick simulated by hand, a change to the counts does reach the pinned
+    /// row, as the row the painter actually wrote. So the pull path, the
+    /// composition and the surface are all already right, and the one thing
+    /// A8 is missing at idle is a caller — which is what makes half 2's
+    /// assertion reachable by wiring alone (`registry.subscribe()`, or a
+    /// bounded timeout on the idle read) rather than by a rewrite.
+    ///
+    /// Half 2 is the failing half: [`idle_ambient_refresh_interval`] reports
+    /// `None`, because there is no cadence between turns at all.
+    ///
+    /// The row is asserted at **120 columns** as well as at the terminal's
+    /// own, finding **F78**: the status row's drop order is not monotonic in
+    /// width, so the segment is checked at a width where it demonstrably
+    /// fits rather than assumed to survive every width.
+    #[test]
+    #[serial]
+    fn the_idle_composer_must_have_an_ambient_cadence() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, source, blocked) = idle_ambient_fixture();
+
+        // Precondition: an idle row, and no tag on it, because nothing is
+        // blocked. Pinned on the composed row rather than on an absence of
+        // bytes, finding **F71**/**F41**.
+        let cols = live::terminal_columns();
+        let idle_row = source.compose(cols);
+        let tag = live::agents_tag(1, 0).expect("1 blocked agent has a tag at all");
+        assert!(
+            !idle_row.contains(tag.trim_end()),
+            "precondition: nothing is blocked, so the idle row carries no \
+             ambient tag: {idle_row:?}"
+        );
+
+        // Half 1, the control. A registry change, then one cadence tick by
+        // hand: the tag reaches the pinned row.
+        blocked.store(1, Ordering::Relaxed);
+        past_the_frame_budget();
+        let before = err.text().len();
+        repaint_status_row();
+        let tail = err.text()[before..].to_string();
+        assert_eq!(
+            tail,
+            expected_status_paint(
+                T3_S12_ROWS,
+                T3_S12_VIEWPORT_ROWS,
+                &live::compose_status_row(
+                    &live::StatusFields {
+                        model: "example-model-v1".to_string(),
+                        used: 1_000,
+                        effective: 100_000,
+                        elapsed: None,
+                        blocked: 1,
+                        ..Default::default()
+                    },
+                    cols,
+                ),
+            ),
+            "one cadence tick must paint the idle row the counts describe"
+        );
+        assert!(
+            tail.contains(tag.trim_end()),
+            "and that row carries the ambient tag: {tail:?}"
+        );
+        // F78: and at 120 columns, a width where the segment fits.
+        let wide = live::compose_status_row(
+            &live::StatusFields {
+                model: "example-model-v1".to_string(),
+                used: 1_000,
+                effective: 100_000,
+                elapsed: None,
+                blocked: 1,
+                ..Default::default()
+            },
+            120,
+        );
+        assert!(
+            wide.contains(tag.trim_end()),
+            "the ambient tag fits at 120 columns: {wide:?}"
+        );
+
+        // Half 2, **the failing half**: nothing calls that tick at idle.
+        let interval = super::idle_ambient_refresh_interval().expect(
+            "A8: the ambient counter MUST update within 250 ms of a registry change in TUI \
+             modes, so the idle composer needs a cadence -- today it blocks in `read()` with \
+             no timeout and a blocked background agent changes nothing on screen until the \
+             user types",
+        );
+        assert!(
+            interval <= super::AMBIENT_LATENCY_BUDGET,
+            "A8 gives the ambient counter {:?}; the idle cadence runs at {interval:?}",
+            super::AMBIENT_LATENCY_BUDGET,
+        );
+        assert!(
+            interval > std::time::Duration::ZERO,
+            "a zero interval is a busy loop, not a cadence"
+        );
+        drop(guard);
+    }
+
+    /// Card **T4-S8**, requirement **A8**, and the **behavioural** half the
+    /// seam's doc comment asks for: an idle registry change reaches the
+    /// painted surface **with no byte read**.
+    ///
+    /// Why this test and not just the interval: making
+    /// [`idle_ambient_refresh_interval`] return `Some(..)` costs one line and
+    /// holds nothing, which is finding **F50**'s failure exactly -- a
+    /// requirement passing a test while nothing implements it. So this drives
+    /// the real cadence, [`idle_ambient_cadence_step`], the same function the
+    /// session's one `spawn_idle_ambient_cadence` call runs for the life of
+    /// the session, and asserts the **bytes the painter wrote** (finding
+    /// **F71**: a visibility claim goes through the surface that paints it,
+    /// never through state).
+    ///
+    /// The registry is stood in for by a plain `watch` channel, which is what
+    /// `AgentRegistry::subscribe` hands out: the wake carries the counts and
+    /// the fixture's cell carries the pull the painter reads, which is how
+    /// production is wired (`main.rs` projects `(blocked, running)` off the
+    /// snapshot, and the `StatusSource` closure re-reads the registry at
+    /// paint time). One registry change moves both.
+    ///
+    /// **Nothing reads a byte**, and that is the point: the composer stays
+    /// blocked in `read()` throughout -- no input is fed to any reader here,
+    /// no decoder and no editor line is touched (**F72**/**F68**).
+    ///
+    /// **No latency is measured.** Both wakes are already-ready `changed()`
+    /// awaits, so `block_on` returns as soon as the step has painted; the only
+    /// sleep is the in-tree frame-budget helper that clears note **N3**'s
+    /// coalescing window, plus the step's own one-frame retry.
+    #[test]
+    #[serial]
+    fn the_idle_ambient_cadence_paints_a_registry_change_with_no_byte_read() {
+        let _state = GlobalState::capture();
+        ReducedMotion::off();
+        let (guard, err, _source, blocked) = idle_ambient_fixture();
+        let cols = live::terminal_columns();
+        let tag = live::agents_tag(1, 0).expect("1 blocked agent has a tag at all");
+
+        // The interval the cadence actually defers by, inside A8's budget.
+        let interval =
+            super::idle_ambient_refresh_interval().expect("the idle composer has a cadence");
+        assert!(
+            interval <= super::AMBIENT_LATENCY_BUDGET,
+            "A8 gives the ambient counter {:?}; the idle cadence defers by {interval:?}",
+            super::AMBIENT_LATENCY_BUDGET,
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a current-thread runtime for the cadence step");
+        let (sender, mut changes) = tokio::sync::watch::channel((0usize, 0usize));
+        let counts = |pair: &(usize, usize)| *pair;
+        let mut seen = *changes.borrow_and_update();
+        past_the_frame_budget();
+
+        // A **bare wake** first: the registry published, but nothing the row
+        // shows moved. No frame -- the same rule the composer applies to a
+        // resize-less signal wake, and what reduced motion and N3's budget
+        // both depend on.
+        let before = err.text().len();
+        sender
+            .send((0, 0))
+            .expect("the cadence is still subscribed");
+        assert!(
+            runtime.block_on(super::idle_ambient_cadence_step(
+                &mut changes,
+                &counts,
+                &mut seen
+            )),
+            "the cadence keeps running while the registry is alive"
+        );
+        assert_eq!(
+            err.text().len(),
+            before,
+            "a bare wake must paint no frame: {:?}",
+            err.text()[before..].escape_debug().to_string()
+        );
+
+        // Now a real one: an agent blocks while the user sits at the prompt.
+        blocked.store(1, Ordering::Relaxed);
+        sender
+            .send((1, 0))
+            .expect("the cadence is still subscribed");
+        let before = err.text().len();
+        assert!(runtime.block_on(super::idle_ambient_cadence_step(
+            &mut changes,
+            &counts,
+            &mut seen
+        )));
+        let tail = err.text()[before..].to_string();
+        assert_eq!(
+            tail,
+            expected_status_paint(
+                T3_S12_ROWS,
+                T3_S12_VIEWPORT_ROWS,
+                &live::compose_status_row(
+                    &live::StatusFields {
+                        model: "example-model-v1".to_string(),
+                        used: 1_000,
+                        effective: 100_000,
+                        elapsed: None,
+                        blocked: 1,
+                        ..Default::default()
+                    },
+                    cols,
+                ),
+            ),
+            "the cadence alone -- no keystroke, no resize, no submitted line --              must put the idle row the registry describes on screen"
+        );
+        assert!(
+            tail.contains(tag.trim_end()),
+            "and that painted row carries A8's ambient tag: {tail:?}"
+        );
+
+        // And it stops when the registry is gone rather than spinning.
+        drop(sender);
+        assert!(
+            !runtime.block_on(super::idle_ambient_cadence_step(
+                &mut changes,
+                &counts,
+                &mut seen
+            )),
+            "a closed registry ends the cadence"
+        );
         drop(guard);
     }
 }
