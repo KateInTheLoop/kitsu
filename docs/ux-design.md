@@ -320,8 +320,20 @@ rule that closed **F34**'s duplicate marker table.
   viewport, where the elapsed segment stops its periodic refresh while the
   queue and agent tags keep updating, together with a **60 fps paint cap
   enforced in the painter** (N3, N9); and the **bounded fd-tagged cell ring**
-  behind `[tui] cell_ring_lines`, not yet fed in production because R6's overlay
-  is its only reader (N4).
+  behind `[tui] cell_ring_lines`, fed in production by the inline surface and the
+  fullscreen tap, and read by the fullscreen frame as well as R6's `Ctrl+O`
+  overlay. It retains the user's submitted prompts, marked and split one cell per
+  line (N4).
+
+  **Searchable is not the same as visible, and the difference is width.** The
+  overlay's `/` searches `CellLine::plain()`, which is `sanitize_terminal_text`
+  over the stored bytes — i.e. exactly the **glyphs of the painted row**, since
+  the only thing stripped is what the terminal does not display. `ascii_structural_
+  markers` is deliberately **not** applied: it is a `--plain` tier transform, and
+  applying it would make a character the user can see fail to match itself. But a
+  row is painted through `fit_row_to_width`, which cuts at `cols`, so **text past
+  the right edge is searched and not shown**. That is deliberate — width-dependent
+  matches would mean one query finding different things in two window sizes.
 
   **Paste at the idle inline prompt** behaves as the during-turn row does: a
   bracketed-paste burst is kept as one draft. Measured at **10 KiB in

@@ -201,6 +201,23 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   losing the conversation; `--tui <mode>` and `[tui] mode` in `kitsu.toml`
   set the start mode.
 
+  **R2 is complete as of T5-S2.** `fullscreen` was never *missing* — it was a
+  **deliberate, multiply-pinned refusal** (**F90**): an arm whose own comment
+  called it *"a mode the design's grammar has"*, twelve call sites of the
+  accepted-modes literals, four test functions and an asserted `/help` string
+  saying it *"is not available yet"*. **Retiring that boundary, not filling a
+  gap, was the card's actual cost** — seven test collisions, six authorised
+  changes by name, and two stops.
+
+  All three spellings now accept it, and **they cross together on purpose**:
+  the code calls them *"the one spelling `/tui`, `--tui` and `[tui] mode` all
+  use"*, and a mode you can switch to but cannot start in would be incoherent.
+  The four advertised surfaces — `/tui`'s args/syntax, `/help tui`'s details,
+  `--tui`'s possible values, and `[tui] mode`'s error — are pinned as **one
+  vocabulary**, with an added ban on the details still announcing fullscreen as
+  unavailable: *a renderer that ships behind a help string saying it has not
+  shipped is a half-done card.*
+
   **Completed in T3-S9, which decided three things R2 left open.** All three are
   user-visible rules, not implementation details, so they belong here:
   - **`fullscreen` is refused** until T5's renderer exists, naming what is
@@ -208,6 +225,15 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
     inline` — the same vocabulary `[tui] mode`'s error uses. A value that
     parsed and silently behaved as `inline` is the quiet coercion this epic has
     refused everywhere else.
+
+    **Lifted in T5-S1b+T5-S2: the renderer exists and `fullscreen` is accepted**
+    in all four spellings (`/tui fullscreen`, `--tui fullscreen`, `[tui] mode`,
+    and bare `/tui`'s report). The **rule** that outlived the refusal is the one
+    above it: a renderer kitsu does not have is refused by name rather than
+    coerced. **F90** is why this pin is amended rather than deleted — *"X is
+    missing" and "X is refused" look identical from outside and are opposite
+    facts*, and a deleted pin would leave no trace that the absence had been
+    deliberate and multiply enforced.
   - **Mid-turn `/tui` is refused**, not queued and not deferred to the turn
     boundary. The reason is specific: the mid-turn dispatcher's default
     fall-through **enqueues the line as a future prompt to the model**, so an
@@ -281,6 +307,81 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
 - **R6** Transcript overlay (`Ctrl+O`): scroll, `/` search, `n`/`N`, `{`/`}`
   prompt jumps, `[` dump the cell ring to native scrollback (fullscreen only),
   `v` open in `$EDITOR`, `q`/`Esc` close.
+
+  **Amended at R6-a's review, twice, after measuring the ring.** Split into four
+  cards (R6-a overlay+scroll+close, R6-b search, R6-c prompt jumps, R6-d the two
+  hand-offs), and **two clauses above are not buildable as written**:
+
+  **`{`/`}` prompt jumps have nothing to jump between (F102).** `CellLine` carries
+  only `fd: Fd` and `styled: String` -- **no role marker** -- and production feeds
+  the ring from exactly two `transcript_line` paths. The user's submitted line is
+  painted by the composer and then **erased**, so it never becomes a transcript
+  line: **the ring holds no prompts at all.** Since **N4** makes the ring the sole
+  source for this overlay, `{`/`}` is unsatisfiable until the *feed* marks prompt
+  boundaries. **R6-c is blocked on that feed change, not on overlay work**, and the
+  honest consequence is wider than the key: **the overlay shows one speaker.**
+  Inferring prompts from `Fd` is refused -- `Stderr` is tools and diagnostics, not
+  the user.
+
+  **F102 RESOLVED: the feed now marks prompts, and R6-c is unblocked.** `CellLine`
+  carries a `prompt` flag, set only through `CellRing::push_prompt`, which splits on
+  `\n` so a multi-line or pasted prompt keeps one cell per line -- both frames are
+  one `fit_row_to_width` per cell, so a single multi-line cell would have garbled
+  them. Prompts file as `Stdout`, the conversation, not `Stderr`, the tools. Three
+  feeds carry it: the foreground submission, the fullscreen tap (whose ring is the
+  **only** ring in that mode), and a **delivered** attached submission -- a refused
+  one is handed back to the composer and was never said. **Injected commands are not
+  marked**: the words are kitsu's, and a transcript marking them as the user's is
+  the same false claim as a doc that says a command works when it does not.
+
+  **The mark had to be preserved at `frame_ring` as well as stored**, because that
+  rebuild is the chokepoint both readers go through; a mark stored faithfully and
+  dropped there would have left **every** reader seeing one speaker, with the feed
+  perfectly correct.
+
+  **`[`'s "fullscreen only" is a description, not a restriction, and nearly a
+  contradiction (F103).** Native scrollback is the one thing the alternate screen
+  does not have: bytes written while `ESC[?1049h` is in effect are discarded by the
+  terminal on `ESC[?1049l`. So a dump performed *while fullscreen holds the screen
+  goes nowhere.* The clause can only mean the key is **offered** only in fullscreen
+  and the dump **leaves the alternate screen first**, or defers to the leave -- which
+  makes `[` a terminal-state hand-off like `v`, not a write, and is why both land in
+  one card.
+
+  **Amended again, before R6-d is carded: the two hand-offs MUST be gated, because
+  the ring now retains what the user pasted.** Once the feed marks prompts (the
+  card that unblocks R6-c), the ring holds the user's own lines, and a user may
+  paste a credential into the composer.
+
+  A submitted line **already** reaches `history` on disk and persisted `messages`,
+  so the ring itself is **strictly weaker** than what the session already keeps.
+  **`[` is not.** It moves that text out of kitsu's address space and into the
+  terminal emulator's scrollback -- a buffer kitsu **does not own, cannot bound and
+  cannot clear**, and which `tmux capture-pane`, `script` and terminal logging
+  routinely capture. Before this, `[` could only dump what the session itself
+  printed; after it, it dumps **what the user pasted**. That is a different
+  exposure class, not more of the same. `v` writes it to a `$EDITOR` temp file, and
+  `/` (R6-b) makes it findable by anyone at the keyboard.
+
+  **This is the exact reversal of F68**, which withholds a swallowed paste burst's
+  **count but never its text** precisely because the clipboard may hold a secret.
+  Retaining prompts contradicts that unless the hand-offs are gated, so: **R6-d
+  ships with an explicit confirmation, or with an opt-out that excludes prompt rows
+  from the dump -- and R6-d is not carded until which one is decided.** R6-b needs
+  no gate: searching in-process memory exposes nothing the overlay does not already
+  paint.
+
+  **R6 is COMPLETE except R6-d.** R6-a (overlay, scroll, close), R6-prompts (the
+  feed, which resolved F102), R6-c (`{`/`}`) and R6-b (`/`, `n`/`N`) have shipped.
+  **R6-b measured two things the requirement had assumed away.** First, cost: a
+  full pass over a 10 000-line ring allocates a string per line and takes
+  **4.1 ms release / 13.7 ms debug** (9.8/45.4 with one 1 MB pasted cell), so
+  **search runs on submit, not per keystroke** — a per-keystroke search would blow
+  N2's 100 ms budget on a short query. Second, `plain()` is **exactly the glyphs of
+  the painted row**, so *searched is painted*; the only divergence is **width**,
+  because `fit_row_to_width` cuts at `cols` and a match past the right edge still
+  counts — width-dependent matches would mean one query finding different things
+  in two window sizes.
 - **R7** Approval prompts in TUI modes MUST render as a bottom-pane modal
   with the same `[y] allow once · [a] always (<dir>) · [n] deny` option line
   (command approvals keep their provenance rows) and the same `◉ permission —`
@@ -1043,6 +1144,43 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   structural-marker substitution is **not** applied at storage — it is an output
   transform, not a storage one.
 
+  **What the ring is a record of — never stated until T5-S2 had to measure it
+  (F92).** It is the **streamed** conversation, and **not**: the binary's own
+  diagnostics, receipts or command errors (`eprintln!` expands to
+  `std::eprintln!` and goes straight to fd 2), nor a **buffered** answer
+  (`print_message` writes directly to stdout inside the live-row suspension).
+  Because text is buffered rather than streamed **whenever tools are advertised
+  that round**, and interactive chat advertises six by default, **what the
+  scrollback contains depends on whether the model was offered tools** — the same
+  answer is in the ring or not accordingly. That is the fact a user scrolling
+  back in fullscreen meets, and it sharpens **F51** from the other side: that
+  finding recorded buffering as a decision about *visible* behaviour, and it also
+  decides what the scrollback **holds**.
+
+  **Routing the binary's diagnostics into the ring was considered and rejected**
+  (**F92**): it looks like a one-place macro change and would re-route several
+  hundred call sites, change **inline** line endings and **classic** bytes,
+  reorder diagnostics against `println!`, and make the ring far fuller than the
+  sizing here assumed — with **309 tests** pinning those bytes. It is a
+  requirements change about what the ring records, disguised as a wiring fix.
+
+  **The reader lands before the feed (T5-S1, F86).** This clause says the ring is
+  not fed until something reads it — so the **order of work follows from the
+  requirement**: the fullscreen view (T5-S1a) ships first and is the reader;
+  making the ring live (T5-S1b) comes second. Shipping the feed first would spend
+  up to ten thousand styled lines during the window before a reader existed —
+  **the exact expenditure this clause forbids.**
+
+  **One byte-level claim *is* testable, and one is not.** "Retained bytes ≤ K for
+  a fixed K" needs the per-line clamp F52 declines, and an **RSS** assertion is
+  worse than untestable — it is *false*, since one pathological line defeats it by
+  design, and it is environment-dependent besides. But **the sum of the retained
+  lines' own byte lengths is identical after 10 000 pushes and after 5 000** —
+  computed from the ring's contents rather than the allocator, so deterministic
+  and parallelism-independent. That pins what RSS was reaching for: **the evicted
+  lines' bytes are not retained anywhere.** Recorded because "no byte-level claim
+  is testable" was an overcorrection of mine (**F85**).
+
   **The ring is an opt-in field on the TUI backend, not a process global**, and
   `classic` cannot construct one: the renderer crate has no dependency path to
   the viewport crate, which makes "classic pays nothing for this" a
@@ -1113,8 +1251,91 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   and window-title clauses describe a runtime (`kitsu_tui::TuiRuntime`) that has
   **no caller in the binary**, so nothing pushes a title or enters the alt
   screen and nothing has to restore them. A test asserting their restore would
-  pass by construction, which is why none was written. They become real when
-  T5's fullscreen renderer uses that runtime.
+  pass by construction, which is why none was written.
+
+  **A third registration gap closed in T5-S1c-ii (F98).** The `/tui` switch
+  **into** fullscreen called `enter_fullscreen` and an `eprintln!` **and nothing
+  else** — so the **classic → fullscreen** route left the session holding the
+  alternate screen on the **default signal disposition**. Every existing signal
+  test entered fullscreen by a route that happened to have a handler already
+  (from inline, or by starting in fullscreen per F96), so **the one route nobody
+  had taken was the one with the gap.** There are now **three** registration
+  sites — startup, the inline re-install, and the fullscreen switch — all
+  `Once`-gated, so the later ones are no-ops.
+
+  **The lesson, after three cards each finding one of these:** F94 taught that
+  **exit paths are enumerable**. F98 is the other half — **the paths *into* a
+  state are enumerable too, and a restore installed on entry is only as good as
+  the entries that install it.**
+
+  **Status as of F94+F96's card: every clause is met on every exit path, for both
+  surfaces that take the alternate screen.** The dying-signal handler now chooses
+  between two compile-time-composed constants on one `AtomicBool` load, so it
+  gives the alternate screen back **only when it is held** — writing
+  `ESC[?1049l` unconditionally was tried and **refused by measurement**, because
+  it is not a no-op on the primary screen (it restores the cursor to its saved
+  slot, so a `SIGTERM` in an ordinary session would drop the shell's next prompt
+  on top of the user's transcript). The panic hook covers both surfaces,
+  including a panic off the main thread, and clears the flag after writing so a
+  take still yields exactly one leave.
+
+  **Two holes were closed, and the second was worse than the first.** A dying
+  signal left the **agent view's** alternate screen taken **since T4-S2** — five
+  cards before fullscreen, which inherited the hole rather than introducing it.
+  And a session **started** in fullscreen installed **no handler at all**
+  (**F96**), because the handler was installed only where the pinned region was
+  and `install` is deliberately inert in fullscreen: `Ctrl+C` there restored
+  nothing, leaving the terminal in **raw mode** as well as the alternate screen.
+  **That intersection of two individually correct decisions is what neither a
+  per-card test nor a per-requirement review looks at.**
+
+  **And "the handler is missing" turned out to be two defects with one symptom.**
+  Installing it was not enough: `CANONICAL_TERMIOS` is published only by
+  `RawStdinGuard::engage`, and a fullscreen-start session's raw mode is
+  **rustyline's**, so the handler had nothing to restore. It now falls back to
+  `tcgetattr` + re-enabling `ICANON|ECHO|ISIG` + `tcsetattr` — not the shell's
+  full termios, which nothing in this process knows, but the difference between a
+  usable shell and `reset` typed blind. Only a test asserting the **terminal's
+  observable state** separated the two; the bytes were already right.
+
+  **Superseded status note (T5-S2), kept for the record:**
+  `install_exit_restore` gives back the **inline region only**, so a dying signal
+  or a panic while fullscreen is active **leaves the alternate screen taken** and
+  the user's terminal in it. This requirement demands restore on *every* exit
+  path including panics and signals; that holds for inline and does not yet hold
+  for fullscreen. **Carded, not quietly patched** — it is a real hole in a mode
+  this epic now ships, and it is not what T5-S2's tests pin.
+
+  **And why fullscreen does not go through `TuiRuntime` at all (F93).** Beyond
+  the correction below: `enter` also calls **crossterm's `enable_raw_mode`, which
+  clears `OPOST`**, and this binary has several hundred direct
+  `println!`/`eprintln!` writers — the agent-view overlay's own comment already
+  records that this would *"staircase all of them down the screen"*. It would
+  also nest a second raw mode under `RawStdinGuard`, whose dying-signal restore
+  snapshots termios. So the fullscreen segment writes the four sequences itself
+  and leaves termios alone. **The general shape: a runtime that bundles two
+  capabilities is unusable by a caller that wants one of them** — this
+  requirement's title and alt-screen clauses looked like one lifecycle, and one
+  of them drags termios with it.
+
+  **Corrected again in T5-S2, because the narrowing was still wrong about the
+  mechanism.** `TuiRuntime::enter` writes `PUSH_TITLE`, the optional OSC 2 title
+  and raw mode — **it does not write `ESC[?1049h` and never has** (verified: that
+  sequence appears only in `main.rs`, in the agent-view overlay, which has taken
+  the alternate screen since T4-S2). So the runtime delivers **one** of this
+  requirement's two clauses, the **title**, and **the alternate screen is code the
+  switch writes.** A findings entry claiming otherwise stood for three cards and
+  travelled into two briefs before an agent read the function body; see **F91**.
+
+  **Narrowed in T5-S1a:** this previously said the clauses become real "when T5's
+  fullscreen renderer uses that runtime". **It is not the renderer.** The
+  fullscreen view is **pure by design** — it holds no terminal, writes nothing,
+  and never enters an alternate screen; that purity is what lets auto-follow and
+  the paging keys be asserted through painted rows instead of a pty (**F71**).
+  The caller is **the mode switch** (T5-S2), which is the only thing that can
+  select fullscreen and therefore the only thing that can call `enter`. Recorded
+  because the renderer shipped without touching a terminal, and a reader of the
+  old sentence would have gone looking for the alt screen in the wrong file.
 
   The restore is installed **only in the viewport**, so classic keeps the signal
   dispositions it started with.

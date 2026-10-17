@@ -220,15 +220,9 @@ impl InlineSurface {
     /// Wrap the two descriptors **and** feed a bounded cell ring of
     /// `cell_ring_lines` lines (requirement **N4**, plan row T3-S6).
     ///
-    /// Opt-in on purpose: only a backend with a transcript overlay and a `[`
-    /// dump has a reader for the ring, so a surface built with
-    /// [`new`](Self::new) retains nothing and pays nothing.
-    // Constructed by tests only for now: nothing reads the ring until the
-    // transcript overlay (`Ctrl+O`, requirement R6) and the `[` dump land in
-    // T5, and feeding an unread ring would spend up to `DEFAULT_CELL_RING_LINES`
-    // styled lines of memory for no benefit. The production constructor arrives
-    // with R6's overlay, which is also what `InlineComposerHost` is waiting on.
-    #[allow(dead_code)]
+    /// Opt-in on purpose: a surface built with [`new`](Self::new) retains
+    /// nothing and pays nothing, which is what every non-inline caller wants.
+    /// The inline install uses this constructor, so inline mode always retains.
     pub fn with_cell_ring(
         out: Box<dyn Write + Send>,
         err: Box<dyn Write + Send>,
@@ -437,6 +431,21 @@ impl Surface for InlineSurface {
             for line in text.lines() {
                 ring.push(fd, line);
             }
+        }
+    }
+
+    /// Record the user's submitted prompt in the cell ring, **writing no
+    /// bytes** -- the whole reason this seam is not `transcript_line`.
+    ///
+    /// The composer painted the submitted row and erased it, so the line is on
+    /// no descriptor; writing it here would add a transcript line the inline
+    /// renderer's one-write-per-line contract (**R3**) says is not there and
+    /// change the byte stream of every session. A backend built without a ring
+    /// records nothing, exactly as the trait default does.
+    fn note_prompt(&self, text: &str) {
+        let mut inner = self.lock();
+        if let Some(ring) = inner.cells.as_mut() {
+            ring.push_prompt(text);
         }
     }
 }

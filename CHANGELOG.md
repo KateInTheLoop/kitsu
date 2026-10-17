@@ -40,6 +40,46 @@ shapes may change in any minor release.
   reason.
 
 ### Added
+- **`/` searches the `Ctrl+O` transcript overlay, and `n`/`N` walk the matches.**
+  The search runs **when you press Enter**, not as you type: a full pass over a
+  10 000-line scrollback costs milliseconds and allocates a string per line, so
+  scanning on every keystroke would blow the interaction budget on a long query.
+  `n` walks toward newer matches and `N` toward older, and **neither wraps** --
+  running out of matches in one direction does nothing rather than teleporting
+  you to the other end. Submitting lands on the **newest** match, which is where
+  "when did this last happen?" starts. Matching ignores case, an empty query
+  cancels, `q` is query text while the line is open so you can search for it, and
+  `Esc` cancels the query without closing the overlay. **The search covers both
+  speakers** -- your own prompts are in the scrollback now -- and the query line
+  replaces the overlay's footer row, so it costs no transcript line.
+- **`{` and `}` jump between prompts in the `Ctrl+O` transcript overlay**, so you
+  can walk back through what you asked instead of scrolling for it. A prompt that
+  spans several lines is **one** stop rather than one per line; by the same rule,
+  two submissions with nothing printed between them are also one stop. A jump
+  that has nowhere to move does **nothing** -- in particular it does not silently
+  stop the overlay following new output. The keys are named on the overlay's own
+  footer, which still names nothing it cannot answer.
+- **A transcript overlay on `Ctrl+O`**, from the inline composer and from
+  fullscreen alike. It opens over the transcript the cell ring retains;
+  `PgUp`/`PgDn` scroll it, `Ctrl+Home`/`Ctrl+End` jump to the oldest retained
+  line and back to the newest, and `q` or `Esc` closes it and leaves the frame
+  behind it exactly where it was. The overlay's keys are listed on its own
+  footer rather than in a global table, since they are live only while it holds
+  the screen; `Ctrl+O` itself is listed by `/help tui`, with the composer's
+  other chords.
+
+  **The overlay shows both speakers.** The ring now retains the lines you submit,
+  marked as yours and split one cell per line, so a multi-line or pasted prompt
+  keeps its shape. Slash commands are retained too -- a report with no visible
+  command is half a transcript -- while commands kitsu injects on your behalf
+  (`/resume`, `/retry`) are **not** marked as yours, because they are not. A line
+  refused at an attached agent is not retained either: it was handed back to the
+  composer and never said.
+
+  **It still shows less than you saw.** The ring records the streamed
+  conversation, so kitsu's own diagnostics and an answer buffered because tools
+  were offered that round are absent from it. `/export` remains the route to the
+  full conversation.
 #### Background agents that can ask
 
 - `[agents] blocking = "ask"` lets a background agent **park** when one of its
@@ -132,6 +172,33 @@ shapes may change in any minor release.
   **A refusal never eats your line:** if the agent finished, stopped, or blocked
   while you were typing, nothing is sent, you are told why in the agent's own
   words, and your text is still in the composer.
+- **Fixed:** pressing `Ctrl+C` while the agent view or the fullscreen renderer was
+  on screen left your terminal on kitsu's alternate screen, hiding your own
+  scrollback until you ran `reset`. This had been true of the agent view for
+  several releases. Every exit path -- a normal close, `/quit`, a dying signal and
+  a panic -- now gives the screen back, and only when kitsu actually took it.
+- **Fixed:** a session started with `--tui fullscreen` (or `[tui] mode =
+  "fullscreen"`) installed no signal restore at all, so `Ctrl+C` left the
+  terminal in raw mode -- no echo, no line editing -- as well as on the alternate
+  screen. It now restores both.
+- **A fullscreen renderer.** `/tui fullscreen` (also `--tui fullscreen` and
+  `[tui] mode = "fullscreen"`) takes the terminal's alternate screen and paints
+  the viewport's scrollback, **repainting as the conversation grows**, and gives
+  the screen and your window title back when you switch away.
+  **It has its own prompt**, drawn on the bottom row, so the frame is no longer
+  painted over between turns -- typing cannot scroll it at all. The slash-command
+  palette is deliberately absent there (the only rows it could use are the
+  frame's), and the agent-view keys are off while fullscreen holds the screen.
+  **`PgUp`/`PgDn` page the retained transcript and `Ctrl+Home`/`Ctrl+End` jump to
+  the oldest retained line and back to following** -- they move the frame, not the
+  caret, and only while fullscreen holds the screen. Paging pins the view, so new
+  output no longer drags it to the bottom until you page back down or press
+  `Ctrl+End`. The keys are listed in `/help tui` rather than the agent view's key
+  table, since they do nothing in the other renderers. Switching keeps the conversation, as the other modes do.
+  **What the scrollback holds is worth knowing:** the streamed conversation --
+  not kitsu's own messages and receipts, and not an answer that was buffered
+  because tools were offered that round, which is the default. Run with
+  `--no-tools` and answers stream, and the scrollback has them.
 - **`/help keys`** prints the agent view's key bindings without opening the view,
   and the view's own `?` help now prints the same rows from the same table — so
   the two can no longer disagree about what a key does.

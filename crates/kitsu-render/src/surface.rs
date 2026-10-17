@@ -81,6 +81,25 @@ pub trait Surface: Send + Sync {
     fn queue(&self, rows: &[String]) {
         let _ = rows;
     }
+
+    /// Record the user's own submitted prompt, **writing no bytes.**
+    ///
+    /// The composer paints the submitted line and erases it, so the prompt is
+    /// on no descriptor and in no backend's retained cells (**F102**): this is
+    /// the seam through which a backend that keeps cells can learn of it
+    /// without changing a single emitted byte, which is why it is not
+    /// `transcript_line`.
+    ///
+    /// # Default: **nothing**
+    ///
+    /// A backend that retains nothing has nothing to record, exactly as
+    /// [`Surface::queue`] has nowhere to paint. Only a backend that owns a
+    /// cell ring overrides this -- and a *wrapper* that displaces such a
+    /// backend must forward it, or the prompt is dropped for the whole time
+    /// the wrapper is installed.
+    fn note_prompt(&self, text: &str) {
+        let _ = text;
+    }
 }
 
 /// Does a write on `fd` share a terminal with the live status row, and so

@@ -4287,9 +4287,29 @@ fn help_then_draft_then_signal(signal_number: libc::c_int) -> Vec<Step> {
 ///   `reset` on.
 ///
 /// The alternate screen and the window title are deliberately **not**
-/// asserted: nothing in this binary enters either (`kitsu_tui::TuiRuntime` is
-/// unused by `kitsu`), so an assertion about leaving them would pass by
-/// construction. N5's other two clauses are vacuous today, not met.
+/// asserted **here**, and the reason changed in T5-S2.
+///
+/// Until this card the reason was that N5's other two clauses were vacuous:
+/// `kitsu_tui::TuiRuntime` had no caller in this binary, so an assertion
+/// about giving the title back would have passed by construction. That is no
+/// longer so. The `/tui fullscreen` switch — the *switch*, not the renderer,
+/// which is pure and touches no terminal — now calls `TuiRuntime::enter` and
+/// `leave`, so the title is pushed with `ESC[22;2t` and popped with
+/// `ESC[23;2t` on a real exit path, and the switch writes `ESC[?1049h` and
+/// `ESC[?1049l` around the fullscreen segment itself. **Both clauses are met,
+/// and both are asserted** — in the fullscreen transition tests at the bottom
+/// of this file, where a session actually enters that mode.
+///
+/// Why not here as well: this script never leaves inline, so this session
+/// takes neither the alternate screen nor the title. An assertion about
+/// restoring them would still pass by construction in *this* session, which
+/// is the F71 shape — an observation the test could make only of itself.
+///
+/// One correction while the comment is being rewritten: the old sentence
+/// "nothing in this binary enters either" was already false before this card.
+/// `run_agent_view_overlay` has written `ESC[?1049h` since T4-S2. The
+/// parenthetical about `TuiRuntime` was the true half, and the general claim
+/// was over-read from it.
 fn assert_restored_after_signal(session: &Session, step: usize, label: &str) {
     let before = String::from_utf8_lossy(&session.raw[..session.marks[step]]).into_owned();
     let region = format!("\x1b[1;{}r", ROWS - 1);
@@ -4634,18 +4654,48 @@ const TUI_SWITCHED_TO_INLINE: &str =
     "~ switched to the inline renderer; the conversation is unchanged";
 
 /// Bare `/tui` **reports**, it does not print usage. Decision: the command's
-/// argument is optional in the registry (`/tui [classic|inline]`), the
+/// argument is optional in the registry (`/tui [classic|inline|fullscreen]`),
+/// the
 /// question "which renderer am I in?" has no other answer in the product, and
 /// `/theme` with no argument already answers the same question for themes.
 /// The accepted vocabulary rides along, so the report is also the usage line.
-const TUI_REPORT_CLASSIC: &str = "tui mode: classic (accepted: classic, inline)";
-const TUI_REPORT_INLINE: &str = "tui mode: inline (accepted: classic, inline)";
+/// `fullscreen` joined the vocabulary in T5-S2, so all three reports list
+/// three modes. The report's shape is unchanged.
+const TUI_REPORT_CLASSIC: &str = "tui mode: classic (accepted: classic, inline, fullscreen)";
+const TUI_REPORT_INLINE: &str = "tui mode: inline (accepted: classic, inline, fullscreen)";
+const TUI_REPORT_FULLSCREEN: &str = "tui mode: fullscreen (accepted: classic, inline, fullscreen)";
 
-/// `fullscreen` is refused, naming what is accepted, and saying why it is not
-/// a typo — consistent with `[tui] mode`'s own error, which lists
-/// ``classic``, ``inline`` and nothing else until T5 ships the renderer.
-const TUI_FULLSCREEN_REFUSED: &str =
-    "/tui fullscreen is not available yet; accepted: classic, inline";
+/// The third switch receipt, built from the same literal in `run_chat` as the
+/// other two: `"~ switched to the {label} renderer; the conversation is
+/// unchanged"`.
+///
+/// **This replaces `TUI_FULLSCREEN_REFUSED`**, which read "/tui fullscreen is
+/// not available yet; accepted: classic, inline". T5-S2 retires that
+/// boundary: the mode has a renderer, a switch arm and an alternate screen,
+/// so the refusal it pinned no longer exists to be pinned.
+const TUI_SWITCHED_TO_FULLSCREEN: &str =
+    "~ switched to the fullscreen renderer; the conversation is unchanged";
+
+/// The alternate screen, taken and given back.
+///
+/// **This is the F89 observable.** A `FullscreenView` that compiles proves
+/// nothing; a `?1049h` in the byte stream proves the switch ran, and only a
+/// transcript line repainted *after* that offset proves the reader read the
+/// ring. The two are asserted separately and deliberately.
+///
+/// Attributable in these scripts, which is what keeps the count meaningful:
+/// the binary's other `?1049h` writer is `run_agent_view_overlay`, reached
+/// only by the agent-view chord or `/jobs view`, and no script below types
+/// either. (So "nothing emits this today" is **not** the non-vacuity
+/// argument — "nothing in *this session* can emit it but the switch" is.)
+const ALT_SCREEN_ON: &str = "\x1b[?1049h";
+const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
+
+/// N5's title clause, which stops being vacuous in this card: the switch
+/// calls `TuiRuntime::enter`/`leave`, and these are the only two sequences in
+/// the workspace that push and pop the terminal's title stack.
+const TITLE_PUSH: &str = "\x1b[22;2t";
+const TITLE_POP: &str = "\x1b[23;2t";
 
 /// The DECSTBM region this geometry pins, and its release.
 fn tui_region() -> String {
@@ -4892,98 +4942,1480 @@ fn tui_switch_from_classic_into_inline_keeps_the_transcript_and_pins_the_region(
     }
 }
 
-/// `/tui fullscreen`, `/tui` bare, and `/tui wat`, in one classic session
-/// that keeps going afterwards.
-fn tui_argument_vocabulary() -> Vec<Step> {
+// ---------------------------------------------------------------------------
+// Card T5-S2: `/tui fullscreen` as a reachable renderer (A+B).
+//
+// `fullscreen` IS NOT REACHABLE YET. `main.rs`'s `/tui` arm answers it with
+// `/tui fullscreen is not available yet`, `TuiRendererRequest` has two
+// variants, and nothing in the binary constructs `FullscreenView` or calls
+// `TuiRuntime::enter`. So every test below fails today, most of them at the
+// harness deadline with the transcript attached: the script waits for a
+// receipt or an `ESC[?1049h` the child cannot print (finding F46's shape).
+//
+// Four transitions are new here, and `classic -> fullscreen` is written
+// first on purpose — see its own note. The other two directions
+// (`classic <-> inline`) are already covered above and are untouched.
+// ---------------------------------------------------------------------------
+
+/// Classic -> fullscreen: a marker printed with no ring behind it, then the
+/// switch.
+fn switch_from_classic_into_fullscreen() -> Vec<Step> {
     vec![
         send("/help for commands", "/tui\r"),
-        send(TUI_REPORT_CLASSIC, "/tui fullscreen\r"),
-        send(TUI_FULLSCREEN_REFUSED, "/theme zz1\r"),
-        // ...and the report tracks the LIVE mode, not the start mode: a
-        // `/tui` that printed `[tui] mode` or `--tui` back would answer
-        // `classic` here too.
-        send(TUI_MARK_1, "/tui inline\r"),
-        send(TUI_SWITCHED_TO_INLINE, "/tui\r"),
-        send(TUI_REPORT_INLINE, "/quit\r"),
+        send(TUI_REPORT_CLASSIC, "/theme zz1\r"),
+        send(TUI_MARK_1, "/tui fullscreen\r"),
+        send(ALT_SCREEN_ON, "/quit\r"),
     ]
 }
 
-/// **Requirements 5 and 6 of the card.** `fullscreen` is refused by name —
-/// not as an unknown command and not as a typo — and bare `/tui` reports the
-/// mode it is in. Both messages name the accepted vocabulary, the same two
-/// spellings `[tui] mode` accepts, so a user who reads either one learns the
-/// whole grammar.
+/// **Classic -> fullscreen, and the vacuity hazard in this card.**
 ///
-/// The refusal must also be inert: no region is pinned, and the session
-/// carries on printing its transcript afterwards.
+/// This transition is written first because it is the one that can paint an
+/// **empty screen and pass**. The cell ring is inline's scrollback: `install`
+/// builds it for `TuiMode::Inline`, and a classic segment feeds nothing. So a
+/// `/tui fullscreen` out of classic has an empty ring by construction, and a
+/// view that painted nothing at all would satisfy any "the frame appeared"
+/// assertion written here. That is T4-S8's hazard sitting inside a
+/// transition, and the response is to **not** put the F89 repaint assertion
+/// in this test — it belongs in the inline -> fullscreen one below, where
+/// there is something in the ring that only a reader could have put on
+/// screen.
+///
+/// What this test pins instead is everything that is *not* the ring: the
+/// switch runs mid-session rather than at startup, it is narrated, it takes
+/// and gives back the alternate screen, and the marker it had no ring to
+/// repaint is written **exactly once** — the honest reading of an empty ring,
+/// and the assertion that would catch a frame conjured from somewhere other
+/// than the ring.
 #[test]
 #[serial]
-fn tui_refuses_fullscreen_and_reports_the_mode_when_bare() {
+fn tui_switch_from_classic_into_fullscreen_has_an_empty_ring_and_says_so() {
     let home = TempDir::new().expect("temp home");
     write_config(home.path());
-    let session = run_styled_chat_pty(home.path(), None, &tui_argument_vocabulary());
+    let session = run_styled_chat_pty(home.path(), None, &switch_from_classic_into_fullscreen());
     let text = session.raw_text();
 
+    // Intent kept from the retired refusal test: bare `/tui` reports the live
+    // renderer and names the whole accepted vocabulary, which is now three
+    // modes wide. Pinned in classic here and in inline and fullscreen in the
+    // two tests below, so each of the three reports is asserted once.
     assert_eq!(
         session.raw_count(TUI_REPORT_CLASSIC),
         1,
-        "bare /tui reports the current mode and the accepted spellings, \
-         exactly once; raw:\n{}",
+        "bare /tui reports classic and the three accepted spellings, exactly \
+         once; raw:\n{}",
         text.escape_debug()
     );
     assert_eq!(
-        session.raw_count(TUI_FULLSCREEN_REFUSED),
+        session.raw_count(TUI_SWITCHED_TO_FULLSCREEN),
         1,
-        "/tui fullscreen is refused by name, with the accepted spellings; \
+        "the switch into fullscreen is narrated exactly once, like the other \
+         two: R2's gate is that a user can tell a working switch from a lost \
+         one; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "the switch takes the alternate screen exactly once; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_OFF),
+        1,
+        "...and gives it back exactly once, at exit — N5's clause, now real; \
          raw:\n{}",
         text.escape_debug()
     );
+
+    // Mid-session, not at startup: this session started classic, so the
+    // classic transcript must precede the alternate screen.
+    let mark_at = text.find(TUI_MARK_1).unwrap_or_else(|| {
+        panic!(
+            "the classic segment must print its marker; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    let entered_at = text.find(ALT_SCREEN_ON).unwrap_or_else(|| {
+        panic!(
+            "the switch must enter the alternate screen; raw:\n{}",
+            text.escape_debug()
+        )
+    });
     assert!(
-        !text.contains("unknown command: /tui"),
-        "/tui must be a registered command, so neither spelling may fall \
-         through to the unknown-command path; raw:\n{}",
+        mark_at < entered_at,
+        "the classic transcript must precede the alternate screen, otherwise \
+         this session started in fullscreen and proves nothing about the \
+         switch; raw:\n{}",
         text.escape_debug()
     );
-    assert_eq!(
-        session.raw_count(TUI_REPORT_INLINE),
-        1,
-        "and after a switch the report follows the live renderer rather than \
-         the start mode; raw:\n{}",
-        text.escape_debug()
-    );
-    // The refusal itself pinned nothing: the only region in this session is
-    // the one the later, accepted `/tui inline` pins, and it comes after the
-    // refusal in the stream.
-    assert_eq!(
-        session.raw_count(&tui_region()),
-        1,
-        "exactly one region, from the one accepted switch; raw:\n{}",
-        text.escape_debug()
-    );
-    let refused_at = text
-        .find(TUI_FULLSCREEN_REFUSED)
-        .expect("the refusal was just counted");
-    let pinned_at = text
-        .find(&tui_region())
-        .expect("the accepted switch's region was just counted");
+    let left_at = text.find(ALT_SCREEN_OFF).unwrap_or_else(|| {
+        panic!(
+            "the alternate screen must be given back; raw:\n{}",
+            text.escape_debug()
+        )
+    });
     assert!(
-        refused_at < pinned_at,
-        "a refused mode pins nothing, so the refusal must precede the only \
-         region in the stream; raw:\n{}",
+        entered_at < left_at,
+        "and it must be entered before it is left; raw:\n{}",
         text.escape_debug()
     );
+
+    // The empty-ring claim, stated as a count. Nothing fed a ring in classic,
+    // so there is nothing for the view to repaint and the marker stays at one
+    // occurrence. A second occurrence here would mean the frame was painted
+    // from something other than this session's ring.
     assert_eq!(
         session.raw_count(TUI_MARK_1),
         1,
-        "and the session keeps running after the refusal; raw:\n{}",
+        "with an empty ring the classic marker is written once and never \
+         repainted; raw:\n{}",
+        text.escape_debug()
+    );
+
+    assert!(
+        !text.contains("unknown command: /tui"),
+        "/tui must stay a registered command on this path; raw:\n{}",
         text.escape_debug()
     );
     assert!(
         session.status.success(),
-        "the session exits cleanly after a refusal, but exited {:?}; \
+        "the session exits cleanly out of fullscreen, but exited {:?}; \
          screen:\n{}",
         session.status,
         session.screen_dump()
+    );
+    assert!(
+        session.raw_mode_off(),
+        "the pty must be canonical again after a fullscreen session: {}",
+        session.termios_dump()
+    );
+}
+
+/// The marker this card's F89 assertion is carried by, and **why it is a
+/// streamed answer rather than `/theme <nonsense>` like the three markers
+/// above**.
+///
+/// This script needs a line that is in the **cell ring**, not merely on the
+/// screen, and the two are not the same set. The ring is fed only by writers
+/// that go through `kitsu_render`'s surface seam —
+/// `InlineSurface::transcript_line` and `write_block`, reached from
+/// `print_fragment`, `finish_line`, `tool_activity`, `tool_result_error`,
+/// `milestone` and `render_error`. The binary's own `eprintln!` is a macro
+/// (`main.rs`) that expands to `std::eprintln!` and writes straight to fd 2,
+/// so **every diagnostic it prints bypasses the ring**: `/theme zz1`'s error
+/// is one of those, and a session that printed only diagnostics hands the
+/// switch an empty ring (measured: 0 retained lines).
+///
+/// The first version of this test used `TUI_MARK_1` and could not pass for
+/// that reason. Routing the macro through the seam was considered and
+/// **rejected** — it would re-route several hundred call sites, change inline
+/// *and* classic byte streams and reorder diagnostics against `println!`, and
+/// it is a decision about what the ring is a *record of* rather than a
+/// wiring fix. What the ring records is the rendered conversation.
+///
+/// So the marker is a **streamed model fragment**, which `print_fragment`
+/// hands to the seam as a block. It satisfies the same four properties
+/// `TUI_MARK_1` was chosen for: emitted by the binary, unique in the whole
+/// byte stream, one physical row at `COLS` = 80, and reachable with no real
+/// network (the SSE mock supplies it).
+///
+/// # Why the session runs with `--no-tools`, which is not a detail
+///
+/// A fragment only reaches `print_fragment` when the round **did not offer
+/// tools** (`orchestrator.rs`: "when tools are advertised this round, DON'T
+/// stream text live — buffer it"). A buffered answer is printed by
+/// `print_message`, which writes to `io::stdout()` **directly** and so
+/// bypasses the seam exactly as `eprintln!` does — measured here too: with
+/// tools advertised the ring held one empty line, pushed by `finish_line`'s
+/// trailing newline, and nothing else.
+///
+/// Interactive chat advertises six tools by default, so `--no-tools` is what
+/// makes this turn's text stream live and therefore land in the ring. Two
+/// turns with a tool call in the first would also work — the final round
+/// withholds tools — but that is a second mock turn and a `--allow-path`
+/// grant to arrange the same one line.
+const RING_MARK: &str = "RING_ALPHA";
+
+/// Inline -> fullscreen: a **streamed** marker into the ring, a bare `/tui`
+/// report, then the switch.
+///
+/// The turn is waited out on [`TURN_DONE_MARKER`] rather than on the fragment
+/// itself, for the reason every streaming script here does: a `/tui` typed
+/// mid-turn is refused rather than queued (`TUI_MID_TURN_REFUSAL`), so the
+/// switch would never run.
+///
+/// And it is waited out with a [`pause`] rather than by triggering the `/tui`
+/// on the summary line directly, which **was** tried and is not enough: the
+/// summary is printed by the turn, and a line written the instant it appears
+/// still reaches the mid-turn collector and is refused. `/quit` is not gated
+/// that way, which is why the streaming scripts above can trigger on the
+/// marker and this one cannot. The pause is the separation the marker alone
+/// does not give; the step after it triggers on a condition already met, and
+/// the pause is what keeps that from coalescing with the turn.
+fn inline_then_fullscreen() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "say hello\r"),
+        pause(TURN_DONE_MARKER, 500),
+        send(RAW_MODE_MARKER, "/tui\r"),
+        send(TUI_REPORT_INLINE, "/tui fullscreen\r"),
+        send(ALT_SCREEN_ON, "/quit\r"),
+    ]
+}
+
+/// **The reachability test, and the assertion finding F89 exists for.**
+///
+/// This is a rewrite of `tui_refuses_fullscreen_and_reports_the_mode_when_bare`
+/// rather than a new test beside it: that test was the exact inverse of this
+/// one — the same session shape, the same region-count machinery, the same
+/// bare-`/tui` report — asserting that the mode was refused. Two tests, one
+/// asserting a refusal and one an acceptance of the same input, cannot both
+/// be right, so the refusal is retired and its skeleton reused (**F85**).
+/// Its surviving intents, all still asserted below: the mode is answered **by
+/// name** and never as an unknown command, bare `/tui` reports the renderer
+/// it is actually in, nothing is pinned that should not be, and the session
+/// keeps running and exits cleanly afterwards.
+///
+/// # How this proves the reader *read*
+///
+/// Two observations on the raw byte stream, and the distinction between them
+/// is the whole of F89:
+///
+/// * **`ESC[?1049h` appears.** The switch ran. A capability that compiles is
+///   not one that is reachable, and this is the byte that says a user typing
+///   `/tui fullscreen` at a prompt got to the new code at all.
+/// * **[`RING_MARK`] appears again *after* that offset.** The reader read.
+///   The marker was streamed once already, into the inline transcript, and
+///   therefore — because a streamed fragment goes through the surface seam —
+///   into the cell ring `install` built for this session. Nothing else in the
+///   process holds that line: the primary screen's copy is bytes already
+///   past, and the alternate screen starts blank. So a second occurrence of
+///   it after the alternate screen is entered can only have come from a
+///   reader that pulled it out of the ring and painted it.
+///
+/// That second assertion is what T5-S1b was rejected for lacking. The feed
+/// and a reader a user can reach land in one commit, or neither does.
+#[test]
+#[serial]
+fn tui_switch_from_inline_into_fullscreen_repaints_the_ring() {
+    let home = TempDir::new().expect("temp home");
+    // The streaming harness writes its own config, pointed at the SSE mock
+    // that supplies the one fragment this test needs in the ring.
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &inline_then_fullscreen(),
+        vec![Turn {
+            events: vec![delta(&format!("{RING_MARK}\n")), finish("stop")],
+            gap: Duration::from_millis(60),
+        }],
+        &["--no-tools".to_string()],
+    );
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.bodies.len(),
+        1,
+        "one turn is one request, so the fragment really came from the mock; \
+         bodies: {:?}",
+        session.bodies
+    );
+
+    // Intent kept from the retired test: bare `/tui` reports the live
+    // renderer, and the vocabulary rides along.
+    assert_eq!(
+        session.raw_count(TUI_REPORT_INLINE),
+        1,
+        "bare /tui reports the current mode and all three accepted \
+         spellings, exactly once; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TUI_SWITCHED_TO_FULLSCREEN),
+        1,
+        "`fullscreen` is answered by name, with the switch receipt the other \
+         two modes get; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        !text.contains("not available yet"),
+        "and it is no longer refused: the renderer exists, so no surface may \
+         still report it as unavailable; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        !text.contains("unknown command: /tui"),
+        "/tui must be a registered command, so no spelling may fall through \
+         to the unknown-command path; raw:\n{}",
+        text.escape_debug()
+    );
+
+    // (a) The switch ran.
+    let entered_at = text.find(ALT_SCREEN_ON).unwrap_or_else(|| {
+        panic!(
+            "the switch must enter the alternate screen, which is the byte \
+             that says `/tui fullscreen` reached the new renderer at all; \
+             raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "exactly once: the one switch in this session, and no agent view is \
+         opened here; raw:\n{}",
+        text.escape_debug()
+    );
+
+    // (b) The reader read. F89's assertion.
+    let first_mark = text.find(RING_MARK).unwrap_or_else(|| {
+        panic!(
+            "the inline segment must stream its marker into the ring; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert!(
+        first_mark < entered_at,
+        "the marker must be written while inline, so that the ring is what \
+         holds it by the time the alternate screen is entered; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        text[entered_at..].contains(RING_MARK),
+        "the transcript line must be REPAINTED after the alternate screen is \
+         entered: that is the only way a line written before the switch can \
+         appear on a screen that starts blank, and it is what distinguishes a \
+         reader that reads from a view that merely compiles (F89). Everything \
+         from the alternate screen onwards:\n{}",
+        text[entered_at..].escape_debug()
+    );
+    assert!(
+        session.raw_count(RING_MARK) >= 2,
+        "...which is also two occurrences of it in the stream, not one; \
+         raw:\n{}",
+        text.escape_debug()
+    );
+
+    // Nothing is left pinned: the inline segment's region is released on the
+    // way into fullscreen or at exit, and either way the counts balance.
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        1,
+        "the inline segment pins the region exactly once, and fullscreen does \
+         not pin a second inline region; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(REGION_RESET),
+        1,
+        "and it is released exactly once; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_OFF),
+        1,
+        "the alternate screen is given back on the way out; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "`/quit` must work from fullscreen — a mode that cannot be left is a \
+         trap — but the session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+    assert!(
+        session.raw_mode_off(),
+        "the pty must be canonical again after the session: {}",
+        session.termios_dump()
+    );
+}
+
+/// A session **started** in fullscreen (`--tui fullscreen`) that switches
+/// into inline.
+fn fullscreen_start_then_inline() -> Vec<Step> {
+    vec![
+        send(ALT_SCREEN_ON, "/tui\r"),
+        send(TUI_REPORT_FULLSCREEN, "/tui inline\r"),
+        send(TUI_SWITCHED_TO_INLINE, "/theme zz2\r"),
+        send(TUI_MARK_2, "/quit\r"),
+    ]
+}
+
+/// **Fullscreen -> inline, which is `tui_bridge::install`'s third call site.**
+///
+/// Finding **F87** recorded a two-site obligation: every field `install`
+/// publishes has to be republished by every *re*-install, because a
+/// re-install that skips one leaves `install`'s own fallback in place for the
+/// rest of the session and nothing fails. This card makes it three sites, and
+/// **two of the three are post-switch re-installs that fail silently** — so
+/// the republish is asserted here exactly as `tui_switch_releases_the_region
+/// _and_re_pins_it` asserts it for the inline -> classic -> inline path: the
+/// pinned row must carry R5's composed status row, which leads with the
+/// model name, and not the fixed `kitsu` placeholder.
+///
+/// It also pins the surface Decision 1 of this card is about: a mode a
+/// session can switch to must be a mode it can **start** in, so this session
+/// starts in fullscreen from the flag.
+#[test]
+#[serial]
+fn tui_switch_from_fullscreen_into_inline_re_pins_and_republishes_the_status_row() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("fullscreen"),
+        &fullscreen_start_then_inline(),
+    );
+    let text = session.raw_text();
+
+    // Started in fullscreen: the alternate screen is taken before the first
+    // scripted keystroke, which is what `--tui fullscreen` has to mean.
+    let entered_at = text.find(ALT_SCREEN_ON).unwrap_or_else(|| {
+        panic!(
+            "`--tui fullscreen` must start the session in fullscreen; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert!(
+        entered_at < session.marks[0],
+        "the alternate screen must be taken at startup, before any input, or \
+         the flag only changed a label; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TUI_REPORT_FULLSCREEN),
+        1,
+        "and bare /tui reports the live renderer as fullscreen, exactly once; \
+         raw:\n{}",
+        text.escape_debug()
+    );
+
+    // The switch away leaves the alternate screen *before* the inline
+    // segment writes to the real screen.
+    let left_at = text.find(ALT_SCREEN_OFF).unwrap_or_else(|| {
+        panic!(
+            "the switch out of fullscreen must give the alternate screen \
+             back; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    let mark_at = text.find(TUI_MARK_2).unwrap_or_else(|| {
+        panic!(
+            "the inline segment must print its marker; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert!(
+        left_at < mark_at,
+        "the alternate screen must be given back before the inline segment \
+         writes, or the user's transcript lands on a screen that is about to \
+         be discarded; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_OFF),
+        1,
+        "exactly once, at the switch and not again at exit; raw:\n{}",
+        text.escape_debug()
+    );
+
+    // The third install site really installed.
+    assert_eq!(
+        session.raw_count(&tui_region()),
+        1,
+        "the switch into inline pins the region exactly once; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(REGION_RESET),
+        1,
+        "and releases it exactly once, at exit; raw:\n{}",
+        text.escape_debug()
+    );
+
+    // F87's clause: the re-install republished R5's status source rather than
+    // leaving `install`'s `"kitsu"` fallback on the pinned row.
+    let screen = session.screen_at(3);
+    let row = screen[(ROWS - 1) as usize].trim_end();
+    assert!(
+        row.starts_with(STATUS_ROW_MODEL),
+        "after switching out of fullscreen the pinned row must carry R5's \
+         composed status row, which leads with {STATUS_ROW_MODEL:?} — a \
+         re-install that forgot to republish the status source leaves the \
+         fixed `kitsu` placeholder there and nothing else fails; row {ROWS} \
+         reads {row:?}; screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        session.raw_mode_off(),
+        "the pty must be canonical again after the session: {}",
+        session.termios_dump()
+    );
+}
+
+/// A session started in fullscreen that drops all the way back to classic.
+fn fullscreen_start_then_classic() -> Vec<Step> {
+    vec![
+        send(ALT_SCREEN_ON, "/tui classic\r"),
+        send(TUI_SWITCHED_TO_CLASSIC, "/theme zz2\r"),
+        send(TUI_MARK_2, "/quit\r"),
+    ]
+}
+
+/// **Fullscreen -> classic: the terminal is given back whole.**
+///
+/// The fourth and last new transition, and the one with no renderer on the
+/// other side to hide a half-restore: after it the session owns no pinned
+/// row, no scroll region, no alternate screen and no title of its own. This
+/// is where **N5's two formerly vacuous clauses** are asserted as a pair —
+/// the alternate screen *and* the window title — because this is the only
+/// script in the file with exactly one complete fullscreen segment, entered
+/// and left before the process ends, so each sequence must appear exactly
+/// once and the counts mean something.
+#[test]
+#[serial]
+fn tui_switch_from_fullscreen_into_classic_restores_the_screen_and_the_title() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("fullscreen"),
+        &fullscreen_start_then_classic(),
+    );
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.raw_count(TUI_SWITCHED_TO_CLASSIC),
+        1,
+        "the switch is narrated; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "one fullscreen segment takes the alternate screen once; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_OFF),
+        1,
+        "...and gives it back once, at the switch; raw:\n{}",
+        text.escape_debug()
+    );
+
+    // N5's title clause. `TuiRuntime::enter`/`leave` are the only writers of
+    // these two sequences in the workspace, so the pair is also the proof
+    // that the switch went through the runtime rather than open-coding the
+    // alternate screen beside it.
+    assert_eq!(
+        session.raw_count(TITLE_PUSH),
+        1,
+        "the fullscreen segment pushes the terminal's title once \
+         (`TuiRuntime::enter`), which is N5's title clause becoming real; \
+         raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(TITLE_POP),
+        1,
+        "and pops it once on the way out (`TuiRuntime::leave`); raw:\n{}",
+        text.escape_debug()
+    );
+    let pushed_at = text.find(TITLE_PUSH).expect("the push was just counted");
+    let popped_at = text.find(TITLE_POP).expect("the pop was just counted");
+    assert!(
+        pushed_at < popped_at,
+        "pushed before popped, or the stack is unbalanced; raw:\n{}",
+        text.escape_debug()
+    );
+
+    // The classic segment is genuinely bare: no region, no alternate screen,
+    // and the marker it prints goes to the real screen.
+    let classic_segment = session.raw_after(1);
+    assert!(
+        !classic_segment.contains(&tui_region()),
+        "no region may be pinned after the drop to classic; after the switch \
+         the child wrote:\n{}",
+        classic_segment.escape_debug()
+    );
+    assert!(
+        !classic_segment.contains(ALT_SCREEN_ON),
+        "and the alternate screen must not be re-taken; after the switch the \
+         child wrote:\n{}",
+        classic_segment.escape_debug()
+    );
+    assert!(
+        classic_segment.contains(TUI_MARK_2),
+        "the classic segment keeps printing its transcript; after the switch \
+         the child wrote:\n{}",
+        classic_segment.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "the session exits cleanly, but exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+    assert!(
+        session.raw_mode_off(),
+        "the pty must be canonical again after the session: {}",
+        session.termios_dump()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Card T5-S1c: the fullscreen frame must FOLLOW the ring, not freeze at entry.
+//
+// Finding **F97**. `enter_fullscreen` paints one frame and returns: there is
+// no repaint, no read loop and no output routing, so `/tui fullscreen` today
+// means "take the alternate screen, print the ring's tail once, then carry on
+// writing to that screen normally". The frame is a snapshot the conversation
+// scrolls over.
+//
+// Every T5-S2 transition test above is satisfied by that single paint —
+// including `tui_switch_from_inline_into_fullscreen_repaints_the_ring`, whose
+// second occurrence of the marker proves the ring *was* read. **A test that
+// proves the ring was read does not prove the ring is being read**, and the
+// test below is the one that separates them: it makes the ring grow *while
+// fullscreen is live* and asserts the retained line is painted again
+// afterwards.
+//
+// The non-regression test after it pins the other half: inline and classic
+// have no fullscreen frame, so neither may grow one.
+// ---------------------------------------------------------------------------
+
+/// The second streamed marker, for the turn that runs **inside** fullscreen.
+///
+/// Chosen for the four properties [`RING_MARK`]'s doc comment lists, and for
+/// the same reason it is a streamed fragment rather than a diagnostic: only a
+/// writer that goes through the surface seam can reach a ring at all, and
+/// `eprintln!` bypasses it.
+const RING_MARK_2: &str = "RING_BETA";
+
+/// Inline -> fullscreen with the marker in the ring, then a **second streamed
+/// turn while fullscreen holds the screen**, then out.
+///
+/// The second turn is what this script adds to [`inline_then_fullscreen`], and
+/// it is submitted at fullscreen's own idle prompt. Both waits are [`pause`]s
+/// on a trigger that is already satisfied, which is the separation this file's
+/// streaming scripts use: a line written the instant a turn's output appears
+/// still reaches the mid-turn collector, where `/tui` is refused and the
+/// prompt would be queued instead of read.
+fn fullscreen_then_a_second_streamed_turn() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "say hello\r"),
+        pause(TURN_DONE_MARKER, 500),
+        send(TURN_DONE_MARKER, "/tui fullscreen\r"),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 500),
+        send(TUI_SWITCHED_TO_FULLSCREEN, "say more\r"),
+        pause(RING_MARK_2, 800),
+        send(RING_MARK_2, "/quit\r"),
+    ]
+}
+
+/// **F97's missing assertion: the frame follows the ring.**
+///
+/// The test above it proves a reader read the ring once. This one proves the
+/// frame is still the ring's: the session streams [`RING_MARK`] while inline,
+/// switches into fullscreen (which paints it), and then streams
+/// [`RING_MARK_2`] with fullscreen holding the alternate screen.
+///
+/// # Why counting [`RING_MARK`] is the assertion
+///
+/// A single paint can only ever put that line on the stream **twice**: once
+/// as the inline transcript wrote it, and once in the entry frame. Nothing
+/// else in the process holds it — the primary screen's copy is bytes already
+/// past, and the alternate screen starts blank. So a **third** occurrence can
+/// only come from a frame painted again after entry, which is what a renderer
+/// that follows its ring does when the ring grows and what a snapshot cannot
+/// do at all.
+///
+/// # And why the order of the last two occurrences is the follow
+///
+/// The frame is painted oldest line first, so the retained line sits *above*
+/// the new one. Asserting that the stream's **last** occurrence of
+/// [`RING_MARK`] is inside the alternate screen and is followed by
+/// [`RING_MARK_2`] pins both halves of transition 10 in
+/// `kitsu_tui::fullscreen`'s table — the appended line entered the frame, and
+/// the frame it entered is the one still showing the older line — without
+/// duplicating the view's own unit coverage of it (the view is pure and
+/// already pinned there; what is unpinned is whether production ever paints a
+/// second frame).
+///
+/// This is deliberately silent about *how* the new line reaches the screen: a
+/// renderer may write the line and then repaint, or route it through the ring
+/// and let the repaint be its only appearance. Both satisfy the assertions
+/// here, and choosing between them is the implementation's.
+#[test]
+#[serial]
+fn tui_fullscreen_frame_follows_the_ring_while_it_is_live() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &fullscreen_then_a_second_streamed_turn(),
+        vec![
+            Turn {
+                events: vec![delta(&format!("{RING_MARK}\n")), finish("stop")],
+                gap: Duration::from_millis(60),
+            },
+            Turn {
+                events: vec![delta(&format!("{RING_MARK_2}\n")), finish("stop")],
+                gap: Duration::from_millis(60),
+            },
+        ],
+        &["--no-tools".to_string()],
+    );
+    let text = session.raw_text();
+
+    assert_eq!(
+        session.bodies.len(),
+        2,
+        "two turns are two requests, so the second fragment really came from \
+         the mock and was really streamed after the switch; bodies: {:?}",
+        session.bodies
+    );
+
+    // The switch ran, exactly once, and this session is in fullscreen for the
+    // whole of the second turn.
+    let entered_at = text.find(ALT_SCREEN_ON).unwrap_or_else(|| {
+        panic!(
+            "the switch must enter the alternate screen; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "exactly once: one switch, and no agent view is opened here; raw:\n{}",
+        text.escape_debug()
+    );
+    let first_mark = text.find(RING_MARK).unwrap_or_else(|| {
+        panic!(
+            "the inline segment must stream its marker into the ring; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert!(
+        first_mark < entered_at,
+        "the first marker must be written while inline, so the ring is what \
+         holds it once the alternate screen is entered; raw:\n{}",
+        text.escape_debug()
+    );
+    let second_mark = text.find(RING_MARK_2).unwrap_or_else(|| {
+        panic!(
+            "the second turn must stream its marker; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert!(
+        entered_at < second_mark,
+        "and the second turn must run with fullscreen already holding the \
+         screen, or this test measures the entry frame again; raw:\n{}",
+        text.escape_debug()
+    );
+
+    // F97's assertion. Two occurrences is the single paint; three is a frame
+    // painted again after the ring grew.
+    assert!(
+        session.raw_count(RING_MARK) >= 3,
+        "the fullscreen frame must FOLLOW the ring: the retained line is \
+         painted once by the inline transcript and once by the entry frame, \
+         so a third occurrence is the repaint that a mode which paints one \
+         frame and returns can never produce (F97). Counted {}; \
+         everything from the alternate screen onwards:\n{}",
+        session.raw_count(RING_MARK),
+        text[entered_at..].escape_debug()
+    );
+
+    // ...and that repaint is a frame, with the appended line below the
+    // retained one (`fullscreen`'s transition 10).
+    let last_mark = text
+        .rfind(RING_MARK)
+        .expect("the marker was just counted at least three times");
+    assert!(
+        last_mark > entered_at,
+        "the last paint of the retained line must be inside the alternate \
+         screen, not back in the inline transcript; everything from the \
+         alternate screen onwards:\n{}",
+        text[entered_at..].escape_debug()
+    );
+    assert!(
+        text[last_mark..].contains(RING_MARK_2),
+        "and the appended line must be on screen *below* the retained one, \
+         which is what makes the repaint a frame that follows rather than a \
+         stray reprint of one line; everything from that paint onwards:\n{}",
+        text[last_mark..].escape_debug()
+    );
+
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_OFF),
+        1,
+        "the alternate screen is still given back exactly once; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "`/quit` must still work after a turn taken in fullscreen, but the \
+         session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+    assert!(
+        session.raw_mode_off(),
+        "the pty must be canonical again after the session: {}",
+        session.termios_dump()
+    );
+}
+
+/// Two streamed turns and no switch at all, for the renderer named by `tui`.
+fn two_streamed_turns() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "say hello\r"),
+        pause(TURN_DONE_MARKER, 500),
+        send(TURN_DONE_MARKER, "say more\r"),
+        pause(RING_MARK_2, 800),
+        send(RING_MARK_2, "/quit\r"),
+    ]
+}
+
+/// **The other half of T5-S1c: inline and classic have no frame to follow.**
+///
+/// A repaint wired at the wrong level — in the surface seam rather than in the
+/// fullscreen segment — would reach these two renderers as well, and inline's
+/// contract is that the transcript goes to the terminal's own scrollback
+/// exactly once (R3) while classic's is that its byte stream is unchanged.
+/// Both are asserted here as counts on the two streamed markers, and as the
+/// absence of the alternate screen, which neither renderer may take.
+///
+/// Two sessions in one test because they assert the same three things about
+/// two renderers; the fullscreen session that *must* repaint is the test
+/// above.
+#[test]
+#[serial]
+fn tui_two_streamed_turns_paint_each_line_once_without_fullscreen() {
+    for mode in ["inline", "classic"] {
+        let home = TempDir::new().expect("temp home");
+        let session = run_styled_streaming_chat_pty_with_args(
+            home.path(),
+            Some(mode),
+            &two_streamed_turns(),
+            vec![
+                Turn {
+                    events: vec![delta(&format!("{RING_MARK}\n")), finish("stop")],
+                    gap: Duration::from_millis(60),
+                },
+                Turn {
+                    events: vec![delta(&format!("{RING_MARK_2}\n")), finish("stop")],
+                    gap: Duration::from_millis(60),
+                },
+            ],
+            &["--no-tools".to_string()],
+        );
+        let text = session.raw_text();
+        assert_eq!(
+            session.bodies.len(),
+            2,
+            "two turns are two requests in {mode} too; bodies: {:?}",
+            session.bodies
+        );
+        assert_eq!(
+            session.raw_count(ALT_SCREEN_ON),
+            0,
+            "the {mode} renderer must never take the alternate screen; \
+             raw:\n{}",
+            text.escape_debug()
+        );
+        assert_eq!(
+            session.raw_count(RING_MARK),
+            1,
+            "and each streamed line reaches the terminal exactly once in \
+             {mode}: there is no frame here to repaint it into; raw:\n{}",
+            text.escape_debug()
+        );
+        assert_eq!(
+            session.raw_count(RING_MARK_2),
+            1,
+            "...the second line included; raw:\n{}",
+            text.escape_debug()
+        );
+        assert!(
+            session.status.success(),
+            "the {mode} session exits cleanly, but exited {:?}; screen:\n{}",
+            session.status,
+            session.screen_dump()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Card T5-S1c-ii: fullscreen gets a composer with a key decoder.
+//
+// Finding **F97**, sharpened. T5-S1c-i made the frame follow the ring; the
+// next rough edge is that fullscreen's idle prompt is **rustyline**.
+// `read_idle_chat_line` reaches the inline composer only inside
+// `if let Some(bridge) = bridge` and `install` returns `None` for
+// `TuiMode::Fullscreen` (`tui_bridge.rs`'s `TuiMode::Classic |
+// TuiMode::Fullscreen => return None`), so this surface has no `KeyFilter`,
+// no `RawStdinGuard` and no composer of its own -- and rustyline's
+// `ChatHelper` paints its prompt, its `\u{2570} model ... cwd ... \u{256f}`
+// row and the whole `\u{256d} slash commands \u{256e}` palette straight onto
+// the frame the repaint just wrote.
+//
+// **Measured on this pty before a line of it was written**, so the two tests
+// below assert against the real failure rather than against a reading of it:
+// with the ring 24 lines deep and the frame filling the screen, the switch
+// leaves `FS_ROW_05 ..= FS_ROW_24` on screen and rustyline's deck row already
+// on the bottom row; one `/c` keystroke then scrolls **eleven** of the
+// frame's rows off the top for good (`FS_ROW_16 ..= FS_ROW_24` is all that is
+// left), and taking the draft back out does not bring them back, because
+// nothing on this surface owns the screen.
+//
+// So the pins are:
+//
+// * the deck row rustyline alone can write never reaches the alternate screen
+//   (**F71**: the painted bytes, never a state field), and the frame is
+//   **whole again** once a palette-opening draft has been taken back out --
+//   which is the user-visible point of the card and is deliberately silent
+//   about whether the composer repaints the frame or never scrolls it;
+// * and a draft **grows by keystroke** on that surface, through two separate
+//   reads, so the decoder is something production reaches twice rather than a
+//   capability that merely compiles (**F89**, and **F97**'s own lesson: one
+//   occurrence proves it happened, a second that it keeps happening).
+//
+// `\u{2570} model` is the discriminator between the two composers, and it is
+// one by construction rather than by taste: `composer_status` (`main.rs`) has
+// exactly one caller, `impl Hinter for ChatHelper::hint`, which appends it to
+// **every** hint that helper returns, palette or no palette. The inline
+// composer's `paint_composer` never writes it. So that row on the alternate
+// screen is rustyline reading this surface's keystrokes, and its absence
+// while a draft is nevertheless painted and edited is something else reading
+// them.
+//
+// Not in scope here, deliberately: **F54**. Nothing below sends `0x03` or
+// asserts anything about `ISIG`. Paging has its own section further down.
+// ---------------------------------------------------------------------------
+
+/// Rustyline's own composer deck, which only its `ChatHelper` can write.
+///
+/// `composer_status` builds `\u{2570}{ model <model> | cwd <dir> }\u{256f}`
+/// and has one caller, that helper's `hint`, which appends it unconditionally.
+const RUSTYLINE_DECK_ROW: &str = "\u{2570} model";
+
+/// The streamed rows that fill the ring, so the frame fills the screen and
+/// the rows rustyline scrolls away are countable.
+///
+/// Twenty-four lines on a 24-row pty: the entry frame is `rows - 1` of them,
+/// so the frame is screen-sized by construction rather than by arithmetic a
+/// later geometry change could falsify. The prefix is what the tests count,
+/// and it is streamed rather than `eprintln!`ed because only a writer that
+/// goes through the surface seam reaches a ring at all.
+const FS_ROW_PREFIX: &str = "FS_ROW_";
+
+/// One streamed turn that fills the ring with [`FS_ROW_PREFIX`] rows.
+fn one_screenful_turn() -> Vec<Turn> {
+    let mut body = String::new();
+    for row in 1..=24 {
+        body.push_str(&format!("{FS_ROW_PREFIX}{row:02}\n"));
+    }
+    vec![Turn {
+        events: vec![delta(&body), finish("stop")],
+        gap: Duration::from_millis(60),
+    }]
+}
+
+/// How many of the frame's rows are on `screen`.
+fn frame_rows_on(screen: &[String]) -> usize {
+    screen
+        .iter()
+        .filter(|row| row.contains(FS_ROW_PREFIX))
+        .count()
+}
+
+/// Inline -> fullscreen with a screenful in the ring, then **three separate
+/// keystroke steps** at fullscreen's own idle prompt, then out.
+///
+/// The keystrokes are separate steps with a pause after each so they cannot
+/// be coalesced into one `read`: the point of the second one is that the
+/// surface decoded the first and is still decoding, and the point of the
+/// third is that the draft can be taken back *out* again. Every trigger is
+/// already satisfied, which is this file's discipline for a keystroke whose
+/// response is not a unique string -- a composer that paints nothing fails on
+/// an assertion rather than on the driver's deadline.
+///
+/// `/c` is a slash prefix on purpose: it is what makes a palette open, and
+/// the palette is what rustyline scrolls the frame away for. The three
+/// backspaces take the draft back to empty, which closes the palette and is
+/// where the frame must be whole again.
+fn fullscreen_then_a_drafted_and_undrafted_slash_prefix() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "say hello\r"),
+        pause(TURN_DONE_MARKER, 500),
+        send(TURN_DONE_MARKER, "/tui fullscreen\r"),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 500),
+        send(TUI_SWITCHED_TO_FULLSCREEN, "/c"),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 400),
+        send(TUI_SWITCHED_TO_FULLSCREEN, "o"),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 400),
+        send(TUI_SWITCHED_TO_FULLSCREEN, "\x7f\x7f\x7f"),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 400),
+        send(TUI_SWITCHED_TO_FULLSCREEN, "/quit\r"),
+    ]
+}
+
+/// **The frame is not painted over, and rustyline is not what reads this
+/// surface.**
+///
+/// Two assertions on the painted bytes, and neither is the other's
+/// restatement: the deck row says *who* is reading the keystrokes, and the
+/// frame-row count says what the reading *costs the user*. A composer that
+/// painted nothing at all would satisfy the first and fail the second's
+/// companion test below.
+#[test]
+#[serial]
+fn tui_fullscreen_idle_prompt_keeps_rustylines_deck_off_the_frame() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &fullscreen_then_a_drafted_and_undrafted_slash_prefix(),
+        one_screenful_turn(),
+        &["--no-tools".to_string()],
+    );
+    let text = session.raw_text();
+
+    // NON-VACUOUS: one real streamed turn, one switch, and a frame that
+    // really does fill the screen before a key is pressed.
+    assert_eq!(
+        session.bodies.len(),
+        1,
+        "the screenful must have come from the mock and been streamed into \
+         the ring; bodies: {:?}",
+        session.bodies
+    );
+    let entered_at = text.find(ALT_SCREEN_ON).unwrap_or_else(|| {
+        panic!(
+            "the switch must enter the alternate screen; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "exactly once: one switch and no overlay; raw:\n{}",
+        text.escape_debug()
+    );
+    let at_switch = session.screen_at(3);
+    let framed = frame_rows_on(&at_switch);
+    assert!(
+        framed >= 15,
+        "NON-VACUOUS: the frame must fill the screen before anything is \
+         typed, or there is nothing for a keystroke to cost; {framed} frame \
+         row(s) at the switch:\n{}",
+        Session::dump(&at_switch)
+    );
+
+    // F71. The deck row is rustyline's and only rustyline's, so a single
+    // occurrence of it inside the alternate screen is this surface's prompt
+    // being read by a cooked-mode line editor painting over the frame.
+    let on_the_alternate_screen = &text[entered_at..];
+    assert_eq!(
+        on_the_alternate_screen.matches(RUSTYLINE_DECK_ROW).count(),
+        0,
+        "rustyline's `{RUSTYLINE_DECK_ROW} ... cwd ...` row is written by its \
+         `ChatHelper` hint and by nothing else in this binary, so it must \
+         never reach the alternate screen: while fullscreen holds the screen \
+         the keystrokes belong to fullscreen's own composer. Everything from \
+         the alternate screen onwards:\n{}",
+        on_the_alternate_screen.escape_debug()
+    );
+
+    // ...and the frame survives being typed at. Asserted after the draft has
+    // been taken back out, because a palette that is *open* may legitimately
+    // cover frame rows -- what it may not do is cost them permanently.
+    let dismissed = session.screen_at(9);
+    assert!(
+        frame_rows_on(&dismissed) >= framed,
+        "the frame's rows must survive the idle prompt: {framed} were on \
+         screen at the switch and {} after a palette-opening draft was typed \
+         and taken back out. Rustyline scrolls them off the top of the \
+         alternate screen and nothing puts them back (F97). Screen after the \
+         draft was dismissed:\n{}",
+        frame_rows_on(&dismissed),
+        Session::dump(&dismissed)
+    );
+
+    // The ordinary exit path, with raw mode now new state on this surface:
+    // every bracketed-paste enable is matched by a disable, and the pty is
+    // canonical again once the session is gone.
+    assert_eq!(
+        session.raw_count("\x1b[?2004h"),
+        session.raw_count("\x1b[?2004l"),
+        "whatever engaged raw mode on this surface must have let it go: \
+         bracketed paste is enabled by `RawStdinGuard::engage` and disabled \
+         by its `Drop`, so an unbalanced count is a guard that outlived its \
+         read; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "`/quit` must still work from fullscreen's own composer, but the \
+         session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+    assert!(
+        session.raw_mode_off(),
+        "and the pty must be canonical again after a fullscreen session that \
+         held raw mode: {}",
+        session.termios_dump()
+    );
+}
+
+/// **The decoder is reachable, and it keeps being reached.**
+///
+/// The companion to the test above, and the one that refuses the cheap fix to
+/// it: suppressing rustyline's helper in fullscreen would leave the deck row
+/// off the screen and the frame intact while leaving the user unable to type.
+/// So this asserts the draft itself -- painted, grown by a second keystroke
+/// in a second read, and erased again -- and asserts it **below** the frame,
+/// which is what "the composer draws where it belongs" means on a surface
+/// whose rows are all frame.
+///
+/// Three reads rather than one is **F97**'s shape applied to the decoder: one
+/// draft proves a keystroke was decoded, the second proves the surface is
+/// still decoding, and the third proves the decoding is editing rather than
+/// echoing -- a cooked-mode byte stream cannot shrink.
+#[test]
+#[serial]
+fn tui_fullscreen_decodes_each_keystroke_at_its_own_idle_prompt() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &fullscreen_then_a_drafted_and_undrafted_slash_prefix(),
+        one_screenful_turn(),
+        &["--no-tools".to_string()],
+    );
+    let text = session.raw_text();
+    assert_eq!(
+        session.bodies.len(),
+        1,
+        "one streamed turn fills the ring; bodies: {:?}",
+        session.bodies
+    );
+
+    // NON-VACUOUS: the keystrokes were written after the alternate screen was
+    // taken, so what answers them is fullscreen's prompt and not inline's.
+    let entered_at = text
+        .find(ALT_SCREEN_ON)
+        .expect("the switch takes the screen");
+    assert!(
+        entered_at < session.marks[4],
+        "the keystrokes must be typed while fullscreen holds the screen; \
+         raw:\n{}",
+        text.escape_debug()
+    );
+
+    // One keystroke, one decoded draft, painted under the frame.
+    for (step, draft) in [(5usize, "/c"), (7, "/co")] {
+        let screen = session.screen_at(step);
+        let row = screen
+            .iter()
+            .position(|row| row.contains(draft))
+            .unwrap_or_else(|| {
+                panic!(
+                    "fullscreen's own composer must paint the draft {draft:?} \
+                     it decoded: this surface has no `KeyFilter` and no raw \
+                     mode today, so the keystroke reaches a cooked-mode line \
+                     editor instead (F97). Screen:\n{}",
+                    Session::dump(&screen)
+                )
+            });
+        let last_frame_row = screen
+            .iter()
+            .rposition(|row| row.contains(FS_ROW_PREFIX))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the frame must still be on screen while the draft is \
+                     being typed; screen:\n{}",
+                    Session::dump(&screen)
+                )
+            });
+        assert!(
+            row > last_frame_row,
+            "and it must paint it *under* the frame rather than into it: the \
+             draft {draft:?} is on row {} and the frame's last row is {}; \
+             screen:\n{}",
+            row + 1,
+            last_frame_row + 1,
+            Session::dump(&screen)
+        );
+    }
+
+    // And the paint that answered each keystroke is **this surface's**, not a
+    // cooked-mode line editor's: the window a keystroke opens carries the new
+    // draft and none of rustyline's deck. Per keystroke rather than per
+    // session, because what is being pinned here is the decode -- the draft
+    // appearing in the window the keystroke opened is the composer having
+    // read that byte (F89: reached, not merely present).
+    for (from, to, draft) in [(4usize, 5usize, "/c"), (6, 7, "/co")] {
+        let window = session.raw_between(from, to);
+        assert!(
+            window.contains(draft),
+            "the keystroke must be answered by a paint of the draft {draft:?} \
+             in the window it opened; the child wrote:\n{}",
+            window.escape_debug()
+        );
+        assert!(
+            !window.contains(RUSTYLINE_DECK_ROW),
+            "...and that paint must not be rustyline's: `{RUSTYLINE_DECK_ROW} \
+             ... cwd ...` in this window is its `ChatHelper` answering the \
+             keystroke, which is a cooked-mode line editor reading a surface \
+             that has no decoder of its own (F97). The child wrote:\n{}",
+            window.escape_debug()
+        );
+    }
+
+    // ...and the editing is the decoder's, not the terminal's: the draft is
+    // gone from the composer once it has been backspaced out.
+    let dismissed = session.screen_at(9);
+    let composer = dismissed
+        .iter()
+        .rposition(|row| row.contains("kitsu>"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the composer's prompt must still be on screen with the draft \
+                 taken back out; screen:\n{}",
+                Session::dump(&dismissed)
+            )
+        });
+    assert!(
+        !dismissed[composer].contains("/co"),
+        "the backspaces must have been decoded as edits: the composer row \
+         still reads {:?}; screen:\n{}",
+        dismissed[composer],
+        Session::dump(&dismissed)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Card **T5-S1c-iii**: the four paging keys, end to end.
+//
+// The decoder's side is pinned in `tui_bridge`'s own tests (the press list,
+// the `Home`/`End` collision, the split sequence, the inline negative) and
+// the anchor's eleven transitions are pinned in `kitsu_tui::fullscreen`.
+// Neither of those is **F89**: a decoder that compiles and a view that pages
+// are not a key the user can press. What this section adds is the one thing
+// only a pty can show -- that a `PgUp` typed at a live fullscreen prompt
+// moves the frame on the screen.
+// ---------------------------------------------------------------------------
+
+/// `PgUp`, `PgDn`, `Ctrl+Home` and `Ctrl+End` as a terminal sends them.
+///
+/// `Ctrl+Home`/`Ctrl+End` are the **modified** forms of plain `Home`/`End`'s
+/// finals, which is the whole of **F65**'s family here: the bytes differ only
+/// in the parameters, and the plain forms must keep moving the caret.
+const PG_UP_KEY: &str = "\x1b[5~";
+const CTRL_END_KEY: &str = "\x1b[1;5F";
+
+/// Inline -> fullscreen with a screenful in the ring, then `PgUp`, then
+/// `Ctrl+End`, then out.
+///
+/// Each press is its own step with a pause after it, for the reason the
+/// keystroke script above gives: the presses must not be coalesced into one
+/// `read`, because a frame that moved once is not a frame the keys keep
+/// moving. Every trigger is already satisfied, so a press that does nothing
+/// fails on an assertion rather than on the driver's deadline.
+fn fullscreen_then_pgup_then_ctrl_end() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "say hello\r"),
+        pause(TURN_DONE_MARKER, 500),
+        send(TURN_DONE_MARKER, "/tui fullscreen\r"),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 500),
+        send(TUI_SWITCHED_TO_FULLSCREEN, PG_UP_KEY),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 500),
+        send(TUI_SWITCHED_TO_FULLSCREEN, CTRL_END_KEY),
+        pause(TUI_SWITCHED_TO_FULLSCREEN, 500),
+        send(TUI_SWITCHED_TO_FULLSCREEN, "/quit\r"),
+    ]
+}
+
+/// **The paging keys are reachable, and they move the frame.**
+///
+/// Finding **F89**: a capability that compiles is not one that is reachable.
+/// The reader hands its bytes to `kitsu_editor::TypeaheadEditor`, whose
+/// `dispatch_csi` has no `5`/`6` parameter for `~` at all -- measured: a
+/// `PgUp` fed to it leaves `(buffer, cursor)` untouched and reports
+/// `changed: false` with no action -- so today this surface answers a `PgUp`
+/// with nothing whatsoever. Only the screen can show that.
+///
+/// **F71/F41**: asserted on the parsed screen, by *which* of the ring's lines
+/// are on it. `FS_ROW_24` is the newest and `FS_ROW_01` is above the entry
+/// window (the frame is `rows - 1` of a 24-line ring), so one press has to
+/// swap which of the two is visible, and `Ctrl+End` has to swap it back.
+#[test]
+#[serial]
+fn tui_fullscreen_pages_the_frame_with_pgup_and_re_latches_with_ctrl_end() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &fullscreen_then_pgup_then_ctrl_end(),
+        one_screenful_turn(),
+        &["--no-tools".to_string()],
+    );
+    let text = session.raw_text();
+
+    // NON-VACUOUS: a real streamed turn, one switch, and an entry frame that
+    // fills the screen with the *newest* lines and keeps `FS_ROW_01` above it.
+    assert_eq!(
+        session.bodies.len(),
+        1,
+        "the screenful must have been streamed into the ring; bodies: {:?}",
+        session.bodies
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "exactly once: one switch and no overlay; raw:\n{}",
+        text.escape_debug()
+    );
+    let at_switch = session.screen_at(3);
+    assert!(
+        frame_rows_on(&at_switch) >= 15,
+        "NON-VACUOUS: the frame must fill the screen before a key is \
+         pressed:\n{}",
+        Session::dump(&at_switch)
+    );
+    let on_screen = |screen: &[String], row: &str| screen.iter().any(|r| r.contains(row));
+    assert!(
+        on_screen(&at_switch, "FS_ROW_24"),
+        "NON-VACUOUS: the entry frame follows the newest line:\n{}",
+        Session::dump(&at_switch)
+    );
+    assert!(
+        !on_screen(&at_switch, "FS_ROW_01"),
+        "NON-VACUOUS: and holds the oldest line *above* the window, or a \
+         `PgUp` has nothing to reveal:\n{}",
+        Session::dump(&at_switch)
+    );
+
+    // One `PgUp`: the frame moves back and the oldest retained line arrives.
+    let paged = session.screen_at(6);
+    assert!(
+        on_screen(&paged, "FS_ROW_01"),
+        "a `PgUp` at fullscreen's own idle prompt must page the frame back: \
+         `ESC[5~` reaches `TypeaheadEditor`, which has no `5` parameter for \
+         `~` and drops it, so this surface answers the key with nothing \
+         today. Screen after the press:\n{}",
+        Session::dump(&paged)
+    );
+    assert!(
+        !on_screen(&paged, "FS_ROW_24"),
+        "...and must move it by a window rather than by a line: the newest \
+         line has to leave the screen, or the press scrolled instead of \
+         paging. Screen after the press:\n{}",
+        Session::dump(&paged)
+    );
+    assert!(
+        session.raw_between(4, 6).contains("FS_ROW_01"),
+        "and the repaint must be what *answers the press*, in the window the \
+         press opened: the frame follows the ring only when the ring grows, \
+         so a press that leaves the repaint to the next transcript line \
+         leaves the user's key dead. The child wrote:\n{}",
+        session.raw_between(4, 6).escape_debug()
+    );
+
+    // `Ctrl+End`: the re-latch, and the half of the `Home`/`End` collision
+    // that has to page rather than move a caret. The draft is empty here, so
+    // a leak to the editor's `move_end` would be invisible -- which is why
+    // the caret half of this pair is pinned in `tui_bridge`'s unit tests and
+    // the frame half is pinned here.
+    let relatched = session.screen_at(8);
+    assert!(
+        on_screen(&relatched, "FS_ROW_24"),
+        "`Ctrl+End` (`ESC[1;5F`) must bring the newest line back and resume \
+         following (transition 9); screen:\n{}",
+        Session::dump(&relatched)
+    );
+
+    // The ordinary exit path, unchanged by the new keys.
+    assert_eq!(
+        session.raw_count("\x1b[?2004h"),
+        session.raw_count("\x1b[?2004l"),
+        "every bracketed-paste enable is matched by a disable: raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "`/quit` must still work after a run of page presses, but the \
+         session exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+    assert!(
+        session.raw_mode_off(),
+        "and the pty must be canonical again: {}",
+        session.termios_dump()
+    );
+}
+
+/// Classic -> fullscreen, then a `SIGTERM` inside the segment.
+///
+/// The third way into fullscreen, and the one no test had taken: the two
+/// signal scripts in the exit-path section below enter from **inline**
+/// (whose `install` registers the dying handler) or start with
+/// `--tui fullscreen` (whose startup registers it for the mode, card F96).
+/// The `/tui` arm's `TuiRendererRequest::Fullscreen` branch calls
+/// `enter_fullscreen` and `eprintln!` and nothing else -- no
+/// `install_exit_restore` -- so a session that reaches fullscreen this way
+/// holds the alternate screen on the **default** signal disposition.
+///
+/// That is an F94-family hole in its own right, and this card is where it
+/// has to be pinned: raw termios is new state on this surface, so a dying
+/// signal on this path now leaves the user's shell with no echo and no line
+/// editing on top of leaving them on the alternate screen, which is exactly
+/// what F96 recorded for the startup path.
+fn classic_into_fullscreen_then_sigterm() -> Vec<Step> {
+    vec![
+        send("/help for commands", "/tui fullscreen\r"),
+        pause(ALT_SCREEN_ON, SETTLE_MS),
+        signal(ALT_SCREEN_ON, libc::SIGTERM),
+        pause(ALT_SCREEN_ON, SETTLE_MS),
+    ]
+}
+
+/// **The exit path this surface's new terminal state adds a suspect to.**
+///
+/// *When a surface takes new terminal state, every exit path is a suspect,
+/// and exit paths are enumerable.* The enumeration for fullscreen's composer
+/// is: a normal switch away, `/quit`, a dying signal, and a panic. The first
+/// two are asserted on the scripts above and in T5-S2's transition tests; the
+/// panic path runs the chained hook and then unwinds through
+/// `RawStdinGuard::drop` and `FullscreenSegment::drop` (neither profile sets
+/// `panic = "abort"`), and there is no in-process way to provoke one from a
+/// script. **This is the third**, on the one route into fullscreen that
+/// registers no handler at all.
+#[test]
+#[serial]
+fn fullscreen_entered_from_classic_sigterm_restores_termios_and_the_screen() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), None, &classic_into_fullscreen_then_sigterm());
+    assert_alt_screen_released_after_signal(&session, 2, "SIGTERM in fullscreen out of classic");
+    assert!(
+        session.raw_mode_off(),
+        "and the pty must be canonical again: a fullscreen composer holds raw \
+         termios, so a session signalled on this path owes the terminal its \
+         line discipline back as well as its screen, but it reads {}",
+        session.termios_dump()
+    );
+    assert!(
+        !session.status.success(),
+        "a signalled session does not exit successfully; it exited {:?}",
+        session.status
     );
 }
 
@@ -6368,5 +7800,383 @@ fn inline_mode_routes_the_detach_chord_and_answers_detach_without_an_attachment(
          `\u{2190}`), rather than being reported as an unknown command; whole \
          screen:\n{}",
         Session::dump(&detached)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Card F94: a dying signal must give the alternate screen back.
+//
+// `SIGNAL_RESTORE` (`tui_bridge.rs`) is `ESC[r ESC[?25h ESC[?2004l
+// ESC[23;2t` -- region reset, show cursor, bracketed paste off, title pop --
+// and **no `ESC[?1049l`**. Two surfaces in this binary take the alternate
+// screen: the agent-view overlay (`main.rs`, written straight-line, restored
+// only on the normal path) and `FullscreenSegment` (a guard, restored only by
+// `Drop`). `Drop` does not run on a signal and the handler writes no
+// `?1049l`, so a `SIGINT` or a `SIGTERM` taken while either surface is up
+// leaves the user looking at kitsu's alternate screen with their transcript
+// stranded on the primary one. That is requirement N5's signal clause, open
+// for the overlay since T4-S2 and for fullscreen since T5-S2.
+//
+// Nothing caught it because no test in this file had ever killed the process
+// while a surface held the alternate screen: every `Action::Signal` script
+// above signals an inline session, which takes no alternate screen at all.
+// The absence was the bug; these four tests are the thing that was missing.
+//
+// The two restores below are deliberately *counted*, not merely found. The
+// restore has to be emitted when the screen is held and **not** when it is
+// not -- a handler that wrote `?1049l` unconditionally would move the cursor
+// to a stale DECSC slot on every `SIGTERM` of a session that never left
+// inline -- so the no-regression and once-only tests are as load-bearing as
+// the two that fail today, and they are what distinguishes a gated restore
+// from an unconditional one.
+// ---------------------------------------------------------------------------
+
+/// Open the agent view with `/jobs view`, let it paint, then kill the child
+/// while it is up.
+///
+/// `/jobs view` rather than the `Ctrl+X a` chord because it is one line with
+/// a receipt-free, already-satisfied trigger and the overlay it reaches is
+/// the same one (`jobs_view_opens_the_overlay_in_inline_mode_and_prints_the_deck_in_classic`
+/// pins that equivalence). The pause is the mark: it separates the overlay's
+/// paint from everything the child writes *after* the signal, which is the
+/// only window in which the restore can be observed.
+fn jobs_view_then_signal(signal_number: libc::c_int) -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/jobs view\r"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        signal(RAW_MODE_MARKER, signal_number),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+    ]
+}
+
+/// Assert that a session which was holding the alternate screen when it was
+/// signalled gave it back.
+///
+/// Both halves are needed and neither is the other's restatement: the screen
+/// must have been *taken* before the signal, or there is nothing owed, and
+/// the leave must appear in the window **after** the signal, or it is the
+/// normal path's leave being read twice.
+fn assert_alt_screen_released_after_signal(session: &Session, step: usize, label: &str) {
+    let before = String::from_utf8_lossy(&session.raw[..session.marks[step]]).into_owned();
+    assert!(
+        before.contains(ALT_SCREEN_ON),
+        "{label}: the alternate screen must have been taken before the signal, \
+         or there is nothing to give back; raw before the signal:\n{}",
+        before.escape_debug()
+    );
+    assert!(
+        !before.contains(ALT_SCREEN_OFF),
+        "{label}: and it must still have been held at the signal -- a session \
+         that had already left it cannot measure the dying restore; raw before \
+         the signal:\n{}",
+        before.escape_debug()
+    );
+
+    let after = session.raw_after(step);
+    assert!(
+        after.contains(ALT_SCREEN_OFF),
+        "{label}: a terminal left on kitsu's alternate screen hides the user's \
+         own transcript until they run `reset`, so every exit path owes \
+         `ESC[?1049l` (N5); everything the child wrote after the signal \
+         was:\n{}",
+        after.escape_debug()
+    );
+}
+
+/// **The overlay's hole, five cards old: `SIGINT` with the agent view up.**
+///
+/// Fails today in the one way that matters: the window after the signal
+/// carries the handler's `ESC[r ESC[?25h ESC[?2004l ESC[23;2t` and nothing
+/// else, so the assertion prints a restore that gave back the title and kept
+/// the screen.
+#[test]
+#[serial]
+fn agent_view_sigint_gives_the_alternate_screen_back() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &jobs_view_then_signal(libc::SIGINT),
+    );
+    assert_alt_screen_released_after_signal(&session, 2, "SIGINT with the agent view up");
+    // The rest of N5's signal clause still holds for this session, so a fix
+    // that reached the alternate screen by rewriting the handler's one
+    // `write(2)` into something that drops the other sequences fails here
+    // rather than passing above.
+    let after = session.raw_after(2);
+    assert!(
+        after.contains(REGION_RESET) && after.contains(PASTE_OFF),
+        "the region reset and the paste-off the handler already wrote must \
+         survive whatever gives the screen back; after the signal the child \
+         wrote:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        session.raw_mode_off(),
+        "and the pty must be canonical again, but it reads {}",
+        session.termios_dump()
+    );
+}
+
+/// Script: switch into fullscreen from inline, then take a `SIGTERM` inside
+/// the fullscreen segment.
+///
+/// Entered by a switch rather than by starting the session in fullscreen, and
+/// that is a measurement rather than a preference: `install` is inert in
+/// fullscreen, so a session *started* there never reaches
+/// `install_exit_restore` and has no dying-signal handler at all. A script
+/// that started in fullscreen would fail this test for that second, larger
+/// reason and say nothing about the alternate screen. See the report.
+fn switch_into_fullscreen_then_sigterm() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/tui fullscreen\r"),
+        signal(ALT_SCREEN_ON, libc::SIGTERM),
+        pause(ALT_SCREEN_ON, SETTLE_MS),
+    ]
+}
+
+/// **Fullscreen's inherited hole: `SIGTERM` inside the segment.**
+///
+/// The same assertion as the overlay's, on the other surface, and it is a
+/// separate test because the two takers are separate code with separate
+/// restores -- a fix that gates on a flag only one of them sets passes one of
+/// these and fails the other, which is the enumeration this card exists to
+/// force.
+#[test]
+#[serial]
+fn fullscreen_segment_sigterm_gives_the_alternate_screen_back() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &switch_into_fullscreen_then_sigterm(),
+    );
+    assert_alt_screen_released_after_signal(&session, 1, "SIGTERM in fullscreen");
+    assert!(
+        !session.status.success(),
+        "a signalled session does not exit successfully; it exited {:?}",
+        session.status
+    );
+}
+
+/// **A GUARD, green today, and the one that says the restore must be gated.**
+///
+/// An inline session takes no alternate screen, so it is owed none back. The
+/// cheapest fix for the two tests above is to append `ESC[?1049l` to the
+/// handler's `const` unconditionally, and this is the test that refuses it:
+/// `?1049l` is not inert on the primary screen -- xterm's `rmcup` restores
+/// the cursor from the DECSC slot, so an unconditional leave on a session
+/// that never took the screen can park the shell's next prompt wherever that
+/// slot happens to point.
+///
+/// Counted over the whole session rather than the post-signal window: this
+/// script never opens a surface, so *any* `?1049l` in it came from the dying
+/// handler.
+#[test]
+#[serial]
+fn inline_sigterm_gives_back_no_alternate_screen_it_never_took() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &help_then_draft_then_signal(libc::SIGTERM),
+    );
+    let text = session.raw_text();
+    // NON-VACUOUS: the handler did run in this session, so the count below is
+    // a statement about what it wrote and not about whether it fired.
+    assert!(
+        session.raw_after(2).contains(REGION_RESET),
+        "NON-VACUOUS: the dying restore must have run, or this session proves \
+         nothing about what it writes; after the signal the child wrote:\n{}",
+        session.raw_after(2).escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        0,
+        "NON-VACUOUS: no surface in this script takes the alternate screen, \
+         so any leave below is the handler's; raw:\n{}",
+        text.escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_OFF),
+        0,
+        "a dying signal must not give back an alternate screen the session \
+         never took; raw:\n{}",
+        text.escape_debug()
+    );
+}
+
+/// Open the agent view, close it with `Esc`, **then** signal.
+fn jobs_view_closed_then_sigint() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/jobs view\r"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        send(RAW_MODE_MARKER, "\x1b"),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+        signal(RAW_MODE_MARKER, libc::SIGINT),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+    ]
+}
+
+/// **A GUARD, green today: the restore is given once, not twice.**
+///
+/// The overlay's normal close already wrote `ESC[?1049l`; a signal arriving
+/// afterwards is on the primary screen again and owes nothing. So the whole
+/// session holds exactly one leave for exactly one take, and whatever tracks
+/// "the screen is held" has to be cleared on the way out as well as set on
+/// the way in -- the half of a gated fix that is easy to forget, and the half
+/// that this test is the only reader of.
+#[test]
+#[serial]
+fn agent_view_closed_before_a_signal_gives_the_screen_back_exactly_once() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &jobs_view_closed_then_sigint());
+    let text = session.raw_text();
+
+    // NON-VACUOUS, both ways: the overlay really opened and really closed, so
+    // the count is about the restore's discipline and not about a view that
+    // never appeared.
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_ON),
+        1,
+        "NON-VACUOUS: the overlay must have taken the alternate screen once; \
+         raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.raw_after(4).contains(REGION_RESET),
+        "NON-VACUOUS: and the dying restore must have run after the close; \
+         after the signal the child wrote:\n{}",
+        session.raw_after(4).escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(ALT_SCREEN_OFF),
+        1,
+        "one take, one leave: the overlay's own close gave the screen back, so \
+         the dying handler must not write a second leave; raw:\n{}",
+        text.escape_debug()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Card F96: a session *started* in fullscreen installs no dying-signal
+// handler at all, which is strictly worse than F94 and shipped one card ago.
+//
+// `install_exit_restore` was called only inside `if installed.is_some()`
+// (`main.rs`), and `install` returns `None` for `Classic | Fullscreen` --
+// fullscreen pins no region, which is right. The conjunction was the defect:
+// `--tui fullscreen` left `SIGINT` and `SIGTERM` on the **default
+// disposition**, so the process died before anything ran. No scroll-region
+// reset, no title pop, no alternate-screen release, and -- the serious half
+// -- no `tcsetattr` back to canonical termios, which is a shell with no echo
+// and no line editing until the user types `reset` blind.
+//
+// Nothing covered it because the four transition tests above all *switch*
+// into fullscreen, so the inline segment they came from had already installed
+// the handler; and the two scripts that start in fullscreen exit normally,
+// which is the one exit path that does not need it. Starting in fullscreen
+// and then dying is the uncovered intersection, and this is the test for it.
+// ---------------------------------------------------------------------------
+
+/// Start in fullscreen, wait until the session owns raw mode, then `SIGTERM`.
+///
+/// Triggered on [`RAW_MODE_MARKER`] rather than on the alternate screen, and
+/// that is the point of the script rather than a detail: the termios half is
+/// the serious half, so the signal has to land while raw mode is actually
+/// engaged. The trailing pause is the window the dying restore is read in.
+fn fullscreen_start_then_sigterm() -> Vec<Step> {
+    vec![
+        signal(RAW_MODE_MARKER, libc::SIGTERM),
+        pause(RAW_MODE_MARKER, SETTLE_MS),
+    ]
+}
+
+/// **A session started in fullscreen gets its terminal back on a signal.**
+///
+/// The three observations are one requirement (N5) in three places, and each
+/// was false before this card:
+///
+/// * **Termios.** The pty's line settings outlive the child -- the harness
+///   holds its own descriptor on the slave -- so `ICANON`/`ECHO`/`ISIG` are
+///   the state a real user's shell would be left in. This is the assertion
+///   that fails on a missing *handler* rather than on missing bytes, and it
+///   is why this test is not a restatement of F94's: a flag that tells the
+///   handler to write more does nothing when there is no handler.
+/// * **The alternate screen.** Taken by `enter_fullscreen` at startup and
+///   owed back by whatever ends the process.
+/// * **The title.** Pushed by the same call, popped by the handler's stream.
+#[test]
+#[serial]
+fn fullscreen_start_sigterm_restores_termios_and_the_screen() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("fullscreen"),
+        &fullscreen_start_then_sigterm(),
+    );
+    let text = session.raw_text();
+    let before = String::from_utf8_lossy(&session.raw[..session.marks[0]]).into_owned();
+
+    // NON-VACUOUS, both halves: the session really was in fullscreen holding
+    // the alternate screen when the signal landed, so the restores below are
+    // about a terminal that was really taken.
+    assert!(
+        before.contains(ALT_SCREEN_ON),
+        "NON-VACUOUS: `--tui fullscreen` must have taken the alternate screen \
+         before the signal; raw before the signal:\n{}",
+        before.escape_debug()
+    );
+    assert!(
+        !before.contains(ALT_SCREEN_OFF),
+        "NON-VACUOUS: and must still have been holding it -- a session that \
+         had already left cannot measure the dying restore; raw before the \
+         signal:\n{}",
+        before.escape_debug()
+    );
+
+    // The termios half, and the one that says the handler exists at all: a
+    // child killed on the default disposition leaves these three cleared.
+    assert!(
+        session.raw_mode_off(),
+        "a session started in fullscreen must install the dying-signal \
+         handler too: without it the signal's default disposition kills the \
+         process with the terminal still in raw mode, and the user's shell \
+         has no echo and no line editing until they type `reset` blind. The \
+         pty reads {} and the child wrote this after the signal:\n{}",
+        session.termios_dump(),
+        session.raw_after(0).escape_debug()
+    );
+
+    let after = session.raw_after(0);
+    assert!(
+        after.contains(REGION_RESET) && after.contains(PASTE_OFF),
+        "and the handler's own stream must have run on this exit path like \
+         any other; after the signal the child wrote:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        after.contains(ALT_SCREEN_OFF),
+        "the alternate screen the startup took must be given back, or the \
+         user's own transcript stays hidden under kitsu's screen (N5); after \
+         the signal the child wrote:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        after.contains(TITLE_POP),
+        "and so must the title the same call pushed; after the signal the \
+         child wrote:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        !session.status.success(),
+        "a signalled session does not exit successfully; it exited {:?}, \
+         raw:\n{}",
+        session.status,
+        text.escape_debug()
     );
 }
