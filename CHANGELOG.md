@@ -26,8 +26,66 @@ shapes may change in any minor release.
   still in use, so it was never cleaned up; and taking an artifact generation
   lock could report failure and skip work. All five lock sites now share one
   implementation, so there is a single place for this to be right.
+- Cancelling a background agent that was waiting for a permission left **no
+  record of how the request ended** — `/jobs show` kept the request with nothing
+  after it, so the timeline said the agent had asked and never said what
+  happened. Every way a request can end is now recorded.
+- `[hooks] on_agent_state` exported a stale activity label (often `started`) as
+  `KITSU_AGENT_WAITING_FOR` for an agent that was in fact waiting for a
+  permission, so a hook was told the state was `blocked` but given a nonsense
+  reason.
 
 ### Added
+#### Background agents that can ask
+
+- `[agents] blocking = "ask"` lets a background agent **park** when one of its
+  own tools needs a permission you have not granted, instead of being refused.
+  It reports as `blocked`, appears first in `/jobs view` under `needs input`,
+  and waits; answering applies exactly the grant the foreground prompt would
+  have applied, through the same code, so no new permission path exists.
+  `[agents] block_timeout_secs` bounds the wait at thirty minutes by default,
+  after which the agent ends as failed-interrupted — an unattended run cannot
+  hang on a question.
+
+  **The default is `fail_closed` everywhere**, which is exactly today's
+  behaviour, so nothing changes unless you opt in. Scripted, piped and JSONL
+  runs are unaffected even then: they never reach the question, because their
+  permission mode short-circuits before the route is consulted.
+
+  Answer a parked agent with **`/jobs reply <id> <y|a|n>`** — allow once, allow
+  always, or deny — from an idle prompt *or* while a turn is running, and with
+  either spelling (`/agent` and `/agents` forward it too). It takes the same
+  keys the foreground approval prompt takes, including the long forms `yes`,
+  `always` and `no`, because it calls the same parser rather than a second copy.
+  A denial releases the agent to carry on with the refusal, exactly as the
+  foreground prompt would. Replying to an agent that is not waiting says so
+  rather than silently doing nothing.
+- A parked background agent is now visible **outside** the process: the state
+  file reports process state `blocked` with a per-agent `waiting_for`,
+  `[hooks] on_agent_state` fires `STATE=blocked` with the same value, and
+  `kitsu agents --json` reports both. All three use one machine vocabulary —
+  `read_file`, `write_file`, `run_command` — so a tool can match a single
+  spelling, and all three name the **kind** of permission and never the path,
+  URL or command line. Answering an agent removes the reason rather than leaving
+  a stale one behind.
+- A background agent's bounded timeline now records **each permission it asked
+  for and how that ended** — allowed once, allowed always, denied, timed out, or
+  cancelled
+  — so `/jobs show` still shows that an agent asked, after it has been answered.
+  `/jobs explain` reports a pending permission on its `waiting on:` line instead
+  of the agent's last tool activity. These entries name the kind of permission
+  ("approval to write a file") and deliberately **never** the path, URL or
+  command line, keeping the timeline's existing promise that tool arguments are
+  never copied into an inspection record.
+- An unknown `/jobs` subcommand now names what you typed even when it is too
+  far from any real one to suggest a correction — previously a far miss printed
+  only the usage line, leaving you to spot your own typo in it.
+- An interrupted background agent now says **why**: the failure reads
+  `run interrupted before completion: authority input closed before a decision`
+  where it previously stopped at the first clause. The old text is still the
+  prefix, so anything matching it keeps matching.
+
+
 
 #### Terminal UI (preview)
 
@@ -114,6 +172,15 @@ shapes may change in any minor release.
   visible after its one-off completion notice has scrolled away.
 
 ### Changed
+- `/jobs --json` reports `thread.schema_version` as **2**, and a thread object
+  may now carry an optional `thread.name`. The version rose because the agent
+  phase vocabulary gained a `blocked` value, which a closed enum cannot accept
+  without one. `name` is omitted entirely when unset rather than sent as null,
+  so existing readers see no new key unless a name exists. Nothing reports
+  `blocked` yet — no agent can enter that state until a later change — so the
+  only difference visible today is the version number and the optional field.
+
+
 
 - The background-agent registry snapshot now also carries an unacknowledged
   count, so a watcher can tell "a result is waiting for you" from "an agent

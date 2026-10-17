@@ -291,6 +291,16 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
   closed, when `agents.blocking = ask` (default in interactive TUI modes). In
   `classic`, piped, scripted, and JSONL runs the default stays `fail_closed`.
   Free-form questions from the model are out of scope (non-goals).
+  **[Amendment, T2-S5a] In scripted, piped and JSONL runs this is stronger than
+  a default: asking is structurally impossible.** `main.rs` computes
+  `interactive = stdin_is_tty() && !scripted && !forced_one_shot`, and a
+  non-interactive run gets `Mode::Deny`, whose arm in `Permissions::resolve`
+  returns `self.denied(..)` **before** `prompt_route()` is ever consulted. So no
+  value of `agents.blocking` can make those runs park an agent — the route is
+  not read on that path at all. That makes B4's "JSONL output is unchanged" and
+  N1 enforced by structure rather than by configuration discipline, and it is
+  why T2's end-to-end proof has to run on a pseudo-terminal rather than under
+  `--script`.
 - **B2** The request is produced by the two existing gates (`Permissions::
   resolve` and the `CommandMode::Ask` branch in `command.rs`): instead of the
   `interactive_prompts_allowed()` bool, both consult a task-local
@@ -388,6 +398,25 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
 - **N8** Security: peek/attach show only redacted timelines; replies to blocked
   agents go through the two existing gates and are journaled like foreground
   approvals.
+
+  **Amended in T2-S6, because "redacted" was the wrong word for what protects
+  these entries.** An approval entry records the **kind** of permission and
+  nothing else -- "approval to write a file" -- never the path, URL or command
+  line. It has to, because redaction here cannot help: `sanitize_and_redact_text`
+  strips terminal controls and *credential* forms (key prefixes, `key=value`,
+  `Bearer`, URL userinfo) and leaves filesystem paths and argv words completely
+  untouched, as a test now pins. Redaction answers "is this a secret?", not "is
+  this private?", and the snapshot validator uses that same function -- so an
+  entry carrying a path would have reached `/jobs show`, `/jobs explain` and the
+  JSONL snapshot while passing validation.
+
+  The guarantee is therefore structural, not filtered: the request's payload is
+  converted to an `AgentApprovalKind` at the boundary and no argument travels to
+  the recording site, and that kind is a **unit enum with no argument-bearing
+  field**, so a future change cannot carry a path into a timeline entry without
+  altering a public type. See **F40**. The "journaled like foreground approvals"
+  clause holds with the same caveat: the journal records that an approval
+  happened and how it was decided, not what was asked for in detail.
 - **N9** `--reduced-motion` MAY enter TUI modes (it keeps styled output by
   definition, `cli.rs`); there it disables spinner animation, counter flashes,
   and periodic age refresh. Its output is not covered by N1's byte-identical

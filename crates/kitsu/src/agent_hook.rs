@@ -108,6 +108,35 @@ pub(crate) struct AgentObservation {
     pub(crate) waiting_for: Option<String>,
 }
 
+/// Observe every retained agent in `registry`, in the shape [`transitions`]
+/// compares.
+///
+/// This exists as a named function rather than a closure in the session loop
+/// because it is the hook's payload assembly, and F40 names payload assembly
+/// as a place whose narrowness was incidental: `waiting_for` is a free-form
+/// `String` here, so a path *can* be assembled into it. The blocked case must
+/// therefore take its value from the argument-free approval kind and never
+/// from anything carrying a tool argument.
+pub(crate) fn observations(registry: &crate::subagent::AgentRegistry) -> Vec<AgentObservation> {
+    registry
+        .progress_snapshot()
+        .agents
+        .into_iter()
+        .map(|progress| AgentObservation {
+            id: progress.id,
+            state: agent_state_label(progress.status),
+            // A parked agent's reason is the typed, argument-free approval
+            // kind -- never the telemetry activity label, which is a
+            // free-form string and, for a parked agent, also stale.
+            waiting_for: progress
+                .waiting_for
+                .map_or(progress.telemetry.last_activity, |kind| {
+                    Some(kind.wire().to_string())
+                }),
+        })
+        .collect()
+}
+
 /// One state change worth firing the hook for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HookEvent {
@@ -203,10 +232,13 @@ mod tests {
     use super::*;
     use crate::subagent::AgentProgressStatus;
 
-    /// Every variant, so adding one breaks the label tests rather than
-    /// silently going unlabelled.
-    const ALL_STATUSES: [AgentProgressStatus; 4] = [
+    /// Every variant, listed by hand. A fixed-size array does not break when
+    /// a variant is added, which is why `agent_state_label` also has an
+    /// explicit per-variant test: this fixture pins the cross-surface
+    /// agreement, not the exhaustiveness.
+    const ALL_STATUSES: [AgentProgressStatus; 5] = [
         AgentProgressStatus::Running,
+        AgentProgressStatus::Blocked,
         AgentProgressStatus::Done,
         AgentProgressStatus::Failed,
         AgentProgressStatus::Cancelled,
@@ -332,6 +364,14 @@ mod tests {
 
     /// One agent must never be described by two vocabularies: the hook's word
     /// and the word `/jobs` prints are the same bytes for the same status.
+    /// T2-S3 (B5/H3): the hook's `STATE=` word for a parked agent is the same
+    /// `blocked` the `/jobs` JSON reports, so an outer herder reads one
+    /// vocabulary.
+    #[test]
+    fn agent_state_label_names_the_blocked_status() {
+        assert_eq!(agent_state_label(AgentProgressStatus::Blocked), "blocked");
+    }
+
     #[test]
     fn agent_state_label_matches_the_jobs_vocabulary_byte_for_byte() {
         for status in ALL_STATUSES {
