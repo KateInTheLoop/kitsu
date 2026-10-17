@@ -20485,18 +20485,24 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // snapshot documents as disjoint tallies; the terminal, failed and
     // unacknowledged records are finished work and are not live agents.
     //
-    // Cadence, and its honest limit: these three sites are the session
-    // boundary, the top of the idle loop and the start of a turn. The
-    // registry's `watch` channel is subscribed only behind
-    // `KITSU_LIVE_NOTICES`, so there is no general hook to republish from.
-    // The title is therefore correct at the idle prompt and at turn start,
-    // and goes stale mid-turn.
+    // Cadence: these three sites are the session boundary, the top of the idle
+    // loop and the start of a turn. Mid-turn changes are republished by the
+    // registry-following cadence (`publish_cadence_state_title`), so the title
+    // does not go stale while a turn runs.
+    //
+    // Unix only, like the rest of `tui_bridge`: the title is a terminal escape
+    // sequence the bridge writes, and on other targets this is a no-op.
     let publish_title = |turn_active: bool| {
-        let snapshot = agent_registry.snapshot();
-        tui_bridge::publish_state_title(
-            agent_state_file::process_state(snapshot.running, snapshot.blocked, turn_active),
-            snapshot.running + snapshot.blocked,
-        );
+        #[cfg(unix)]
+        {
+            let snapshot = agent_registry.snapshot();
+            tui_bridge::publish_state_title(
+                agent_state_file::process_state(snapshot.running, snapshot.blocked, turn_active),
+                snapshot.running + snapshot.blocked,
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = turn_active;
     };
     // The agent state hook (`[hooks] on_agent_state`, requirement H3). It is
     // independent of the state file above: a user may want the notification
