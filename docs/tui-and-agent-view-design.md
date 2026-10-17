@@ -209,17 +209,17 @@ Numbered so stages and tests can cite them. **MUST/SHOULD/MAY** as usual.
 - **R4** The composer MUST keep every current editing feature: history,
   Ctrl+R search, slash hint and Tab completion, the `@file` and slash-palette
   completion lists, hint and highlight now hosted by rustyline's `ChatHelper`,
-  **[Status, T0-S9] R4 is partially met by the inline preview and the gap is
-  deliberate.** Met: history (including across sessions — it reuses rustyline's
-  own persistence), Ctrl+R search, and the slash hint, which is this card. Not
-  met: Tab completion and the `@file` / slash-palette completion lists. Tab is
-  the cheaper of the two by far — the during-turn collector's whole Tab
-  handling is seven lines that append the showing inline hint to the buffer, so
-  parity with *that* is a small card; the rustyline-level completion **lists**
-  (`@file` paths, the bordered palette) are the larger piece, because the
-  palette draws over several rows and so needs a viewport taller than one.
-  Highlighting is also absent. None of this blocks the opt-in preview; all of it
-  blocks R4 being called satisfied.
+  **[Status, T0-S16] R4 is met apart from two named items.** Met: history
+  (including across sessions — it reuses rustyline's own persistence), Ctrl+R
+  search with its status indicator, the slash hint, **Tab accepting that
+  hint**, and the **bordered slash-command palette**, which shares the classic
+  prompt's own renderer rather than reimplementing it. Still absent: **`@file`
+  path completion** and **highlighting** of the draft. Neither needs more
+  viewport machinery — the palette's arrival settled the geometry questions
+  (F16's resize and truncation halves, F19's minimum height) — so both are
+  ordinary features rather than blockers. None of this blocks the opt-in
+  preview; what still gates making it the default is Q1, the live terminal
+  matrix.
   bracketed paste as one draft, Alt+Enter newline, Esc clears draft,
   draft-aware Ctrl+C, `↑`-on-empty queue recall, queue preview rows,
   `[N queued]`, approval handoff.

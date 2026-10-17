@@ -9,18 +9,7 @@ shapes may change in any minor release.
 
 ## [Unreleased]
 
-### Fixed
-
-- Preserve the last line of long assistant replies before live-row redraws;
-  bound the live composer to terminal height and prevent narrow-window wrapping.
-  Model output limits now print a truncation marker in streaming human output.
-
 ### Added
-
-- A `git` tool available by default in interactive chat, backed by exact
-  command approvals and Linux containment. General commands remain opt-in;
-  `--no-tools` disables Git too.
-
 
 #### Terminal UI (preview)
 
@@ -32,6 +21,12 @@ shapes may change in any minor release.
   — only `inline` selects it — and with the variable unset output is
   byte-identical to before, so no existing session changes.
 
+  Resizing the terminal re-pins the viewport: the row follows the new bottom
+  and the transcript scrolls in the full new height, with your draft intact. If
+  a resize leaves the window too short to hold a scroll region plus the row,
+  the viewport releases entirely rather than pinning a row it cannot draw, and
+  re-installs when there is room again.
+
   Ctrl+Z suspends from the inline prompt, releasing the pinned row and the
   terminal's scrolling restriction first so the shell is handed back an
   ordinary terminal, then restoring both — and your unsubmitted draft — on
@@ -39,10 +34,27 @@ shapes may change in any minor release.
   mode. Ctrl+\ is deliberately inert, because its usual action dumps core and
   this process holds credentials and conversation text in memory.
 
-  Command history persists across sessions in inline mode, and Ctrl+R reverse
-  search works, with its status line and the inline slash-completion hint both
-  shown on the pinned row. Still missing from the inline prompt: Tab completion,
-  and the bordered palette that lists and filters commands as you type.
+  Command history persists across sessions in inline mode, Ctrl+R reverse
+  search works with its status line on the pinned row, and Tab completes a
+  slash command from the hint beside the draft — the same behaviour the
+  during-turn row has.
+
+  Typing a slash prefix opens the **bordered command palette** above the
+  composer. It is the same palette the classic prompt draws, from the same
+  renderer, so the two cannot drift. The viewport grows to hold it and narrows
+  as you type; on a window too short for the full list the box is **built
+  smaller** rather than clipped, so it never loses its border; and it closes
+  as soon as the prefix stops being one. Resizing the terminal keeps it open at
+  the right height.
+
+  Completions at the inline prompt are ranked by command order, so the hint,
+  what Tab inserts, and the palette's first entry always agree — typing `/s`
+  suggests `save` and opens the palette, where it previously suggested `steer`
+  and opened nothing. The during-turn input row is unchanged: while a turn is
+  running, commands that act on that turn still come first.
+
+  Still missing from the inline prompt: `@file` path completion, and syntax
+  highlighting of the draft.
 
 #### Background agents and herding
 

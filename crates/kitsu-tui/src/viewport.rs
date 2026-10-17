@@ -77,6 +77,115 @@ impl Inner {
     }
 }
 
+/// What a resize should do to an inline viewport (finding F16).
+///
+/// DECSTBM margins are **absolute row numbers**, so a latched geometry is
+/// wrong the instant the terminal is resized: shrinking strands the pinned row
+/// off-screen or leaves margins past the bottom of the screen, growing leaves
+/// the region covering only part of the window, and either way
+/// [`InlineSurface::paint`] goes on addressing rows from the stale geometry.
+///
+/// The decision is kept in this pure value so the policy -- in particular what
+/// happens when a resize crosses finding F19's `rows >= viewport_rows + 2`
+/// bound in either direction -- is testable without a terminal, a signal or a
+/// blocking read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResizePlan {
+    /// Emit nothing: either the dimensions did not change, or the viewport is
+    /// already released and the terminal is still too short to pin one.
+    ///
+    /// The first half is what keeps a spurious `SIGWINCH` from flickering the
+    /// pinned row.
+    Unchanged,
+    /// A viewport is pinned and stays pinned at a new size: tear the old
+    /// geometry down and set the new one up, so both margins and the pinned
+    /// rows are right for the new size. Never patch one margin in place.
+    Relatch { rows: u16, viewport_rows: u16 },
+    /// A viewport is pinned and the new size is below F19's bound: release it
+    /// -- region reset, rows cleared, nothing pinned -- and stay released
+    /// while the terminal is too short. A pinned row that cannot be drawn
+    /// correctly is worse than no pinned row, and keeping a region whose
+    /// margins exceed the screen is exactly the corruption F19 was about.
+    Release,
+    /// No viewport is pinned and the new size clears F19's bound: install one.
+    /// This is the second half of the round trip -- a terminal made too short
+    /// and then tall again ends up correctly pinned.
+    Install { rows: u16, viewport_rows: u16 },
+}
+
+/// Decide what a resize to `rows` x `viewport_rows` should do, given the
+/// dimensions currently installed (`None` when nothing is pinned).
+///
+/// The bound is [`InlineSurface::show`]'s own, `rows >= viewport_rows + 2`, and
+/// must stay that way: a plan that says install where `show` declines would
+/// leave the caller believing a region is pinned when none is.
+pub fn plan_resize(installed: Option<(u16, u16)>, rows: u16, viewport_rows: u16) -> ResizePlan {
+    // A spurious notification carries no dimensions, so the redundant resize
+    // is the common case and has to be the cheapest one: nothing at all.
+    if installed == Some((rows, viewport_rows)) {
+        return ResizePlan::Unchanged;
+    }
+    // `show`'s own bound, and `saturating_add` for the same reason it uses
+    // one: a nonsensical `viewport_rows` near `u16::MAX` must decline rather
+    // than wrap into an apparently workable geometry.
+    let workable = rows >= viewport_rows.saturating_add(2);
+    match (installed.is_some(), workable) {
+        (true, true) => ResizePlan::Relatch {
+            rows,
+            viewport_rows,
+        },
+        (true, false) => ResizePlan::Release,
+        (false, true) => ResizePlan::Install {
+            rows,
+            viewport_rows,
+        },
+        // Released and still too short: there is nothing to tear down and
+        // nothing that can be pinned, so no bytes.
+        (false, false) => ResizePlan::Unchanged,
+    }
+}
+
+/// The usable viewport height on a `terminal_rows`-high terminal for a caller
+/// that wants `requested` rows drawn (T0-S14).
+///
+/// F19's bound still rules -- the region needs two scrolling rows above the
+/// viewport -- so the usable maximum is `terminal_rows - 2`. A request above
+/// that is **clamped, not refused**: a palette too tall for the window is
+/// shortened, and only a terminal that cannot pin even one row ends up with no
+/// viewport at all (which is `plan_resize`'s `Release`, already built).
+///
+/// Pure, for the same reason [`plan_resize`] is: the property that the height
+/// latched is always one [`InlineSurface::show`] would accept has to be
+/// checkable without a terminal.
+///
+pub fn clamp_viewport_rows(terminal_rows: u16, requested: u16) -> u16 {
+    // `saturating_sub` is the whole of the degenerate case: a terminal under
+    // three rows has no usable height at all, and zero is the honest answer
+    // rather than a geometry `show` would decline.
+    requested.min(terminal_rows.saturating_sub(2))
+}
+
+/// The rows of `content` that survive the clamp on a `terminal_rows`-high
+/// terminal: the **last** [`clamp_viewport_rows`]`(terminal_rows,
+/// content.len())` of them, in order.
+///
+/// Rows are dropped from the **top**. The composer is the bottom row and the
+/// palette sits above it, so the row the user is typing into must be the last
+/// thing to go; losing it to make room for a list of suggestions would be the
+/// wrong trade.
+///
+/// Returning the slice rather than a count is deliberate: its `len()` *is*
+/// the height, so the two cannot disagree even in here.
+pub fn fit_viewport_rows(content: &[String], terminal_rows: u16) -> &[String] {
+    // `content.len()` may exceed `u16::MAX`; the clamp's own ceiling is well
+    // under that, so saturating the cast cannot change the answer.
+    let height = clamp_viewport_rows(
+        terminal_rows,
+        u16::try_from(content.len()).unwrap_or(u16::MAX),
+    );
+    &content[content.len() - height as usize..]
+}
+
 /// An inline viewport: a pinned region at the bottom of the terminal with the
 /// transcript scrolling in a DECSTBM region above it.
 ///
@@ -188,15 +297,34 @@ impl InlineSurface {
     /// on, and emitting absolute positions against a guess would scribble over
     /// the transcript. Doing nothing is the only choice that cannot corrupt
     /// the screen.
-    pub fn paint(&self, viewport: &[String]) {
+    /// # Width fitting (finding F16, truncation half)
+    ///
+    /// Every row passes through [`fit_row_to_width`] against `cols` before it
+    /// is written, so no painted row can wrap into the row below it. With a
+    /// one-row viewport an over-long row merely wrapped untidily; with the
+    /// multi-row composer and the slash palette it wraps *into and corrupts*
+    /// the next pinned row, which is why the fitting is here and not left to
+    /// each caller.
+    ///
+    /// A row already within `cols` visible columns is written byte-for-byte as
+    /// before -- that is `fit_row_to_width`'s first rule and what keeps the
+    /// paint byte sequences above unchanged.
+    ///
+    /// `cols` is a **parameter** rather than part of the latched geometry:
+    /// `InlineSurface` lives in `kitsu-tui` and must not probe the terminal
+    /// itself (a second probe is a second source of truth), and a column count
+    /// latched at `show` would be stale after a resize for exactly the reason
+    /// the row geometry is. Callers pass
+    /// [`kitsu_render::live::terminal_columns`], the shared probe the live row
+    /// already uses.
+    pub fn paint(&self, viewport: &[String], cols: usize) {
         let mut inner = self.lock();
         let Some((bottom, _)) = inner.geometry else {
             return;
         };
         for (i, row) in viewport.iter().enumerate() {
             let line = bottom as usize + 1 + i;
-            // No width fitting: a row wider than the terminal wraps into the
-            // next viewport row. Recorded as a known gap for a later card.
+            let row = kitsu_render::fit_row_to_width(row, cols);
             let _ = write!(inner.err, "\x1b[{line};1H\x1b[2K{row}");
         }
         let _ = write!(inner.err, "\x1b[{bottom};1H");
@@ -488,7 +616,7 @@ mod tests {
         surface.show(24, 3);
         assert_eq!(sink.bytes(), b"\x1b[1;21r\x1b[21;1H".to_vec());
         let before = sink.bytes().len();
-        surface.paint(&["composer".to_string()]);
+        surface.paint(&["composer".to_string()], 80);
         assert_eq!(
             &sink.bytes()[before..],
             b"\x1b[22;1H\x1b[2Kcomposer\x1b[21;1H"
@@ -505,7 +633,7 @@ mod tests {
         // 10, and the cursor goes back to row 8 inside the region.
         surface.show(10, 2);
         let before = sink.bytes().len();
-        surface.paint(&["composer".to_string(), "status".to_string()]);
+        surface.paint(&["composer".to_string(), "status".to_string()], 80);
         assert_eq!(
             &sink.bytes()[before..],
             b"\x1b[9;1H\x1b[2Kcomposer\x1b[10;1H\x1b[2Kstatus\x1b[8;1H"
@@ -580,11 +708,14 @@ mod tests {
             let fd = if i % 2 == 1 { Fd::Stdout } else { Fd::Stderr };
             surface.transcript_line(fd, &format!("line {i:02}"));
         }
-        surface.paint(&[
-            "> composer".to_string(),
-            "status: 2 agents".to_string(),
-            "hint: ctrl-c".to_string(),
-        ]);
+        surface.paint(
+            &[
+                "> composer".to_string(),
+                "status: 2 agents".to_string(),
+                "hint: ctrl-c".to_string(),
+            ],
+            80,
+        );
         sink.bytes()
     }
 
@@ -828,12 +959,515 @@ mod tests {
         for (rows, viewport_rows) in TOO_SHORT {
             let (surface, sink) = shared();
             surface.show(rows, viewport_rows);
-            surface.paint(&["> composer".to_string()]);
+            surface.paint(&["> composer".to_string()], 80);
             assert!(
                 sink.bytes().is_empty(),
                 "show({rows}, {viewport_rows}) then paint must emit nothing, got {:?}",
                 sink.text()
             );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Finding F16: the viewport has no resize handling.
+    //
+    // Geometry is latched once at install and never updated, and DECSTBM
+    // margins are absolute row numbers. `plan_resize` is the pure half of the
+    // fix: it takes the dimensions currently installed plus the new ones and
+    // says what should happen, so the policy is pinned here rather than in a
+    // signal handler nobody can drive from a unit test.
+    //
+    // The decided policy, which these tests pin:
+    //
+    //   * same dimensions            -> nothing at all (a spurious SIGWINCH
+    //                                   must not flicker the pinned row);
+    //   * new size, bound cleared    -> release the old geometry and set up
+    //                                   the new one, never patch a margin;
+    //   * resize below F19's bound   -> release and stay released;
+    //   * released, still too short  -> nothing;
+    //   * released, bound cleared    -> install.
+    // ---------------------------------------------------------------------
+
+    use super::{plan_resize, ResizePlan};
+
+    #[test]
+    fn plan_resize_does_nothing_when_the_dimensions_are_unchanged() {
+        // The spurious-SIGWINCH case. A resize notification carries no
+        // dimensions, so a redundant one is the common case, not the odd one:
+        // re-latching here would tear the region down and set it back up on
+        // every window focus change that happens to raise the signal, which
+        // the user sees as the pinned row flickering.
+        assert_eq!(
+            plan_resize(Some((24, 1)), 24, 1),
+            ResizePlan::Unchanged,
+            "a resize to the same dimensions must emit nothing"
+        );
+        assert_eq!(
+            plan_resize(Some((40, 3)), 40, 3),
+            ResizePlan::Unchanged,
+            "and the same with a taller viewport"
+        );
+    }
+
+    #[test]
+    fn plan_resize_relatches_when_the_terminal_changes_size_above_the_bound() {
+        // Both directions. Shrinking is the dangerous one -- the old bottom
+        // margin may now be past the bottom of the screen -- but growing is
+        // just as wrong, leaving the transcript scrolling in a subset of the
+        // window with dead space below it.
+        assert_eq!(
+            plan_resize(Some((24, 1)), 40, 1),
+            ResizePlan::Relatch {
+                rows: 40,
+                viewport_rows: 1
+            },
+            "growing must re-latch so the region covers the whole new screen"
+        );
+        assert_eq!(
+            plan_resize(Some((40, 1)), 24, 1),
+            ResizePlan::Relatch {
+                rows: 24,
+                viewport_rows: 1
+            },
+            "shrinking must re-latch so the margins stay on screen"
+        );
+        // A changed viewport row count is a resize too: this is the seam the
+        // multi-row composer and the slash palette will drive.
+        assert_eq!(
+            plan_resize(Some((24, 1)), 24, 3),
+            ResizePlan::Relatch {
+                rows: 24,
+                viewport_rows: 3
+            },
+            "a changed pinned row count re-latches at the same height"
+        );
+    }
+
+    #[test]
+    fn plan_resize_releases_the_viewport_when_a_resize_crosses_below_the_bound() {
+        // The decision this card makes: a pinned row that cannot be drawn
+        // correctly is worse than no pinned row, so the viewport releases
+        // rather than keeping a region whose margins no longer fit.
+        for (rows, viewport_rows) in TOO_SHORT {
+            assert_eq!(
+                plan_resize(Some((24, 1)), rows, viewport_rows),
+                ResizePlan::Release,
+                "a resize to ({rows}, {viewport_rows}) is below F19's bound, so the \
+                 viewport must release rather than keep a broken region"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_resize_stays_released_while_the_terminal_is_too_short() {
+        // Released and still too short: nothing to tear down and nothing that
+        // can be pinned, so no bytes. Without this, every SIGWINCH while a
+        // window is dragged through a too-short size would emit a teardown for
+        // a geometry that was never latched.
+        for (rows, viewport_rows) in TOO_SHORT {
+            assert_eq!(
+                plan_resize(None, rows, viewport_rows),
+                ResizePlan::Unchanged,
+                "released and still too short at ({rows}, {viewport_rows}): no bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_resize_reinstalls_once_a_later_resize_clears_the_bound() {
+        // The other half of the round trip. A terminal dragged too short and
+        // then tall again must end up with a correctly pinned viewport, not
+        // permanently without one.
+        assert_eq!(
+            plan_resize(None, 24, 1),
+            ResizePlan::Install {
+                rows: 24,
+                viewport_rows: 1
+            },
+            "a released viewport re-installs as soon as the terminal is tall enough"
+        );
+        assert_eq!(
+            plan_resize(None, 3, 1),
+            ResizePlan::Install {
+                rows: 3,
+                viewport_rows: 1
+            },
+            "including at the smallest workable geometry, rows == viewport_rows + 2"
+        );
+    }
+
+    #[test]
+    fn plan_resize_pins_a_geometry_exactly_when_show_would_emit_one() {
+        // The property, driven over every small geometry: the plan may only
+        // ask for a pinned viewport where `show` actually emits a region. A
+        // plan that said install where `show` declines would leave the caller
+        // believing a region is pinned when none is -- finding F19's defect
+        // moved one layer up.
+        for rows in 0u16..=40 {
+            for viewport_rows in 0u16..=8 {
+                let workable = rows >= viewport_rows + 2;
+                for installed in [None, Some((24u16, 1u16)), Some((40u16, 3u16))] {
+                    let plan = plan_resize(installed, rows, viewport_rows);
+                    let pins = match plan {
+                        ResizePlan::Relatch { .. } | ResizePlan::Install { .. } => true,
+                        ResizePlan::Release | ResizePlan::Unchanged => false,
+                    };
+                    if installed == Some((rows, viewport_rows)) {
+                        assert_eq!(
+                            plan,
+                            ResizePlan::Unchanged,
+                            "plan_resize({installed:?}, {rows}, {viewport_rows}) must be inert"
+                        );
+                        continue;
+                    }
+                    assert_eq!(
+                        pins,
+                        workable,
+                        "plan_resize({installed:?}, {rows}, {viewport_rows}) returned {plan:?}, \
+                         but show() {} emit a region for that geometry",
+                        if workable { "would" } else { "would not" }
+                    );
+                    // And a plan that pins must carry the *new* dimensions:
+                    // carrying the old ones is the stale-geometry bug itself.
+                    if let ResizePlan::Relatch {
+                        rows: r,
+                        viewport_rows: v,
+                    }
+                    | ResizePlan::Install {
+                        rows: r,
+                        viewport_rows: v,
+                    } = plan
+                    {
+                        assert_eq!(
+                            (r, v),
+                            (rows, viewport_rows),
+                            "the plan must carry the new dimensions, not the latched ones"
+                        );
+                    }
+                    // Release only ever applies to a viewport there is
+                    // something to release.
+                    if plan == ResizePlan::Release {
+                        assert!(
+                            installed.is_some(),
+                            "plan_resize({installed:?}, {rows}, {viewport_rows}) asked to \
+                             release a viewport that was never pinned"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Finding F16, truncation half: `paint` fits each row to the terminal.
+    //
+    // `paint` used to write every row with no width limit, so a row wider
+    // than the terminal wrapped into the next viewport row. With a one-row
+    // viewport that was untidy; with the multi-row composer and the slash
+    // palette it overwrites the row below. The fitting itself is pinned in
+    // `kitsu_render::fit_row_to_width`; these tests pin the wiring, and the
+    // existing byte-exact paint tests above are the regression net for rows
+    // that already fit.
+    // ---------------------------------------------------------------------
+
+    /// Visible width of a styled row, the in-tree idiom: sanitise the escapes
+    /// away, then measure.
+    fn visible_cols(row: &str) -> usize {
+        kitsu_render::sanitize_terminal_text(row).chars().count()
+    }
+
+    #[test]
+    fn paint_leaves_a_row_within_the_terminal_width_byte_identical() {
+        // The property the fitting may not cost us: a row that fits produces
+        // exactly the bytes it produced before this card, the trailing park
+        // included and with nothing appended to the row itself -- even when it
+        // leaves styling active.
+        let (surface, sink) = shared();
+        surface.show(10, 2);
+        let before = sink.bytes().len();
+        surface.paint(&["composer".to_string(), "\x1b[31mstatus".to_string()], 80);
+        assert_eq!(
+            &sink.bytes()[before..],
+            b"\x1b[9;1H\x1b[2Kcomposer\x1b[10;1H\x1b[2K\x1b[31mstatus\x1b[8;1H",
+            "a fitting row is written byte-for-byte, with no reset appended"
+        );
+    }
+
+    #[test]
+    fn paint_truncates_an_over_long_row_so_it_cannot_wrap() {
+        let (surface, sink) = shared();
+        surface.show(10, 2);
+        let before = sink.bytes().len();
+        // 30 visible columns into a 12-column terminal.
+        surface.paint(&["0123456789abcdefghijklmnopqrst".to_string()], 12);
+        let tail = String::from_utf8(sink.bytes()[before..].to_vec()).expect("UTF-8");
+        assert_eq!(
+            tail, "\x1b[9;1H\x1b[2K0123456789ab\x1b[8;1H",
+            "the row is cut to the terminal's width, got {tail:?}"
+        );
+
+        // And the property rather than the literal: the text written between
+        // the clear and the park is at most `cols` visible columns, for every
+        // width.
+        for cols in 1usize..=40 {
+            let (surface, sink) = shared();
+            surface.show(10, 2);
+            let before = sink.bytes().len();
+            surface.paint(&["0123456789abcdefghijklmnopqrst".to_string()], cols);
+            let tail = String::from_utf8(sink.bytes()[before..].to_vec()).expect("UTF-8");
+            let body = tail
+                .strip_prefix("\x1b[9;1H\x1b[2K")
+                .and_then(|rest| rest.strip_suffix("\x1b[8;1H"))
+                .unwrap_or_else(|| panic!("paint at {cols} cols emitted {tail:?}"));
+            assert!(
+                visible_cols(body) <= cols,
+                "paint at {cols} cols wrote {} visible columns: {body:?}",
+                visible_cols(body)
+            );
+        }
+    }
+
+    #[test]
+    fn paint_keeps_an_over_long_row_from_disturbing_another_viewport_row() {
+        // The case this card exists for, driven through the emulator because
+        // wrapping is a property of the terminal and not of the byte stream.
+        //
+        // The row painted *after* an over-long one happens to repair the
+        // damage, since it clears its own line; so the corruption shows where
+        // a real multi-row viewport will show it -- a partial repaint. Here
+        // the status row is painted once and the composer row alone is
+        // repainted, exactly as a keystroke redraw would.
+        let (surface, sink) = shared();
+        surface.show(6, 2);
+        surface.paint(&["> ".to_string(), "status: ok".to_string()], 12);
+        surface.paint(&["0123456789abcdefghijklmnopqrst".to_string()], 12);
+        let mut parser = vt100::Parser::new(6, 12, 0);
+        parser.process(&sink.bytes());
+        let screen: Vec<String> = parser.screen().rows(0, 12).collect();
+        assert_eq!(
+            screen[4], "0123456789ab",
+            "the composer row holds exactly the terminal's width"
+        );
+        assert_eq!(
+            screen[5], "status: ok",
+            "and the status row below it survives the repaint rather than \
+             being overwritten by the composer's overflow"
+        );
+    }
+
+    #[test]
+    fn paint_keeps_an_over_long_last_row_from_scrolling_the_whole_screen() {
+        // The worse half of the same defect: the *last* pinned row sits on the
+        // last row of the screen, so its overflow autowraps off the bottom and
+        // scrolls everything -- the transcript above and the viewport itself
+        // move up a row, which is precisely the corruption the viewport exists
+        // to avoid.
+        let (surface, sink) = shared();
+        surface.show(6, 2);
+        // Deliberately within the 12-column width: a longer line autowraps
+        // and scrolls the region by itself, which would confound the very
+        // thing asserted below. The transcript's own clipping is the
+        // terminal's business; this test is about the viewport's last row.
+        surface.transcript_line(Fd::Stdout, "transcript");
+        surface.paint(
+            &[
+                "> composer".to_string(),
+                "0123456789abcdefghijklmnopqrst".to_string(),
+            ],
+            12,
+        );
+        let mut parser = vt100::Parser::new(6, 12, 0);
+        parser.process(&sink.bytes());
+        let screen: Vec<String> = parser.screen().rows(0, 12).collect();
+        assert_eq!(
+            screen[2], "transcript",
+            "the over-long pinned row caused no FURTHER scroll. One scroll is \
+             expected and is the transcript's own newline: the cursor is \
+             parked on the region's last row, so writing a line there scrolls \
+             the region once by itself. If the last pinned row had wrapped off \
+             the bottom instead of being cut, everything would have shifted \
+             again and this would read one row higher"
+        );
+        assert_eq!(screen[4], "> composer", "the first pinned row stayed put");
+        assert_eq!(
+            screen[5], "0123456789ab",
+            "and the last pinned row is cut rather than wrapping off the \
+             bottom of the screen"
+        );
+    }
+
+    #[test]
+    fn paint_resets_style_after_truncating_a_styled_row_so_it_cannot_bleed() {
+        // The bleed case: cutting a row mid-style leaves SGR active, and the
+        // next row painted immediately after would inherit it. The reset is
+        // owed by the fitter, so this is a wiring test -- what reaches the
+        // sink must end the row's styling before the next position.
+        let (surface, sink) = shared();
+        surface.show(10, 2);
+        let before = sink.bytes().len();
+        surface.paint(
+            &[
+                "\x1b[31mred row that overflows the terminal".to_string(),
+                "plain".to_string(),
+            ],
+            8,
+        );
+        let tail = String::from_utf8(sink.bytes()[before..].to_vec()).expect("UTF-8");
+        let (first, rest) = tail
+            .split_once("\x1b[10;1H")
+            .unwrap_or_else(|| panic!("two rows are painted: {tail:?}"));
+        assert!(
+            first.ends_with("\x1b[0m"),
+            "the truncated styled row ends with a reset: {first:?}"
+        );
+        assert_eq!(
+            // Eight columns means eight: "red row" is seven, so the eighth
+            // visible character -- the space -- is kept. Reserving a column
+            // would contradict `fit_row_to_width("abcdefghij", 9)`.
+            first,
+            "\x1b[9;1H\x1b[2K\x1b[31mred row \x1b[0m",
+            "and the whole first row is exactly that: {first:?}"
+        );
+        assert_eq!(rest, "\x1b[2Kplain\x1b[8;1H");
+
+        // Through the emulator: the second row is not red.
+        let mut parser = vt100::Parser::new(10, 8, 0);
+        parser.process(&sink.bytes());
+        let second = parser.screen().cell(9, 0).expect("row 10, column 1");
+        assert!(
+            !second.fgcolor().eq(&vt100::Color::Idx(1)),
+            "the second row must not inherit the first row's colour"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // T0-S14: a dynamic viewport height.
+    //
+    // The height follows the content a caller hands the viewport, clamped to
+    // what the terminal can hold: F19's bound means the usable maximum is
+    // `terminal_rows - 2`. A request above that is **clamped rather than
+    // refused** -- a palette too tall for the window is shortened, not made to
+    // take the whole viewport down with it -- and when rows must be dropped
+    // they go from the **top**, so the composer, the bottom row, always
+    // survives.
+    //
+    // Both decisions live in pure functions for the reason `plan_resize` does.
+    // ---------------------------------------------------------------------
+
+    use super::{clamp_viewport_rows, fit_viewport_rows};
+
+    fn rows_of(labels: &[&str]) -> Vec<String> {
+        labels.iter().map(|row| row.to_string()).collect()
+    }
+
+    #[test]
+    fn clamp_viewport_rows_leaves_a_request_the_terminal_can_hold_alone() {
+        // Two scrolling rows above the viewport is the whole of the bound, so
+        // on 24 rows anything up to 22 passes through untouched -- and one row
+        // (today's hardcoded height) must be untouched on every terminal that
+        // can pin it at all.
+        assert_eq!(clamp_viewport_rows(24, 1), 1);
+        assert_eq!(clamp_viewport_rows(24, 5), 5);
+        assert_eq!(clamp_viewport_rows(24, 22), 22, "rows - 2 is usable");
+        assert_eq!(
+            clamp_viewport_rows(3, 1),
+            1,
+            "the smallest workable geometry"
+        );
+    }
+
+    #[test]
+    fn clamp_viewport_rows_shortens_a_request_taller_than_the_terminal_can_hold() {
+        // The decision: clamp, do not refuse. Some rows fit, so some rows are
+        // drawn.
+        assert_eq!(
+            clamp_viewport_rows(5, 5),
+            3,
+            "a five-row palette on a five-row terminal is cut to the three rows \
+             that fit below two scrolling rows"
+        );
+        assert_eq!(clamp_viewport_rows(24, 40), 22);
+        assert_eq!(clamp_viewport_rows(4, 9), 2);
+        // And where not even one row can be pinned the clamp is zero, which is
+        // F19's release case rather than a geometry anyone installs.
+        assert_eq!(clamp_viewport_rows(2, 1), 0);
+        assert_eq!(clamp_viewport_rows(1, 3), 0);
+        assert_eq!(clamp_viewport_rows(0, 1), 0);
+    }
+
+    #[test]
+    fn fit_viewport_rows_drops_rows_from_the_top_so_the_composer_survives() {
+        // The headline, pinned exactly as the card states it: five rows
+        // requested on a terminal that can hold three, and the three that
+        // remain are the **last** three, in order.
+        let content = rows_of(&["one", "two", "three", "four", "> composer"]);
+        assert_eq!(
+            fit_viewport_rows(&content, 5),
+            &content[2..],
+            "the topmost rows go first: the composer is the bottom row and must \
+             be the last thing dropped"
+        );
+        assert_eq!(
+            fit_viewport_rows(&content, 5).last().map(String::as_str),
+            Some("> composer")
+        );
+        // A request the terminal can hold is handed back whole.
+        assert_eq!(fit_viewport_rows(&content, 24), &content[..]);
+        // And where nothing can be pinned, nothing survives.
+        assert!(fit_viewport_rows(&content, 2).is_empty());
+    }
+
+    #[test]
+    fn fit_viewport_rows_always_matches_the_clamp_and_show_accepts_that_height() {
+        // The property that makes the clamp worth having as a pure function,
+        // and the same one `plan_resize_pins_a_geometry_exactly_when_show_would_emit_one`
+        // pins for the resize path: the height a request ends up with is
+        // always a height `show` would latch.
+        for terminal_rows in 0u16..=16 {
+            for requested in 0usize..=12 {
+                let content: Vec<String> = (0..requested).map(|i| format!("row {i}")).collect();
+                let height = clamp_viewport_rows(terminal_rows, requested as u16);
+                let fitted = fit_viewport_rows(&content, terminal_rows);
+
+                assert!(
+                    height <= requested as u16,
+                    "clamp_viewport_rows({terminal_rows}, {requested}) grew the request to \
+                     {height}"
+                );
+                assert_eq!(
+                    fitted.len(),
+                    height as usize,
+                    "fit_viewport_rows must hand back exactly the clamped height for \
+                     ({terminal_rows}, {requested})"
+                );
+                assert_eq!(
+                    fitted,
+                    &content[requested - fitted.len()..],
+                    "the surviving rows are the last ones, in order, for \
+                     ({terminal_rows}, {requested})"
+                );
+
+                if height > 0 {
+                    let (surface, sink) = shared();
+                    surface.show(terminal_rows, height);
+                    assert!(
+                        !sink.bytes().is_empty(),
+                        "clamp_viewport_rows({terminal_rows}, {requested}) returned {height}, \
+                         a height show() declines to latch -- the clamp must never admit a \
+                         geometry the terminal discards"
+                    );
+                    assert_eq!(
+                        surface.lock().geometry,
+                        Some((terminal_rows - height, height))
+                    );
+                } else {
+                    assert!(
+                        terminal_rows < 3 || requested == 0,
+                        "clamp_viewport_rows({terminal_rows}, {requested}) refused a height \
+                         the terminal could hold: at least one row fits"
+                    );
+                }
+            }
         }
     }
 

@@ -366,6 +366,94 @@ is already the first to draw. Resize reflow is already scoped as T3-S8; row
 truncation needs a `cols` input the current API does not take, and belongs with
 it.
 
+### Truncation: half of it was closed in T0-S9, and the note above is now stale
+
+The claim that truncation "needs a `cols` input the current API does not take"
+was true when written and is only **partly** true now. T0-S9 gave the bridge
+`live::compose_input_row(draft, cols)` and `live::terminal_columns()`, so the
+**draft row** is composed through the classic row's own width fitting — the
+same windowing, ellipsis and hint-reservation logic, not a reimplementation.
+That row can no longer overflow.
+
+What remains open is `InlineSurface::paint` itself, which still emits `ESC[2K`
+plus the row text with **no width limit**. Any caller handing it a long row —
+the status string today, palette rows tomorrow — can still wrap into the next
+viewport row and corrupt it. So the precedent to reuse already exists and is
+already wired for one row; extending it to `paint` is the remaining work.
+
+**RESOLVED in T0-S13**, which closes F16 entirely. `kitsu-render` gained
+`fit_row_to_width(row, cols)` — escape-aware, beside the width primitives it
+reuses — and `paint` takes `cols` and applies it per row. The contract is six
+numbered rules in application order, and the ordering is itself pinned:
+
+1. **Byte-identity first.** A row whose visible width fits is returned
+   byte-identical, with no allocation path reachable — which is what keeps every
+   exact-byte assertion in `paint` true, and the output-tier discipline intact.
+2. Escapes cost zero columns, so a heavily styled row is not truncated because
+   its escape bytes inflated a byte count.
+3. Visible columns are counted with the existing `char_display_width`, so a
+   wide character costs two.
+4. A wide character is never split: the fit stops before it and the leftover
+   column stays **unpadded**, since `paint` has already cleared the row and a
+   pad would advance the cursor past the text.
+5. Exactly one reset is appended, and only when the row was **both** truncated
+   **and** carried SGR. The predicate is SGR-specific rather than any-escape:
+   only SGR leaves colour or attributes behind, so a reset after a cursor move
+   or an OSC sequence would be bytes emitted for no reason into a stream other
+   tests assert exactly.
+6. Zero columns yields nothing for a row of visible width above zero, while a
+   zero-width row satisfies rule 1 first and returns identical.
+
+`cols` is a parameter rather than latched at `show`, for two stated reasons: a
+second terminal probe inside `kitsu-tui` would be a second source of truth, and
+a latched width would go stale after a resize exactly as the row geometry did.
+
+The scanner is local to `fit_row_to_width` rather than reused from
+`TerminalTextSanitizer`, deliberately: that type is a char-at-a-time *stripping*
+machine with no notion of sequence boundaries or SGR-ness, so getting offsets
+out of it would mean restructuring the code the byte-identity invariant runs
+through. The helper mirrors its byte classes so the two cannot drift silently.
+
+### Resize decision, taken in T0-S11
+
+What happens when a resize crosses F19's `rows >= viewport_rows + 2` bound was
+undecided, and a resize can cross it in either direction. The decision:
+
+- **Below the bound, the viewport releases** — region reset, rows cleared,
+  nothing pinned — and stays released while the terminal is too short.
+- **Back above the bound, it re-installs.**
+
+Rationale: a pinned row that cannot be drawn correctly is worse than no pinned
+row, and the alternative — keeping a region whose margins no longer fit the
+screen — is precisely the corruption F19 exists to prevent. The tall → short →
+tall round trip must therefore end with a correctly installed viewport, and the
+short interval must emit a real release rather than leaving a stale region.
+
+Detection is `SIGWINCH` with a handler that does nothing but store into an
+`AtomicBool`, which is the only async-signal-safe action available to it. The
+reader already retries on `EINTR`, so a signal interrupting the blocking read
+is the natural wake-up: on waking it checks the flag, re-latches, and repaints.
+Re-latching re-sets the region rather than patching it, because DECSTBM margins
+are absolute row numbers.
+
+### RESOLVED in T0-S11 — the resize half
+
+`plan_resize(installed, rows, viewport_rows)` is the pure decision table
+(`Unchanged` / `Relatch` / `Release` / `Install`), pinned by a property test
+over `rows 0..=40 × viewport_rows 0..=8` asserting that a plan pins a geometry
+**iff** `show` would emit one for it, so the plan and F19's bound cannot drift
+apart. `BridgeGuard::resize` applies it as a single hide-then-show pair at the
+new dimensions — **not** four branches — because `hide` is inert without a
+latched geometry and `show` is inert below the bound, so every arm falls out of
+that one pair. It emits no paint: a resize happens mid-read, so the row's
+content is the live draft and the reader draws it immediately after.
+
+The truncation half of F16 remains open for `paint` in general (see above).
+
+**The one property no in-repo test reaches is recorded separately as F24**: the
+handler must be installed via `sigaction` with `sa_flags` omitting
+`SA_RESTART`, or the interrupted read restarts and the loop never wakes.
+
 **F15 RESOLVED in T0-S5a** (recorded here since F15 sits above): the viewport
 replaces the live row. `kitsu-render` gained `set_live_rows_enabled`, which
 `live_rows_supported` consults, and the bridge disables the live row for as
@@ -802,6 +890,25 @@ T0-S9.
 The other two are separate — but they are **very** different sizes, which I
 also got wrong at first by assuming "completion" meant one thing:
 
+- **Tab completion, cheap tier: DONE in T0-S10.** Tab now accepts the showing
+  slash hint at the inline prompt, which is parity with the during-turn row.
+  Two things made it more than a transplant. The suffix must be recomputed from
+  the draft rather than read back out of the hint slot, because the slot holds
+  the *search status* while Ctrl+R is armed — appending that would type
+  `⌕ reverse-search '…'` into the prompt, and it is reachable rather than
+  theoretical, since actions are handled after a whole read completes and a
+  later Ctrl+R in the same read can arm the status first. The test author
+  proved the trap bites by implementing the naive version and watching the
+  draft become `"deploy the thing  ⌕ reverse-search 'dep'"`. And no
+  special-case for search was needed: the editor treats any control key in
+  search mode as accept-exit-refeed, so by the time Tab is seen the draft is
+  the matched history line and no slash hint applies — readline's own
+  "accept and act". My instinct had been to pin "Tab does nothing mid-search",
+  which would have contradicted the editor's rule.
+
+  What remains is only the **lists**: `@file` path completion and the bordered
+  palette. Original note follows.
+
 - **Tab completion has two tiers, and the cheap one is nearly free.** The
   during-turn collector's entire Tab handling is seven lines
   (`main.rs:14530-14538`): if an inline slash hint is showing, append it to the
@@ -881,3 +988,496 @@ something. Triggering on output proves the program is alive, not that it is
 ready. Third, it is a reminder that a green suite is not evidence of a
 deterministic suite — this one had been green every time I ran it, and was
 nonetheless failing one run in fifteen.
+
+## F24 — `SA_RESTART` would make resize handling silently dead, and no in-repo test can catch it
+
+Found: T0-S11, by the test author, as the limit of what its own tests reach.
+
+The resize path depends on a `SIGWINCH` arriving while the reader blocks in
+`read()` and surfacing as `EINTR`, so the loop wakes and checks the pending
+flag. **Whether that happens depends entirely on how the handler is
+installed:**
+
+- `libc::signal` on Linux/glibc implies **`SA_RESTART`**, which restarts the
+  interrupted read. The flag is set and the loop never wakes to look at it.
+- `sigaction` with `sa_flags` that omit `SA_RESTART` returns `EINTR` and the
+  loop wakes.
+
+**The failure mode is the dangerous kind: invisible.** Every unit test passes
+either way, because a test raises the signal from the same thread and never
+blocks in `read`. The feature would look complete, ship, and do nothing — a
+resized window would leave the viewport stranded exactly as F16 describes,
+with no error anywhere.
+
+So the correct installation is load-bearing and is recorded in a comment at the
+call site, specifically so a later "simplification" to `libc::signal` is
+recognisable as a regression rather than tidying.
+
+**Correction, made while scoping T0-S12: "only a human can catch this" was
+wrong.** A *reliable* pseudo-terminal test does catch it, and my reasoning for
+saying otherwise does not hold up. The harness signals a **separate process**
+that is genuinely blocked in a real `read` on a real tty — so with `SA_RESTART`
+set the child would not wake, the viewport would not move, and the test would
+fail. The property is only untestable *in-process*, where a raise from the same
+thread never blocks in `read`; that is a limitation of unit tests, not of
+testing.
+
+The decisive design constraint, which is what makes such a test worth anything:
+**no input may follow the resize before the assertion.** A keystroke after the
+resize wakes the blocking read by itself, the flag is then checked, and the
+viewport resizes *even with `SA_RESTART` set* — so a test that types afterwards
+passes under both installations and establishes nothing.
+
+**T0-S12 shipped that test, and proved it discriminates rather than asserting
+it:** with `sa_flags` temporarily set to `SA_RESTART` all three resize tests
+failed on the deadline; restored, all three pass. The stronger form was
+achieved too — the gate on sending the next byte *is* the new geometry
+appearing in the stream, so if the flag were only checked on the next keystroke
+there would be no next keystroke and the test times out with the transcript
+attached.
+
+So this class of regression is now caught in CI. The human check below stays on
+the matrix regardless, since a real terminal also exercises the window manager,
+the multiplexer and fonts, none of which a pty models.
+
+**The human check**, on the terminal matrix: resize a real window mid-draft and
+confirm the pinned row follows. It was the second item there that could not be
+settled from inside this repository, after Q1 — now partly reclaimed.
+
+Related, and the reason this class of bug is worth a finding of its own:
+`note_resize` may do nothing but store into an atomic, because a signal handler
+runs in a context where allocation, locking and printing are all unsafe. A
+handler that "just logs" would be a far more spectacular version of the same
+mistake.
+
+## F25 — the pseudo-terminal resize test was deferred, and why five runs could not settle it
+
+Found: T0-S11. Recorded so the next card inherits the reasoning rather than
+re-deriving it.
+
+The standing rule for a new pseudo-terminal test is five consecutive green runs
+or drop it. The test author could not meet that bar **and explained why the bar
+was unmeetable rather than gaming it**: the implementation did not exist yet, so
+the test had to fail by design, and five runs of a designed failure cannot
+distinguish a flake from the intended red. The evidence the rule asks for was
+unobtainable at that moment.
+
+Two further costs it identified:
+
+- `Step` has no action that sends no bytes, so a resize step does not fit the
+  existing script shape;
+- `Session`'s emulator is fixed at the harness's `ROWS × COLS`, so a resized
+  screen cannot be modelled by any existing accessor. Both would change for
+  every existing script.
+
+And the one property only a real terminal adds — that `SIGWINCH` surfaces as
+`EINTR` rather than restarting the read — is a property of **how the handler is
+installed** (F24), which an intermittent test would not establish either.
+
+**RESOLVED in T0-S12**, and it was worth the harness cost. Three tests, 12 in
+the suite, five consecutive green runs in each profile, verified independently.
+The harness gained a `Step` action that sends no bytes, a `set_window_size`
+helper, and — the part that was genuinely necessary — a `Session` that replays
+the byte stream in segments and calls `vt100::Parser::set_size` at exactly the
+offset where the child was resized. Without that split every post-resize
+absolute address is modelled against the old grid and silently discarded.
+
+The decisive outcome: **F24 is now caught in CI rather than by a human.** See
+F24's correction.
+
+
+## F26 — a `SIGWINCH` arriving mid-paint is latched but not acted on until the next wake
+
+Found: T0-S12, disclosed by the test author rather than hidden behind the
+harness accommodation it required. **Real, narrow, and currently untested.**
+
+The resize path's delivery mechanism is a signal interrupting the reader's
+blocking `read`. If the signal instead lands while the reader is **mid-paint** —
+between waking and blocking again — the flag latches, the reader then blocks,
+and nothing wakes it. The pending resize sits unapplied until the next event:
+another signal, or a keystroke.
+
+It self-corrects on any later event, and a real window drag emits many signals,
+so the realistic exposure is small. But it is genuine, and it is the one thing
+a human dragging a window *slowly* might still see — a viewport that catches up
+one event late.
+
+**Why this is recorded rather than fixed:** the honest fix is not a bigger
+handler (it may do nothing but an atomic store) but checking the flag at more
+points, or a self-pipe so the wake is a readable descriptor rather than an
+`EINTR`. That is a design change to the read loop, not a patch, and the current
+behaviour is a late update rather than a wrong one.
+
+**Why it must not be "cleaned up" out of the test harness:** the pseudo-terminal
+resize steps re-deliver the signal every 100 ms while the next step's trigger is
+outstanding, precisely because of this race — the trigger that fires a resize is
+the child's own paint output, so the child may still be inside that paint when
+the signal lands. Removing the re-arm reintroduces a narrow but real flake.
+Re-delivery is safe because a resize to unchanged dimensions is `Unchanged` and
+emits zero bytes, and it does **not** weaken the `SA_RESTART` discrimination,
+because a resize step writes no input byte.
+
+## The composer and palette are three cards, in a forced order
+
+Recorded in T0-S13 so the sequence is not rediscovered. R4's remaining gap —
+Rustyline's completion lists, meaning `@file` paths and the bordered
+slash-command palette — cannot be done as one card, and the order is forced by
+a dependency rather than by preference:
+
+1. **T0-S13, escape-aware row fitting for `paint`** (F16's truncation half).
+   This must come first. With a single viewport row an over-long row merely
+   wraps untidily; with several rows **it wraps into and overwrites the row
+   below**. Building a multi-row composer on an unbounded `paint` would mean
+   debugging corruption that has nothing to do with the composer.
+2. **T0-S14, a variable viewport height.** The bridge installs with
+   `viewport_rows = 1` hardcoded. A palette that grows and shrinks as you type
+   needs the height to change at runtime, which means re-latching the region
+   on every change — the same operation T0-S11's resize already does, so this
+   is more plumbing than new mechanism. It also interacts with F19's minimum
+   height: a palette that would not fit must be truncated or suppressed rather
+   than pushing the region to an invalid geometry.
+3. **T0-S15, the palette itself** — matching, filtering as you type, the
+   border, and `Tab` semantics against a list rather than a single hint. Split
+   again on contact: **S15a** the rows as data, **S16** the wiring (named S16
+   rather than S15b to match the `S16-*` references in the committed tests).
+
+### The drop-from-the-top rule collides with a bordered box
+
+Found while scoping T0-S15a, and it is a collision between two decisions I made
+in earlier cards rather than a defect in either.
+
+T0-S14 established that when the viewport cannot fit every requested row, the
+**topmost** rows are dropped so the composer survives. That is correct for a
+list. It is **wrong for a bordered box**: the top row is the box's top border
+and its ` slash commands ` label, so dropping it leaves a frame with no lid —
+and dropping two leaves a stray `│` column with no context at all.
+
+The resolution is not to change the rule, which is right for the general case,
+but to **build the palette to the height it will be granted** rather than
+building it at full size and letting the clamp cut it. Hence
+`granted_rows(requested)` as a query the caller consults *before* laying out —
+which is exactly the shape recorded above, and arrived at twice from different
+directions: once to let a palette mark its hidden entries without a repaint
+flicker, and once here to keep its frame intact.
+
+A consequence for the "N more" row: the existing `slash_palette` already emits
+one when matches exceed `SLASH_PALETTE_ROWS`, but the **height** can hide
+entries too. A count that reflects only the row cap would under-report whenever
+the window is short, which is the kind of wrong that looks right — so it is
+pinned against a prefix matching many commands at a small height.
+
+Worth stating plainly, because it is the reason this card is small: the classic
+palette renderer already does matching, both frame styles, the row cap, the
+"N more" row, the no-match case and per-row width fitting with ellipsis. The
+inline palette **reuses** it. Two palettes that drifted would be worse than one
+palette with an awkward call site.
+
+### T0-S14's two decisions, taken rather than deferred
+
+**A requested height too tall for the window is clamped, not refused.** F19's
+bound still rules — the region needs two scrolling rows above the viewport — so
+the usable maximum is `terminal_rows - 2`. Refusing is the right answer only
+when *not even one row* can be pinned, which is T0-S11's release case and is
+already built. When some rows fit, a palette too tall for the window should be
+shortened rather than making the whole viewport vanish, because the composer
+lives in that viewport.
+
+**When rows must be dropped, the topmost ones go.** The composer is the bottom
+row and the palette sits above it, so dropping from the top keeps the row the
+user is actually typing into. Losing the thing you are typing into to make room
+for a list of suggestions would be the wrong trade, and it is the kind of
+default that is easy to get backwards and hard to notice in a test that only
+counts rows — so it is pinned by asserting the surviving rows are the **last**
+of the requested set, in order.
+
+A consequence worth stating: the row count painted must always equal the latched
+height. Painting more rows than the viewport is tall would put the extras inside
+the scroll region, where they scroll away with the transcript — which looks like
+a disappearing palette rather than an off-by-one.
+
+### Two things T0-S14 deliberately left to T0-S15, with the answers
+
+**1. Who learns the granted height.** `paint_rows` returns only whether a
+viewport is pinned, so a caller cannot find out *before* painting how many rows
+it was granted. The palette will need that: when rows are dropped it should
+mark its top visible row ("N more") rather than silently truncate, and it has
+to know the count while laying out, not after.
+
+The test author offered two shapes and declined to choose. **Decided: add
+`BridgeGuard::granted_rows(requested) -> u16`**, delegating to the same pure
+`clamp_viewport_rows`, and leave `paint_rows`'s return as it is. Reasoning:
+changing `paint_rows` to return the height tells the caller only *after* it has
+painted, so a palette wanting a marker would paint, discover it was clamped,
+and repaint — a visible flicker. A query answered before painting avoids that.
+And routing the query through the guard rather than letting the caller call the
+pure clamp itself keeps one source of truth for the terminal height, which is
+the whole reason `paint_rows` is a single operation.
+
+**1a. My "by construction" shape was wrong, and the implementer was right to
+refuse it.** I specified that `paint_draft` should route through `paint_rows`,
+so that the painted row count could not disagree with the latched height. Two
+**pre-existing** tests forbid it, and I verified both rather than taking the
+report:
+
+- one installs a 3-row viewport, resizes to `(40, 3)`, then calls `paint_draft`
+  and asserts exactly a **one-row** paint into a viewport that stays **3 tall**;
+- another resizes to `(2, 1)` — below the bound — then calls `paint_draft` and
+  asserts **zero** bytes.
+
+Through `paint_rows` a one-row draft clamps to height 1 and re-latches, which
+directly contradicts the first, and the second would emit bytes. So the two are
+genuinely different operations: **`paint_draft` draws into whatever viewport
+exists, while `paint_rows` lets the content choose the height.** The
+by-construction property therefore holds for every multi-row caller and only
+trivially for `paint_draft`.
+
+That is not a permanent answer. With a palette open, a keystroke must repaint
+*all* the rows, not just the composer — so `paint_draft`'s single-row semantics
+becomes wrong exactly when the palette lands, and reconciling them is T0-S15's
+job. It is the same shape of question as the hardcoded `1` below.
+
+**1b. A bug my specified shape would have introduced.** The implementer added an
+early return when the clamp is zero, which I had not asked for and which is
+necessary: `resize(2, 0)` is `plan_resize(None, 2, 0)` = `Install`, and
+`show(2, 0)` would latch a **full-screen** region — the clamp returning "no rows
+fit" would have been turned into "the region is the whole screen". Zero means
+leave the latched geometry alone, so a released viewport stays released and
+emits nothing. It is also the right answer for empty content.
+
+**2. `on_resize`'s hardcoded row count.** `main.rs` still calls
+`bridge.resize(rows, 1)` when the terminal changes size. That is correct while
+nothing requests more than one row, and **becomes a bug the moment the palette
+does**: a terminal resize would silently reset the viewport to one row,
+collapsing an open palette. The fix belongs to whichever card first requests a
+taller viewport — either `resize` should keep the guard's current
+`viewport_rows` when the caller does not specify one, or the caller should
+re-`paint_rows` after a resize. Left unpinned on purpose, because pinning it
+before a second row exists would have meant inventing the caller.
+
+`@file` path completion is a fourth, independent piece: it shares the "lists"
+label but not the geometry problem, since it can reuse whatever T0-S15 builds.
+
+## F27 — the obvious test for viewport row overflow is vacuous
+
+Found: T0-S13, by the test author, while trying to write the test the card was
+*about*. Worth recording because the trap is not obvious and the next person to
+test viewport painting will walk into it.
+
+The natural test for "a row wider than the terminal corrupts the row below" is:
+paint a two-row viewport with an over-long first row, then assert the second row
+is intact. **That test passes even with no width fitting at all.** `paint`
+writes each row as `ESC[{line};1H ESC[2K {row}`, so the over-long first row does
+smear into the second row's cells — and then the second row's own `ESC[2K`
+erases the smear before writing. Within a single full repaint the corruption is
+always repaired by the very next row.
+
+Two shapes do observe it, and both are in the suite:
+
+- **A partial repaint.** Redrawing only the composer row — which is what a
+  keystroke does — leaves the row below unrepaired, because nothing clears it.
+  This is the realistic case: full repaints are the exception, per-keystroke
+  redraws are the norm.
+- **An overflow on the last pinned row.** There is no row below it to repair
+  anything, so the overflow autowraps off the bottom of the screen and scrolls
+  the transcript *and* the viewport up by a line. The symptom is not a corrupt
+  row but a scrolled screen, which is worse and harder to attribute.
+
+**The lesson generalises:** a repaint-based renderer repairs its own damage on
+the next full pass, so any test that asserts a full repaint looks clean when it
+is not. Tests of painting defects must use a partial repaint, or the last row,
+or both. A green full-repaint test is weak evidence about a renderer of this
+shape.
+
+
+## F28 — an unrelated transaction test flaked once and has not reproduced
+
+Reported by the T0-S14 implementer, recorded so the next person to see it knows
+it is not new and not from the viewport work.
+
+`session::transaction::tests::branch_transaction_retries_only_exact_verified_residue`
+failed once during a parallel `cargo test -p kitsu --bins` run, and passed on
+every rerun and in isolation. It touches no viewport, render or terminal code.
+
+**I could not reproduce it:** 8 further full-suite parallel runs and 5 isolated
+runs, all green. So the honest status is *seen once, unreproduced in 13
+attempts* — not dismissed, not confirmed.
+
+The implementer's guess, untested, is a `#[serial]` or global-state gap in that
+module. Worth bearing in mind that F23 established this suite had a test failing
+roughly 7% of the time while appearing green on every manual run, so "I ran it
+and it passed" is weak evidence here. If it recurs, the cheap first step is a
+repeat-run loop on that module alone rather than the whole suite.
+
+### CONFIRMED in T0-S17, and narrowed
+
+It recurred — a different agent hit it, and this time I reproduced it: **1
+failure in 12** consecutive full-suite `cargo test -p kitsu --bins` runs, which
+matches the original single sighting at roughly 8%.
+
+Then I ran the loop this finding itself recommended, and the result is a clear
+signature:
+
+| How it was run | Failures |
+|---|---|
+| the test alone, 15 runs | **0** |
+| its own module in parallel, 8 runs | **0** |
+| the whole `--bins` suite in parallel, 12 runs | **1** |
+
+So it is **cross-module interference**, not anything inside
+`session::transaction`: some other test elsewhere in the binary mutates shared
+state this one depends on. That rules out the implementer's guess of a gap
+*within* the module, and it rules out the test being inherently racy.
+
+**Next step, for whoever picks it up:** bisect by module rather than by test —
+run `session::transaction` together with each other top-level module group until
+the pair reproduces. The suspects are the globals this binary already serialises
+elsewhere (the render surface, the live-row state, the inference carrier, the
+process environment), since a test that mutates one without `#[serial]` is
+exactly this shape. Note it has never been observed outside a full parallel run,
+so a fix must be verified the same way — at least a dozen full-suite runs, not
+an isolated one.
+
+A second flake was reported in the same card — `paint_rows_growing_relatches_…`,
+from T0-S14 — and did **not** reproduce in those 12 runs. Status: seen once,
+unreproduced. Recorded here rather than given its own number precisely because
+one sighting is not yet a finding.
+
+## F29 — the inline palette duplicates the classic one's frame and labels
+
+Found while reviewing T0-S15a. **Accepted deliberately, on evidence, with the
+factoring recorded rather than deferred silently.**
+
+`palette_rows` reuses the classic renderer's *pieces* — `matching_slash_commands`,
+the entry format, `fit_palette_text` and `fit_palette_text_with_padding` — but it
+necessarily re-derives the row-selection step, because `slash_palette` has **no
+height parameter**: its `SLASH_PALETTE_ROWS` cap is unconditional, and the whole
+point of the inline palette is to be built to a granted height so its frame
+survives.
+
+That re-derivation drags along copies of the two labels (` slash commands `,
+` type to filter · Tab to complete `), both frame-character sets, and the
+`no matching command` text. Duplication in a renderer is precisely how this
+project has been bitten before — it is the reasoning that made T0-S9 share
+`compose_input_row` instead of reimplementing the row composer.
+
+**Why accepted anyway: the drift is provably caught, not hopefully caught.** A
+test asserts the inline rows equal `slash_palette`'s own output, for two widths
+and both frames, at the exact height. I verified the net bites rather than
+assuming it: changing the label in `slash_palette` **alone** turns that test
+red. So the cost of the duplication is a double edit that fails loudly, not a
+silent divergence.
+
+**The factoring, for T0-S15b to do first**, since that card touches this code
+anyway: give the classic renderer the height parameter —
+`slash_palette_rows(prefix, rich, inner_width, max_rows) -> Vec<String>` — and
+make `slash_palette` a thin join over it with the classic height, exactly as
+`compose_input_row` is a thin wrapper over `compose_row`. Then the labels, the
+frames and the selection logic exist once, the parity test becomes trivially
+true, and the inline path stops carrying copies. It was not done in S15a because
+that card was scoped to tests-then-implementation of the data, and refactoring
+the classic Rustyline hint path mid-card would have put a shared, separately
+tested surface at risk for no test-visible gain.
+
+**RESOLVED in T0-S16, as that card's first step.** `slash_palette_rows(prefix,
+rich, inner_width, max_rows)` now owns the labels, both frame sets, the entry
+formatting, the row cap and the "N more" step, and `slash_palette` is a thin
+join over it — exactly the `compose_input_row`/`compose_row` shape. The
+implementer ran the suite between the refactor and the wiring and saw the
+identical 6 + 1 failures and nothing new, which is what "behaviour-preserving"
+has to mean in practice.
+
+Verified by classifying every occurrence rather than taking the report: the
+` slash commands ` label exists **once** in production, four lines into
+`slash_palette_rows`; the two other non-comment hits are assertions in the
+classic path's own tests, and `tui_bridge.rs` retains only a doc comment. The
+inline palette now contains no palette text at all.
+
+
+## F30 — the during-turn hint's priority list is reused at the idle prompt
+
+Found in T0-S16, and the cause is **mine**: T0-S9 and T0-S10 reused
+`typeahead_slash_hint` verbatim at the inline idle prompt. That function ranks
+matches through `MID_TURN_HINT_PRIORITY`, whose own doc comment says
+*"Commands that act on the RUNNING turn, in preference order. While a turn is
+live these outrank plain registry order"*.
+
+At an **idle** prompt no turn is running, so that ranking is wrong on its own
+terms. Concretely: registry order for `s` is `save`, `sessions`, `skill`,
+`skills`, `status`, but the priority list puts `steer` first — so typing `/s`
+hints `teer` while a palette would lead with `save`.
+
+The implementer hit this while wiring the palette and handled it locally, with
+a third stand-down clause: the palette hides when a hint is showing that is not
+the lead entry's own completion. That is defensible — the hint is the
+keystroke's answer and the palette is its menu, so a menu contradicting the
+answer is worse than no menu — and it is documented at the function. But it is
+**symptom-level**: it suppresses a correct palette because an inappropriate
+hint disagrees with it.
+
+**The principled fix** is to rank by registry order at the idle prompt and keep
+the mid-turn priority for the during-turn row, after which hint and palette
+agree by construction and the third clause can go. It is a real card, not a
+drive-by: it changes what `/s` hints at idle (user-visible), and it would turn
+the `/s` case in T0-S16's regression test from one row into a palette, so that
+test changes with it.
+
+**RESOLVED in T0-S17.** `idle_slash_hint` ranks by registry order; the
+during-turn row keeps `typeahead_slash_hint`. Both are thin wrappers over one
+`slash_hint_ranked` holding the shared structural rules, so only the ranking
+differs — and **the function name is how a call site declares its policy**,
+since there is no longer a default to inherit silently. That was the whole
+defect. The third stand-down clause is gone, pinned as *removed* rather than
+merely unreachable by a test that passes the old disagreeing hint explicitly and
+still requires a palette.
+
+The exact-match case is handled structurally rather than by special-casing: the
+length test moved out of the ranking into the shared tail, so when the lead
+entry *is* the prefix the hint empties instead of the ranking stepping past it
+to a longer sibling. `/agent` and `/save` both yield nothing, matching the
+during-turn path's own behaviour for its exact matches.
+
+**Four tests had to change, and they were pinning the defect.** The inline
+reader's hint and Tab group expected `/s` to hint `teer` and Tab to type
+`/steer` — one of them said so in its own prose: *"Tab at an idle `/s` types
+`/steer`"*. That is F30's symptom written down as an expectation, so no
+implementation could satisfy both it and the fix. The implementer correctly
+refused to touch them and escalated; I made the change, keeping `/s` as the
+input so the tests now assert the corrected behaviour rather than dodging the
+interesting case, and noting the cursor column moved with the shorter word.
+
+Worth noting as a general lesson: reusing a function across contexts carried
+its *policy* along with its mechanics, and the policy was named for the context
+it came from. The name said `MID_TURN` and was reused where no turn exists.
+
+### A second defect in the same area, found by the property rather than by examples
+
+While writing T0-S17's tests the author pinned the invariant the stand-down
+clause had been compensating for — *for any slash prefix with a match,
+`prefix + hint` equals the lead palette entry's name* — and it failed first not
+on `/s` but on **`/agent`**, which neither I nor T0-S16 had noticed.
+
+`typeahead_slash_hint` selects with
+`find(|name| name.starts_with(rest) && name.len() > rest.len())`, which **skips
+an exact match**. Both `agent` and `agents` are registered, so `/agent` hints
+`s`, completing `agents` — while registry order's lead for `agent` is `agent`
+itself. The correct idle hint there is **empty**, which is also what the
+during-turn path does for its own exact matches (`typeahead_slash_hint("/steer")`
+is empty) and what the palette's second stand-down clause already assumes.
+
+**The lesson is about the instrument, not the bug.** Example-based tests had
+covered this area for three cards — `/s`, `/co`, `/cont`, `/context`, `/mod` —
+and none of them happened to be a command name that is also a prefix of
+another. A property over every proper prefix of every registered command (about
+390 of them) found it on the first run. Where a relationship between two
+functions is the real contract, assert the relationship, not a handful of its
+instances.
+
+### Two call sites, not one
+
+Worth recording because a half-fix here would have been worse than the defect.
+The idle prompt reads the hint in **two** places: `hint_of`, which is what the
+row *displays*, and the `CompleteRequest` arm, which is what Tab *accepts*.
+Both inherited the mid-turn ranking, which means the bug was never cosmetic —
+**Tab at an idle `/s` typed `/steer`**. Fixing only the display would have left
+the row showing one completion while the key inserted another. I verified both
+sites independently of the test author, and we agreed.

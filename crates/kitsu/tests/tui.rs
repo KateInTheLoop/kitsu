@@ -21,7 +21,24 @@
 //!
 //! Every read loop here has a deadline and fails with the transcript attached
 //! rather than blocking the suite.
-
+//!
+//! # Resize, now tested here (findings F16 and F24)
+//!
+//! The module used to record that a resize test was out of reach: [`Step`] had
+//! no action that sends no bytes, [`Session`]'s emulator was fixed at `ROWS` x
+//! `COLS`, and the one thing only a real terminal exercises -- that a
+//! `SIGWINCH` arriving while the reader blocks in `read()` surfaces as `EINTR`
+//! rather than being restarted under `SA_RESTART` -- was judged untestable
+//! outside a human's terminal.
+//!
+//! Both gaps are closed below ([`Action::Resize`], and a parser that is
+//! `set_size`d at the same offset in the byte stream where the child was
+//! resized), and **the judgement was wrong**: this harness signals a separate
+//! process that is genuinely blocked in a real `read` on a real tty, so with
+//! `SA_RESTART` set the child would not wake, would emit no new geometry, and
+//! the resize tests below would fail on their triggers. See
+//! `inline_mode_resize_*`.
+//!
 #![cfg(unix)]
 
 use std::fs;
@@ -42,6 +59,12 @@ const COLS: u16 = 80;
 
 /// How long a session may take before the harness kills the child and fails.
 const DEADLINE: Duration = Duration::from_secs(20);
+
+/// How long the driver waits for a resize to show up in the stream before
+/// re-delivering `SIGWINCH`. See the `rearm` binding in
+/// [`run_styled_chat_pty_with`] for why re-delivery is both necessary and
+/// harmless.
+const REARM: Duration = Duration::from_millis(100);
 
 /// Write `~/.kitsu/config.toml` under `home` with one unreachable gateway.
 ///
@@ -65,30 +88,98 @@ auth         = {{ method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN", expires_e
     fs::write(dir.join("config.toml"), config).expect("write config.toml");
 }
 
-/// One scripted input: wait until `trigger` appears in everything read so far,
-/// then write `send` to the master. Polling on a trigger rather than sleeping
-/// is what keeps the harness from racing the child's prompt.
+/// What a [`Step`] does once its trigger fires.
+#[derive(Clone, Copy)]
+enum Action {
+    /// Write these bytes to the master: a keystroke, a line, a control byte.
+    Send(&'static str),
+    /// Resize the window to `rows` x `cols` and **send no input at all**:
+    /// `TIOCSWINSZ` on the master, then `SIGWINCH` to the child.
+    ///
+    /// This is the action the resize tests are built on, and sending no bytes
+    /// is the whole point of it -- any keystroke would wake the child's
+    /// blocking `read` by itself and the measurement would say nothing about
+    /// how the signal handler was installed. See
+    /// [`run_styled_chat_pty_with`]'s driver for the re-arm, and the
+    /// `inline_mode_resize_*` tests for why.
+    Resize { rows: u16, cols: u16 },
+}
+
+/// One scripted action: wait until `trigger` appears in everything read so far,
+/// then perform `action`. Polling on a trigger rather than sleeping is what
+/// keeps the harness from racing the child's prompt.
 struct Step {
     trigger: &'static str,
-    send: &'static str,
+    action: Action,
+}
+
+/// A step that writes `bytes` to the master once `trigger` is seen.
+fn send(trigger: &'static str, bytes: &'static str) -> Step {
+    Step {
+        trigger,
+        action: Action::Send(bytes),
+    }
+}
+
+/// A step that resizes the window to `rows` x `cols` once `trigger` is seen,
+/// writing nothing to the master.
+fn resize(trigger: &'static str, rows: u16, cols: u16) -> Step {
+    Step {
+        trigger,
+        action: Action::Resize { rows, cols },
+    }
+}
+
+/// Set the window size on a PTY master.
+fn set_window_size(master: libc::c_int, rows: u16, cols: u16) {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `master` is a live PTY master and `size` is a valid winsize.
+    assert_eq!(
+        unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &size) },
+        0,
+        "set the PTY window size to {rows}x{cols}"
+    );
+}
+
+/// Where in the byte stream the window was resized, and to what.
+///
+/// The emulator has to be `set_size`d at exactly this offset: resize it any
+/// earlier or later and every absolute row address on the far side of the
+/// resize is modelled against the wrong geometry.
+#[derive(Clone, Copy)]
+struct Resized {
+    at: usize,
+    rows: u16,
+    cols: u16,
 }
 
 /// Everything a finished session left behind: the raw byte stream off the PTY
 /// master and the emulator that consumed it.
 struct Session {
     raw: Vec<u8>,
-    parser: vt100::Parser,
     status: std::process::ExitStatus,
     /// How many times the driver observed the child **stopped** (`WIFSTOPPED`)
     /// and resumed it with `SIGCONT`. Always zero unless
     /// [`Options::resume_on_stop`] was set, because the default poll cannot
     /// see a stopped child at all (see `poll_child`).
     stops: usize,
-    /// `raw.len()` at the moment each scripted input was written, so a test
+    /// `raw.len()` at the moment each scripted action was performed, so a test
     /// can replay a *prefix* of the stream and see the screen as it stood
     /// mid-session rather than only after exit. `marks[1]` is the screen just
     /// before `/quit` went in, which is the one the F17 question is about.
+    ///
+    /// A [`Action::Resize`] step marks the stream like any other, which is what
+    /// lets a resize test assert on the screen *after* the signal was
+    /// delivered and *before* the next byte of input went in.
     marks: Vec<usize>,
+    /// Every window resize the script performed, in stream order. Empty for
+    /// every script that never resizes, which is all nine original ones.
+    resizes: Vec<Resized>,
 }
 
 impl Session {
@@ -106,19 +197,52 @@ impl Session {
         hay.windows(needle.len()).filter(|w| *w == needle).count()
     }
 
-    /// The final screen, one `String` per row, trailing blanks trimmed per row
-    /// by `vt100` itself.
-    fn screen(&self) -> Vec<String> {
-        self.parser.screen().rows(0, COLS).collect()
+    /// Replay the first `upto` bytes into a fresh emulator, applying every
+    /// resize the script performed at the offset it was performed at.
+    ///
+    /// Splitting the stream at the resize offsets is not a nicety: `vt100`'s
+    /// screen is a fixed grid and the child addresses rows absolutely, so a
+    /// parser left at `ROWS` would model every post-resize `ESC[30;1H` against
+    /// a 24-row screen and silently discard it.
+    fn parse(&self, upto: usize) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+        let mut pos = 0usize;
+        for resized in &self.resizes {
+            if resized.at >= upto {
+                break;
+            }
+            parser.process(&self.raw[pos..resized.at]);
+            parser.set_size(resized.rows, resized.cols);
+            pos = resized.at;
+        }
+        parser.process(&self.raw[pos..upto]);
+        parser
     }
 
-    /// The screen as it stood when scripted input `step` was written: the
+    /// One parsed screen, one `String` per row, trailing blanks trimmed per
+    /// row by `vt100` itself, at whatever geometry was in force by then.
+    fn rows_of(parser: &vt100::Parser) -> Vec<String> {
+        let (_rows, cols) = parser.screen().size();
+        parser.screen().rows(0, cols).collect()
+    }
+
+    /// The final screen.
+    fn screen(&self) -> Vec<String> {
+        Self::rows_of(&self.parse(self.raw.len()))
+    }
+
+    /// The screen as it stood when scripted action `step` was performed: the
     /// first `marks[step]` bytes replayed into a fresh emulator.
     fn screen_at(&self, step: usize) -> Vec<String> {
-        let upto = self.marks[step];
-        let mut parser = vt100::Parser::new(ROWS, COLS, 0);
-        parser.process(&self.raw[..upto]);
-        parser.screen().rows(0, COLS).collect()
+        Self::rows_of(&self.parse(self.marks[step]))
+    }
+
+    /// The bytes the child wrote between two scripted actions, as lossy text.
+    ///
+    /// For a resize test this is the interesting window: everything the child
+    /// emitted *in response to the signal alone*, with no input in it.
+    fn raw_between(&self, from: usize, to: usize) -> String {
+        String::from_utf8_lossy(&self.raw[self.marks[from]..self.marks[to]]).into_owned()
     }
 
     /// A numbered dump of any screen, for failure messages.
@@ -219,18 +343,7 @@ fn run_styled_chat_pty_with(
     // probe (`crossterm::terminal::size`) reports this and the viewport's
     // arithmetic is deterministic rather than inherited from the test runner's
     // terminal (or absent, falling back to 80x24 by accident).
-    let size = libc::winsize {
-        ws_row: options.rows,
-        ws_col: options.cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: `master` is a live PTY master and `size` is a valid winsize.
-    assert_eq!(
-        unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &size) },
-        0,
-        "set the PTY window size"
-    );
+    set_window_size(master, ROWS, COLS);
 
     // SAFETY: the master descriptor stays owned here; non-blocking reads let
     // the driver poll for triggers instead of hanging.
@@ -331,7 +444,23 @@ fn run_styled_chat_pty_with(
     let mut raw: Vec<u8> = Vec::new();
     let mut step = 0usize;
     let mut marks: Vec<usize> = Vec::new();
+    let mut resizes: Vec<Resized> = Vec::new();
     let mut stops = 0usize;
+    let pid = child.id() as libc::pid_t;
+    // The re-arm, for [`Action::Resize`] only: which step's trigger we are
+    // waiting on, and when the next `SIGWINCH` is due.
+    //
+    // One signal is almost always enough, but "almost" would be a flake. The
+    // trigger that fires a resize step is the child's own output, so the child
+    // may still be inside its paint rather than back in `read()` when the
+    // signal lands; the flag latches, the read then blocks, and nothing
+    // further would ever wake it. Re-delivering is safe -- the second resize
+    // is to the *same* dimensions, which `plan_resize` answers `Unchanged`,
+    // i.e. zero bytes -- and it is still **only a signal**: no input byte is
+    // ever written here, so a reader that only noticed the flag on the next
+    // keystroke would still hang to the deadline, which is exactly the
+    // failure the tests want.
+    let mut rearm: Option<(usize, Instant)> = None;
 
     let status = loop {
         let mut buffer = [0_u8; 8192];
@@ -347,12 +476,43 @@ fn run_styled_chat_pty_with(
         if let Some(next) = script.get(step) {
             let seen = String::from_utf8_lossy(&raw);
             if seen.contains(next.trigger) {
-                terminal
-                    .write_all(next.send.as_bytes())
-                    .expect("write scripted input");
-                terminal.flush().expect("flush scripted input");
                 marks.push(raw.len());
+                match next.action {
+                    Action::Send(bytes) => {
+                        terminal
+                            .write_all(bytes.as_bytes())
+                            .expect("write scripted input");
+                        terminal.flush().expect("flush scripted input");
+                    }
+                    Action::Resize { rows, cols } => {
+                        set_window_size(master, rows, cols);
+                        resizes.push(Resized {
+                            at: raw.len(),
+                            rows,
+                            cols,
+                        });
+                        // SAFETY: signalling a child this harness owns.
+                        unsafe { libc::kill(pid, libc::SIGWINCH) };
+                        // Re-arm only while a *later* step is still waiting:
+                        // a script whose last action is a resize has nothing
+                        // left to observe the signal with, so nudging it
+                        // forever would just be noise.
+                        rearm =
+                            (step + 1 < script.len()).then(|| (step + 1, Instant::now() + REARM));
+                    }
+                }
                 step += 1;
+            }
+        }
+
+        // Still waiting on the trigger that follows a resize: nudge it again.
+        if let Some((waiting_on, due)) = rearm {
+            if step != waiting_on {
+                rearm = None;
+            } else if Instant::now() >= due {
+                // SAFETY: signalling a child this harness owns.
+                unsafe { libc::kill(pid, libc::SIGWINCH) };
+                rearm = Some((waiting_on, Instant::now() + REARM));
             }
         }
 
@@ -381,14 +541,12 @@ fn run_styled_chat_pty_with(
         std::thread::sleep(Duration::from_millis(5));
     };
 
-    let mut parser = vt100::Parser::new(options.rows, options.cols, 0);
-    parser.process(&raw);
     Session {
         raw,
-        parser,
         status,
         stops,
         marks,
+        resizes,
     }
 }
 
@@ -452,14 +610,8 @@ const RAW_MODE_MARKER: &str = "\x1b[?2004h";
 /// prompt.
 fn help_then_quit() -> Vec<Step> {
     vec![
-        Step {
-            trigger: "/help for commands",
-            send: "/help\n",
-        },
-        Step {
-            trigger: "/help <command> explains one command in detail",
-            send: "/quit\n",
-        },
+        send("/help for commands", "/help\n"),
+        send("/help <command> explains one command in detail", "/quit\n"),
     ]
 }
 
@@ -720,18 +872,9 @@ fn inline_mode_teardown_parks_below_the_transcript_and_clears_the_status_row() {
 /// left-aligned lines, which is what the staircase check needs.
 fn type_context_then_quit() -> Vec<Step> {
     vec![
-        Step {
-            trigger: RAW_MODE_MARKER,
-            send: "/context",
-        },
-        Step {
-            trigger: "/context",
-            send: "\r",
-        },
-        Step {
-            trigger: "context window source",
-            send: "/quit\r",
-        },
+        send(RAW_MODE_MARKER, "/context"),
+        send("/context", "\r"),
+        send("context window source", "/quit\r"),
     ]
 }
 
@@ -891,14 +1034,8 @@ fn inline_mode_raw_idle_input_does_not_staircase_command_output() {
 /// recalled history entry being painted.
 fn submit_context_then_quit() -> Vec<Step> {
     vec![
-        Step {
-            trigger: RAW_MODE_MARKER,
-            send: "/context\r",
-        },
-        Step {
-            trigger: "context window source",
-            send: "/quit\r",
-        },
+        send(RAW_MODE_MARKER, "/context\r"),
+        send("context window source", "/quit\r"),
     ]
 }
 
@@ -913,14 +1050,8 @@ fn submit_context_then_quit() -> Vec<Step> {
 /// nothing to paint at all.)
 fn recall_with_up_then_quit() -> Vec<Step> {
     vec![
-        Step {
-            trigger: RAW_MODE_MARKER,
-            send: "\x1b[A\x1b[A",
-        },
-        Step {
-            trigger: "/context",
-            send: "\x03/quit\r",
-        },
+        send(RAW_MODE_MARKER, "\x1b[A\x1b[A"),
+        send("/context", "\x03/quit\r"),
     ]
 }
 
@@ -1052,18 +1183,9 @@ fn inline_mode_recalls_history_persisted_by_an_earlier_session() {
 /// already painted at startup.)
 fn type_context_suspend_then_quit() -> Vec<Step> {
     vec![
-        Step {
-            trigger: RAW_MODE_MARKER,
-            send: "/context\x1a",
-        },
-        Step {
-            trigger: "\x1b[r",
-            send: "\r",
-        },
-        Step {
-            trigger: "context window source",
-            send: "/quit\r",
-        },
+        send(RAW_MODE_MARKER, "/context\x1a"),
+        send("\x1b[r", "\r"),
+        send("context window source", "/quit\r"),
     ]
 }
 
@@ -1152,18 +1274,9 @@ fn inline_mode_suspends_and_resumes_with_the_draft_intact() {
 /// assertion rather than on the driver's deadline.
 fn type_slash_prefix_then_quit() -> Vec<Step> {
     vec![
-        Step {
-            trigger: RAW_MODE_MARKER,
-            send: "/cont",
-        },
-        Step {
-            trigger: "/cont",
-            send: "ext\r",
-        },
-        Step {
-            trigger: "context window source",
-            send: "/quit\r",
-        },
+        send(RAW_MODE_MARKER, "/cont"),
+        send("/cont", "ext\r"),
+        send("context window source", "/quit\r"),
     ]
 }
 
@@ -1207,69 +1320,404 @@ fn inline_mode_shows_the_slash_completion_hint_on_the_viewport_row() {
     );
 }
 
-/// A real provider response taller than the terminal must retain its final
-/// unterminated line when the live editor resumes and the tool receipt prints.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// ---------------------------------------------------------------------------
+// Resize (findings F16 and F24)
+// ---------------------------------------------------------------------------
+
+/// The taller window the resize tests grow to, and the region it implies.
+///
+/// 30 rather than 25 so the new bottom margin cannot be confused with the old
+/// one by an off-by-one, and so the new pinned row is a long way from where
+/// the old one was: a child that never re-latched would leave the draft on row
+/// 24 of a 30-row screen, which the assertions below would see as a bare row
+/// 30.
+const TALL_ROWS: u16 = 30;
+
+/// Two rows, which is *below* finding F19's `rows >= viewport_rows + 2` bound
+/// for the single pinned row inline mode installs, so a resize to it must
+/// release the viewport rather than pin one it cannot draw.
+const TOO_SHORT_ROWS: u16 = 2;
+
+/// The DECSTBM the child must emit once the window is [`TALL_ROWS`] high:
+/// `bottom = rows - viewport_rows` with `viewport_rows = 1`.
+fn tall_region() -> String {
+    format!("\x1b[1;{}r", TALL_ROWS - 1)
+}
+
+/// Type `/context` at the inline idle prompt, grow the window, then leave.
+///
+/// **The third step's trigger is the load-bearing part of this script.** It is
+/// the *new* scroll region, which only the child's resize path emits, so the
+/// next byte of input is written strictly after the resize has already taken
+/// effect -- and the draft is submitted by that step rather than retyped. No
+/// byte of input exists between the signal and the geometry: if the pending
+/// flag were only noticed on the next keystroke there would be no next
+/// keystroke, the trigger would never fire, and the driver would fail on its
+/// deadline with the transcript attached.
+fn type_context_grow_then_quit() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/context"),
+        resize("/context", TALL_ROWS, COLS),
+        submit_on_tall_region(),
+        send("context window source", "/quit\r"),
+    ]
+}
+
+/// Submit the carried-over draft, triggered on the taller window's region.
+///
+/// Shared by the two scripts that end at [`TALL_ROWS`], and a function because
+/// the trigger is a formatted string the `&'static str` field cannot hold
+/// inline. A `OnceLock` leak-free `&'static str` is the cheapest way to give
+/// it one.
+fn submit_on_tall_region() -> Step {
+    static TRIGGER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let trigger: &'static String = TRIGGER.get_or_init(tall_region);
+    send(trigger.as_str(), "\r")
+}
+
+/// Test 10. **Finding F24: the `SIGWINCH` really wakes a blocked `read`.**
+///
+/// The handler in `tui_bridge::install_sigwinch_handler` is installed with
+/// `sigaction` and `sa_flags = 0` *specifically* so that `SIGWINCH` arriving
+/// while the inline reader blocks in `read()` returns `EINTR` instead of being
+/// restarted. On Linux/glibc the one-line `libc::signal` implies
+/// **`SA_RESTART`**, and under that flag the handler would still set the
+/// pending flag but the read would never return, so the viewport would
+/// silently never resize -- while every unit test in the suite still passed,
+/// because raising a signal on the thread that is not blocked proves nothing
+/// about a blocked one.
+///
+/// F24 recorded that as something only a human at a real terminal could catch.
+/// It is not: this test signals a **separate process** that is genuinely
+/// blocked in a real `read` on a real tty, and sends it **no input whatever**
+/// afterwards. Under `SA_RESTART` the child would not wake, would emit no new
+/// geometry, and the script's third step -- which triggers on that geometry --
+/// would never fire, failing the test on the driver's deadline.
+///
+/// **Do not delete this as redundant with the `plan_resize` property test or
+/// the `tui_bridge` resize tests.** Those pin the decision and the bytes. This
+/// is the only test of the delivery mechanism.
+#[test]
 #[serial]
-async fn long_wrapped_response_preserves_its_tail_on_short_terminals() {
-    use wiremock::{
-        matchers::{method, path},
-        Mock, MockServer, ResponseTemplate,
-    };
-    let server = MockServer::start().await;
-    let text = format!(
-        "{}\nFINAL_TAIL_NO_NEWLINE",
-        "a long paragraph that wraps in a narrow terminal ".repeat(150)
+fn inline_mode_resizes_the_pinned_row_on_a_signal_alone() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &type_context_grow_then_quit());
+
+    // What the child emitted between the resize and the next byte of input:
+    // the signal's doing, alone.
+    let answer = session.raw_between(1, 2);
+    assert!(
+        answer.contains(&tall_region()),
+        "the signal alone must make the child re-latch at the new geometry; \
+         everything it wrote between the resize and the next input was:\n{}",
+        answer.escape_debug()
     );
-    let chunk =
-        serde_json::json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]});
-    let done = serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":200,"completion_tokens":500,"total_tokens":700}});
-    let response = format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n");
-    Mock::given(method("POST"))
-        .and(path(CHAT_PATH))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(response, "text/event-stream"))
-        .mount(&server)
-        .await;
-    for mode in [None, Some("inline")] {
-        for (rows, cols) in [(8, 32), (24, 80)] {
-            let home = TempDir::new().unwrap();
-            write_config(home.path());
-            let config = home.path().join(".kitsu/config.toml");
-            fs::write(
-                &config,
-                fs::read_to_string(&config)
-                    .unwrap()
-                    .replace("https://gateway.invalid", &server.uri()),
+    assert!(
+        answer.contains(&format!("\x1b[{TALL_ROWS};1H")),
+        "and repaint the draft on the new bottom row {TALL_ROWS}; it wrote:\n{}",
+        answer.escape_debug()
+    );
+
+    // The screen as it stood after the resize and before `/quit` went in.
+    let after = session.screen_at(2);
+    assert_eq!(
+        after.len(),
+        TALL_ROWS as usize,
+        "the emulator must have been resized with the child"
+    );
+    let viewport = &after[(TALL_ROWS - 1) as usize];
+    assert!(
+        viewport.contains("/context"),
+        "the pinned row must have moved to the new bottom row {TALL_ROWS} and \
+         still show the draft, but it reads {viewport:?}; whole screen:\n{}",
+        Session::dump(&after)
+    );
+    // ...and it moved rather than being duplicated: the old pinned row is not
+    // still carrying the draft 6 rows up the screen.
+    let stray = after[..(TALL_ROWS - 1) as usize]
+        .iter()
+        .position(|row| row.contains("/context"));
+    assert!(
+        stray.is_none(),
+        "the old pinned row must be cleared by the re-latch, but row {} still \
+         shows the draft ({:?}); whole screen:\n{}",
+        stray.unwrap_or_default() + 1,
+        stray.map(|row| after[row].clone()).unwrap_or_default(),
+        Session::dump(&after)
+    );
+
+    // The draft was never retyped, so the session still submits `/context`
+    // after the resize: the editor's buffer survived the re-latch.
+    assert!(
+        session.status.success(),
+        "the resized session must still exit cleanly, but exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+}
+
+/// Type `/context`, shrink the window below F19's bound, then leave.
+///
+/// The submit triggers on the **region release** (`ESC[r`), which nothing
+/// else emits until teardown -- so, as in the script above, the input is
+/// written strictly after the signal has already been acted on, and no
+/// keystroke exists that could have woken the read instead.
+fn type_context_shrink_then_quit() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/context"),
+        resize("/context", TOO_SHORT_ROWS, COLS),
+        send("\x1b[r", "\r"),
+        send("context window source", "/quit\r"),
+    ]
+}
+
+/// Test 11. **The release case.** A window shrunk below finding F19's
+/// `rows >= viewport_rows + 2` bound cannot carry a pinned row that is drawn
+/// correctly, so the resize must release the region and pin nothing -- not
+/// set a region whose margins exceed the screen, which is the corruption F19
+/// was about.
+///
+/// Observed on the signal alone, with no input between the resize and the
+/// assertion, so this is also a second instance of the F24 measurement above.
+#[test]
+#[serial]
+fn inline_mode_resize_below_the_minimum_height_releases_the_region() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &type_context_shrink_then_quit(),
+    );
+
+    let answer = session.raw_between(1, 2);
+    assert!(
+        answer.contains("\x1b[r"),
+        "a resize below the bound must release the scroll region; everything \
+         the child wrote between the resize and the next input was:\n{}",
+        answer.escape_debug()
+    );
+    assert!(
+        !answer.contains("\x1b[1;"),
+        "and must pin no new region -- a DECSTBM whose bottom margin exceeds a \
+         {TOO_SHORT_ROWS}-row screen is exactly what F19 forbids -- but it \
+         wrote:\n{}",
+        answer.escape_debug()
+    );
+
+    // Nothing is pinned afterwards either: the only region this session ever
+    // set is the startup one, so no later paint re-latched behind the plan's
+    // back.
+    assert_eq!(
+        session.raw_count(&format!("\x1b[1;{}r", ROWS - 1)),
+        1,
+        "the startup region is the only one ever set; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+    assert_eq!(
+        session.raw_count(&tall_region()),
+        0,
+        "and certainly not the taller one this script never resizes to"
+    );
+
+    // And no pinned row survives on the screen: with nothing latched, `paint`
+    // is inert, so the draft is not drawn anywhere.
+    let after = session.screen_at(2);
+    assert_eq!(
+        after.len(),
+        TOO_SHORT_ROWS as usize,
+        "the emulator must have been resized with the child"
+    );
+    let pinned = after.iter().position(|row| row.contains("/context"));
+    assert!(
+        pinned.is_none(),
+        "with the viewport released nothing may be pinned, but row {} shows \
+         {:?}; whole screen:\n{}",
+        pinned.unwrap_or_default() + 1,
+        pinned.map(|row| after[row].clone()).unwrap_or_default(),
+        Session::dump(&after)
+    );
+}
+
+/// The round trip: type `/context`, shrink below the bound, grow back above
+/// it, then leave.
+///
+/// Both resizes send nothing, and each one's effect is the next step's
+/// trigger: the release (`ESC[r`) gates the second resize, and the taller
+/// window's region gates the submit. So the whole trip runs on two signals
+/// and no input at all.
+fn type_context_shrink_grow_then_quit() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/context"),
+        resize("/context", TOO_SHORT_ROWS, COLS),
+        resize("\x1b[r", TALL_ROWS, COLS),
+        submit_on_tall_region(),
+        send("context window source", "/quit\r"),
+    ]
+}
+
+/// Test 12. **The round trip.** A window made too short and then tall again
+/// ends up correctly pinned, with the draft intact -- the second half of
+/// `ResizePlan::Install`, through the real signal path rather than the plan.
+///
+/// The draft is the point: it was typed once, before the first resize, and
+/// never retyped. It survives both re-latches because the editor's buffer is
+/// the reader's, not the surface's, and the reader repaints from it on every
+/// wake.
+#[test]
+#[serial]
+fn inline_mode_resize_round_trip_ends_correctly_pinned() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(
+        home.path(),
+        Some("inline"),
+        &type_context_shrink_grow_then_quit(),
+    );
+
+    // The release came first, on the first signal...
+    let released = session.raw_between(1, 2);
+    assert!(
+        released.contains("\x1b[r"),
+        "the shrink must release the region first; it wrote:\n{}",
+        released.escape_debug()
+    );
+    // ...and the re-install came on the second, still with no input in between.
+    let installed = session.raw_between(2, 3);
+    assert!(
+        installed.contains(&tall_region()),
+        "growing back above the bound must pin a viewport again; everything \
+         the child wrote between the second resize and the next input was:\n{}",
+        installed.escape_debug()
+    );
+
+    let after = session.screen_at(3);
+    assert_eq!(after.len(), TALL_ROWS as usize);
+    let viewport = &after[(TALL_ROWS - 1) as usize];
+    assert!(
+        viewport.contains("/context"),
+        "the round trip must end with the draft pinned on row {TALL_ROWS}, but \
+         it reads {viewport:?}; whole screen:\n{}",
+        Session::dump(&after)
+    );
+    assert!(
+        session.status.success(),
+        "the session must still exit cleanly, but exited {:?}; screen:\n{}",
+        session.status,
+        session.screen_dump()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T0-S16: the slash palette above the composer, end to end
+// ---------------------------------------------------------------------------
+
+/// The palette script: type `/co` at the idle prompt and leave it unsubmitted,
+/// then finish `/context` by hand and leave.
+///
+/// `/co` is a prefix of three registry commands, so the palette has entries to
+/// show and is strictly taller than its minimal box. Both inputs trigger on
+/// something that exists **today** -- `RAW_MODE_MARKER` for the first
+/// keystroke and the draft's own echo for the second -- so a missing palette
+/// fails this test on its assertion rather than on the driver's deadline.
+fn type_slash_co_then_quit() -> Vec<Step> {
+    vec![
+        send(RAW_MODE_MARKER, "/co"),
+        send("/co", "ntext\r"),
+        send("context window source", "/quit\r"),
+    ]
+}
+
+/// Test 13. **The composer, end to end.** With `/co` typed and nothing
+/// submitted, the pinned viewport must be a real bordered palette with the
+/// composer as its bottom row: the lid and its ` slash commands ` label, the
+/// matching entries, the footer separator, and the draft on row 24.
+///
+/// This is the first end-to-end proof that the inline composer draws anything
+/// above one row. The unit tests in `tui_bridge` pin the bytes; this one pins
+/// that the palette is wired through the real reader, the real guard and a
+/// real pseudo-terminal, and that its rows land on **pinned** rows rather than
+/// inside the scroll region where the next transcript line would scroll them
+/// away.
+#[test]
+#[serial]
+fn inline_mode_shows_the_slash_palette_above_the_composer() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty(home.path(), Some("inline"), &type_slash_co_then_quit());
+
+    let typed = session.screen_at(1);
+    let composer = &typed[(ROWS - 1) as usize];
+    assert!(
+        composer.contains("/co"),
+        "the bottom row must still be the composer, but it reads {composer:?}; \
+         whole screen:\n{}",
+        Session::dump(&typed)
+    );
+
+    // The palette sits directly above it: the footer separator on row 23 and
+    // the lid above the entries, all of them inside the pinned region.
+    let lid = typed
+        .iter()
+        .position(|row| row.contains("slash commands"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the palette's lid must be on screen; whole screen:\n{}",
+                Session::dump(&typed)
             )
-            .unwrap();
-            let steps = [
-                Step {
-                    trigger: RAW_MODE_MARKER,
-                    send: "say a long paragraph\r",
-                },
-                Step {
-                    trigger: "500 output",
-                    send: "/quit\r",
-                },
-            ];
-            let session = run_styled_chat_pty_with(
-                home.path(),
-                mode,
-                &steps,
-                Options {
-                    rows,
-                    cols,
-                    ..Options::default()
-                },
-            );
-            assert!(session.status.success(), "{}", session.raw_text());
-            let mut parser = vt100::Parser::new(rows, cols, 1000);
-            parser.process(&session.raw[..session.marks[1]]);
-            assert!(
-                parser.screen().contents().contains("FINAL_TAIL_NO_NEWLINE"),
-                "tail lost in {mode:?} at {cols}x{rows}: {}",
-                parser.screen().contents()
-            );
-        }
-    }
+        });
+    let footer = typed
+        .iter()
+        .position(|row| row.contains("type to filter"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the palette's footer separator must be on screen; whole screen:\n{}",
+                Session::dump(&typed)
+            )
+        });
+    assert_eq!(
+        footer,
+        (ROWS - 2) as usize,
+        "the footer separator must sit directly above the composer; whole \
+         screen:\n{}",
+        Session::dump(&typed)
+    );
+    assert!(
+        lid < footer,
+        "the lid must be above the footer; whole screen:\n{}",
+        Session::dump(&typed)
+    );
+    assert!(
+        typed[lid + 1..footer]
+            .iter()
+            .any(|row| row.contains("/context")),
+        "and the matching entries between them; whole screen:\n{}",
+        Session::dump(&typed)
+    );
+
+    // The pinned rows really are pinned: the region the child set must be
+    // tall enough for the whole box, not the startup one-row region.
+    assert!(
+        // The region's BOTTOM MARGIN, which is the screen height less the
+        // viewport's own height -- not the viewport height itself, and not a
+        // three-parameter cursor address the viewport never emits.
+        session.raw_count(&format!(
+            "\x1b[1;{}r",
+            usize::from(ROWS) - (footer - lid + 2)
+        )) > 0,
+        "the child must latch a region that leaves the palette pinned; raw:\n{}",
+        session.raw_text().escape_debug()
+    );
+
+    // And the palette is display-only: the draft was `/co`, so the three
+    // characters sent next are what completes the command.
+    let after = session.screen_at(2);
+    assert!(
+        after[..(ROWS - 1) as usize]
+            .iter()
+            .any(|row| row.contains("context window source")),
+        "the palette must not have been submitted as text; whole screen:\n{}",
+        Session::dump(&after)
+    );
 }
