@@ -1867,19 +1867,6 @@ impl PinnedPane {
         self.installed().is_some()
     }
 
-    /// Finding F21, step 1: hand the terminal back as a normal full-screen
-    /// scrolling terminal before the process stops.
-    ///
-    /// Exactly `InlineSurface::hide`'s teardown — clear the pinned rows,
-    /// release the DECSTBM region, park below the transcript — and nothing
-    /// else: no termios restore and no signal, both of which are the
-    /// caller's, in that order, after this returns.
-    pub(crate) fn release_for_suspend(&self) {
-        // Delegated, not reimplemented: `hide` is the only place the teardown
-        // byte sequence lives, so a release cannot drift from a drop.
-        self.viewport.hide();
-    }
-
     /// Finding F16: apply a terminal resize.
     ///
     /// The region is **re-set**, never patched: the teardown for the old
@@ -1905,7 +1892,7 @@ impl PinnedPane {
     ///
     /// Returns whether a viewport is pinned once the resize has been applied.
     ///
-    /// [`release_for_suspend`]: Self::release_for_suspend
+    /// [`release_for_suspend`]: BridgeGuard::release_for_suspend
     /// [`reinstall_after_resume`]: Self::reinstall_after_resume
     pub(crate) fn resize(&self, rows: u16, viewport_rows: u16) -> bool {
         // Exactly the suspend pair with new dimensions, minus the paint --
@@ -4746,20 +4733,26 @@ mod tests {
         );
     }
 
-    /// **Test: the fullscreen ring holds a STREAMED answer and cannot hold a
-    /// buffered one — and the line bound is applied on the same path.**
+    /// **Test: the fullscreen ring holds a streamed answer, and now a buffered
+    /// one too — and the line bound is applied on the same path.**
     ///
-    /// Measured, not reasoned: the ring is fed only from the surface seam, and
-    /// `kitsu_render::print_message` writes straight to the process descriptor
-    /// without consulting `active_surface`, so an answer printed whole at the
-    /// end of a round can never enter it. `print_fragment` routes through
-    /// `write_block`, so a streamed one does.
+    /// Measured, not reasoned. This test was written when the ring was fed only
+    /// from the surface seam and `kitsu_render::print_message` wrote straight
+    /// to the process descriptor without consulting `active_surface`, so an
+    /// answer printed whole at the end of a round could never enter it.
     ///
-    /// Why it matters for **F51**: with tools advertised — the default — an
-    /// ordinary answer is buffered, so the fullscreen scrollback has never
-    /// held it (`docs/functionality.md` says so). Once such answers stream,
-    /// they arrive here through `print_fragment` for the first time. This
-    /// test pins the mechanism that makes that true.
+    /// **Amended when E11 was rebased onto main, because that premise is no
+    /// longer true.** Main's fix for a long reply's destroyed last line routes
+    /// `print_message` through `active_surface().write_block`, so a buffered
+    /// answer now reaches the ring as well. The limitation F145 recorded as
+    /// holding "by construction" was removed upstream, by a different change
+    /// with a different motive.
+    ///
+    /// Why it still matters for **F51**: with tools advertised — the default —
+    /// an ordinary answer used to be buffered, and F51's deliverable is that
+    /// such answers stream and so arrive here through `print_fragment`. That
+    /// is the first assertion, and it is unchanged. Only the second assertion's
+    /// claim about the *other* path is restated to what is now measurable.
     ///
     /// The third assertion is for **F52**: the new content is pushed through
     /// the same `CellRing::push` as everything else, so the ring's **line**
@@ -4768,7 +4761,7 @@ mod tests {
     /// pathological line is untouched by this.
     #[test]
     #[serial]
-    fn the_fullscreen_ring_holds_a_streamed_answer_and_not_a_buffered_one() {
+    fn the_fullscreen_ring_holds_a_streamed_answer_and_now_a_buffered_one_too() {
         let _state = GlobalState::capture();
         let tap = Arc::new(FullscreenTap {
             inner: Arc::new(SurfaceSpy::default()),
@@ -4785,10 +4778,10 @@ mod tests {
             "a streamed answer reaches the ring through the surface seam: {held:?}"
         );
         assert!(
-            !held.iter().any(|line| line.contains("buffered answer")),
-            "a buffered answer bypasses the seam and cannot reach the ring, \
-             which is why the default configuration's answers are missing from \
-             the fullscreen scrollback today: {held:?}"
+            held.iter().any(|line| line.contains("buffered answer")),
+            "a buffered answer reaches the ring too, since main routed \
+             print_message through the surface seam to stop a long reply's \
+             last line being destroyed: {held:?}"
         );
 
         // The bound: this ring holds two lines, so a third streamed line
