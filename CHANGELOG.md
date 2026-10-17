@@ -9,6 +9,8 @@ shapes may change in any minor release.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-16
+
 ### Fixed
 
 - Preserve the last line of long assistant replies before live-row redraws;
@@ -624,4 +626,6 @@ First public release.
   directory it was resolved against, instead of reporting only that the path
   does not exist.
 
+[Unreleased]: https://github.com/KateInTheLoop/kitsu/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/KateInTheLoop/kitsu/releases/tag/v0.2.0
 [0.1.0]: https://github.com/KateInTheLoop/kitsu/releases/tag/v0.1.0

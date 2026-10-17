@@ -52,15 +52,15 @@ distro.
 
 ```bash
 # Debian / Ubuntu
-curl -LO https://github.com/KateInTheLoop/kitsu/releases/latest/download/kitsu_0.1.0-1_amd64.deb
-sudo dpkg -i kitsu_0.1.0-1_amd64.deb
+curl -LO https://github.com/KateInTheLoop/kitsu/releases/latest/download/kitsu_0.2.0-1_amd64.deb
+sudo dpkg -i kitsu_0.2.0-1_amd64.deb
 
 # Fedora / RHEL / openSUSE
-sudo dnf install https://github.com/KateInTheLoop/kitsu/releases/latest/download/kitsu-0.1.0-1.x86_64.rpm
+sudo dnf install https://github.com/KateInTheLoop/kitsu/releases/latest/download/kitsu-0.2.0-1.x86_64.rpm
 
 # macOS / any Linux — tarball
-curl -L https://github.com/KateInTheLoop/kitsu/releases/latest/download/kitsu-v0.1.0-universal-apple-darwin.tar.gz | tar xz
-sudo install -m755 kitsu-v0.1.0-universal-apple-darwin/kitsu /usr/local/bin/kitsu
+curl -L https://github.com/KateInTheLoop/kitsu/releases/latest/download/kitsu-v0.2.0-universal-apple-darwin.tar.gz | tar xz
+sudo install -m755 kitsu-v0.2.0-universal-apple-darwin/kitsu /usr/local/bin/kitsu
 ```
 
 Windows: download the `...-x86_64-pc-windows-msvc.zip` asset, unzip it, and put
