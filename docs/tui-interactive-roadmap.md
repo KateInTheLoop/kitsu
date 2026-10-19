@@ -96,8 +96,21 @@ sibling (filenames only). Tighten the grant recipe if "don't read X" matters.
 
 ## TODO — ordered
 
-### 0. Picker redesign to popup + type/Tab (NEXT TO BUILD — design finalized & verified)
-Supersedes the fullscreen `run_model_picker`/`model_picker_rows` (DELETE them).
+### 0. Picker redesign to popup + type/Tab — DONE (`6cd05a0`, CatherinaInTheLoop)
+Shipped: popup over the composer via `MODAL_PANE` (not fullscreen). Type to
+filter, ↑/↓ move, Tab completes selection into filter, Enter picks, Esc/Ctrl-C
+cancel; `scroll_window` for long lists; paste only edits the filter (copy-paste
+safe). `/model` and `/models [filter]` (inline+tty) open it pre-filtered; pick
+delegates to the `/model <id>` switch path (boxed async recursion). Non-tty/
+classic/fullscreen/scripted keep the text list. New `tui_bridge::paint_modal_rows`
++ `modal_pane_budget`; `clear_approval_modal` restores the composer. Pure
+`model_popup_step`/`model_popup_view`/`scroll_window` unit-tested. Fullscreen
+`run_model_picker`/`model_picker_rows` removed.
+NOT yet confirmed live by the user — needs a hands-on try (`/model`, `/models`,
+`/models opus`).
+
+--- original design notes (kept for reference) ---
+Superseded the fullscreen `run_model_picker`/`model_picker_rows`.
 
 MECHANISM (verified in code):
 - Render into the pinned `MODAL_PANE` (tui_bridge.rs:1273), NOT the alt screen.
