@@ -6784,23 +6784,63 @@ fn model_picker_step(key: OverlayKey, selected: &mut usize, len: usize) -> Model
 /// selected one marked `>` and the current one tagged. Kept a pure projection
 /// (string rows only) so the terminal driver just paints what this returns,
 /// exactly as the transcript/agent overlays separate rows from bytes.
+///
+/// `max_rows` is the on-screen budget (terminal height minus the pinned
+/// composer row). The list scrolls to keep `selected` visible when there are
+/// more models than fit — without it a catalog taller than the screen would
+/// leave rows below the fold unreachable and let the selection scroll off
+/// invisibly. A clipped top or bottom is shown as a `… N more` row so the
+/// window is never silently partial.
 #[cfg(unix)]
-fn model_picker_rows(models: &[String], current: &str, selected: usize, cols: usize) -> Vec<String> {
-    let mut rows = Vec::with_capacity(models.len() + 2);
-    rows.push(fit_overlay_row(
-        "select a model — ↑/↓ move · Enter select · Esc cancel",
-        cols,
-    ));
+fn model_picker_rows(
+    models: &[String],
+    current: &str,
+    selected: usize,
+    cols: usize,
+    max_rows: usize,
+) -> Vec<String> {
+    let title = "select a model — ↑/↓ move · Enter select · Esc cancel";
+    // Rows on screen = title + blank + (≤2 "… more" markers) + items. Reserve
+    // the two marker rows up front so the item window can never overflow the
+    // budget — simpler and always correct, at the cost of two rows when the
+    // list happens not to be clipped (a non-issue on any real terminal).
+    let viewport = max_rows.saturating_sub(4).max(1);
+    let (start, end) = scroll_window(models.len(), selected, viewport);
+
+    let mut rows = Vec::with_capacity(max_rows);
+    rows.push(fit_overlay_row(title, cols));
     rows.push(String::new());
-    for (index, model) in models.iter().enumerate() {
+    if start > 0 {
+        rows.push(fit_overlay_row(&format!("  ↑ {start} more"), cols));
+    }
+    for index in start..end {
         let marker = if index == selected { ">" } else { " " };
-        let current_tag = if model == current { "  (current)" } else { "" };
+        let current_tag = if models[index] == current { "  (current)" } else { "" };
         rows.push(fit_overlay_row(
-            &format!("{marker} {model}{current_tag}"),
+            &format!("{marker} {}{current_tag}", models[index]),
             cols,
         ));
     }
+    if end < models.len() {
+        rows.push(fit_overlay_row(&format!("  ↓ {} more", models.len() - end), cols));
+    }
     rows
+}
+
+/// The `[start, end)` slice of a `len`-item list to show in a `viewport`-row
+/// window that keeps `selected` visible: centred on the selection, clamped to
+/// both ends. Pure arithmetic, unit-tested. The caller shows `start > 0` /
+/// `end < len` as "… more" markers.
+#[cfg(unix)]
+fn scroll_window(len: usize, selected: usize, viewport: usize) -> (usize, usize) {
+    if len <= viewport {
+        return (0, len);
+    }
+    let start = selected.saturating_sub(viewport / 2);
+    let end = (start + viewport).min(len);
+    // Pin to the bottom when the centred window ran past the end, so the last
+    // page is full rather than short.
+    (end.saturating_sub(viewport), end)
 }
 
 /// Truncate one overlay row to the terminal width so a long model id never
@@ -6860,9 +6900,9 @@ fn run_model_picker(models: &[String], current: &str) -> Option<String> {
     let mut held: Vec<u8> = Vec::new();
     let outcome = loop {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let content = model_picker_rows(models, current, selected, cols as usize);
-        let mut frame = String::from("\x1b[2J");
         let budget = rows.saturating_sub(1) as usize;
+        let content = model_picker_rows(models, current, selected, cols as usize, budget);
+        let mut frame = String::from("\x1b[2J");
         for (index, row) in content.iter().take(budget).enumerate() {
             frame.push_str(&format!("\x1b[{};1H\x1b[2K{row}", index + 1));
         }
@@ -30341,15 +30381,46 @@ mod tests {
     #[test]
     fn model_picker_rows_mark_selection_and_current() {
         let models = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let rows = model_picker_rows(&models, "b", 2, 80);
-        // Title + blank + one row per model.
+        // Ample budget: title + blank + one row per model, no markers.
+        let rows = model_picker_rows(&models, "b", 2, 80, 24);
         assert_eq!(rows.len(), 5);
         assert!(rows[2].starts_with("  a"), "unselected rows are not marked: {:?}", rows[2]);
         assert!(rows[3].contains("(current)"), "current model tagged: {:?}", rows[3]);
         assert!(rows[4].starts_with("> c"), "selected row marked: {:?}", rows[4]);
         // A narrow terminal truncates with an ellipsis rather than wrapping.
-        let narrow = model_picker_rows(&models, "b", 0, 4);
+        let narrow = model_picker_rows(&models, "b", 0, 4, 24);
         assert!(narrow.iter().all(|r| r.chars().count() <= 4), "rows fit the width: {narrow:?}");
+    }
+
+    #[test]
+    fn scroll_window_keeps_selection_visible_and_pins_ends() {
+        // Fits entirely: whole list, no clipping.
+        assert_eq!(scroll_window(3, 1, 10), (0, 3));
+        // Top of a long list: window starts at 0.
+        assert_eq!(scroll_window(100, 0, 10), (0, 10));
+        // Middle: selection centred, both edges clipped.
+        let (s, e) = scroll_window(100, 50, 10);
+        assert!(s <= 50 && 50 < e && e - s == 10, "selection in a full window: {s}..{e}");
+        // Bottom: window pins to the end rather than running past it.
+        assert_eq!(scroll_window(100, 99, 10), (90, 100));
+        // The selected index is always inside [start, end) for every position.
+        for sel in 0..100 {
+            let (s, e) = scroll_window(100, sel, 10);
+            assert!(s <= sel && sel < e, "sel {sel} fell outside {s}..{e}");
+            assert_eq!(e - s, 10, "window stays full at sel {sel}");
+        }
+    }
+
+    #[test]
+    fn model_picker_rows_scroll_a_long_list_with_markers() {
+        let models: Vec<String> = (0..48).map(|i| format!("m{i:02}")).collect();
+        // Small budget (10 rows): title+blank+2 markers reserved → 6 items.
+        let rows = model_picker_rows(&models, "m00", 40, 80, 10);
+        assert!(rows.len() <= 10, "respects the row budget: {}", rows.len());
+        // Selection m40 is visible, and both "more" markers are shown.
+        assert!(rows.iter().any(|r| r.starts_with("> m40")), "selected visible: {rows:?}");
+        assert!(rows.iter().any(|r| r.contains("↑") && r.contains("more")), "top marker: {rows:?}");
+        assert!(rows.iter().any(|r| r.contains("↓") && r.contains("more")), "bottom marker: {rows:?}");
     }
 
     #[test]
