@@ -99,7 +99,7 @@ pub fn group_rows(rows: Vec<AgentRow>) -> Vec<AgentGroup> {
 /// A2's order, rows in input order within a group. The selection walks this
 /// and never the input order, so moving down goes to the row below the one on
 /// screen.
-fn display_order(rows: &[AgentRow]) -> Vec<u64> {
+pub fn display_order(rows: &[AgentRow]) -> Vec<u64> {
     group_rows(rows.to_vec())
         .into_iter()
         .flat_map(|group| group.rows.into_iter().map(|row| row.id))

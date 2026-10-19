@@ -6542,6 +6542,15 @@ fn read_chat_line_inline(
             carried = apply_inline_attach_ordinal(registry, attached, ordinal, draft);
             continue;
         }
+        // Shift+Left / Shift+Right: cycle the attached agent. Sequenced here
+        // with the ordinal attach, for the same reason -- this is the one place
+        // holding both the registry (to resolve the step over display order)
+        // and the attachment it mutates. The draft replays through `carried`
+        // (**F76**), so cycling never costs a typed line.
+        if let Ok(tui_bridge::InlineRead::CycleAgent(delta, draft)) = outcome {
+            carried = apply_inline_cycle_agent(registry, attached, delta, draft);
+            continue;
+        }
         // Card **T4-S6b**, requirement A5: while attached, a submitted line
         // is the attached agent's -- a steer, or an answer while it is
         // blocked -- and never a turn. Routed here, before the line can
@@ -6600,6 +6609,10 @@ fn read_chat_line_inline_outcome(outcome: std::io::Result<tui_bridge::InlineRead
         // against and the session's attachment -- so this arm is unreachable
         // from here, like the three above it.
         Ok(tui_bridge::InlineRead::AttachOrdinal(_, _)) => ChatReadline::Eof,
+        // Shift+Left/Right: handled by the caller's loop, the only place that
+        // holds both the registry and the attachment -- unreachable from here,
+        // like `AttachOrdinal` above it.
+        Ok(tui_bridge::InlineRead::CycleAgent(_, _)) => ChatReadline::Eof,
         Ok(tui_bridge::InlineRead::Interrupted) => {
             // Deliberately NOT re-raising SIGINT here, unlike the during-turn
             // collector. The collector raises because a turn is in flight and
@@ -9282,6 +9295,58 @@ fn apply_inline_attach_ordinal(
         );
     }
     draft
+}
+
+/// Step the attachment to the previous (`delta < 0`) or next (`delta > 0`)
+/// agent in display order, and return the draft for the loop to replay.
+///
+/// Pure except for the `attached` mutation, and goes through the same
+/// `overlay_visible_rows` + `display_order` the overlay and the ordinal attach
+/// use, so the three never disagree about order. Clamps at both ends (no wrap);
+/// when detached, `Shift+Right` lands on the first agent and `Shift+Left` is
+/// inert, so a single chord from the normal composer attaches to something
+/// predictable rather than the last row. An empty view leaves attachment as it
+/// was.
+#[cfg(unix)]
+fn apply_inline_cycle_agent(
+    registry: &subagent::AgentRegistry,
+    attached: &mut Option<u64>,
+    delta: isize,
+    draft: String,
+) -> String {
+    let rows = overlay_visible_rows(registry, &OverlayState::new());
+    let order = kitsu_tui::agents_view::display_order(&rows);
+    if let Some(next) = cycle_target(&order, *attached, delta) {
+        apply_agent_view_exit(
+            &AgentViewExit {
+                shown: false,
+                attached: Some(next),
+            },
+            attached,
+        );
+    }
+    draft
+}
+
+/// The agent a `Shift+Left`/`Shift+Right` step lands on, or `None` to leave
+/// attachment unchanged. Pure over the display order so the clamp and the
+/// detached-start rules are testable without a registry.
+///
+/// Clamps at both ends (no wrap). Detached: `+1` starts at the first agent,
+/// `-1` stays detached. Empty order: nothing.
+#[cfg(unix)]
+fn cycle_target(order: &[u64], attached: Option<u64>, delta: isize) -> Option<u64> {
+    if order.is_empty() {
+        return None;
+    }
+    match attached.and_then(|id| order.iter().position(|row| *row == id)) {
+        Some(current) => {
+            let stepped = (current as isize + delta).clamp(0, order.len() as isize - 1);
+            Some(order[stepped as usize])
+        }
+        None if delta > 0 => Some(order[0]),
+        None => None,
+    }
 }
 
 /// Which agent, if any, one submitted line belongs to (card **T4-S6b**,
@@ -30036,6 +30101,23 @@ mod tests {
         let low = parse_with_effort(&["kitsu", "--effort", "low", "ask", "hi"]);
         assert_eq!((low.max_rounds, low.timeout_secs), (10, 120));
         assert_eq!(low.max_output_tokens, None);
+    }
+
+    #[test]
+    fn cycle_target_clamps_and_starts_from_detached() {
+        let order = [10u64, 20, 30];
+        // Forward/back from the middle.
+        assert_eq!(cycle_target(&order, Some(20), 1), Some(30));
+        assert_eq!(cycle_target(&order, Some(20), -1), Some(10));
+        // Clamp at both ends — no wrap.
+        assert_eq!(cycle_target(&order, Some(30), 1), Some(30));
+        assert_eq!(cycle_target(&order, Some(10), -1), Some(10));
+        // Detached: forward lands on the first agent, backward stays detached.
+        assert_eq!(cycle_target(&order, None, 1), Some(10));
+        assert_eq!(cycle_target(&order, None, -1), None);
+        // An attachment no longer in the order falls to the first; empty order is inert.
+        assert_eq!(cycle_target(&order, Some(99), 1), Some(10));
+        assert_eq!(cycle_target(&[], Some(10), 1), None);
     }
 
     #[test]

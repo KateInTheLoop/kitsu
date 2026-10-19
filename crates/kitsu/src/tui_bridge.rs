@@ -2371,6 +2371,14 @@ const DETACH_CHORD_KEY: u8 = b'd';
 /// `ESC [ D`, the left arrow as every terminal sends it, and what the editor
 /// reads as backward-char.
 const LEFT_ARROW: &[u8] = b"\x1b[D";
+/// `Shift+Left` / `Shift+Right` as a terminal sends them (`1;2` is the Shift
+/// modifier). Unlike plain `LEFT_ARROW` these are unambiguous presses with no
+/// empty-composer affordance, so they are lifted out whole and mean "cycle the
+/// attached agent" (previous / next in display order). They never reach the
+/// editor, so Shift+arrow is inert as cursor motion -- deliberately, that is
+/// the whole key.
+const SHIFT_LEFT: &[u8] = b"\x1b[1;2D";
+const SHIFT_RIGHT: &[u8] = b"\x1b[1;2C";
 /// The four paging keys as a terminal sends them, and the press each one
 /// means to [`kitsu_tui::fullscreen::FullscreenView`].
 ///
@@ -2406,6 +2414,11 @@ enum KeyItem {
     /// composer is empty *at this point in the chunk* before deciding whether
     /// it is cursor movement or half of the two-press affordance.
     Left,
+    /// `Shift+Left` (`-1`) / `Shift+Right` (`+1`): step the attached agent to
+    /// the previous / next in display order. Lifted out like [`KeyItem::Open`]:
+    /// resolving the step needs the registry and the session attachment, which
+    /// this filter does not hold, so it is carried to the caller as a delta.
+    CycleAgent(isize),
     /// `<prefix> a`: open the agent view.
     Open,
     /// `<prefix> d`: detach from the attached agent (card **T4-S6a**,
@@ -2584,6 +2597,26 @@ impl KeyFilter {
                     index += LEFT_ARROW.len();
                     continue;
                 }
+                // Shift+Left/Right: complete presses, matched before the
+                // partial check for `LEFT_ARROW`'s reason. They share the
+                // `ESC [ 1 ; 2` prefix with nothing the editor decodes, so
+                // lifting them whole never steals a cursor key.
+                if rest.starts_with(SHIFT_LEFT) {
+                    if !bytes.is_empty() {
+                        items.push(KeyItem::Bytes(std::mem::take(&mut bytes)));
+                    }
+                    items.push(KeyItem::CycleAgent(-1));
+                    index += SHIFT_LEFT.len();
+                    continue;
+                }
+                if rest.starts_with(SHIFT_RIGHT) {
+                    if !bytes.is_empty() {
+                        items.push(KeyItem::Bytes(std::mem::take(&mut bytes)));
+                    }
+                    items.push(KeyItem::CycleAgent(1));
+                    index += SHIFT_RIGHT.len();
+                    continue;
+                }
                 // Before the partial check below, for `LEFT_ARROW`'s reason:
                 // a complete sequence is a press, and only an incomplete one
                 // waits for the rest of itself.
@@ -2599,6 +2632,8 @@ impl KeyFilter {
                 }
                 if Self::is_partial(rest, PASTE_START)
                     || Self::is_partial(rest, LEFT_ARROW)
+                    || Self::is_partial(rest, SHIFT_LEFT)
+                    || Self::is_partial(rest, SHIFT_RIGHT)
                     || (self.pages
                         && PAGE_KEYS
                             .iter()
@@ -2724,6 +2759,13 @@ pub(crate) enum InlineRead {
     /// they typed.
     AttachOrdinal(usize, String),
 
+    /// `Shift+Left` / `Shift+Right`: cycle the attached agent to the previous
+    /// (`-1`) or next (`+1`) in display order. Carries the delta and the draft,
+    /// pure for [`InlineRead::AttachOrdinal`]'s reason: resolving a step needs
+    /// the registry and the session attachment, which the reader does not hold.
+    /// The chord has no empty-composer precondition, so the draft is carried
+    /// back for **F76**'s reason — cycling must not cost a typed line.
+    CycleAgent(isize, String),
     /// `Ctrl+O`: open the transcript overlay over the cell ring (requirement
     /// **R6**).
     ///
@@ -3034,6 +3076,9 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
                 // chord *switches* agent.
                 KeyItem::Attach(ordinal) => {
                     return Ok(InlineRead::AttachOrdinal(ordinal, editor.buffer_string()));
+                }
+                KeyItem::CycleAgent(delta) => {
+                    return Ok(InlineRead::CycleAgent(delta, editor.buffer_string()));
                 }
                 KeyItem::Detach => {
                     left_presses = 0;
@@ -8914,6 +8959,41 @@ mod tests {
             KeyFilter::new(attach_keys()).feed(b"\x18d"),
             vec![KeyItem::Detach],
             "`Ctrl+X d` is unchanged by the digits"
+        );
+    }
+
+    /// Shift+Left/Right lift out whole as agent-cycle steps, survive a split
+    /// read, never steal a plain arrow, and — the load-bearing one — are text
+    /// inside a bracketed paste so a pasted escape sequence never moves agents.
+    #[test]
+    fn the_key_filter_lifts_shift_arrows_as_agent_cycle_steps() {
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"\x1b[1;2D"),
+            vec![KeyItem::CycleAgent(-1)],
+            "Shift+Left steps to the previous agent"
+        );
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"\x1b[1;2C"),
+            vec![KeyItem::CycleAgent(1)],
+            "Shift+Right steps to the next agent"
+        );
+        // Split across reads — the prefix is held, not resolved as Esc.
+        let mut split = KeyFilter::new(attach_keys());
+        assert_eq!(split.feed(b"\x1b[1;2"), Vec::new(), "partial sequence held");
+        assert_eq!(split.feed(b"C"), vec![KeyItem::CycleAgent(1)], "completed next read");
+        // CONTROL: a plain left arrow is still the editor's backward-char, not a cycle.
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(b"\x1b[D"),
+            vec![KeyItem::Left],
+            "plain Left is unchanged"
+        );
+        // CONTROL (copy-paste safety): the same bytes inside a bracketed paste
+        // are text, never a cycle — pasting content must never switch agents.
+        let pasted = b"\x1b[200~\x1b[1;2D\x1b[201~";
+        assert_eq!(
+            KeyFilter::new(attach_keys()).feed(pasted),
+            vec![KeyItem::Bytes(pasted.to_vec())],
+            "a pasted Shift+Left is pasted text, not a cycle"
         );
     }
 
