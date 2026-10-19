@@ -78,27 +78,21 @@ The fullscreen alternate-screen takeover is the wrong feel. Instead:
 - The current `run_model_picker` (fullscreen) stays in the tree as WIP but is
   NOT the shipping design; likely replaced.
 
-## SEPARATE BUG (not TUI) — auto-mode read/write refusals
-The user's recurring pain running kitsu as a plain CLI agent (opus-5-5 run):
-the model **refused to read kernel source or write files** and stopped with a
-plan, citing: `$OUT` never set to a path, the only granted root was
-**read-only**, git blocked (macOS, expected), and it had "nowhere confirmed to
-write". The user: *"always issues with reading files and writing! it should
-work by default, in auto mode!"*
-- Likely causes to investigate (NOT yet diagnosed):
-  - The launch grants (`--allow-path` read-only vs `--allow-read-write`) didn't
-    cover the OUT dir, OR the prompt's `$OUT` wasn't expanded so the model never
-    had a concrete path.
-  - Deny-by-default in scripted/piped mode means no write happens without an
-    explicit `--allow-write`/`--allow-read-write` root — the model then correctly
-    refuses. "Auto mode" needs the grants wired so reads+writes to the work dir
-    just work.
-  - `--dangerously-skip-permissions` / a proper grant set may be the intended
-    "auto mode"; confirm what the user expects "by default" to mean.
-- It also **listed a forbidden `rfc/v2/` sibling** (saw filenames, read none) —
-  read-scoping wasn't tight enough. Revisit the grant scoping recipe.
-- See memory: kitsu-macos-no-commands, kitsu-reliability-notes (#4 budget),
-  kitsu-effort-presets. This belongs on the reliability-notes ledger too.
+## DONE — auto-mode read/write fix (`c3e1f02`, authored KateInTheLoop)
+Root cause (diagnosed): `--yes` suppressed prompts but granted NO roots and
+registered NO fs tools in non-interactive mode, so an automation run could
+neither read nor write — the model refused correctly ("nowhere to write").
+There was simply no scoped no-prompt read+write mode.
+FIX: `--yes` now grants the launch cwd as a read+write root and registers the
+fs tools. Scoped to cwd only (NOT the global `--dangerously-skip-permissions`
+bypass); writes outside cwd still denied; config/state protected; commands
+still off. Pure `cwd_grant` helper + unit test (integration suite blocked on
+macOS). Verified live: `kitsu --yes chat "create hello.txt"` writes in cwd
+with no prompts; write outside cwd is PolicyDenied.
+USAGE for the kernel task: run kitsu from the OUT dir (or a dir containing both
+OUT and the read inputs) with `--yes`, instead of read-only `--allow-path`.
+STILL OPEN from that run: read-scoping let the model LIST a forbidden `rfc/v2/`
+sibling (filenames only). Tighten the grant recipe if "don't read X" matters.
 
 ## TODO — ordered
 
