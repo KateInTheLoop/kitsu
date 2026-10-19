@@ -6739,6 +6739,180 @@ fn run_transcript_overlay(lines: &[kitsu_tui::cells::CellLine], take_alternate_s
     }
 }
 
+/// What one key did to the model picker's selection (pure, so the arrow/Enter/
+/// Esc logic is tested without a terminal — finding **F69**'s rule applied to a
+/// new overlay). `len` is the number of models; the index clamps to it and
+/// never wraps, matching `AgentSelection`.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelPickerStep {
+    /// Selection moved (or a no-op key was ignored); keep the loop running.
+    Continue,
+    /// `Enter`/`→`: commit the model at this index.
+    Pick(usize),
+    /// `Esc`/`q`, or a drained descriptor: close without switching.
+    Cancel,
+}
+
+/// Apply one decoded key to the picker's `selected` index. Up/Down move and
+/// clamp; Enter/Right pick; StepBack (resolved Esc) and `q` cancel; everything
+/// else is inert. Pulled out of the terminal loop so the movement and the pick
+/// are unit-testable (the transcript overlay's F69 seam, for the picker).
+#[cfg(unix)]
+fn model_picker_step(key: OverlayKey, selected: &mut usize, len: usize) -> ModelPickerStep {
+    if len == 0 {
+        return ModelPickerStep::Cancel;
+    }
+    match key {
+        OverlayKey::Up => {
+            *selected = selected.saturating_sub(1);
+            ModelPickerStep::Continue
+        }
+        OverlayKey::Down => {
+            *selected = (*selected + 1).min(len - 1);
+            ModelPickerStep::Continue
+        }
+        OverlayKey::Enter | OverlayKey::Right => ModelPickerStep::Pick(*selected),
+        OverlayKey::StepBack => ModelPickerStep::Cancel,
+        OverlayKey::Char('q') => ModelPickerStep::Cancel,
+        // Backspace and other chars are inert over a plain selection list.
+        OverlayKey::Char(_) | OverlayKey::Backspace => ModelPickerStep::Continue,
+    }
+}
+
+/// Render the picker's visible rows: a title, then one row per model with the
+/// selected one marked `>` and the current one tagged. Kept a pure projection
+/// (string rows only) so the terminal driver just paints what this returns,
+/// exactly as the transcript/agent overlays separate rows from bytes.
+#[cfg(unix)]
+fn model_picker_rows(models: &[String], current: &str, selected: usize, cols: usize) -> Vec<String> {
+    let mut rows = Vec::with_capacity(models.len() + 2);
+    rows.push(fit_overlay_row(
+        "select a model — ↑/↓ move · Enter select · Esc cancel",
+        cols,
+    ));
+    rows.push(String::new());
+    for (index, model) in models.iter().enumerate() {
+        let marker = if index == selected { ">" } else { " " };
+        let current_tag = if model == current { "  (current)" } else { "" };
+        rows.push(fit_overlay_row(
+            &format!("{marker} {model}{current_tag}"),
+            cols,
+        ));
+    }
+    rows
+}
+
+/// Truncate one overlay row to the terminal width so a long model id never
+/// wraps and costs a frame row (the agent view's `fit_all` rule).
+#[cfg(unix)]
+fn fit_overlay_row(row: &str, cols: usize) -> String {
+    if cols == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = row.chars().collect();
+    if chars.len() <= cols {
+        row.to_string()
+    } else if cols == 1 {
+        "…".to_string()
+    } else {
+        let mut out: String = chars[..cols - 1].iter().collect();
+        out.push('…');
+        out
+    }
+}
+
+/// An arrow-scrollable model picker over the already-fetched catalog. Returns
+/// the chosen model id, or `None` on cancel / unavailable terminal.
+///
+/// Built from the same primitives as the transcript and agent overlays —
+/// `RawStdinGuard`, the alternate screen, `decode_overlay_keys` with the
+/// lone-`ESC` grace (`stdin_waiting(ESC_SEQUENCE_GRACE)`), and whole-frame
+/// absolute-addressed paint — rather than a new widget, so split UTF-8, the
+/// Esc-vs-arrow ambiguity and the panic/signal screen restore are the ones
+/// those surfaces already solved. Declines (returns `None`) outside Inline+tty,
+/// so `/model` with no arg falls back to its usage message there.
+#[cfg(unix)]
+fn run_model_picker(models: &[String], current: &str) -> Option<String> {
+    use std::io::{Read as _, Write as _};
+
+    if tui_bridge::live_mode() != tui_bridge::TuiMode::Inline {
+        return None;
+    }
+    if !kitsu_render::stdin_is_tty() || !kitsu_render::stderr_styled() || models.is_empty() {
+        return None;
+    }
+    // The slash command runs after the reader returned, so raw mode is torn
+    // down here (unlike the composer's own overlay route) — engage our own,
+    // exactly as `/jobs view` does. No raw mode, no way back out, so decline.
+    let _raw = RawStdinGuard::engage()?;
+
+    let mut err = std::io::stderr();
+    kitsu_tui::note_alternate_screen(true);
+    let _ = err.write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h");
+    let _ = err.flush();
+
+    // Start on the current model if it is in the list, else the top.
+    let mut selected = models.iter().position(|m| m == current).unwrap_or(0);
+    let mut stdin = std::io::stdin();
+    let mut buffer = [0u8; 256];
+    let mut pending = OverlayPending::None;
+    let mut held: Vec<u8> = Vec::new();
+    let outcome = loop {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let content = model_picker_rows(models, current, selected, cols as usize);
+        let mut frame = String::from("\x1b[2J");
+        let budget = rows.saturating_sub(1) as usize;
+        for (index, row) in content.iter().take(budget).enumerate() {
+            frame.push_str(&format!("\x1b[{};1H\x1b[2K{row}", index + 1));
+        }
+        let _ = err.write_all(frame.as_bytes());
+        let _ = err.flush();
+
+        // Resolve a lone held `ESC` on a quiet tick, the agent view's grace.
+        if held == [0x1b] && !stdin_waiting(ESC_SEQUENCE_GRACE) {
+            held.clear();
+            break None;
+        }
+        let count = match stdin.read(&mut buffer) {
+            Ok(0) => break None,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break None,
+        };
+        held.extend_from_slice(&buffer[..count]);
+        // A bare trailing ESC is ambiguous (Esc vs the first byte of an arrow);
+        // hold it for the grace tick above. Any longer chunk decodes now.
+        if held == [0x1b] {
+            continue;
+        }
+        let chunk = std::mem::take(&mut held);
+        let mut done: Option<Option<String>> = None;
+        for key in decode_overlay_keys(&chunk, &mut pending) {
+            match model_picker_step(key, &mut selected, models.len()) {
+                ModelPickerStep::Continue => {}
+                ModelPickerStep::Pick(index) => {
+                    done = Some(Some(models[index].clone()));
+                    break;
+                }
+                ModelPickerStep::Cancel => {
+                    done = Some(None);
+                    break;
+                }
+            }
+        }
+        if let Some(result) = done {
+            break result;
+        }
+    };
+
+    let _ = err.write_all(b"\x1b[?25h\x1b[?1049l");
+    let _ = err.flush();
+    kitsu_tui::note_alternate_screen(false);
+    tui_bridge::reinstall_pinned_region();
+    outcome
+}
+
 /// How the transcript overlay's key loop ended.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24494,13 +24668,50 @@ async fn handle_slash(
             return SlashResult::ClearSession;
         }
         "model" => {
-            if arg.is_empty() {
-                eprintln!(
-                    "usage: /model <name> (current: {}); /models to list available",
-                    terminal_inline(model)
-                );
-                return SlashResult::Error;
-            } else if arg == "list" || arg.starts_with("list ") {
+            // Bare `/model` on an inline tty opens the arrow-scroll picker; the
+            // pick becomes the switch target and flows through the same
+            // validate + context-window + replace path a typed id does, so
+            // there is one switch code path and the picker adds no second one.
+            // ponytail: the picker fetches the catalog to populate itself and
+            // the switch below re-fetches to validate — a second GET on a rare,
+            // interactive action, not worth threading the list through.
+            let picked: Option<String> = if arg.is_empty() {
+                #[cfg(unix)]
+                {
+                    match await_cancellable(list_models_with_runtime_telemetry(
+                        provider,
+                        runtime_log,
+                        cli.timeout_secs.saturating_mul(1_000),
+                    ))
+                    .await
+                    {
+                        Some(Ok(Some(models))) => {
+                            run_model_picker(&filter_model_catalog(models, ""), model)
+                        }
+                        _ => None,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            } else {
+                None
+            };
+            let arg: &str = match (arg.is_empty(), picked.as_deref()) {
+                (true, Some(choice)) => choice,
+                (true, None) => {
+                    // No pick (cancelled, non-tty, classic/fullscreen, or no
+                    // catalog): keep the original usage message.
+                    eprintln!(
+                        "usage: /model <name> (current: {}); /models to list available",
+                        terminal_inline(model)
+                    );
+                    return SlashResult::Error;
+                }
+                (false, _) => arg,
+            };
+            if arg == "list" || arg.starts_with("list ") {
                 // Alias: `/model list [filter]` → same as `/models [filter]`.
                 let filter = arg.strip_prefix("list").unwrap_or("").trim();
                 let Some(result) = await_cancellable(list_models_and_print(
@@ -30101,6 +30312,44 @@ mod tests {
         let low = parse_with_effort(&["kitsu", "--effort", "low", "ask", "hi"]);
         assert_eq!((low.max_rounds, low.timeout_secs), (10, 120));
         assert_eq!(low.max_output_tokens, None);
+    }
+
+    #[test]
+    fn model_picker_step_moves_clamps_picks_and_cancels() {
+        let len = 3;
+        let mut sel = 1;
+        // Move within bounds.
+        assert_eq!(model_picker_step(OverlayKey::Down, &mut sel, len), ModelPickerStep::Continue);
+        assert_eq!(sel, 2);
+        // Clamp at the bottom — no wrap.
+        assert_eq!(model_picker_step(OverlayKey::Down, &mut sel, len), ModelPickerStep::Continue);
+        assert_eq!(sel, 2);
+        assert_eq!(model_picker_step(OverlayKey::Up, &mut sel, len), ModelPickerStep::Continue);
+        assert_eq!(sel, 1);
+        // Enter and Right both pick the current index.
+        assert_eq!(model_picker_step(OverlayKey::Enter, &mut sel, len), ModelPickerStep::Pick(1));
+        assert_eq!(model_picker_step(OverlayKey::Right, &mut sel, len), ModelPickerStep::Pick(1));
+        // Esc (resolved StepBack) and `q` cancel; other chars are inert.
+        assert_eq!(model_picker_step(OverlayKey::StepBack, &mut sel, len), ModelPickerStep::Cancel);
+        assert_eq!(model_picker_step(OverlayKey::Char('q'), &mut sel, len), ModelPickerStep::Cancel);
+        assert_eq!(model_picker_step(OverlayKey::Char('z'), &mut sel, len), ModelPickerStep::Continue);
+        // An empty catalog cancels rather than indexing out of range.
+        let mut empty = 0;
+        assert_eq!(model_picker_step(OverlayKey::Enter, &mut empty, 0), ModelPickerStep::Cancel);
+    }
+
+    #[test]
+    fn model_picker_rows_mark_selection_and_current() {
+        let models = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let rows = model_picker_rows(&models, "b", 2, 80);
+        // Title + blank + one row per model.
+        assert_eq!(rows.len(), 5);
+        assert!(rows[2].starts_with("  a"), "unselected rows are not marked: {:?}", rows[2]);
+        assert!(rows[3].contains("(current)"), "current model tagged: {:?}", rows[3]);
+        assert!(rows[4].starts_with("> c"), "selected row marked: {:?}", rows[4]);
+        // A narrow terminal truncates with an ellipsis rather than wrapping.
+        let narrow = model_picker_rows(&models, "b", 0, 4);
+        assert!(narrow.iter().all(|r| r.chars().count() <= 4), "rows fit the width: {narrow:?}");
     }
 
     #[test]
