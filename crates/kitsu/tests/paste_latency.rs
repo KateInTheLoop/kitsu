@@ -359,8 +359,8 @@ fn measure_paste(home: &Path, mode: Option<&'static str>) -> Measurement {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0,

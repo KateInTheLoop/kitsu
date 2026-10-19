@@ -109,8 +109,8 @@ where
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0,
@@ -875,8 +875,8 @@ fn test_auth_login_hides_tty_input_and_restores_echo_on_sigint() {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
@@ -1853,8 +1853,8 @@ fn test_query_only_interactive_session_does_not_create_a_snapshot() {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0,
@@ -1942,8 +1942,8 @@ fn test_terminal_mode_pty_matrix_decouples_rendering_and_input() {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0,
@@ -2111,7 +2111,7 @@ fn test_slash_palette_and_footer_fit_a_fifty_column_pty() {
 
     let mut master = -1;
     let mut slave = -1;
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: 24,
         ws_col: 50,
         ws_xpixel: 0,
@@ -2125,8 +2125,8 @@ fn test_slash_palette_and_footer_fit_a_fifty_column_pty() {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
+                std::ptr::null_mut(),
+                &mut size,
             )
         },
         0,
@@ -11505,8 +11505,8 @@ async fn test_interactive_empty_response_rolls_back_and_keeps_retry_available() 
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0,
@@ -14746,7 +14746,7 @@ fn test_status_styled_deck_uses_narrow_layout_on_a_thirty_two_column_pty() {
 
     let mut master = -1;
     let mut slave = -1;
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: 40,
         ws_col: 32,
         ws_xpixel: 0,
@@ -14760,8 +14760,8 @@ fn test_status_styled_deck_uses_narrow_layout_on_a_thirty_two_column_pty() {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
+                std::ptr::null_mut(),
+                &mut size,
             )
         },
         0,
@@ -21449,8 +21449,8 @@ fn run_styled_chat_pty_turn(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0,
