@@ -1295,14 +1295,37 @@ pub(crate) fn paint_approval_modal(
     options: &str,
     cue: Option<&str>,
 ) -> bool {
-    let Some(pane) = lock(&MODAL_PANE).clone() else {
-        return false;
-    };
     let mut rows = kitsu_render::approval_modal(header, details, options);
     if let Some(cue) = cue {
         rows.push(cue.to_string());
     }
-    pane.paint_rows(&rows)
+    paint_modal_rows(&rows)
+}
+
+/// Paint arbitrary rows onto the pinned modal pane over the composer, growing
+/// the viewport to fit (clamped by the terminal). Returns false when no pane is
+/// published (classic mode / no inline viewport), so the caller can fall back.
+///
+/// This is the non-fullscreen popup primitive: an overlay that lives above the
+/// composer row rather than taking the alternate screen. The model picker and
+/// the approval modal both paint through here; [`clear_approval_modal`] takes
+/// any of them back down and restores the composer's status row. `max_rows` the
+/// pane will grant is [`granted_rows`](BridgeGuard::granted_rows) via the
+/// published pane — callers that need the budget ahead of time read it there.
+pub(crate) fn paint_modal_rows(rows: &[String]) -> bool {
+    let Some(pane) = lock(&MODAL_PANE).clone() else {
+        return false;
+    };
+    pane.paint_rows(rows)
+}
+
+/// How many rows the pinned modal pane would grant for a popup — the budget a
+/// composer-popup must fit within (terminal height less the pinned composer
+/// row). Zero when no pane is published.
+pub(crate) fn modal_pane_budget() -> u16 {
+    lock(&MODAL_PANE)
+        .clone()
+        .map_or(0, |pane| pane.granted_rows(u16::MAX).saturating_sub(1))
 }
 
 /// Whether a pinned pane is published at all: card **T3-S7b**'s "is there a

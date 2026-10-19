@@ -6739,90 +6739,137 @@ fn run_transcript_overlay(lines: &[kitsu_tui::cells::CellLine], take_alternate_s
     }
 }
 
-/// What one key did to the model picker's selection (pure, so the arrow/Enter/
-/// Esc logic is tested without a terminal — finding **F69**'s rule applied to a
-/// new overlay). `len` is the number of models; the index clamps to it and
-/// never wraps, matching `AgentSelection`.
+/// What one key did to the model popup (pure, so filter/selection/pick logic
+/// is tested without a terminal). The popup over the composer: type to filter,
+/// arrows to move, Tab to complete the selection into the filter, Enter to
+/// pick, Esc/Ctrl-C to cancel.
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ModelPickerStep {
-    /// Selection moved (or a no-op key was ignored); keep the loop running.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ModelPopupStep {
+    /// Filter or selection changed (or an inert key); keep the loop running.
     Continue,
-    /// `Enter`/`→`: commit the model at this index.
-    Pick(usize),
-    /// `Esc`/`q`, or a drained descriptor: close without switching.
+    /// `Enter`: commit this model id.
+    Pick(String),
+    /// `Esc`/`Ctrl-C`, or a drained descriptor: close without switching.
     Cancel,
 }
 
-/// Apply one decoded key to the picker's `selected` index. Up/Down move and
-/// clamp; Enter/Right pick; StepBack (resolved Esc) and `q` cancel; everything
-/// else is inert. Pulled out of the terminal loop so the movement and the pick
-/// are unit-testable (the transcript overlay's F69 seam, for the picker).
+/// The popup's mutable state: the live filter text and the selected row within
+/// the *filtered* list. Selection is an index into the filtered view, clamped
+/// on every filter change so it never points past the end.
 #[cfg(unix)]
-fn model_picker_step(key: OverlayKey, selected: &mut usize, len: usize) -> ModelPickerStep {
-    if len == 0 {
-        return ModelPickerStep::Cancel;
+#[derive(Clone, Debug, Default)]
+struct ModelPopup {
+    filter: String,
+    selected: usize,
+}
+
+#[cfg(unix)]
+impl ModelPopup {
+    /// The models matching the current filter, in catalog order. One source
+    /// (`filter_model_catalog`) so the popup narrows exactly as `/models <x>`
+    /// does — no second filter to drift.
+    fn filtered(&self, models: &[String]) -> Vec<String> {
+        filter_model_catalog(models.to_vec(), &self.filter)
     }
-    match key {
-        OverlayKey::Up => {
-            *selected = selected.saturating_sub(1);
-            ModelPickerStep::Continue
-        }
-        OverlayKey::Down => {
-            *selected = (*selected + 1).min(len - 1);
-            ModelPickerStep::Continue
-        }
-        OverlayKey::Enter | OverlayKey::Right => ModelPickerStep::Pick(*selected),
-        OverlayKey::StepBack => ModelPickerStep::Cancel,
-        OverlayKey::Char('q') => ModelPickerStep::Cancel,
-        // Backspace and other chars are inert over a plain selection list.
-        OverlayKey::Char(_) | OverlayKey::Backspace => ModelPickerStep::Continue,
+
+    /// Clamp the selection to the current filtered length (empty list → 0).
+    fn clamp(&mut self, filtered_len: usize) {
+        self.selected = self.selected.min(filtered_len.saturating_sub(1));
     }
 }
 
-/// Render the picker's visible rows: a title, then one row per model with the
-/// selected one marked `>` and the current one tagged. Kept a pure projection
-/// (string rows only) so the terminal driver just paints what this returns,
-/// exactly as the transcript/agent overlays separate rows from bytes.
-///
-/// `max_rows` is the on-screen budget (terminal height minus the pinned
-/// composer row). The list scrolls to keep `selected` visible when there are
-/// more models than fit — without it a catalog taller than the screen would
-/// leave rows below the fold unreachable and let the selection scroll off
-/// invisibly. A clipped top or bottom is shown as a `… N more` row so the
-/// window is never silently partial.
+/// Apply one decoded key to the popup. Printable chars extend the filter;
+/// Backspace trims it; arrows move; Tab completes the selected id into the
+/// filter (so the next keystroke refines from there); Enter picks; Esc/Ctrl-C
+/// cancel. A paste arrives as its characters and therefore only ever edits the
+/// filter — it can never act as a command, which is the copy-paste-safety rule.
 #[cfg(unix)]
-fn model_picker_rows(
+fn model_popup_step(key: OverlayKey, popup: &mut ModelPopup, models: &[String]) -> ModelPopupStep {
+    let filtered = popup.filtered(models);
+    match key {
+        OverlayKey::Up => {
+            popup.selected = popup.selected.saturating_sub(1);
+            ModelPopupStep::Continue
+        }
+        OverlayKey::Down => {
+            if !filtered.is_empty() {
+                popup.selected = (popup.selected + 1).min(filtered.len() - 1);
+            }
+            ModelPopupStep::Continue
+        }
+        OverlayKey::Enter | OverlayKey::Right => match filtered.get(popup.selected) {
+            Some(model) => ModelPopupStep::Pick(model.clone()),
+            None => ModelPopupStep::Continue,
+        },
+        OverlayKey::StepBack => ModelPopupStep::Cancel,
+        OverlayKey::Char('\t') => {
+            // Tab completes the highlighted id into the filter, so typing
+            // continues from a concrete model rather than a fragment.
+            if let Some(model) = filtered.get(popup.selected) {
+                popup.filter = model.clone();
+                popup.selected = 0;
+            }
+            ModelPopupStep::Continue
+        }
+        OverlayKey::Backspace => {
+            popup.filter.pop();
+            popup.clamp(popup.filtered(models).len());
+            ModelPopupStep::Continue
+        }
+        // Ctrl-C arrives as the raw byte 0x03, decoded to this control char.
+        OverlayKey::Char('\u{3}') => ModelPopupStep::Cancel,
+        OverlayKey::Char(c) if !c.is_control() => {
+            popup.filter.push(c);
+            popup.selected = 0;
+            ModelPopupStep::Continue
+        }
+        // Other control chars are inert.
+        OverlayKey::Char(_) => ModelPopupStep::Continue,
+    }
+}
+
+/// Render the popup rows: a framed title with the live filter, the scrolled
+/// slice of matching models (selected marked `>`, current tagged), and a
+/// footer cue. Pure projection so the driver just paints what this returns.
+/// `max_rows` is the pane budget (terminal height less the composer row).
+#[cfg(unix)]
+fn model_popup_view(
     models: &[String],
     current: &str,
-    selected: usize,
+    popup: &ModelPopup,
     cols: usize,
     max_rows: usize,
 ) -> Vec<String> {
-    let title = "select a model — ↑/↓ move · Enter select · Esc cancel";
-    // Rows on screen = title + blank + (≤2 "… more" markers) + items. Reserve
-    // the two marker rows up front so the item window can never overflow the
-    // budget — simpler and always correct, at the cost of two rows when the
-    // list happens not to be clipped (a non-issue on any real terminal).
-    let viewport = max_rows.saturating_sub(4).max(1);
-    let (start, end) = scroll_window(models.len(), selected, viewport);
+    let filtered = popup.filtered(models);
+    let header = if popup.filter.is_empty() {
+        "select a model — type to filter · ↑/↓ move · Tab complete · Enter select · Esc cancel"
+            .to_string()
+    } else {
+        format!("select a model · filter: {}", popup.filter)
+    };
+    // Title + blank + footer + ≤2 "… more" markers are the fixed chrome.
+    let viewport = max_rows.saturating_sub(5).max(1);
+    let selected = popup.selected.min(filtered.len().saturating_sub(1));
+    let (start, end) = scroll_window(filtered.len(), selected, viewport);
 
     let mut rows = Vec::with_capacity(max_rows);
-    rows.push(fit_overlay_row(title, cols));
+    rows.push(fit_overlay_row(&header, cols));
     rows.push(String::new());
-    if start > 0 {
-        rows.push(fit_overlay_row(&format!("  ↑ {start} more"), cols));
-    }
-    for index in start..end {
-        let marker = if index == selected { ">" } else { " " };
-        let current_tag = if models[index] == current { "  (current)" } else { "" };
-        rows.push(fit_overlay_row(
-            &format!("{marker} {}{current_tag}", models[index]),
-            cols,
-        ));
-    }
-    if end < models.len() {
-        rows.push(fit_overlay_row(&format!("  ↓ {} more", models.len() - end), cols));
+    if filtered.is_empty() {
+        rows.push(fit_overlay_row("  (no model matches this filter)", cols));
+    } else {
+        if start > 0 {
+            rows.push(fit_overlay_row(&format!("  ↑ {start} more"), cols));
+        }
+        for index in start..end {
+            let marker = if index == selected { ">" } else { " " };
+            let tag = if filtered[index] == current { "  (current)" } else { "" };
+            rows.push(fit_overlay_row(&format!("{marker} {}{tag}", filtered[index]), cols));
+        }
+        if end < filtered.len() {
+            rows.push(fit_overlay_row(&format!("  ↓ {} more", filtered.len() - end), cols));
+        }
     }
     rows
 }
@@ -6838,8 +6885,6 @@ fn scroll_window(len: usize, selected: usize, viewport: usize) -> (usize, usize)
     }
     let start = selected.saturating_sub(viewport / 2);
     let end = (start + viewport).min(len);
-    // Pin to the bottom when the centred window ran past the end, so the last
-    // page is full rather than short.
     (end.saturating_sub(viewport), end)
 }
 
@@ -6862,19 +6907,21 @@ fn fit_overlay_row(row: &str, cols: usize) -> String {
     }
 }
 
-/// An arrow-scrollable model picker over the already-fetched catalog. Returns
-/// the chosen model id, or `None` on cancel / unavailable terminal.
+/// A model picker rendered as a POPUP over the composer (the pinned modal pane),
+/// not a fullscreen takeover. Type to filter, ↑/↓ to move, Tab to complete,
+/// Enter to pick, Esc/Ctrl-C to cancel. Returns the chosen id, or `None` on
+/// cancel / unavailable surface.
 ///
-/// Built from the same primitives as the transcript and agent overlays —
-/// `RawStdinGuard`, the alternate screen, `decode_overlay_keys` with the
-/// lone-`ESC` grace (`stdin_waiting(ESC_SEQUENCE_GRACE)`), and whole-frame
-/// absolute-addressed paint — rather than a new widget, so split UTF-8, the
-/// Esc-vs-arrow ambiguity and the panic/signal screen restore are the ones
-/// those surfaces already solved. Declines (returns `None`) outside Inline+tty,
-/// so `/model` with no arg falls back to its usage message there.
+/// Reuses the pane machinery (`paint_modal_rows` grows the viewport over the
+/// composer; `clear_approval_modal` restores it) and the overlay byte decoder
+/// (`decode_overlay_keys` + the 50 ms lone-`ESC` grace). `MODAL_PANE` is live
+/// for the whole `BridgeGuard` lifetime, so this works from `handle_slash`
+/// post-submit; we engage our own `RawStdinGuard` because the reader's is gone
+/// by then. Declines (None) when no pane is published (classic/non-tty), so the
+/// caller falls back to the text list.
 #[cfg(unix)]
-fn run_model_picker(models: &[String], current: &str) -> Option<String> {
-    use std::io::{Read as _, Write as _};
+fn run_model_picker(models: &[String], current: &str, initial_filter: &str) -> Option<String> {
+    use std::io::Read as _;
 
     if tui_bridge::live_mode() != tui_bridge::TuiMode::Inline {
         return None;
@@ -6882,36 +6929,33 @@ fn run_model_picker(models: &[String], current: &str) -> Option<String> {
     if !kitsu_render::stdin_is_tty() || !kitsu_render::stderr_styled() || models.is_empty() {
         return None;
     }
-    // The slash command runs after the reader returned, so raw mode is torn
-    // down here (unlike the composer's own overlay route) — engage our own,
-    // exactly as `/jobs view` does. No raw mode, no way back out, so decline.
+    let budget = tui_bridge::modal_pane_budget();
+    if budget == 0 {
+        return None; // No pinned pane to paint the popup into.
+    }
     let _raw = RawStdinGuard::engage()?;
 
-    let mut err = std::io::stderr();
-    kitsu_tui::note_alternate_screen(true);
-    let _ = err.write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h");
-    let _ = err.flush();
-
-    // Start on the current model if it is in the list, else the top.
-    let mut selected = models.iter().position(|m| m == current).unwrap_or(0);
+    // Pre-fill the filter (from `/models <filter>`), else start selected on the
+    // current model if present.
+    let mut popup = ModelPopup {
+        filter: initial_filter.to_string(),
+        selected: if initial_filter.is_empty() {
+            models.iter().position(|m| m == current).unwrap_or(0)
+        } else {
+            0
+        },
+    };
+    let cols = current_terminal_columns().unwrap_or(80);
     let mut stdin = std::io::stdin();
     let mut buffer = [0u8; 256];
     let mut pending = OverlayPending::None;
     let mut held: Vec<u8> = Vec::new();
     let outcome = loop {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let budget = rows.saturating_sub(1) as usize;
-        let content = model_picker_rows(models, current, selected, cols as usize, budget);
-        let mut frame = String::from("\x1b[2J");
-        for (index, row) in content.iter().take(budget).enumerate() {
-            frame.push_str(&format!("\x1b[{};1H\x1b[2K{row}", index + 1));
-        }
-        let _ = err.write_all(frame.as_bytes());
-        let _ = err.flush();
+        let budget = tui_bridge::modal_pane_budget().max(3) as usize;
+        let rows = model_popup_view(models, current, &popup, cols, budget);
+        tui_bridge::paint_modal_rows(&rows);
 
-        // Resolve a lone held `ESC` on a quiet tick, the agent view's grace.
         if held == [0x1b] && !stdin_waiting(ESC_SEQUENCE_GRACE) {
-            held.clear();
             break None;
         }
         let count = match stdin.read(&mut buffer) {
@@ -6921,21 +6965,19 @@ fn run_model_picker(models: &[String], current: &str) -> Option<String> {
             Err(_) => break None,
         };
         held.extend_from_slice(&buffer[..count]);
-        // A bare trailing ESC is ambiguous (Esc vs the first byte of an arrow);
-        // hold it for the grace tick above. Any longer chunk decodes now.
         if held == [0x1b] {
             continue;
         }
         let chunk = std::mem::take(&mut held);
         let mut done: Option<Option<String>> = None;
         for key in decode_overlay_keys(&chunk, &mut pending) {
-            match model_picker_step(key, &mut selected, models.len()) {
-                ModelPickerStep::Continue => {}
-                ModelPickerStep::Pick(index) => {
-                    done = Some(Some(models[index].clone()));
+            match model_popup_step(key, &mut popup, models) {
+                ModelPopupStep::Continue => {}
+                ModelPopupStep::Pick(model) => {
+                    done = Some(Some(model));
                     break;
                 }
-                ModelPickerStep::Cancel => {
+                ModelPopupStep::Cancel => {
                     done = Some(None);
                     break;
                 }
@@ -6946,10 +6988,8 @@ fn run_model_picker(models: &[String], current: &str) -> Option<String> {
         }
     };
 
-    let _ = err.write_all(b"\x1b[?25h\x1b[?1049l");
-    let _ = err.flush();
-    kitsu_tui::note_alternate_screen(false);
-    tui_bridge::reinstall_pinned_region();
+    // Take the popup back down and restore the composer's status row.
+    tui_bridge::clear_approval_modal();
     outcome
 }
 
@@ -24549,6 +24589,71 @@ async fn handle_slash(
             }
         }
         "models" => {
+            // Interactive inline+tty: open the popup over the composer,
+            // pre-filtered by `arg`. A pick delegates to the `/model <id>`
+            // switch path (one switch code path); a cancel is a no-op. Scripted/
+            // piped/classic/non-tty fall through to the static text list below.
+            #[cfg(unix)]
+            if tui_bridge::live_mode() == tui_bridge::TuiMode::Inline
+                && kitsu_render::stdin_is_tty()
+                && kitsu_render::stderr_styled()
+            {
+                match await_cancellable(list_models_with_runtime_telemetry(
+                    provider,
+                    runtime_log,
+                    cli.timeout_secs.saturating_mul(1_000),
+                ))
+                .await
+                {
+                    Some(Ok(Some(models))) => {
+                        let catalog = filter_model_catalog(models, "");
+                        if let Some(picked) = run_model_picker(&catalog, model, arg.trim()) {
+                            // Delegate the pick to the switch path (boxed for
+                            // async recursion), so validation, context-window
+                            // pinning and replace_model are not duplicated.
+                            return Box::pin(handle_slash(
+                                &format!("model {picked}"),
+                                messages,
+                                model,
+                                provider,
+                                tools,
+                                cli,
+                                perms,
+                                journal,
+                                session,
+                                skillset,
+                                context_window,
+                                context_window_pinned,
+                                state,
+                                registry,
+                                runtime_log,
+                                attached,
+                                view_dispatcher,
+                            ))
+                            .await;
+                        }
+                        // Cancelled: the composer is already restored.
+                        return SlashResult::Continue(None);
+                    }
+                    Some(Ok(None)) => {
+                        eprintln!("this gateway does not expose a model list (its models_path is empty)");
+                        return SlashResult::Continue(None);
+                    }
+                    Some(Err(error)) => {
+                        return report_slash_provider_error(
+                            "could not list models",
+                            error,
+                            ProviderOperation::ModelCatalog,
+                            cli.timeout_secs,
+                            session.provider_diagnostics,
+                        );
+                    }
+                    None => {
+                        eprintln!("^C (model catalog request cancelled)");
+                        return SlashResult::Cancelled;
+                    }
+                }
+            }
             let Some(result) = await_cancellable(list_models_and_print(
                 provider,
                 arg,
@@ -24761,7 +24866,7 @@ async fn handle_slash(
                     .await
                     {
                         Some(Ok(Some(models))) => {
-                            run_model_picker(&filter_model_catalog(models, ""), model)
+                            run_model_picker(&filter_model_catalog(models, ""), model, "")
                         }
                         _ => None,
                     }
@@ -30390,41 +30495,82 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_step_moves_clamps_picks_and_cancels() {
-        let len = 3;
-        let mut sel = 1;
-        // Move within bounds.
-        assert_eq!(model_picker_step(OverlayKey::Down, &mut sel, len), ModelPickerStep::Continue);
-        assert_eq!(sel, 2);
-        // Clamp at the bottom — no wrap.
-        assert_eq!(model_picker_step(OverlayKey::Down, &mut sel, len), ModelPickerStep::Continue);
-        assert_eq!(sel, 2);
-        assert_eq!(model_picker_step(OverlayKey::Up, &mut sel, len), ModelPickerStep::Continue);
-        assert_eq!(sel, 1);
-        // Enter and Right both pick the current index.
-        assert_eq!(model_picker_step(OverlayKey::Enter, &mut sel, len), ModelPickerStep::Pick(1));
-        assert_eq!(model_picker_step(OverlayKey::Right, &mut sel, len), ModelPickerStep::Pick(1));
-        // Esc (resolved StepBack) and `q` cancel; other chars are inert.
-        assert_eq!(model_picker_step(OverlayKey::StepBack, &mut sel, len), ModelPickerStep::Cancel);
-        assert_eq!(model_picker_step(OverlayKey::Char('q'), &mut sel, len), ModelPickerStep::Cancel);
-        assert_eq!(model_picker_step(OverlayKey::Char('z'), &mut sel, len), ModelPickerStep::Continue);
-        // An empty catalog cancels rather than indexing out of range.
-        let mut empty = 0;
-        assert_eq!(model_picker_step(OverlayKey::Enter, &mut empty, 0), ModelPickerStep::Cancel);
+    fn model_popup_step_filters_moves_completes_picks_and_cancels() {
+        let models = vec![
+            "global.anthropic.claude-opus-5-5".to_string(),
+            "global.anthropic.claude-opus-4-8".to_string(),
+            "gemma-4-26b".to_string(),
+        ];
+        let mut p = ModelPopup::default();
+        // Typing filters; selection resets to the top of the narrowed list.
+        for c in "opus".chars() {
+            assert_eq!(model_popup_step(OverlayKey::Char(c), &mut p, &models), ModelPopupStep::Continue);
+        }
+        assert_eq!(p.filter, "opus");
+        let matched = p.filtered(&models);
+        assert_eq!(matched.len(), 2, "only the two opus ids match");
+        // Down moves within the filtered list and clamps.
+        model_popup_step(OverlayKey::Down, &mut p, &models);
+        assert_eq!(p.selected, 1);
+        model_popup_step(OverlayKey::Down, &mut p, &models);
+        assert_eq!(p.selected, 1, "clamped at the bottom of the filtered list");
+        // Enter picks the highlighted filtered id (order is the filter's, not
+        // the test's — filter_model_catalog sorts).
+        assert_eq!(
+            model_popup_step(OverlayKey::Enter, &mut p, &models),
+            ModelPopupStep::Pick(matched[1].clone()),
+        );
+        // Backspace trims the filter and re-clamps.
+        model_popup_step(OverlayKey::Backspace, &mut p, &models);
+        assert_eq!(p.filter, "opu");
+        // Tab completes the selection into the filter.
+        let mut t = ModelPopup { filter: "gem".to_string(), selected: 0 };
+        model_popup_step(OverlayKey::Char('\t'), &mut t, &models);
+        assert_eq!(t.filter, "gemma-4-26b", "Tab completes the highlighted id");
+        // Esc and Ctrl-C cancel.
+        assert_eq!(model_popup_step(OverlayKey::StepBack, &mut p, &models), ModelPopupStep::Cancel);
+        assert_eq!(
+            model_popup_step(OverlayKey::Char('\u{3}'), &mut p, &models),
+            ModelPopupStep::Cancel,
+        );
     }
 
     #[test]
-    fn model_picker_rows_mark_selection_and_current() {
-        let models = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        // Ample budget: title + blank + one row per model, no markers.
-        let rows = model_picker_rows(&models, "b", 2, 80, 24);
-        assert_eq!(rows.len(), 5);
-        assert!(rows[2].starts_with("  a"), "unselected rows are not marked: {:?}", rows[2]);
-        assert!(rows[3].contains("(current)"), "current model tagged: {:?}", rows[3]);
-        assert!(rows[4].starts_with("> c"), "selected row marked: {:?}", rows[4]);
-        // A narrow terminal truncates with an ellipsis rather than wrapping.
-        let narrow = model_picker_rows(&models, "b", 0, 4, 24);
-        assert!(narrow.iter().all(|r| r.chars().count() <= 4), "rows fit the width: {narrow:?}");
+    fn model_popup_step_paste_only_edits_the_filter_never_acts() {
+        // A paste arrives as its characters. Even containing what look like
+        // commands, it can only extend the filter — never pick or cancel.
+        let models = vec!["opus".to_string(), "sonnet".to_string()];
+        let mut p = ModelPopup::default();
+        for c in "son".chars() {
+            assert_eq!(model_popup_step(OverlayKey::Char(c), &mut p, &models), ModelPopupStep::Continue);
+        }
+        assert_eq!(p.filter, "son");
+        assert_eq!(p.filtered(&models), vec!["sonnet".to_string()]);
+    }
+
+    #[test]
+    fn model_popup_view_marks_selection_filter_and_scrolls() {
+        let models: Vec<String> = (0..48).map(|i| format!("m{i:02}")).collect();
+        // Unfiltered, ample budget: header + blank + current tag + selection.
+        let p = ModelPopup { filter: String::new(), selected: 2 };
+        let rows = model_popup_view(&models, "m01", &p, 80, 24);
+        assert!(rows[0].contains("type to filter"), "header cue: {:?}", rows[0]);
+        assert!(rows.iter().any(|r| r.contains("m01") && r.contains("(current)")), "current tagged");
+        assert!(rows.iter().any(|r| r.starts_with("> m02")), "selection marked");
+        // Filtered header shows the filter text; only matches render.
+        let f = ModelPopup { filter: "m4".to_string(), selected: 0 };
+        let frows = model_popup_view(&models, "m01", &f, 80, 24);
+        assert!(frows[0].contains("filter: m4"), "filter shown: {:?}", frows[0]);
+        assert!(frows.iter().skip(2).all(|r| r.trim().is_empty() || r.contains("m4") || r.contains("more")));
+        // A filter that matches nothing says so, never panics.
+        let none = ModelPopup { filter: "zzz".to_string(), selected: 5 };
+        let nrows = model_popup_view(&models, "m01", &none, 80, 24);
+        assert!(nrows.iter().any(|r| r.contains("no model matches")), "empty-filter message");
+        // Small budget scrolls with markers, keeps selection visible.
+        let deep = ModelPopup { filter: String::new(), selected: 40 };
+        let drows = model_popup_view(&models, "m00", &deep, 80, 10);
+        assert!(drows.len() <= 10, "respects budget: {}", drows.len());
+        assert!(drows.iter().any(|r| r.starts_with("> m40")), "deep selection visible: {drows:?}");
     }
 
     #[test]
@@ -30444,18 +30590,6 @@ mod tests {
             assert!(s <= sel && sel < e, "sel {sel} fell outside {s}..{e}");
             assert_eq!(e - s, 10, "window stays full at sel {sel}");
         }
-    }
-
-    #[test]
-    fn model_picker_rows_scroll_a_long_list_with_markers() {
-        let models: Vec<String> = (0..48).map(|i| format!("m{i:02}")).collect();
-        // Small budget (10 rows): title+blank+2 markers reserved → 6 items.
-        let rows = model_picker_rows(&models, "m00", 40, 80, 10);
-        assert!(rows.len() <= 10, "respects the row budget: {}", rows.len());
-        // Selection m40 is visible, and both "more" markers are shown.
-        assert!(rows.iter().any(|r| r.starts_with("> m40")), "selected visible: {rows:?}");
-        assert!(rows.iter().any(|r| r.contains("↑") && r.contains("more")), "top marker: {rows:?}");
-        assert!(rows.iter().any(|r| r.contains("↓") && r.contains("more")), "bottom marker: {rows:?}");
     }
 
     #[test]

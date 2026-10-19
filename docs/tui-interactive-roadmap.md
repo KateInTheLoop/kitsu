@@ -96,8 +96,43 @@ sibling (filenames only). Tighten the grant recipe if "don't read X" matters.
 
 ## TODO — ordered
 
-### 0. Picker redesign to popup + type/Tab (was "model picker"; now reopened)
-Per NEW design direction above. Supersedes the fullscreen `run_model_picker`.
+### 0. Picker redesign to popup + type/Tab (NEXT TO BUILD — design finalized & verified)
+Supersedes the fullscreen `run_model_picker`/`model_picker_rows` (DELETE them).
+
+MECHANISM (verified in code):
+- Render into the pinned `MODAL_PANE` (tui_bridge.rs:1273), NOT the alt screen.
+  `paint_approval_modal` (tui_bridge.rs:1292) proves arbitrary rows can be
+  painted over the composer from anywhere; the pane auto-grows its viewport to
+  content height (clamped by `granted_rows`), and `clear_approval_modal`
+  (tui_bridge.rs:1327) restores the composer status row on close.
+- `MODAL_PANE` is published for the whole `BridgeGuard` lifetime (install,
+  tui_bridge.rs:203), so it IS live during `handle_slash` (post-submit).
+- Still engage `RawStdinGuard` (reader's raw guard is dropped by the time
+  handle_slash runs, same as the fullscreen picker did), and reuse
+  `decode_overlay_keys` + `ESC_SEQUENCE_GRACE` + `stdin_waiting`.
+- NOT the slash palette (`slash_palette_rows`, main.rs:6022): that is sync,
+  command-names only (bails on whitespace after `/`), no arrow-select, and
+  cannot do the async catalog fetch. Right idea (type-to-filter+Tab over the
+  composer), wrong vehicle for argument-side async lists.
+
+NEW CODE:
+- `tui_bridge::paint_modal_rows(&[String]) -> bool` (thin sibling of
+  paint_approval_modal; or generalise it). Reuse `clear_approval_modal` to
+  restore.
+- Rework `run_model_picker` into a pinned-pane loop holding filter String +
+  selected index. Keys: printable→append to filter (re-filter, clamp sel);
+  Backspace→trim filter; ↑/↓→move; Tab→complete sel into filter/accept; Enter→
+  pick; Esc/Ctrl-C→cancel. Paste = filter text (never commands) → copy-paste safe.
+- Pure `model_popup_view(models, filter, selected, cols, max_rows) ->
+  (Vec<String> rows, filtered_len)` = filter_model_catalog + scroll_window
+  (already written) + render. UNIT TEST this (the integration suite can't run
+  on macOS). Keep/relocate the `scroll_window` + its test.
+- Wiring: `/model` (no arg) and `/models [filter]` on inline+tty open the popup
+  (pre-filtered by [filter]); pick flows through the EXISTING switch path (one
+  switch code path). Non-tty/classic/fullscreen/scripted → today's text list.
+
+DECISION (user): `/models <text>` opens the popup PRE-FILTERED (not the static
+text list) in interactive mode. Static list stays for scripted/piped/classic.
 
 ### 1. Rendering pass (in progress)
 - Flicker: investigated — overlays build one string + single atomic write, so
