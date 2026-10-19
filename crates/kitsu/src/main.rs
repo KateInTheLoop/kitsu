@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use rustyline::ExternalPrinter as _;
 
 use cli::{AuthCommand, Cli, Command, SessionCommand};
@@ -1900,7 +1900,14 @@ impl std::fmt::Display for CliError {
 }
 
 fn run() -> Result<(), CliError> {
-    let cli = match Cli::try_parse() {
+    // Parse via ArgMatches (not the plain derive) so `apply_effort` can see
+    // which budget flags were user-set vs defaulted, then fold in the preset.
+    let cli = match Cli::command().try_get_matches().and_then(|matches| {
+        Cli::from_arg_matches(&matches).map(|mut cli| {
+            cli.apply_effort(&matches);
+            cli
+        })
+    }) {
         Ok(cli) => cli,
         Err(error) => match error.kind() {
             clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
@@ -29993,6 +30000,42 @@ mod tests {
             ArtifactStoragePolicy::Automatic,
         );
         assert_eq!(cfg.context_window, Some(DEFAULT_CONTEXT_WINDOW));
+    }
+
+    /// Parse exactly as `main` does — through ArgMatches so `apply_effort` can
+    /// distinguish user-set budget flags from defaulted ones.
+    fn parse_with_effort(argv: &[&str]) -> Cli {
+        let matches = Cli::command()
+            .try_get_matches_from(argv)
+            .expect("effort fixture parses");
+        let mut cli = Cli::from_arg_matches(&matches).expect("effort fixture builds");
+        cli.apply_effort(&matches);
+        cli
+    }
+
+    #[test]
+    fn effort_preset_raises_defaulted_budgets_but_not_explicit_ones() {
+        // No --effort: byte-identical to today's defaults.
+        let plain = parse_with_effort(&["kitsu", "ask", "hi"]);
+        assert_eq!((plain.max_rounds, plain.timeout_secs), (10, 120));
+        assert_eq!(plain.max_output_tokens, None);
+
+        // --effort high lifts all three where they were defaulted.
+        let high = parse_with_effort(&["kitsu", "--effort", "high", "ask", "hi"]);
+        assert_eq!((high.max_rounds, high.timeout_secs), (40, 300));
+        assert_eq!(high.max_output_tokens, Some(16000));
+
+        // An explicit flag wins over the preset; the others still move.
+        let mixed =
+            parse_with_effort(&["kitsu", "--effort", "max", "--max-rounds", "7", "ask", "hi"]);
+        assert_eq!(mixed.max_rounds, 7, "explicit --max-rounds must beat preset");
+        assert_eq!(mixed.timeout_secs, 600);
+        assert_eq!(mixed.max_output_tokens, Some(32000));
+
+        // --effort low is a deliberate no-op (equals historical defaults).
+        let low = parse_with_effort(&["kitsu", "--effort", "low", "ask", "hi"]);
+        assert_eq!((low.max_rounds, low.timeout_secs), (10, 120));
+        assert_eq!(low.max_output_tokens, None);
     }
 
     #[test]

@@ -1,7 +1,31 @@
 //! CLI surface (clap derive). Bare `kitsu` opens chat; global gateway/model
 //! selectors and `-p` cover the common launch paths without a subcommand.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Effort preset for `--effort` / `KITSU_EFFORT`. Expands into baseline values
+/// for the round, timeout, and output-token budgets; see [`Effort::preset`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl Effort {
+    /// `(max_rounds, timeout_secs, max_output_tokens)` for this preset. `low`
+    /// equals the historical per-flag defaults, so `--effort low` is a no-op.
+    pub fn preset(self) -> (u32, u64, u32) {
+        match self {
+            Effort::Low => (10, 120, 4096),
+            Effort::Medium => (20, 180, 8192),
+            Effort::High => (40, 300, 16000),
+            Effort::Max => (100, 600, 32000),
+        }
+    }
+}
 
 /// The value parser for `--tui <MODE>`.
 ///
@@ -158,6 +182,16 @@ pub struct Cli {
         value_parser = ["none", "minimal", "low", "medium", "high", "xhigh"]
     )]
     pub reasoning_effort: Option<String>,
+
+    /// Effort preset that raises `--max-rounds`, `--timeout-secs`, and
+    /// `--max-output-tokens` together, so tool-heavy work (large-repo review,
+    /// multi-file generation) isn't truncated by the conservative per-flag
+    /// defaults. `low` is exactly today's defaults; `max` is generous on all
+    /// three. Any of those three flags set explicitly (or via their own env)
+    /// overrides the preset. Set once with `KITSU_EFFORT` to stop tuning limits
+    /// by hand. Unset changes nothing.
+    #[arg(long, global = true, value_name = "LEVEL", env = "KITSU_EFFORT")]
+    pub effort: Option<Effort>,
 
     /// Maximum agent tool-call rounds per turn before the loop stops. Tool-aware
     /// reviews of large repos need many rounds to read files THEN write the
@@ -340,6 +374,33 @@ impl Cli {
             Some("inline") => Some(crate::config::TuiMode::Inline),
             Some("fullscreen") => Some(crate::config::TuiMode::Fullscreen),
             _ => None,
+        }
+    }
+
+    /// Fold `--effort`/`KITSU_EFFORT` into the three budget fields, but only
+    /// where the user left that flag at its default. An explicit `--max-rounds`
+    /// / `--timeout-secs` / `--max-output-tokens` (or its own env) always wins
+    /// over the preset, so the two settings compose predictably. `matches` is
+    /// the same parse that produced `self`; it is the only way to tell a
+    /// defaulted value from a user-typed one that happens to equal the default.
+    /// `--effort low` is a deliberate no-op: its budgets equal the historical
+    /// per-flag defaults.
+    pub fn apply_effort(&mut self, matches: &clap::ArgMatches) {
+        use clap::parser::ValueSource;
+        let Some(effort) = self.effort else { return };
+        let (rounds, timeout, tokens) = effort.preset();
+        let defaulted =
+            |id: &str| matches.value_source(id) == Some(ValueSource::DefaultValue);
+        if defaulted("max_rounds") {
+            self.max_rounds = rounds;
+        }
+        if defaulted("timeout_secs") {
+            self.timeout_secs = timeout;
+        }
+        // No default on this one — `None` is the only "unset". Leave `low`
+        // alone so it stays a pure no-op (unset still lets the gateway cap).
+        if effort != Effort::Low && self.max_output_tokens.is_none() {
+            self.max_output_tokens = Some(tokens);
         }
     }
 }
