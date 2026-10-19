@@ -4524,7 +4524,7 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
     } else if cli.dangerously_allow_all_filesystem {
         "DANGER: global non-protected filesystem bypass when tools are enabled"
     } else if cli.yes {
-        "non-prompting and confined to explicit/current roots when tools are enabled"
+        "non-prompting; launch directory granted read+write, confined to explicit/current roots"
     } else {
         "interactive chat prompts; automation is deny-by-default unless roots are granted"
     };
@@ -19387,6 +19387,32 @@ async fn run_turn_steerable(
     }
 }
 
+/// Whether the launch directory is granted as a read and/or write root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CwdGrant {
+    read: bool,
+    write: bool,
+}
+
+/// How the launch directory is granted, given `--yes` and whether the run is
+/// interactive. Pure so the policy is unit-testable without spawning kitsu
+/// (the integration suite can't run on macOS — pre-existing credential-store
+/// check). `--yes` means "no prompts, just work": grant the cwd read+write so
+/// an automation run can read and write there without hand-assembling
+/// `--allow-read-write <dir>` (scoped to the cwd — NOT the global bypass).
+/// Interactive-without-`--yes` keeps the historical read-only cwd grant; writes
+/// outside explicit roots still prompt. Non-interactive without `--yes` grants
+/// nothing (deny-by-default stands).
+fn cwd_grant(yes: bool, interactive: bool) -> CwdGrant {
+    if yes {
+        CwdGrant { read: true, write: true }
+    } else if interactive {
+        CwdGrant { read: true, write: false }
+    } else {
+        CwdGrant { read: false, write: false }
+    }
+}
+
 async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliError> {
     let ChatInvocation {
         first_prompt,
@@ -19573,9 +19599,14 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     read_roots.extend(allow_read_write.iter().cloned());
     let mut write_roots: Vec<String> = allow_write.to_vec();
     write_roots.extend(allow_read_write.iter().cloned());
-    if interactive {
-        if let Ok(cwd) = std::env::current_dir() {
-            read_roots.push(cwd.to_string_lossy().to_string());
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd = cwd.to_string_lossy().to_string();
+        let grant = cwd_grant(cli.yes, interactive);
+        if grant.read {
+            read_roots.push(cwd.clone());
+        }
+        if grant.write {
+            write_roots.push(cwd);
         }
     }
     let mut perms = Permissions::new(&read_roots, &write_roots, mode)
@@ -19647,18 +19678,22 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // flags are deliberately excluded: they change fallback policy but never
     // create capabilities. --allow-write is genuinely write-only; callers who
     // want edit/readback workflows opt into --allow-read-write explicitly.
-    // The unattended bypass exists so loop automation runs with no human;
-    // unlike the filesystem-only bypass it therefore does register fs tools
-    // in non-interactive runs (documented on the flag).
+    // --yes is the exception among approval flags: it now grants the launch cwd
+    // as a read+write root (above), so it must also register the fs tools that
+    // use that grant — otherwise "no prompts, just work" would silently offer
+    // no tools at all. The unattended bypass likewise registers fs tools so
+    // loop automation runs with no human.
     let can_read = !no_tools
         && !forced_one_shot
         && (interactive
             || cli.dangerously_skip_permissions
+            || cli.yes
             || !allow_paths.is_empty()
             || !allow_read_write.is_empty());
     let can_write = !no_tools
         && (interactive
             || cli.dangerously_skip_permissions
+            || cli.yes
             || !allow_write.is_empty()
             || !allow_read_write.is_empty());
     if has_required_writes && !can_write {
@@ -30421,6 +30456,17 @@ mod tests {
         assert!(rows.iter().any(|r| r.starts_with("> m40")), "selected visible: {rows:?}");
         assert!(rows.iter().any(|r| r.contains("↑") && r.contains("more")), "top marker: {rows:?}");
         assert!(rows.iter().any(|r| r.contains("↓") && r.contains("more")), "bottom marker: {rows:?}");
+    }
+
+    #[test]
+    fn cwd_grant_gives_yes_runs_read_write_and_keeps_deny_by_default() {
+        // --yes: read+write the launch dir, interactive or not.
+        assert_eq!(cwd_grant(true, false), CwdGrant { read: true, write: true });
+        assert_eq!(cwd_grant(true, true), CwdGrant { read: true, write: true });
+        // Interactive without --yes: historical read-only cwd grant.
+        assert_eq!(cwd_grant(false, true), CwdGrant { read: true, write: false });
+        // Non-interactive without --yes: nothing — deny-by-default stands.
+        assert_eq!(cwd_grant(false, false), CwdGrant { read: false, write: false });
     }
 
     #[test]

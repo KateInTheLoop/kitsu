@@ -247,10 +247,14 @@ pub struct Cli {
     #[arg(long, value_name = "CHARS", global = true)]
     pub offload_cap: Option<u32>,
 
-    /// Never prompt for filesystem access. Enabled filesystem tools remain
-    /// confined to explicit/current read and write roots; requests outside
-    /// those roots are denied. This never registers a tool or approves a
-    /// developer command.
+    /// Never prompt for filesystem access, and grant the launch directory as a
+    /// read+write root so an automation run just works there. Enabled
+    /// filesystem tools remain confined to explicit/current read and write
+    /// roots; requests outside those roots are denied. Scoped to the launch
+    /// directory — this is NOT the global filesystem bypass
+    /// (`--dangerously-skip-permissions`); Kitsu config/state stay protected and
+    /// developer commands are not approved. Pass `--allow-path`/`--allow-write`/
+    /// `--allow-read-write` to widen beyond the launch directory.
     #[arg(
         long,
         global = true,
@@ -539,7 +543,7 @@ pub enum Command {
     },
     /// Interactive chat, scripted multi-turn work, or one piped turn.
     #[command(
-        after_help = "CONTINUITY:\n  Interactive chat autosaves by default.\n  kitsu chat --session --script turns.txt     Autosave a new scripted session\n  kitsu chat --resume last --script more.txt  Resume and autosave explicitly\n  echo 'next' | kitsu chat --resume <id>      Resume from piped input\n\nTOOL CONTROL:\n  kitsu chat --no-tools 'Draft a concise summary'\n  --no-tools keeps client-side context and attachments but offers no model tools. Use --allow-path for client-side reads in scripted or piped chat.\n\nFILESYSTEM CAPABILITIES:\n  --allow-path is read-only, --allow-write is write-only, and --allow-read-write is explicit combined authority. --yes suppresses prompts but preserves roots."
+        after_help = "CONTINUITY:\n  Interactive chat autosaves by default.\n  kitsu chat --session --script turns.txt     Autosave a new scripted session\n  kitsu chat --resume last --script more.txt  Resume and autosave explicitly\n  echo 'next' | kitsu chat --resume <id>      Resume from piped input\n\nTOOL CONTROL:\n  kitsu chat --no-tools 'Draft a concise summary'\n  --no-tools keeps client-side context and attachments but offers no model tools. Use --allow-path for client-side reads in scripted or piped chat.\n\nFILESYSTEM CAPABILITIES:\n  --allow-path is read-only, --allow-write is write-only, and --allow-read-write is explicit combined authority. --yes suppresses prompts and grants the launch directory read+write (scoped to it); widen with the --allow-* flags."
     )]
     Chat {
         /// Optional first prompt; queued as the first turn. In non-TTY mode
