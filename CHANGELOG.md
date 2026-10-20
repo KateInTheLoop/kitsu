@@ -9,6 +9,18 @@ shapes may change in any minor release.
 
 ## [Unreleased]
 
+### Added
+
+- **macOS command containment via Apple Seatbelt.** Enabled developer commands
+  (including Git) now run on macOS inside a `sandbox-exec` profile — deny by
+  default, writes confined to the granted command roots and cwd, network
+  isolated — the same mandatory-containment guarantee the Linux Bubblewrap
+  backend provides. Previously command execution failed closed on macOS with
+  "no reviewed command-containment backend". Both backends sit behind one
+  shared policy layer (root resolution, executable fingerprinting, environment,
+  argv/cwd authorization); the backend is selected by target OS, and platforms
+  without a reviewed backend (e.g. Windows) still fail closed.
+
 ## [0.2.0] - 2026-10-16
 
 ### Fixed

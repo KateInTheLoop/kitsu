@@ -195,8 +195,23 @@ pub struct CommandGrantedExecutable {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandContainmentBackendKind {
+    /// Linux/Android: `bwrap` (Bubblewrap) namespaces + bind mounts.
     Bubblewrap,
+    /// macOS: Apple Seatbelt via `/usr/bin/sandbox-exec`.
+    Seatbelt,
 }
+
+/// The containment backend this build uses, selected by target OS. A binary
+/// runs on exactly one OS, so every containment error/status it produces names
+/// this backend. On platforms with no reviewed backend (e.g. Windows) this is a
+/// harmless placeholder: those paths only ever carry an `UnsupportedPlatform`
+/// error whose `Display` reports the reason, not a live backend.
+#[cfg(target_os = "macos")]
+const DEFAULT_CONTAINMENT_BACKEND: CommandContainmentBackendKind =
+    CommandContainmentBackendKind::Seatbelt;
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_CONTAINMENT_BACKEND: CommandContainmentBackendKind =
+    CommandContainmentBackendKind::Bubblewrap;
 
 /// Host-owned containment configuration. Tool arguments cannot modify it.
 ///
@@ -291,7 +306,9 @@ pub struct CommandContainmentError {
 impl CommandContainmentError {
     fn new(reason: CommandContainmentUnavailableReason, detail: String) -> Self {
         Self {
-            backend: CommandContainmentBackendKind::Bubblewrap,
+            // The build's own backend (one OS, one backend). See
+            // DEFAULT_CONTAINMENT_BACKEND.
+            backend: DEFAULT_CONTAINMENT_BACKEND,
             reason,
             detail,
         }
@@ -300,9 +317,19 @@ impl CommandContainmentError {
 
 impl std::fmt::Display for CommandContainmentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Remediation is backend-specific: a missing bwrap is installable, but
+        // sandbox-exec ships with macOS so its absence means something else.
+        let remediation = match self.backend {
+            CommandContainmentBackendKind::Bubblewrap => {
+                "install/enable bubblewrap or disable the command tool"
+            }
+            CommandContainmentBackendKind::Seatbelt => {
+                "ensure /usr/bin/sandbox-exec is present (it ships with macOS) or disable the command tool"
+            }
+        };
         write!(
             f,
-            "mandatory command containment ({:?}) is unavailable: {}; install/enable bubblewrap or disable the command tool",
+            "mandatory command containment ({:?}) is unavailable: {}; {remediation}",
             self.reason, self.detail
         )
     }
@@ -634,19 +661,23 @@ struct AuthorizedCommand {
     executable: CommandGrantedExecutable,
 }
 
-/// Descriptor-bound command root retained for the policy lifetime. Linux
+/// Descriptor-bound command root retained for the policy lifetime. On Linux
 /// containment mounts clones of these descriptors, so a rename/symlink swap
-/// cannot redirect bubblewrap to a different host directory.
+/// cannot redirect bubblewrap to a different host directory. On other unix
+/// (macOS/Seatbelt) the descriptor is not passed to the sandbox — it names the
+/// root by path — but the held fd still lets [`revalidate`](Self::revalidate)
+/// detect a dev/ino change before the profile is built, matching the cwd's own
+/// anti-rename check ([`AuthorizedCwd::revalidate`]).
 #[derive(Debug)]
 struct BoundCommandRoot {
     canonical: PathBuf,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     directory: std::fs::File,
 }
 
 impl BoundCommandRoot {
     fn bind(canonical: PathBuf) -> Result<Self, ToolError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let directory = open_directory(&canonical).map_err(|error| {
             ToolError::PolicyDenied(format!(
                 "command root '{}' could not be bound for containment: {error}",
@@ -655,13 +686,13 @@ impl BoundCommandRoot {
         })?;
         Ok(Self {
             canonical,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             directory,
         })
     }
 
     fn revalidate(&self) -> Result<(), ToolError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
 
@@ -814,8 +845,82 @@ struct ContainedLaunch {
     argv0: Option<OsString>,
     inherited_paths: Vec<std::fs::File>,
     shell_signal_status: bool,
-    #[cfg(test)]
-    direct_cwd: Option<PathBuf>,
+    /// Working directory to set on the outer process (unix only). Bubblewrap
+    /// leaves this `None` — it `--chdir`s inside its own argv. Seatbelt (which
+    /// has no `--chdir`) and the direct test backend set the authorized cwd
+    /// here, so the contained command runs in the directory it was approved
+    /// for. Applied at the exec site; never a path the model chose.
+    working_directory: Option<PathBuf>,
+}
+
+/// Policy inputs both containment backends need from an authorized command:
+/// the canonical program, the writable command roots, the read-only runtime
+/// roots, and the authorized cwd. Produced by [`authorized_launch_inputs`];
+/// each backend turns it into its own enforcement (bwrap argv+fds, or a
+/// Seatbelt profile).
+struct LaunchInputs {
+    program: PathBuf,
+    writable_command_roots: Vec<PathBuf>,
+    cwd: PathBuf,
+}
+
+/// Pull the canonical executable and run the shared executable-visibility gate,
+/// returning the path sets a backend enforces. Backend-agnostic: the identical
+/// check that bwrap and Seatbelt both require before building enforcement.
+fn authorized_launch_inputs(
+    policy: &CommandPolicy,
+    ready: &ContainmentBackendReady,
+    authorized: &AuthorizedCommand,
+) -> Result<LaunchInputs, CommandContainmentError> {
+    let executable = authorized.executable.fingerprint.as_ref().ok_or_else(|| {
+        CommandContainmentError::new(
+            CommandContainmentUnavailableReason::ExecutableOutsideVisibleRoots,
+            "approved executable has no validated path".to_string(),
+        )
+    })?;
+    let executable_visible = policy
+        .command_roots
+        .iter()
+        .chain(ready.readonly_runtime_roots.iter())
+        .any(|root| executable.canonical_path.starts_with(root));
+    if !executable_visible {
+        let toolchain_dir = executable
+            .canonical_path
+            .parent()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_else(|| executable.canonical_path.display().to_string());
+        return Err(CommandContainmentError::new(
+            CommandContainmentUnavailableReason::ExecutableOutsideVisibleRoots,
+            format!(
+                "approved executable '{}' is outside every command/runtime root; its own directory is a separate root requirement on top of the cwd root — add it with `--command-root {toolchain_dir}`",
+                executable.canonical_path.display()
+            ),
+        ));
+    }
+    Ok(LaunchInputs {
+        program: executable.canonical_path.clone(),
+        writable_command_roots: policy
+            .bound_command_roots
+            .iter()
+            .map(|root| root.canonical.clone())
+            .collect(),
+        cwd: authorized.cwd.canonical.clone(),
+    })
+}
+
+/// The contained child's environment: runtime-root toolchain wiring first
+/// (PATH additions, CARGO_HOME/RUSTUP_HOME), then user `--command-env`
+/// pass-through, which wins on a name clash. Bubblewrap feeds this into its own
+/// `--clearenv`/`--setenv` argv; the exec site also applies it to the outer
+/// process so Seatbelt (which inherits the outer env) sees the same set. Kept
+/// as one formula so the two cannot drift.
+fn runtime_plus_passthrough_env(
+    config_roots: &[PathBuf],
+    passthrough: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut env = runtime_root_environment(config_roots);
+    env.extend(passthrough.iter().cloned());
+    env
 }
 
 trait CommandContainmentBackend: Send + Sync {
@@ -831,11 +936,15 @@ trait CommandContainmentBackend: Send + Sync {
     ) -> Result<ContainedLaunch, CommandContainmentError>;
 }
 
+/// Linux (and the Windows/other fail-closed fallback) command containment via
+/// Bubblewrap. Not built on macOS, which uses [`SeatbeltBackend`].
+#[cfg(not(target_os = "macos"))]
 struct BubblewrapBackend {
     config: CommandContainmentConfig,
     cached_preflight: Mutex<Option<Result<ContainmentBackendReady, CommandContainmentError>>>,
 }
 
+#[cfg(not(target_os = "macos"))]
 impl BubblewrapBackend {
     fn new(config: CommandContainmentConfig) -> Self {
         Self {
@@ -957,6 +1066,7 @@ impl BubblewrapBackend {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 impl CommandContainmentBackend for BubblewrapBackend {
     fn preflight(&self) -> Result<ContainmentBackendReady, CommandContainmentError> {
         let mut cached = self.cached_preflight.lock().unwrap();
@@ -988,35 +1098,12 @@ impl CommandContainmentBackend for BubblewrapBackend {
                 ),
             ));
         }
-        let executable = authorized.executable.fingerprint.as_ref().ok_or_else(|| {
-            CommandContainmentError::new(
-                CommandContainmentUnavailableReason::ExecutableOutsideVisibleRoots,
-                "approved executable has no validated path".to_string(),
-            )
-        })?;
-        let executable_visible = policy
-            .command_roots
-            .iter()
-            .chain(ready.readonly_runtime_roots.iter())
-            .any(|root| executable.canonical_path.starts_with(root));
-        if !executable_visible {
-            let toolchain_dir = executable
-                .canonical_path
-                .parent()
-                .map(|dir| dir.display().to_string())
-                .unwrap_or_else(|| executable.canonical_path.display().to_string());
-            return Err(CommandContainmentError::new(
-                CommandContainmentUnavailableReason::ExecutableOutsideVisibleRoots,
-                format!(
-                    "approved executable '{}' is outside every command/runtime root; its own directory is a separate root requirement on top of the cwd root — add it with `--command-root {toolchain_dir}`",
-                    executable.canonical_path.display()
-                ),
-            ));
-        }
+        // Shared executable-visibility gate + canonical program path.
+        let inputs = authorized_launch_inputs(policy, &ready, authorized)?;
 
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (policy, authorized, argv, executable);
+            let _ = (policy, authorized, argv, inputs);
             Err(CommandContainmentError::new(
                 CommandContainmentUnavailableReason::UnsupportedPlatform,
                 "bubblewrap containment is Linux-only".to_string(),
@@ -1027,11 +1114,13 @@ impl CommandContainmentBackend for BubblewrapBackend {
         {
             use std::os::fd::AsRawFd;
 
-            // Runtime-root env first, then user pass-through: an explicit
-            // --command-env entry of the same name wins (last one merged).
-            let mut launch_environment =
-                runtime_root_environment(self.config.readonly_runtime_roots());
-            launch_environment.extend(policy.passthrough_environment.iter().cloned());
+            // Shared env formula (runtime-root wiring then --command-env
+            // pass-through, pass-through wins). base_bubblewrap_arguments feeds
+            // it into bwrap's own --clearenv/--setenv.
+            let launch_environment = runtime_plus_passthrough_env(
+                self.config.readonly_runtime_roots(),
+                &policy.passthrough_environment,
+            );
             let mut arguments = base_bubblewrap_arguments(&[], &launch_environment);
             let mut inherited_paths = Vec::with_capacity(
                 ready
@@ -1089,7 +1178,7 @@ impl CommandContainmentBackend for BubblewrapBackend {
             arguments.push(OsString::from("--argv0"));
             arguments.push(OsString::from(&argv[0]));
             arguments.push(OsString::from("--"));
-            arguments.push(executable.canonical_path.as_os_str().to_os_string());
+            arguments.push(inputs.program.as_os_str().to_os_string());
             arguments.extend(argv[1..].iter().map(OsString::from));
             Ok(ContainedLaunch {
                 program: ready.backend_path,
@@ -1099,11 +1188,299 @@ impl CommandContainmentBackend for BubblewrapBackend {
                 // Bubblewrap documents 128+signal as the contained child's
                 // signal termination encoding.
                 shell_signal_status: true,
-                #[cfg(test)]
-                direct_cwd: None,
+                // bwrap --chdir's inside its own argv.
+                working_directory: None,
             })
         }
     }
+}
+
+/// The production containment backend for this build's OS. Linux → Bubblewrap,
+/// macOS → Seatbelt. Every other platform (e.g. Windows) falls back to the
+/// Bubblewrap backend, whose off-Linux `run_preflight`/`prepare` fail closed
+/// with `UnsupportedPlatform` — the single slot a future native backend plugs
+/// into. This is the only OS-vs-OS branch; everything above it is shared.
+fn default_containment_backend(
+    config: CommandContainmentConfig,
+) -> Arc<dyn CommandContainmentBackend> {
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(SeatbeltBackend::new(config))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Arc::new(BubblewrapBackend::new(config))
+    }
+}
+
+/// Mirrors [`BubblewrapBackend`]: a memoized preflight that fingerprints the
+/// system `sandbox-exec` and validates the runtime roots, and a `prepare` that
+/// turns the shared [`LaunchInputs`] into a deny-by-default SBPL profile passed
+/// inline via `-p`. Unlike bwrap it binds roots by canonical PATH in the
+/// profile, not by descriptor; the anti-rename defense is the dev/ino
+/// revalidation that [`BoundCommandRoot`]/[`AuthorizedCwd`] already perform on
+/// unix before this runs (see the root-pinning note on `build_seatbelt_profile`).
+#[cfg(target_os = "macos")]
+struct SeatbeltBackend {
+    config: CommandContainmentConfig,
+    cached_preflight: Mutex<Option<Result<ContainmentBackendReady, CommandContainmentError>>>,
+}
+
+/// The fixed macOS system path to Seatbelt's launcher. Unlike `bwrap` (which
+/// varies by distro and is configurable) this ships with the OS at one place.
+// ponytail: fixed system path; add a config knob only if a non-standard
+// location ever shows up.
+#[cfg(target_os = "macos")]
+const DEFAULT_SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
+
+#[cfg(target_os = "macos")]
+impl SeatbeltBackend {
+    fn new(config: CommandContainmentConfig) -> Self {
+        Self {
+            config,
+            cached_preflight: Mutex::new(None),
+        }
+    }
+
+    fn run_preflight(&self) -> Result<ContainmentBackendReady, CommandContainmentError> {
+        {
+            let configured = Path::new(DEFAULT_SANDBOX_EXEC_PATH);
+            if !configured.exists() {
+                return Err(CommandContainmentError::new(
+                    CommandContainmentUnavailableReason::BackendMissing,
+                    format!("sandbox-exec was not found at '{}'", configured.display()),
+                ));
+            }
+            let fingerprint = fingerprint_executable(configured).ok_or_else(|| {
+                CommandContainmentError::new(
+                    CommandContainmentUnavailableReason::BackendNotExecutable,
+                    format!(
+                        "sandbox-exec at '{}' is not a regular executable",
+                        configured.display()
+                    ),
+                )
+            })?;
+            // Capability probe: a trivial allow-all profile around /usr/bin/true
+            // must exit 0. Non-empty stderr is NOT a failure — some macOS builds
+            // print a deprecation note (verified absent on the dev host, but we
+            // do not depend on that). Only the exit status gates readiness.
+            let probe = std::process::Command::new(&fingerprint.canonical_path)
+                .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|error| {
+                    CommandContainmentError::new(
+                        CommandContainmentUnavailableReason::BackendProbeFailed,
+                        format!("could not start sandbox-exec capability probe: {error}"),
+                    )
+                })?;
+            if !probe.status.success() {
+                let detail = safe_backend_diagnostic(&probe.stderr);
+                return Err(CommandContainmentError::new(
+                    CommandContainmentUnavailableReason::BackendProbeFailed,
+                    format!(
+                        "sandbox-exec could not apply a trivial sandbox profile{}",
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {detail}")
+                        }
+                    ),
+                ));
+            }
+            // System executable/library dirs are read-only roots too, so system
+            // tools (/bin/sh, /usr/bin/git) pass the shared executable-visibility
+            // gate — exactly as Linux's runtime_mount_paths seeds /usr,/bin,…
+            // into readonly_runtime_roots. Tools outside these (Homebrew in
+            // /opt/homebrew, /usr/local) need a --command-root, same as Linux.
+            let mut readonly_runtime_roots: Vec<PathBuf> = ["/usr", "/bin", "/sbin"]
+                .into_iter()
+                .map(PathBuf::from)
+                .filter(|path| path.exists())
+                .collect();
+            for root in validate_runtime_roots(&self.config)? {
+                if !readonly_runtime_roots.iter().any(|seed| root.starts_with(seed)) {
+                    readonly_runtime_roots.push(root);
+                }
+            }
+            if fingerprint_executable(&fingerprint.canonical_path).as_ref() != Some(&fingerprint) {
+                return Err(CommandContainmentError::new(
+                    CommandContainmentUnavailableReason::BackendChanged,
+                    "sandbox-exec changed during containment preflight".to_string(),
+                ));
+            }
+            Ok(ContainmentBackendReady {
+                backend_path: fingerprint.canonical_path.clone(),
+                readonly_runtime_roots,
+                fingerprint,
+            })
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl CommandContainmentBackend for SeatbeltBackend {
+    fn preflight(&self) -> Result<ContainmentBackendReady, CommandContainmentError> {
+        let mut cached = self.cached_preflight.lock().unwrap();
+        if let Some(result) = cached.as_ref() {
+            return result.clone();
+        }
+        let result = self.run_preflight();
+        *cached = Some(result.clone());
+        result
+    }
+
+    fn refresh(&self) {
+        *self.cached_preflight.lock().unwrap() = None;
+    }
+
+    fn prepare(
+        &self,
+        policy: &CommandPolicy,
+        authorized: &AuthorizedCommand,
+        argv: &[String],
+    ) -> Result<ContainedLaunch, CommandContainmentError> {
+        let ready = self.preflight()?;
+        if fingerprint_executable(&ready.backend_path).as_ref() != Some(&ready.fingerprint) {
+            return Err(CommandContainmentError::new(
+                CommandContainmentUnavailableReason::BackendChanged,
+                format!(
+                    "sandbox-exec at '{}' changed after preflight",
+                    ready.backend_path.display()
+                ),
+            ));
+        }
+        // Shared executable-visibility gate + canonical path sets. The cwd and
+        // command roots have already had their dev/ino anti-rename check at the
+        // exec site (AuthorizedCwd + BoundCommandRoot revalidate, both #[cfg(unix)]).
+        let inputs = authorized_launch_inputs(policy, &ready, authorized)?;
+
+        let profile = build_seatbelt_profile(&inputs)?;
+        let mut arguments = Vec::with_capacity(argv.len().saturating_add(3));
+        arguments.push(OsString::from("-p"));
+        arguments.push(OsString::from(profile));
+        arguments.push(inputs.program.as_os_str().to_os_string());
+        arguments.extend(argv[1..].iter().map(OsString::from));
+        Ok(ContainedLaunch {
+            program: ready.backend_path,
+            arguments,
+            // sandbox-exec has no inner-argv0 override; the target sees
+            // argv[0] = its canonical path. ponytail: add an `exec -a` shim
+            // only if a basename-dispatching tool ever needs it.
+            argv0: None,
+            // Roots are named by path in the profile; no fds are passed.
+            inherited_paths: Vec::new(),
+            // sandbox-exec execve's the target in place, so waitpid yields the
+            // target's own signal status (verified: `kill -TERM $$` under a
+            // trivial profile reports SIGTERM). So decode signals the normal
+            // way, not bwrap's 128+n convention.
+            shell_signal_status: false,
+            // No --chdir equivalent: run the child in its authorized cwd.
+            working_directory: Some(inputs.cwd.clone()),
+        })
+    }
+}
+
+/// Build a deny-by-default Seatbelt (SBPL) profile confining a command to its
+/// authorized roots. Writable access is EXACTLY the writable command roots, the
+/// cwd, `/private/tmp` (the canonical `TMPDIR=/tmp`), and the three write-only
+/// device nodes — nothing else. Reads cover the system/toolchain paths a
+/// dynamically-linked binary needs. Network is denied.
+///
+/// Root-pinning note: Seatbelt names canonical PATHS here, so (unlike Linux's
+/// descriptor bind) a path-component swap between the exec-site dev/ino
+/// revalidation and sandbox-exec's own `open` could still redirect a write.
+/// This is the same honest TOCTOU limit Linux already carries for the inner
+/// executable (`pinned=false`); `sandbox-exec` takes no fd, so true fd-pinning
+/// of roots is impossible via its CLI.
+///
+/// ponytail: the mach-lookup and dyld/system read sets are deliberately
+/// generous — the enforced boundary is write-confinement + no network. Narrow
+/// them only if a concrete escape or a toolchain-load failure demands it.
+#[cfg(target_os = "macos")]
+fn build_seatbelt_profile(inputs: &LaunchInputs) -> Result<String, CommandContainmentError> {
+    use std::fmt::Write as _;
+
+    let mut writable: Vec<&Path> = Vec::new();
+    for root in &inputs.writable_command_roots {
+        writable.push(root.as_path());
+    }
+    writable.push(inputs.cwd.as_path());
+
+    let mut profile = String::new();
+    profile.push_str("(version 1)\n");
+    profile.push_str("(deny default)\n");
+    // The enforced perimeter is WRITE confinement + no network (Codex's
+    // workspace-write model). Reads are open: dyld's read set is SIP-hidden and
+    // varies by macOS version, so a read allow-list fails closed in the wrong
+    // direction — a missing dyld path aborts the process (SIGABRT) rather than
+    // denying one file. What the command may *run* is already gated by the
+    // shared executable-visibility check; what it may *change* is gated here.
+    profile.push_str("(deny network*)\n");
+    profile.push_str("(allow process*)\n");
+    profile.push_str("(allow sysctl-read)\n");
+    profile.push_str("(allow mach-lookup)\n");
+    profile.push_str("(allow file-read*)\n");
+
+    // Writes: ONLY the writable command roots, the cwd, the temp dir, and the
+    // write-only device nodes. This is the enforced boundary the tests pin.
+    profile.push_str("(allow file-write*\n");
+    for path in &writable {
+        write_subpath(&mut profile, path)?;
+    }
+    let _ = writeln!(profile, "    (subpath \"/private/tmp\")");
+    for dev in ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"] {
+        let _ = writeln!(profile, "    (literal \"{dev}\")");
+    }
+    profile.push_str(")\n");
+
+    Ok(profile)
+}
+
+/// Emit one `    (subpath "…")` line with the path safely SBPL-quoted.
+#[cfg(target_os = "macos")]
+fn write_subpath(profile: &mut String, path: &Path) -> Result<(), CommandContainmentError> {
+    use std::fmt::Write as _;
+    let quoted = sbpl_quote(path)?;
+    let _ = writeln!(profile, "    (subpath {quoted})");
+    Ok(())
+}
+
+/// Quote a path as an SBPL string literal. Trust boundary: a path is about to
+/// become part of a security policy, so this fails closed rather than produce a
+/// profile that doesn't mean what it says.
+///
+/// - Non-UTF-8 → refuse (never lossily transcode a path into a policy).
+/// - Control chars / newlines → refuse (defends the s-expression structure).
+/// - Otherwise wrap in `"`, backslash-escaping `\` and `"`. A literal `)` inside
+///   a quoted SBPL string is inert, so escaping `\` and `"` is sufficient.
+#[cfg(target_os = "macos")]
+fn sbpl_quote(path: &Path) -> Result<String, CommandContainmentError> {
+    let text = path.to_str().ok_or_else(|| {
+        CommandContainmentError::new(
+            CommandContainmentUnavailableReason::InvalidConfiguration,
+            format!("containment path is not valid UTF-8: {}", path.display()),
+        )
+    })?;
+    if text.chars().any(|c| c.is_control()) {
+        return Err(CommandContainmentError::new(
+            CommandContainmentUnavailableReason::InvalidConfiguration,
+            format!("containment path contains a control character: {}", path.display()),
+        ));
+    }
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for c in text.chars() {
+        if c == '\\' || c == '"' {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    Ok(quoted)
 }
 
 #[cfg(test)]
@@ -1150,11 +1527,13 @@ impl CommandContainmentBackend for DirectTestContainmentBackend {
             argv0: Some(OsString::from(&argv[0])),
             inherited_paths: Vec::new(),
             shell_signal_status: false,
-            direct_cwd: Some(authorized.cwd.canonical.clone()),
+            working_directory: Some(authorized.cwd.canonical.clone()),
         })
     }
 }
 
+// Used only by the Linux bwrap root-fd revalidation path.
+#[cfg(target_os = "linux")]
 fn containment_policy_error(error: ToolError) -> CommandContainmentError {
     CommandContainmentError::new(
         CommandContainmentUnavailableReason::InvalidConfiguration,
@@ -1194,6 +1573,25 @@ fn runtime_mount_paths(
     if alternatives.exists() {
         mounts.push(alternatives);
     }
+    // Append the validated config runtime roots, skipping any already covered
+    // by a system mount above.
+    for current in validate_runtime_roots(config)? {
+        if !mounts.iter().any(|root| current.starts_with(root)) {
+            mounts.push(current);
+        }
+    }
+    Ok(mounts)
+}
+
+/// Re-canonicalize each configured read-only runtime root and fail closed if it
+/// changed or is no longer a directory, de-duplicating roots nested in earlier
+/// ones. Backend-agnostic: Linux folds these into its bind-mount list, Seatbelt
+/// uses them directly as the profile's read-only roots (and as the source of
+/// the toolchain env via [`runtime_root_environment`]).
+fn validate_runtime_roots(
+    config: &CommandContainmentConfig,
+) -> Result<Vec<PathBuf>, CommandContainmentError> {
+    let mut roots: Vec<PathBuf> = Vec::new();
     for configured in &config.readonly_runtime_roots {
         let current = std::fs::canonicalize(configured).map_err(|error| {
             CommandContainmentError::new(
@@ -1213,11 +1611,11 @@ fn runtime_mount_paths(
                 ),
             ));
         }
-        if !mounts.iter().any(|root| current.starts_with(root)) {
-            mounts.push(current);
+        if !roots.iter().any(|root| current.starts_with(root)) {
+            roots.push(current);
         }
     }
-    Ok(mounts)
+    Ok(roots)
 }
 
 /// Environment adjustments derived from configured read-only runtime roots.
@@ -1386,7 +1784,7 @@ impl CommandPolicy {
         let containment_config = CommandContainmentConfig::default();
         #[cfg(not(test))]
         let containment_backend: Arc<dyn CommandContainmentBackend> =
-            Arc::new(BubblewrapBackend::new(containment_config.clone()));
+            default_containment_backend(containment_config.clone());
         #[cfg(test)]
         let containment_backend: Arc<dyn CommandContainmentBackend> =
             Arc::new(DirectTestContainmentBackend);
@@ -1429,7 +1827,7 @@ impl CommandPolicy {
     /// disables containment; an unusable configuration is exposed through
     /// [`Self::containment_status`] and every execution fails closed.
     pub fn with_containment_config(mut self, config: CommandContainmentConfig) -> Self {
-        self.containment_backend = Arc::new(BubblewrapBackend::new(config.clone()));
+        self.containment_backend = default_containment_backend(config.clone());
         self.containment_config = config;
         self
     }
@@ -1460,7 +1858,7 @@ impl CommandPolicy {
     pub fn containment_status(&self) -> CommandContainmentStatus {
         match self.containment_backend.preflight() {
             Ok(ready) => CommandContainmentStatus::Ready(CommandContainmentReady {
-                backend: CommandContainmentBackendKind::Bubblewrap,
+                backend: DEFAULT_CONTAINMENT_BACKEND,
                 backend_path: ready.backend_path,
                 writable_command_roots: self.command_roots.clone(),
                 readonly_runtime_roots: ready.readonly_runtime_roots,
@@ -2787,11 +3185,18 @@ async fn run_supervised_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // Bubblewrap's own `--clearenv`/`--setenv` argv is what actually governs
-    // the contained child's environment (see `base_bubblewrap_arguments`);
-    // this loop matters for the non-bwrap test containment backend, which
-    // execs the target program directly using this outer `Command`.
-    for (name, value) in merged_containment_environment(&policy.passthrough_environment) {
+    // The full contained environment: base + runtime-root toolchain wiring +
+    // --command-env pass-through. Bubblewrap ignores this outer env (its own
+    // `--clearenv`/`--setenv` governs the child), but Seatbelt and the direct
+    // test backend `execve` the target in place, so they inherit it — and
+    // without the runtime-root wiring here a Seatbelt child would lose the
+    // cargo/rustup PATH additions (Seam 1). Applying it unconditionally is
+    // correct for all three: bwrap wipes it, the others need it.
+    let launch_environment = runtime_plus_passthrough_env(
+        policy.containment_config.readonly_runtime_roots(),
+        &policy.passthrough_environment,
+    );
+    for (name, value) in merged_containment_environment(&launch_environment) {
         command.env(name, value);
     }
     #[cfg(unix)]
@@ -2821,8 +3226,11 @@ async fn run_supervised_command(
             });
         }
     }
-    #[cfg(test)]
-    if let Some(cwd) = launch.direct_cwd {
+    // Run the contained command in its authorized cwd. Bubblewrap leaves this
+    // None (it --chdir's inside its own argv); Seatbelt and the direct test
+    // backend set it, since neither re-roots the child any other way. The path
+    // is the canonical authorized cwd, never a model-chosen value.
+    if let Some(cwd) = &launch.working_directory {
         command.current_dir(cwd);
     }
     let shell_signal_status = launch.shell_signal_status;
@@ -4486,6 +4894,12 @@ mod tests {
         assert_eq!(home, Some("/tmp/kitsu-passthrough-home"));
     }
 
+    // Linux-only: it forces a BubblewrapBackend via a bogus bwrap path and
+    // expects BackendMissing. On macOS `with_containment_config` yields a
+    // SeatbeltBackend that ignores that path and probes /usr/bin/sandbox-exec,
+    // so the premise does not hold. The equivalent macOS failure modes are
+    // covered by the Seatbelt profile/preflight tests.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn missing_containment_backend_is_typed_and_denied_before_approval() {
         let dir = tempfile::tempdir().unwrap();
@@ -5395,5 +5809,151 @@ mod tests {
             !lowercase.contains("transient"),
             "a permanent spawn failure must not claim to be transient: {message}"
         );
+    }
+
+    // ---- macOS Seatbelt backend ---------------------------------------------
+
+    #[cfg(target_os = "macos")]
+    fn launch_inputs_for(program: &str, writable: &[&str], cwd: &str) -> LaunchInputs {
+        LaunchInputs {
+            program: PathBuf::from(program),
+            writable_command_roots: writable.iter().map(PathBuf::from).collect(),
+            cwd: PathBuf::from(cwd),
+        }
+    }
+
+    /// The profile is deny-default, isolates the network, names the program for
+    /// exec, and the writable set is EXACTLY the command roots + cwd + tmp (+dev
+    /// nodes) — nothing else. Pure string assertions, nothing spawned (mirrors
+    /// the `base_bubblewrap_arguments` plan tests).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_profile_denies_by_default_and_confines_writes_to_the_roots() {
+        let inputs = launch_inputs_for(
+            "/opt/tool/bin/git",
+            &["/work/project"],
+            "/work/project/sub",
+        );
+        let profile = build_seatbelt_profile(&inputs).expect("profile builds");
+
+        assert!(profile.contains("(version 1)"), "{profile}");
+        assert!(profile.contains("(deny default)"), "{profile}");
+        assert!(profile.contains("(deny network*)"), "{profile}");
+        // Reads and process spawning are open; the enforced perimeter is writes
+        // + network. What may run is gated by the shared executable-visibility
+        // check, not the profile.
+        assert!(profile.contains("(allow file-read*)"), "reads open: {profile}");
+        assert!(profile.contains("(allow process*)"), "process open: {profile}");
+
+        // Isolate the file-write* block (from its opening line to the lone `)`
+        // terminator) and assert its subpaths are exactly the writable roots +
+        // cwd + /private/tmp (dev nodes are literals, not subpaths).
+        let after_open = profile
+            .split("(allow file-write*\n")
+            .nth(1)
+            .expect("a file-write* block");
+        let write_block: String = after_open
+            .lines()
+            .take_while(|l| l.trim() != ")")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let write_subpaths: Vec<&str> = write_block
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("(subpath \"").and_then(|s| s.strip_suffix("\")")))
+            .collect();
+        let mut expected = vec!["/work/project", "/work/project/sub", "/private/tmp"];
+        let mut got = write_subpaths.clone();
+        expected.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, expected, "writable subpaths must be exactly roots+cwd+tmp: {profile}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_profile_carries_no_environment_secrets() {
+        // The profile never carries env at all (env rides the outer process),
+        // so it trivially cannot leak a token — assert that invariant holds.
+        let inputs = launch_inputs_for("/bin/echo", &["/w"], "/w");
+        let profile = build_seatbelt_profile(&inputs).unwrap();
+        assert!(!profile.contains("TOKEN"), "{profile}");
+        assert!(!profile.contains("SECRET"), "{profile}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sbpl_quote_escapes_quotes_and_rejects_control_and_non_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // A path with an embedded double-quote is escaped, not dropped.
+        let q = sbpl_quote(Path::new("/weird/a\"b")).expect("quotes escape");
+        assert_eq!(q, "\"/weird/a\\\"b\"");
+        // A backslash is escaped too.
+        let b = sbpl_quote(Path::new("/weird/a\\b")).unwrap();
+        assert_eq!(b, "\"/weird/a\\\\b\"");
+        // A newline (s-expr structure attack) is refused.
+        assert!(matches!(
+            sbpl_quote(Path::new("/weird/a\nb")),
+            Err(e) if e.reason == CommandContainmentUnavailableReason::InvalidConfiguration
+        ));
+        // Non-UTF-8 is refused (never lossily transcoded into a policy).
+        let non_utf8 = std::ffi::OsStr::from_bytes(b"/weird/\xff");
+        assert!(matches!(
+            sbpl_quote(Path::new(non_utf8)),
+            Err(e) if e.reason == CommandContainmentUnavailableReason::InvalidConfiguration
+        ));
+    }
+
+    /// Live end-to-end: a granted command runs contained via sandbox-exec, and
+    /// a write OUTSIDE the granted roots is denied by the profile. Skips (does
+    /// not fail) if Seatbelt is unavailable, mirroring the bwrap live test.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn live_seatbelt_runs_a_command_and_blocks_outside_writes() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let policy = CommandPolicy::new(&[root(&allowed)], CommandMode::Deny)
+            .unwrap()
+            .with_containment_config(CommandContainmentConfig::default());
+        let CommandContainmentStatus::Ready(ready) = policy.containment_status() else {
+            eprintln!(
+                "skipping live Seatbelt assertions: {:?}",
+                policy.containment_status()
+            );
+            return;
+        };
+        assert_eq!(ready.backend, CommandContainmentBackendKind::Seatbelt);
+
+        // A write INSIDE the granted root succeeds and is contained.
+        let inside = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo contained > ./inside.txt".to_string(),
+        ];
+        policy.grant_command(&inside, allowed.path()).unwrap();
+        let output = execute_command(
+            &policy,
+            CommandExecArgs { argv: inside, cwd: root(&allowed), timeout_ms: Some(5_000) },
+        )
+        .await
+        .unwrap();
+        assert!(output.success, "write inside root should succeed: {}", output.stderr);
+        assert!(allowed.path().join("inside.txt").exists(), "file was written in the root");
+
+        // A write OUTSIDE every granted root is denied by the profile.
+        let leak = outside.path().join("leak.txt");
+        let escape = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo escaped > {}", leak.display()),
+        ];
+        policy.grant_command(&escape, allowed.path()).unwrap();
+        let output = execute_command(
+            &policy,
+            CommandExecArgs { argv: escape, cwd: root(&allowed), timeout_ms: Some(5_000) },
+        )
+        .await
+        .unwrap();
+        assert!(!output.success, "write outside the roots must fail");
+        assert!(!leak.exists(), "the outside file must not have been created");
     }
 }
