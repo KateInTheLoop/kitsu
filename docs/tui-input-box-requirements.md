@@ -125,12 +125,21 @@ blind edit to cursor/layout risked regressions).
 4. **Copy-box: edit-into** (Req B, enter/exit the span to edit). Last, builds on
    the span model.
 
-### Open decisions (need a call before building)
-- Threshold: ≥2 lines? ≥N words? both?
-- Box style: `╭─╮` frame vs `❯` + rule (match kitsu's existing kitsune banner
-  box, or the Claude `❯` look the user showed).
-- "Enter paste box" key (must dodge the taken bindings above).
-- Does the status meter go above or below the box?
+### Decisions (made 2026-10-20)
+1. **Threshold:** collapse a paste into a copy-box when it is **≥ 2 lines OR
+   ≥ 10 words**. Shorter pastes insert inline as text.
+2. **Box style:** `╭─ … ─╮ / │ … │ / ╰─ … ─╯` frame matching kitsu's kitsune
+   banner, **full-width** rule (the Claude `❯`-box look, kitsu-skinned).
+3. **Copy-box editing = a separate POPUP overlay, NOT in-line span editing.**
+   The copy-box is a display token in the main input. To view/edit it, open a
+   popup overlay showing the full pasted text; **Esc exits** (saving edits).
+   **No recursive paste-box inside** the popup — it holds plain full text only.
+   This sidesteps the flat-`Vec<char>` span-model problem for EDITING: the main
+   buffer only needs to store the token + its backing text, and the popup is a
+   normal text editor over that backing string. Boundary-delete still removes
+   the whole token. Reuses the alt-screen/MODAL_PANE overlay machinery already
+   built for the model picker / agent view.
+4. **Status meter goes ABOVE the input box.**
 
 ### Non-goals / risks
 - Classic + fullscreen modes keep current behavior (box is inline-only).
