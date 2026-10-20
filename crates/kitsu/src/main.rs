@@ -23041,6 +23041,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     report_write_checkpoints(write_journal.drain_and_take_reports().await);
     if !no_session {
         let _ = rl.save_history(&history_path);
+        // Tell the user how to come back: an autosaved session is only useful
+        // if its id is visible at exit. Printed to stderr (not the JSONL event
+        // stream), only for a real interactive session that actually persisted
+        // an id, so scripted/piped runs stay quiet.
+        if interactive {
+            if let Some(id) = session.session_id.borrow().as_deref() {
+                eprintln!(
+                    "~ session saved: resume with `kitsu chat --resume {}` (or `--resume last`)",
+                    shell_quote(id)
+                );
+            }
+        }
     }
     if let Some(task) = agent_notification_task {
         task.abort();
