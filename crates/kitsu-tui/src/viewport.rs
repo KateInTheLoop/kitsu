@@ -74,6 +74,11 @@ struct Inner {
     /// separate ring lock would let their pushes land in the opposite order
     /// from their bytes.
     cells: Option<crate::cells::CellRing>,
+    /// True while [`InlineSurface::place_caret`] has moved the cursor into the
+    /// pinned viewport (the framed input box owns its caret there). Every
+    /// transcript write re-parks on the scroll region's last row first, so
+    /// output never lands inside the viewport (review F5).
+    caret_in_viewport: bool,
 }
 
 impl Inner {
@@ -82,6 +87,20 @@ impl Inner {
         match fd {
             Fd::Stdout => &mut *self.out,
             Fd::Stderr => &mut *self.err,
+        }
+    }
+
+    /// Restore the park invariant before a transcript write: if the caret was
+    /// placed inside the viewport, move it back to column 1 of the scroll
+    /// region's last row — exactly where [`InlineSurface::paint`] parks it.
+    fn repark(&mut self) {
+        if !self.caret_in_viewport {
+            return;
+        }
+        self.caret_in_viewport = false;
+        if let Some((bottom, _)) = self.geometry {
+            let _ = write!(self.err, "\x1b[{bottom};1H");
+            let _ = self.err.flush();
         }
     }
 }
@@ -213,6 +232,7 @@ impl InlineSurface {
                 err,
                 geometry: None,
                 cells: None,
+                caret_in_viewport: false,
             }),
         }
     }
@@ -237,6 +257,7 @@ impl InlineSurface {
                 // its own, so nothing here can drift from
                 // `TuiConfig::{MIN,DEFAULT,MAX}_CELL_RING_LINES`.
                 cells: Some(crate::cells::CellRing::new(cell_ring_lines)),
+                caret_in_viewport: false,
             }),
         }
     }
@@ -370,6 +391,25 @@ impl InlineSurface {
             let _ = write!(inner.err, "\x1b[{line};1H\x1b[2K{row}");
         }
         let _ = write!(inner.err, "\x1b[{bottom};1H");
+        inner.caret_in_viewport = false;
+        let _ = inner.err.flush();
+    }
+
+    /// Move the hardware caret into the viewport at `viewport_row` (1-based,
+    /// counted from the viewport's TOP row) and `col` (1-based), for a composer
+    /// that owns its caret (the framed input box). The viewport's rows are
+    /// addressed from the *latched* geometry, so the caret can never land
+    /// outside them; out-of-range rows clamp to the last viewport row. The
+    /// next transcript write re-parks on the scroll region first.
+    pub fn place_caret(&self, viewport_row: u16, col: u16) {
+        let mut inner = self.lock();
+        let Some((bottom, viewport_rows)) = inner.geometry else {
+            return;
+        };
+        let row = viewport_row.clamp(1, viewport_rows.max(1));
+        let line = bottom + row;
+        let _ = write!(inner.err, "\x1b[{line};{}H", col.max(1));
+        inner.caret_in_viewport = true;
         let _ = inner.err.flush();
     }
 }
@@ -380,6 +420,7 @@ impl Surface for InlineSurface {
     /// viewport runs in raw mode where `ONLCR` no longer supplies it.
     fn transcript_line(&self, fd: Fd, text: &str) {
         let mut inner = self.lock();
+        inner.repark();
         let sink = inner.sink(fd);
         let _ = sink.write_all(text.as_bytes());
         let _ = sink.write_all(b"\r\n");
@@ -406,6 +447,7 @@ impl Surface for InlineSurface {
         let mut bytes: Vec<u8> = Vec::new();
         block(&mut bytes);
         let mut inner = self.lock();
+        inner.repark();
         let sink = inner.sink(fd);
         let _ = sink.write_all(&bytes);
         let _ = sink.flush();
@@ -516,6 +558,35 @@ mod tests {
             .windows(needle.len())
             .filter(|w| *w == needle)
             .count()
+    }
+
+    /// Review F5: a composer that places its caret inside the viewport must
+    /// not make the next transcript write land there. The write re-parks on
+    /// the scroll region's last row first, exactly where `paint` parks.
+    #[test]
+    fn transcript_write_after_place_caret_reparks_on_the_scroll_region() {
+        let (surface, sink) = shared();
+        surface.show(24, 3); // scroll region 1..=21, viewport rows 22..=24
+        surface.place_caret(2, 9); // viewport row 2 → terminal line 23
+        let before = sink.bytes().len();
+        assert!(sink.text().ends_with("\x1b[23;9H"), "caret placed in the viewport");
+
+        surface.transcript_line(Fd::Stdout, "answer");
+        let after = String::from_utf8(sink.bytes()[before..].to_vec()).unwrap();
+        assert!(
+            after.starts_with("\x1b[21;1Hanswer\r\n"),
+            "re-park on row 21 before the text: {after:?}"
+        );
+
+        // Already parked: a second write adds no positioning bytes.
+        let before = sink.bytes().len();
+        surface.transcript_line(Fd::Stdout, "more");
+        let after = String::from_utf8(sink.bytes()[before..].to_vec()).unwrap();
+        assert_eq!(after, "more\r\n", "no re-park when nothing moved the caret");
+
+        // Out-of-range rows clamp to the viewport; never the scroll region.
+        surface.place_caret(99, 1);
+        assert!(sink.text().ends_with("\x1b[24;1H"), "clamped to the last viewport row");
     }
 
     #[test]

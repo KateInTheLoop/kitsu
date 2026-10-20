@@ -370,6 +370,35 @@ pub fn compose_input_box(draft: &LiveDraft, cols: usize) -> InputBox {
     }
 }
 
+/// Fit a composed box into `max_rows` (the height the viewport will actually
+/// grant). The viewport keeps the LAST rows of over-tall content, which would
+/// cut off the top border (review F8), so trim CONTENT rows here instead:
+/// first the rows above the caret (oldest context), then rows below it. Both
+/// borders and the caret row always survive; the caret row index is kept in
+/// step. Never returns fewer than 3 rows.
+pub fn fit_input_box(mut b: InputBox, max_rows: usize) -> InputBox {
+    let max_rows = max_rows.max(3);
+    if b.rows.len() <= max_rows {
+        return b;
+    }
+    let overflow = b.rows.len() - max_rows;
+    let caret_idx = b.caret.0 - 1; // 0-based; index 0 is the top border
+    let drop_above = overflow.min(caret_idx.saturating_sub(1));
+    if drop_above > 0 {
+        b.rows.drain(1..1 + drop_above);
+        b.caret.0 -= drop_above;
+    }
+    let remaining = overflow - drop_above;
+    if remaining > 0 {
+        let start = b.caret.0; // first row below the caret row (0-based)
+        let end = (start + remaining).min(b.rows.len() - 1); // keep bottom border
+        if start < end {
+            b.rows.drain(start..end);
+        }
+    }
+    b
+}
+
 /// The plain content lines for the input box, the caret's line index among
 /// them, and the caret's column within that line. Mirrors
 /// `compose_draft_context_rows`' budget but returns plain (unframed) text so
@@ -1727,6 +1756,31 @@ mod tests {
         assert!(!sanitize_terminal_text(&b.rows[3]).contains("kitsu>"), "prompt only on first line");
         assert_eq!(b.caret.0, 4, "caret on the cursor's line (row 4, 1-based)");
         assert_eq!(b.caret.1, 2 + "third".len() + 1, "caret after 'third'");
+    }
+
+    #[test]
+    fn fit_input_box_keeps_both_borders_and_the_caret_row() {
+        // Review F8: a box taller than the grant must lose CONTENT rows, never
+        // the top border (the viewport would otherwise drop it from the top).
+        let buffer: String = (1..=20).map(|n| format!("l{n}\n")).collect::<String>() + "end";
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: buffer.clone(),
+            cursor: buffer.chars().count(),
+            ..LiveDraft::default()
+        };
+        let full = compose_input_box(&draft, 40);
+        assert!(full.rows.len() > 6, "precondition: taller than the grant");
+        let fit = fit_input_box(full, 6);
+        assert_eq!(fit.rows.len(), 6, "{:?}", fit.rows);
+        assert!(sanitize_terminal_text(&fit.rows[0]).starts_with('╭'), "top border kept");
+        assert!(sanitize_terminal_text(&fit.rows[5]).starts_with('╰'), "bottom border kept");
+        let caret_row = sanitize_terminal_text(&fit.rows[fit.caret.0 - 1]);
+        assert!(caret_row.contains("end"), "caret row survives: {caret_row:?}");
+
+        // A box that already fits is untouched.
+        let small = compose_input_box(&LiveDraft { prompt: "k> ".to_string(), ..LiveDraft::default() }, 40);
+        assert_eq!(fit_input_box(small, 6).rows.len(), 3);
     }
 
     #[test]

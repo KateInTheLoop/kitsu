@@ -1733,10 +1733,11 @@ impl BridgeGuard {
                 hint: hint.to_string(),
                 hint_reserved,
             };
-            let boxed = live::compose_input_box(&composed, columns);
-            let budget = self
-                .granted_rows(u16::MAX)
-                .saturating_sub(u16::try_from(boxed.rows.len()).unwrap_or(u16::MAX));
+            // Fit the box to what the terminal will grant BEFORE painting, so
+            // the viewport never drops the top border to make room (review F8).
+            let grant = usize::from(self.granted_rows(u16::MAX));
+            let boxed = live::fit_input_box(live::compose_input_box(&composed, columns), grant);
+            let budget = u16::try_from(grant.saturating_sub(boxed.rows.len())).unwrap_or(0);
             let mut content = if crate::slash_palette_adds_to_the_row(draft, hint) {
                 palette_rows(
                     draft,
@@ -1747,21 +1748,17 @@ impl BridgeGuard {
             } else {
                 Vec::new()
             };
+            let above = content.len();
             content.extend(boxed.rows.iter().cloned());
             let painted = self.paint_rows(&content);
-            // Place the caret inside the box. The box is the bottom of the
-            // region, so its top row is terminal row (term_rows - len + 1)
-            // whatever sits above it; address the caret absolutely.
+            // Own the caret inside the box, through the surface so the next
+            // transcript write re-parks on the scroll region first (review F5).
+            // The row is counted from the viewport's top, from the latched
+            // geometry — not a fresh terminal probe (review F8).
             if painted {
-                use std::io::Write as _;
-                let total = boxed.rows.len() as u16;
-                let term_rows = live::terminal_rows() as u16;
-                let top = term_rows.saturating_sub(total).saturating_add(1);
-                let caret_row = top + (boxed.caret.0 as u16).saturating_sub(1);
-                let caret_col = boxed.caret.1;
-                let mut err = std::io::stderr();
-                let _ = err.write_all(format!("\x1b[{caret_row};{caret_col}H").as_bytes());
-                let _ = err.flush();
+                let row = u16::try_from(above + boxed.caret.0).unwrap_or(u16::MAX);
+                let col = u16::try_from(boxed.caret.1).unwrap_or(u16::MAX);
+                self.pane.viewport.place_caret(row, col);
             }
             return painted;
         }
