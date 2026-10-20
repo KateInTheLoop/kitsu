@@ -5956,4 +5956,172 @@ mod tests {
         assert!(!output.success, "write outside the roots must fail");
         assert!(!leak.exists(), "the outside file must not have been created");
     }
+
+    // ---- macOS Seatbelt backend: live integration (file ops, git, scripts,
+    // permission grant/revoke). Each skips (does not fail) when Seatbelt is
+    // unavailable, mirroring the Linux live tests. ------------------------------
+
+    /// A contained policy over `root` using the real Seatbelt backend, or None
+    /// if containment is not ready on this host (the test should then skip).
+    #[cfg(target_os = "macos")]
+    fn live_seatbelt_policy(root_dir: &tempfile::TempDir) -> Option<CommandPolicy> {
+        let policy = CommandPolicy::new(&[root(root_dir)], CommandMode::Deny)
+            .unwrap()
+            .with_containment_config(CommandContainmentConfig::default());
+        match policy.containment_status() {
+            CommandContainmentStatus::Ready(ready)
+                if ready.backend == CommandContainmentBackendKind::Seatbelt =>
+            {
+                Some(policy)
+            }
+            other => {
+                eprintln!("skipping live Seatbelt test: {other:?}");
+                None
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn run_granted(
+        policy: &CommandPolicy,
+        dir: &tempfile::TempDir,
+        argv: &[&str],
+    ) -> CommandOutput {
+        let argv: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
+        policy.grant_command(&argv, dir.path()).unwrap();
+        execute_command(
+            policy,
+            CommandExecArgs { argv, cwd: root(dir), timeout_ms: Some(10_000) },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// File operations round-trip under containment: a write inside the root
+    /// lands on disk and a subsequent contained read sees it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn live_seatbelt_file_ops_round_trip_inside_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(policy) = live_seatbelt_policy(&dir) else { return };
+
+        let write = run_granted(
+            &policy,
+            &dir,
+            &["/bin/sh", "-c", "printf 'hello-contained' > ./note.txt"],
+        )
+        .await;
+        assert!(write.success, "write inside root: {}", write.stderr);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("note.txt")).unwrap(),
+            "hello-contained"
+        );
+
+        // A contained read of the same file sees the content.
+        let read = run_granted(&policy, &dir, &["/bin/cat", "./note.txt"]).await;
+        assert!(read.success, "read inside root: {}", read.stderr);
+        assert_eq!(read.stdout.trim(), "hello-contained");
+    }
+
+    /// Git works end-to-end under containment: init, add, commit, status — all
+    /// writing inside the granted root. This is the headline capability the
+    /// macOS backend unlocks.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn live_seatbelt_git_init_add_commit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(policy) = live_seatbelt_policy(&dir) else { return };
+        let git = "/usr/bin/git";
+        if !std::path::Path::new(git).exists() {
+            eprintln!("skipping: {git} not present");
+            return;
+        }
+
+        let init = run_granted(&policy, &dir, &[git, "init", "-q"]).await;
+        assert!(init.success, "git init: {}", init.stderr);
+        assert!(dir.path().join(".git").exists(), "repo created in the root");
+
+        // Config + a file + add + commit, all contained writes.
+        for argv in [
+            vec![git, "config", "user.email", "t@t"],
+            vec![git, "config", "user.name", "t"],
+        ] {
+            let out = run_granted(&policy, &dir, &argv).await;
+            assert!(out.success, "git config: {}", out.stderr);
+        }
+        let _ = run_granted(&policy, &dir, &["/bin/sh", "-c", "echo hi > ./f.txt"]).await;
+        let add = run_granted(&policy, &dir, &[git, "add", "f.txt"]).await;
+        assert!(add.success, "git add: {}", add.stderr);
+        let commit = run_granted(&policy, &dir, &[git, "commit", "-q", "-m", "x"]).await;
+        assert!(commit.success, "git commit: {}", commit.stderr);
+        let status = run_granted(&policy, &dir, &[git, "status", "--porcelain"]).await;
+        assert!(status.success, "git status: {}", status.stderr);
+        assert!(status.stdout.trim().is_empty(), "clean tree after commit: {:?}", status.stdout);
+    }
+
+    /// A multi-step shell script runs contained and its writes (including a
+    /// nested directory) stay inside the root.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn live_seatbelt_script_creates_nested_files_inside_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(policy) = live_seatbelt_policy(&dir) else { return };
+
+        let out = run_granted(
+            &policy,
+            &dir,
+            &["/bin/sh", "-c", "mkdir -p sub/deep && echo a > sub/deep/a.txt && echo b >> sub/deep/a.txt && wc -l < sub/deep/a.txt"],
+        )
+        .await;
+        assert!(out.success, "script: {}", out.stderr);
+        assert_eq!(out.stdout.trim(), "2", "script ran all steps");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sub/deep/a.txt")).unwrap(),
+            "a\nb\n"
+        );
+    }
+
+    /// The permission grant/revoke flow gates execution: in Deny mode an
+    /// ungranted argv is refused before it runs; granting lets it run; revoking
+    /// refuses it again. (Independent of the sandbox — works without Seatbelt —
+    /// but asserted here as the authority half of the backend contract.)
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn live_seatbelt_grant_then_revoke_gates_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(policy) = live_seatbelt_policy(&dir) else { return };
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "echo ok > ./g.txt".to_string()];
+
+        // Ungranted in Deny mode: refused before execution, no file.
+        let denied = execute_command(
+            &policy,
+            CommandExecArgs { argv: argv.clone(), cwd: root(&dir), timeout_ms: Some(5_000) },
+        )
+        .await;
+        assert!(denied.is_err(), "ungranted command must be denied");
+        assert!(!dir.path().join("g.txt").exists(), "denied command wrote nothing");
+
+        // Granted: runs and writes.
+        policy.grant_command(&argv, dir.path()).unwrap();
+        let ok = execute_command(
+            &policy,
+            CommandExecArgs { argv: argv.clone(), cwd: root(&dir), timeout_ms: Some(5_000) },
+        )
+        .await
+        .unwrap();
+        assert!(ok.success, "granted command runs: {}", ok.stderr);
+        assert!(dir.path().join("g.txt").exists(), "granted command wrote the file");
+
+        // Revoked: refused again.
+        assert!(
+            policy.revoke_command(&argv, dir.path()).unwrap().is_some(),
+            "revoke removes the grant"
+        );
+        let denied_again = execute_command(
+            &policy,
+            CommandExecArgs { argv, cwd: root(&dir), timeout_ms: Some(5_000) },
+        )
+        .await;
+        assert!(denied_again.is_err(), "revoked command is denied again");
+    }
 }
