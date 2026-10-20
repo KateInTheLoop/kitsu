@@ -19458,9 +19458,9 @@ struct CwdGrant {
 /// check). `--yes` means "no prompts, just work": grant the cwd read+write so
 /// an automation run can read and write there without hand-assembling
 /// `--allow-read-write <dir>` (scoped to the cwd — NOT the global bypass).
-/// Interactive-without-`--yes` keeps the historical read-only cwd grant; writes
-/// outside explicit roots still prompt. Non-interactive without `--yes` grants
-/// nothing (deny-by-default stands).
+/// An interactive session gets the same read+write cwd grant, so editing the
+/// current project just works; writes OUTSIDE the cwd still prompt (Mode::Ask).
+/// Non-interactive without `--yes` grants nothing (deny-by-default stands).
 fn cwd_grant(yes: bool, interactive: bool) -> CwdGrant {
     if yes || interactive {
         // Both a non-prompting `--yes` run and an interactive session grant the
