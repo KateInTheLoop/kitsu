@@ -320,10 +320,14 @@ const DRAFT_CONTEXT_ROWS: usize = 12;
 /// to [`DRAFT_CONTEXT_ROWS`], older ones collapsing into a `⋮` marker inside the
 /// frame. Returns at least 3 rows (top border, one content row, bottom border).
 ///
-/// NOTE: unused until Phase 2 wires it into `redraw_locked` (the live scroll
-/// region / resize / overlay interplay, which must be verified on a real
-/// terminal). Built and unit-tested first so the geometry is correct before the
-/// un-testable wiring. See docs/tui-input-box-requirements.md.
+/// NOTE: unused until Phase 2 wires it into the composer painter. The correct
+/// wiring site is `tui_bridge::paint_composer` → `compose_input_row` (the
+/// pinned-viewport bottom row that actually draws the idle `kitsu>` prompt),
+/// NOT the typeahead `render_region`. Wiring a multi-row box there means
+/// growing the pinned DECSTBM viewport region to the box height — a viewport
+/// change that must be verified on a real terminal. Built and unit-tested first
+/// so the geometry is correct before the un-testable wiring.
+/// See docs/tui-input-box-requirements.md.
 #[allow(dead_code)]
 struct InputBox {
     rows: Vec<String>,
@@ -331,7 +335,7 @@ struct InputBox {
     caret: (usize, usize),
 }
 
-#[allow(dead_code)] // Phase 2 wires this into the live redraw; see InputBox.
+#[allow(dead_code)] // Phase 2 wires this via tui_bridge::paint_composer.
 fn compose_input_box(draft: &LiveDraft, cols: usize) -> InputBox {
     // A sane floor so a pathologically narrow terminal still yields a box
     // rather than panicking on the width arithmetic.
@@ -373,7 +377,7 @@ fn compose_input_box(draft: &LiveDraft, cols: usize) -> InputBox {
 /// `compose_draft_context_rows`' budget but returns plain (unframed) text so
 /// the box renderer owns the framing. The prompt is the first thing on the
 /// caret line (e.g. "kitsu> "), matching the single-row composer.
-#[allow(dead_code)] // Phase 2 wires this via compose_input_box; see InputBox.
+#[allow(dead_code)] // used by compose_input_box; both wired in Phase 2.
 fn input_box_content(draft: &LiveDraft, inner: usize) -> (Vec<String>, usize, usize) {
     let prompt = sanitize_terminal_text(&draft.prompt);
     let buffer = &draft.buffer;
