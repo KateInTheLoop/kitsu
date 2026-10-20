@@ -304,6 +304,129 @@ const STATUS_METER_CELLS: u64 = 8;
 /// are hidden.
 const DRAFT_CONTEXT_ROWS: usize = 12;
 
+/// A full-width framed input box (Phase 1 of the Claude-CLI-style composer,
+/// see docs/tui-input-box-requirements.md). Renders the draft inside a
+/// kitsu-banner frame that is ALWAYS present (even empty), so the input region
+/// and its caret exist from launch rather than appearing only once typing
+/// starts. Pure: returns the frame rows plus the caret's (row, col) *within the
+/// returned rows*, both 1-based, for the live loop to position the hardware
+/// cursor. The live wiring (scroll region, resize, overlay interplay) consumes
+/// this; it is kept separate so the geometry is unit-testable without a
+/// terminal — the one part of the composer that can be.
+///
+/// `cols` is the terminal width. The box claims the full width. `inner` is the
+/// usable text width (`cols - 4`: two border cells + one pad each side). The
+/// draft's cursor line is shown on the caret row; extra lines render above up
+/// to [`DRAFT_CONTEXT_ROWS`], older ones collapsing into a `⋮` marker inside the
+/// frame. Returns at least 3 rows (top border, one content row, bottom border).
+///
+/// NOTE: unused until Phase 2 wires it into `redraw_locked` (the live scroll
+/// region / resize / overlay interplay, which must be verified on a real
+/// terminal). Built and unit-tested first so the geometry is correct before the
+/// un-testable wiring. See docs/tui-input-box-requirements.md.
+#[allow(dead_code)]
+struct InputBox {
+    rows: Vec<String>,
+    /// 1-based (row, col) of the caret within `rows`.
+    caret: (usize, usize),
+}
+
+#[allow(dead_code)] // Phase 2 wires this into the live redraw; see InputBox.
+fn compose_input_box(draft: &LiveDraft, cols: usize) -> InputBox {
+    // A sane floor so a pathologically narrow terminal still yields a box
+    // rather than panicking on the width arithmetic.
+    let cols = cols.max(8);
+    let (r, g, b) = crate::theme().accent;
+    let inner = cols - 4; // "│ " + text + " │"
+    let bar = |s: &str| format!("│ {s} │"); // caller pads `s` to `inner`
+
+    // Content lines (plain, display-mapped, clamped to `inner`), with the
+    // caret's line index and column within it.
+    let (content, caret_line, caret_col_in_line) = input_box_content(draft, inner);
+
+    let horizontal: String = "─".repeat(cols.saturating_sub(2));
+    let top = format!("{}", format!("╭{horizontal}╮").truecolor(r, g, b));
+    let bottom = format!("{}", format!("╰{horizontal}╯").truecolor(r, g, b));
+
+    let mut rows = Vec::with_capacity(content.len() + 2);
+    rows.push(top);
+    for line in &content {
+        // Pad the (already clamped) plain text to the inner width.
+        let pad = inner.saturating_sub(display_width(line));
+        let padded = format!("{line}{}", " ".repeat(pad));
+        rows.push(bar(&padded));
+    }
+    rows.push(bottom);
+
+    // Caret: content starts at row index 1 (after the top border); columns are
+    // "│ " = 2 border/pad cells + the column within the line, all 1-based.
+    let caret_row = 1 + caret_line + 1; // +1 for top border, +1 for 1-based
+    let caret_col = 2 + caret_col_in_line + 1;
+    InputBox {
+        rows,
+        caret: (caret_row, caret_col),
+    }
+}
+
+/// The plain content lines for the input box, the caret's line index among
+/// them, and the caret's column within that line. Mirrors
+/// `compose_draft_context_rows`' budget but returns plain (unframed) text so
+/// the box renderer owns the framing. The prompt is the first thing on the
+/// caret line (e.g. "kitsu> "), matching the single-row composer.
+#[allow(dead_code)] // Phase 2 wires this via compose_input_box; see InputBox.
+fn input_box_content(draft: &LiveDraft, inner: usize) -> (Vec<String>, usize, usize) {
+    let prompt = sanitize_terminal_text(&draft.prompt);
+    let buffer = &draft.buffer;
+    let clamp = |s: &str| -> String {
+        let mapped: String = sanitize_terminal_text(s).chars().map(display_char).collect();
+        if display_width(&mapped) <= inner {
+            return mapped;
+        }
+        let budget = inner.saturating_sub(1);
+        let mut used = 0usize;
+        let mut out: String = mapped
+            .chars()
+            .take_while(|&c| {
+                used += crate::char_display_width(c);
+                used <= budget
+            })
+            .collect();
+        out.push('…');
+        out
+    };
+
+    if !buffer.contains('\n') {
+        // Single line: "prompt + buffer", caret after the prompt + cursor chars.
+        let line = format!("{prompt}{buffer}");
+        let caret_col = display_width(&prompt)
+            + display_width(&buffer.chars().take(draft.cursor).collect::<String>());
+        return (vec![clamp(&line)], 0, caret_col.min(inner));
+    }
+
+    // Multi-line: earlier lines (dim-free here; the frame is the chrome), then
+    // the cursor line carrying the prompt. Budgeted like the context rows.
+    let chars: Vec<char> = buffer.chars().collect();
+    let cursor = draft.cursor.min(chars.len());
+    let lines: Vec<&str> = buffer.split('\n').collect();
+    let cursor_line = chars[..cursor].iter().filter(|&&c| c == '\n').count();
+    let mut out: Vec<String> = Vec::new();
+    if cursor_line > DRAFT_CONTEXT_ROWS {
+        out.push(clamp(&format!("⋮ +{} earlier line(s)", cursor_line - DRAFT_CONTEXT_ROWS)));
+    }
+    let first = cursor_line.saturating_sub(DRAFT_CONTEXT_ROWS);
+    for line in lines.iter().take(cursor_line).skip(first) {
+        out.push(clamp(line));
+    }
+    // Cursor line carries the prompt prefix.
+    let (line_start, _, _) = current_line_bounds(buffer, cursor);
+    let cursor_line_text: String = lines.get(cursor_line).copied().unwrap_or("").to_string();
+    let caret_line_idx = out.len();
+    out.push(clamp(&format!("{prompt}{cursor_line_text}")));
+    let caret_col = display_width(&prompt)
+        + display_width(&chars[line_start..cursor].iter().collect::<String>());
+    (out, caret_line_idx, caret_col.min(inner))
+}
+
 /// The shortest model segment worth keeping. Below this the model is dropped
 /// outright instead of truncated to an unreadable stub.
 const STATUS_MODEL_MIN_COLS: usize = 7;
@@ -1531,6 +1654,55 @@ mod tests {
         assert_eq!(plain.len(), 2);
         assert!(plain[0].contains("first line"));
         assert!(plain[1].contains("second line"));
+    }
+
+    #[test]
+    fn input_box_is_always_framed_with_a_caret_even_when_empty() {
+        // Empty draft: a 3-row full-width box (top, one content row, bottom),
+        // caret on the content row just after the prompt. This is the fix for
+        // "no box at idle + stranded cursor": the region and caret exist with
+        // no input.
+        let draft = LiveDraft { prompt: "kitsu> ".to_string(), ..LiveDraft::default() };
+        let b = compose_input_box(&draft, 40);
+        assert_eq!(b.rows.len(), 3, "empty box is top+content+bottom: {:?}", b.rows);
+        assert!(sanitize_terminal_text(&b.rows[0]).starts_with("╭"));
+        assert!(sanitize_terminal_text(&b.rows[2]).starts_with("╰"));
+        // Full width: every row is `cols` display columns.
+        for row in &b.rows {
+            assert_eq!(display_width(&sanitize_terminal_text(row)), 40, "full-width: {row:?}");
+        }
+        // Caret on row 2 (1-based: top border is 1), column after "│ kitsu> ".
+        assert_eq!(b.caret.0, 2, "caret on the content row");
+        assert_eq!(b.caret.1, 2 + "kitsu> ".len() + 1, "caret just past the prompt");
+    }
+
+    #[test]
+    fn input_box_places_caret_after_typed_text_and_grows_multiline() {
+        // Single line: caret advances with the cursor.
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "hello".to_string(),
+            cursor: 5,
+            ..LiveDraft::default()
+        };
+        let b = compose_input_box(&draft, 40);
+        assert_eq!(b.rows.len(), 3);
+        assert!(sanitize_terminal_text(&b.rows[1]).contains("kitsu> hello"));
+        assert_eq!(b.caret.1, 2 + "kitsu> hello".len() + 1);
+
+        // Multi-line: the box grows and the caret lands on the cursor's line.
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "first\nsecond\nthird".to_string(),
+            cursor: 18, // end of "third"
+            ..LiveDraft::default()
+        };
+        let b = compose_input_box(&draft, 40);
+        // top + 2 earlier lines + cursor line + bottom = 5 rows.
+        assert_eq!(b.rows.len(), 5, "{:?}", b.rows);
+        assert!(sanitize_terminal_text(&b.rows[3]).contains("kitsu> third"));
+        assert_eq!(b.caret.0, 4, "caret on the cursor's line (row 4, 1-based)");
+        assert_eq!(b.caret.1, 2 + "kitsu> third".len() + 1);
     }
 
     #[test]
