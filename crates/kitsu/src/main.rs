@@ -6805,7 +6805,7 @@ fn model_popup_step(key: OverlayKey, popup: &mut ModelPopup, models: &[String]) 
             None => ModelPopupStep::Continue,
         },
         OverlayKey::StepBack => ModelPopupStep::Cancel,
-        OverlayKey::Char('\t') => {
+        OverlayKey::Tab => {
             // Tab completes the highlighted id into the filter, so typing
             // continues from a concrete model rather than a fragment.
             if let Some(model) = filtered.get(popup.selected) {
@@ -6819,8 +6819,8 @@ fn model_popup_step(key: OverlayKey, popup: &mut ModelPopup, models: &[String]) 
             popup.clamp(popup.filtered(models).len());
             ModelPopupStep::Continue
         }
-        // Ctrl-C arrives as the raw byte 0x03, decoded to this control char.
-        OverlayKey::Char('\u{3}') => ModelPopupStep::Cancel,
+        // Ctrl-C: raw mode clears ISIG, so it arrives as a byte (review F4).
+        OverlayKey::Interrupt => ModelPopupStep::Cancel,
         OverlayKey::Char(c) if !c.is_control() => {
             popup.filter.push(c);
             popup.selected = 0;
@@ -8195,6 +8195,11 @@ enum OverlayKey {
     Enter,
     /// `Backspace` or `Delete`: take a character back out of a prompt.
     Backspace,
+    /// `Tab` (0x09). Completes the model popup's selection; inert elsewhere.
+    Tab,
+    /// `Ctrl-C` (0x03). Raw mode clears ISIG, so this arrives as a byte, not a
+    /// signal. Cancels the model popup; inert elsewhere.
+    Interrupt,
     /// One printable ASCII character. Non-ASCII bytes are dropped: the view's
     /// prompts are a name and a correction typed into an overlay that paints
     /// plain ASCII rows, and a half-decoded UTF-8 character has no business
@@ -8230,6 +8235,8 @@ fn decode_overlay_keys(bytes: &[u8], pending: &mut OverlayPending) -> Vec<Overla
         match byte {
             b'\r' | b'\n' => Some(OverlayKey::Enter),
             0x7f | 0x08 => Some(OverlayKey::Backspace),
+            b'\t' => Some(OverlayKey::Tab),
+            0x03 => Some(OverlayKey::Interrupt),
             0x20..=0x7e => Some(OverlayKey::Char(byte as char)),
             _ => None,
         }
@@ -9127,7 +9134,9 @@ fn handle_overlay_input(
             | OverlayKey::Down
             | OverlayKey::Right
             | OverlayKey::Enter
-            | OverlayKey::Backspace => state.prompt = Some(OverlayPrompt::Decision(id)),
+            | OverlayKey::Backspace
+            | OverlayKey::Tab
+            | OverlayKey::Interrupt => state.prompt = Some(OverlayPrompt::Decision(id)),
         },
         None => match key {
             // Esc, resolved as a real key press rather than as the
@@ -9191,7 +9200,9 @@ fn handle_overlay_input(
             // Backspace belongs to the prompts; over the row list there is
             // nothing for it to do, and it must not reach the composer
             // underneath either.
-            OverlayKey::Backspace => {}
+            // Tab and Ctrl-C have no meaning over the row list (review F4
+            // only gave them meaning in the model popup).
+            OverlayKey::Backspace | OverlayKey::Tab | OverlayKey::Interrupt => {}
             OverlayKey::Char('?') => state.helping = true,
             OverlayKey::Char('q') => return OverlayStep::Closing,
             // Space: peek the selected agent. The byte is the view's
@@ -30555,14 +30566,38 @@ mod tests {
         assert_eq!(p.filter, "opu");
         // Tab completes the selection into the filter.
         let mut t = ModelPopup { filter: "gem".to_string(), selected: 0 };
-        model_popup_step(OverlayKey::Char('\t'), &mut t, &models);
+        model_popup_step(OverlayKey::Tab, &mut t, &models);
         assert_eq!(t.filter, "gemma-4-26b", "Tab completes the highlighted id");
         // Esc and Ctrl-C cancel.
         assert_eq!(model_popup_step(OverlayKey::StepBack, &mut p, &models), ModelPopupStep::Cancel);
         assert_eq!(
-            model_popup_step(OverlayKey::Char('\u{3}'), &mut p, &models),
+            model_popup_step(OverlayKey::Interrupt, &mut p, &models),
             ModelPopupStep::Cancel,
         );
+    }
+
+    #[test]
+    fn overlay_decoder_emits_tab_and_ctrl_c_for_the_model_popup() {
+        // Review F4: through the REAL decoder, not hand-built keys. Before the
+        // fix 0x09 and 0x03 were dropped, so Tab-complete and Ctrl-C cancel in
+        // the popup could never fire.
+        let mut pending = OverlayPending::None;
+        assert_eq!(
+            decode_overlay_keys(b"\t\x03", &mut pending),
+            vec![OverlayKey::Tab, OverlayKey::Interrupt]
+        );
+        // And the popup acts on them end to end.
+        let models = vec!["gemma-4-26b".to_string(), "opus".to_string()];
+        let mut p = ModelPopup { filter: "gem".to_string(), selected: 0 };
+        for key in decode_overlay_keys(b"\t", &mut pending) {
+            model_popup_step(key, &mut p, &models);
+        }
+        assert_eq!(p.filter, "gemma-4-26b", "Tab from the wire completes");
+        let step = decode_overlay_keys(b"\x03", &mut pending)
+            .into_iter()
+            .map(|key| model_popup_step(key, &mut p, &models))
+            .next();
+        assert_eq!(step, Some(ModelPopupStep::Cancel), "Ctrl-C from the wire cancels");
     }
 
     #[test]
