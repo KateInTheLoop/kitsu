@@ -568,42 +568,41 @@ fn find_pair(chars: &[char], from: usize, needle: &[char]) -> Option<usize> {
     (from..=chars.len() - needle.len()).find(|&idx| chars[idx..idx + needle.len()] == *needle)
 }
 
-/// Whether an emphasis marker at `i` may OPEN an italic span. The char after it
-/// must exist and not be whitespace (so "a * b" and a trailing "*" stay
-/// literal). `_` additionally requires a word boundary before it — not preceded
-/// by an alphanumeric — so `snake_case` / `a_b_c` identifiers are not mangled.
+/// Whether an emphasis marker at `i` may OPEN an italic span. A span must look
+/// like emphasized WORDS, not punctuation: the marker must not sit inside a
+/// word (no alphanumeric before it), and the next char must start a word
+/// (alphanumeric, or an opening quote/paren). This keeps `snake_case`,
+/// `a*b*c`, `2 * 3` and glob paths like `src/*.rs` literal (review F9), while
+/// `*From Innsbruck to Prague*` and `_emphasis_` still render.
 fn emphasis_can_open(chars: &[char], i: usize) -> bool {
-    let next = match chars.get(i + 1) {
-        Some(c) if !c.is_whitespace() => *c,
-        _ => return false,
+    let Some(&next) = chars.get(i + 1) else {
+        return false;
     };
     // `**`/`__` is a bold delimiter, handled by the bold arm — not italic-open.
     if next == chars[i] {
         return false;
     }
-    if chars[i] == '_' {
-        if let Some(prev) = i.checked_sub(1).and_then(|p| chars.get(p)) {
-            if prev.is_alphanumeric() {
-                return false;
-            }
-        }
+    if !(next.is_alphanumeric() || matches!(next, '"' | '\'' | '(')) {
+        return false;
     }
-    true
+    match i.checked_sub(1).and_then(|p| chars.get(p)) {
+        Some(prev) => !prev.is_alphanumeric(),
+        None => true,
+    }
 }
 
 /// Index of the matching italic close for a span opened by `marker` at
-/// `from - 1`, scanning from `from`. The close must not be preceded by
-/// whitespace, must not be a doubled (bold) marker, and for `_` must not be
-/// followed by an alphanumeric. Returns None when unclosed (left literal).
+/// `from - 1`, scanning from `from`. The close must end a word (preceded by an
+/// alphanumeric or closing punctuation, never whitespace), must not be followed
+/// by an alphanumeric (no intraword close), and must not be a doubled (bold)
+/// marker. Returns None when unclosed (left literal).
 fn find_emphasis_close(chars: &[char], from: usize, marker: char) -> Option<usize> {
     let mut idx = from;
     while idx < chars.len() {
-        if chars[idx] == marker {
-            let prev_ok = idx > from && !chars[idx - 1].is_whitespace();
-            let next_ok = match chars.get(idx + 1) {
-                Some(c) if marker == '_' => !c.is_alphanumeric(),
-                _ => true,
-            };
+        if chars[idx] == marker && idx > from {
+            let prev = chars[idx - 1];
+            let prev_ok = prev.is_alphanumeric() || matches!(prev, '.' | '!' | '?' | ')' | '"' | '\'');
+            let next_ok = !chars.get(idx + 1).is_some_and(|c| c.is_alphanumeric());
             let doubled = chars.get(idx + 1) == Some(&marker);
             if prev_ok && next_ok && !doubled {
                 return Some(idx);
@@ -728,10 +727,14 @@ impl LineStyler {
         {
             // Consume the leading #/##/### and render the heading text bold,
             // with inline markdown inside it also styled. The accent color
-            // distinguishes it from inline **bold** body text.
+            // distinguishes it from inline **bold** body text. Inner spans end
+            // with a full SGR reset, which would drop the heading style for
+            // the rest of the line (review F10), so re-assert it after each.
             let (r, g, b) = theme().accent;
-            let inner = style_inline_markdown(heading, in_fence);
-            format!("{}", inner.truecolor(r, g, b).bold())
+            let heading_sgr = format!("\x1b[1m\x1b[38;2;{r};{g};{b}m");
+            let inner = style_inline_markdown(heading, in_fence)
+                .replace("\x1b[0m", &format!("\x1b[0m{heading_sgr}"));
+            format!("{heading_sgr}{inner}\x1b[0m")
         } else {
             style_inline_markdown(line, in_fence)
         }
@@ -2999,6 +3002,26 @@ mod tests {
         assert_eq!(sanitize_terminal_text(&styler.style_line("an unclosed *marker")), "an unclosed *marker");
         // **bold** still wins over single-* italic.
         assert_eq!(sanitize_terminal_text(&styler.style_line("**b**")), "b");
+        // Review F9: glob paths and intraword asterisks stay literal.
+        assert_eq!(
+            sanitize_terminal_text(&styler.style_line("edit src/*.rs and tests/*.rs")),
+            "edit src/*.rs and tests/*.rs"
+        );
+        assert_eq!(sanitize_terminal_text(&styler.style_line("a*b*c")), "a*b*c");
+        // Emphasis inside punctuation still renders.
+        assert_eq!(sanitize_terminal_text(&styler.style_line("(*really*)")), "(really)");
+    }
+
+    #[test]
+    fn heading_style_survives_inline_spans() {
+        // Review F10: text after an inline span inside a heading keeps the
+        // heading's bold/accent style (inner spans end with a full reset).
+        let mut styler = LineStyler::default();
+        let styled = styler.style_line("# Use `foo` now");
+        assert_eq!(sanitize_terminal_text(&styled), "Use foo now");
+        let after_code = styled.rsplit("\x1b[0m").nth(1).expect("a reset precedes ' now'");
+        assert!(after_code.contains("\x1b[1m"), "bold re-asserted after the span: {styled:?}");
+        assert!(styled.ends_with(" now\x1b[0m"), "heading closes once at the end: {styled:?}");
     }
 
     #[test]
