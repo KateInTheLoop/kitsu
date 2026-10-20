@@ -462,6 +462,13 @@ pub fn print_message(s: &str) {
 /// Style inline markdown elements in a line: bold, inline code, and list markers.
 /// Respects code fence state (does not style inside fenced code blocks).
 /// Unclosed markers are left unstyled.
+///
+/// In the STYLED tier the markers are CONSUMED: `**bold**` renders as bold text
+/// with no asterisks, `` `code` `` as accented text with no backticks. This is
+/// display-only — the authoritative transcript is the `messages` history (what
+/// `/export`, resume and the API use), which keeps the raw markdown. The
+/// unstyled tier (`format_message(_, false)`: `--plain`, pipes, `-o`, JSONL)
+/// returns the source verbatim, so tooling still sees exact markdown.
 fn style_inline_markdown(line: &str, in_fence: bool) -> String {
     if in_fence {
         return line.to_string();
@@ -479,10 +486,11 @@ fn style_inline_markdown(line: &str, in_fence: bool) -> String {
         let trimmed_chars: Vec<char> = trimmed.chars().collect();
         if trimmed_chars.len() >= 2 {
             if (trimmed_chars[0] == '-' || trimmed_chars[0] == '*') && trimmed_chars[1] == ' ' {
-                // Unordered list: "- " or "* "
+                // Unordered list "- "/"* " → a consistent "• " bullet, so the
+                // two source spellings read identically.
                 out.push_str(&line[..indent_len]);
-                out.push_str(&format!("{}", trimmed_chars[0].to_string().dimmed()));
-                out.push_str(&format!("{}", trimmed_chars[1].to_string().dimmed()));
+                out.push_str(&format!("{}", "•".to_string().dimmed()));
+                out.push(' ');
                 i = indent_len + 2;
             } else if trimmed_chars[0].is_ascii_digit() {
                 // Ordered list: "1. " etc
@@ -494,7 +502,7 @@ fn style_inline_markdown(line: &str, in_fence: bool) -> String {
                     && trimmed_chars[j] == '.'
                     && trimmed_chars[j + 1] == ' '
                 {
-                    // Valid ordered list marker
+                    // Valid ordered list marker: keep the number, dim the dot.
                     out.push_str(&line[..indent_len]);
                     for ch in &trimmed_chars[..j] {
                         out.push_str(&format!("{}", ch.to_string().dimmed()));
@@ -507,14 +515,14 @@ fn style_inline_markdown(line: &str, in_fence: bool) -> String {
         }
     }
 
-    // Style only CLOSED spans (the spec: unclosed markers pass through
-    // unstyled). Each span is pushed as ONE styled chunk, not per-char
-    // escapes.
+    // Style only CLOSED spans (unclosed markers pass through unstyled, markers
+    // and all). A closed span is emitted as its INNER text, styled, with the
+    // markers consumed. Each span is one styled chunk, not per-char escapes.
     while i < chars.len() {
         if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
             if let Some(close) = find_pair(&chars, i + 2, &['*', '*']) {
                 let span: String = chars[i + 2..close].iter().collect();
-                out.push_str(&format!("{}", format!("**{span}**").bold()));
+                out.push_str(&format!("{}", span.bold()));
                 i = close + 2;
                 continue;
             }
@@ -523,7 +531,7 @@ fn style_inline_markdown(line: &str, in_fence: bool) -> String {
         } else if chars[i] == '`' {
             if let Some(close) = find_pair(&chars, i + 1, &['`']) {
                 let span: String = chars[i + 1..close].iter().collect();
-                out.push_str(&format!("{}", format!("`{span}`").truecolor(r, g, b)));
+                out.push_str(&format!("{}", span.truecolor(r, g, b)));
                 i = close + 1;
                 continue;
             }
@@ -653,8 +661,17 @@ impl LineStyler {
             } else {
                 line.to_string()
             }
-        } else if line.starts_with("### ") || line.starts_with("## ") || line.starts_with("# ") {
-            format!("{}", line.bold())
+        } else if let Some(heading) = line
+            .strip_prefix("### ")
+            .or_else(|| line.strip_prefix("## "))
+            .or_else(|| line.strip_prefix("# "))
+        {
+            // Consume the leading #/##/### and render the heading text bold,
+            // with inline markdown inside it also styled. The accent color
+            // distinguishes it from inline **bold** body text.
+            let (r, g, b) = theme().accent;
+            let inner = style_inline_markdown(heading, in_fence);
+            format!("{}", inner.truecolor(r, g, b).bold())
         } else {
             style_inline_markdown(line, in_fence)
         }
@@ -2716,78 +2733,55 @@ mod tests {
 
     #[test]
     fn buffered_markdown_retains_streaming_structure() {
+        // The protective invariant: the UNSTYLED tier (pipes, --plain, -o, JSONL)
+        // returns the source verbatim, so tooling and the API transcript always
+        // see exact markdown. The STYLED TTY tier consumes closed markers.
         let message = "# Heading\n\n```diff\n+added\n-removed\n@@ hunk\n```\n";
         let rendered = format_message(message, true);
-
         assert!(rendered.contains('\x1b'), "TTY rendering should be styled");
-        assert_eq!(sanitize_terminal_text(&rendered), message);
-        assert_eq!(format_message(message, false), message);
+        assert_eq!(format_message(message, false), message, "unstyled tier is verbatim");
+        // The heading '# ' marker is consumed; the fence interior is verbatim.
+        let plain = sanitize_terminal_text(&rendered);
+        assert!(plain.contains("Heading") && !plain.contains("# Heading"), "heading marker consumed: {plain:?}");
+        assert!(plain.contains("+added") && plain.contains("@@ hunk"), "fence interior verbatim: {plain:?}");
 
-        // Test bold styling
-        let bold_message = "This is **bold text** in a line\n";
-        let bold_rendered = format_message(bold_message, true);
-        assert!(
-            bold_rendered.contains('\x1b'),
-            "TTY rendering should include bold"
+        // Bold: the `**` are consumed, the inner text remains and is styled.
+        let bold_rendered = format_message("This is **bold text** in a line\n", true);
+        assert!(bold_rendered.contains('\x1b'), "bold is styled");
+        assert_eq!(
+            sanitize_terminal_text(&bold_rendered),
+            "This is bold text in a line\n",
+            "** markers consumed"
         );
-        assert_eq!(sanitize_terminal_text(&bold_rendered), bold_message);
 
-        // Test inline code styling
-        let code_message = "Use `inline_code()` function here\n";
-        let code_rendered = format_message(code_message, true);
-        assert!(
-            code_rendered.contains('\x1b'),
-            "TTY rendering should include inline code"
+        // Inline code: backticks consumed, inner text styled.
+        let code_rendered = format_message("Use `inline_code()` function here\n", true);
+        assert!(code_rendered.contains('\x1b'), "code is styled");
+        assert_eq!(
+            sanitize_terminal_text(&code_rendered),
+            "Use inline_code() function here\n",
+            "backtick markers consumed"
         );
-        assert_eq!(sanitize_terminal_text(&code_rendered), code_message);
 
-        // Test list markers
-        let list_message = "- First item\n* Second item\n1. Third item\n";
-        let list_rendered = format_message(list_message, true);
-        assert!(
-            list_rendered.contains('\x1b'),
-            "TTY rendering should include list markers"
-        );
-        assert_eq!(sanitize_terminal_text(&list_rendered), list_message);
+        // List markers: "- "/"* " normalize to a "• " bullet; ordered kept.
+        let list_rendered = format_message("- First item\n* Second item\n1. Third item\n", true);
+        assert!(list_rendered.contains('\x1b'), "list markers styled");
+        let list_plain = sanitize_terminal_text(&list_rendered);
+        assert_eq!(list_plain, "• First item\n• Second item\n1. Third item\n", "{list_plain:?}");
 
-        // Test unclosed bold marker (must be left completely unstyled)
+        // Unclosed markers pass through completely unstyled, markers and all.
         let unclosed_bold = "This has an unclosed **bold marker\n";
-        let unclosed_rendered = format_message(unclosed_bold, true);
-        assert_eq!(
-            unclosed_rendered, unclosed_bold,
-            "no styling on unclosed **"
-        );
-        assert_eq!(sanitize_terminal_text(&unclosed_rendered), unclosed_bold);
-
-        // Test unclosed code marker (must be left completely unstyled)
+        assert_eq!(format_message(unclosed_bold, true), unclosed_bold, "no styling on unclosed **");
         let unclosed_code = "This has an unclosed `code marker\n";
-        let unclosed_code_rendered = format_message(unclosed_code, true);
-        assert_eq!(
-            unclosed_code_rendered, unclosed_code,
-            "no styling on unclosed `"
-        );
-        assert_eq!(
-            sanitize_terminal_text(&unclosed_code_rendered),
-            unclosed_code
-        );
+        assert_eq!(format_message(unclosed_code, true), unclosed_code, "no styling on unclosed `");
 
-        // Test combined markdown
-        let combined = "# Title\n\nSome **bold** and `code` with a list:\n- Item 1\n* Item 2\n";
-        let combined_rendered = format_message(combined, true);
-        assert!(
-            combined_rendered.contains('\x1b'),
-            "TTY rendering should be styled"
-        );
-        assert_eq!(sanitize_terminal_text(&combined_rendered), combined);
-
-        // Test that styling is not applied inside code fences
+        // Inside a code fence nothing is consumed — interior is verbatim.
         let fenced = "```rust\n**not bold**\n`not code`\n```\n";
-        let fenced_rendered = format_message(fenced, true);
-        assert_eq!(sanitize_terminal_text(&fenced_rendered), fenced);
+        let fenced_plain = sanitize_terminal_text(&format_message(fenced, true));
+        assert!(fenced_plain.contains("**not bold**"), "fence interior keeps markers: {fenced_plain:?}");
 
-        // Test plain mode returns original text
-        assert_eq!(format_message(bold_message, false), bold_message);
-        assert_eq!(format_message(list_message, false), list_message);
+        // Plain mode returns original text exactly.
+        assert_eq!(format_message("This is **bold text** in a line\n", false), "This is **bold text** in a line\n");
     }
 
     #[test]
@@ -2899,28 +2893,26 @@ mod tests {
 
     #[test]
     fn line_styler_preserves_styling_invariants() {
-        // Test that styled lines round-trip via sanitize
+        // The styled tier consumes closed markers; strip-ANSI yields the
+        // rendered text (markers gone), not the source. The source is preserved
+        // by the unstyled tier, tested in buffered_markdown_retains_streaming_structure.
         let mut styler = LineStyler::default();
 
-        // Test heading
-        let heading = "# Main Title";
-        let styled_heading = styler.style_line(heading);
-        assert_eq!(sanitize_terminal_text(&styled_heading), heading);
+        // Heading: '# ' consumed.
+        let styled_heading = styler.style_line("# Main Title");
+        assert_eq!(sanitize_terminal_text(&styled_heading), "Main Title");
 
-        // Test bold
-        let bold = "This is **bold text** here";
-        let styled_bold = styler.style_line(bold);
-        assert_eq!(sanitize_terminal_text(&styled_bold), bold);
+        // Bold: '**' consumed.
+        let styled_bold = styler.style_line("This is **bold text** here");
+        assert_eq!(sanitize_terminal_text(&styled_bold), "This is bold text here");
 
-        // Test inline code
-        let code = "Use `function()` like this";
-        let styled_code = styler.style_line(code);
-        assert_eq!(sanitize_terminal_text(&styled_code), code);
+        // Inline code: backticks consumed.
+        let styled_code = styler.style_line("Use `function()` like this");
+        assert_eq!(sanitize_terminal_text(&styled_code), "Use function() like this");
 
-        // Test list marker
-        let list = "- First item";
-        let styled_list = styler.style_line(list);
-        assert_eq!(sanitize_terminal_text(&styled_list), list);
+        // List marker: '- ' normalized to a bullet.
+        let styled_list = styler.style_line("- First item");
+        assert_eq!(sanitize_terminal_text(&styled_list), "• First item");
     }
 
     #[test]
