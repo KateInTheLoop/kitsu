@@ -860,6 +860,7 @@ struct ContainedLaunch {
 /// Seatbelt profile).
 struct LaunchInputs {
     program: PathBuf,
+    readonly_runtime_roots: Vec<PathBuf>,
     writable_command_roots: Vec<PathBuf>,
     cwd: PathBuf,
 }
@@ -899,6 +900,7 @@ fn authorized_launch_inputs(
     }
     Ok(LaunchInputs {
         program: executable.canonical_path.clone(),
+        readonly_runtime_roots: ready.readonly_runtime_roots.clone(),
         writable_command_roots: policy
             .bound_command_roots
             .iter()
@@ -1413,17 +1415,56 @@ fn build_seatbelt_profile(inputs: &LaunchInputs) -> Result<String, CommandContai
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
     profile.push_str("(deny default)\n");
-    // The enforced perimeter is WRITE confinement + no network (Codex's
-    // workspace-write model). Reads are open: dyld's read set is SIP-hidden and
-    // varies by macOS version, so a read allow-list fails closed in the wrong
-    // direction — a missing dyld path aborts the process (SIGABRT) rather than
-    // denying one file. What the command may *run* is already gated by the
-    // shared executable-visibility check; what it may *change* is gated here.
     profile.push_str("(deny network*)\n");
-    profile.push_str("(allow process*)\n");
+    profile.push_str("(allow process-fork)\n");
     profile.push_str("(allow sysctl-read)\n");
-    profile.push_str("(allow mach-lookup)\n");
+
+    // Exec: only the binaries a Linux bwrap sandbox would mount — system dirs,
+    // the Xcode/CLT toolchain that /usr/bin/git & co. shim into, and the
+    // command + runtime roots (review F2). A granted `sh -c` can no longer
+    // reach a binary outside them (e.g. /opt/homebrew without a root).
+    profile.push_str("(allow process-exec*\n");
+    for sys in [
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/System",
+        "/Library/Developer",
+        "/Applications/Xcode.app",
+    ] {
+        let _ = writeln!(profile, "    (subpath \"{sys}\")");
+    }
+    for path in writable.iter().copied().chain(inputs.readonly_runtime_roots.iter().map(PathBuf::as_path)) {
+        write_subpath(&mut profile, path)?;
+    }
+    profile.push_str(")\n");
+
+    // Mach services: an allow-list instead of every service (review F1). An
+    // unrestricted mach-lookup reaches launchd/LaunchServices, which can start
+    // processes outside the sandbox. These two are what sh/git/coreutils need
+    // (verified empirically): per-user temp-dir resolution and user/group name
+    // lookup.
+    profile.push_str("(allow mach-lookup\n");
+    for service in ["com.apple.bsd.dirhelper", "com.apple.system.opendirectoryd.libinfo"] {
+        let _ = writeln!(profile, "    (global-name \"{service}\")");
+    }
+    profile.push_str(")\n");
+
+    // Reads stay broad: dyld's read set is SIP-hidden and version-specific, so
+    // a read allow-list fails the wrong way (SIGABRT). Instead the known
+    // secret locations are denied AFTER the broad allow — in SBPL the later
+    // matching rule wins (verified) — so a contained command cannot read SSH
+    // keys, cloud credentials, keychains, or the shell rc files that hold
+    // gateway tokens (review F1).
     profile.push_str("(allow file-read*)\n");
+    let secrets = seatbelt_secret_paths();
+    if !secrets.is_empty() {
+        profile.push_str("(deny file-read*\n");
+        for path in &secrets {
+            write_subpath(&mut profile, path)?;
+        }
+        profile.push_str(")\n");
+    }
 
     // Writes: ONLY the writable command roots, the cwd, the temp dir, and the
     // write-only device nodes. This is the enforced boundary the tests pin.
@@ -1438,6 +1479,51 @@ fn build_seatbelt_profile(inputs: &LaunchInputs) -> Result<String, CommandContai
     profile.push_str(")\n");
 
     Ok(profile)
+}
+
+/// Host paths a contained command must never read, relative to $HOME. The
+/// kitsu config/state dirs are included: they hold managed credentials.
+/// Shell rc files are included because users keep gateway tokens there.
+// ponytail: fixed list of well-known secret homes; make it configurable if a
+// user needs to add their own.
+#[cfg(target_os = "macos")]
+const SEATBELT_SECRET_HOME_PATHS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".config/gcloud",
+    ".azure",
+    ".kube",
+    ".docker",
+    ".netrc",
+    ".git-credentials",
+    ".kitsu",
+    ".config/kitsu",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".bashrc",
+    ".bash_profile",
+    ".profile",
+    "Library/Keychains",
+];
+
+/// The secret paths under the real home directory, canonicalized where they
+/// exist (Seatbelt matches canonical paths). Missing paths are still listed
+/// under the canonical home so a later-created file is covered.
+#[cfg(target_os = "macos")]
+fn seatbelt_secret_paths() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let home = std::fs::canonicalize(&home).unwrap_or(home);
+    SEATBELT_SECRET_HOME_PATHS
+        .iter()
+        .map(|rel| {
+            let path = home.join(rel);
+            std::fs::canonicalize(&path).unwrap_or(path)
+        })
+        .collect()
 }
 
 /// Emit one `    (subpath "…")` line with the path safely SBPL-quoted.
@@ -5817,6 +5903,7 @@ mod tests {
     fn launch_inputs_for(program: &str, writable: &[&str], cwd: &str) -> LaunchInputs {
         LaunchInputs {
             program: PathBuf::from(program),
+            readonly_runtime_roots: Vec::new(),
             writable_command_roots: writable.iter().map(PathBuf::from).collect(),
             cwd: PathBuf::from(cwd),
         }
@@ -5839,11 +5926,18 @@ mod tests {
         assert!(profile.contains("(version 1)"), "{profile}");
         assert!(profile.contains("(deny default)"), "{profile}");
         assert!(profile.contains("(deny network*)"), "{profile}");
-        // Reads and process spawning are open; the enforced perimeter is writes
-        // + network. What may run is gated by the shared executable-visibility
-        // check, not the profile.
-        assert!(profile.contains("(allow file-read*)"), "reads open: {profile}");
-        assert!(profile.contains("(allow process*)"), "process open: {profile}");
+        // Review F1/F2: no blanket process or mach-lookup allows.
+        assert!(!profile.contains("(allow process*)"), "no blanket process allow: {profile}");
+        assert!(!profile.contains("(allow mach-lookup)\n"), "no blanket mach-lookup: {profile}");
+        assert!(profile.contains("(allow process-exec*\n"), "exec is an allow-list: {profile}");
+        assert!(profile.contains("(global-name \"com.apple.bsd.dirhelper\")"), "{profile}");
+        // Reads are broad, but secret paths are denied AFTER the allow (the
+        // later SBPL rule wins).
+        let allow_read = profile.find("(allow file-read*)").expect("broad read allow");
+        let deny_read = profile.find("(deny file-read*").expect("secret deny block");
+        assert!(deny_read > allow_read, "deny must follow the allow to win");
+        assert!(profile.contains("/.ssh\")"), "ssh keys denied: {profile}");
+        assert!(profile.contains("/.zshrc\")"), "shell rc (gateway tokens) denied: {profile}");
 
         // Isolate the file-write* block (from its opening line to the lone `)`
         // terminator) and assert its subpaths are exactly the writable roots +
@@ -6079,6 +6173,66 @@ mod tests {
             std::fs::read_to_string(dir.path().join("sub/deep/a.txt")).unwrap(),
             "a\nb\n"
         );
+    }
+
+    /// Review F1: a granted command cannot read host secrets. Uses the real
+    /// shell rc / ssh dir when present and checks the denial reason, never the
+    /// content (nothing is printed on success either).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn live_seatbelt_denies_reading_host_secret_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(policy) = live_seatbelt_policy(&dir) else { return };
+        let home = std::env::var("HOME").unwrap();
+        let mut checked = 0;
+        for rel in [".zshrc", ".ssh", ".aws", ".kitsu"] {
+            let path = format!("{home}/{rel}");
+            if !std::path::Path::new(&path).exists() {
+                continue;
+            }
+            checked += 1;
+            let probe = format!("ls -d {path}/. >/dev/null 2>&1 || head -c1 {path} >/dev/null");
+            let out = run_granted(&policy, &dir, &["/bin/sh", "-c", &probe]).await;
+            assert!(!out.success, "{rel} must not be readable inside the sandbox");
+            assert!(out.stdout.is_empty(), "nothing from {rel} reaches stdout");
+            assert!(
+                out.stderr.contains("Operation not permitted"),
+                "{rel} denied by the sandbox, not missing: {:?}",
+                out.stderr
+            );
+        }
+        if checked == 0 {
+            eprintln!("skipping: no secret paths exist under $HOME on this host");
+        }
+    }
+
+    /// Review F2: exec is an allow-list. A granted `sh -c` cannot run a binary
+    /// outside the system dirs and command/runtime roots (Linux bwrap parity).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn live_seatbelt_denies_exec_outside_the_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let Some(policy) = live_seatbelt_policy(&dir) else { return };
+        let script = outside.path().join("tool.sh");
+        std::fs::write(&script, "#!/bin/sh\necho ESCAPED\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = std::fs::canonicalize(&script).unwrap();
+
+        let out = run_granted(&policy, &dir, &["/bin/sh", "-c", &script.to_string_lossy()]).await;
+        assert!(!out.success, "exec outside the roots must fail");
+        assert!(!out.stdout.contains("ESCAPED"), "the outside binary never ran");
+        assert!(out.stderr.contains("Operation not permitted"), "{:?}", out.stderr);
+
+        // CONTROL: the same script inside the command root runs.
+        let inside = dir.path().join("tool.sh");
+        std::fs::write(&inside, "#!/bin/sh\necho INSIDE\n").unwrap();
+        std::fs::set_permissions(&inside, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let inside = std::fs::canonicalize(&inside).unwrap();
+        let out = run_granted(&policy, &dir, &["/bin/sh", "-c", &inside.to_string_lossy()]).await;
+        assert!(out.success, "exec inside a root still works: {}", out.stderr);
+        assert_eq!(out.stdout.trim(), "INSIDE");
     }
 
     /// The permission grant/revoke flow gates execution: in Deny mode an
