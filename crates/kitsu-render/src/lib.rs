@@ -528,6 +528,20 @@ fn style_inline_markdown(line: &str, in_fence: bool) -> String {
             }
             out.push_str("**");
             i += 2;
+        } else if (chars[i] == '*' || chars[i] == '_') && emphasis_can_open(&chars, i) {
+            // Single-`*` / single-`_` italic. Checked AFTER `**` so bold wins,
+            // and only when the marker opens a span (next char is not space and
+            // the delimiter is word-boundaried for `_`, so snake_case names and
+            // multiply signs are not mangled).
+            let marker = chars[i];
+            if let Some(close) = find_emphasis_close(&chars, i + 1, marker) {
+                let span: String = chars[i + 1..close].iter().collect();
+                out.push_str(&format!("{}", span.italic()));
+                i = close + 1;
+                continue;
+            }
+            out.push(marker);
+            i += 1;
         } else if chars[i] == '`' {
             if let Some(close) = find_pair(&chars, i + 1, &['`']) {
                 let span: String = chars[i + 1..close].iter().collect();
@@ -552,6 +566,52 @@ fn find_pair(chars: &[char], from: usize, needle: &[char]) -> Option<usize> {
         return None;
     }
     (from..=chars.len() - needle.len()).find(|&idx| chars[idx..idx + needle.len()] == *needle)
+}
+
+/// Whether an emphasis marker at `i` may OPEN an italic span. The char after it
+/// must exist and not be whitespace (so "a * b" and a trailing "*" stay
+/// literal). `_` additionally requires a word boundary before it — not preceded
+/// by an alphanumeric — so `snake_case` / `a_b_c` identifiers are not mangled.
+fn emphasis_can_open(chars: &[char], i: usize) -> bool {
+    let next = match chars.get(i + 1) {
+        Some(c) if !c.is_whitespace() => *c,
+        _ => return false,
+    };
+    // `**`/`__` is a bold delimiter, handled by the bold arm — not italic-open.
+    if next == chars[i] {
+        return false;
+    }
+    if chars[i] == '_' {
+        if let Some(prev) = i.checked_sub(1).and_then(|p| chars.get(p)) {
+            if prev.is_alphanumeric() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Index of the matching italic close for a span opened by `marker` at
+/// `from - 1`, scanning from `from`. The close must not be preceded by
+/// whitespace, must not be a doubled (bold) marker, and for `_` must not be
+/// followed by an alphanumeric. Returns None when unclosed (left literal).
+fn find_emphasis_close(chars: &[char], from: usize, marker: char) -> Option<usize> {
+    let mut idx = from;
+    while idx < chars.len() {
+        if chars[idx] == marker {
+            let prev_ok = idx > from && !chars[idx - 1].is_whitespace();
+            let next_ok = match chars.get(idx + 1) {
+                Some(c) if marker == '_' => !c.is_alphanumeric(),
+                _ => true,
+            };
+            let doubled = chars.get(idx + 1) == Some(&marker);
+            if prev_ok && next_ok && !doubled {
+                return Some(idx);
+            }
+        }
+        idx += 1;
+    }
+    None
 }
 
 /// Stateful line styler for per-line markdown formatting.
@@ -2913,6 +2973,32 @@ mod tests {
         // List marker: '- ' normalized to a bullet.
         let styled_list = styler.style_line("- First item");
         assert_eq!(sanitize_terminal_text(&styled_list), "• First item");
+    }
+
+    #[test]
+    fn italic_renders_but_spares_identifiers() {
+        let mut styler = LineStyler::default();
+        // *italic* and _italic_ consume their markers.
+        assert_eq!(
+            sanitize_terminal_text(&styler.style_line("a *From Innsbruck* b")),
+            "a From Innsbruck b"
+        );
+        assert_eq!(
+            sanitize_terminal_text(&styler.style_line("an _emphasized_ word")),
+            "an emphasized word"
+        );
+        // The styled output actually carries the italic SGR (3).
+        assert!(styler.style_line("*x*").contains("\x1b[3m"), "italic SGR present");
+        // snake_case / underscored identifiers are NOT italicized.
+        assert_eq!(
+            sanitize_terminal_text(&styler.style_line("call read_file_at and a_b_c")),
+            "call read_file_at and a_b_c"
+        );
+        // A bare multiply/space asterisk and unclosed markers stay literal.
+        assert_eq!(sanitize_terminal_text(&styler.style_line("2 * 3 = 6")), "2 * 3 = 6");
+        assert_eq!(sanitize_terminal_text(&styler.style_line("an unclosed *marker")), "an unclosed *marker");
+        // **bold** still wins over single-* italic.
+        assert_eq!(sanitize_terminal_text(&styler.style_line("**b**")), "b");
     }
 
     #[test]
