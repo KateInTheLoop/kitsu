@@ -1703,6 +1703,36 @@ impl BridgeGuard {
         rich: bool,
     ) -> bool {
         let columns = live::terminal_columns();
+        // Opt-in framed input box (KITSU_INPUT_BOX=1). Reuses the existing
+        // region-growth of `paint_rows` — the same machinery the slash palette
+        // grows into — so the box renders where the palette already proves
+        // multi-row painting works, unlike the earlier render_region attempt.
+        if std::env::var_os("KITSU_INPUT_BOX").is_some_and(|v| v == "1" || v == "true") {
+            let composed = live::LiveDraft {
+                prompt: prompt.to_string(),
+                buffer: draft.to_string(),
+                cursor,
+                hint: hint.to_string(),
+                hint_reserved,
+            };
+            let boxed = live::compose_input_box(&composed, columns);
+            let painted = self.paint_rows(&boxed.rows);
+            // Place the caret inside the box: paint_rows leaves the cursor on
+            // the bottom row of the region; address it absolutely. The box's
+            // top row is at terminal row (term_rows - (len-1)).
+            if painted {
+                use std::io::Write as _;
+                let total = boxed.rows.len() as u16;
+                let term_rows = live::terminal_rows() as u16;
+                let top = term_rows.saturating_sub(total).saturating_add(1);
+                let caret_row = top + (boxed.caret.0 as u16).saturating_sub(1);
+                let caret_col = boxed.caret.1;
+                let mut err = std::io::stderr();
+                let _ = err.write_all(format!("\x1b[{caret_row};{caret_col}H").as_bytes());
+                let _ = err.flush();
+            }
+            return painted;
+        }
         // What this terminal will actually grant, less the composer's own
         // row: the palette's whole budget. `granted_rows` is the same clamp
         // `paint_rows` latches, so there is no second bound to drift.
