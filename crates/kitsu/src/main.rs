@@ -19444,11 +19444,16 @@ struct CwdGrant {
 /// outside explicit roots still prompt. Non-interactive without `--yes` grants
 /// nothing (deny-by-default stands).
 fn cwd_grant(yes: bool, interactive: bool) -> CwdGrant {
-    if yes {
+    if yes || interactive {
+        // Both a non-prompting `--yes` run and an interactive session grant the
+        // launch directory read+write, so working in the current project just
+        // works: `--yes` never prompts; interactive (Mode::Ask) still prompts
+        // for writes OUTSIDE the cwd but not inside it. Previously interactive
+        // granted cwd read-only, which made the model conclude the project was
+        // read-only and decline to edit at all rather than attempt a write.
         CwdGrant { read: true, write: true }
-    } else if interactive {
-        CwdGrant { read: true, write: false }
     } else {
+        // Non-interactive without --yes stays deny-by-default.
         CwdGrant { read: false, write: false }
     }
 }
@@ -20299,19 +20304,25 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let mut provenance: Vec<CtxEntry> = Vec::new();
     let prompt_environment = {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        // Interactive chat implicitly grants the launch directory as a read
-        // root (see the Permissions setup above); tell the model the same
-        // truth the permission layer enforces.
+        // Tell the model the SAME truth the permission layer enforces (see
+        // `cwd_grant`): an interactive or `--yes` run grants the launch
+        // directory read+write, so the model must see it as `read-write` and
+        // edit directly instead of concluding the project is read-only. A
+        // read-only cwd label here was why the model declined to write.
         let mut read_only: Vec<String> = allow_paths.to_vec();
-        if interactive {
-            let cwd_text = cwd.to_string_lossy().to_string();
-            if !read_only.contains(&cwd_text) {
-                read_only.push(cwd_text);
+        let mut read_write: Vec<String> = allow_read_write.to_vec();
+        let grant = cwd_grant(cli.yes, interactive);
+        let cwd_text = cwd.to_string_lossy().to_string();
+        if grant.read && grant.write {
+            if !read_write.contains(&cwd_text) {
+                read_write.push(cwd_text);
             }
+        } else if grant.read && !read_only.contains(&cwd_text) {
+            read_only.push(cwd_text);
         }
         PromptEnvironment {
             access_prompts: perms.mode() == Mode::Ask,
-            ..PromptEnvironment::from_grants(&cwd, &read_only, allow_write, allow_read_write)
+            ..PromptEnvironment::from_grants(&cwd, &read_only, allow_write, &read_write)
                 .with_command_pregrants(&explicit_command_grants)
         }
     };
@@ -30597,10 +30608,31 @@ mod tests {
         // --yes: read+write the launch dir, interactive or not.
         assert_eq!(cwd_grant(true, false), CwdGrant { read: true, write: true });
         assert_eq!(cwd_grant(true, true), CwdGrant { read: true, write: true });
-        // Interactive without --yes: historical read-only cwd grant.
-        assert_eq!(cwd_grant(false, true), CwdGrant { read: true, write: false });
+        // Interactive without --yes: read+write the launch dir too (writes
+        // inside it; Mode::Ask still prompts for writes outside it).
+        assert_eq!(cwd_grant(false, true), CwdGrant { read: true, write: true });
         // Non-interactive without --yes: nothing — deny-by-default stands.
         assert_eq!(cwd_grant(false, false), CwdGrant { read: false, write: false });
+    }
+
+    #[test]
+    fn interactive_prompt_labels_the_cwd_read_write_not_read_only() {
+        // The fix for "the model declares the project read-only and declines to
+        // edit": an interactive grant must surface cwd as read-write in the
+        // prompt, so the model edits directly.
+        let cwd = std::path::Path::new("/work/project");
+        let env = PromptEnvironment::from_grants(
+            cwd,
+            &[], // allow_paths
+            &[], // allow_write
+            &["/work/project".to_string()], // read_write (what interactive now feeds)
+        );
+        let (_, authority) = env
+            .roots
+            .iter()
+            .find(|(p, _)| p == "/work/project")
+            .expect("cwd is a listed root");
+        assert_eq!(*authority, "read-write", "cwd must be read-write, not read-only");
     }
 
     #[test]
