@@ -30502,7 +30502,11 @@ mod tests {
     /// Parse exactly as `main` does — through ArgMatches so `apply_effort` can
     /// distinguish user-set budget flags from defaulted ones.
     fn parse_with_effort(argv: &[&str]) -> Cli {
+        // Hermetic: drop the KITSU_EFFORT env binding so a developer's own
+        // `export KITSU_EFFORT=max` can't leak in. Thread-safe, unlike
+        // mutating the process environment under parallel tests.
         let matches = Cli::command()
+            .mut_arg("effort", |arg| arg.env(None))
             .try_get_matches_from(argv)
             .expect("effort fixture parses");
         let mut cli = Cli::from_arg_matches(&matches).expect("effort fixture builds");
