@@ -1568,6 +1568,24 @@ where
     })
 }
 
+/// Whether the composer paints the framed input box. On by default;
+/// `KITSU_INPUT_BOX=0` (or `false`) restores the single composer row. Test
+/// builds default to the legacy row so the composer/palette tests keep pinning
+/// that renderer; the box geometry is tested in `kitsu_render::live`.
+fn input_box_enabled() -> bool {
+    input_box_setting(std::env::var_os("KITSU_INPUT_BOX").as_deref(), !cfg!(test))
+}
+
+/// `KITSU_INPUT_BOX` parsing: `0`/`false` off, `1`/`true` on, anything else
+/// (including unset) falls back to `default`.
+fn input_box_setting(value: Option<&std::ffi::OsStr>, default: bool) -> bool {
+    match value.and_then(|v| v.to_str()) {
+        Some("0") | Some("false") => false,
+        Some("1") | Some("true") => true,
+        _ => default,
+    }
+}
+
 impl BridgeGuard {
     /// Hand the guard requirement **R5**'s live fields, replacing the fixed
     /// `status` text for every idle paint, and publish the during-turn
@@ -1703,11 +1721,11 @@ impl BridgeGuard {
         rich: bool,
     ) -> bool {
         let columns = live::terminal_columns();
-        // Opt-in framed input box (KITSU_INPUT_BOX=1). Reuses the existing
-        // region-growth of `paint_rows` — the same machinery the slash palette
-        // grows into — so the box renders where the palette already proves
-        // multi-row painting works, unlike the earlier render_region attempt.
-        if std::env::var_os("KITSU_INPUT_BOX").is_some_and(|v| v == "1" || v == "true") {
+        // The framed input box is the default; KITSU_INPUT_BOX=0 restores the
+        // single composer row. It reuses `paint_rows`' region growth — the same
+        // machinery the slash palette grows into — and keeps the palette: the
+        // palette rows sit ABOVE the box, so `/` completion still works.
+        if input_box_enabled() {
             let composed = live::LiveDraft {
                 prompt: prompt.to_string(),
                 buffer: draft.to_string(),
@@ -1716,10 +1734,24 @@ impl BridgeGuard {
                 hint_reserved,
             };
             let boxed = live::compose_input_box(&composed, columns);
-            let painted = self.paint_rows(&boxed.rows);
-            // Place the caret inside the box: paint_rows leaves the cursor on
-            // the bottom row of the region; address it absolutely. The box's
-            // top row is at terminal row (term_rows - (len-1)).
+            let budget = self
+                .granted_rows(u16::MAX)
+                .saturating_sub(u16::try_from(boxed.rows.len()).unwrap_or(u16::MAX));
+            let mut content = if crate::slash_palette_adds_to_the_row(draft, hint) {
+                palette_rows(
+                    draft,
+                    rich,
+                    crate::composer_surface_inner_width(Some(columns)),
+                    budget,
+                )
+            } else {
+                Vec::new()
+            };
+            content.extend(boxed.rows.iter().cloned());
+            let painted = self.paint_rows(&content);
+            // Place the caret inside the box. The box is the bottom of the
+            // region, so its top row is terminal row (term_rows - len + 1)
+            // whatever sits above it; address the caret absolutely.
             if painted {
                 use std::io::Write as _;
                 let total = boxed.rows.len() as u16;
@@ -9013,6 +9045,25 @@ mod tests {
             vec![KeyItem::Detach],
             "`Ctrl+X d` is unchanged by the digits"
         );
+    }
+
+    /// Shift+Left/Right lift out whole as agent-cycle steps, survive a split
+    /// read, never steal a plain arrow, and — the load-bearing one — are text
+    /// inside a bracketed paste so a pasted escape sequence never moves agents.
+    #[test]
+    fn input_box_setting_defaults_on_and_honours_explicit_opt_out() {
+        use crate::tui_bridge::input_box_setting;
+        use std::ffi::OsStr;
+        // Unset: the production default (on) is what applies.
+        assert!(input_box_setting(None, true));
+        assert!(!input_box_setting(None, false), "test builds default to the row");
+        // Explicit values win over the default either way.
+        assert!(!input_box_setting(Some(OsStr::new("0")), true));
+        assert!(!input_box_setting(Some(OsStr::new("false")), true));
+        assert!(input_box_setting(Some(OsStr::new("1")), false));
+        assert!(input_box_setting(Some(OsStr::new("true")), false));
+        // Junk falls back to the default rather than guessing.
+        assert!(input_box_setting(Some(OsStr::new("yes please")), true));
     }
 
     /// Shift+Left/Right lift out whole as agent-cycle steps, survive a split
