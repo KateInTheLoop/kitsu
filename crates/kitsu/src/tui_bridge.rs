@@ -1414,7 +1414,11 @@ pub(crate) fn repaint_status_row() {
         *painted = Some(key);
     }
     *lock(&source.last_paint) = Some(std::time::Instant::now());
-    viewport.paint(std::slice::from_ref(&row), cols);
+    // Top row only: with the framed input box the status row sits above the
+    // box, and repainting it must not clobber the box or pull the caret out of
+    // it (review F7). In single-row mode the top row IS the row, so this is
+    // the same bytes as before.
+    viewport.paint_top_row(&row, cols);
 }
 
 /// Note **N3**'s coalescing window: one row paint per 1/60 s.
@@ -1711,6 +1715,13 @@ impl BridgeGuard {
     /// would need the granted height in its key -- a palette rebuilt at the
     /// old budget surviving a resize is exactly the defect
     /// `resize_rows_preserves_an_open_palettes_height` pins.
+    /// After a read: collapse the viewport back to the single status row, so an
+    /// empty input box is not left pinned while the turn streams (review F7).
+    /// The next idle read paints the box again.
+    pub(crate) fn reset_composer(&self) -> bool {
+        self.paint_rows(&[self.status_row()])
+    }
+
     pub(crate) fn paint_composer(
         &self,
         prompt: &str,
@@ -1735,19 +1746,21 @@ impl BridgeGuard {
             };
             // Fit the box to what the terminal will grant BEFORE painting, so
             // the viewport never drops the top border to make room (review F8).
-            let grant = usize::from(self.granted_rows(u16::MAX));
+            // One row of the grant is the status row, which sits at the TOP
+            // (decision 4: meter above the box). It must be the region's first
+            // row because the status cadence repaints exactly that row.
+            let grant = usize::from(self.granted_rows(u16::MAX)).saturating_sub(1);
             let boxed = live::fit_input_box(live::compose_input_box(&composed, columns), grant);
             let budget = u16::try_from(grant.saturating_sub(boxed.rows.len())).unwrap_or(0);
-            let mut content = if crate::slash_palette_adds_to_the_row(draft, hint) {
-                palette_rows(
+            let mut content = vec![self.status_row()];
+            if crate::slash_palette_adds_to_the_row(draft, hint) {
+                content.extend(palette_rows(
                     draft,
                     rich,
                     crate::composer_surface_inner_width(Some(columns)),
                     budget,
-                )
-            } else {
-                Vec::new()
-            };
+                ));
+            }
             let above = content.len();
             content.extend(boxed.rows.iter().cloned());
             let painted = self.paint_rows(&content);

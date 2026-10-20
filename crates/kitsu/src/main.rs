@@ -6481,7 +6481,9 @@ fn read_chat_line_inline(
         // palette, and this is the call that must take the viewport back down
         // to one row. `paint_draft` would paint the status row and leave an
         // open palette's frame pinned above it until something else repainted.
-        bridge.paint_composer(prompt, "", 0, "", false, rich);
+        // Back to the one status row: an empty draft's palette and the input
+        // box must not stay pinned while the turn streams (review F7).
+        bridge.reset_composer();
         // Card T4-S2: the agent view. The reader is pure for the same reason
         // it is pure for a suspend, so the overlay's terminal, alternate
         // screen and key loop are sequenced here — and the draft comes back

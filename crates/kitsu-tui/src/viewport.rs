@@ -78,7 +78,7 @@ struct Inner {
     /// pinned viewport (the framed input box owns its caret there). Every
     /// transcript write re-parks on the scroll region's last row first, so
     /// output never lands inside the viewport (review F5).
-    caret_in_viewport: bool,
+    caret_in_viewport: Option<(u16, u16)>,
 }
 
 impl Inner {
@@ -94,10 +94,9 @@ impl Inner {
     /// placed inside the viewport, move it back to column 1 of the scroll
     /// region's last row — exactly where [`InlineSurface::paint`] parks it.
     fn repark(&mut self) {
-        if !self.caret_in_viewport {
+        if self.caret_in_viewport.take().is_none() {
             return;
         }
-        self.caret_in_viewport = false;
         if let Some((bottom, _)) = self.geometry {
             let _ = write!(self.err, "\x1b[{bottom};1H");
             let _ = self.err.flush();
@@ -232,7 +231,7 @@ impl InlineSurface {
                 err,
                 geometry: None,
                 cells: None,
-                caret_in_viewport: false,
+                caret_in_viewport: None,
             }),
         }
     }
@@ -257,7 +256,7 @@ impl InlineSurface {
                 // its own, so nothing here can drift from
                 // `TuiConfig::{MIN,DEFAULT,MAX}_CELL_RING_LINES`.
                 cells: Some(crate::cells::CellRing::new(cell_ring_lines)),
-                caret_in_viewport: false,
+                caret_in_viewport: None,
             }),
         }
     }
@@ -340,6 +339,7 @@ impl InlineSurface {
         let Some((bottom, viewport_rows)) = inner.geometry.take() else {
             return;
         };
+        inner.caret_in_viewport = None;
         // Deliberately swallowed, as in `show`: a failed escape sequence has
         // nowhere to be reported but the terminal that would not take it.
         for i in 0..viewport_rows {
@@ -391,7 +391,31 @@ impl InlineSurface {
             let _ = write!(inner.err, "\x1b[{line};1H\x1b[2K{row}");
         }
         let _ = write!(inner.err, "\x1b[{bottom};1H");
-        inner.caret_in_viewport = false;
+        inner.caret_in_viewport = None;
+        let _ = inner.err.flush();
+    }
+
+    /// Repaint ONLY the viewport's top row (the status row above the input
+    /// box), leaving every other viewport row and the caret where they were.
+    /// The status cadence uses this so a ticking meter never clobbers the box
+    /// or moves the caret out of it (review F7). With no caret placed, it
+    /// parks like [`paint`](Self::paint).
+    pub fn paint_top_row(&self, row: &str, cols: usize) {
+        let mut inner = self.lock();
+        let Some((bottom, _)) = inner.geometry else {
+            return;
+        };
+        let line = bottom + 1;
+        let row = kitsu_render::fit_row_to_width(row, cols);
+        let _ = write!(inner.err, "\x1b[{line};1H\x1b[2K{row}");
+        match inner.caret_in_viewport {
+            Some((caret_line, col)) => {
+                let _ = write!(inner.err, "\x1b[{caret_line};{col}H");
+            }
+            None => {
+                let _ = write!(inner.err, "\x1b[{bottom};1H");
+            }
+        }
         let _ = inner.err.flush();
     }
 
@@ -408,8 +432,9 @@ impl InlineSurface {
         };
         let row = viewport_row.clamp(1, viewport_rows.max(1));
         let line = bottom + row;
-        let _ = write!(inner.err, "\x1b[{line};{}H", col.max(1));
-        inner.caret_in_viewport = true;
+        let col = col.max(1);
+        let _ = write!(inner.err, "\x1b[{line};{col}H");
+        inner.caret_in_viewport = Some((line, col));
         let _ = inner.err.flush();
     }
 }
@@ -587,6 +612,28 @@ mod tests {
         // Out-of-range rows clamp to the viewport; never the scroll region.
         surface.place_caret(99, 1);
         assert!(sink.text().ends_with("\x1b[24;1H"), "clamped to the last viewport row");
+    }
+
+    /// Review F7: the status cadence repaints only the viewport's TOP row (the
+    /// status row above the box) and puts the caret back in the box.
+    #[test]
+    fn paint_top_row_repaints_only_the_status_row_and_restores_the_caret() {
+        let (surface, sink) = shared();
+        surface.show(24, 4); // viewport rows 21..=24; top row is 21
+        surface.place_caret(3, 12); // terminal line 23
+        let before = sink.bytes().len();
+        surface.paint_top_row("model · ■□□ 1%", 80);
+        let after = String::from_utf8(sink.bytes()[before..].to_vec()).unwrap();
+        assert!(after.starts_with("\x1b[21;1H\x1b[2Kmodel"), "only the top row: {after:?}");
+        assert!(after.ends_with("\x1b[23;12H"), "caret restored to the box: {after:?}");
+        assert_eq!(count(after.as_bytes(), b"\x1b[2K"), 1, "no other row touched");
+
+        // Without a placed caret it parks like paint().
+        surface.transcript_line(Fd::Stdout, "x"); // re-parks, clears the caret
+        let before = sink.bytes().len();
+        surface.paint_top_row("status", 80);
+        let after = String::from_utf8(sink.bytes()[before..].to_vec()).unwrap();
+        assert!(after.ends_with("\x1b[20;1H"), "parked on the scroll region: {after:?}");
     }
 
     #[test]
