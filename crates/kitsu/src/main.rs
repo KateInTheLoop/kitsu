@@ -7430,7 +7430,12 @@ fn read_chat_line_fullscreen(
             // rather than dropped because that is what a key which did
             // nothing owes the user (finding F76's replay, same mechanism).
             Ok(tui_bridge::InlineRead::OpenAgentView(draft))
-            | Ok(tui_bridge::InlineRead::Detached(draft)) => {
+            | Ok(tui_bridge::InlineRead::Detached(draft))
+            | Ok(tui_bridge::InlineRead::CycleAgent(_, draft))
+            | Ok(tui_bridge::InlineRead::AttachOrdinal(_, draft)) => {
+                // Agent routes are inline-only. Here they are inert: replay the
+                // draft instead of falling to `other`, which would map them to
+                // Eof and end the session (review F3).
                 carried = draft;
                 continue;
             }

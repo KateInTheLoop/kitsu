@@ -2685,8 +2685,13 @@ impl KeyFilter {
                 // Shift+Left/Right: complete presses, matched before the
                 // partial check for `LEFT_ARROW`'s reason. They share the
                 // `ESC [ 1 ; 2` prefix with nothing the editor decodes, so
-                // lifting them whole never steals a cursor key.
-                if rest.starts_with(SHIFT_LEFT) {
+                // lifting them whole never steals a cursor key. Only lifted
+                // when agent routes are active (a chord prefix is configured):
+                // under `InlineKeys::disabled()` — the fullscreen and overlay
+                // readers — they pass through like any unbound sequence
+                // instead of becoming an agent action those readers can't
+                // handle (review F3).
+                if self.keys.prefix.is_some() && rest.starts_with(SHIFT_LEFT) {
                     if !bytes.is_empty() {
                         items.push(KeyItem::Bytes(std::mem::take(&mut bytes)));
                     }
@@ -2694,7 +2699,7 @@ impl KeyFilter {
                     index += SHIFT_LEFT.len();
                     continue;
                 }
-                if rest.starts_with(SHIFT_RIGHT) {
+                if self.keys.prefix.is_some() && rest.starts_with(SHIFT_RIGHT) {
                     if !bytes.is_empty() {
                         items.push(KeyItem::Bytes(std::mem::take(&mut bytes)));
                     }
@@ -9090,6 +9095,14 @@ mod tests {
             KeyFilter::new(attach_keys()).feed(b"\x1b[D"),
             vec![KeyItem::Left],
             "plain Left is unchanged"
+        );
+        // Review F3: with agent routes off (the fullscreen/overlay readers run
+        // under InlineKeys::disabled()), Shift+Left is NOT an agent action —
+        // it passes through as bytes, so it can never end those sessions.
+        assert_eq!(
+            KeyFilter::new(InlineKeys::disabled()).feed(b"\x1b[1;2D"),
+            vec![KeyItem::Bytes(b"\x1b[1;2D".to_vec())],
+            "disabled keys never lift Shift+Left into CycleAgent"
         );
         // CONTROL (copy-paste safety): the same bytes inside a bracketed paste
         // are text, never a cycle — pasting content must never switch agents.
