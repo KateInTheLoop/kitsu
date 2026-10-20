@@ -295,6 +295,15 @@ pub struct StatusFields {
 /// half that, so the meter costs the row twelve columns rather than twenty.
 const STATUS_METER_CELLS: u64 = 8;
 
+/// How many lines of a multi-line draft to show ABOVE the cursor's line in the
+/// composer before collapsing the rest into a `⋮ +N earlier` marker. The pinned
+/// region grows to fit its content (clamped to the terminal height by the
+/// viewport), so this is what makes the input visibly expand into a box for a
+/// large paste or hand-typed block, instead of the old 2-line peephole. Older
+/// lines stay reachable by scrolling the cursor up; the marker shows how many
+/// are hidden.
+const DRAFT_CONTEXT_ROWS: usize = 12;
+
 /// The shortest model segment worth keeping. Below this the model is dropped
 /// outright instead of truncated to an unreadable stub.
 const STATUS_MODEL_MIN_COLS: usize = 7;
@@ -708,16 +717,16 @@ fn compose_wrap_rows_for_line(
     let segments = wrap_segments(line, segment_width);
     let earlier = segments.len().saturating_sub(1);
     let mut rows = Vec::new();
-    if earlier > 2 {
+    if earlier > DRAFT_CONTEXT_ROWS {
         rows.push(format!(
             "{}",
-            clamp(format!("  ⋮ +{} earlier segment(s)", earlier - 2)).dimmed()
+            clamp(format!("  ⋮ +{} earlier segment(s)", earlier - DRAFT_CONTEXT_ROWS)).dimmed()
         ));
     }
     for segment in segments
         .iter()
         .take(earlier)
-        .skip(earlier.saturating_sub(2))
+        .skip(earlier.saturating_sub(DRAFT_CONTEXT_ROWS))
     {
         rows.push(format!("{}", clamp(format!("  │ {segment}")).dimmed()));
     }
@@ -776,16 +785,16 @@ fn compose_draft_context_rows(
         clipped
     };
     let mut rows = Vec::new();
-    if cursor_line > 2 {
+    if cursor_line > DRAFT_CONTEXT_ROWS {
         rows.push(format!(
             "{}",
-            clamp(format!("  ⋮ +{} earlier line(s)", cursor_line - 2)).dimmed()
+            clamp(format!("  ⋮ +{} earlier line(s)", cursor_line - DRAFT_CONTEXT_ROWS)).dimmed()
         ));
     }
     for line in lines
         .iter()
         .take(cursor_line)
-        .skip(cursor_line.saturating_sub(2))
+        .skip(cursor_line.saturating_sub(DRAFT_CONTEXT_ROWS))
     {
         let text: String = crate::sanitize_terminal_text(line)
             .chars()
@@ -1451,15 +1460,14 @@ mod tests {
         assert_eq!(plain_rows.len(), 2, "{plain_rows:?}");
         assert!(plain_rows[0].contains("abcdefghij"));
         assert!(plain_rows[1].contains("klmnopqrst"));
-        // Many segments collapse older ones into a marker.
-        let long = "x".repeat(65);
-        let rows = compose_draft_context_rows(&long, 65, 80, 10);
+        // Enough segments to exceed the context budget collapse older ones
+        // into a marker (200 chars at width 10 → 20 segments, 19 earlier).
+        let long = "x".repeat(200);
+        let rows = compose_draft_context_rows(&long, 200, 80, 10);
         let plain_rows: Vec<String> = rows.iter().map(|r| sanitize_terminal_text(r)).collect();
-        assert!(
-            plain_rows[0].contains("+4 earlier segment(s)"),
-            "{plain_rows:?}"
-        );
-        assert_eq!(plain_rows.len(), 3);
+        assert!(plain_rows[0].contains("earlier segment(s)"), "{plain_rows:?}");
+        let shown = plain_rows.iter().filter(|r| r.contains("│")).count();
+        assert_eq!(shown, DRAFT_CONTEXT_ROWS, "shows the budget worth of segments: {plain_rows:?}");
     }
 
     #[test]
@@ -1526,16 +1534,28 @@ mod tests {
     }
 
     #[test]
-    fn context_rows_collapse_far_lines_into_markers() {
+    fn context_rows_grow_with_the_draft_and_collapse_only_past_the_budget() {
+        // A 6-line draft (well under DRAFT_CONTEXT_ROWS) shows every earlier
+        // line — the box grows instead of a 2-line peephole. Cursor in l5.
         let buffer = "l1\nl2\nl3\nl4\nl5\nl6";
-        // Cursor in l5 (chars: l1\n=3 ... start of l5 = 12).
         let rows = compose_draft_context_rows(buffer, 13, 80, 70);
         let plain: Vec<String> = rows.iter().map(|r| sanitize_terminal_text(r)).collect();
-        assert!(plain[0].contains("+2 earlier line(s)"), "{plain:?}");
-        assert!(plain[1].contains("l3"));
-        assert!(plain[2].contains("l4"));
-        assert!(plain[3].contains("+1 line(s) below — Enter submits all"));
-        assert_eq!(plain.len(), 4);
+        assert!(!plain.iter().any(|r| r.contains("earlier line(s)")), "no collapse under budget: {plain:?}");
+        assert!(plain[0].contains("l1") && plain[1].contains("l2"), "earliest lines shown: {plain:?}");
+        assert!(plain.iter().any(|r| r.contains("l4")), "all context lines shown: {plain:?}");
+        assert!(plain.last().unwrap().contains("+1 line(s) below — Enter submits all"));
+
+        // A draft with more earlier lines than the budget DOES collapse the
+        // overflow into the marker, keeping the box bounded.
+        let big: String = (1..=30).map(|n| format!("line{n}\n")).collect::<String>() + "cursorline";
+        let cursor = big.chars().count(); // at the end, after 30 newlines
+        let rows = compose_draft_context_rows(&big, cursor, 80, 70);
+        let plain: Vec<String> = rows.iter().map(|r| sanitize_terminal_text(r)).collect();
+        assert!(plain[0].contains("earlier line(s)"), "overflow collapses: {plain:?}");
+        // Exactly DRAFT_CONTEXT_ROWS context lines + the marker (+ cursor line).
+        let shown = plain.iter().filter(|r| r.contains("│")).count();
+        assert_eq!(shown, DRAFT_CONTEXT_ROWS, "shows the budget worth of lines: {plain:?}");
+
         // Single-line drafts produce no context rows.
         assert!(compose_draft_context_rows("plain", 3, 80, 70).is_empty());
         // Narrow terminals clamp context rows too.
