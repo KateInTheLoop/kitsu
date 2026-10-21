@@ -2,6 +2,7 @@
 //! Full UX (palette, code blocks, spinners) is later phases (design §8).
 
 pub mod jsonl;
+pub mod layout;
 pub mod live;
 pub mod surface;
 
