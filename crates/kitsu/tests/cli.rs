@@ -8721,7 +8721,10 @@ async fn test_interactive_confirmation_eof_interrupts_without_followup_send() {
 
     let server = MockServer::start().await;
     let repo = TempDir::new().expect("temp interactive repo");
-    let target = repo.path().join("must-not-exist.txt");
+    // Interactive chat grants its launch directory read+write, so a write
+    // inside `repo` never asks. Target a directory outside it to reach the gate.
+    let outside = TempDir::new().expect("temp directory outside the launch root");
+    let target = outside.path().join("must-not-exist.txt");
     let write_arguments = serde_json::json!({
         "path": target.to_string_lossy(),
         "content": "confirmation EOF must not write"
@@ -8832,7 +8835,10 @@ async fn test_interactive_explicit_denial_remains_provider_recoverable() {
 
     let server = MockServer::start().await;
     let repo = TempDir::new().expect("temp interactive repo");
-    let target = repo.path().join("must-not-exist.txt");
+    // Interactive chat grants its launch directory read+write, so a write
+    // inside `repo` never asks. Target a directory outside it to reach the gate.
+    let outside = TempDir::new().expect("temp directory outside the launch root");
+    let target = outside.path().join("must-not-exist.txt");
     let write_arguments = serde_json::json!({
         "path": target.to_string_lossy(),
         "content": "explicit denial must not write"

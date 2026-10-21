@@ -384,6 +384,14 @@ struct Options {
     /// the child's first `TIOCGWINSZ` probe to already report the short
     /// geometry, which a [`Action::Resize`] step cannot arrange.
     size: (u16, u16),
+    /// Run the framed input box instead of the single composer row.
+    ///
+    /// Off by default: almost every measurement here pins the single-row
+    /// viewport's geometry (`ESC[1;{ROWS-1}r`, the composer on the last row),
+    /// which is the `KITSU_INPUT_BOX=0` fallback the plan keeps supported. The
+    /// child's composer is always set explicitly so an ambient
+    /// `KITSU_INPUT_BOX` in the runner's shell cannot choose it.
+    input_box: bool,
 }
 
 impl Default for Options {
@@ -393,6 +401,7 @@ impl Default for Options {
             resume_on_stop: false,
             legacy_env_gate: false,
             size: (ROWS, COLS),
+            input_box: false,
         }
     }
 }
@@ -492,6 +501,7 @@ fn run_styled_chat_pty_core(
         .env_remove("ANTHROPIC_TOKEN_EXPIRES")
         .env_remove("KITSU_GATEWAY")
         .env_remove("KITSU_MODEL")
+        .env("KITSU_INPUT_BOX", if options.input_box { "1" } else { "0" })
         .current_dir(home)
         // SAFETY: all three live descriptors transfer exactly once.
         .stdin(unsafe { Stdio::from_raw_fd(child_stdin) })
@@ -1119,6 +1129,58 @@ fn type_context_then_quit() -> Vec<Step> {
 /// Today the second half is what fails: `ECHO` is off only during a turn, the
 /// idle prompt is still rustyline's, and rustyline repaints `kitsu> /context`
 /// inside the region while row 24 keeps the static `kitsu` status.
+/// **The framed input box, the production default, paints whole.**
+///
+/// The rest of this file pins the single-row fallback (`Options::input_box`
+/// is off by default). This is the box's own end-to-end check: once the
+/// child settles, the bottom three rows are the frame -- top border, prompt
+/// row, bottom border -- both at idle and with a typed draft, and the draft
+/// appears only inside the frame.
+#[test]
+#[serial]
+fn inline_mode_input_box_paints_the_whole_frame_at_idle_and_with_a_draft() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty_with(
+        home.path(),
+        Some("inline"),
+        &[
+            pause(RAW_MODE_MARKER, SETTLE_MS),
+            send(RAW_MODE_MARKER, "/context"),
+            pause(RAW_MODE_MARKER, SETTLE_MS),
+            send(RAW_MODE_MARKER, "\x15/quit\r"),
+        ],
+        Options {
+            input_box: true,
+            ..Options::default()
+        },
+    );
+
+    let frame = |screen: &[String], draft: &str| {
+        let rows = ROWS as usize;
+        let (top, content, bottom) = (&screen[rows - 3], &screen[rows - 2], &screen[rows - 1]);
+        assert!(
+            top.starts_with('╭') && content.starts_with('│') && bottom.starts_with('╰'),
+            "the bottom three rows must be the whole frame; whole screen:\n{}",
+            Session::dump(screen)
+        );
+        assert!(
+            content.contains(&format!("kitsu> {draft}")),
+            "the prompt row must show {draft:?}; whole screen:\n{}",
+            Session::dump(screen)
+        );
+    };
+    frame(&session.screen_at(1), "");
+    let typed = session.screen_at(3);
+    frame(&typed, "/context");
+    assert_eq!(
+        typed.iter().filter(|row| row.contains("/context")).count(),
+        1,
+        "the draft is painted only inside the frame; whole screen:\n{}",
+        Session::dump(&typed)
+    );
+}
+
 #[test]
 #[serial]
 fn inline_mode_echoes_the_idle_draft_in_the_viewport_row() {
@@ -2912,6 +2974,12 @@ fn kitsu_tui_environment_variable_no_longer_selects_the_viewport() {
 /// reach into the workspace's render crate, and adding a dev-dependency to
 /// borrow one function is not worth it. The raw-byte tests below are the only
 /// callers; everything else asserts on `vt100`'s already-parsed screen.
+/// `parent/file` of a path: the part a shortened tool line always keeps.
+fn path_tail(path: &Path) -> String {
+    let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+    format!("{}/{}", name(path.parent().unwrap()), name(path))
+}
+
 fn strip_csi(text: &str) -> String {
     let mut out = String::new();
     let mut chars = text.chars().peekable();
@@ -3443,6 +3511,13 @@ fn gated_read_turns(forbidden: &Path) -> Vec<Turn> {
 /// A tool round that touches the *command* gate. The answer is a denial, so
 /// nothing is ever executed and the test does not depend on OS containment
 /// being available at all -- only on the prompt being rendered.
+/// A harmless executable: macOS ships `true` only under `/usr/bin`.
+const TRUE_BIN: &str = if cfg!(target_os = "macos") {
+    "/usr/bin/true"
+} else {
+    "/bin/true"
+};
+
 fn gated_command_turns(cwd: &Path) -> Vec<Turn> {
     vec![
         Turn {
@@ -3451,7 +3526,8 @@ fn gated_command_turns(cwd: &Path) -> Vec<Turn> {
                     "gated-command-1",
                     "command_exec",
                     &format!(
-                        "{{\"argv\":[\"/bin/true\"],\"cwd\":{}}}",
+                        "{{\"argv\":[{}],\"cwd\":{}}}",
+                        serde_json_string(TRUE_BIN),
                         serde_json_string(&cwd.to_string_lossy())
                     ),
                 ),
@@ -4146,7 +4222,9 @@ fn inline_mode_allow_always_grants_the_whole_directory() {
         session.raw_text().escape_debug()
     );
     assert!(
-        strip_csi(&session.raw_text()).contains(&format!("{}", second.display())),
+        // The tool line keeps the path's last three components (`…/tmp/.tmpX/f`
+        // on macOS, whose temp root is `/private/tmp`), so match that tail.
+        strip_csi(&session.raw_text()).contains(&path_tail(&second)),
         "the second file must really have been read; raw:\n{}",
         session.raw_text().escape_debug()
     );
@@ -4291,6 +4369,11 @@ fn inline_mode_interrupting_the_approval_dismisses_the_modal_without_a_receipt()
 /// established, so a change to the help text cannot leave them matching a
 /// stale literal.
 const HELP_FOOTER: &str = "/help <command> explains one command in detail";
+
+/// The single-row composer's echo of a typed `/context` draft: the prompt's
+/// closing SGR reset, then the draft. `/help`'s own `  /context [...]` line
+/// never carries it.
+const DRAFT_CONTEXT_ECHO: &str = "\x1b[0m /context";
 
 /// Bracketed paste off, the sequence `RawStdinGuard::drop` writes.
 const PASTE_OFF: &str = "\x1b[?2004l";
@@ -4605,8 +4688,12 @@ fn classic_mode_ctrl_l_pins_no_region_and_keeps_one_transcript() {
 fn help_then_draft_then_grow() -> Vec<Step> {
     vec![
         send(RAW_MODE_MARKER, "/help\r"),
-        send("commands:", "/context"),
-        resize("/context", TALL_ROWS, COLS),
+        // `/help` itself lists `/context`, and triggers match the whole stream:
+        // wait for its last line, then for the composer's echo of the draft, or
+        // the resize can land while `/help` is still arriving (macOS PTYs
+        // deliver it in several reads) and its tail is misread as a reprint.
+        send(HELP_FOOTER, "/context"),
+        resize(DRAFT_CONTEXT_ECHO, TALL_ROWS, COLS),
         submit_on_tall_region(),
         send("context window source", "/quit\r"),
     ]
