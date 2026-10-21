@@ -1,7 +1,12 @@
 # Input box + copy-box: requirements & analysis
 
-Status: REQUIREMENTS ONLY (not implemented). Captured 2026-10-20 from live
-testing on stock macOS Terminal. Branch context: `feat/tui-rendering`.
+Captured 2026-10-20 from live testing on stock macOS Terminal. Branch context:
+`feat/tui-rendering`. The framed composer and stabilization fixes are now
+implemented; visual navigation and copy-box work remain planned. Current
+execution order, status, and acceptance criteria live in
+[next-development-plan.md](next-development-plan.md). The observations and
+proposed phasing below describe the original baseline; the recorded product
+decisions remain applicable.
 
 ## What the user wants (Claude-CLI-style input)
 A persistent, **bordered, auto-expanding** input box — like Claude Code's `❯`

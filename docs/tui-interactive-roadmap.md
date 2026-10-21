@@ -1,8 +1,10 @@
 # Interactive TUI upgrade — roadmap & status
 
-Branch: `feat/tui-option-picker` (off `main` + openpty macOS test fix).
-Everything local, **not pushed**. This file is the single source of truth for
-where we are and what is left.
+Historical implementation notes, started on `feat/tui-option-picker` and now
+carried on `feat/tui-rendering`. Everything stays local, **not pushed**.
+Current status, remaining work, and acceptance criteria are maintained in
+[next-development-plan.md](next-development-plan.md); its milestone order and
+status supersede the older lists below. The guiding constraints still apply.
 
 ## Guiding constraints (from the user — do not violate)
 1. **Copy-paste is sacred.** Navigation/keys must NEVER fight copy-paste. Any

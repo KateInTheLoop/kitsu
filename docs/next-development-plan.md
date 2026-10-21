@@ -1,150 +1,413 @@
 # kitsu — next development plan
 
-Written 2026-10-20 after reviewing `feat/tui-rendering` (24 commits on `main`,
-all local, authored CatherinaInTheLoop). Supersedes the "still open" list in
-`tui-interactive-roadmap.md`. Review evidence: `docs/review-feat-tui-rendering.md`
-(written by the verification pass; findings below are cited by its numbers).
+Updated 2026-10-20 following the plan analysis. Implementation baseline:
+`55892a477ee24cc4cacf14ae19c790ee05b0a486` on `feat/tui-rendering`, 33 commits
+ahead of recorded `main` at `c035bebd3b747341667e4ad8791e9bcd21ffac11`.
+The worktree was clean at that baseline. Documentation edits after it do not
+change the implementation checkpoint.
 
-## Where we are
+**Scope: local development only. Do not push to upstream, publish a PR, merge
+to upstream, change authentication, or delete/reorganize branches as part of
+this plan.** Roadmap implementation has started with Stage 0 validation and
+formatting; Stage 1B behavior changes still wait for Stage 0 acceptance.
 
-Shipped on the branch: `--effort` presets, interactive/`--yes` cwd read+write,
-macOS Seatbelt command containment + live tests, model popup picker, Shift+←/→
-agent cycle, resume id on exit, markdown rendering, and the framed input box
-(now the default; `KITSU_INPUT_BOX=0` opts out).
+This is the current execution plan. It supersedes the remaining-work lists in
+[tui-interactive-roadmap.md](tui-interactive-roadmap.md) and the earlier phasing
+in [tui-input-box-requirements.md](tui-input-box-requirements.md). The latter's
+recorded product decisions still apply. The
+[branch review](review-feat-tui-rendering.md) remains historical evidence about
+the code before its follow-up fixes, not a list of current defects.
 
-What changed in the picture:
-- The code review found 10 issues. Two are holes in the Seatbelt sandbox and one
-  ends the session on a keypress. The branch should not be pushed or merged
-  until those are fixed.
-- Item "caret across wraps" from the old list is bigger than an untested path:
-  Up/Down are hard-bound to history recall (`kitsu-editor/src/lib.rs:372,572`),
-  so you cannot move up through your own multi-line draft at all.
-- Item "default vs flag" is done.
+## Current checkpoint
 
-## Rule for all TUI work
+Implemented on the local branch: `--effort` presets, interactive/`--yes` cwd
+read+write, macOS Seatbelt command containment, model popup picker,
+Shift+Left/Right agent cycling, resume id on exit, markdown rendering, and the
+framed composer. The frame is the default **within inline mode**;
+`KITSU_INPUT_BOX=0` retains the older composer. Inline mode itself remains
+opt-in. Keep the fallback through this plan's editor and copy-box milestones.
 
-Pure geometry first, with unit tests. Then wire it and verify on a real
-terminal (stock Terminal.app, plus iTerm2 and tmux before anything is called
-done). No terminal change is reported as working until it has been seen.
+All ten review findings have implementation fixes. Use the review's original
+IDs below; the previous plan numbered some of them differently.
 
----
+| Review ID | Implemented change | Fix commit |
+|---|---|---|
+| F1 | Seatbelt excludes known secret paths and narrows Mach-service lookup | `c909b97` |
+| F2 | Seatbelt restricts executable paths to system/toolchain and granted roots | `c909b97` |
+| F3 | Disabled agent keys no longer emit cycling; fullscreen preserves the draft | `632741c` |
+| F4 | Model-popup Tab and Ctrl-C reach their handlers through the byte decoder | `11f2a31` |
+| F5 | Surface owns box caret placement and re-parks before transcript writes | `37439cb` |
+| F6 | `cwd_grant` comments describe interactive read+write correctly | `2e708ff` |
+| F7 | Status returns above the box; post-read reset collapses the composer | `e6923ac` |
+| F8 | Box fitting preserves borders/caret and uses latched viewport geometry | `37439cb` |
+| F9 | Markdown emphasis preserves glob paths | `af6a42a` |
+| F10 | Heading styling survives inline-span resets | `af6a42a` |
 
-## Milestone 0 — Stabilize the branch (do first)
+`55892a4` also isolates the effort-preset test from an exported `KITSU_EFFORT`.
+The review rejected F6's stale-CLI-help subclaim; that is not pending work.
+The original launchd escape subclaim was plausible, not a demonstrated escape.
 
-Verified by the aggregation pass (`docs/review-feat-tui-rendering.md`): 9 of
-10 confirmed. Severity HIGH 3 (1, 3, 4 below), MEDIUM 4, LOW 3. Two sub-claims
-did not hold: the launchd spawn-to-unsandboxed escape is PLAUSIBLE, not proven
-(`launchctl list` worked, `launchctl submit` failed on this macOS); the "CLI
-help is stale" part of #10 is REJECTED (help is already correct; only two code
-comments are stale). Confirmed live: writes to $HOME are denied, but `~/.zshrc`
-is readable and `~/.ssh` is listable from inside the sandbox.
+The checkpoint inspection observed 148 render tests and 158 TUI tests passing,
+plus focused popup-decoder and agent-cycle tests. The Seatbelt test command
+completed successfully, but its live tests can return early when containment
+or host fixtures are unavailable. That result alone does not certify that
+every runtime assertion executed. `cargo fmt --all -- --check` failed across
+seven source files. Full-suite, Linux-runtime, and real-terminal acceptance
+remain open; none is inferred from the targeted results.
 
-Fix order (verified): cheap user-visible breaks first, then the sandbox, then
-polish — **3, 4, 5, 1+2, 7, 6, 8+9, 10**.
+**Seatbelt boundary:** file reads remain broadly allowed, with exclusions for
+known secret locations. This is not general filesystem read isolation or
+proof that every possible credential location is protected. Writes, executable
+paths, and Mach services have their own restrictions. Acceptance records must
+describe the tested boundaries without claiming full Linux/macOS equivalence.
 
-**Decision needed for 1+2:** the open read and exec boundaries were deliberate
-(the profile's own comments say so). Is "a granted command can read your home
-directory" acceptable for a locally-approved command? Recommendation: no — deny
-the secret paths explicitly and narrow mach-lookup, since the gateway JWT lives
-in `~/.zshrc`.
+## Delivery rules and milestone order
 
-| # | Issue | Why first | Fix direction |
+- Build pure state/layout behavior first, then wire it to terminal input and
+  painting. Reuse existing editor, pane, surface, and restore mechanisms.
+- Bracketed-paste payload is content. A new key must stay inert inside a paste,
+  including when delimiters, escape sequences, or UTF-8 cross read boundaries.
+- No mouse capture; native selection and copy-paste must keep working.
+- Enable new behavior explicitly per consumer. `TypeaheadEditor` also serves
+  during-turn input and overlay lines; changing it globally can change classic,
+  fullscreen, and approval/filter behavior unintentionally.
+- Provider tests use local fakes/wiremock, without credentials or live models.
+- Implementation cards include relevant tests, formatting, affected-crate
+  checks, and documentation. Milestone exits run the full gates below.
+- A terminal feature is complete only after its automated acceptance and a
+  recorded Terminal.app, iTerm2, and tmux check. Record missing environments as
+  pending, rather than treating them as passes.
+- Keep local checkpoint receipts in this file as work progresses: source SHA,
+  tree state, commands, outcomes, logs, environment, and outstanding checks.
+  Do not introduce a new receipt framework for this work.
+
+| Stage | Outcome | Prerequisite | Status |
 |---|---|---|---|
-| 1 | Seatbelt `allow file-read*` + `allow mach-lookup` | Contained command can read ~/.ssh, ~/.aws, kitsu tokens, and launch an unsandboxed process via launchd | Keep reads broadly open (dyld needs it — a read allow-list SIGABRTs) but add explicit `deny file-read*` for secret paths: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gcloud`, `~/Library/Keychains`, kitsu config + state dirs. Replace `allow mach-lookup` with a global-name allowlist found empirically (what git/sh/cargo need). Live tests must prove a secret read fails and `open`/`osascript` cannot escape. |
-| 2 | Seatbelt `allow process*` | Child can exec any binary; Linux can't | Restrict `process-exec*` to the system dirs + command roots + runtime roots (the same set bwrap mounts). Keep `process-fork`. Live test: `/bin/sh -c /opt/homebrew/bin/x` denied unless that dir is a root. |
-| 3 | Shift+←/→ in fullscreen → `Eof` | Ends the session, loses the draft | Gate `CycleAgent` decoding on enabled keys, and give the fullscreen loop an explicit inert arm. Test: KeyFilter with disabled keys never yields `CycleAgent`. |
-| 4 | Box parks the cursor inside the pinned region | Transcript writes land in the box | Park back in the scroll region before any transcript write; only own the caret while the composer is reading. Same mechanism the single-row composer uses. |
-| 5 | Status row gone at idle; 3-row box left pinned during a turn | Lost status/meter; broken frame pieces | Paint the status row above the box at idle (this is decision 4 — status meter above the box). Post-read reset collapses back to one row. |
-| 6 | Caret row from a fresh `terminal_rows()` and unclamped box height | Wrong row on short terminals / mid-resize | Clamp the box to the latched grant before composing; keep the top border by dropping content rows, not the frame; compute the caret from the latched height. |
-| 7 | Model popup Tab and Ctrl-C never fire | Header advertises keys that do nothing | Decode 0x09 and 0x03 in `decode_overlay_keys` (or a popup-local decoder). Test through the real decoder, not hand-built keys. |
-| 8 | `*` italic eats glob paths (`src/*.rs`) | Wrong paths shown | Word-boundary rule for `*` like `_`: closing `*` must not be followed by an alphanumeric, opening must not be preceded by one. |
-| 9 | Heading style lost after an inline span | Half-styled headings | Re-apply the heading SGR after each inner reset, or style segments individually. |
-| 10 | `cwd_grant` docs/help stale | Behavior change was intended; docs say otherwise | Update the doc comment, `--help`, and README to say interactive mode can write inside the launch dir and still prompts outside it. |
+| 0 | Verified stabilization baseline | Existing fixes above | Validation in progress |
+| 1A | Layout, draft-state, and keyboard contracts | Stage 0 accepted before behavior changes; design can proceed while manual checks are pending | Contract draft; pure fixtures pending |
+| 1B | Visual navigation and draft preservation | 1A contracts complete; Stage 0 accepted | Not started |
+| 2A | Collapsed paste blocks and lossless submission | 1B accepted | Not started |
+| 2B | Popup editing and contextual footer | 2A accepted | Not started |
+| Later | Diff windows, additional panes, platform extensions | Separate scoped plans | Deferred |
 
-Also in Milestone 0:
-- **Linux compile check.** The Seatbelt refactor changed shared code and the
-  Bubblewrap backend, and has never been compiled for Linux. Install the
-  `x86_64-unknown-linux-gnu` target (or run in a Linux container/CI) and run the
-  bwrap live tests. Must pass before push.
-- Re-run the full suites; the only allowed failures are the known pre-existing
-  macOS ones.
+## Stage 0 — Finish stabilization validation
 
-Exit criteria: all CRITICAL/HIGH findings fixed with tests, Linux build green,
-live check of the box on Terminal.app + iTerm2 + tmux.
+The ten findings are implemented; do not schedule their fixes again. Complete
+the evidence and resolve new failures before beginning behavior changes.
 
----
+1. **Formatting and regression baseline.** Apply formatting in a separate
+   implementation change, then run the full gates. For any claimed pre-existing
+   macOS failure, record its exact test name, failure signature, toolchain,
+   environment, and reproduction against the implementation baseline above.
+   To call a failure pre-branch, also reproduce it against recorded `main`;
+   distinguish existing upstream failures from defects introduced by this
+   branch. Historical counts such as “193 failures” are not an exemption. An
+   unmatched failure remains unresolved. If needed, use an isolated local
+   checkout for comparison and preserve the user's worktree.
+2. **Native Linux validation.** Use a Linux host or VM, or a container running
+   on Linux with usable Bubblewrap/user namespaces. A Linux Rust target on
+   macOS can support a compile check but cannot supply Linux runtime evidence.
+   Run the shared-code build and existing Linux containment tests, recording
+   whether the backend was ready and which live assertions actually ran.
+   Keep this validation local; an upstream push/PR is not a test dependency.
+3. **macOS runtime evidence.** Capture Seatbelt readiness and the actual
+   execution of file operations, Git, scripts, write confinement, known-secret
+   denial, executable restrictions, and grant/revoke cases. Use controlled
+   fixtures when existing host secret paths are absent. Record skips explicitly.
+   Include controlled Mach-service/LaunchServices probes for F1, and distinguish
+   a denied request from an executed escape check; do not generalize from an
+   unrelated command failure. Never record real credential contents.
+4. **Real-terminal checkpoint.** Test an artifact built from the recorded SHA
+   and verify its source provenance; prefer an explicit local binary path over
+   assuming an installed `kitsu` is current. Check the empty prompt, typing,
+   wraps, status cadence, streaming/async output, popup Tab/Ctrl-C, agent keys,
+   short windows, resize, overlays, suspend/resume, and terminal restoration.
+   Select inline explicitly with `--tui inline`; include a smoke check with
+   `KITSU_INPUT_BOX=0`.
 
-## Milestone 1 — Make the input box a real editor
+Full automated gates, on each applicable platform:
 
-1. **Up/Down move within the draft.** In a multi-line draft, ↑/↓ move the caret
-   by visual row (respecting soft wraps). History recall only happens when the
-   caret is already on the first row (↑) or last row (↓) — the Claude CLI
-   behavior. Needs the editor to know visual-row geometry, so the wrap math
-   (`input_box_content` / `locate_caret_in_segments`) becomes shared between
-   render and editor rather than render-only.
-2. **Caret across wraps, verified.** Arrow through wrapped rows both ways,
-   Home/End per visual row vs per logical line (decide), word motion across a
-   wrap boundary.
-3. **Resize.** Box re-wraps on SIGWINCH without leaving frame fragments.
-4. **Legacy renderer.** Decide whether `KITSU_INPUT_BOX=0` stays supported. If
-   yes, fix its "cursor above `kitsu>`" bug (no caret at an empty draft). If
-   no, remove the flag and the dead path after one release.
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets --no-fail-fast
+cargo test --locked --release --workspace --all-targets --no-fail-fast
+git diff --check
+```
 
-## Milestone 2 — Copy-box
+Use [invariant-tests.md](roadmap/invariant-tests.md) to select additional
+authority, cancellation, JSONL, and session regressions affected by a change;
+include the existing run/session boundary scripts when their boundaries change.
+Record baseline warnings/failures individually as well as test failures.
+Dependency changes must also respect the workspace's declared Rust version and
+record any existing toolchain limitation rather than claiming an unrun MSRV
+check passed. A backend-unavailable early return is not containment acceptance.
 
-Decisions are already made (`tui-input-box-requirements.md`): collapse a paste
-of ≥2 lines or ≥10 words; kitsu-banner style; edit in a popup (Esc exits, no
-nested paste); status meter above the box.
+**Exit:** every review ID has its fix and appropriate executed evidence; full
+gates pass or have individually reproduced baseline exceptions with no new
+failures; native Linux containment runs; terminal checks are recorded. Formatting
+and new regressions must be resolved, not added to a blanket failure allowance.
 
-1. **Token model in the editor.** The buffer stays `Vec<char>` for typed text
-   and gains paste spans: `[Pasted text #N +M lines]` as one display unit
-   backed by the full text. Cursor treats a span as one unit; Backspace/Delete
-   at its edge removes the whole span. Detection only inside bracketed paste.
-2. **Submit expands** spans to their full text. The `messages` history and the
-   API never see the placeholder. Test this first — it's the correctness line.
-3. **Popup edit.** A key on a span (or entering it with the caret) opens an
-   overlay editor over the backing text, reusing the model-picker overlay
-   machinery. Esc saves and closes. Plain text only inside.
-4. **Key choice for "open span".** Must avoid Ctrl+←/→ (word motion),
-   Shift+←/→ (agent cycle), Ctrl+X chords, Ctrl+O, Ctrl+R. Proposal: Enter
-   while the caret sits on a span opens it; Tab cycles spans. Decide before
-   building.
+**Separate default-mode gate:** the
+[E11 native-scrollback matrix](roadmap/cycles/e11/terminal-matrix.md) is still
+unrun. Screen-state tests do not answer whether native terminal scrollback
+retains region-scrolled output. Use the current `--tui inline` selector when
+following that checklist; its historical `KITSU_TUI=inline` example is retired.
+Record the observation during terminal checks and keep the larger matrix open
+until its decision rule is satisfied. This plan does not flip the overall
+default to inline.
 
-## Milestone 3 — Gray hint footer
+### Local Stage 0 receipt — 2026-10-21 (unaccepted)
 
-One dim line under the box with the current affordances (`↵ send · ⇧↵ newline ·
-Tab next paste · Esc …`), context-sensitive. Small once Milestones 1–2 define
-the keys.
+Source HEAD remains `55892a477ee24cc4cacf14ae19c790ee05b0a486` on
+`feat/tui-rendering`; the worktree has uncommitted documentation and source
+changes. No push or upstream operation was performed. Host: macOS, Homebrew
+Rust 1.96.0. This shell supplied `KITSU_EFFORT=max`, `NO_COLOR=1`, and a
+`/var/folders/.../T` temporary directory. These affected independent tests,
+so the meaningful test invocations clear the first two and set
+`TMPDIR=/private/tmp`. The mock-server suite also needs local port binding,
+and was rerun outside the command sandbox.
 
-## Milestone 4 — Later (from the roadmap, unchanged order)
+- `cargo fmt --all -- --check`, `cargo clippy --locked --workspace
+  --all-targets -- -D warnings`, and `git diff --check` pass on the current
+  tree. Formatting was applied to the seven source files that failed the
+  initial check. Small existing Clippy warnings and macOS-only test imports
+  were corrected.
+- The first full debug run with inherited settings was invalidated by local
+  port and temp-path restrictions. A clean full debug run recorded 968/970
+  main-binary unit tests, 256/264 CLI tests (one ignored), 48/85 PTY tests,
+  and 385/389 command-tool library tests passing. Its full failure signatures
+  are in `/private/tmp/kitsu-stage0-debug-clean-20261021.log`. No failure in
+  that log is yet classified as an accepted baseline exception.
+- The command-tool fixture corrections now pass the full 387-test library
+  suite; the main-binary macOS filename correction now passes all 970 unit
+  tests. The Seatbelt outside-write assertion executed and passed with an
+  outside path outside the profile's explicitly permitted `/private/tmp`.
+  Those focused checks used the clean environment and local execution.
+- The clean release-profile full gate completed with 969/970 main-binary unit
+  tests, 256/264 CLI tests (one ignored), 48/85 PTY tests, and all 387
+  command-tool library tests passing. Its full signatures are in
+  `/private/tmp/kitsu-stage0-release-clean-20261021.log`. The lone unit
+  failure is the skills directory fixture, which passed in isolation in both
+  profiles and in the subsequent complete debug unit run; concurrent
+  execution remains to be investigated. The seven CLI and 37 PTY failures
+  match the debug run by test name. No failing test is accepted as a baseline
+  exception yet.
+- One PTY case was rerun alone and still failed:
+  `inline_mode_echoes_the_idle_draft_in_the_viewport_row` expects `/context`
+  on the last screen row, while the current framed composer paints it on the
+  content row above the bottom border. That test's single-row expectation is
+  stale; the remaining PTY failures still require individual triage. This is
+  evidence of an assertion mismatch, not a blanket exemption for the matrix.
+- Native Linux containment, controlled macOS Seatbelt probes beyond the
+  focused assertion, Terminal.app/iTerm2/tmux walkthroughs, and the E11
+  scrollback matrix remain pending. Stage 0 cannot be accepted from these
+  automated results.
 
-- Codex-style expandable diff windows with `+N/−M` per file (reuse `/diff`
-  evidence).
-- Multi-window / popup framework, optional fox side pane, navigation help.
-- tmux auto-detect (coexist, no double alt-screen).
-- Windows containment backend (AppContainer / restricted token) in the
-  `default_containment_backend` slot; WSL2 uses the Linux path.
-- Integration tests on the Linux side to mirror the five macOS live tests.
+## Stage 1A — Define layout, draft-state, and input contracts
 
----
+This stage establishes the contracts and pure fixtures before changing keys.
+Inspect existing APIs before choosing a representation or adding dependencies.
+The working transition, coordinate, consumer, and key decisions are recorded in
+[tui-editor-contracts.md](tui-editor-contracts.md); they are not accepted until
+the pure layout fixtures and dependency checks below are complete.
 
-## Housekeeping (any time, small)
+### Shared layout
 
-- **Push identity.** Before the first push, confirm the github.com keychain
-  account `mmpg-x86` is personal, or log `gh` into the personal github.com
-  account. Commits are already all CatherinaInTheLoop; the corporate `gh`
-  login is for github.sie.sony.com only.
-- **Branches.** Decide on `backup/*` and the older `feat/local-autodetect`,
-  `fix/*` branches. Nothing deleted without a yes.
-- **PR shape.** `feat/tui-rendering` contains the whole stack. Either one PR, or
-  split into the existing branch layers (effort → picker/agent-cycle →
-  Seatbelt → rendering) so the security-sensitive Seatbelt change gets its own
-  review.
-- **Docs.** README + CHANGELOG entries for the box default, cwd write, resume
-  hint, markdown rendering.
+Define a pure mapping between source positions and visual row/column positions,
+used by both painting and navigation. It takes the draft, first-line prompt,
+available width, and display projection. Compute the full draft layout before
+viewport clipping; the first visible row is not necessarily the first draft row.
 
-## Suggested next step
+Cover explicit newlines, soft wraps, tabs, sanitized display text, wide and
+combining characters, empty/trailing lines, exact wrap boundaries, and long
+prompts. Record the character/grapheme policy and maintain explicit conversion
+between source offsets and terminal cells. Leave an extension point for paste
+labels whose display length differs from their backing text.
 
-Milestone 0, items 1–3 (both Seatbelt holes and the fullscreen session-ending
-key), each with a test, then the Linux compile check. Then the box items (4–6)
-with you at the terminal.
+Choose a lower-level pure module/API without making the editor depend on the
+terminal/ANSI renderer. Keep one authority for wrapping and hit positions.
+
+### Draft ownership and preservation
+
+Define an in-memory draft snapshot with source content, cursor, selection,
+preferred vertical column, and the history/search state needed to resume
+editing. Reserve representation for paste identities, backing text, and spans;
+full paste-block implementation belongs to 2A.
+
+Draft restoration must use state restoration, not replay stored text as input
+keystrokes. The current `InlineRead` string payloads and `Cursor`-chained replay
+in `read_chat_line_inline` are migration sites. Enumerate transcript/agent
+overlays, attach/cycle/detach, suspend/resume, approval handoffs, completion,
+queued recall, and idle/during-turn transitions. Define which state survives
+each transition. Terminal descriptors/guards are not part of the snapshot.
+
+Persisted conversation history remains expanded text. An unfinished draft must
+retain editing metadata across supported transitions; display labels never
+serve as its canonical content. Classic/fullscreen fallback must preserve the
+full text even when it displays an expanded projection instead of paste tokens.
+Do not add a disk format or session schema change just to preserve a live draft.
+
+### Keyboard and consumer matrix
+
+Record behavior for ordinary editing, history walk, reverse search, explicit
+paste selection, paste popup, and bracketed-paste ingestion. Also record the
+capabilities of inline idle input, during-turn input, classic, fullscreen, and
+overlay/approval line editors. New box behavior is inline-only; other consumers
+retain their existing contracts unless explicitly covered by a later card.
+
+Fixed constraints:
+
+- Ordinary draft Enter sends; Tab retains slash-completion priority. Paste
+  editing requires an explicit, visible selection/edit state, not merely a
+  caret touching a span boundary.
+- Alt+Enter is the currently supported newline binding. Do not advertise
+  Shift+Enter without separately implementing and verifying its byte sequences.
+- Ctrl+Left/Right word motion, Shift+Left/Right agent cycling, Ctrl+X chords,
+  Ctrl+O, and Ctrl+R retain their meanings outside the relevant existing modes.
+- Up/Down navigate visual rows in an editable multiline draft; entering history
+  occurs only at the corresponding full-draft boundary. Preserve the preferred
+  column through short rows and restore the original draft/cursor after a walk.
+- Keep `KITSU_INPUT_BOX=0`; include its empty-draft caret defect in 1B.
+
+Close these choices in 1A before their implementation cards: how repeated
+Up/Down traverse recalled multiline entries; how editing exits a history walk;
+Home/End versus Ctrl+A/E semantics; the non-conflicting paste-focus entry and
+cycling keys; and Ctrl-C/EOF/interruption behavior in the paste popup. Esc saves
+and closes that popup, as already decided. Later cards must use this table
+rather than invent bindings independently.
+
+### Viewport and hints
+
+Budget the status row above the box, box borders/content, palette or active
+modal, and hint/footer below it. Define priorities and a compact fallback when
+the terminal cannot fit the minimum frame; never drop a border or place a caret
+outside the granted area. Reserve at least the existing transcript minimum.
+
+Search status and other essential editor feedback must remain visible in box
+mode. The current box content builder ignores `LiveDraft.hint`; 1B must restore
+that feedback. Define the footer's layout now, implement essential feedback in
+1B, then add paste-specific cues in 2B.
+
+**Exit:** contracts, transition/consumer/key tables, and pure layout fixtures
+cover the cases above; dependency direction is explicit; no terminal behavior
+has changed merely to establish the contracts.
+
+## Stage 1B — Visual navigation and draft preservation
+
+Implement the agreed layout, snapshot restoration, and navigation policy in
+small cards. Preserve existing editor normalization and use the same source-to-
+display mapping for painting and movement. Update geometry on resize before
+interpreting the next visual movement; keep the caret visible without changing
+source content. Fix the fallback composer's empty-draft caret behavior.
+
+**Acceptance:**
+
+- Pure tests cover preferred-column movement, prompt offsets, short/empty rows,
+  soft wraps, exact boundaries, and the agreed Unicode policy.
+- Raw-byte tests cover CSI/SS3 spellings, fragmented input, bracketed-paste
+  immunity, history/draft restoration, reverse search, and queued recall.
+- Integration tests preserve full draft and cursor through overlays, agent
+  switches, suspend/resume, approval handoffs, and idle/during-turn transitions.
+  Mode/capability tests pin unchanged classic/fullscreen/overlay behavior.
+- PTY tests exercise resize with a mid-draft caret, short-window shrink/grow,
+  palette/modal restoration, async output, and essential search/hint visibility.
+- Full gates and Terminal.app/iTerm2/tmux checks pass; the fallback remains
+  usable. Record accepted results before starting 2A.
+
+## Stage 2A — Collapsed paste blocks and lossless submission
+
+Keep the established product choices: collapse a bracketed paste of **at least
+two lines OR ten words**, use the kitsu frame style and dim token label, and
+keep the status meter above the box. Shorter/unbracketed input keeps its current
+text semantics. Recognize a paste by delimiters, never by timing or chunk size.
+
+Choose the span representation from 1A's contract: expanded text plus range
+metadata or explicit text/paste segments. Keeping a `Vec<char>` is an option,
+not a constraint that justifies a lossy design. A label such as
+`[Pasted text #N +M lines]` is display-only; identical typed text is ordinary
+text, not a lookup key. Give blocks stable session-local identities.
+
+Define threshold counting after the editor's existing normalization, including
+CRLF, trailing newlines, and whitespace-only text. Specify label line counts,
+oversized-label rendering, and when edited blocks stay collapsed. Navigation
+treats a collapsed block as one logical unit while layout accounts for the
+label's actual cell width. Backspace/Delete on the appropriate side removes the
+whole block; insertion, word deletion, kill commands, completion, history, and
+search must update or intentionally discard metadata without losing content.
+
+**Acceptance:**
+
+- First establish a fake-provider test proving that submission and conversation
+  history contain all normalized backing text in order, with no generated
+  placeholder. Preserve today's newline/control normalization without adding
+  content loss. Test literal placeholder-like text as a negative control.
+- Test threshold edges, multiple/adjacent blocks, insertion before/between/after
+  blocks, atomic deletion, fragmented delimiters/UTF-8, and control-key payloads.
+- Test snapshot restoration and all affected mutation/history/search/queue paths
+  with real block metadata, rather than only plain strings.
+- Adapt `crates/kitsu/tests/paste_latency.rs`: its visible tail sentinel will be
+  hidden by collapse. Observe completed block display instead; independently
+  verify full payload submission through the fake provider. Preserve the
+  measurement's meaningful completion point and existing strict-budget option.
+  Record the 10 KiB result and check larger inputs for repeated copying or
+  per-byte repaint regressions.
+- Full gates and real-terminal checks pass. Until popup editing lands, disclose
+  that the block supports atomic navigation/deletion but not popup editing yet.
+
+## Stage 2B — Paste popup and contextual footer
+
+Reuse existing modal-pane painting and surface restoration. For input, reuse
+the raw-text editor's UTF-8 and bracketed-paste handling with the agreed popup
+key policy. The model picker's direct `decode_overlay_keys` path accepts ASCII
+characters and does not preserve paste boundaries; it is not a multiline text
+editor to copy wholesale.
+
+Open only from the explicit selection/edit action defined in 1A. The popup owns
+the full backing text, supports multiline navigation and resize, and does not
+create recursive paste boxes. Esc saves edits and closes. Enter inside the
+popup follows the editor policy, never the parent composer's send action.
+Apply 1A's Ctrl-C/EOF/interruption rules and update the selected block safely
+when the edit completes.
+
+Maintain a single stdin owner. Coordinate with `APPROVAL_INPUT_ACTIVE`, the
+during-turn collector, and raw-mode guards; define deferral when an approval
+needs the input owner. Restore the parent draft, cursor, block selection, hints,
+and viewport on every exit. Keep native text selection available.
+
+Complete the dim footer using 1A's budget. Show only supported actions for the
+current state: ordinary send/newline/completion, explicit block selection, or
+popup editing with Esc save/close. Long text must truncate safely; small windows
+must follow the compact fallback instead of corrupting the frame.
+
+**Exit:** full payload remains correct after popup edits, UTF-8/multiline paste
+stays content, normal Enter/Tab behavior remains intact, interrupted/short-window
+paths preserve the draft and terminal, full gates pass, and the complete flow
+has recorded Terminal.app/iTerm2/tmux verification.
+
+## Later work — separate scope
+
+Preserve this product order, with a separate plan and acceptance for each:
+
+1. Expandable diff windows with per-file `+N/−M`, reusing `/diff` evidence.
+2. Multiple panes/popups, optional fox side pane, and navigation help.
+3. tmux detection/adaptation based on observed compatibility needs. tmux
+   coexistence and testing already apply to every terminal milestone above.
+4. Windows containment backend; WSL2 continues to use the Linux path.
+
+Existing Linux containment regression coverage is Stage 0 work, not a deferred
+feature. Additional backend parity fixtures follow the actual gaps discovered
+there. No generic window framework or dependency migration is required merely
+to implement one paste-edit popup.
+
+## Local documentation and next checkpoint
+
+Keep README, CHANGELOG, and functionality/UX documentation aligned with each
+implemented behavior; reconcile existing entries rather than duplicating them.
+Keep review evidence historical and update this plan's status/receipt at each
+accepted stage. Preserve all existing branches and user changes.
+
+**Next implementation step, when requested:** finish Stage 0 formatting and
+baseline evidence, including native Linux and real-terminal checks. Stage 1A's
+design contracts can be prepared while environment-dependent checks are pending;
+Stage 1B waits for their acceptance. The known review fixes are already present.
