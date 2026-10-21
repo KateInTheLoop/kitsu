@@ -204,6 +204,39 @@ and was rerun outside the command sandbox.
   scrollback matrix remain pending. Stage 0 cannot be accepted from these
   automated results.
 
+### Failure triage — 2026-10-21 (against `9dd7bc6`)
+
+Re-ran the suites after the `chore(stage0)` fix commit. kitsu-tools lib is
+387/387 and the main binary is 970/970, which clears the receipt's
+`builtins::command::*`, `skills::global_skill_count_budget`, and
+`workspace::live_review_*` entries. The CLI suite still shows 7 failures and
+`tests/tui.rs` 35. Setting `KITSU_INPUT_BOX=0` reduces the PTY failures from 35
+to 3, which isolates the geometry-stale cases from the rest. Classification:
+
+- **Stale box-vs-row geometry (32 PTY).** Most `inline_mode_*`/`tui_switch_*`
+  cases assert the old single-row composer (region set once, composer on the
+  bottom row, one pin per segment). They pass under `KITSU_INPUT_BOX=0`; the
+  framed box's scroll-region re-sizing is correct. These tests must be rewritten
+  to the box layout as part of resolving Stage 0, not accepted as exceptions.
+- **Collides with the cwd read+write grant (2 CLI).**
+  `test_interactive_explicit_denial_remains_provider_recoverable` and
+  `test_interactive_confirmation_eof_interrupts_without_followup_send` time out
+  because their guarded write now lands inside the auto-granted cwd and no
+  longer prompts (the intended `61a1dff` behavior). Fix: target a path outside
+  cwd so the denial/EOF path is still exercised.
+- **macOS environment / path display (2 CLI).**
+  `test_n1_non_tty_stays_byte_identical` diffs `…/tmp/…` abbreviation against its
+  `<WORK>` substitution; `test_system_prompt_discloses_the_exact_pregranted_command`
+  cannot resolve `pytest` in the sandbox. Neither is a branch regression.
+- **Reproduce individually (3).** `test_durable_script_save_failure_*`
+  (exit 0 vs 1, likely a macOS permission-bit difference),
+  `test_a_styled_tty_run_stays_silent_*`, and
+  `test_query_only_interactive_session_*` (startup/timing). Not yet classified.
+
+No confirmed shipping-behavior regression. Resolving the stale geometry and the
+two cwd-grant tests, plus reproducing the last three, remains Stage 0 exit work;
+Stage 1A design may proceed meanwhile because it changes no behavior.
+
 ## Stage 1A — Define layout, draft-state, and input contracts
 
 This stage establishes the contracts and pure fixtures before changing keys.
