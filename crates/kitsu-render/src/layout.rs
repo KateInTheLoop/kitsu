@@ -53,15 +53,22 @@ pub struct Atom {
     pub width: usize,
     /// Glyphs painted for this atom (already projected; no newlines).
     pub glyphs: String,
+    /// A hard row break (a source `'\n'`), not a painted atom.
+    pub breaks: bool,
 }
 
 impl Atom {
     /// One ordinary source scalar as its own atom.
+    /// The glyph is sanitized, so a bidi control paints as its visible
+    /// `[U+202E]` marker and a stray control paints as nothing -- one source
+    /// boundary either way.
     fn scalar(index: usize, ch: char) -> Self {
+        let glyphs = crate::sanitize_terminal_text(&display_glyph(ch).to_string());
         Atom {
             source: index..index + 1,
-            width: cell_width(ch),
-            glyphs: display_glyph(ch).to_string(),
+            width: glyphs.chars().map(cell_width).sum(),
+            glyphs,
+            breaks: false,
         }
     }
 }
@@ -92,6 +99,7 @@ impl Projection for ScalarProjection {
                         source: i..i + 1,
                         width: 0,
                         glyphs: String::new(),
+                        breaks: true,
                     }
                 } else {
                     Atom::scalar(i, ch)
@@ -186,11 +194,9 @@ impl Layout {
 
         let atoms = projection.atoms(source);
         for atom in &atoms {
-            let is_newline = atom.width == 0 && atom.glyphs.is_empty() && atom.source.len() == 1;
-
             // A newline's boundary sits at the end of the current row's content;
             // then the row breaks.
-            if is_newline {
+            if atom.breaks {
                 boundaries[atom.source.start] = Pos {
                     row: row_index,
                     col: prompt_cells_for(first_row, prompt_cells) + row_width,
@@ -451,6 +457,7 @@ mod tests {
                     source: 0..len,
                     width: 20,
                     glyphs: "[Pasted text #1 +9 lines]".to_string(),
+                    breaks: false,
                 }]
             }
         }
@@ -463,6 +470,16 @@ mod tests {
         }
         // End-of-draft is just past the label.
         assert_eq!(l.source_to_cell(5), Pos { row: 0, col: 20 });
+    }
+
+    /// Sanitized display text: a bidi control keeps one source boundary but paints
+    /// its visible marker's width, and the boundaries after it shift by that width.
+    #[test]
+    fn bidi_control_paints_its_visible_marker() {
+        let l = layout("a\u{202e}b", "", 40);
+        assert_eq!(l.rows[0].glyphs, "a[U+202E]b");
+        assert_eq!(l.source_to_cell(1), Pos { row: 0, col: 1 });
+        assert_eq!(l.source_to_cell(2), Pos { row: 0, col: 9 });
     }
 
     /// cell_to_source past a row's content clamps to that row's last boundary,

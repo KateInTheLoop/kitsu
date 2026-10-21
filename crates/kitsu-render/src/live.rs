@@ -405,42 +405,30 @@ pub fn fit_input_box(mut b: InputBox, max_rows: usize) -> InputBox {
 /// the box renderer owns the framing. The prompt is the first thing on the
 /// caret line (e.g. "kitsu> "), matching the single-row composer.
 fn input_box_content(draft: &LiveDraft, inner: usize) -> (Vec<String>, usize, usize) {
+    // One layout authority for painting and caret placement (Stage 1A): the
+    // same mapping vertical navigation will use.
     let prompt = sanitize_terminal_text(&draft.prompt);
-    let prompt_w = display_width(&prompt);
-    let buffer = &draft.buffer;
-    let chars: Vec<char> = buffer.chars().collect();
-    let cursor = draft.cursor.min(chars.len());
-    let logical: Vec<&str> = buffer.split('\n').collect();
-    let cursor_line = chars[..cursor].iter().filter(|&&c| c == '\n').count();
-    let (line_start, _, _) = current_line_bounds(buffer, cursor);
-    let cursor_in_line = cursor - line_start; // char offset within the cursor's logical line
-
-    // Wrap each logical line into `inner`-wide visual rows. The prompt prefixes
-    // the FIRST logical line only. Track where the caret lands (visual row +
-    // display column) as rows accumulate.
-    let mut rows: Vec<String> = Vec::new();
-    let mut caret_row = 0usize;
-    let mut caret_col = prompt_w; // fallback: just past the prompt
-    for (li, line) in logical.iter().enumerate() {
-        let full = if li == 0 {
-            format!("{prompt}{}", sanitize_terminal_text(line))
-        } else {
-            sanitize_terminal_text(line)
-        };
-        let segs = wrap_segments(&full, inner); // display_char-mapped, 1 char→1 char
-        if li == cursor_line {
-            // Caret's char column within `full` (prompt counts on line 0).
-            let caret_c = if li == 0 {
-                prompt.chars().count() + cursor_in_line
+    let layout = crate::layout::Layout::compute(
+        &draft.buffer,
+        &prompt,
+        inner,
+        &crate::layout::ScalarProjection,
+    );
+    let caret = layout.source_to_cell(draft.cursor);
+    let mut caret_row = caret.row;
+    let caret_col = caret.col;
+    let mut rows: Vec<String> = layout
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            if i == 0 {
+                format!("{prompt}{}", row.glyphs)
             } else {
-                cursor_in_line
-            };
-            let (seg_idx, col) = locate_caret_in_segments(&segs, caret_c, inner);
-            caret_row = rows.len() + seg_idx;
-            caret_col = col;
-        }
-        rows.extend(segs);
-    }
+                row.glyphs.clone()
+            }
+        })
+        .collect();
 
     // Bound the box height: keep a window of at most DRAFT_CONTEXT_ROWS visual
     // rows ending at the caret row (caret stays visible at/near the bottom),
@@ -457,28 +445,6 @@ fn input_box_content(draft: &LiveDraft, inner: usize) -> (Vec<String>, usize, us
         }
     }
     (rows, caret_row, caret_col.min(inner))
-}
-
-/// Which wrap segment holds char index `caret_c`, and the caret's display
-/// column within it. A caret exactly at a full segment's end moves to the start
-/// of the next segment (so typing continues on the next visual row), except on
-/// the last segment where it rests at the end.
-fn locate_caret_in_segments(segs: &[String], caret_c: usize, inner: usize) -> (usize, usize) {
-    let mut acc = 0usize;
-    for (i, seg) in segs.iter().enumerate() {
-        let seg_chars = seg.chars().count();
-        if caret_c < acc + seg_chars || i + 1 == segs.len() {
-            let offset = caret_c.saturating_sub(acc).min(seg_chars);
-            let col = display_width(&seg.chars().take(offset).collect::<String>());
-            return (i, col.min(inner));
-        }
-        if caret_c == acc + seg_chars {
-            // At the boundary of a full, non-last segment → next row, col 0.
-            return (i + 1, 0);
-        }
-        acc += seg_chars;
-    }
-    (0, 0)
 }
 
 /// The shortest model segment worth keeping. Below this the model is dropped
