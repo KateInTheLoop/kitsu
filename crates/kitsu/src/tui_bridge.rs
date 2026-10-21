@@ -1351,6 +1351,11 @@ pub(crate) fn clear_approval_modal() {
     let Some(pane) = lock(&MODAL_PANE).clone() else {
         return;
     };
+    let turn = lock(&TURN_DRAFT).take();
+    if let Some(t) = turn {
+        paint_turn_draft(&t.prompt, &t.draft, t.cursor, &t.hint, t.hint_reserved);
+        return;
+    }
     let row = match lock(&STATUS_PAINTER).clone() {
         Some((_, source)) => {
             source.invalidate();
@@ -1359,6 +1364,84 @@ pub(crate) fn clear_approval_modal() {
         None => pane.status.clone(),
     };
     pane.paint_rows(std::slice::from_ref(&row));
+}
+
+/// The during-turn draft last painted by [`paint_turn_draft`], so taking an
+/// approval modal down puts it back: the prompter clears the modal on its own
+/// thread, after the collector has already repainted, and would otherwise
+/// leave only the status row until the next keystroke.
+struct TurnDraft {
+    prompt: String,
+    draft: String,
+    cursor: usize,
+    hint: String,
+    hint_reserved: bool,
+}
+
+static TURN_DRAFT: std::sync::Mutex<Option<TurnDraft>> = std::sync::Mutex::new(None);
+
+/// The collector is done with its draft: a later modal teardown restores the
+/// status row only.
+pub(crate) fn end_turn_draft() {
+    *lock(&TURN_DRAFT) = None;
+}
+
+/// Paint the **during-turn** draft on the pinned pane, exactly as the idle
+/// composer paints it. The classic live row stands down while the inline
+/// viewport is installed (finding F15), so without this the collector's draft
+/// was stored and queued but never drawn. An empty draft collapses the pane to
+/// the status row, so no empty box stays pinned while the turn streams
+/// (review F7). Returns false when no pane is published (classic mode).
+pub(crate) fn paint_turn_draft(
+    prompt: &str,
+    draft: &str,
+    cursor: usize,
+    hint: &str,
+    hint_reserved: bool,
+) -> bool {
+    let Some(pane) = lock(&MODAL_PANE).clone() else {
+        return false;
+    };
+    *lock(&TURN_DRAFT) = Some(TurnDraft {
+        prompt: prompt.to_string(),
+        draft: draft.to_string(),
+        cursor,
+        hint: hint.to_string(),
+        hint_reserved,
+    });
+    let status_row = || match lock(&STATUS_PAINTER).clone() {
+        Some((_, source)) => {
+            source.invalidate();
+            source.compose(live::terminal_columns())
+        }
+        None => pane.status.clone(),
+    };
+    if draft.is_empty() && hint.is_empty() {
+        return pane.paint_rows(&[status_row()]);
+    }
+    if !input_box_enabled() {
+        // The single-row fallback's one row is the status row, which the
+        // turn's cadence repaints every tick; the draft gets its own row below.
+        // ponytail: no slash palette here during a turn; the box path has it.
+        let composed = live::LiveDraft {
+            prompt: prompt.to_string(),
+            buffer: draft.to_string(),
+            cursor,
+            hint: hint.to_string(),
+            hint_reserved,
+        };
+        let row = live::compose_input_row(&composed, live::terminal_columns()).0;
+        return pane.paint_rows(&[status_row(), row]);
+    }
+    pane.paint_composer(
+        &status_row,
+        prompt,
+        draft,
+        cursor,
+        hint,
+        hint_reserved,
+        kitsu_render::stderr_styled(),
+    )
 }
 
 /// Repaint R5's status row on the pinned viewport row, if one is installed
@@ -1731,86 +1814,15 @@ impl BridgeGuard {
         hint_reserved: bool,
         rich: bool,
     ) -> bool {
-        let columns = live::terminal_columns();
-        // The framed input box is the default; KITSU_INPUT_BOX=0 restores the
-        // single composer row. It reuses `paint_rows`' region growth — the same
-        // machinery the slash palette grows into — and keeps the palette: the
-        // palette rows sit ABOVE the box, so `/` completion still works.
-        if input_box_enabled() {
-            let composed = live::LiveDraft {
-                prompt: prompt.to_string(),
-                buffer: draft.to_string(),
-                cursor,
-                hint: hint.to_string(),
-                hint_reserved,
-            };
-            // Fit the box to what the terminal will grant BEFORE painting, so
-            // the viewport never drops the top border to make room (review F8).
-            // One row of the grant is the status row, which sits at the TOP
-            // (decision 4: meter above the box). It must be the region's first
-            // row because the status cadence repaints exactly that row.
-            let grant = usize::from(self.granted_rows(u16::MAX)).saturating_sub(1);
-            let boxed = live::fit_input_box(live::compose_input_box(&composed, columns), grant);
-            let budget = u16::try_from(grant.saturating_sub(boxed.rows.len())).unwrap_or(0);
-            let mut content = vec![self.status_row()];
-            if crate::slash_palette_adds_to_the_row(draft, hint) {
-                content.extend(palette_rows(
-                    draft,
-                    rich,
-                    crate::composer_surface_inner_width(Some(columns)),
-                    budget,
-                ));
-            }
-            let above = content.len();
-            content.extend(boxed.rows.iter().cloned());
-            let painted = self.paint_rows(&content);
-            // Own the caret inside the box, through the surface so the next
-            // transcript write re-parks on the scroll region first (review F5).
-            // The row is counted from the viewport's top, from the latched
-            // geometry — not a fresh terminal probe (review F8).
-            if painted {
-                let row = u16::try_from(above + boxed.caret.0).unwrap_or(u16::MAX);
-                let col = u16::try_from(boxed.caret.1).unwrap_or(u16::MAX);
-                self.pane.viewport.place_caret(row, col);
-            }
-            return painted;
-        }
-        // What this terminal will actually grant, less the composer's own
-        // row: the palette's whole budget. `granted_rows` is the same clamp
-        // `paint_rows` latches, so there is no second bound to drift.
-        let budget = self.granted_rows(u16::MAX).saturating_sub(1);
-        // Whether a palette belongs on screen at all is the slash registry's
-        // call, not this module's: a draft that already names a command, or
-        // whose hint points somewhere the list does not lead, gets the row
-        // alone rather than a menu that contradicts it.
-        let mut content = if crate::slash_palette_adds_to_the_row(draft, hint) {
-            palette_rows(
-                draft,
-                rich,
-                crate::composer_surface_inner_width(Some(columns)),
-                budget,
-            )
-        } else {
-            Vec::new()
-        };
-        content.push(if draft.is_empty() && hint.is_empty() {
-            // Exactly `paint_draft`'s rule: an idle row reads the status
-            // text, so the bottom row says the same whether or not a read is
-            // in flight. Keeping the rule here is what lets the post-read
-            // reset route through this method -- it then collapses an open
-            // palette *and* leaves today's status row behind.
-            self.status_row()
-        } else {
-            let composed = live::LiveDraft {
-                prompt: prompt.to_string(),
-                buffer: draft.to_string(),
-                cursor,
-                hint: hint.to_string(),
-                hint_reserved,
-            };
-            live::compose_input_row(&composed, columns).0
-        });
-        self.paint_rows(&content)
+        self.pane.paint_composer(
+            &|| self.status_row(),
+            prompt,
+            draft,
+            cursor,
+            hint,
+            hint_reserved,
+            rich,
+        )
     }
 
     /// A terminal resize that keeps the viewport's **current** height, for
@@ -1831,6 +1843,7 @@ impl BridgeGuard {
     ///
     /// The pane's own query, so the guard and the modal painter share one
     /// clamp (see [`PinnedPane::granted_rows`]).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn granted_rows(&self, requested: u16) -> u16 {
         self.pane.granted_rows(requested)
     }
@@ -1883,6 +1896,103 @@ impl BridgeGuard {
 }
 
 impl PinnedPane {
+    /// The composer's whole paint -- status row, slash palette, and the framed
+    /// box (or the single row with `KITSU_INPUT_BOX=0`) -- shared by the idle
+    /// reader ([`BridgeGuard::paint_composer`]) and the during-turn collector
+    /// ([`paint_turn_draft`]), so both show a draft the same way.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_composer(
+        &self,
+        status_row: &dyn Fn() -> String,
+        prompt: &str,
+        draft: &str,
+        cursor: usize,
+        hint: &str,
+        hint_reserved: bool,
+        rich: bool,
+    ) -> bool {
+        let columns = live::terminal_columns();
+        // The framed input box is the default; KITSU_INPUT_BOX=0 restores the
+        // single composer row. It reuses `paint_rows`' region growth — the same
+        // machinery the slash palette grows into — and keeps the palette: the
+        // palette rows sit ABOVE the box, so `/` completion still works.
+        if input_box_enabled() {
+            let composed = live::LiveDraft {
+                prompt: prompt.to_string(),
+                buffer: draft.to_string(),
+                cursor,
+                hint: hint.to_string(),
+                hint_reserved,
+            };
+            // Fit the box to what the terminal will grant BEFORE painting, so
+            // the viewport never drops the top border to make room (review F8).
+            // One row of the grant is the status row, which sits at the TOP
+            // (decision 4: meter above the box). It must be the region's first
+            // row because the status cadence repaints exactly that row.
+            let grant = usize::from(self.granted_rows(u16::MAX)).saturating_sub(1);
+            let boxed = live::fit_input_box(live::compose_input_box(&composed, columns), grant);
+            let budget = u16::try_from(grant.saturating_sub(boxed.rows.len())).unwrap_or(0);
+            let mut content = vec![status_row()];
+            if crate::slash_palette_adds_to_the_row(draft, hint) {
+                content.extend(palette_rows(
+                    draft,
+                    rich,
+                    crate::composer_surface_inner_width(Some(columns)),
+                    budget,
+                ));
+            }
+            let above = content.len();
+            content.extend(boxed.rows.iter().cloned());
+            let painted = self.paint_rows(&content);
+            // Own the caret inside the box, through the surface so the next
+            // transcript write re-parks on the scroll region first (review F5).
+            // The row is counted from the viewport's top, from the latched
+            // geometry — not a fresh terminal probe (review F8).
+            if painted {
+                let row = u16::try_from(above + boxed.caret.0).unwrap_or(u16::MAX);
+                let col = u16::try_from(boxed.caret.1).unwrap_or(u16::MAX);
+                self.viewport.place_caret(row, col);
+            }
+            return painted;
+        }
+        // What this terminal will actually grant, less the composer's own
+        // row: the palette's whole budget. `granted_rows` is the same clamp
+        // `paint_rows` latches, so there is no second bound to drift.
+        let budget = self.granted_rows(u16::MAX).saturating_sub(1);
+        // Whether a palette belongs on screen at all is the slash registry's
+        // call, not this module's: a draft that already names a command, or
+        // whose hint points somewhere the list does not lead, gets the row
+        // alone rather than a menu that contradicts it.
+        let mut content = if crate::slash_palette_adds_to_the_row(draft, hint) {
+            palette_rows(
+                draft,
+                rich,
+                crate::composer_surface_inner_width(Some(columns)),
+                budget,
+            )
+        } else {
+            Vec::new()
+        };
+        content.push(if draft.is_empty() && hint.is_empty() {
+            // Exactly `paint_draft`'s rule: an idle row reads the status
+            // text, so the bottom row says the same whether or not a read is
+            // in flight. Keeping the rule here is what lets the post-read
+            // reset route through this method -- it then collapses an open
+            // palette *and* leaves today's status row behind.
+            status_row()
+        } else {
+            let composed = live::LiveDraft {
+                prompt: prompt.to_string(),
+                buffer: draft.to_string(),
+                cursor,
+                hint: hint.to_string(),
+                hint_reserved,
+            };
+            live::compose_input_row(&composed, columns).0
+        });
+        self.paint_rows(&content)
+    }
+
     /// The terminal height currently latched.
     fn rows(&self) -> u16 {
         self.rows.load(std::sync::atomic::Ordering::Relaxed)

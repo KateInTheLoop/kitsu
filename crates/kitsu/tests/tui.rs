@@ -2359,11 +2359,93 @@ fn run_styled_streaming_chat_pty_with_args(
     turns: Vec<Turn>,
     extra_args: &[String],
 ) -> StreamSession {
+    run_styled_streaming_chat_pty_with_options(
+        home,
+        tui,
+        script,
+        turns,
+        extra_args,
+        Options::default(),
+    )
+}
+
+/// [`run_styled_streaming_chat_pty_with_args`] with explicit [`Options`].
+fn run_styled_streaming_chat_pty_with_options(
+    home: &Path,
+    tui: Option<&str>,
+    script: &[Step],
+    turns: Vec<Turn>,
+    extra_args: &[String],
+    options: Options,
+) -> StreamSession {
     let mock = SseMock::start(turns);
     write_streaming_config(home, &mock.base_url());
-    let session = run_styled_chat_pty_core(home, tui, script, Options::default(), extra_args);
+    let session = run_styled_chat_pty_core(home, tui, script, options, extra_args);
     let bodies = mock.bodies();
     StreamSession { session, bodies }
+}
+
+/// A turn slow enough to type into: a first delta, a long gap, the rest.
+fn slow_turn() -> Vec<Turn> {
+    vec![Turn {
+        events: vec![
+            delta("SLOW_TURN_STARTED\n"),
+            delta("SLOW_TURN_DONE\n"),
+            finish("stop"),
+        ],
+        gap: Duration::from_millis(1500),
+    }]
+}
+
+/// **The user-reported bug: text typed during a turn was invisible.** The
+/// draft was queued (the status row said `[1 queued]`) but never painted,
+/// because the classic live row is stood down in inline mode. Typed while the
+/// turn streams, the draft must be on the pinned pane -- in the framed box
+/// and in the single-row fallback.
+fn assert_turn_draft_is_visible(input_box: bool) {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty_with_options(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "go slow\r"),
+            send("SLOW_TURN_STARTED", "typed-during-turn"),
+            pause("SLOW_TURN_STARTED", SETTLE_MS),
+            send(TURN_DONE_MARKER, "\x15/quit\r"),
+        ],
+        slow_turn(),
+        &[],
+        Options {
+            input_box,
+            ..Options::default()
+        },
+    );
+    // Mark 2 closes the pause: mid-turn, the draft typed, the answer unfinished.
+    let screen = session.session.screen_at(2);
+    let pane = &screen[(ROWS as usize).saturating_sub(4)..];
+    assert!(
+        pane.iter().any(|row| row.contains("typed-during-turn")),
+        "box={input_box}: the during-turn draft must be painted on the pinned \
+         pane while the turn streams; whole screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        !screen.iter().any(|row| row.contains("SLOW_TURN_DONE")),
+        "precondition: the turn was still streaming; whole screen:\n{}",
+        Session::dump(&screen)
+    );
+}
+
+#[test]
+#[serial]
+fn inline_mode_paints_the_draft_typed_during_a_turn_in_the_box() {
+    assert_turn_draft_is_visible(true);
+}
+
+#[test]
+#[serial]
+fn inline_mode_paints_the_draft_typed_during_a_turn_in_the_row() {
+    assert_turn_draft_is_visible(false);
 }
 
 /// The trigger every streaming script uses for its *second* input: the live

@@ -18837,11 +18837,17 @@ fn resolve_editor_actions(
 /// reverse-search status while Ctrl+R is active, the inline slash hint
 /// otherwise.
 #[cfg(unix)]
-fn update_live_row(editor: &kitsu_editor::TypeaheadEditor) {
+fn update_live_row(editor: &kitsu_editor::TypeaheadEditor, prompt: &str) {
     let buffer = editor.buffer_string();
     let search_status = editor.search_status();
     let hint_reserved = search_status.is_some();
     let hint = search_status.unwrap_or_else(|| typeahead_slash_hint(&buffer));
+    // Inline mode: the pinned pane is the only place the draft can show (the
+    // classic row is stood down). A parked approval owns the pane until its
+    // answer is read, after which the collector repaints through here.
+    if !approval_key_request_pending() {
+        tui_bridge::paint_turn_draft(prompt, &buffer, editor.cursor(), &hint, hint_reserved);
+    }
     kitsu_render::live::live_input_update(buffer, editor.cursor(), hint, hint_reserved);
 }
 
@@ -19073,7 +19079,7 @@ fn run_live_typeahead(
     // turn it is in, not the idle row the reader left behind.
     tui_bridge::repaint_status_row();
     live::live_input_begin(prompt.clone());
-    update_live_row(&editor);
+    update_live_row(&editor, &prompt);
     // Card T3-S7b: this loop can now serve an approval read itself, so say so
     // while the guard is held. Cleared on every path that lets the guard go.
     APPROVAL_KEY_READER.store(raw.is_some(), Ordering::Release);
@@ -19102,7 +19108,7 @@ fn run_live_typeahead(
             editor.reset_pending_input();
             if raw.is_some() {
                 live::live_input_begin(prompt.clone());
-                update_live_row(&editor);
+                update_live_row(&editor, &prompt);
             }
             continue;
         }
@@ -19128,7 +19134,7 @@ fn run_live_typeahead(
                     raw = Some(guard);
                     APPROVAL_KEY_READER.store(true, Ordering::Release);
                     live::live_input_begin(prompt.clone());
-                    update_live_row(&editor);
+                    update_live_row(&editor, &prompt);
                 }
                 None => break,
             }
@@ -19175,7 +19181,7 @@ fn run_live_typeahead(
             // evidence that no bytes are inbound.
             quiet_ticks += 1;
             if quiet_ticks >= 2 && editor.resolve_lone_escape() {
-                update_live_row(&editor);
+                update_live_row(&editor, &prompt);
             }
             continue;
         }
@@ -19262,13 +19268,14 @@ fn run_live_typeahead(
             break;
         }
         if effects.needs_redraw {
-            update_live_row(&editor);
+            update_live_row(&editor, &prompt);
         }
     }
     // The reader is leaving: a prompter waiting on an in-loop key must stop
     // waiting (T3-S7b), so withdraw the offer before the guard goes.
     APPROVAL_KEY_READER.store(false, Ordering::Release);
     live::live_input_end();
+    tui_bridge::end_turn_draft();
     drop(raw);
     result.pending_draft = editor.take_draft();
     result
