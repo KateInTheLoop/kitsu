@@ -129,6 +129,10 @@ pub enum CommandDecision {
     AllowOnce,
     /// Grant this exact argv in this exact canonical cwd for the session.
     AllowForSession,
+    /// Run this invocation and stop asking for the rest of the session: the
+    /// policy behaves as [`CommandMode::AutoAllow`] until
+    /// [`CommandPolicy::set_session_auto`] turns it off.
+    AllowAllForSession,
     /// Do not run the invocation.
     Deny,
     /// Authority input closed before a decision; interrupt the current run.
@@ -1845,6 +1849,9 @@ pub struct CommandPolicy {
     bound_command_roots: Vec<BoundCommandRoot>,
     grants: RwLock<Vec<CommandGrantInfo>>,
     mode: CommandMode,
+    /// Auto mode chosen at a prompt (`AllowAllForSession`): an `Ask` policy
+    /// then skips the prompt like `AutoAllow` does. Never set for `Deny`.
+    session_auto: std::sync::atomic::AtomicBool,
     prompter: Option<Arc<dyn CommandPrompter>>,
     limits: CommandLimits,
     artifact_sink: Option<Arc<dyn CommandOutputArtifactSink>>,
@@ -1892,6 +1899,7 @@ impl CommandPolicy {
             bound_command_roots,
             grants: RwLock::new(Vec::new()),
             mode,
+            session_auto: std::sync::atomic::AtomicBool::new(false),
             prompter: None,
             limits: CommandLimits::default(),
             artifact_sink: None,
@@ -2001,6 +2009,22 @@ impl CommandPolicy {
 
     pub fn mode(&self) -> CommandMode {
         self.mode
+    }
+
+    /// Whether auto mode was turned on at a prompt this session.
+    pub fn session_auto(&self) -> bool {
+        self.session_auto.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Turn prompt-chosen auto mode on or off. Only an `Ask` policy can be in
+    /// auto mode; for the others this is a no-op and returns `false`.
+    pub fn set_session_auto(&self, on: bool) -> bool {
+        if self.mode != CommandMode::Ask {
+            return false;
+        }
+        self.session_auto
+            .store(on, std::sync::atomic::Ordering::Release);
+        true
     }
 
     pub fn limits(&self) -> CommandLimits {
@@ -2166,7 +2190,12 @@ impl CommandPolicy {
             });
         }
 
-        match self.mode {
+        let mode = if self.session_auto() {
+            CommandMode::AutoAllow
+        } else {
+            self.mode
+        };
+        match mode {
             // The dangerous bypass answers the approval question, nothing
             // else: cwd/root confinement and executable resolution were
             // already enforced above, and containment still wraps execution.
@@ -2222,6 +2251,13 @@ impl CommandPolicy {
                     }),
                     CommandDecision::AllowForSession => {
                         self.insert_grant(argv.to_vec(), cwd, executable.clone());
+                        Ok(AuthorizedCommand {
+                            cwd: authorized_cwd,
+                            executable,
+                        })
+                    }
+                    CommandDecision::AllowAllForSession => {
+                        self.set_session_auto(true);
                         Ok(AuthorizedCommand {
                             cwd: authorized_cwd,
                             executable,
@@ -4163,6 +4199,43 @@ mod tests {
         let _ = execute_command(&policy, args(&["/bin/echo", "one"], &child)).await;
 
         assert_eq!(prompts.load(Ordering::Relaxed), 3);
+    }
+
+    /// `[u]` auto mode: one prompt, then every later command (any argv, any
+    /// root cwd) runs without asking, until it is turned off again. A `Deny`
+    /// policy can never be put into auto mode.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn auto_mode_from_a_prompt_stops_asking_until_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::Ask)
+            .unwrap()
+            .with_prompter(Arc::new(FixedPrompter {
+                decision: CommandDecision::AllowAllForSession,
+                prompts: prompts.clone(),
+            }));
+
+        for word in ["one", "two", "three"] {
+            let out = execute_command(&policy, args(&["/bin/echo", word], dir.path()))
+                .await
+                .unwrap();
+            assert_eq!(out.stdout.trim(), word);
+        }
+        assert_eq!(prompts.load(Ordering::Relaxed), 1, "asked once only");
+        assert!(policy.session_auto());
+
+        assert!(policy.set_session_auto(false));
+        let _ = execute_command(&policy, args(&["/bin/echo", "four"], dir.path())).await;
+        assert_eq!(prompts.load(Ordering::Relaxed), 2, "off: asks again");
+
+        let deny = CommandPolicy::new(&[root(&dir)], CommandMode::Deny).unwrap();
+        assert!(!deny.set_session_auto(true), "Deny cannot enter auto mode");
+        assert!(
+            execute_command(&deny, args(&["/bin/echo", "x"], dir.path()))
+                .await
+                .is_err()
+        );
     }
 
     #[cfg(unix)]

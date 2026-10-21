@@ -1878,10 +1878,22 @@ fn approval_header_with_mode(request: &str, styled: bool) -> String {
 /// The aligned approval option line `[y] allow once · [a] <label> · [n] deny`,
 /// with the answer letters bold on a styled TTY.
 pub fn approval_options(always_label: &str) -> String {
-    approval_options_with_mode(always_label, stderr_style())
+    approval_options_with_mode(always_label, false, stderr_style())
 }
 
-fn approval_options_with_mode(always_label: &str, styled: bool) -> String {
+/// The command prompt's options: [`approval_options`] plus `[u]`, which
+/// turns auto mode on for the rest of the session.
+pub fn command_approval_options(always_label: &str) -> String {
+    approval_options_with_mode(always_label, true, stderr_style())
+}
+
+/// The `[u]` option's label, shared by the styled and plain prompts.
+pub const AUTO_MODE_OPTION: &str = "auto mode";
+
+/// The command prompt's `[a]` label: the exact argv/cwd session grant.
+pub const COMMAND_ALWAYS_LABEL: &str = "exact argv/cwd for session";
+
+fn approval_options_with_mode(always_label: &str, auto: bool, styled: bool) -> String {
     let always_label = sanitize_terminal_inline(always_label);
     let key = |k: &str| {
         if styled {
@@ -1890,8 +1902,13 @@ fn approval_options_with_mode(always_label: &str, styled: bool) -> String {
             format!("[{k}]")
         }
     };
+    let auto = if auto {
+        format!(" · {} {AUTO_MODE_OPTION}", key("u"))
+    } else {
+        String::new()
+    };
     format!(
-        "  {} allow once · {} {always_label} · {} deny",
+        "  {} allow once · {} {always_label}{auto} · {} deny",
         key("y"),
         key("a"),
         key("n")
@@ -3555,13 +3572,13 @@ mod tests {
         let unstyled = approval_header_with_mode("run rm -rf /tmp/x", false);
         assert_eq!(unstyled, "◉ permission — run rm -rf /tmp/x");
 
-        let options = approval_options_with_mode("always (/etc)", true);
+        let options = approval_options_with_mode("always (/etc)", false, true);
         assert_eq!(
             sanitize_terminal_text(&options),
             "  [y] allow once · [a] always (/etc) · [n] deny"
         );
         assert!(options.contains("\x1b[1m"));
-        assert!(!approval_options_with_mode("always (/etc)", false).contains('\u{1b}'));
+        assert!(!approval_options_with_mode("always (/etc)", false, false).contains('\u{1b}'));
     }
 
     /// **T3-S7a.** The bottom-pane modal's rows are exactly the surfaces that
@@ -3574,7 +3591,7 @@ mod tests {
     #[test]
     fn approval_modal_paints_header_then_details_then_the_option_line() {
         let header = approval_header_with_mode("kitsu wants to read /etc/hostname", false);
-        let options = approval_options_with_mode("always (/etc)", false);
+        let options = approval_options_with_mode("always (/etc)", false, false);
         let rows = approval_modal(&header, &[], &options);
         assert_eq!(
             rows,
@@ -3584,6 +3601,19 @@ mod tests {
         );
     }
 
+    /// The command prompt alone offers `[u]` auto mode, before deny, and all
+    /// four answers fit an 80-column pane (a truncated line hides `[n] deny`).
+    #[test]
+    fn command_approval_options_add_the_auto_key() {
+        let options = approval_options_with_mode(crate::COMMAND_ALWAYS_LABEL, true, false);
+        assert_eq!(
+            options,
+            "  [y] allow once · [a] exact argv/cwd for session · [u] auto mode · [n] deny"
+        );
+        assert!(options.chars().count() <= 80, "{}", options.chars().count());
+        assert!(!approval_options_with_mode("always (/etc)", false, false).contains("[u]"));
+    }
+
     /// **T3-S7a, R7's `command approvals keep their provenance rows`.** Every
     /// detail row survives, in order, between the header and the option line
     /// -- the five the command prompter composes today (cwd, executable,
@@ -3591,7 +3621,8 @@ mod tests {
     #[test]
     fn approval_modal_keeps_every_provenance_row_in_order() {
         let header = approval_header_with_mode("run /bin/true", false);
-        let options = approval_options_with_mode("allow this exact argv/cwd for session", false);
+        let options =
+            approval_options_with_mode("allow this exact argv/cwd for session", false, false);
         let details = vec![
             "  cwd: /repo".to_string(),
             "  executable: /bin/true (ambient PATH lookup; observed: /bin/true; bytes not pinned)"
@@ -3618,7 +3649,7 @@ mod tests {
     #[test]
     fn approval_modal_option_line_is_the_shared_composer_byte_for_byte() {
         let header = approval_header_with_mode("kitsu wants to write /tmp/x", false);
-        let options = approval_options_with_mode("always (/tmp)", false);
+        let options = approval_options_with_mode("always (/tmp)", false, false);
         let rows = approval_modal(&header, &["  cwd: /tmp".to_string()], &options);
         assert_eq!(
             rows.last().map(String::as_str),

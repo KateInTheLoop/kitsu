@@ -5404,6 +5404,14 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         alias_of: None,
     },
     SlashCommandSpec {
+        name: "auto",
+        args: "[on|off]",
+        description: "show or switch command auto mode for this session",
+        details: "Auto mode runs every later command without a permission prompt; containment, command roots and argv checks still apply. Answer [u] at a command prompt or use /auto on to start it, /auto off to stop. File access outside the granted roots still asks.",
+        group: CommandGroup::Permissions,
+        alias_of: None,
+    },
+    SlashCommandSpec {
         name: "checkpoint",
         args: "<id>",
         description: "preview one recoverable verified file checkpoint",
@@ -24845,6 +24853,37 @@ async fn handle_slash(
                 }
             }
         }
+        "auto" => {
+            let Some(policy) = session.command_policy.as_ref() else {
+                eprintln!("commands are disabled in this run");
+                return SlashResult::Error;
+            };
+            let on = match arg {
+                "" => None,
+                "on" => Some(true),
+                "off" => Some(false),
+                _ => {
+                    eprintln!("usage: /auto [on|off]");
+                    return SlashResult::Error;
+                }
+            };
+            if let Some(on) = on {
+                if !policy.set_session_auto(on) {
+                    eprintln!(
+                        "auto mode applies to prompted commands; this run's command mode is {:?}",
+                        policy.mode()
+                    );
+                    return SlashResult::Error;
+                }
+            }
+            if policy.mode() == kitsu_tools::CommandMode::AutoAllow {
+                eprintln!("~ auto mode: on for this run (--dangerously-skip-permissions)");
+            } else if policy.session_auto() {
+                eprintln!("{AUTO_MODE_ON_NOTICE}");
+            } else {
+                eprintln!("~ auto mode off: each new command asks before it runs");
+            }
+        }
         "revoke-command" => {
             let Ok(index) = arg.parse::<usize>() else {
                 eprintln!("usage: /revoke-command <number> (see /permissions)");
@@ -25520,6 +25559,21 @@ fn await_approval_key(receiver: &std::sync::mpsc::Receiver<Option<char>>) -> Opt
     answer
 }
 
+/// Printed when `[u]` turns command auto mode on.
+const AUTO_MODE_ON_NOTICE: &str = "~ auto mode on: remaining commands run without asking \
+     (containment still applies; /auto off to stop)";
+
+/// `u`/`auto` at a command prompt: auto mode for the rest of the session.
+fn is_auto_mode_answer(answer: &str) -> bool {
+    let answer = answer
+        .trim()
+        .trim_start_matches("\u{1b}[200~")
+        .trim_end_matches("\u{1b}[201~")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(answer.as_str(), "u" | "auto")
+}
+
 fn parse_permission_answer(answer: &str) -> Option<Decision> {
     let answer = answer
         .trim()
@@ -25677,7 +25731,8 @@ impl CommandPrompter for CliCommandPrompter {
                     terminal_inline(req.authority_notice())
                 )),
             ];
-            let options = kitsu_render::approval_options("allow this exact argv/cwd for session");
+            let options =
+                kitsu_render::command_approval_options(kitsu_render::COMMAND_ALWAYS_LABEL);
             (header, details, options)
         });
         // Card T3-S7b, exactly as the filesystem prompt above: where a pane
@@ -25711,12 +25766,13 @@ impl CommandPrompter for CliCommandPrompter {
             }
             match styled.as_ref() {
                 None => eprint!(
-                    "\ncommand permission> run {}\n  cwd: {}\n  executable: {} ({resolution}; observed: {observed}; bytes not pinned)\n  timeout: {} ms\n  authority: {}\n  [y] allow once   [a] allow this exact argv/cwd for session   [n] deny\n> ",
+                    "\ncommand permission> run {}\n  cwd: {}\n  executable: {} ({resolution}; observed: {observed}; bytes not pinned)\n  timeout: {} ms\n  authority: {}\n  [y] allow once   [a] allow this exact argv/cwd for session   [u] {}   [n] deny\n> ",
                     terminal_inline(&req.display_argv()),
                     terminal_inline(&req.cwd),
                     terminal_inline(&req.executable.invocation),
                     req.timeout_ms,
                     terminal_inline(req.authority_notice()),
+                    kitsu_render::AUTO_MODE_OPTION,
                 ),
                 Some((header, details, options)) => {
                     if approval_modal_paint(header, details, options, None) {
@@ -25740,6 +25796,12 @@ impl CommandPrompter for CliCommandPrompter {
         };
         approval_modal_commit(modal.as_deref());
         drop(reader_owner);
+        // `[u]` is the command prompt's own answer; the file prompt shares the
+        // parser below and must keep rejecting it.
+        if is_auto_mode_answer(&answer) {
+            eprintln!("{AUTO_MODE_ON_NOTICE}");
+            return CommandDecision::AllowAllForSession;
+        }
         // One parser, finding F45: this prompt used to re-implement
         // `parse_permission_answer`'s trim, paste-marker strip, lowercase and
         // match inline -- the same three answers under different names. The

@@ -3585,6 +3585,75 @@ fn gated_command_turns(cwd: &Path) -> Vec<Turn> {
     ]
 }
 
+/// Two gated commands, each its own round, then a closing reply.
+fn two_gated_command_turns(cwd: &Path) -> Vec<Turn> {
+    let call = |id: &str| Turn {
+        events: vec![
+            tool_call(
+                id,
+                "command_exec",
+                &format!(
+                    "{{\"argv\":[{}],\"cwd\":{}}}",
+                    serde_json_string(TRUE_BIN),
+                    serde_json_string(&cwd.to_string_lossy())
+                ),
+            ),
+            finish("tool_calls"),
+        ],
+        gap: Duration::from_millis(30),
+    };
+    vec![
+        call("gated-command-1"),
+        call("gated-command-2"),
+        Turn {
+            events: vec![delta("COMMAND_GATE_DONE\n"), finish("stop")],
+            gap: Duration::from_millis(30),
+        },
+    ]
+}
+
+/// **`[u]` auto mode.** Answering `u` at the first command prompt runs it and
+/// every later command in the session without another prompt.
+#[test]
+#[serial]
+fn inline_mode_auto_mode_answer_stops_later_command_prompts() {
+    let home = TempDir::new().expect("temp home");
+    let work = TempDir::new().expect("temp command root");
+    let session = run_styled_streaming_chat_pty_with_args(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "run the commands\r"),
+            send("authority:", "u"),
+            send(TURN_DONE_MARKER, "/quit\r"),
+        ],
+        two_gated_command_turns(work.path()),
+        &[
+            "--command-root".to_string(),
+            work.path().to_string_lossy().into_owned(),
+        ],
+    );
+
+    let text = strip_csi(&session.raw_text());
+    assert!(
+        text.contains("COMMAND_GATE_DONE"),
+        "the turn finished; raw:\n{text}"
+    );
+    assert!(
+        text.contains("auto mode on"),
+        "`u` announces auto mode; raw:\n{text}"
+    );
+    assert_eq!(
+        text.matches("authority:").count(),
+        1,
+        "only the first command asks; raw:\n{text}"
+    );
+    assert!(
+        !text.contains("denied"),
+        "neither command was denied; raw:\n{text}"
+    );
+}
+
 /// A gated read answered `y`, in one mode. `marks[1]` is the answer.
 fn gated_read_session(tui: Option<&str>, forbidden: &Path, extra: &[String]) -> StreamSession {
     let home = TempDir::new().expect("temp home");
@@ -3766,7 +3835,8 @@ fn inline_mode_command_approval_modal_keeps_its_provenance_rows() {
             rows.len()
         );
     }
-    let expected_options = "[y] allow once · [a] allow this exact argv/cwd for session · [n] deny";
+    let expected_options =
+        "[y] allow once · [a] exact argv/cwd for session · [u] auto mode · [n] deny";
     assert!(
         rows.iter().any(|row| row.trim() == expected_options),
         "R7: the command modal's option line must be the shared composer's \
