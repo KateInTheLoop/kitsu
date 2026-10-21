@@ -1181,6 +1181,49 @@ fn inline_mode_input_box_paints_the_whole_frame_at_idle_and_with_a_draft() {
     );
 }
 
+/// **Stage 1B: in the framed box, ↑/↓ move between the draft's visual rows.**
+///
+/// A two-line draft (Alt+Enter between the lines); ↑ from the end of the
+/// second line lands on the same visual column of the first, where a typed
+/// `X` goes; ↓ returns to the second line, clamped to its end, where `Y`
+/// goes. History is never entered, because neither press is at the draft's
+/// outer boundary.
+#[test]
+#[serial]
+fn inline_mode_input_box_up_and_down_move_between_draft_rows() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty_with(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "hello\x1b\rworld!!!!!!"),
+            pause(RAW_MODE_MARKER, SETTLE_MS),
+            send(RAW_MODE_MARKER, "\x1b[AX\x1b[BY"),
+            pause(RAW_MODE_MARKER, SETTLE_MS),
+            send(RAW_MODE_MARKER, "\x15/quit\r"),
+        ],
+        Options {
+            input_box: true,
+            ..Options::default()
+        },
+    );
+
+    let screen = session.screen_at(4);
+    let rows = ROWS as usize;
+    // "kitsu> " is 7 cells, so column 11 on row 0 is after "hell".
+    assert!(
+        screen[rows - 3].contains("kitsu> hellXo"),
+        "↑ must land on the same column of the row above; whole screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        screen[rows - 2].contains("world!!!!!!Y"),
+        "↓ must return to the row below, clamped to its end; whole screen:\n{}",
+        Session::dump(&screen)
+    );
+}
+
 #[test]
 #[serial]
 fn inline_mode_echoes_the_idle_draft_in_the_viewport_row() {

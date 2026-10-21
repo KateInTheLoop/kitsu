@@ -1576,7 +1576,7 @@ where
 /// `KITSU_INPUT_BOX=0` (or `false`) restores the single composer row. Test
 /// builds default to the legacy row so the composer/palette tests keep pinning
 /// that renderer; the box geometry is tested in `kitsu_render::live`.
-fn input_box_enabled() -> bool {
+pub(crate) fn input_box_enabled() -> bool {
     input_box_setting(std::env::var_os("KITSU_INPUT_BOX").as_deref(), !cfg!(test))
 }
 
@@ -2912,6 +2912,7 @@ pub(crate) fn read_line_inline<R: std::io::Read>(
         InlineKeys::disabled(),
         None,
         None,
+        None,
     )
 }
 
@@ -2983,6 +2984,7 @@ pub(crate) fn composer_prompt(base: &str, attached: Option<u64>) -> String {
 /// Paging with the caret mid-draft would then move the caret on every press.
 /// A sink keeps one read, one editor and one draft across a whole run of
 /// presses.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
     input: &mut R,
     paint: &mut dyn FnMut(&str, usize, &str, bool),
@@ -2991,6 +2993,7 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
     keys: InlineKeys,
     attached: Option<u64>,
     pages: Option<&mut dyn FnMut(kitsu_tui::fullscreen::Page)>,
+    vertical: Option<kitsu_editor::VerticalMotion>,
 ) -> std::io::Result<InlineRead> {
     use kitsu_editor::{EditorAction, FeedOutcome, TypeaheadEditor};
 
@@ -3017,6 +3020,9 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
     }
 
     let mut editor = TypeaheadEditor::new(history.to_vec());
+    // Stage 1B: the framed composer's ↑/↓ walk its visual rows first. Only the
+    // consumer that paints through the shared layout passes a motion.
+    editor.set_vertical_motion(vertical);
     let mut filter = KeyFilter::new(keys);
     // The sink is the gate: with one, the four paging sequences are keys and
     // are lifted out of the stream; without one they are bytes like any
@@ -4238,6 +4244,7 @@ mod tests {
                 InlineKeys::disabled(),
                 None,
                 Some(&mut sink),
+                None,
             )
             .expect("inline read")
         };
@@ -8807,6 +8814,7 @@ mod tests {
             &mut || {},
             keys,
             attached,
+            None,
             None,
         )
         .expect("inline read")

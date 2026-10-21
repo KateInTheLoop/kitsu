@@ -18,7 +18,8 @@
 //! # Supported keys
 //!
 //! Printable UTF-8 insert, Enter (submit), Backspace, Delete, ←/→/Home/End
-//! (also Ctrl+B/F/A/E), ↑/↓ history walk with a draft stash, Ctrl+U (kill to
+//! (also Ctrl+B/F/A/E), ↑/↓ history walk with a draft stash (visual rows
+//! first for a consumer that injects [`VerticalMotion`]), Ctrl+U (kill to
 //! start), Ctrl+K (kill to end), Ctrl+W and Alt+Backspace (delete word
 //! behind), Alt+D and Ctrl+Delete (delete word ahead), Alt+B/F and Ctrl+←/→
 //! (word motion), Ctrl+D (EOF on an empty draft, delete otherwise), and
@@ -42,6 +43,14 @@
 //! A bracketed paste (`ESC[200~`…`ESC[201~`) stays one draft block: its
 //! newlines insert literally instead of submitting. Unknown escape sequences
 //! are consumed and ignored so they never leak into the draft.
+
+/// Visual-row motion a consumer may inject (see
+/// [`TypeaheadEditor::set_vertical_motion`]): given the draft, the cursor, the
+/// preferred cell column, and the direction (`true` = up), the new cursor and
+/// the column to keep preferring, or `None` at the draft's first/last visual
+/// row. The editor stays free of any layout dependency; the consumer that
+/// paints the draft supplies the mapping it paints with.
+pub type VerticalMotion = Box<dyn Fn(&str, usize, Option<usize>, bool) -> Option<(usize, usize)>>;
 
 /// A side effect the collector must perform after feeding bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,6 +125,15 @@ pub struct TypeaheadEditor {
     /// live draft (which is stashed on the first ↑).
     history_cursor: Option<usize>,
     stash: Vec<char>,
+    /// The live draft's cursor when it was stashed, restored with it.
+    stash_cursor: usize,
+    /// Injected visual-row motion; `None` keeps ↑/↓ as the history walk.
+    vertical: Option<VerticalMotion>,
+    /// The preferred column of a run of ↑/↓, keyed by the cursor and draft
+    /// length it left behind: any other edit or motion invalidates it.
+    // ponytail: (cursor, len) misses a same-length replace at the same cursor;
+    // track an edit counter if that ever shows up as a wrong column.
+    preferred_col: Option<(usize, usize, usize)>,
     pending: Pending,
     csi_params: Vec<u8>,
     /// Partial UTF-8 sequence awaiting continuation bytes.
@@ -151,6 +169,9 @@ impl TypeaheadEditor {
             history,
             history_cursor: None,
             stash: Vec::new(),
+            stash_cursor: 0,
+            vertical: None,
+            preferred_col: None,
             pending: Pending::None,
             csi_params: Vec::new(),
             utf8: Vec::new(),
@@ -163,6 +184,14 @@ impl TypeaheadEditor {
 
     pub fn buffer_string(&self) -> String {
         self.buffer.iter().collect()
+    }
+
+    /// Make ↑/↓ move between visual rows first, entering history only at the
+    /// draft's first (↑) or last (↓) row. Opt-in per consumer: only the inline
+    /// framed composer paints with the mapping this needs.
+    pub fn set_vertical_motion(&mut self, motion: Option<VerticalMotion>) {
+        self.vertical = motion;
+        self.preferred_col = None;
     }
 
     /// Cursor position as a char index into [`Self::buffer_string`].
@@ -369,8 +398,8 @@ impl TypeaheadEditor {
                     return;
                 }
                 match byte {
-                    b'A' => self.history_prev(outcome),
-                    b'B' => self.history_next(outcome),
+                    b'A' => self.vertical_or_history(true, outcome),
+                    b'B' => self.vertical_or_history(false, outcome),
                     b'C' => self.move_right(outcome),
                     b'D' => self.move_left(outcome),
                     b'H' => self.move_home(outcome),
@@ -569,8 +598,8 @@ impl TypeaheadEditor {
             return;
         }
         match final_byte {
-            b'A' => self.history_prev(outcome),
-            b'B' => self.history_next(outcome),
+            b'A' => self.vertical_or_history(true, outcome),
+            b'B' => self.vertical_or_history(false, outcome),
             // Ctrl+→ / Alt+→ (modifier params 5/3) jump by words.
             b'C' => match self.csi_params.as_slice() {
                 b"1;5" | b"1;3" => self.move_word_right(outcome),
@@ -706,6 +735,30 @@ impl TypeaheadEditor {
         }
     }
 
+    /// ↑/↓: a visual row when the injected motion has one, else the history
+    /// walk exactly as before.
+    fn vertical_or_history(&mut self, up: bool, outcome: &mut FeedOutcome) {
+        if let Some(motion) = &self.vertical {
+            let preferred = self
+                .preferred_col
+                .filter(|&(cursor, len, _)| cursor == self.cursor && len == self.buffer.len())
+                .map(|(_, _, col)| col);
+            let text: String = self.buffer.iter().collect();
+            if let Some((cursor, col)) = motion(&text, self.cursor, preferred, up) {
+                self.cursor = cursor.min(self.buffer.len());
+                self.preferred_col = Some((self.cursor, self.buffer.len(), col));
+                outcome.changed = true;
+                return;
+            }
+        }
+        self.preferred_col = None;
+        if up {
+            self.history_prev(outcome);
+        } else {
+            self.history_next(outcome);
+        }
+    }
+
     fn history_prev(&mut self, outcome: &mut FeedOutcome) {
         // The very first ↑ on an untouched draft is a recall point: queued
         // prompts (owned by the collector) take precedence over history.
@@ -728,6 +781,7 @@ impl TypeaheadEditor {
             None if self.history.is_empty() => return,
             None => {
                 self.stash = std::mem::take(&mut self.buffer);
+                self.stash_cursor = self.cursor;
                 self.history.len() - 1
             }
             Some(0) => return,
@@ -746,11 +800,19 @@ impl TypeaheadEditor {
         if index + 1 < self.history.len() {
             self.history_cursor = Some(index + 1);
             self.buffer = self.history[index + 1].chars().collect();
+            self.cursor = self.buffer.len();
         } else {
+            // Leaving the walk restores the original draft. A consumer that
+            // opted into visual motion also gets its cursor back (the 1B
+            // contract); the others keep the historical cursor-at-end.
             self.history_cursor = None;
             self.buffer = std::mem::take(&mut self.stash);
+            self.cursor = if self.vertical.is_some() {
+                self.stash_cursor.min(self.buffer.len())
+            } else {
+                self.buffer.len()
+            };
         }
-        self.cursor = self.buffer.len();
         outcome.changed = true;
     }
 }
@@ -1385,5 +1447,66 @@ mod tests {
             "pasted",
             "NON-VACUOUS: the paste really is open and really did arrive"
         );
+    }
+
+    /// A stand-in for the layout: rows are the draft's `\n`-separated lines and
+    /// a column is a char offset, which is all the editor's half needs.
+    fn line_motion() -> VerticalMotion {
+        Box::new(
+            |text: &str, cursor: usize, preferred: Option<usize>, up: bool| {
+                let starts: Vec<usize> = std::iter::once(0)
+                    .chain(
+                        text.chars()
+                            .enumerate()
+                            .filter(|(_, c)| *c == '\n')
+                            .map(|(i, _)| i + 1),
+                    )
+                    .collect();
+                let row = starts.iter().rposition(|&s| s <= cursor).unwrap();
+                let col = preferred.unwrap_or(cursor - starts[row]);
+                let target = if up { row.checked_sub(1)? } else { row + 1 };
+                let start = *starts.get(target)?;
+                let end = starts
+                    .get(target + 1)
+                    .map_or(text.chars().count(), |next| next - 1);
+                Some(((start + col).min(end), col))
+            },
+        )
+    }
+
+    /// Stage 1B: ↑/↓ walk the draft's rows first, keep the preferred column
+    /// through a short row, and only enter history at the draft's top row;
+    /// leaving history restores the original draft and its cursor.
+    #[test]
+    fn vertical_motion_walks_rows_before_history_and_restores_the_cursor() {
+        let mut editor =
+            TypeaheadEditor::with_draft(vec!["old".into()], "abcdef\nx\nghijkl".into());
+        editor.set_vertical_motion(Some(line_motion()));
+        assert_eq!(editor.cursor(), 15);
+        editor.feed(b"\x1b[A");
+        assert_eq!(editor.cursor(), 8, "row 1 is short: clamped to its end");
+        editor.feed(b"\x1b[A");
+        assert_eq!(editor.cursor(), 6, "the preferred column 6 survived");
+        editor.feed(b"\x1bOD"); // SS3 left, onto column 5
+        editor.feed(b"\x1b[A");
+        assert_eq!(editor.buffer_string(), "old", "top row: ↑ enters history");
+        editor.feed(b"\x1b[B");
+        assert_eq!(editor.buffer_string(), "abcdef\nx\nghijkl");
+        assert_eq!(editor.cursor(), 5, "the draft's own cursor comes back");
+        // Inside a bracketed paste the arrows are content, never motion.
+        editor.feed(b"\x1b[200~\x1b[A\x1b[201~");
+        assert_eq!(editor.cursor(), 5);
+    }
+
+    /// Without the opt-in, ↑/↓ stay the plain history walk with the cursor at
+    /// the end -- classic, fullscreen and overlay editors are unchanged.
+    #[test]
+    fn without_vertical_motion_arrows_stay_history() {
+        let mut editor = TypeaheadEditor::with_draft(vec!["old".into()], "a\nb".into());
+        editor.feed(b"\x1b[D\x1b[A");
+        assert_eq!(editor.buffer_string(), "old");
+        editor.feed(b"\x1b[B");
+        assert_eq!(editor.buffer_string(), "a\nb");
+        assert_eq!(editor.cursor(), 3, "cursor at the end, as before");
     }
 }

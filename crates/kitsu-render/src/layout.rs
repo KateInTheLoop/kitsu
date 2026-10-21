@@ -292,13 +292,17 @@ impl Layout {
             if pos.row != target.row {
                 continue;
             }
-            // Affinity: on a tie, or when the target is to the right, prefer the
-            // boundary at or before the target column.
+            // Affinity: on a tie prefer the boundary at or before the target
+            // column, and among boundaries sharing one cell (a base and its
+            // combining mark) keep the earliest, so motion never splits them.
             let delta = pos.col.abs_diff(target.col);
             let prefer = match best {
                 None => true,
-                Some((_, best_delta)) => {
-                    delta < best_delta || (delta == best_delta && pos.col <= target.col)
+                Some((best_idx, best_delta)) => {
+                    delta < best_delta
+                        || (delta == best_delta
+                            && pos.col <= target.col
+                            && self.boundaries[best_idx].col > target.col)
                 }
             };
             if prefer {
@@ -310,6 +314,30 @@ impl Layout {
         }
         // No boundary on that row (target below the draft): clamp to the end.
         self.boundaries.len() - 1
+    }
+
+    /// One visual row of `↑`/`↓` motion from `cursor`, aiming for
+    /// `preferred_col` (else the cursor's own cell). Returns the new source
+    /// boundary and the column to keep preferring, or `None` when `cursor` is
+    /// already on the first (`up`) or last row -- the full-draft boundary where
+    /// the key falls through to history.
+    pub fn vertical(
+        &self,
+        cursor: usize,
+        preferred_col: Option<usize>,
+        up: bool,
+    ) -> Option<(usize, usize)> {
+        let here = self.source_to_cell(cursor);
+        let row = if up {
+            here.row.checked_sub(1)?
+        } else {
+            here.row + 1
+        };
+        if row >= self.rows.len() {
+            return None;
+        }
+        let col = preferred_col.unwrap_or(here.col);
+        Some((self.cell_to_source(Pos { row, col }), col))
     }
 
     /// Clip the full layout to `height` physical rows around `anchor`'s row,
@@ -480,6 +508,35 @@ mod tests {
         assert_eq!(l.rows[0].glyphs, "a[U+202E]b");
         assert_eq!(l.source_to_cell(1), Pos { row: 0, col: 1 });
         assert_eq!(l.source_to_cell(2), Pos { row: 0, col: 9 });
+    }
+
+    /// Vertical motion keeps its preferred column through a short row, never
+    /// splits a base from its combining mark, and reports the draft boundaries.
+    #[test]
+    fn vertical_motion_keeps_the_preferred_column() {
+        // Rows: "> abcdef" / "x" / "ghijkl"; the caret starts after 'e' (col 6).
+        let l = layout("abcdef\nx\nghijkl", "> ", 40);
+        let start = 4; // 'e'
+        assert_eq!(l.source_to_cell(start), Pos { row: 0, col: 6 });
+        assert_eq!(
+            l.vertical(start, None, true),
+            None,
+            "first row: falls to history"
+        );
+        let (short, col) = l.vertical(start, None, false).unwrap();
+        assert_eq!(short, 8, "short row clamps to its end (the newline slot)");
+        assert_eq!(col, 6, "but the preferred column survives");
+        let (back, _) = l.vertical(short, Some(col), false).unwrap();
+        assert_eq!(
+            l.source_to_cell(back),
+            Pos { row: 2, col: 6 },
+            "'k' under 'e'"
+        );
+        assert_eq!(l.vertical(back, Some(col), false), None, "last row");
+
+        // A combining mark shares its base's cell: landing there picks the base.
+        let m = layout("ab\ne\u{0301}x", "", 40);
+        assert_eq!(m.vertical(0, None, false), Some((3, 0)));
     }
 
     /// cell_to_source past a row's content clamps to that row's last boundary,

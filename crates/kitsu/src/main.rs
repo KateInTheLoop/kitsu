@@ -6472,6 +6472,15 @@ fn read_chat_line_inline(
                 // fullscreen segment holds the screen, and a surface with no
                 // frame to move has nothing for a press to mean.
                 None,
+                // Stage 1B: the framed box walks its visual rows with ↑/↓,
+                // through the layout it paints with; the row fallback keeps
+                // ↑/↓ as history.
+                tui_bridge::input_box_enabled().then(|| {
+                    Box::new(kitsu_render::live::input_box_vertical_motion(
+                        prompt,
+                        kitsu_render::live::terminal_columns,
+                    )) as kitsu_editor::VerticalMotion
+                }),
             )
         };
         // Whatever happened, the row must not keep showing a draft that is
@@ -7393,6 +7402,7 @@ fn read_chat_line_fullscreen(
                 // one. The sink *is* the gate -- the inline reader's `None`
                 // leaves all four sequences to the editor.
                 Some(&mut page),
+                None,
             )
         };
         match read {
@@ -37137,6 +37147,7 @@ mod tests {
                 keys,
                 attached,
                 None,
+                None,
             )
             .expect("a cursor cannot fail to read")
         }
@@ -37280,6 +37291,7 @@ mod tests {
                 keys,
                 attached,
                 None,
+                None,
             )
             .expect("a cursor cannot fail to read")
         }
@@ -37401,6 +37413,7 @@ mod tests {
                 &mut || {},
                 keys,
                 attached,
+                None,
                 None,
             )
             .expect("a cursor cannot fail to read")
@@ -39381,6 +39394,7 @@ mod tests {
             &mut || {},
             keys,
             attached,
+            None,
             None,
         )
         .expect("a cursor cannot fail to read")

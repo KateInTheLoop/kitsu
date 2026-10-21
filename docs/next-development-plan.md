@@ -84,8 +84,8 @@ describe the tested boundaries without claiming full Linux/macOS equivalence.
 | Stage | Outcome | Prerequisite | Status |
 |---|---|---|---|
 | 0 | Verified stabilization baseline | Existing fixes above | Validation in progress |
-| 1A | Layout, draft-state, and keyboard contracts | Stage 0 accepted before behavior changes; design can proceed while manual checks are pending | Contract draft; pure fixtures pending |
-| 1B | Visual navigation and draft preservation | 1A contracts complete; Stage 0 accepted | Not started |
+| 1A | Layout, draft-state, and keyboard contracts | Stage 0 accepted before behavior changes; design can proceed while manual checks are pending | Pure layout and fixtures landed (`854c07b`) |
+| 1B | Visual navigation and draft preservation | 1A contracts complete; Stage 0 accepted | Started ahead of Stage 0 acceptance by user decision, 2026-10-21; first cards landed |
 | 2A | Collapsed paste blocks and lossless submission | 1B accepted | Not started |
 | 2B | Popup editing and contextual footer | 2A accepted | Not started |
 | Later | Diff windows, additional panes, platform extensions | Separate scoped plans | Deferred |
@@ -347,6 +347,31 @@ source content. Fix the fallback composer's empty-draft caret behavior.
   palette/modal restoration, async output, and essential search/hint visibility.
 - Full gates and Terminal.app/iTerm2/tmux checks pass; the fallback remains
   usable. Record accepted results before starting 2A.
+
+### Local Stage 1B receipt — 2026-10-21 (unaccepted)
+
+Started before Stage 0 acceptance at the user's explicit request; Stage 0's
+Linux, Seatbelt-probe and real-terminal checks are still open, so nothing here
+is accepted. Landed:
+
+- The framed box paints through `kitsu_render::layout` (`53a5825`): one
+  source-to-cell authority for rows and caret, sanitized per scalar.
+- ↑/↓ in the framed box move between visual rows with a preferred column and
+  enter history only at the draft's first/last row; leaving history restores
+  the draft's cursor. The editor takes the motion by injection
+  (`TypeaheadEditor::set_vertical_motion`), so it keeps no layout dependency,
+  and only the inline idle reader with the box enabled opts in. During-turn,
+  fullscreen, overlay and `KITSU_INPUT_BOX=0` keep their keymaps.
+- PTY suite: the harness pins `KITSU_INPUT_BOX` explicitly; 87/87 pass,
+  including box-mode frame and ↑/↓ tests. Workspace gates: fmt, clippy and
+  `git diff --check` clean; every suite passes except the five macOS CLI cases
+  in the Stage 0 triage.
+
+Open 1B cards: Home/End as visual-row start/end; the during-turn collector's
+box motion; snapshot restoration in place of `Cursor` replay across overlays,
+suspend, approval and queued recall; `LiveDraft.hint` in the box footer; the
+fallback composer's empty-draft caret; resize PTY coverage with a mid-draft
+caret; and the Terminal.app/iTerm2/tmux checks.
 
 ## Stage 2A — Collapsed paste blocks and lossless submission
 

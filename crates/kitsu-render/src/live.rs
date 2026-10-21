@@ -339,7 +339,7 @@ pub fn compose_input_box(draft: &LiveDraft, cols: usize) -> InputBox {
     // rather than panicking on the width arithmetic.
     let cols = cols.max(8);
     let (r, g, b) = crate::theme().accent;
-    let inner = cols - 4; // "│ " + text + " │"
+    let inner = input_box_inner(cols);
     let bar = |s: &str| format!("│ {s} │"); // caller pads `s` to `inner`
 
     // Content lines (plain, display-mapped, clamped to `inner`), with the
@@ -367,6 +367,30 @@ pub fn compose_input_box(draft: &LiveDraft, cols: usize) -> InputBox {
     InputBox {
         rows,
         caret: (caret_row, caret_col),
+    }
+}
+
+/// Content cells inside the frame: `"│ " + text + " │"`.
+fn input_box_inner(cols: usize) -> usize {
+    cols.max(8) - 4
+}
+
+/// The box's ↑/↓ motion, for the editor's injected vertical motion: one visual row
+/// through the same layout [`compose_input_box`] paints with, at `cols()`
+/// sampled per keystroke so a resize is honored before the next move.
+pub fn input_box_vertical_motion(
+    prompt: &str,
+    cols: impl Fn() -> usize + 'static,
+) -> impl Fn(&str, usize, Option<usize>, bool) -> Option<(usize, usize)> {
+    let prompt = sanitize_terminal_text(prompt);
+    move |text, cursor, preferred, up| {
+        crate::layout::Layout::compute(
+            text,
+            &prompt,
+            input_box_inner(cols()),
+            &crate::layout::ScalarProjection,
+        )
+        .vertical(cursor, preferred, up)
     }
 }
 
