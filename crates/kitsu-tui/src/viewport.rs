@@ -594,7 +594,10 @@ mod tests {
         surface.show(24, 3); // scroll region 1..=21, viewport rows 22..=24
         surface.place_caret(2, 9); // viewport row 2 → terminal line 23
         let before = sink.bytes().len();
-        assert!(sink.text().ends_with("\x1b[23;9H"), "caret placed in the viewport");
+        assert!(
+            sink.text().ends_with("\x1b[23;9H"),
+            "caret placed in the viewport"
+        );
 
         surface.transcript_line(Fd::Stdout, "answer");
         let after = String::from_utf8(sink.bytes()[before..].to_vec()).unwrap();
@@ -611,7 +614,10 @@ mod tests {
 
         // Out-of-range rows clamp to the viewport; never the scroll region.
         surface.place_caret(99, 1);
-        assert!(sink.text().ends_with("\x1b[24;1H"), "clamped to the last viewport row");
+        assert!(
+            sink.text().ends_with("\x1b[24;1H"),
+            "clamped to the last viewport row"
+        );
     }
 
     /// Review F7: the status cadence repaints only the viewport's TOP row (the
@@ -624,16 +630,29 @@ mod tests {
         let before = sink.bytes().len();
         surface.paint_top_row("model · ■□□ 1%", 80);
         let after = String::from_utf8(sink.bytes()[before..].to_vec()).unwrap();
-        assert!(after.starts_with("\x1b[21;1H\x1b[2Kmodel"), "only the top row: {after:?}");
-        assert!(after.ends_with("\x1b[23;12H"), "caret restored to the box: {after:?}");
-        assert_eq!(count(after.as_bytes(), b"\x1b[2K"), 1, "no other row touched");
+        assert!(
+            after.starts_with("\x1b[21;1H\x1b[2Kmodel"),
+            "only the top row: {after:?}"
+        );
+        assert!(
+            after.ends_with("\x1b[23;12H"),
+            "caret restored to the box: {after:?}"
+        );
+        assert_eq!(
+            count(after.as_bytes(), b"\x1b[2K"),
+            1,
+            "no other row touched"
+        );
 
         // Without a placed caret it parks like paint().
         surface.transcript_line(Fd::Stdout, "x"); // re-parks, clears the caret
         let before = sink.bytes().len();
         surface.paint_top_row("status", 80);
         let after = String::from_utf8(sink.bytes()[before..].to_vec()).unwrap();
-        assert!(after.ends_with("\x1b[20;1H"), "parked on the scroll region: {after:?}");
+        assert!(
+            after.ends_with("\x1b[20;1H"),
+            "parked on the scroll region: {after:?}"
+        );
     }
 
     #[test]

@@ -608,6 +608,7 @@ mod tests {
 
     /// The child writes its three lines one at a time, so a file that merely
     /// exists may hold only the first. Wait for the whole record.
+    #[cfg(target_os = "linux")]
     async fn await_file_lines(
         path: &std::path::Path,
         lines: usize,

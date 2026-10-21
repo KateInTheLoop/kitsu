@@ -2057,7 +2057,7 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
                 dir.join("SKILL.md"),
                 format!("---\nname: {name}\ndescription: bounded\n---\nbody"),
             )
-            .unwrap();
+            .unwrap_or_else(|error| panic!("cannot write {name} in {}: {error}", dir.display()));
         }
 
         let first = SkillSet::discover_from(&project, false, None, &permissions());

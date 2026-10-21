@@ -1000,6 +1000,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn live_review_excludes_hard_link_aliases_of_private_directory_files() {
+        #[cfg(target_os = "linux")]
         use std::os::unix::ffi::OsStringExt;
 
         let repo = tempfile::tempdir().unwrap();
@@ -1021,10 +1022,16 @@ mod tests {
         std::fs::write(&visible, "VISIBLE_WORKTREE\n").unwrap();
         let untracked_alias = repo.path().join("untracked-private-alias.json");
         std::fs::hard_link(&session, &untracked_alias).unwrap();
-        let byte_name_alias = repo.path().join(std::ffi::OsString::from_vec(
-            b"private-alias-\xff.json".to_vec(),
-        ));
-        std::fs::hard_link(&session, &byte_name_alias).unwrap();
+        // macOS filesystems reject malformed UTF-8 names before the review
+        // code can inspect them. The valid-name aliases above still exercise
+        // the hard-link boundary on macOS.
+        #[cfg(target_os = "linux")]
+        {
+            let byte_name_alias = repo.path().join(std::ffi::OsString::from_vec(
+                b"private-alias-\xff.json".to_vec(),
+            ));
+            std::fs::hard_link(&session, &byte_name_alias).unwrap();
+        }
 
         for target in [
             ReviewTarget::WorkingTree,

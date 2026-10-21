@@ -9071,7 +9071,10 @@ mod tests {
         use std::ffi::OsStr;
         // Unset: the production default (on) is what applies.
         assert!(input_box_setting(None, true));
-        assert!(!input_box_setting(None, false), "test builds default to the row");
+        assert!(
+            !input_box_setting(None, false),
+            "test builds default to the row"
+        );
         // Explicit values win over the default either way.
         assert!(!input_box_setting(Some(OsStr::new("0")), true));
         assert!(!input_box_setting(Some(OsStr::new("false")), true));
@@ -9099,7 +9102,11 @@ mod tests {
         // Split across reads — the prefix is held, not resolved as Esc.
         let mut split = KeyFilter::new(attach_keys());
         assert_eq!(split.feed(b"\x1b[1;2"), Vec::new(), "partial sequence held");
-        assert_eq!(split.feed(b"C"), vec![KeyItem::CycleAgent(1)], "completed next read");
+        assert_eq!(
+            split.feed(b"C"),
+            vec![KeyItem::CycleAgent(1)],
+            "completed next read"
+        );
         // CONTROL: a plain left arrow is still the editor's backward-char, not a cycle.
         assert_eq!(
             KeyFilter::new(attach_keys()).feed(b"\x1b[D"),

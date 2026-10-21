@@ -601,7 +601,8 @@ fn find_emphasis_close(chars: &[char], from: usize, marker: char) -> Option<usiz
     while idx < chars.len() {
         if chars[idx] == marker && idx > from {
             let prev = chars[idx - 1];
-            let prev_ok = prev.is_alphanumeric() || matches!(prev, '.' | '!' | '?' | ')' | '"' | '\'');
+            let prev_ok =
+                prev.is_alphanumeric() || matches!(prev, '.' | '!' | '?' | ')' | '"' | '\'');
             let next_ok = !chars.get(idx + 1).is_some_and(|c| c.is_alphanumeric());
             let doubled = chars.get(idx + 1) == Some(&marker);
             if prev_ok && next_ok && !doubled {
@@ -2571,22 +2572,17 @@ fn context_lines(
     };
     let model = clean(model);
     let note = clean(note);
-    let pct = if effective > 0 {
-        (used.saturating_mul(100) / effective).min(999)
-    } else {
-        0
-    };
+    let pct = used
+        .saturating_mul(100)
+        .checked_div(effective)
+        .unwrap_or(0)
+        .min(999);
     let headroom = effective.saturating_sub(used);
     const CELLS: u64 = 16;
-    let filled = if effective > 0 {
-        let cells = (used.saturating_mul(CELLS) / effective).min(CELLS);
-        if used > 0 && cells == 0 {
-            1
-        } else {
-            cells
-        }
-    } else {
-        CELLS
+    let filled = match used.saturating_mul(CELLS).checked_div(effective) {
+        Some(0) if used > 0 => 1,
+        Some(cells) => cells.min(CELLS),
+        None => CELLS,
     };
     let (filled_cell, empty_cell) = if mode.plain {
         ('#', '-')
@@ -2802,11 +2798,21 @@ mod tests {
         let message = "# Heading\n\n```diff\n+added\n-removed\n@@ hunk\n```\n";
         let rendered = format_message(message, true);
         assert!(rendered.contains('\x1b'), "TTY rendering should be styled");
-        assert_eq!(format_message(message, false), message, "unstyled tier is verbatim");
+        assert_eq!(
+            format_message(message, false),
+            message,
+            "unstyled tier is verbatim"
+        );
         // The heading '# ' marker is consumed; the fence interior is verbatim.
         let plain = sanitize_terminal_text(&rendered);
-        assert!(plain.contains("Heading") && !plain.contains("# Heading"), "heading marker consumed: {plain:?}");
-        assert!(plain.contains("+added") && plain.contains("@@ hunk"), "fence interior verbatim: {plain:?}");
+        assert!(
+            plain.contains("Heading") && !plain.contains("# Heading"),
+            "heading marker consumed: {plain:?}"
+        );
+        assert!(
+            plain.contains("+added") && plain.contains("@@ hunk"),
+            "fence interior verbatim: {plain:?}"
+        );
 
         // Bold: the `**` are consumed, the inner text remains and is styled.
         let bold_rendered = format_message("This is **bold text** in a line\n", true);
@@ -2830,21 +2836,38 @@ mod tests {
         let list_rendered = format_message("- First item\n* Second item\n1. Third item\n", true);
         assert!(list_rendered.contains('\x1b'), "list markers styled");
         let list_plain = sanitize_terminal_text(&list_rendered);
-        assert_eq!(list_plain, "• First item\n• Second item\n1. Third item\n", "{list_plain:?}");
+        assert_eq!(
+            list_plain, "• First item\n• Second item\n1. Third item\n",
+            "{list_plain:?}"
+        );
 
         // Unclosed markers pass through completely unstyled, markers and all.
         let unclosed_bold = "This has an unclosed **bold marker\n";
-        assert_eq!(format_message(unclosed_bold, true), unclosed_bold, "no styling on unclosed **");
+        assert_eq!(
+            format_message(unclosed_bold, true),
+            unclosed_bold,
+            "no styling on unclosed **"
+        );
         let unclosed_code = "This has an unclosed `code marker\n";
-        assert_eq!(format_message(unclosed_code, true), unclosed_code, "no styling on unclosed `");
+        assert_eq!(
+            format_message(unclosed_code, true),
+            unclosed_code,
+            "no styling on unclosed `"
+        );
 
         // Inside a code fence nothing is consumed — interior is verbatim.
         let fenced = "```rust\n**not bold**\n`not code`\n```\n";
         let fenced_plain = sanitize_terminal_text(&format_message(fenced, true));
-        assert!(fenced_plain.contains("**not bold**"), "fence interior keeps markers: {fenced_plain:?}");
+        assert!(
+            fenced_plain.contains("**not bold**"),
+            "fence interior keeps markers: {fenced_plain:?}"
+        );
 
         // Plain mode returns original text exactly.
-        assert_eq!(format_message("This is **bold text** in a line\n", false), "This is **bold text** in a line\n");
+        assert_eq!(
+            format_message("This is **bold text** in a line\n", false),
+            "This is **bold text** in a line\n"
+        );
     }
 
     #[test]
@@ -2967,11 +2990,17 @@ mod tests {
 
         // Bold: '**' consumed.
         let styled_bold = styler.style_line("This is **bold text** here");
-        assert_eq!(sanitize_terminal_text(&styled_bold), "This is bold text here");
+        assert_eq!(
+            sanitize_terminal_text(&styled_bold),
+            "This is bold text here"
+        );
 
         // Inline code: backticks consumed.
         let styled_code = styler.style_line("Use `function()` like this");
-        assert_eq!(sanitize_terminal_text(&styled_code), "Use function() like this");
+        assert_eq!(
+            sanitize_terminal_text(&styled_code),
+            "Use function() like this"
+        );
 
         // List marker: '- ' normalized to a bullet.
         let styled_list = styler.style_line("- First item");
@@ -2991,15 +3020,24 @@ mod tests {
             "an emphasized word"
         );
         // The styled output actually carries the italic SGR (3).
-        assert!(styler.style_line("*x*").contains("\x1b[3m"), "italic SGR present");
+        assert!(
+            styler.style_line("*x*").contains("\x1b[3m"),
+            "italic SGR present"
+        );
         // snake_case / underscored identifiers are NOT italicized.
         assert_eq!(
             sanitize_terminal_text(&styler.style_line("call read_file_at and a_b_c")),
             "call read_file_at and a_b_c"
         );
         // A bare multiply/space asterisk and unclosed markers stay literal.
-        assert_eq!(sanitize_terminal_text(&styler.style_line("2 * 3 = 6")), "2 * 3 = 6");
-        assert_eq!(sanitize_terminal_text(&styler.style_line("an unclosed *marker")), "an unclosed *marker");
+        assert_eq!(
+            sanitize_terminal_text(&styler.style_line("2 * 3 = 6")),
+            "2 * 3 = 6"
+        );
+        assert_eq!(
+            sanitize_terminal_text(&styler.style_line("an unclosed *marker")),
+            "an unclosed *marker"
+        );
         // **bold** still wins over single-* italic.
         assert_eq!(sanitize_terminal_text(&styler.style_line("**b**")), "b");
         // Review F9: glob paths and intraword asterisks stay literal.
@@ -3009,7 +3047,10 @@ mod tests {
         );
         assert_eq!(sanitize_terminal_text(&styler.style_line("a*b*c")), "a*b*c");
         // Emphasis inside punctuation still renders.
-        assert_eq!(sanitize_terminal_text(&styler.style_line("(*really*)")), "(really)");
+        assert_eq!(
+            sanitize_terminal_text(&styler.style_line("(*really*)")),
+            "(really)"
+        );
     }
 
     #[test]
@@ -3019,9 +3060,18 @@ mod tests {
         let mut styler = LineStyler::default();
         let styled = styler.style_line("# Use `foo` now");
         assert_eq!(sanitize_terminal_text(&styled), "Use foo now");
-        let after_code = styled.rsplit("\x1b[0m").nth(1).expect("a reset precedes ' now'");
-        assert!(after_code.contains("\x1b[1m"), "bold re-asserted after the span: {styled:?}");
-        assert!(styled.ends_with(" now\x1b[0m"), "heading closes once at the end: {styled:?}");
+        let after_code = styled
+            .rsplit("\x1b[0m")
+            .nth(1)
+            .expect("a reset precedes ' now'");
+        assert!(
+            after_code.contains("\x1b[1m"),
+            "bold re-asserted after the span: {styled:?}"
+        );
+        assert!(
+            styled.ends_with(" now\x1b[0m"),
+            "heading closes once at the end: {styled:?}"
+        );
     }
 
     #[test]

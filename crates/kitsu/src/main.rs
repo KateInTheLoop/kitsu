@@ -26,7 +26,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use clap::{CommandFactory, FromArgMatches, Parser};
+#[cfg(test)]
+use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use rustyline::ExternalPrinter as _;
 
 use cli::{AuthCommand, Cli, Command, SessionCommand};
@@ -3448,10 +3450,8 @@ fn refresh_hint_contains_credential(hint: &str) -> bool {
         let mut chars = after.chars();
         match chars.next() {
             Some('=' | ':' | '"' | '\'' | '_' | '-') => return true,
-            Some(ch) if ch.is_ascii_whitespace() => {
-                if chars.any(|ch| !ch.is_ascii_whitespace()) {
-                    return true;
-                }
+            Some(ch) if ch.is_ascii_whitespace() && chars.any(|ch| !ch.is_ascii_whitespace()) => {
+                return true;
             }
             _ => {}
         }
@@ -6864,13 +6864,16 @@ fn model_popup_view(
         if start > 0 {
             rows.push(fit_overlay_row(&format!("  ↑ {start} more"), cols));
         }
-        for index in start..end {
+        for (index, model) in filtered.iter().enumerate().take(end).skip(start) {
             let marker = if index == selected { ">" } else { " " };
-            let tag = if filtered[index] == current { "  (current)" } else { "" };
-            rows.push(fit_overlay_row(&format!("{marker} {}{tag}", filtered[index]), cols));
+            let tag = if *model == current { "  (current)" } else { "" };
+            rows.push(fit_overlay_row(&format!("{marker} {model}{tag}"), cols));
         }
         if end < filtered.len() {
-            rows.push(fit_overlay_row(&format!("  ↓ {} more", filtered.len() - end), cols));
+            rows.push(fit_overlay_row(
+                &format!("  ↓ {} more", filtered.len() - end),
+                cols,
+            ));
         }
     }
     rows
@@ -14783,13 +14786,10 @@ fn is_deadline_timeout(error: &kitsu_core::AgentError) -> bool {
 fn truncate_to_resumable_tail(messages: &mut Vec<ChatMessage>) -> usize {
     use kitsu_providers::Role;
     let original = messages.len();
-    loop {
-        let Some(call_idx) = messages
-            .iter()
-            .rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
-        else {
-            break;
-        };
+    while let Some(call_idx) = messages
+        .iter()
+        .rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+    {
         let answered: std::collections::HashSet<&str> = messages[call_idx + 1..]
             .iter()
             .filter(|m| m.role == Role::Tool)
@@ -19469,10 +19469,16 @@ fn cwd_grant(yes: bool, interactive: bool) -> CwdGrant {
         // for writes OUTSIDE the cwd but not inside it. Previously interactive
         // granted cwd read-only, which made the model conclude the project was
         // read-only and decline to edit at all rather than attempt a write.
-        CwdGrant { read: true, write: true }
+        CwdGrant {
+            read: true,
+            write: true,
+        }
     } else {
         // Non-interactive without --yes stays deny-by-default.
-        CwdGrant { read: false, write: false }
+        CwdGrant {
+            read: false,
+            write: false,
+        }
     }
 }
 
@@ -24677,7 +24683,9 @@ async fn handle_slash(
                         return SlashResult::Continue(None);
                     }
                     Some(Ok(None)) => {
-                        eprintln!("this gateway does not expose a model list (its models_path is empty)");
+                        eprintln!(
+                            "this gateway does not expose a model list (its models_path is empty)"
+                        );
                         return SlashResult::Continue(None);
                     }
                     Some(Err(error)) => {
@@ -30529,7 +30537,10 @@ mod tests {
         // An explicit flag wins over the preset; the others still move.
         let mixed =
             parse_with_effort(&["kitsu", "--effort", "max", "--max-rounds", "7", "ask", "hi"]);
-        assert_eq!(mixed.max_rounds, 7, "explicit --max-rounds must beat preset");
+        assert_eq!(
+            mixed.max_rounds, 7,
+            "explicit --max-rounds must beat preset"
+        );
         assert_eq!(mixed.timeout_secs, 600);
         assert_eq!(mixed.max_output_tokens, Some(32000));
 
@@ -30549,7 +30560,10 @@ mod tests {
         let mut p = ModelPopup::default();
         // Typing filters; selection resets to the top of the narrowed list.
         for c in "opus".chars() {
-            assert_eq!(model_popup_step(OverlayKey::Char(c), &mut p, &models), ModelPopupStep::Continue);
+            assert_eq!(
+                model_popup_step(OverlayKey::Char(c), &mut p, &models),
+                ModelPopupStep::Continue
+            );
         }
         assert_eq!(p.filter, "opus");
         let matched = p.filtered(&models);
@@ -30569,11 +30583,17 @@ mod tests {
         model_popup_step(OverlayKey::Backspace, &mut p, &models);
         assert_eq!(p.filter, "opu");
         // Tab completes the selection into the filter.
-        let mut t = ModelPopup { filter: "gem".to_string(), selected: 0 };
+        let mut t = ModelPopup {
+            filter: "gem".to_string(),
+            selected: 0,
+        };
         model_popup_step(OverlayKey::Tab, &mut t, &models);
         assert_eq!(t.filter, "gemma-4-26b", "Tab completes the highlighted id");
         // Esc and Ctrl-C cancel.
-        assert_eq!(model_popup_step(OverlayKey::StepBack, &mut p, &models), ModelPopupStep::Cancel);
+        assert_eq!(
+            model_popup_step(OverlayKey::StepBack, &mut p, &models),
+            ModelPopupStep::Cancel
+        );
         assert_eq!(
             model_popup_step(OverlayKey::Interrupt, &mut p, &models),
             ModelPopupStep::Cancel,
@@ -30592,7 +30612,10 @@ mod tests {
         );
         // And the popup acts on them end to end.
         let models = vec!["gemma-4-26b".to_string(), "opus".to_string()];
-        let mut p = ModelPopup { filter: "gem".to_string(), selected: 0 };
+        let mut p = ModelPopup {
+            filter: "gem".to_string(),
+            selected: 0,
+        };
         for key in decode_overlay_keys(b"\t", &mut pending) {
             model_popup_step(key, &mut p, &models);
         }
@@ -30601,7 +30624,11 @@ mod tests {
             .into_iter()
             .map(|key| model_popup_step(key, &mut p, &models))
             .next();
-        assert_eq!(step, Some(ModelPopupStep::Cancel), "Ctrl-C from the wire cancels");
+        assert_eq!(
+            step,
+            Some(ModelPopupStep::Cancel),
+            "Ctrl-C from the wire cancels"
+        );
     }
 
     #[test]
@@ -30611,7 +30638,10 @@ mod tests {
         let models = vec!["opus".to_string(), "sonnet".to_string()];
         let mut p = ModelPopup::default();
         for c in "son".chars() {
-            assert_eq!(model_popup_step(OverlayKey::Char(c), &mut p, &models), ModelPopupStep::Continue);
+            assert_eq!(
+                model_popup_step(OverlayKey::Char(c), &mut p, &models),
+                ModelPopupStep::Continue
+            );
         }
         assert_eq!(p.filter, "son");
         assert_eq!(p.filtered(&models), vec!["sonnet".to_string()]);
@@ -30621,25 +30651,61 @@ mod tests {
     fn model_popup_view_marks_selection_filter_and_scrolls() {
         let models: Vec<String> = (0..48).map(|i| format!("m{i:02}")).collect();
         // Unfiltered, ample budget: header + blank + current tag + selection.
-        let p = ModelPopup { filter: String::new(), selected: 2 };
+        let p = ModelPopup {
+            filter: String::new(),
+            selected: 2,
+        };
         let rows = model_popup_view(&models, "m01", &p, 80, 24);
-        assert!(rows[0].contains("type to filter"), "header cue: {:?}", rows[0]);
-        assert!(rows.iter().any(|r| r.contains("m01") && r.contains("(current)")), "current tagged");
-        assert!(rows.iter().any(|r| r.starts_with("> m02")), "selection marked");
+        assert!(
+            rows[0].contains("type to filter"),
+            "header cue: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("m01") && r.contains("(current)")),
+            "current tagged"
+        );
+        assert!(
+            rows.iter().any(|r| r.starts_with("> m02")),
+            "selection marked"
+        );
         // Filtered header shows the filter text; only matches render.
-        let f = ModelPopup { filter: "m4".to_string(), selected: 0 };
+        let f = ModelPopup {
+            filter: "m4".to_string(),
+            selected: 0,
+        };
         let frows = model_popup_view(&models, "m01", &f, 80, 24);
-        assert!(frows[0].contains("filter: m4"), "filter shown: {:?}", frows[0]);
-        assert!(frows.iter().skip(2).all(|r| r.trim().is_empty() || r.contains("m4") || r.contains("more")));
+        assert!(
+            frows[0].contains("filter: m4"),
+            "filter shown: {:?}",
+            frows[0]
+        );
+        assert!(frows
+            .iter()
+            .skip(2)
+            .all(|r| r.trim().is_empty() || r.contains("m4") || r.contains("more")));
         // A filter that matches nothing says so, never panics.
-        let none = ModelPopup { filter: "zzz".to_string(), selected: 5 };
+        let none = ModelPopup {
+            filter: "zzz".to_string(),
+            selected: 5,
+        };
         let nrows = model_popup_view(&models, "m01", &none, 80, 24);
-        assert!(nrows.iter().any(|r| r.contains("no model matches")), "empty-filter message");
+        assert!(
+            nrows.iter().any(|r| r.contains("no model matches")),
+            "empty-filter message"
+        );
         // Small budget scrolls with markers, keeps selection visible.
-        let deep = ModelPopup { filter: String::new(), selected: 40 };
+        let deep = ModelPopup {
+            filter: String::new(),
+            selected: 40,
+        };
         let drows = model_popup_view(&models, "m00", &deep, 80, 10);
         assert!(drows.len() <= 10, "respects budget: {}", drows.len());
-        assert!(drows.iter().any(|r| r.starts_with("> m40")), "deep selection visible: {drows:?}");
+        assert!(
+            drows.iter().any(|r| r.starts_with("> m40")),
+            "deep selection visible: {drows:?}"
+        );
     }
 
     #[test]
@@ -30650,7 +30716,10 @@ mod tests {
         assert_eq!(scroll_window(100, 0, 10), (0, 10));
         // Middle: selection centred, both edges clipped.
         let (s, e) = scroll_window(100, 50, 10);
-        assert!(s <= 50 && 50 < e && e - s == 10, "selection in a full window: {s}..{e}");
+        assert!(
+            s <= 50 && 50 < e && e - s == 10,
+            "selection in a full window: {s}..{e}"
+        );
         // Bottom: window pins to the end rather than running past it.
         assert_eq!(scroll_window(100, 99, 10), (90, 100));
         // The selected index is always inside [start, end) for every position.
@@ -30664,13 +30733,37 @@ mod tests {
     #[test]
     fn cwd_grant_gives_yes_runs_read_write_and_keeps_deny_by_default() {
         // --yes: read+write the launch dir, interactive or not.
-        assert_eq!(cwd_grant(true, false), CwdGrant { read: true, write: true });
-        assert_eq!(cwd_grant(true, true), CwdGrant { read: true, write: true });
+        assert_eq!(
+            cwd_grant(true, false),
+            CwdGrant {
+                read: true,
+                write: true
+            }
+        );
+        assert_eq!(
+            cwd_grant(true, true),
+            CwdGrant {
+                read: true,
+                write: true
+            }
+        );
         // Interactive without --yes: read+write the launch dir too (writes
         // inside it; Mode::Ask still prompts for writes outside it).
-        assert_eq!(cwd_grant(false, true), CwdGrant { read: true, write: true });
+        assert_eq!(
+            cwd_grant(false, true),
+            CwdGrant {
+                read: true,
+                write: true
+            }
+        );
         // Non-interactive without --yes: nothing — deny-by-default stands.
-        assert_eq!(cwd_grant(false, false), CwdGrant { read: false, write: false });
+        assert_eq!(
+            cwd_grant(false, false),
+            CwdGrant {
+                read: false,
+                write: false
+            }
+        );
     }
 
     #[test]
@@ -30681,8 +30774,8 @@ mod tests {
         let cwd = std::path::Path::new("/work/project");
         let env = PromptEnvironment::from_grants(
             cwd,
-            &[], // allow_paths
-            &[], // allow_write
+            &[],                            // allow_paths
+            &[],                            // allow_write
             &["/work/project".to_string()], // read_write (what interactive now feeds)
         );
         let (_, authority) = env
@@ -30690,7 +30783,10 @@ mod tests {
             .iter()
             .find(|(p, _)| p == "/work/project")
             .expect("cwd is a listed root");
-        assert_eq!(*authority, "read-write", "cwd must be read-write, not read-only");
+        assert_eq!(
+            *authority, "read-write",
+            "cwd must be read-write, not read-only"
+        );
     }
 
     #[test]

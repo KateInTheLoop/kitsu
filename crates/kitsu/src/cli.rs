@@ -393,8 +393,7 @@ impl Cli {
         use clap::parser::ValueSource;
         let Some(effort) = self.effort else { return };
         let (rounds, timeout, tokens) = effort.preset();
-        let defaulted =
-            |id: &str| matches.value_source(id) == Some(ValueSource::DefaultValue);
+        let defaulted = |id: &str| matches.value_source(id) == Some(ValueSource::DefaultValue);
         if defaulted("max_rounds") {
             self.max_rounds = rounds;
         }

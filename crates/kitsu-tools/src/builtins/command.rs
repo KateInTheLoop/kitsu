@@ -1304,7 +1304,10 @@ impl SeatbeltBackend {
                 .filter(|path| path.exists())
                 .collect();
             for root in validate_runtime_roots(&self.config)? {
-                if !readonly_runtime_roots.iter().any(|seed| root.starts_with(seed)) {
+                if !readonly_runtime_roots
+                    .iter()
+                    .any(|seed| root.starts_with(seed))
+                {
                     readonly_runtime_roots.push(root);
                 }
             }
@@ -1434,7 +1437,11 @@ fn build_seatbelt_profile(inputs: &LaunchInputs) -> Result<String, CommandContai
     ] {
         let _ = writeln!(profile, "    (subpath \"{sys}\")");
     }
-    for path in writable.iter().copied().chain(inputs.readonly_runtime_roots.iter().map(PathBuf::as_path)) {
+    for path in writable
+        .iter()
+        .copied()
+        .chain(inputs.readonly_runtime_roots.iter().map(PathBuf::as_path))
+    {
         write_subpath(&mut profile, path)?;
     }
     profile.push_str(")\n");
@@ -1445,7 +1452,10 @@ fn build_seatbelt_profile(inputs: &LaunchInputs) -> Result<String, CommandContai
     // (verified empirically): per-user temp-dir resolution and user/group name
     // lookup.
     profile.push_str("(allow mach-lookup\n");
-    for service in ["com.apple.bsd.dirhelper", "com.apple.system.opendirectoryd.libinfo"] {
+    for service in [
+        "com.apple.bsd.dirhelper",
+        "com.apple.system.opendirectoryd.libinfo",
+    ] {
         let _ = writeln!(profile, "    (global-name \"{service}\")");
     }
     profile.push_str(")\n");
@@ -1554,7 +1564,10 @@ fn sbpl_quote(path: &Path) -> Result<String, CommandContainmentError> {
     if text.chars().any(|c| c.is_control()) {
         return Err(CommandContainmentError::new(
             CommandContainmentUnavailableReason::InvalidConfiguration,
-            format!("containment path contains a control character: {}", path.display()),
+            format!(
+                "containment path contains a control character: {}",
+                path.display()
+            ),
         ));
     }
     let mut quoted = String::with_capacity(text.len() + 2);
@@ -3987,17 +4000,23 @@ mod tests {
                 prompts: prompts.clone(),
             }));
         let target_arg = target.to_string_lossy().into_owned();
+        let touch = if cfg!(target_os = "macos") {
+            "/usr/bin/touch"
+        } else {
+            "/bin/touch"
+        };
 
-        assert!(matches!(
-            execute_command(
-                &policy,
-                args(&["/bin/touch", target_arg.as_str()], allowed.path())
-            )
-            .await,
-            Err(ToolError::Interrupted(
-                ToolInterruption::AuthorityInputClosed
-            ))
-        ));
+        let result =
+            execute_command(&policy, args(&[touch, target_arg.as_str()], allowed.path())).await;
+        assert!(
+            matches!(
+                &result,
+                Err(ToolError::Interrupted(
+                    ToolInterruption::AuthorityInputClosed
+                ))
+            ),
+            "expected closed authority input, got {result:?}"
+        );
         assert_eq!(prompts.load(Ordering::Relaxed), 1);
         assert!(!target.exists(), "interrupted command was executed");
     }
@@ -5756,7 +5775,7 @@ mod tests {
     /// of this inode fails with `ETXTBSY` for as long as the returned handle
     /// lives. That makes the F134 race a deterministic fixture: no sleeps, no
     /// sibling forks and no wall-clock assertions are involved.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn write_test_executable_keeping_write_descriptor(path: &Path, output: &str) -> std::fs::File {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
@@ -5777,7 +5796,7 @@ mod tests {
     /// F135: `ETXTBSY` at `execve` means "this inode is open for writing by
     /// somebody" and is definitionally transient. The failure a person reads
     /// must say so, and must still carry the underlying OS error.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn etxtbsy_at_spawn_is_reported_as_a_transient_condition() {
         let dir = tempfile::tempdir().unwrap();
@@ -5816,7 +5835,7 @@ mod tests {
     /// same executable at the very same path runs once it is closed. Nothing
     /// here waits on the clock -- closing the descriptor is what clears
     /// `i_writecount`.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn releasing_the_write_descriptor_lets_the_same_command_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -5916,28 +5935,42 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_profile_denies_by_default_and_confines_writes_to_the_roots() {
-        let inputs = launch_inputs_for(
-            "/opt/tool/bin/git",
-            &["/work/project"],
-            "/work/project/sub",
-        );
+        let inputs =
+            launch_inputs_for("/opt/tool/bin/git", &["/work/project"], "/work/project/sub");
         let profile = build_seatbelt_profile(&inputs).expect("profile builds");
 
         assert!(profile.contains("(version 1)"), "{profile}");
         assert!(profile.contains("(deny default)"), "{profile}");
         assert!(profile.contains("(deny network*)"), "{profile}");
         // Review F1/F2: no blanket process or mach-lookup allows.
-        assert!(!profile.contains("(allow process*)"), "no blanket process allow: {profile}");
-        assert!(!profile.contains("(allow mach-lookup)\n"), "no blanket mach-lookup: {profile}");
-        assert!(profile.contains("(allow process-exec*\n"), "exec is an allow-list: {profile}");
-        assert!(profile.contains("(global-name \"com.apple.bsd.dirhelper\")"), "{profile}");
+        assert!(
+            !profile.contains("(allow process*)"),
+            "no blanket process allow: {profile}"
+        );
+        assert!(
+            !profile.contains("(allow mach-lookup)\n"),
+            "no blanket mach-lookup: {profile}"
+        );
+        assert!(
+            profile.contains("(allow process-exec*\n"),
+            "exec is an allow-list: {profile}"
+        );
+        assert!(
+            profile.contains("(global-name \"com.apple.bsd.dirhelper\")"),
+            "{profile}"
+        );
         // Reads are broad, but secret paths are denied AFTER the allow (the
         // later SBPL rule wins).
-        let allow_read = profile.find("(allow file-read*)").expect("broad read allow");
+        let allow_read = profile
+            .find("(allow file-read*)")
+            .expect("broad read allow");
         let deny_read = profile.find("(deny file-read*").expect("secret deny block");
         assert!(deny_read > allow_read, "deny must follow the allow to win");
         assert!(profile.contains("/.ssh\")"), "ssh keys denied: {profile}");
-        assert!(profile.contains("/.zshrc\")"), "shell rc (gateway tokens) denied: {profile}");
+        assert!(
+            profile.contains("/.zshrc\")"),
+            "shell rc (gateway tokens) denied: {profile}"
+        );
 
         // Isolate the file-write* block (from its opening line to the lone `)`
         // terminator) and assert its subpaths are exactly the writable roots +
@@ -5953,13 +5986,20 @@ mod tests {
             .join("\n");
         let write_subpaths: Vec<&str> = write_block
             .lines()
-            .filter_map(|l| l.trim().strip_prefix("(subpath \"").and_then(|s| s.strip_suffix("\")")))
+            .filter_map(|l| {
+                l.trim()
+                    .strip_prefix("(subpath \"")
+                    .and_then(|s| s.strip_suffix("\")"))
+            })
             .collect();
         let mut expected = vec!["/work/project", "/work/project/sub", "/private/tmp"];
         let mut got = write_subpaths.clone();
         expected.sort_unstable();
         got.sort_unstable();
-        assert_eq!(got, expected, "writable subpaths must be exactly roots+cwd+tmp: {profile}");
+        assert_eq!(
+            got, expected,
+            "writable subpaths must be exactly roots+cwd+tmp: {profile}"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -6004,7 +6044,9 @@ mod tests {
     #[tokio::test]
     async fn live_seatbelt_runs_a_command_and_blocks_outside_writes() {
         let allowed = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        // The profile allows /private/tmp for command scratch files, so a
+        // fixture there cannot prove write confinement.
+        let outside = tempfile::tempdir_in("/private/var/tmp").unwrap();
         let policy = CommandPolicy::new(&[root(&allowed)], CommandMode::Deny)
             .unwrap()
             .with_containment_config(CommandContainmentConfig::default());
@@ -6026,12 +6068,23 @@ mod tests {
         policy.grant_command(&inside, allowed.path()).unwrap();
         let output = execute_command(
             &policy,
-            CommandExecArgs { argv: inside, cwd: root(&allowed), timeout_ms: Some(5_000) },
+            CommandExecArgs {
+                argv: inside,
+                cwd: root(&allowed),
+                timeout_ms: Some(5_000),
+            },
         )
         .await
         .unwrap();
-        assert!(output.success, "write inside root should succeed: {}", output.stderr);
-        assert!(allowed.path().join("inside.txt").exists(), "file was written in the root");
+        assert!(
+            output.success,
+            "write inside root should succeed: {}",
+            output.stderr
+        );
+        assert!(
+            allowed.path().join("inside.txt").exists(),
+            "file was written in the root"
+        );
 
         // A write OUTSIDE every granted root is denied by the profile.
         let leak = outside.path().join("leak.txt");
@@ -6043,12 +6096,19 @@ mod tests {
         policy.grant_command(&escape, allowed.path()).unwrap();
         let output = execute_command(
             &policy,
-            CommandExecArgs { argv: escape, cwd: root(&allowed), timeout_ms: Some(5_000) },
+            CommandExecArgs {
+                argv: escape,
+                cwd: root(&allowed),
+                timeout_ms: Some(5_000),
+            },
         )
         .await
         .unwrap();
         assert!(!output.success, "write outside the roots must fail");
-        assert!(!leak.exists(), "the outside file must not have been created");
+        assert!(
+            !leak.exists(),
+            "the outside file must not have been created"
+        );
     }
 
     // ---- macOS Seatbelt backend: live integration (file ops, git, scripts,
@@ -6085,7 +6145,11 @@ mod tests {
         policy.grant_command(&argv, dir.path()).unwrap();
         execute_command(
             policy,
-            CommandExecArgs { argv, cwd: root(dir), timeout_ms: Some(10_000) },
+            CommandExecArgs {
+                argv,
+                cwd: root(dir),
+                timeout_ms: Some(10_000),
+            },
         )
         .await
         .unwrap()
@@ -6097,7 +6161,9 @@ mod tests {
     #[tokio::test]
     async fn live_seatbelt_file_ops_round_trip_inside_the_root() {
         let dir = tempfile::tempdir().unwrap();
-        let Some(policy) = live_seatbelt_policy(&dir) else { return };
+        let Some(policy) = live_seatbelt_policy(&dir) else {
+            return;
+        };
 
         let write = run_granted(
             &policy,
@@ -6124,7 +6190,9 @@ mod tests {
     #[tokio::test]
     async fn live_seatbelt_git_init_add_commit_status() {
         let dir = tempfile::tempdir().unwrap();
-        let Some(policy) = live_seatbelt_policy(&dir) else { return };
+        let Some(policy) = live_seatbelt_policy(&dir) else {
+            return;
+        };
         let git = "/usr/bin/git";
         if !std::path::Path::new(git).exists() {
             eprintln!("skipping: {git} not present");
@@ -6150,7 +6218,11 @@ mod tests {
         assert!(commit.success, "git commit: {}", commit.stderr);
         let status = run_granted(&policy, &dir, &[git, "status", "--porcelain"]).await;
         assert!(status.success, "git status: {}", status.stderr);
-        assert!(status.stdout.trim().is_empty(), "clean tree after commit: {:?}", status.stdout);
+        assert!(
+            status.stdout.trim().is_empty(),
+            "clean tree after commit: {:?}",
+            status.stdout
+        );
     }
 
     /// A multi-step shell script runs contained and its writes (including a
@@ -6159,7 +6231,9 @@ mod tests {
     #[tokio::test]
     async fn live_seatbelt_script_creates_nested_files_inside_the_root() {
         let dir = tempfile::tempdir().unwrap();
-        let Some(policy) = live_seatbelt_policy(&dir) else { return };
+        let Some(policy) = live_seatbelt_policy(&dir) else {
+            return;
+        };
 
         let out = run_granted(
             &policy,
@@ -6182,7 +6256,9 @@ mod tests {
     #[tokio::test]
     async fn live_seatbelt_denies_reading_host_secret_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let Some(policy) = live_seatbelt_policy(&dir) else { return };
+        let Some(policy) = live_seatbelt_policy(&dir) else {
+            return;
+        };
         let home = std::env::var("HOME").unwrap();
         let mut checked = 0;
         for rel in [".zshrc", ".ssh", ".aws", ".kitsu"] {
@@ -6193,7 +6269,10 @@ mod tests {
             checked += 1;
             let probe = format!("ls -d {path}/. >/dev/null 2>&1 || head -c1 {path} >/dev/null");
             let out = run_granted(&policy, &dir, &["/bin/sh", "-c", &probe]).await;
-            assert!(!out.success, "{rel} must not be readable inside the sandbox");
+            assert!(
+                !out.success,
+                "{rel} must not be readable inside the sandbox"
+            );
             assert!(out.stdout.is_empty(), "nothing from {rel} reaches stdout");
             assert!(
                 out.stderr.contains("Operation not permitted"),
@@ -6213,7 +6292,9 @@ mod tests {
     async fn live_seatbelt_denies_exec_outside_the_roots() {
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let Some(policy) = live_seatbelt_policy(&dir) else { return };
+        let Some(policy) = live_seatbelt_policy(&dir) else {
+            return;
+        };
         let script = outside.path().join("tool.sh");
         std::fs::write(&script, "#!/bin/sh\necho ESCAPED\n").unwrap();
         use std::os::unix::fs::PermissionsExt as _;
@@ -6222,8 +6303,15 @@ mod tests {
 
         let out = run_granted(&policy, &dir, &["/bin/sh", "-c", &script.to_string_lossy()]).await;
         assert!(!out.success, "exec outside the roots must fail");
-        assert!(!out.stdout.contains("ESCAPED"), "the outside binary never ran");
-        assert!(out.stderr.contains("Operation not permitted"), "{:?}", out.stderr);
+        assert!(
+            !out.stdout.contains("ESCAPED"),
+            "the outside binary never ran"
+        );
+        assert!(
+            out.stderr.contains("Operation not permitted"),
+            "{:?}",
+            out.stderr
+        );
 
         // CONTROL: the same script inside the command root runs.
         let inside = dir.path().join("tool.sh");
@@ -6231,7 +6319,11 @@ mod tests {
         std::fs::set_permissions(&inside, std::fs::Permissions::from_mode(0o755)).unwrap();
         let inside = std::fs::canonicalize(&inside).unwrap();
         let out = run_granted(&policy, &dir, &["/bin/sh", "-c", &inside.to_string_lossy()]).await;
-        assert!(out.success, "exec inside a root still works: {}", out.stderr);
+        assert!(
+            out.success,
+            "exec inside a root still works: {}",
+            out.stderr
+        );
         assert_eq!(out.stdout.trim(), "INSIDE");
     }
 
@@ -6243,28 +6335,48 @@ mod tests {
     #[tokio::test]
     async fn live_seatbelt_grant_then_revoke_gates_execution() {
         let dir = tempfile::tempdir().unwrap();
-        let Some(policy) = live_seatbelt_policy(&dir) else { return };
-        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "echo ok > ./g.txt".to_string()];
+        let Some(policy) = live_seatbelt_policy(&dir) else {
+            return;
+        };
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo ok > ./g.txt".to_string(),
+        ];
 
         // Ungranted in Deny mode: refused before execution, no file.
         let denied = execute_command(
             &policy,
-            CommandExecArgs { argv: argv.clone(), cwd: root(&dir), timeout_ms: Some(5_000) },
+            CommandExecArgs {
+                argv: argv.clone(),
+                cwd: root(&dir),
+                timeout_ms: Some(5_000),
+            },
         )
         .await;
         assert!(denied.is_err(), "ungranted command must be denied");
-        assert!(!dir.path().join("g.txt").exists(), "denied command wrote nothing");
+        assert!(
+            !dir.path().join("g.txt").exists(),
+            "denied command wrote nothing"
+        );
 
         // Granted: runs and writes.
         policy.grant_command(&argv, dir.path()).unwrap();
         let ok = execute_command(
             &policy,
-            CommandExecArgs { argv: argv.clone(), cwd: root(&dir), timeout_ms: Some(5_000) },
+            CommandExecArgs {
+                argv: argv.clone(),
+                cwd: root(&dir),
+                timeout_ms: Some(5_000),
+            },
         )
         .await
         .unwrap();
         assert!(ok.success, "granted command runs: {}", ok.stderr);
-        assert!(dir.path().join("g.txt").exists(), "granted command wrote the file");
+        assert!(
+            dir.path().join("g.txt").exists(),
+            "granted command wrote the file"
+        );
 
         // Revoked: refused again.
         assert!(
@@ -6273,7 +6385,11 @@ mod tests {
         );
         let denied_again = execute_command(
             &policy,
-            CommandExecArgs { argv, cwd: root(&dir), timeout_ms: Some(5_000) },
+            CommandExecArgs {
+                argv,
+                cwd: root(&dir),
+                timeout_ms: Some(5_000),
+            },
         )
         .await;
         assert!(denied_again.is_err(), "revoked command is denied again");

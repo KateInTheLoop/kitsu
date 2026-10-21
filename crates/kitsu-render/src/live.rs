@@ -430,7 +430,11 @@ fn input_box_content(draft: &LiveDraft, inner: usize) -> (Vec<String>, usize, us
         let segs = wrap_segments(&full, inner); // display_char-mapped, 1 char→1 char
         if li == cursor_line {
             // Caret's char column within `full` (prompt counts on line 0).
-            let caret_c = if li == 0 { prompt.chars().count() + cursor_in_line } else { cursor_in_line };
+            let caret_c = if li == 0 {
+                prompt.chars().count() + cursor_in_line
+            } else {
+                cursor_in_line
+            };
             let (seg_idx, col) = locate_caret_in_segments(&segs, caret_c, inner);
             caret_row = rows.len() + seg_idx;
             caret_col = col;
@@ -893,7 +897,11 @@ fn compose_wrap_rows_for_line(
     if earlier > DRAFT_CONTEXT_ROWS {
         rows.push(format!(
             "{}",
-            clamp(format!("  ⋮ +{} earlier segment(s)", earlier - DRAFT_CONTEXT_ROWS)).dimmed()
+            clamp(format!(
+                "  ⋮ +{} earlier segment(s)",
+                earlier - DRAFT_CONTEXT_ROWS
+            ))
+            .dimmed()
         ));
     }
     for segment in segments
@@ -961,7 +969,11 @@ fn compose_draft_context_rows(
     if cursor_line > DRAFT_CONTEXT_ROWS {
         rows.push(format!(
             "{}",
-            clamp(format!("  ⋮ +{} earlier line(s)", cursor_line - DRAFT_CONTEXT_ROWS)).dimmed()
+            clamp(format!(
+                "  ⋮ +{} earlier line(s)",
+                cursor_line - DRAFT_CONTEXT_ROWS
+            ))
+            .dimmed()
         ));
     }
     for line in lines
@@ -1638,9 +1650,15 @@ mod tests {
         let long = "x".repeat(200);
         let rows = compose_draft_context_rows(&long, 200, 80, 10);
         let plain_rows: Vec<String> = rows.iter().map(|r| sanitize_terminal_text(r)).collect();
-        assert!(plain_rows[0].contains("earlier segment(s)"), "{plain_rows:?}");
+        assert!(
+            plain_rows[0].contains("earlier segment(s)"),
+            "{plain_rows:?}"
+        );
         let shown = plain_rows.iter().filter(|r| r.contains("│")).count();
-        assert_eq!(shown, DRAFT_CONTEXT_ROWS, "shows the budget worth of segments: {plain_rows:?}");
+        assert_eq!(
+            shown, DRAFT_CONTEXT_ROWS,
+            "shows the budget worth of segments: {plain_rows:?}"
+        );
     }
 
     #[test]
@@ -1712,18 +1730,34 @@ mod tests {
         // caret on the content row just after the prompt. This is the fix for
         // "no box at idle + stranded cursor": the region and caret exist with
         // no input.
-        let draft = LiveDraft { prompt: "kitsu> ".to_string(), ..LiveDraft::default() };
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            ..LiveDraft::default()
+        };
         let b = compose_input_box(&draft, 40);
-        assert_eq!(b.rows.len(), 3, "empty box is top+content+bottom: {:?}", b.rows);
+        assert_eq!(
+            b.rows.len(),
+            3,
+            "empty box is top+content+bottom: {:?}",
+            b.rows
+        );
         assert!(sanitize_terminal_text(&b.rows[0]).starts_with("╭"));
         assert!(sanitize_terminal_text(&b.rows[2]).starts_with("╰"));
         // Full width: every row is `cols` display columns.
         for row in &b.rows {
-            assert_eq!(display_width(&sanitize_terminal_text(row)), 40, "full-width: {row:?}");
+            assert_eq!(
+                display_width(&sanitize_terminal_text(row)),
+                40,
+                "full-width: {row:?}"
+            );
         }
         // Caret on row 2 (1-based: top border is 1), column after "│ kitsu> ".
         assert_eq!(b.caret.0, 2, "caret on the content row");
-        assert_eq!(b.caret.1, 2 + "kitsu> ".len() + 1, "caret just past the prompt");
+        assert_eq!(
+            b.caret.1,
+            2 + "kitsu> ".len() + 1,
+            "caret just past the prompt"
+        );
     }
 
     #[test]
@@ -1751,9 +1785,20 @@ mod tests {
         let b = compose_input_box(&draft, 40);
         // top + "kitsu> first" + "second" + "third" + bottom = 5 rows.
         assert_eq!(b.rows.len(), 5, "{:?}", b.rows);
-        assert!(sanitize_terminal_text(&b.rows[1]).contains("kitsu> first"), "{:?}", b.rows);
-        assert!(sanitize_terminal_text(&b.rows[3]).contains("third"), "{:?}", b.rows);
-        assert!(!sanitize_terminal_text(&b.rows[3]).contains("kitsu>"), "prompt only on first line");
+        assert!(
+            sanitize_terminal_text(&b.rows[1]).contains("kitsu> first"),
+            "{:?}",
+            b.rows
+        );
+        assert!(
+            sanitize_terminal_text(&b.rows[3]).contains("third"),
+            "{:?}",
+            b.rows
+        );
+        assert!(
+            !sanitize_terminal_text(&b.rows[3]).contains("kitsu>"),
+            "prompt only on first line"
+        );
         assert_eq!(b.caret.0, 4, "caret on the cursor's line (row 4, 1-based)");
         assert_eq!(b.caret.1, 2 + "third".len() + 1, "caret after 'third'");
     }
@@ -1773,13 +1818,28 @@ mod tests {
         assert!(full.rows.len() > 6, "precondition: taller than the grant");
         let fit = fit_input_box(full, 6);
         assert_eq!(fit.rows.len(), 6, "{:?}", fit.rows);
-        assert!(sanitize_terminal_text(&fit.rows[0]).starts_with('╭'), "top border kept");
-        assert!(sanitize_terminal_text(&fit.rows[5]).starts_with('╰'), "bottom border kept");
+        assert!(
+            sanitize_terminal_text(&fit.rows[0]).starts_with('╭'),
+            "top border kept"
+        );
+        assert!(
+            sanitize_terminal_text(&fit.rows[5]).starts_with('╰'),
+            "bottom border kept"
+        );
         let caret_row = sanitize_terminal_text(&fit.rows[fit.caret.0 - 1]);
-        assert!(caret_row.contains("end"), "caret row survives: {caret_row:?}");
+        assert!(
+            caret_row.contains("end"),
+            "caret row survives: {caret_row:?}"
+        );
 
         // A box that already fits is untouched.
-        let small = compose_input_box(&LiveDraft { prompt: "k> ".to_string(), ..LiveDraft::default() }, 40);
+        let small = compose_input_box(
+            &LiveDraft {
+                prompt: "k> ".to_string(),
+                ..LiveDraft::default()
+            },
+            40,
+        );
         assert_eq!(fit_input_box(small, 6).rows.len(), 3);
     }
 
@@ -1799,7 +1859,13 @@ mod tests {
         let content = b.rows.len() - 2; // minus top+bottom borders
         assert_eq!(content, 3, "long line wraps across rows: {:?}", b.rows);
         // No ellipsis: wrapping replaced truncation.
-        assert!(!b.rows.iter().any(|r| sanitize_terminal_text(r).contains('…')), "no truncation: {:?}", b.rows);
+        assert!(
+            !b.rows
+                .iter()
+                .any(|r| sanitize_terminal_text(r).contains('…')),
+            "no truncation: {:?}",
+            b.rows
+        );
         // Caret is on the LAST content row (row index: top border=1, +3 content).
         assert_eq!(b.caret.0, 4, "caret on the last wrapped row: {:?}", b.rows);
     }
@@ -1811,10 +1877,22 @@ mod tests {
         let buffer = "l1\nl2\nl3\nl4\nl5\nl6";
         let rows = compose_draft_context_rows(buffer, 13, 80, 70);
         let plain: Vec<String> = rows.iter().map(|r| sanitize_terminal_text(r)).collect();
-        assert!(!plain.iter().any(|r| r.contains("earlier line(s)")), "no collapse under budget: {plain:?}");
-        assert!(plain[0].contains("l1") && plain[1].contains("l2"), "earliest lines shown: {plain:?}");
-        assert!(plain.iter().any(|r| r.contains("l4")), "all context lines shown: {plain:?}");
-        assert!(plain.last().unwrap().contains("+1 line(s) below — Enter submits all"));
+        assert!(
+            !plain.iter().any(|r| r.contains("earlier line(s)")),
+            "no collapse under budget: {plain:?}"
+        );
+        assert!(
+            plain[0].contains("l1") && plain[1].contains("l2"),
+            "earliest lines shown: {plain:?}"
+        );
+        assert!(
+            plain.iter().any(|r| r.contains("l4")),
+            "all context lines shown: {plain:?}"
+        );
+        assert!(plain
+            .last()
+            .unwrap()
+            .contains("+1 line(s) below — Enter submits all"));
 
         // A draft with more earlier lines than the budget DOES collapse the
         // overflow into the marker, keeping the box bounded.
@@ -1822,10 +1900,16 @@ mod tests {
         let cursor = big.chars().count(); // at the end, after 30 newlines
         let rows = compose_draft_context_rows(&big, cursor, 80, 70);
         let plain: Vec<String> = rows.iter().map(|r| sanitize_terminal_text(r)).collect();
-        assert!(plain[0].contains("earlier line(s)"), "overflow collapses: {plain:?}");
+        assert!(
+            plain[0].contains("earlier line(s)"),
+            "overflow collapses: {plain:?}"
+        );
         // Exactly DRAFT_CONTEXT_ROWS context lines + the marker (+ cursor line).
         let shown = plain.iter().filter(|r| r.contains("│")).count();
-        assert_eq!(shown, DRAFT_CONTEXT_ROWS, "shows the budget worth of lines: {plain:?}");
+        assert_eq!(
+            shown, DRAFT_CONTEXT_ROWS,
+            "shows the budget worth of lines: {plain:?}"
+        );
 
         // Single-line drafts produce no context rows.
         assert!(compose_draft_context_rows("plain", 3, 80, 70).is_empty());

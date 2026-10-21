@@ -10,7 +10,9 @@ use super::onboarding::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2008,11 +2010,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::config::onboarding::{
-        AcquisitionReceipt, CatalogIntent, CredentialPlan, GuidedSetupTransaction,
-        NormalizedSetupPreview, OwnedEffectKind, PublicationReceipt, RollbackReceipt, SetupAdapter,
-        SetupDirective, SetupFailureKind, SetupFence, SetupProposalInput, SetupRouteInput,
-        SetupSelection, ValidationReceipt, MAX_OWNED_EFFECTS,
+        AcquisitionReceipt, PublicationReceipt, RollbackReceipt, SetupFailureKind,
+        ValidationReceipt,
+    };
+    use crate::config::onboarding::{
+        CatalogIntent, CredentialPlan, GuidedSetupTransaction, NormalizedSetupPreview,
+        OwnedEffectKind, SetupAdapter, SetupDirective, SetupFence, SetupProposalInput,
+        SetupRouteInput, SetupSelection, MAX_OWNED_EFFECTS,
     };
     use crate::config::{Config, GatewayAdapter};
     use std::path::{Path, PathBuf};

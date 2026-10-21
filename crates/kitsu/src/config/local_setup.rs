@@ -1012,6 +1012,7 @@ mod tests {
         CatalogIntent, CredentialPlan, NormalizedSetupPreview, RollbackTruth, SetupAdapter,
         SetupProposalInput, SetupRouteInput, SetupSelection, SetupStage, SetupTerminalCause,
     };
+    #[cfg(target_os = "linux")]
     use crate::config::publication::{
         inject_next_rollback_fault, inject_publication_faults, ConfigPublicationFailureKind,
         ConfigResidueKind, PublicationFaultPoint, RollbackFaultPoint,
