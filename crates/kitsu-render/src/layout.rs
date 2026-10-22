@@ -16,18 +16,17 @@
 //! before any viewport clipping — the first visible row is not necessarily the
 //! first draft row.
 
-use unicode_width::UnicodeWidthChar;
-
 /// Display width of one source scalar in terminal cells. A combining mark is
 /// zero; an East-Asian wide / fullwidth glyph is two; a tab is one (shown as
 /// `⇥`); everything else is one. Control characters are treated as zero — the
 /// editor sanitizes them out of the draft before layout, so they never reach a
 /// real cell, and a stray one must not desync the mapping.
 fn cell_width(ch: char) -> usize {
-    if ch == '\t' {
-        return 1;
-    }
-    UnicodeWidthChar::width(ch).unwrap_or(0)
+    // One width authority for the whole crate (review): the layout must wrap
+    // and pad with exactly the policy `fit_row_to_width` measures at paint
+    // time, or a combining mark / emoji they disagree on pushes the box border
+    // off its column.
+    crate::char_display_width(ch)
 }
 
 /// Display width of `text` in terminal cells under this module's policy —

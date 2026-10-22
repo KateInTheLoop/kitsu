@@ -964,22 +964,20 @@ pub const GLYPH_RECEIPT: &str = "◈";
 /// Torii session-boundary milestone marker (`--plain`: `*`).
 pub const GLYPH_TORII: &str = "⛩";
 
-/// Approximate terminal display width of one char: 2 for CJK/emoji ranges the
-/// banner and its dynamic values can reasonably contain, else 1. Control and
-/// zero-width characters are removed by sanitization before this runs.
-fn char_display_width(ch: char) -> usize {
-    match ch as u32 {
-        0x1100..=0x115F
-        | 0x2E80..=0xA4CF
-        | 0xAC00..=0xD7A3
-        | 0xF900..=0xFAFF
-        | 0xFE30..=0xFE4F
-        | 0xFF00..=0xFF60
-        | 0xFFE0..=0xFFE6
-        | 0x1F300..=0x1FAFF
-        | 0x20000..=0x3FFFD => 2,
-        _ => 1,
+/// Terminal display width of one char in cells: the single width authority for
+/// this crate. A combining mark is zero, an East-Asian wide / fullwidth glyph
+/// is two, a tab is one (the renderer shows it as `⇥`), everything else is one.
+///
+/// This MUST be the same policy the layout wraps and pads with and the same one
+/// `fit_row_to_width` measures with: review found the box laid out with
+/// `unicode-width` but was re-fitted at paint time with an approximate table,
+/// so a combining mark or an emoji the two disagreed on knocked the right
+/// border off. Control characters are removed by sanitization before this runs.
+pub(crate) fn char_display_width(ch: char) -> usize {
+    if ch == '\t' {
+        return 1;
     }
+    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 fn display_width(s: &str) -> usize {
@@ -1886,16 +1884,12 @@ pub fn approval_options(always_label: &str) -> String {
 ///
 /// Width-aware (review 7): a single fixed line is truncated to the pane width
 /// when it paints, and the fourth answer pushed `[n] deny` off the end on a
-/// narrow terminal. When the verbose line does not fit `cols`, a compact
-/// spelling that still names every key — deny included — is used instead.
+/// narrow terminal. The widest spelling that fits `cols` is used, down to a
+/// tight floor (~22 cells) that still names every key with deny last — so for
+/// any pane wide enough to show the modal's provenance rows at all, a
+/// right-edge truncation never hides deny.
 pub fn command_approval_options(always_label: &str, cols: usize) -> String {
     let styled = stderr_style();
-    let verbose = approval_options_with_mode(always_label, true, styled);
-    // Styling is zero-width ANSI, so the plain spelling is the true width.
-    let plain = approval_options_with_mode(always_label, true, false);
-    if display_width(&plain) <= cols {
-        return verbose;
-    }
     let key = |k: &str| {
         if styled {
             format!("{}", format!("[{k}]").bold())
@@ -1903,13 +1897,39 @@ pub fn command_approval_options(always_label: &str, cols: usize) -> String {
             format!("[{k}]")
         }
     };
-    format!(
-        "  {} once · {} session · {} auto · {} deny",
-        key("y"),
-        key("a"),
-        key("u"),
-        key("n")
-    )
+    // Widest first. Each candidate is paired with its plain (unstyled) form,
+    // whose display width is the true on-screen width — styling is zero-width
+    // ANSI — so the choice does not depend on whether stderr is a TTY.
+    let verbose_plain = approval_options_with_mode(always_label, true, false);
+    let candidates = [
+        (
+            approval_options_with_mode(always_label, true, styled),
+            verbose_plain,
+        ),
+        (
+            format!(
+                "  {} once · {} session · {} auto · {} deny",
+                key("y"),
+                key("a"),
+                key("u"),
+                key("n")
+            ),
+            "  [y] once · [a] session · [u] auto · [n] deny".to_string(),
+        ),
+        (
+            format!("  {} {} {} {} deny", key("y"), key("a"), key("u"), key("n")),
+            "  [y] [a] [u] [n] deny".to_string(),
+        ),
+    ];
+    for (styled_line, plain) in &candidates {
+        if display_width(plain) <= cols {
+            return styled_line.clone();
+        }
+    }
+    // Narrower than the tight floor: return it anyway (the modal is degraded at
+    // this width regardless); the fitter truncates, but deny is last so it is
+    // the first thing room is found for as the pane grows back.
+    candidates.into_iter().next_back().unwrap().0
 }
 
 /// The `[u]` option's label, shared by the styled and plain prompts.
@@ -3637,14 +3657,22 @@ mod tests {
             sanitize_terminal_text(&wide),
             "  [y] allow once · [a] exact argv/cwd for session · [u] auto mode · [n] deny"
         );
-        // A 50-column pane: the verbose line would be truncated, so the compact
-        // one is used, and it still shows every key including deny within 50.
-        let narrow = crate::command_approval_options(crate::COMMAND_ALWAYS_LABEL, 50);
-        let plain = sanitize_terminal_text(&narrow);
-        assert_eq!(plain, "  [y] once · [a] session · [u] auto · [n] deny");
-        assert!(display_width(&plain) <= 50, "{}", display_width(&plain));
-        for key in ["[y]", "[a]", "[u]", "[n] deny"] {
-            assert!(plain.contains(key), "compact line keeps {key}: {plain:?}");
+        // Each pane width gets the widest spelling that fits, and every one
+        // keeps all four keys with deny last — a right-edge truncation must
+        // never be what hides deny.
+        for cols in [80, 50, 30, 22] {
+            let narrow = crate::command_approval_options(crate::COMMAND_ALWAYS_LABEL, cols);
+            let plain = sanitize_terminal_text(&narrow);
+            assert!(
+                display_width(&plain) <= cols,
+                "cols={cols}: {} > {cols}: {plain:?}",
+                display_width(&plain)
+            );
+            for key in ["[y]", "[a]", "[u]", "[n] deny"] {
+                assert!(plain.contains(key), "cols={cols} keeps {key}: {plain:?}");
+            }
+            // deny is always the last option, so it is the last thing dropped.
+            assert!(plain.trim_end().ends_with("[n] deny"), "{plain:?}");
         }
         assert!(!approval_options_with_mode("always (/etc)", false, false).contains("[u]"));
     }

@@ -1351,25 +1351,38 @@ pub(crate) fn clear_approval_modal() {
     let Some(pane) = lock(&MODAL_PANE).clone() else {
         return;
     };
-    let turn = lock(&TURN_DRAFT).take();
+    // Review 3: clone the live draft rather than take-then-restore it. Taking
+    // it out and re-storing through paint_turn_draft opened a window where a
+    // concurrent end_turn_draft() (the collector finishing its turn) was lost
+    // and a dead draft was resurrected. Cloning never writes TURN_DRAFT, so an
+    // end_turn_draft that wins the race leaves it `None` and the status row
+    // comes back, which is correct.
+    let turn = lock(&TURN_DRAFT).clone();
     if let Some(t) = turn {
-        paint_turn_draft(&t.prompt, &t.draft, t.cursor, &t.hint, t.hint_reserved);
+        paint_turn_draft_on(&pane, &t);
         return;
     }
-    let row = match lock(&STATUS_PAINTER).clone() {
+    pane.paint_rows(std::slice::from_ref(&status_row_for(&pane)));
+}
+
+/// The status row to restore on a pinned pane: R5's composed row when a
+/// session has published its fields, else the pane's fixed install text. The
+/// compose path invalidates the cadence painter's dedupe so it paints again.
+fn status_row_for(pane: &PinnedPane) -> String {
+    match lock(&STATUS_PAINTER).clone() {
         Some((_, source)) => {
             source.invalidate();
             source.compose(live::terminal_columns())
         }
         None => pane.status.clone(),
-    };
-    pane.paint_rows(std::slice::from_ref(&row));
+    }
 }
 
 /// The during-turn draft last painted by [`paint_turn_draft`], so taking an
 /// approval modal down puts it back: the prompter clears the modal on its own
 /// thread, after the collector has already repainted, and would otherwise
 /// leave only the status row until the next keystroke.
+#[derive(Clone)]
 struct TurnDraft {
     prompt: String,
     draft: String,
@@ -1387,11 +1400,11 @@ pub(crate) fn end_turn_draft() {
 }
 
 /// Paint the **during-turn** draft on the pinned pane, exactly as the idle
-/// composer paints it. The classic live row stands down while the inline
-/// viewport is installed (finding F15), so without this the collector's draft
-/// was stored and queued but never drawn. An empty draft collapses the pane to
-/// the status row, so no empty box stays pinned while the turn streams
-/// (review F7). Returns false when no pane is published (classic mode).
+/// composer paints it, and remember it so a later approval-modal teardown can
+/// put it back. The classic live row stands down while the inline viewport is
+/// installed (finding F15), so without this the collector's draft was stored
+/// and queued but never drawn. Returns false when no pane is published
+/// (classic mode).
 pub(crate) fn paint_turn_draft(
     prompt: &str,
     draft: &str,
@@ -1402,44 +1415,48 @@ pub(crate) fn paint_turn_draft(
     let Some(pane) = lock(&MODAL_PANE).clone() else {
         return false;
     };
-    *lock(&TURN_DRAFT) = Some(TurnDraft {
+    let turn = TurnDraft {
         prompt: prompt.to_string(),
         draft: draft.to_string(),
         cursor,
         hint: hint.to_string(),
         hint_reserved,
-    });
-    let status_row = || match lock(&STATUS_PAINTER).clone() {
-        Some((_, source)) => {
-            source.invalidate();
-            source.compose(live::terminal_columns())
-        }
-        None => pane.status.clone(),
     };
-    if draft.is_empty() && hint.is_empty() {
-        return pane.paint_rows(&[status_row()]);
+    *lock(&TURN_DRAFT) = Some(turn.clone());
+    paint_turn_draft_on(&pane, &turn)
+}
+
+/// Paint one [`TurnDraft`] on `pane` without touching the stored `TURN_DRAFT`.
+/// Shared by [`paint_turn_draft`] (which stores first) and
+/// [`clear_approval_modal`] (which restores a clone, so a racing
+/// [`end_turn_draft`] can never be resurrected — review 3). An empty draft
+/// collapses the pane to the status row, so no empty box stays pinned while
+/// the turn streams (review F7).
+fn paint_turn_draft_on(pane: &PinnedPane, turn: &TurnDraft) -> bool {
+    if turn.draft.is_empty() && turn.hint.is_empty() {
+        return pane.paint_rows(&[status_row_for(pane)]);
     }
     if !input_box_enabled() {
         // The single-row fallback's one row is the status row, which the
         // turn's cadence repaints every tick; the draft gets its own row below.
         // ponytail: no slash palette here during a turn; the box path has it.
         let composed = live::LiveDraft {
-            prompt: prompt.to_string(),
-            buffer: draft.to_string(),
-            cursor,
-            hint: hint.to_string(),
-            hint_reserved,
+            prompt: turn.prompt.clone(),
+            buffer: turn.draft.clone(),
+            cursor: turn.cursor,
+            hint: turn.hint.clone(),
+            hint_reserved: turn.hint_reserved,
         };
         let row = live::compose_input_row(&composed, live::terminal_columns()).0;
-        return pane.paint_rows(&[status_row(), row]);
+        return pane.paint_rows(&[status_row_for(pane), row]);
     }
     pane.paint_composer(
-        &status_row,
-        prompt,
-        draft,
-        cursor,
-        hint,
-        hint_reserved,
+        &|| status_row_for(pane),
+        &turn.prompt,
+        &turn.draft,
+        turn.cursor,
+        &turn.hint,
+        turn.hint_reserved,
         kitsu_render::stderr_styled(),
     )
 }

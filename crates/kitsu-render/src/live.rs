@@ -1715,10 +1715,20 @@ mod tests {
         // never a column short or over, which would bow or wrap the border.
         let cols = 24;
         for draft in [
+            // A combining mark alone (0 cells): the old heuristic counted it as
+            // 1, so a shared-authority regression would pad one short.
             LiveDraft {
                 prompt: "kitsu> ".to_string(),
-                buffer: "e\u{0301}\u{2705}x".to_string(), // é + ✅ + x
-                cursor: 3,
+                buffer: "e\u{0301}x".to_string(), // é + x
+                cursor: 2,
+                ..LiveDraft::default()
+            },
+            // An emoji alone (2 cells): the old heuristic counted ✅ as 1, so a
+            // regression would pad one long and the row would wrap.
+            LiveDraft {
+                prompt: "kitsu> ".to_string(),
+                buffer: "\u{2705}done".to_string(), // ✅ done
+                cursor: 5,
                 ..LiveDraft::default()
             },
             // A prompt wider than the whole frame must not overflow it.
@@ -1739,6 +1749,15 @@ mod tests {
                 );
                 assert!(plain.starts_with('│') || plain.starts_with('╭') || plain.starts_with('╰'));
                 assert!(plain.ends_with('│') || plain.ends_with('╮') || plain.ends_with('╯'));
+                // The real paint path (review 1): InlineSurface::paint re-fits
+                // every row with fit_row_to_width. That measure MUST agree with
+                // the one the box padded under, or the trailing border is
+                // truncated off. A fitting row is returned byte-for-byte.
+                assert_eq!(
+                    crate::fit_row_to_width(row, cols),
+                    *row,
+                    "paint-time fit must not truncate the border: {plain:?}"
+                );
             }
         }
     }
