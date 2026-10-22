@@ -19070,6 +19070,18 @@ fn run_live_typeahead(
         ..TypeaheadCaptureResult::default()
     };
     let mut editor = kitsu_editor::TypeaheadEditor::with_draft(history, initial_draft);
+    // Review 6: the during-turn box is painted through `paint_turn_draft`, the
+    // same framed composer the idle reader uses, so ↑/↓ must walk its visual
+    // rows here too — otherwise the same draft navigates by row at idle and by
+    // history mid-turn. The row fallback keeps ↑/↓ as history (no motion set).
+    if tui_bridge::input_box_enabled() {
+        let prompt_for_motion = prompt.clone();
+        editor.set_vertical_motion(Some(Box::new(
+            kitsu_render::live::input_box_vertical_motion(&prompt_for_motion, || {
+                kitsu_render::live::terminal_columns()
+            }),
+        )));
+    }
     let mut raw = Some(raw);
     // Consecutive no-data poll timeouts; the lone-Esc resolver requires two.
     let mut quiet_ticks = 0u32;
@@ -25751,8 +25763,10 @@ impl CommandPrompter for CliCommandPrompter {
                     terminal_inline(req.authority_notice())
                 )),
             ];
-            let options =
-                kitsu_render::command_approval_options(kitsu_render::COMMAND_ALWAYS_LABEL);
+            let options = kitsu_render::command_approval_options(
+                kitsu_render::COMMAND_ALWAYS_LABEL,
+                kitsu_render::live::terminal_columns(),
+            );
             (header, details, options)
         });
         // Card T3-S7b, exactly as the filesystem prompt above: where a pane

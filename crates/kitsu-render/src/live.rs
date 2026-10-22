@@ -353,10 +353,13 @@ pub fn compose_input_box(draft: &LiveDraft, cols: usize) -> InputBox {
     let mut rows = Vec::with_capacity(content.len() + 2);
     rows.push(top);
     for line in &content {
-        // Pad the (already clamped) plain text to the inner width.
-        let pad = inner.saturating_sub(display_width(line));
-        let padded = format!("{line}{}", " ".repeat(pad));
-        rows.push(bar(&padded));
+        // Fit each line to exactly `inner` cells under the SAME width policy
+        // the layout used (review F: `display_width` is a rough heuristic that
+        // disagrees with the layout on combining marks and many emoji, which
+        // left the right border a column off; and a prompt wider than the
+        // frame used to overflow it entirely). Truncate-then-pad keeps every
+        // row exactly `inner` wide, so the border always lands on its column.
+        rows.push(bar(&crate::layout::clamp_to_width(line, inner)));
     }
     rows.push(bottom);
 
@@ -1712,6 +1715,42 @@ mod tests {
         assert_eq!(plain.len(), 2);
         assert!(plain[0].contains("first line"));
         assert!(plain[1].contains("second line"));
+    }
+
+    #[test]
+    fn input_box_rows_stay_exactly_cols_wide_for_wide_and_zero_width_glyphs() {
+        // Review F4/F5: the frame is padded under the layout's width policy,
+        // so a combining mark (0 cells), an emoji (2 cells), and a prompt
+        // wider than the frame all leave every row exactly `cols` cells —
+        // never a column short or over, which would bow or wrap the border.
+        let cols = 24;
+        for draft in [
+            LiveDraft {
+                prompt: "kitsu> ".to_string(),
+                buffer: "e\u{0301}\u{2705}x".to_string(), // é + ✅ + x
+                cursor: 3,
+                ..LiveDraft::default()
+            },
+            // A prompt wider than the whole frame must not overflow it.
+            LiveDraft {
+                prompt: "a-very-long-attached-agent-prompt> ".to_string(),
+                buffer: "x".to_string(),
+                cursor: 1,
+                ..LiveDraft::default()
+            },
+        ] {
+            let b = compose_input_box(&draft, cols);
+            for row in &b.rows {
+                let plain = sanitize_terminal_text(row);
+                assert_eq!(
+                    crate::layout::text_width(&plain),
+                    cols,
+                    "row must be exactly {cols} cells: {plain:?}"
+                );
+                assert!(plain.starts_with('│') || plain.starts_with('╭') || plain.starts_with('╰'));
+                assert!(plain.ends_with('│') || plain.ends_with('╮') || plain.ends_with('╯'));
+            }
+        }
     }
 
     #[test]

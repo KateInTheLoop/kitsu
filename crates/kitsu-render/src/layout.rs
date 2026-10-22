@@ -30,6 +30,35 @@ fn cell_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
+/// Display width of `text` in terminal cells under this module's policy —
+/// the authority the layout and the painter must share so a padded row is
+/// exactly as wide as it was laid out.
+pub fn text_width(text: &str) -> usize {
+    text.chars().map(cell_width).sum()
+}
+
+/// Fit already-projected display text to exactly `cells` columns: truncate on
+/// a cell boundary if it is wider (a wide glyph that would straddle the edge
+/// is dropped and a space keeps the width exact), then pad with spaces. The
+/// box painter uses this so a combining mark, an emoji, or a prompt wider than
+/// the frame cannot push the right border off its column.
+pub fn clamp_to_width(text: &str, cells: usize) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = cell_width(ch);
+        if used + w > cells {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    for _ in used..cells {
+        out.push(' ');
+    }
+    out
+}
+
 /// The glyph a source scalar paints as. Newlines never reach here (they break
 /// rows); tabs render as `⇥`, matching `live::display_char`.
 fn display_glyph(ch: char) -> char {
@@ -537,6 +566,26 @@ mod tests {
         // A combining mark shares its base's cell: landing there picks the base.
         let m = layout("ab\ne\u{0301}x", "", 40);
         assert_eq!(m.vertical(0, None, false), Some((3, 0)));
+    }
+
+    /// clamp_to_width fits to exactly `cells` under the layout's own width
+    /// policy: a combining mark adds no width (review F: the heuristic pad
+    /// left the border a column short), a wide glyph is two and is dropped
+    /// whole rather than straddling the edge, and text wider than the frame
+    /// (a long prompt on a narrow terminal) is truncated, not overflowed.
+    #[test]
+    fn clamp_to_width_is_exact_in_cells() {
+        assert_eq!(clamp_to_width("ab", 4), "ab  ");
+        assert_eq!(text_width(&clamp_to_width("e\u{0301}x", 4)), 4); // é + x = 2 cells
+        assert_eq!(clamp_to_width("e\u{0301}x", 4), "e\u{0301}x  ");
+        // '中' is two cells: at width 3 only one fits, the second is dropped
+        // and a space keeps the width exact rather than straddling the edge.
+        assert_eq!(clamp_to_width("中中", 3), "中 ");
+        assert_eq!(text_width(&clamp_to_width("中中", 3)), 3);
+        // A prompt wider than the frame is truncated to the frame.
+        assert_eq!(clamp_to_width("kitsu> a", 4), "kits");
+        // An emoji counts as two cells under this policy.
+        assert_eq!(text_width(&clamp_to_width("✅x", 5)), 5);
     }
 
     /// cell_to_source past a row's content clamps to that row's last boundary,

@@ -1881,10 +1881,35 @@ pub fn approval_options(always_label: &str) -> String {
     approval_options_with_mode(always_label, false, stderr_style())
 }
 
-/// The command prompt's options: [`approval_options`] plus `[u]`, which
-/// turns auto mode on for the rest of the session.
-pub fn command_approval_options(always_label: &str) -> String {
-    approval_options_with_mode(always_label, true, stderr_style())
+/// The command prompt's options: [`approval_options`] plus `[u]`, which turns
+/// auto mode on for the rest of the session.
+///
+/// Width-aware (review 7): a single fixed line is truncated to the pane width
+/// when it paints, and the fourth answer pushed `[n] deny` off the end on a
+/// narrow terminal. When the verbose line does not fit `cols`, a compact
+/// spelling that still names every key — deny included — is used instead.
+pub fn command_approval_options(always_label: &str, cols: usize) -> String {
+    let styled = stderr_style();
+    let verbose = approval_options_with_mode(always_label, true, styled);
+    // Styling is zero-width ANSI, so the plain spelling is the true width.
+    let plain = approval_options_with_mode(always_label, true, false);
+    if display_width(&plain) <= cols {
+        return verbose;
+    }
+    let key = |k: &str| {
+        if styled {
+            format!("{}", format!("[{k}]").bold())
+        } else {
+            format!("[{k}]")
+        }
+    };
+    format!(
+        "  {} once · {} session · {} auto · {} deny",
+        key("y"),
+        key("a"),
+        key("u"),
+        key("n")
+    )
 }
 
 /// The `[u]` option's label, shared by the styled and plain prompts.
@@ -3601,16 +3626,26 @@ mod tests {
         );
     }
 
-    /// The command prompt alone offers `[u]` auto mode, before deny, and all
-    /// four answers fit an 80-column pane (a truncated line hides `[n] deny`).
+    /// The command prompt offers `[u]` auto mode before deny. The verbose line
+    /// is used when it fits; a narrower pane gets a compact spelling that still
+    /// names every key — review 7: `[n] deny` must never be the answer a
+    /// truncation hides. The file prompt has no `[u]`.
     #[test]
     fn command_approval_options_add_the_auto_key() {
-        let options = approval_options_with_mode(crate::COMMAND_ALWAYS_LABEL, true, false);
+        let wide = crate::command_approval_options(crate::COMMAND_ALWAYS_LABEL, 80);
         assert_eq!(
-            options,
+            sanitize_terminal_text(&wide),
             "  [y] allow once · [a] exact argv/cwd for session · [u] auto mode · [n] deny"
         );
-        assert!(options.chars().count() <= 80, "{}", options.chars().count());
+        // A 50-column pane: the verbose line would be truncated, so the compact
+        // one is used, and it still shows every key including deny within 50.
+        let narrow = crate::command_approval_options(crate::COMMAND_ALWAYS_LABEL, 50);
+        let plain = sanitize_terminal_text(&narrow);
+        assert_eq!(plain, "  [y] once · [a] session · [u] auto · [n] deny");
+        assert!(display_width(&plain) <= 50, "{}", display_width(&plain));
+        for key in ["[y]", "[a]", "[u]", "[n] deny"] {
+            assert!(plain.contains(key), "compact line keeps {key}: {plain:?}");
+        }
         assert!(!approval_options_with_mode("always (/etc)", false, false).contains("[u]"));
     }
 

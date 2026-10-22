@@ -2448,6 +2448,51 @@ fn inline_mode_paints_the_draft_typed_during_a_turn_in_the_row() {
     assert_turn_draft_is_visible(false);
 }
 
+/// **Review 6: ↑/↓ navigate the draft's visual rows during a turn, exactly as
+/// at idle.** Type a two-line draft while a turn streams, then ↑ onto the
+/// first line and insert there; a history walk would instead replace the whole
+/// draft. The box is the same framed composer the idle reader uses, so the
+/// motion must be the same. (Row 0 carries the prompt, so the preferred column
+/// lands on the first character of the line above — `Xfirst`, not `firstX`.)
+#[test]
+#[serial]
+fn inline_mode_up_arrow_moves_within_the_draft_during_a_turn() {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty_with_options(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "go slow\r"),
+            // Two lines (Alt+Enter between), caret at the end of the second.
+            send("SLOW_TURN_STARTED", "first\x1b\rsecond"),
+            send("second", "\x1b[AX"),
+            pause("SLOW_TURN_STARTED", SETTLE_MS),
+            // Ctrl+C clears the whole draft; then exit cleanly.
+            send(TURN_DONE_MARKER, "\x03/quit\r"),
+        ],
+        slow_turn(),
+        &[],
+        Options {
+            input_box: true,
+            ..Options::default()
+        },
+    );
+    // Mark 3 closes the pause: mid-turn, after ↑ and the inserted X.
+    let screen = session.session.screen_at(3);
+    assert!(
+        screen.iter().any(|row| row.contains("Xfirst")),
+        "↑ must move onto the first line and insert there, not recall history; \
+         whole screen:\n{}",
+        Session::dump(&screen)
+    );
+    assert!(
+        screen.iter().any(|row| row.contains("second")),
+        "the second line is intact (no history walk replaced the draft); \
+         whole screen:\n{}",
+        Session::dump(&screen)
+    );
+}
+
 /// The trigger every streaming script uses for its *second* input: the live
 /// summary line kitsu prints when a turn has finished (`↳ 0.1s · … (6%
 /// used)`). Triggering on the end of the turn rather than on a fragment of
