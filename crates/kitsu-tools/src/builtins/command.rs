@@ -2190,15 +2190,13 @@ impl CommandPolicy {
             });
         }
 
-        let mode = if self.session_auto() {
-            CommandMode::AutoAllow
-        } else {
-            self.mode
-        };
-        match mode {
+        match self.mode {
             // The dangerous bypass answers the approval question, nothing
             // else: cwd/root confinement and executable resolution were
             // already enforced above, and containment still wraps execution.
+            // `--dangerously-skip-permissions` is a whole-run decision and so
+            // bypasses every route; prompt-chosen auto mode (`session_auto`)
+            // is scoped to the foreground route below, never background work.
             CommandMode::AutoAllow => Ok(AuthorizedCommand {
                 cwd: authorized_cwd,
                 executable,
@@ -2229,6 +2227,14 @@ impl CommandPolicy {
                             display_argv(argv),
                             cwd.display()
                         )));
+                    }
+                    // Prompt-chosen auto mode skips the question for the rest
+                    // of the session, but only here, where a human chose it:
+                    // the exact same bypass for a background or subagent
+                    // command would silently widen an answer the user gave to
+                    // one foreground prompt into authority they never granted.
+                    crate::PromptRoute::Foreground if self.session_auto() => {
+                        CommandDecision::AllowOnce
                     }
                     crate::PromptRoute::Foreground => self.prompt(request).await,
                     crate::PromptRoute::Registry { agent_id, sender } => match crate::ask_registry(
@@ -4235,6 +4241,59 @@ mod tests {
             execute_command(&deny, args(&["/bin/echo", "x"], dir.path()))
                 .await
                 .is_err()
+        );
+    }
+
+    /// Auto mode is foreground-only: a prompt answer cannot widen into
+    /// background or subagent commands. With `session_auto` on, a `Denied`
+    /// route still fails closed and a `Registry` route still parks the
+    /// question for a human instead of running silently.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn auto_mode_does_not_leak_into_background_or_registry_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let policy = Arc::new(
+            CommandPolicy::new(&[root(&dir)], CommandMode::Ask)
+                .unwrap()
+                .with_prompter(Arc::new(FixedPrompter {
+                    decision: CommandDecision::AllowAllForSession,
+                    prompts: prompts.clone(),
+                })),
+        );
+
+        // Turn auto mode on through the foreground prompt, as `[u]` does.
+        execute_command(&policy, args(&["/bin/echo", "fg"], dir.path()))
+            .await
+            .unwrap();
+        assert!(policy.session_auto());
+
+        // Background: still fails closed despite auto mode.
+        let denied = crate::scope_without_interactive_prompts(execute_command(
+            &policy,
+            args(&["/bin/echo", "bg"], dir.path()),
+        ))
+        .await;
+        assert!(
+            matches!(&denied, Err(ToolError::PolicyDenied(message)) if message.contains("requires interactive approval")),
+            "auto mode must not authorize a background command: {denied:?}"
+        );
+
+        // Registry: the question is still parked for a human, not auto-run.
+        let (sender, seen) = crate::registry_prompt_stub(crate::Decision::AllowOnce);
+        let before = prompts.load(Ordering::Relaxed);
+        crate::scope_with_registry_prompts(
+            7,
+            sender,
+            execute_command(&policy, args(&["/bin/echo", "agent"], dir.path())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1, "the registry was asked");
+        assert_eq!(
+            prompts.load(Ordering::Relaxed),
+            before,
+            "the foreground prompter was not consulted for the registry route"
         );
     }
 

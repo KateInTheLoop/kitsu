@@ -10236,7 +10236,6 @@ struct SessionInfo {
     run_tallies: Arc<kitsu_core::RunTallies>,
     tool_names: Vec<String>,
     command_roots: Vec<std::path::PathBuf>,
-    command_mode: Option<&'static str>,
     command_policy: Option<Arc<kitsu_tools::CommandPolicy>>,
     command_artifact_sink: Option<command_artifact::CommandArtifactSink>,
     invocation_command_grants: Vec<kitsu_tools::CommandGrantInfo>,
@@ -10793,6 +10792,9 @@ fn reset_command_session(
         return;
     };
     policy.reset_session_grants();
+    // Auto mode is session state too: /new and /resume start a fresh session,
+    // so a prompt-chosen bypass must not silently carry into it.
+    policy.set_session_auto(false);
     for grant in explicit_grants {
         // Re-grant against the cwd the pregrant was bound to at startup, never
         // the current launch directory: an explicit-cwd grant must survive /new
@@ -10805,6 +10807,22 @@ fn reset_command_session(
             );
         }
     }
+}
+
+/// The live command-mode label for `/status`, `/permissions`, and the JSON
+/// receipts, computed from the policy so it reflects a prompt-chosen auto mode
+/// rather than the mode fixed at startup. `None` when commands are disabled.
+fn command_mode_label(policy: Option<&Arc<kitsu_tools::CommandPolicy>>) -> Option<&'static str> {
+    policy.map(|policy| {
+        if policy.session_auto() {
+            return "auto (no prompts this session; /auto off to restore asking)";
+        }
+        match policy.mode() {
+            kitsu_tools::CommandMode::Ask => "ask",
+            kitsu_tools::CommandMode::Deny => "deny unless pre-granted",
+            kitsu_tools::CommandMode::AutoAllow => "DANGEROUS auto-allow (no prompts)",
+        }
+    })
 }
 
 fn restored_messages(
@@ -12051,7 +12069,7 @@ fn session_status_payload(
         },
         "commands": {
             "enabled": commands_enabled,
-            "mode": session.command_mode,
+            "mode": command_mode_label(session.command_policy.as_ref()),
             "cwd_roots": session.command_roots.len(),
             "exact_grants": exact_command_grants,
         },
@@ -12252,7 +12270,7 @@ fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
         }
     }
     out.push_str("\n  commands     ");
-    if let Some(mode) = session.command_mode {
+    if let Some(mode) = command_mode_label(session.command_policy.as_ref()) {
         out.push_str(&format!(
             "{mode}; separate exact argv/cwd approval; filesystem flags have no effect"
         ));
@@ -12515,12 +12533,12 @@ fn permissions_payload(
         },
         "host_evidence": host_evidence,
         "commands": {
-            "enabled": session.command_mode.is_some(),
-            "mode": session.command_mode,
+            "enabled": session.command_policy.is_some(),
+            "mode": command_mode_label(session.command_policy.as_ref()),
             "cwd_roots": json_paths(session.command_roots.clone()),
             "exact_grants": command_grants,
             "revoked_invocation_grants": revoked_command_grants,
-            "ambient_authority_notice": session.command_mode.map(|_| kitsu_tools::CommandAmbientAuthority::CURRENT.notice()),
+            "ambient_authority_notice": session.command_policy.as_ref().map(|_| kitsu_tools::CommandAmbientAuthority::CURRENT.notice()),
             "containment": containment,
         },
         "artifact_policy": artifact_policy_receipt(
@@ -20608,11 +20626,6 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .as_ref()
             .map(|policy| policy.command_roots())
             .unwrap_or_default(),
-        command_mode: command_policy.as_ref().map(|policy| match policy.mode() {
-            kitsu_tools::CommandMode::Ask => "ask",
-            kitsu_tools::CommandMode::Deny => "deny unless pre-granted",
-            kitsu_tools::CommandMode::AutoAllow => "DANGEROUS auto-allow (no prompts)",
-        }),
         command_policy: command_policy.clone(),
         command_artifact_sink: command_artifact_sink.clone(),
         invocation_command_grants: command_policy
@@ -31550,6 +31563,29 @@ mod tests {
             ))
             .is_none()
         );
+    }
+
+    #[test]
+    fn auto_mode_resets_with_the_session_and_shows_in_the_label() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = Arc::new(
+            kitsu_tools::CommandPolicy::new(
+                &[root.path().to_string_lossy().to_string()],
+                kitsu_tools::CommandMode::Ask,
+            )
+            .unwrap(),
+        );
+        // Label starts at the real mode and follows the auto flag live.
+        assert_eq!(command_mode_label(Some(&policy)), Some("ask"));
+        assert!(policy.set_session_auto(true));
+        assert!(command_mode_label(Some(&policy))
+            .unwrap()
+            .starts_with("auto"));
+        // /new and /resume clear auto mode with the rest of the session.
+        reset_command_session(Some(&policy), &[]);
+        assert!(!policy.session_auto());
+        assert_eq!(command_mode_label(Some(&policy)), Some("ask"));
+        assert_eq!(command_mode_label(None), None);
     }
 
     #[test]
