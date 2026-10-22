@@ -387,13 +387,8 @@ pub fn input_box_vertical_motion(
 ) -> impl Fn(&str, usize, Option<usize>, bool) -> Option<(usize, usize)> {
     let prompt = sanitize_terminal_text(prompt);
     move |text, cursor, preferred, up| {
-        crate::layout::Layout::compute(
-            text,
-            &prompt,
-            input_box_inner(cols()),
-            &crate::layout::ScalarProjection,
-        )
-        .vertical(cursor, preferred, up)
+        crate::layout::Layout::compute(text, &prompt, input_box_inner(cols()))
+            .vertical(cursor, preferred, up)
     }
 }
 
@@ -435,12 +430,7 @@ fn input_box_content(draft: &LiveDraft, inner: usize) -> (Vec<String>, usize, us
     // One layout authority for painting and caret placement (Stage 1A): the
     // same mapping vertical navigation will use.
     let prompt = sanitize_terminal_text(&draft.prompt);
-    let layout = crate::layout::Layout::compute(
-        &draft.buffer,
-        &prompt,
-        inner,
-        &crate::layout::ScalarProjection,
-    );
+    let layout = crate::layout::Layout::compute(&draft.buffer, &prompt, inner);
     let caret = layout.source_to_cell(draft.cursor);
     let mut caret_row = caret.row;
     let caret_col = caret.col;

@@ -59,21 +59,10 @@ pub fn clamp_to_width(text: &str, cells: usize) -> String {
     out
 }
 
-/// The glyph a source scalar paints as. Newlines never reach here (they break
-/// rows); tabs render as `⇥`, matching `live::display_char`.
-fn display_glyph(ch: char) -> char {
-    if ch == '\t' {
-        '⇥'
-    } else {
-        ch
-    }
-}
-
 /// A projection atom: a contiguous source range that lays out as one unit with
-/// an independently measured label width. Ordinary text is one atom per
-/// scalar; a paste token (Stage 2A) is one atom spanning many source scalars
-/// whose label width differs from its backing text. Reserved here so the
-/// layout authority already accounts for label width without 2A's editing.
+/// an independently measured label width. A paste token (Stage 2A) is one atom
+/// spanning many source scalars whose label width differs from its backing
+/// text; [`Layout::compute`] lays out ordinary text without building these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Atom {
     /// Source scalar range `[start, end)` into the draft (prompt excluded).
@@ -86,60 +75,7 @@ pub struct Atom {
     pub breaks: bool,
 }
 
-impl Atom {
-    /// One ordinary source scalar as its own atom.
-    /// The glyph is sanitized, so a bidi control paints as its visible
-    /// `[U+202E]` marker and a stray control paints as nothing -- one source
-    /// boundary either way.
-    fn scalar(index: usize, ch: char) -> Self {
-        let glyphs = crate::sanitize_terminal_text(&display_glyph(ch).to_string());
-        Atom {
-            source: index..index + 1,
-            width: glyphs.chars().map(cell_width).sum(),
-            glyphs,
-            breaks: false,
-        }
-    }
-}
-
-/// How the draft projects to display atoms. The default is one atom per source
-/// scalar; later a paste-aware projection replaces chosen ranges with single
-/// wide-label atoms. Returned atoms must be contiguous and cover `[0, len)` of
-/// the source in order; a `'\n'` is never inside an atom (it is a row break).
-pub trait Projection {
-    /// Project `source` (the whole draft) into display atoms in source order.
-    fn atoms(&self, source: &str) -> Vec<Atom>;
-}
-
-/// The identity projection: every scalar is its own atom. Newlines are emitted
-/// as zero-width atoms so callers that walk atoms still see them; the layout
-/// pass treats them as row breaks.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ScalarProjection;
-
-impl Projection for ScalarProjection {
-    fn atoms(&self, source: &str) -> Vec<Atom> {
-        source
-            .chars()
-            .enumerate()
-            .map(|(i, ch)| {
-                if ch == '\n' {
-                    Atom {
-                        source: i..i + 1,
-                        width: 0,
-                        glyphs: String::new(),
-                        breaks: true,
-                    }
-                } else {
-                    Atom::scalar(i, ch)
-                }
-            })
-            .collect()
-    }
-}
-
-/// A source boundary placed in the grid: which physical row, which cell, and
-/// whether the prompt sits before it on that row.
+/// A source boundary placed in the grid: which physical row, which cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pos {
     pub row: usize,
@@ -153,10 +89,9 @@ pub struct Row {
     pub glyphs: String,
     /// Cells the content occupies (prompt excluded).
     pub width: usize,
-    /// The source scalar index where this row's content begins.
+    /// The source scalar index where this row's content begins. Used to bound
+    /// [`Layout::cell_to_source`]'s scan to one row's worth of boundaries.
     pub start: usize,
-    /// Leading cells reserved by the prompt (row 0 only; else 0).
-    pub prompt_cells: usize,
 }
 
 /// The full-draft layout: every physical row, plus the cell position of each
@@ -168,138 +103,188 @@ pub struct Layout {
     boundaries: Vec<Pos>,
 }
 
-impl Layout {
-    /// Lay the whole draft out at `width` cells with a first-row `prompt`,
-    /// using `projection`. `width` is clamped to at least one usable content
-    /// cell. The prompt occupies cells on row 0 only; if it alone fills the
-    /// width, content still gets a one-cell minimum so the caret has a home.
-    pub fn compute(
-        source: &str,
-        prompt: &str,
-        width: usize,
-        projection: &dyn Projection,
-    ) -> Layout {
-        let total_width = width.max(1);
-        let prompt_cells: usize = prompt.chars().map(cell_width).sum();
+/// Does this scalar need the full sanitizer, or can it be laid out as itself?
+///
+/// ASCII graphic characters and the space pass through
+/// [`crate::sanitize_terminal_text`] unchanged at one cell, which is the
+/// overwhelming bulk of any typed or pasted draft (a code paste is almost
+/// entirely this). Everything else — controls, bidi/format controls, line and
+/// paragraph separators, and wide or combining glyphs — takes the sanitizing
+/// path. This is the fast path review 8 calls for: it avoids a per-scalar
+/// `String` allocation and sanitizer call for the common character.
+fn is_plain_ascii(ch: char) -> bool {
+    ch == ' ' || ch.is_ascii_graphic()
+}
 
-        let mut rows: Vec<Row> = Vec::new();
-        let scalar_count = source.chars().count();
-        // boundary[i] for i in 0..=scalar_count.
-        let mut boundaries: Vec<Pos> = vec![Pos { row: 0, col: 0 }; scalar_count + 1];
+/// Builds rows and the source→cell boundary table from a stream of display
+/// units, so [`Layout::compute`] (a direct char walk) and
+/// [`Layout::compute_from_atoms`] (the paste path) share one layout loop
+/// without either allocating the other's intermediate form.
+struct RowBuilder {
+    total_width: usize,
+    prompt_cells: usize,
+    rows: Vec<Row>,
+    boundaries: Vec<Pos>,
+    row_glyphs: String,
+    row_width: usize,
+    row_start: usize,
+    row_index: usize,
+    first_row: bool,
+    /// Content column of the last positive-width glyph on this row, so a
+    /// zero-width combining mark shares that cell instead of the advanced one.
+    last_visible_col: Option<usize>,
+}
 
-        // Row-building state.
-        let mut row_glyphs = String::new();
-        let mut row_width = 0usize; // content cells used (prompt excluded)
-        let mut row_start = 0usize; // source index this row's content began at
-        let mut row_index = 0usize;
-        let mut first_row = true;
-        // Content column of the last positive-width glyph on this row, so a
-        // zero-width combining mark can share that cell instead of the advanced
-        // column. Reset at every row break.
-        let mut last_visible_col: Option<usize> = None;
-
-        // Usable content cells on the current row.
-        let avail = |first: bool| -> usize {
-            if first {
-                total_width.saturating_sub(prompt_cells).max(1)
-            } else {
-                total_width
-            }
-        };
-
-        let flush = |rows: &mut Vec<Row>,
-                     glyphs: &mut String,
-                     width: &mut usize,
-                     start: usize,
-                     first: bool| {
-            rows.push(Row {
-                glyphs: std::mem::take(glyphs),
-                width: *width,
-                start,
-                prompt_cells: if first { prompt_cells } else { 0 },
-            });
-            *width = 0;
-        };
-
-        let atoms = projection.atoms(source);
-        for atom in &atoms {
-            // A newline's boundary sits at the end of the current row's content;
-            // then the row breaks.
-            if atom.breaks {
-                boundaries[atom.source.start] = Pos {
-                    row: row_index,
-                    col: prompt_cells_for(first_row, prompt_cells) + row_width,
-                };
-                flush(
-                    &mut rows,
-                    &mut row_glyphs,
-                    &mut row_width,
-                    row_start,
-                    first_row,
-                );
-                row_index += 1;
-                first_row = false;
-                row_start = atom.source.end;
-                last_visible_col = None;
-                continue;
-            }
-
-            // Soft-wrap a positive-width atom that no longer fits. A fresh row
-            // always offers a full width, so an atom wider than the whole row
-            // (an oversized paste label) still gets its own row rather than
-            // looping forever.
-            if atom.width > 0 && row_width + atom.width > avail(first_row) && row_width > 0 {
-                flush(
-                    &mut rows,
-                    &mut row_glyphs,
-                    &mut row_width,
-                    row_start,
-                    first_row,
-                );
-                row_index += 1;
-                first_row = false;
-                row_start = atom.source.start;
-                last_visible_col = None;
-            }
-
-            // Record the start-of-paint cell for every scalar this atom spans.
-            // A multi-scalar (paste) atom collapses its interior boundaries onto
-            // the atom's start cell — the caret cannot land inside a token. A
-            // zero-width mark shares the previous visible cell.
-            let content_col = if atom.width == 0 {
-                last_visible_col.unwrap_or(row_width)
-            } else {
-                row_width
-            };
-            let here = Pos {
-                row: row_index,
-                col: prompt_cells_for(first_row, prompt_cells) + content_col,
-            };
-            for b in atom.source.clone() {
-                boundaries[b] = here;
-            }
-
-            row_glyphs.push_str(&atom.glyphs);
-            if atom.width > 0 {
-                last_visible_col = Some(row_width);
-            }
-            row_width += atom.width;
+impl RowBuilder {
+    fn new(prompt_cells: usize, total_width: usize, scalar_count: usize) -> Self {
+        RowBuilder {
+            total_width,
+            prompt_cells,
+            rows: Vec::new(),
+            boundaries: vec![Pos { row: 0, col: 0 }; scalar_count + 1],
+            row_glyphs: String::new(),
+            row_width: 0,
+            row_start: 0,
+            row_index: 0,
+            first_row: true,
+            last_visible_col: None,
         }
+    }
 
-        // The end-of-draft boundary sits just past the last content cell.
-        boundaries[scalar_count] = Pos {
-            row: row_index,
-            col: prompt_cells_for(first_row, prompt_cells) + row_width,
+    /// Usable content cells on the current row (the prompt eats into row 0).
+    fn avail(&self) -> usize {
+        if self.first_row {
+            self.total_width.saturating_sub(self.prompt_cells).max(1)
+        } else {
+            self.total_width
+        }
+    }
+
+    fn prompt_offset(&self) -> usize {
+        if self.first_row {
+            self.prompt_cells
+        } else {
+            0
+        }
+    }
+
+    fn flush(&mut self) {
+        self.rows.push(Row {
+            glyphs: std::mem::take(&mut self.row_glyphs),
+            width: self.row_width,
+            start: self.row_start,
+        });
+        self.row_width = 0;
+    }
+
+    /// A hard row break at source index `src` (a `'\n'`).
+    fn push_break(&mut self, src: usize) {
+        self.boundaries[src] = Pos {
+            row: self.row_index,
+            col: self.prompt_offset() + self.row_width,
         };
-        flush(
-            &mut rows,
-            &mut row_glyphs,
-            &mut row_width,
-            row_start,
-            first_row,
-        );
+        self.flush();
+        self.row_index += 1;
+        self.first_row = false;
+        self.row_start = src + 1;
+        self.last_visible_col = None;
+    }
 
-        Layout { rows, boundaries }
+    /// One painted unit spanning source range `src`, `width` cells wide, drawn
+    /// as `glyphs`. A multi-scalar (paste) unit collapses its interior
+    /// boundaries onto its start cell; a zero-width unit shares the previous
+    /// visible cell.
+    fn push_unit(&mut self, src: std::ops::Range<usize>, width: usize, glyphs: &str) {
+        // Soft-wrap a positive-width unit that no longer fits. A fresh row
+        // always offers a full width, so a unit wider than the whole row (an
+        // oversized paste label) still gets its own row rather than looping.
+        if width > 0 && self.row_width + width > self.avail() && self.row_width > 0 {
+            self.flush();
+            self.row_index += 1;
+            self.first_row = false;
+            self.row_start = src.start;
+            self.last_visible_col = None;
+        }
+        let content_col = if width == 0 {
+            self.last_visible_col.unwrap_or(self.row_width)
+        } else {
+            self.row_width
+        };
+        let here = Pos {
+            row: self.row_index,
+            col: self.prompt_offset() + content_col,
+        };
+        for b in src {
+            self.boundaries[b] = here;
+        }
+        self.row_glyphs.push_str(glyphs);
+        if width > 0 {
+            self.last_visible_col = Some(self.row_width);
+        }
+        self.row_width += width;
+    }
+
+    fn finish(mut self, scalar_count: usize) -> Layout {
+        // The end-of-draft boundary sits just past the last content cell.
+        self.boundaries[scalar_count] = Pos {
+            row: self.row_index,
+            col: self.prompt_offset() + self.row_width,
+        };
+        self.flush();
+        Layout {
+            rows: self.rows,
+            boundaries: self.boundaries,
+        }
+    }
+}
+
+fn prompt_width(prompt: &str) -> usize {
+    prompt.chars().map(cell_width).sum()
+}
+
+impl Layout {
+    /// Lay the whole draft out at `width` cells with a first-row `prompt`.
+    /// `width` is clamped to at least one usable content cell. The prompt
+    /// occupies cells on row 0 only; if it alone fills the width, content still
+    /// gets a one-cell minimum so the caret has a home. The full draft is laid
+    /// out before any viewport clipping — the first visible row is not
+    /// necessarily the first draft row.
+    pub fn compute(source: &str, prompt: &str, width: usize) -> Layout {
+        let scalar_count = source.chars().count();
+        let mut b = RowBuilder::new(prompt_width(prompt), width.max(1), scalar_count);
+        let mut buf = [0u8; 4];
+        for (i, ch) in source.chars().enumerate() {
+            if ch == '\n' {
+                b.push_break(i);
+            } else if ch == '\t' {
+                b.push_unit(i..i + 1, 1, "⇥"); // matches live::display_char
+            } else if is_plain_ascii(ch) {
+                b.push_unit(i..i + 1, 1, ch.encode_utf8(&mut buf));
+            } else {
+                // Sanitize so a bidi control paints its visible `[U+202E]`
+                // marker and a stray control paints as nothing — one source
+                // boundary either way.
+                let glyphs = crate::sanitize_terminal_text(&ch.to_string());
+                b.push_unit(i..i + 1, glyphs.chars().map(cell_width).sum(), &glyphs);
+            }
+        }
+        b.finish(scalar_count)
+    }
+
+    /// Lay out a draft already projected into [`Atom`]s (the Stage 2A paste
+    /// path): a paste token is one wide atom over many source scalars. Atoms
+    /// must be contiguous and cover `[0, len)` in source order.
+    pub fn compute_from_atoms(atoms: &[Atom], prompt: &str, width: usize) -> Layout {
+        let scalar_count = atoms.last().map_or(0, |a| a.source.end);
+        let mut b = RowBuilder::new(prompt_width(prompt), width.max(1), scalar_count);
+        for atom in atoms {
+            if atom.breaks {
+                b.push_break(atom.source.start);
+            } else {
+                b.push_unit(atom.source.clone(), atom.width, &atom.glyphs);
+            }
+        }
+        b.finish(scalar_count)
     }
 
     /// Cell position of a source boundary. An out-of-range index clamps to the
@@ -315,9 +300,26 @@ impl Layout {
     /// last boundary of that row; a target below the last row clamps to
     /// end-of-draft.
     pub fn cell_to_source(&self, target: Pos) -> usize {
-        // Candidate boundaries on the target row, in source order.
+        // Boundaries are monotonic in row as the source index grows, so one
+        // row's boundaries are a contiguous slice — scan only that slice
+        // (review 8: the old scan walked every boundary in the draft). The
+        // slice runs from this row's first source index to the next row's
+        // (or end-of-draft on the last row), inclusive of that end boundary.
+        let last = self.boundaries.len() - 1;
+        let (lo, hi) = match self.rows.get(target.row) {
+            Some(row) => {
+                let hi = self
+                    .rows
+                    .get(target.row + 1)
+                    .map_or(last, |next| next.start);
+                (row.start, hi.min(last))
+            }
+            // No such row (target below the draft): clamp to end-of-draft.
+            None => return last,
+        };
         let mut best: Option<(usize, usize)> = None; // (source_index, |col delta|)
-        for (idx, pos) in self.boundaries.iter().enumerate() {
+        for idx in lo..=hi {
+            let pos = self.boundaries[idx];
             if pos.row != target.row {
                 continue;
             }
@@ -338,11 +340,7 @@ impl Layout {
                 best = Some((idx, delta));
             }
         }
-        if let Some((idx, _)) = best {
-            return idx;
-        }
-        // No boundary on that row (target below the draft): clamp to the end.
-        self.boundaries.len() - 1
+        best.map_or(last, |(idx, _)| idx)
     }
 
     /// One visual row of `↑`/`↓` motion from `cursor`, aiming for
@@ -368,28 +366,6 @@ impl Layout {
         let col = preferred_col.unwrap_or(here.col);
         Some((self.cell_to_source(Pos { row, col }), col))
     }
-
-    /// Clip the full layout to `height` physical rows around `anchor`'s row,
-    /// keeping the anchored row visible. Returns the rows to paint and the
-    /// index of the first visible row (so callers can offset boundary rows).
-    pub fn viewport(&self, anchor: Pos, height: usize) -> (&[Row], usize) {
-        if height == 0 || self.rows.len() <= height {
-            return (&self.rows, 0);
-        }
-        // Keep the anchor row in view, preferring to show rows above it.
-        let last = self.rows.len() - 1;
-        let anchor_row = anchor.row.min(last);
-        let start = anchor_row.saturating_sub(height - 1).min(last + 1 - height);
-        (&self.rows[start..start + height], start)
-    }
-}
-
-fn prompt_cells_for(first_row: bool, prompt_cells: usize) -> usize {
-    if first_row {
-        prompt_cells
-    } else {
-        0
-    }
 }
 
 #[cfg(test)]
@@ -397,7 +373,7 @@ mod tests {
     use super::*;
 
     fn layout(source: &str, prompt: &str, width: usize) -> Layout {
-        Layout::compute(source, prompt, width, &ScalarProjection)
+        Layout::compute(source, prompt, width)
     }
 
     /// Fixture 1: empty draft with a long prompt. One row; the only boundary is
@@ -490,35 +466,29 @@ mod tests {
     /// the anchored row and reports where it starts.
     #[test]
     fn wraps_above_the_visible_slice() {
+        // The whole draft is laid out before any viewport clip: all four rows
+        // exist, and Row.start pins where each one begins in the source, which
+        // is what lets the caller window it (and cell_to_source scan one row).
         let l = layout("aaaabbbbccccdddd", "", 4); // 4 rows of 4
         assert_eq!(l.rows.len(), 4);
-        let anchor = l.source_to_cell(15); // last 'd', on row 3
-        let (vis, first) = l.viewport(anchor, 2);
-        assert_eq!(first, 2, "shows the last two rows");
-        assert_eq!(vis.len(), 2);
-        assert_eq!(vis[0].glyphs, "cccc");
-        assert_eq!(vis[1].glyphs, "dddd");
+        assert_eq!(l.source_to_cell(15).row, 3, "last 'd' is on row 3");
+        assert_eq!(l.rows[2].glyphs, "cccc");
+        assert_eq!(l.rows[2].start, 8);
+        assert_eq!(l.rows[3].start, 12);
     }
 
-    /// Fixture 7: a paste label wider than the viewport gets its own row and
-    /// its interior boundaries collapse to the atom's start — you cannot land
-    /// the caret inside the token.
+    /// Fixture 7: a paste label wider than the frame (the Stage 2A atom path)
+    /// gets its own row and its interior boundaries collapse to the atom's
+    /// start — you cannot land the caret inside the token.
     #[test]
-    fn paste_label_wider_than_viewport() {
-        struct PasteProj;
-        impl Projection for PasteProj {
-            fn atoms(&self, source: &str) -> Vec<Atom> {
-                // Whole source is one wide token.
-                let len = source.chars().count();
-                vec![Atom {
-                    source: 0..len,
-                    width: 20,
-                    glyphs: "[Pasted text #1 +9 lines]".to_string(),
-                    breaks: false,
-                }]
-            }
-        }
-        let l = Layout::compute("xxxxx", "", 8, &PasteProj);
+    fn paste_label_wider_than_frame() {
+        let atoms = [Atom {
+            source: 0..5,
+            width: 20,
+            glyphs: "[Pasted text #1 +9 lines]".to_string(),
+            breaks: false,
+        }];
+        let l = Layout::compute_from_atoms(&atoms, "", 8);
         assert_eq!(l.rows.len(), 1, "oversized atom still gets one row");
         assert_eq!(l.rows[0].width, 20);
         // Every interior source boundary maps to the token's start cell.
@@ -527,6 +497,37 @@ mod tests {
         }
         // End-of-draft is just past the label.
         assert_eq!(l.source_to_cell(5), Pos { row: 0, col: 20 });
+    }
+
+    /// A multi-row paste atom stream still lays out and maps correctly: a
+    /// break between two tokens, each a single wide atom.
+    #[test]
+    fn paste_atoms_across_a_row_break() {
+        let atoms = [
+            Atom {
+                source: 0..3,
+                width: 4,
+                glyphs: "[#1]".to_string(),
+                breaks: false,
+            },
+            Atom {
+                source: 3..4,
+                width: 0,
+                glyphs: String::new(),
+                breaks: true,
+            },
+            Atom {
+                source: 4..7,
+                width: 4,
+                glyphs: "[#2]".to_string(),
+                breaks: false,
+            },
+        ];
+        let l = Layout::compute_from_atoms(&atoms, "> ", 40);
+        assert_eq!(l.rows.len(), 2);
+        assert_eq!(l.source_to_cell(0), Pos { row: 0, col: 2 }, "after prompt");
+        assert_eq!(l.source_to_cell(4), Pos { row: 1, col: 0 });
+        assert_eq!(l.source_to_cell(7), Pos { row: 1, col: 4 });
     }
 
     /// Sanitized display text: a bidi control keeps one source boundary but paints
