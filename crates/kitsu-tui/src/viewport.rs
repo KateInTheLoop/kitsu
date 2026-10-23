@@ -515,6 +515,35 @@ impl Surface for InlineSurface {
             ring.push_prompt(text);
         }
     }
+
+    /// Echo the submitted prompt into the transcript AND mark it in the ring.
+    ///
+    /// The inline composer paints the submitted row while the user types and
+    /// erases it on Enter, so without this the user never sees what they sent
+    /// and the transcript jumps straight to the agent's reply. This writes the
+    /// line to the transcript (one write per line, R3) prefixed with the
+    /// composer's prompt on the first line — byte-shaped exactly like the line
+    /// classic's kernel echo leaves — and marks it so `Ctrl+O` still coalesces
+    /// it into one prompt block. It replaces, not supplements, `note_prompt`
+    /// at the call site: both would double the ring entry.
+    fn echo_prompt(&self, prompt: &str, text: &str) {
+        let mut inner = self.lock();
+        inner.repark();
+        for (i, line) in text.lines().enumerate() {
+            let shown = if i == 0 {
+                format!("{prompt}{line}")
+            } else {
+                line.to_string()
+            };
+            let sink = inner.sink(Fd::Stdout);
+            let _ = sink.write_all(shown.as_bytes());
+            let _ = sink.write_all(b"\r\n");
+            let _ = sink.flush();
+            if let Some(ring) = inner.cells.as_mut() {
+                ring.push_prompt(&shown);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

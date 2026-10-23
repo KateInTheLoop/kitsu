@@ -624,6 +624,23 @@ impl Surface for FullscreenTap {
     fn note_prompt(&self, text: &str) {
         lock(&self.ring).push_prompt(text);
     }
+
+    /// In fullscreen the frame is repainted from the ring, not written line by
+    /// line, so the prompt is **marked in the ring and no bytes are written** —
+    /// the next frame shows it. (The inline surface, which erased the composer
+    /// row, is the one that must also paint; here painting would double it.)
+    /// The prompt prefix is prepended per line so a `{`/`}` jump lands on the
+    /// same text the inline overlay shows.
+    fn echo_prompt(&self, prompt: &str, text: &str) {
+        let mut ring = lock(&self.ring);
+        for (i, line) in text.lines().enumerate() {
+            if i == 0 {
+                ring.push_prompt(&format!("{prompt}{line}"));
+            } else {
+                ring.push_prompt(line);
+            }
+        }
+    }
 }
 
 /// A writer that copies what it forwards, for [`FullscreenTap::write_block`].
@@ -1038,19 +1055,34 @@ pub(crate) enum PromptOrigin {
 /// the prompt is in the ring before the first byte of its answer can be
 /// written. It is not sequenced against the stream; it precedes it.
 ///
-/// Writes no bytes: see [`Surface::note_prompt`].
+/// Mark the user's submitted line in the ring **without writing bytes**, for a
+/// path that paints the line itself right after (the attached-agent submit,
+/// which paints its steer/answer receipt). See [`Surface::note_prompt`].
 pub(crate) fn note_submitted_prompt(text: &str, origin: PromptOrigin) {
     match origin {
         PromptOrigin::User => kitsu_render::surface::active_surface().note_prompt(text),
-        // Not handed over at all, which is the strongest reading of "never
-        // marked the user's": there is no byte-free seam for retaining an
-        // unmarked line, and inventing one to file kitsu's own synthesized
-        // command beside its output would be a second decision this card did
-        // not make (**F61**). The command's *output* is retained as it always
-        // was, through `transcript_line`. The exclusion has one home -- here --
-        // rather than being folded into the call sites, so there is one place
-        // to change if the ring should one day carry injected lines unmarked.
+        // Kitsu's own synthesized line (/resume, /retry): never marked the
+        // user's (F77). Its command's output is retained through
+        // transcript_line as always.
         PromptOrigin::Injected => {}
+    }
+}
+
+/// Echo the user's submitted **chat turn** into the transcript, prefixed with
+/// the composer `prompt`, and mark it in the ring for Ctrl+O. This is the fix
+/// for "the submitted line vanishes": the inline composer paints the line while
+/// typing and erases it on Enter, so without an echo the transcript jumps
+/// straight to the agent's reply with no record of what was asked. Classic's
+/// kernel echo already left the line on screen, so [`Surface::echo_prompt`] is
+/// a no-op there; the inline and fullscreen surfaces paint/mark it.
+///
+/// The main-turn path in `run_chat` (idle/queued/priority) converges here; the
+/// attached-agent path uses [`note_submitted_prompt`] instead, since it paints
+/// its own receipt line. An injected line (kitsu's `/resume`, `/retry`) is not
+/// the user's words, so it is neither echoed nor marked.
+pub(crate) fn echo_submitted_prompt(prompt: &str, text: &str, origin: PromptOrigin) {
+    if origin == PromptOrigin::User {
+        kitsu_render::surface::active_surface().echo_prompt(prompt, text);
     }
 }
 

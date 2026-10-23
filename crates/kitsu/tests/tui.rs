@@ -2493,6 +2493,62 @@ fn inline_mode_up_arrow_moves_within_the_draft_during_a_turn() {
     );
 }
 
+/// **UI bug: the submitted prompt was invisible in inline mode.** The composer
+/// paints the line while typing and erases it on Enter, so the transcript used
+/// to jump straight to the agent's reply with no record of what was asked. The
+/// submitted turn must now be echoed into the scroll region, prefixed with the
+/// `kitsu>` prompt, above the answer it provoked — in the box and the row.
+fn assert_submitted_prompt_is_echoed(input_box: bool) {
+    let home = TempDir::new().expect("temp home");
+    let session = run_styled_streaming_chat_pty_with_options(
+        home.path(),
+        Some("inline"),
+        &[
+            send(RAW_MODE_MARKER, "what is the capital of france\r"),
+            send(TURN_DONE_MARKER, "/quit\r"),
+        ],
+        vec![Turn {
+            events: vec![delta("Paris.\n"), finish("stop")],
+            gap: Duration::from_millis(30),
+        }],
+        &[],
+        Options {
+            input_box,
+            ..Options::default()
+        },
+    );
+    let text = strip_csi(&session.session.raw_text());
+    // The echoed turn carries the prompt and the typed text, and it precedes
+    // the answer — a transcript, in order.
+    let echo = text
+        .find("kitsu> what is the capital of france")
+        .unwrap_or_else(|| {
+            panic!(
+                "box={input_box}: the submitted prompt must be echoed into the \
+                 transcript; raw:\n{}",
+                session.session.raw_text().escape_debug()
+            )
+        });
+    let answer = text.find("Paris.").expect("the answer streamed");
+    assert!(
+        echo < answer,
+        "box={input_box}: the echoed prompt must precede the answer; raw:\n{}",
+        session.session.raw_text().escape_debug()
+    );
+}
+
+#[test]
+#[serial]
+fn inline_mode_echoes_the_submitted_prompt_in_the_box() {
+    assert_submitted_prompt_is_echoed(true);
+}
+
+#[test]
+#[serial]
+fn inline_mode_echoes_the_submitted_prompt_in_the_row() {
+    assert_submitted_prompt_is_echoed(false);
+}
+
 /// The trigger every streaming script uses for its *second* input: the live
 /// summary line kitsu prints when a turn has finished (`↳ 0.1s · … (6%
 /// used)`). Triggering on the end of the turn rather than on a fragment of

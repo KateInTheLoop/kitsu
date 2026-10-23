@@ -22046,25 +22046,38 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         if !no_session {
             let _ = rl.add_history_entry(&line);
         }
-        // **F102**: the composer paints the submitted line and erases it, so
-        // the cell ring -- N4's sole record of the transcript -- holds no
-        // prompts and the `Ctrl+O` overlay shows one speaker. This is the one
-        // place every route a submitted line can take converges: the three
-        // idle readers through `ChatReadline`, a queued prompt and a priority
-        // command through the `line` binding above. It is after the empty-line
-        // skip and beside `add_history_entry` deliberately -- what is worth
-        // remembering in history is what is worth retaining in the ring -- and
-        // before the slash dispatch and the turn, so a prompt is in the ring
-        // ahead of anything it provokes. It writes no bytes.
+        // **F102 / UI bug**: the inline composer paints the submitted line and
+        // erases it on Enter, so without an echo here the user never sees what
+        // they sent and the transcript jumps straight to the agent's reply.
+        // This is the one place every route a submitted line can take
+        // converges: the three idle readers through `ChatReadline`, a queued
+        // prompt and a priority command through the `line` binding above. It is
+        // after the empty-line skip and beside `add_history_entry` deliberately
+        // -- what is worth remembering in history is worth echoing and retaining
+        // in the ring -- and before the slash dispatch and the turn, so the
+        // prompt is on screen and in the ring ahead of anything it provokes.
+        // Echoes bytes only on a surface whose composer erased the line
+        // (inline/fullscreen); classic's kernel echo already showed it.
         #[cfg(unix)]
-        tui_bridge::note_submitted_prompt(
-            &line,
-            if line_is_injected {
+        {
+            let origin = if line_is_injected {
                 tui_bridge::PromptOrigin::Injected
             } else {
                 tui_bridge::PromptOrigin::User
-            },
-        );
+            };
+            // A slash command is a local UI action with its own visible output
+            // (a receipt, or an overlay that repaints the screen), so it is
+            // recorded in the ring but NOT echoed into the transcript -- echoing
+            // it would double a `/context` report and break an overlay's
+            // restore-the-screen invariant. An ordinary turn is the user's
+            // words to the agent, and the inline composer erased them, so it is
+            // echoed above the answer it provokes.
+            if line.starts_with('/') {
+                tui_bridge::note_submitted_prompt(&line, origin);
+            } else {
+                tui_bridge::echo_submitted_prompt(&visible_prompt, &line, origin);
+            }
+        }
         let mut submitted = SubmittedPrompt::full(line);
 
         if let Some(rest) = submitted.text.strip_prefix('/') {

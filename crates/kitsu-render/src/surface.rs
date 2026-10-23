@@ -100,6 +100,25 @@ pub trait Surface: Send + Sync {
     fn note_prompt(&self, text: &str) {
         let _ = text;
     }
+
+    /// Echo the user's submitted prompt into the transcript so they can see
+    /// what they sent, and record it marked in the ring for the `Ctrl+O`
+    /// overlay (what [`Surface::note_prompt`] did alone).
+    ///
+    /// `prompt` is the composer's prefix (e.g. `kitsu> `), prepended to the
+    /// first line only, so the echoed line matches what classic leaves on
+    /// screen. Multi-line prompts echo one line each.
+    ///
+    /// # Default: **nothing**
+    ///
+    /// The classic renderer reads the submitted line through the kernel's own
+    /// echo — ICANON leaves `kitsu> …` on the terminal already — so echoing it
+    /// again here would double it. Only a backend whose composer *erases* the
+    /// submitted row (the inline viewport) overrides this; a wrapper that
+    /// displaces such a backend must forward it.
+    fn echo_prompt(&self, prompt: &str, text: &str) {
+        let _ = (prompt, text);
+    }
 }
 
 /// Does a write on `fd` share a terminal with the live status row, and so
