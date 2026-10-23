@@ -1465,10 +1465,17 @@ fn build_seatbelt_profile(inputs: &LaunchInputs) -> Result<String, CommandContai
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
     profile.push_str("(deny default)\n");
-    // Network stays denied unless `--allow-network` opted in (then ssh/curl can
-    // reach the network for this granted command). Write-confinement, the exec
-    // allow-list, and the secret-read denials below are unaffected either way.
-    if !inputs.allow_network {
+    // Network: denied by default. `--allow-network` must ALLOW it explicitly —
+    // under `(deny default)`, merely omitting the deny still leaves network
+    // denied, so a granted ssh/curl gets "Operation not permitted" on connect.
+    // Write-confinement, the exec allow-list, and the secret-read denials below
+    // are unaffected either way.
+    if inputs.allow_network {
+        profile.push_str("(allow network*)\n");
+        // An outbound connection needs the socket syscalls too; `network*`
+        // covers connect/bind but not socket creation under `(deny default)`.
+        profile.push_str("(allow system-socket)\n");
+    } else {
         profile.push_str("(deny network*)\n");
     }
     profile.push_str("(allow process-fork)\n");
@@ -1504,10 +1511,19 @@ fn build_seatbelt_profile(inputs: &LaunchInputs) -> Result<String, CommandContai
     // (verified empirically): per-user temp-dir resolution and user/group name
     // lookup.
     profile.push_str("(allow mach-lookup\n");
-    for service in [
+    let mut mach_services = vec![
         "com.apple.bsd.dirhelper",
         "com.apple.system.opendirectoryd.libinfo",
-    ] {
+    ];
+    if inputs.allow_network {
+        // Outbound TCP consults SystemConfiguration for route/reachability
+        // even for a bare IP; without it connect() fails before leaving the
+        // host. DNS (mDNSResponder) is deliberately NOT added — name
+        // resolution is the separate option the user did not take, so a
+        // hostname still fails and an IP works.
+        mach_services.push("com.apple.SystemConfiguration.configd");
+    }
+    for service in mach_services {
         let _ = writeln!(profile, "    (global-name \"{service}\")");
     }
     profile.push_str(")\n");
@@ -6210,6 +6226,11 @@ mod tests {
         assert!(
             !open.contains("(deny network*)"),
             "--allow-network drops the network deny: {open}"
+        );
+        assert!(
+            open.contains("(allow network*)"),
+            "--allow-network must ALLOW network explicitly, not just omit the \
+             deny — (deny default) leaves it denied otherwise: {open}"
         );
         // ~/.ssh is still denied; the two host files are re-allowed after it.
         let deny_ssh = open.find("/.ssh\")").expect("~/.ssh still denied");
