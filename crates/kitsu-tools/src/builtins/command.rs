@@ -1171,14 +1171,21 @@ impl CommandContainmentBackend for BubblewrapBackend {
             // sandbox. A name-based host still needs DNS (the declined option);
             // an IP-based one works with these alone.
             if allow_network {
-                // OpenSSH finds the user (and so `~/.ssh`) through getpwuid(),
-                // i.e. /etc/passwd — and the sandbox /etc is otherwise empty, so
-                // ssh would exit "No user exists for uid N" before connecting.
-                // passwd/group are world-readable and secret-free (hashes live
-                // in /etc/shadow, which stays out). With them, the real home
-                // resolves and the host files bound below at their real paths
-                // are where ssh looks.
-                for system_file in ["/etc/passwd", "/etc/group"] {
+                // ssh finds the home (and so `~/.ssh`) through getpwuid(); the
+                // always-on runtime mounts already carry /etc/passwd and
+                // /etc/group, so the host files bound below are where it looks.
+                //
+                // This adds the non-secret network configuration the empty
+                // sandbox /etc lacks: name resolution (resolv.conf — a symlink
+                // into /run on systemd hosts, which bwrap follows — hosts,
+                // nsswitch.conf, gai.conf), port/protocol names, the CA trust
+                // store curl/git need for https (Debian /etc/ssl, Fedora
+                // /etc/pki), and the system ssh_config/ssh_known_hosts.
+                // `-try` skips any that a distro does not have. Nothing here
+                // holds a secret: /etc/shadow and host private keys
+                // (/etc/ssh/ssh_host_*_key) are not in the list — /etc/ssh is
+                // bound file by file for exactly that reason.
+                for system_file in LINUX_NETWORK_ETC_FILES {
                     arguments.push(OsString::from("--ro-bind-try"));
                     arguments.push(OsString::from(system_file));
                     arguments.push(OsString::from(system_file));
@@ -1496,6 +1503,15 @@ fn build_seatbelt_profile(inputs: &LaunchInputs) -> Result<String, CommandContai
         // to remote IP endpoints keeps TCP/UDP to any host:port and blocks
         // every UNIX socket.
         profile.push_str("(allow network-outbound (remote ip \"*:*\"))\n");
+        // The ONE UNIX socket the network needs: macOS resolves every hostname
+        // through mDNSResponder, so without it `curl example.com`, `git clone`
+        // and `ssh name` fail on lookup. A literal path — the ssh-agent and
+        // docker sockets stay blocked (verified).
+        profile.push_str("(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n");
+        // Inbound on local addresses: ping needs it to receive its ICMP reply,
+        // and a local dev server (`npm run dev`, `python -m http.server`)
+        // needs it to accept a connection.
+        profile.push_str("(allow network-inbound (local ip \"*:*\"))\n");
         // Socket creation is a separate operation from connect under
         // `(deny default)`.
         profile.push_str("(allow system-socket)\n");
@@ -1546,6 +1562,10 @@ fn build_seatbelt_profile(inputs: &LaunchInputs) -> Result<String, CommandContai
         // resolution is the separate option the user did not take, so a
         // hostname still fails and an IP works.
         mach_services.push("com.apple.SystemConfiguration.configd");
+        // TLS: macOS evaluates certificate trust out of process; without this
+        // `curl https://…` and `git clone https://…` fail the handshake.
+        // (Found by tracing curl's lookups under a reporting profile.)
+        mach_services.push("com.apple.TrustEvaluationAgent");
     }
     for service in mach_services {
         let _ = writeln!(profile, "    (global-name \"{service}\")");
@@ -1589,6 +1609,16 @@ fn build_seatbelt_profile(inputs: &LaunchInputs) -> Result<String, CommandContai
         write_subpath(&mut profile, path)?;
     }
     let _ = writeln!(profile, "    (subpath \"/private/tmp\")");
+    // The per-user temp dir (`/var/folders/…/T`). xcrun — behind /usr/bin/cc,
+    // c++, make, lldb on macOS — and clang ignore TMPDIR and take this dir from
+    // confstr(), so without it every compile fails "unable to make temporary
+    // file". The sibling per-user CACHE dir (`…/C`) is deliberately not
+    // included (verified unnecessary).
+    // ponytail: this dir is shared with the user's other processes' temp
+    // files; a per-command private temp would need confstr interposition.
+    if let Some(temp) = darwin_user_temp_dir() {
+        write_subpath(&mut profile, &temp)?;
+    }
     for dev in ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"] {
         let _ = writeln!(profile, "    (literal \"{dev}\")");
     }
@@ -1649,6 +1679,31 @@ fn write_subpath(profile: &mut String, path: &Path) -> Result<(), CommandContain
     let quoted = sbpl_quote(path)?;
     let _ = writeln!(profile, "    (subpath {quoted})");
     Ok(())
+}
+
+/// The canonical per-user temp dir, from `confstr(_CS_DARWIN_USER_TEMP_DIR)`,
+/// or `None` if the OS does not report one.
+#[cfg(target_os = "macos")]
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: confstr writes at most `buffer.len()` bytes, NUL-terminated, into
+    // the valid buffer and returns the length it needed (0 on error).
+    let needed = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buffer.as_mut_ptr().cast::<libc::c_char>(),
+            buffer.len(),
+        )
+    };
+    if needed == 0 || needed > buffer.len() {
+        return None;
+    }
+    let path = PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..needed - 1]));
+    let path = std::fs::canonicalize(&path).ok()?;
+    // Never let a misreported value widen writes to `/` or the home dir.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    (path.components().count() > 3 && Some(&path) != home.as_ref()).then_some(path)
 }
 
 /// Emit one `    (literal "…")` line (a single file, not a subtree).
@@ -1779,6 +1834,32 @@ fn containment_denied(error: CommandContainmentError) -> ToolError {
     ToolError::PolicyDenied(error.to_string())
 }
 
+/// Read-only `/etc` entries bound into the Linux sandbox under
+/// `--allow-network` (see the launch site). All world-readable and secret-free.
+#[cfg(target_os = "linux")]
+const LINUX_NETWORK_ETC_FILES: &[&str] = &[
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+    "/etc/gai.conf",
+    "/etc/host.conf",
+    "/etc/services",
+    "/etc/protocols",
+    // CA trust only — never the whole /etc/ssl or /etc/pki, whose `private/`
+    // subdirectories hold server keys. Debian/Ubuntu certs symlink into
+    // /usr/share/ca-certificates (already mounted with /usr).
+    "/etc/ssl/certs",
+    "/etc/ssl/openssl.cnf",
+    "/etc/ca-certificates",
+    "/etc/pki/ca-trust",
+    "/etc/pki/tls/certs",
+    "/etc/pki/tls/cert.pem",
+    "/etc/pki/tls/openssl.cnf",
+    "/etc/ssh/ssh_config",
+    "/etc/ssh/ssh_config.d",
+    "/etc/ssh/ssh_known_hosts",
+];
+
 #[cfg(target_os = "linux")]
 fn runtime_mount_paths(
     config: &CommandContainmentConfig,
@@ -1790,7 +1871,16 @@ fn runtime_mount_paths(
             mounts.push(path);
         }
     }
-    for path in ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"] {
+    // passwd/group: getpwuid() — whoami, id, python's getpass, ssh's home
+    // lookup — fails "cannot find name for user ID" without them. Both are
+    // world-readable and secret-free (hashes live in /etc/shadow, never mounted).
+    for path in [
+        "/etc/ld.so.cache",
+        "/etc/ld.so.conf",
+        "/etc/ld.so.conf.d",
+        "/etc/passwd",
+        "/etc/group",
+    ] {
         let path = PathBuf::from(path);
         if path.exists() {
             mounts.push(path);
@@ -3801,7 +3891,20 @@ pub fn command_exec_tool(policy: Arc<CommandPolicy>) -> (ToolDescriptor, Handler
              unsupported containment fails closed. Session approval binds the observed \
              executable filesystem identity and is revoked if it changes. Returns \
              bounded head/tail stdout/stderr previews, truthful byte \
-             counts, and structured exit, signal, or timeout metadata.",
+             counts, and structured exit, signal, or timeout metadata.{platform_limits}",
+            // Tools the OS itself refuses inside any sandbox, so the model
+            // picks an alternative instead of retrying or blaming the target.
+            platform_limits = if cfg!(target_os = "macos") {
+                " On macOS, setuid tools (ps, top) cannot run contained, and debugging \
+                 or tracing (lldb run/attach, dtruss, dtrace) needs Developer Mode or \
+                 root, so it is not available here; inspect processes with lsof -p, \
+                 and debug by compiling with -g and running the binary directly."
+            } else {
+                " Inside the Linux sandbox the process view is its own PID namespace \
+                 (ps shows only the command's own processes) and ptrace is limited to \
+                 descendants, so gdb/strace can run a program they start but cannot \
+                 attach to an existing host process."
+            },
             network_clause = if policy.ambient_authority().network_confined {
                 "network/PID/IPC/UTS namespaces are isolated"
             } else {
@@ -6351,14 +6454,25 @@ mod tests {
                     .and_then(|s| s.strip_suffix("\")"))
             })
             .collect();
+        let user_temp = darwin_user_temp_dir().map(|p| p.to_string_lossy().into_owned());
         let mut expected = vec!["/work/project", "/work/project/sub", "/private/tmp"];
+        if let Some(temp) = &user_temp {
+            // The per-user temp dir xcrun/clang need (and nothing broader).
+            expected.push(temp.as_str());
+        }
         let mut got = write_subpaths.clone();
         expected.sort_unstable();
         got.sort_unstable();
         assert_eq!(
             got, expected,
-            "writable subpaths must be exactly roots+cwd+tmp: {profile}"
+            "writable subpaths must be exactly roots+cwd+tmp+user temp: {profile}"
         );
+        if let Some(temp) = &user_temp {
+            assert!(
+                temp.ends_with("/T"),
+                "only the per-user TEMP dir, never its cache sibling: {temp}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -6512,6 +6626,116 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// **Tool matrix probe** (run on demand: `cargo test -p kitsu-tools --lib
+    /// tool_matrix -- --ignored --nocapture`). Runs the everyday tools a coding
+    /// agent reaches for through the real containment backend, one granted
+    /// `sh -c` per workflow, and prints PASS/FAIL with the stderr tail. It
+    /// panics only if a workflow listed as `must` fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "environment probe; run with --ignored --nocapture"]
+    async fn tool_matrix() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let backend = |network: bool| {
+            CommandPolicy::new(&[root(&dir)], CommandMode::Deny)
+                .unwrap()
+                .with_containment_config(
+                    CommandContainmentConfig::default().with_network_allowed(network),
+                )
+        };
+        let sealed = backend(false);
+        if !sealed.containment_status().is_ready() {
+            eprintln!(
+                "skipping: containment unavailable: {:?}",
+                sealed.containment_status()
+            );
+            return;
+        }
+        let open = backend(true);
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut conn in tcp.incoming().flatten() {
+                let _ = conn.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nHELLO");
+            }
+        });
+        std::fs::write(
+            dir.path().join("hello.c"),
+            "#include <stdio.h>\nint main(void){puts(\"HELLO_C\");return 0;}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("Makefile"), "all:\n\t@echo HELLO_MAKE\n").unwrap();
+
+        // (name, script, network, must-pass)
+        let cases: Vec<(&str, String, bool, bool)> = vec![
+            ("file ops cp/mv/ln/chmod/rm/mkdir", "echo hi > a && cp a b && mv b c && ln -s c d && chmod 600 c && mkdir -p x/y && rm a && cat d".into(), false, true),
+            ("dd", "dd if=/dev/zero of=z bs=1024 count=4 2>&1 && test -s z".into(), false, true),
+            ("tar/gzip", "echo t > t && tar czf t.tgz t && tar tzf t.tgz && gzip -k t && test -f t.gz".into(), false, true),
+            ("zip/unzip", "echo z > zz && zip -q z.zip zz && unzip -l z.zip".into(), false, false),
+            ("grep/sed/awk/sort/wc/find", "printf 'b\\na\\n' > s && sort s | sed s/a/A/ | awk '{print $1}' | grep -c . && find . -name s | wc -l".into(), false, true),
+            ("diff/patch", "echo one > p1 && echo two > p2 && (diff -u p1 p2 > p.diff; true) && patch p1 < p.diff && cat p1".into(), false, true),
+            ("make", "make".into(), false, true),
+            ("cc compile+run", "cc hello.c -o hello && ./hello".into(), false, true),
+            ("c++", "printf 'int main(){}' > m.cc && c++ m.cc -o m && ./m".into(), false, false),
+            ("python3/perl", "python3 -c 'print(1+1)' && perl -e 'print 3'".into(), false, true),
+            ("git", "git init -q g && cd g && git -c user.email=a@b -c user.name=n commit -q --allow-empty -m x && git log --oneline | wc -l".into(), false, true),
+            ("uname/id/whoami/env", "uname -a && id && whoami && env | grep -c PATH".into(), false, true),
+            ("ps", "ps -o pid,comm -p $$".into(), false, false),
+            ("df/du", "df -h . && du -sh .".into(), false, false),
+            ("file/xxd/shasum", "file hello.c && head -c 8 hello.c | xxd && (shasum hello.c || sha256sum hello.c)".into(), false, true),
+            ("openssl", "openssl dgst -sha256 hello.c".into(), false, false),
+            ("debugger (lldb|gdb)", "cc -g hello.c -o dbg && if command -v lldb >/dev/null; then lldb --batch -o run ./dbg; else gdb -batch -ex run ./dbg; fi".into(), false, false),
+            ("tracer (strace|dtruss)", "if command -v strace >/dev/null; then strace -f -o /dev/null true; else dtruss true; fi".into(), false, false),
+            ("lsof", "lsof -p $$".into(), false, false),
+            ("SEALED: curl blocked", format!("! curl -s -m 3 http://127.0.0.1:{port}/"), false, true),
+            ("net: curl 127.0.0.1", format!("curl -s -m 5 http://127.0.0.1:{port}/"), true, true),
+            ("net: nc 127.0.0.1", format!("printf x | nc -w 2 127.0.0.1 {port}"), true, true),
+            ("net: ping 127.0.0.1", "ping -c 1 127.0.0.1".into(), true, false),
+            ("net: DNS curl example.com", "curl -s -m 5 -o /dev/null -w '%{http_code}' https://example.com".into(), true, false),
+            ("net: ssh client runs", format!("ssh -V && (ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no -p {port} probe@127.0.0.1 true; true)"), true, false),
+        ];
+        let mut must_failed = Vec::new();
+        for (name, script, network, must) in cases {
+            let policy = if network { &open } else { &sealed };
+            let argv = ["/bin/sh".to_string(), "-c".to_string(), script];
+            policy.grant_command(&argv, dir.path()).unwrap();
+            let out = execute_command(
+                policy,
+                CommandExecArgs {
+                    argv: argv.to_vec(),
+                    cwd: root(&dir),
+                    timeout_ms: Some(20_000),
+                },
+            )
+            .await;
+            let (ok, tail) = match &out {
+                Ok(o) => (
+                    o.success,
+                    format!(
+                        "{} | {}",
+                        o.stdout.trim().lines().last().unwrap_or(""),
+                        o.stderr.trim().lines().last().unwrap_or("")
+                    ),
+                ),
+                Err(e) => (false, e.to_string()),
+            };
+            eprintln!(
+                "{} {:<34} {}",
+                if ok { "PASS" } else { "FAIL" },
+                name,
+                tail.chars().take(150).collect::<String>()
+            );
+            if must && !ok {
+                must_failed.push(name);
+            }
+        }
+        assert!(
+            must_failed.is_empty(),
+            "must-pass workflows failed: {must_failed:?}"
+        );
     }
 
     /// **Live, end to end:** `--allow-network` lets a contained command open an
