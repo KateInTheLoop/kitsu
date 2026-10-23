@@ -890,11 +890,17 @@ struct ContainedLaunch {
 /// Seatbelt profile).
 struct LaunchInputs {
     program: PathBuf,
+    // Read by the Seatbelt profile builder only; bubblewrap takes the same
+    // facts from the policy's descriptors, so on Linux these are unread.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     readonly_runtime_roots: Vec<PathBuf>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     writable_command_roots: Vec<PathBuf>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     cwd: PathBuf,
-    /// `--allow-network`: network isolation is dropped and the SSH host files
-    /// become readable. Both backends read this off the one struct.
+    /// `--allow-network`: read by the Seatbelt profile builder. Bubblewrap
+    /// reads the same flag straight from its config at launch.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     allow_network: bool,
 }
 
@@ -1165,6 +1171,18 @@ impl CommandContainmentBackend for BubblewrapBackend {
             // sandbox. A name-based host still needs DNS (the declined option);
             // an IP-based one works with these alone.
             if allow_network {
+                // OpenSSH finds the user (and so `~/.ssh`) through getpwuid(),
+                // i.e. /etc/passwd — and the sandbox /etc is otherwise empty, so
+                // ssh would exit "No user exists for uid N" before connecting.
+                // passwd/group are world-readable and secret-free (hashes live
+                // in /etc/shadow, which stays out). With them, the real home
+                // resolves and the host files bound below at their real paths
+                // are where ssh looks.
+                for system_file in ["/etc/passwd", "/etc/group"] {
+                    arguments.push(OsString::from("--ro-bind-try"));
+                    arguments.push(OsString::from(system_file));
+                    arguments.push(OsString::from(system_file));
+                }
                 for file in ssh_host_read_files() {
                     arguments.push(OsString::from("--ro-bind-try"));
                     arguments.push(file.as_os_str().to_os_string());
@@ -1471,9 +1489,15 @@ fn build_seatbelt_profile(inputs: &LaunchInputs) -> Result<String, CommandContai
     // Write-confinement, the exec allow-list, and the secret-read denials below
     // are unaffected either way.
     if inputs.allow_network {
-        profile.push_str("(allow network*)\n");
-        // An outbound connection needs the socket syscalls too; `network*`
-        // covers connect/bind but not socket creation under `(deny default)`.
+        // Outbound IP only. `(allow network*)` also admits connect() to local
+        // UNIX-domain sockets (verified with sandbox-exec), which would hand a
+        // contained command the user's ssh-agent (signing with keys that are
+        // otherwise denied) or a docker socket (root-equivalent). Restricting
+        // to remote IP endpoints keeps TCP/UDP to any host:port and blocks
+        // every UNIX socket.
+        profile.push_str("(allow network-outbound (remote ip \"*:*\"))\n");
+        // Socket creation is a separate operation from connect under
+        // `(deny default)`.
         profile.push_str("(allow system-socket)\n");
     } else {
         profile.push_str("(deny network*)\n");
@@ -1875,6 +1899,11 @@ fn base_bubblewrap_arguments(
     let mut flags = vec!["--die-with-parent", "--new-session", "--unshare-user"];
     // Network isolation is dropped only under `--allow-network`; the other
     // namespaces (pid/ipc/uts/cgroup) and the userns lockdown are unchanged.
+    // Filesystem UNIX sockets (ssh-agent under /run or /tmp, docker.sock) stay
+    // unreachable because those paths are not mounted.
+    // ponytail: sharing the host netns also exposes *abstract* UNIX sockets
+    // (some D-Bus/X11 setups); a seccomp filter on AF_UNIX connect would close
+    // that if a host relies on them.
     if !allow_network {
         flags.push("--unshare-net");
     }
@@ -2093,7 +2122,7 @@ impl CommandPolicy {
                     .iter()
                     .map(|(name, _)| name.clone())
                     .collect(),
-                network_isolated: true,
+                network_isolated: !self.containment_config.allow_network,
                 pid_isolated: true,
                 ipc_isolated: true,
                 uts_isolated: true,
@@ -6228,9 +6257,15 @@ mod tests {
             "--allow-network drops the network deny: {open}"
         );
         assert!(
-            open.contains("(allow network*)"),
-            "--allow-network must ALLOW network explicitly, not just omit the \
-             deny — (deny default) leaves it denied otherwise: {open}"
+            open.contains("(allow network-outbound (remote ip \"*:*\"))"),
+            "--allow-network must ALLOW outbound IP explicitly, not just omit \
+             the deny — (deny default) leaves it denied otherwise: {open}"
+        );
+        // Never the blanket form: `network*` also admits local UNIX sockets
+        // (ssh-agent, docker.sock).
+        assert!(
+            !open.contains("(allow network*)"),
+            "no blanket network allow: {open}"
         );
         // ~/.ssh is still denied; the two host files are re-allowed after it.
         let deny_ssh = open.find("/.ssh\")").expect("~/.ssh still denied");
@@ -6477,6 +6512,67 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// **Live, end to end:** `--allow-network` lets a contained command open an
+    /// outbound TCP connection, the default does not, and neither lets it
+    /// reach a local UNIX-domain socket — so a contained command can never talk
+    /// to the user's ssh-agent or docker socket. Real `nc`, real listeners.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn live_seatbelt_allow_network_reaches_tcp_but_never_unix_sockets() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let Some(sealed) = live_seatbelt_policy(&dir) else {
+            return;
+        };
+        let nc = "/usr/bin/nc";
+        if !std::path::Path::new(nc).exists() {
+            eprintln!("skipping: {nc} not present");
+            return;
+        }
+        let open = CommandPolicy::new(&[root(&dir)], CommandMode::Deny)
+            .unwrap()
+            .with_containment_config(
+                CommandContainmentConfig::default().with_network_allowed(true),
+            );
+
+        // A TCP listener and a UNIX-socket listener, each answering HELLO.
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port().to_string();
+        let sock_dir = tempfile::tempdir_in("/private/tmp").unwrap();
+        let sock = sock_dir.path().join("agent.sock");
+        let unix = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for mut conn in tcp.incoming().flatten() {
+                let _ = conn.write_all(b"HELLO\n");
+            }
+        });
+        std::thread::spawn(move || {
+            for mut conn in unix.incoming().flatten() {
+                let _ = conn.write_all(b"HELLO\n");
+            }
+        });
+        let sock = sock.to_string_lossy().into_owned();
+        let tcp_argv = [nc, "-w", "2", "127.0.0.1", port.as_str()];
+        let unix_argv = [nc, "-w", "2", "-U", sock.as_str()];
+
+        let reached = run_granted(&open, &dir, &tcp_argv).await;
+        assert!(
+            reached.stdout.contains("HELLO"),
+            "--allow-network must reach TCP: {reached:?}"
+        );
+        let blocked = run_granted(&sealed, &dir, &tcp_argv).await;
+        assert!(
+            !blocked.stdout.contains("HELLO"),
+            "the default must not reach TCP: {blocked:?}"
+        );
+        let agent = run_granted(&open, &dir, &unix_argv).await;
+        assert!(
+            !agent.stdout.contains("HELLO"),
+            "--allow-network must never reach a local UNIX socket \
+             (ssh-agent/docker.sock): {agent:?}"
+        );
     }
 
     /// File operations round-trip under containment: a write inside the root
