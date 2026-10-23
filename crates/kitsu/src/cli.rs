@@ -627,6 +627,19 @@ pub enum Command {
         #[arg(long = "command-runtime-root", value_name = "PATH")]
         command_runtime_roots: Vec<String>,
 
+        /// Let contained commands reach the network (off by default: the
+        /// sandbox isolates the network namespace). With this, a granted
+        /// command such as `ssh`, `curl`, or `git` over the network can
+        /// connect out, and the SSH host files `~/.ssh/known_hosts` and
+        /// `~/.ssh/config` become readable so a host key verifies — private
+        /// keys (`~/.ssh/id_*`) stay denied. Everything else is unchanged:
+        /// write-confinement to command roots, the executable allow-list,
+        /// and exact argv/cwd approval all still apply. A name-based host also
+        /// needs DNS, which this does not add; an IP works on its own. Implies
+        /// --enable-commands.
+        #[arg(long = "allow-network")]
+        allow_network: bool,
+
         /// Opt-in, explicit pass-through of one environment variable into
         /// contained commands (repeatable), layered on top of the fixed
         /// non-secret base set every contained command already receives

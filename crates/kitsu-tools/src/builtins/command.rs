@@ -227,6 +227,12 @@ const DEFAULT_CONTAINMENT_BACKEND: CommandContainmentBackendKind =
 pub struct CommandContainmentConfig {
     bubblewrap_path: PathBuf,
     readonly_runtime_roots: Vec<PathBuf>,
+    /// Opt-in (`--allow-network`): drop the network isolation for granted
+    /// commands so ssh/curl/git-over-net can reach the network, and make the
+    /// SSH host files (`~/.ssh/known_hosts`, `~/.ssh/config`) readable so a
+    /// host key verifies. Off by default — the sandbox denies all network and
+    /// every `~/.ssh` path. Private keys (`id_*`) stay denied either way.
+    allow_network: bool,
 }
 
 impl Default for CommandContainmentConfig {
@@ -234,6 +240,7 @@ impl Default for CommandContainmentConfig {
         Self {
             bubblewrap_path: PathBuf::from(DEFAULT_BUBBLEWRAP_PATH),
             readonly_runtime_roots: Vec::new(),
+            allow_network: false,
         }
     }
 }
@@ -245,6 +252,18 @@ impl CommandContainmentConfig {
 
     pub fn readonly_runtime_roots(&self) -> &[PathBuf] {
         &self.readonly_runtime_roots
+    }
+
+    /// Whether `--allow-network` opened network access + SSH host files.
+    pub fn allow_network(&self) -> bool {
+        self.allow_network
+    }
+
+    /// Opt into network access for granted commands (`--allow-network`). Off by
+    /// default; see [`CommandContainmentConfig`].
+    pub fn with_network_allowed(mut self, allow: bool) -> Self {
+        self.allow_network = allow;
+        self
     }
 
     /// Select a bubblewrap executable. Availability and filesystem identity are
@@ -411,9 +430,16 @@ impl CommandAmbientAuthority {
         executable_identity_pinned: false,
     };
 
-    /// Concise wording suitable for an approval UI.
+    /// Concise wording suitable for an approval UI. The network clause tells
+    /// the truth about `--allow-network`: isolation is stated only when it is
+    /// actually in force, so an approving user is never told the network is
+    /// sealed when a granted command can reach it.
     pub const fn notice(self) -> &'static str {
-        "the command runs in mandatory OS containment: approved command roots are writable, required runtime paths are read-only, network/PID/IPC/UTS namespaces are isolated, and only a fixed non-secret environment is supplied; executable identity is revalidated but not launched from an immutable handle"
+        if self.network_confined {
+            "the command runs in mandatory OS containment: approved command roots are writable, required runtime paths are read-only, network/PID/IPC/UTS namespaces are isolated, and only a fixed non-secret environment is supplied; executable identity is revalidated but not launched from an immutable handle"
+        } else {
+            "the command runs in OS containment with --allow-network: approved command roots are writable, required runtime paths are read-only, PID/IPC/UTS namespaces are isolated but THE NETWORK IS REACHABLE (and ~/.ssh/known_hosts + config are readable; private keys are not), and only a fixed non-secret environment is supplied; executable identity is revalidated but not launched from an immutable handle"
+        }
     }
 }
 
@@ -867,6 +893,9 @@ struct LaunchInputs {
     readonly_runtime_roots: Vec<PathBuf>,
     writable_command_roots: Vec<PathBuf>,
     cwd: PathBuf,
+    /// `--allow-network`: network isolation is dropped and the SSH host files
+    /// become readable. Both backends read this off the one struct.
+    allow_network: bool,
 }
 
 /// Pull the canonical executable and run the shared executable-visibility gate,
@@ -911,6 +940,7 @@ fn authorized_launch_inputs(
             .map(|root| root.canonical.clone())
             .collect(),
         cwd: authorized.cwd.canonical.clone(),
+        allow_network: policy.containment_config.allow_network,
     })
 }
 
@@ -1027,7 +1057,7 @@ impl BubblewrapBackend {
                             .to_string(),
                     )
                 })?;
-            let mut arguments = base_bubblewrap_arguments(&runtime_mounts, &[]);
+            let mut arguments = base_bubblewrap_arguments(&runtime_mounts, &[], false);
             arguments.push(OsString::from("--"));
             arguments.push(true_path.as_os_str().to_os_string());
             let output = std::process::Command::new(&fingerprint.canonical_path)
@@ -1127,7 +1157,20 @@ impl CommandContainmentBackend for BubblewrapBackend {
                 self.config.readonly_runtime_roots(),
                 &policy.passthrough_environment,
             );
-            let mut arguments = base_bubblewrap_arguments(&[], &launch_environment);
+            let allow_network = self.config.allow_network();
+            let mut arguments = base_bubblewrap_arguments(&[], &launch_environment, allow_network);
+            // `--allow-network`: bind the SSH host files read-only so `ssh` can
+            // verify a host (the empty /etc the base builds has none). Only
+            // these two files — never ~/.ssh — so private keys never enter the
+            // sandbox. A name-based host still needs DNS (the declined option);
+            // an IP-based one works with these alone.
+            if allow_network {
+                for file in ssh_host_read_files() {
+                    arguments.push(OsString::from("--ro-bind-try"));
+                    arguments.push(file.as_os_str().to_os_string());
+                    arguments.push(file.as_os_str().to_os_string());
+                }
+            }
             let mut inherited_paths = Vec::with_capacity(
                 ready
                     .readonly_runtime_roots
@@ -1422,7 +1465,12 @@ fn build_seatbelt_profile(inputs: &LaunchInputs) -> Result<String, CommandContai
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
     profile.push_str("(deny default)\n");
-    profile.push_str("(deny network*)\n");
+    // Network stays denied unless `--allow-network` opted in (then ssh/curl can
+    // reach the network for this granted command). Write-confinement, the exec
+    // allow-list, and the secret-read denials below are unaffected either way.
+    if !inputs.allow_network {
+        profile.push_str("(deny network*)\n");
+    }
     profile.push_str("(allow process-fork)\n");
     profile.push_str("(allow sysctl-read)\n");
 
@@ -1478,6 +1526,20 @@ fn build_seatbelt_profile(inputs: &LaunchInputs) -> Result<String, CommandContai
             write_subpath(&mut profile, path)?;
         }
         profile.push_str(")\n");
+    }
+    // `--allow-network`: re-allow exactly the two SSH host files after the
+    // blanket `~/.ssh` deny (the later rule wins), so `ssh` can read a host's
+    // key and config to verify it. Private keys (`id_*`, `identity`) stay under
+    // the deny — only these two literals are carved back out.
+    if inputs.allow_network {
+        let ssh_files = ssh_host_read_files();
+        if !ssh_files.is_empty() {
+            profile.push_str("(allow file-read*\n");
+            for path in &ssh_files {
+                write_literal(&mut profile, path)?;
+            }
+            profile.push_str(")\n");
+        }
     }
 
     // Writes: ONLY the writable command roots, the cwd, the temp dir, and the
@@ -1547,6 +1609,35 @@ fn write_subpath(profile: &mut String, path: &Path) -> Result<(), CommandContain
     let quoted = sbpl_quote(path)?;
     let _ = writeln!(profile, "    (subpath {quoted})");
     Ok(())
+}
+
+/// Emit one `    (literal "…")` line (a single file, not a subtree).
+#[cfg(target_os = "macos")]
+fn write_literal(profile: &mut String, path: &Path) -> Result<(), CommandContainmentError> {
+    use std::fmt::Write as _;
+    let quoted = sbpl_quote(path)?;
+    let _ = writeln!(profile, "    (literal {quoted})");
+    Ok(())
+}
+
+/// The SSH host files a contained `ssh` needs to read to verify a host under
+/// `--allow-network`: `~/.ssh/known_hosts` and `~/.ssh/config`. Just these two
+/// — never the whole `~/.ssh`, so private keys stay denied. Canonicalized where
+/// present; a missing file is still listed under the canonical home so a
+/// later-created one is covered.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn ssh_host_read_files() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let home = std::fs::canonicalize(&home).unwrap_or(home);
+    [".ssh/known_hosts", ".ssh/config"]
+        .iter()
+        .map(|rel| {
+            let path = home.join(rel);
+            std::fs::canonicalize(&path).unwrap_or(path)
+        })
+        .collect()
 }
 
 /// Quote a path as an SBPL string literal. Trust boundary: a path is about to
@@ -1763,12 +1854,15 @@ fn runtime_root_environment(roots: &[PathBuf]) -> Vec<(String, String)> {
 fn base_bubblewrap_arguments(
     runtime_mounts: &[PathBuf],
     extra_env: &[(String, String)],
+    allow_network: bool,
 ) -> Vec<OsString> {
-    let mut arguments = [
-        "--die-with-parent",
-        "--new-session",
-        "--unshare-user",
-        "--unshare-net",
+    let mut flags = vec!["--die-with-parent", "--new-session", "--unshare-user"];
+    // Network isolation is dropped only under `--allow-network`; the other
+    // namespaces (pid/ipc/uts/cgroup) and the userns lockdown are unchanged.
+    if !allow_network {
+        flags.push("--unshare-net");
+    }
+    flags.extend([
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
@@ -1788,10 +1882,8 @@ fn base_bubblewrap_arguments(
         "/tmp/kitsu-home",
         "--dir",
         "/etc",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect::<Vec<_>>();
+    ]);
+    let mut arguments = flags.into_iter().map(OsString::from).collect::<Vec<_>>();
     for path in runtime_mounts {
         arguments.push(OsString::from("--ro-bind"));
         arguments.push(path.as_os_str().to_os_string());
@@ -2032,8 +2124,11 @@ impl CommandPolicy {
     }
 
     /// Describe authority retained by every command under the current policy.
-    pub const fn ambient_authority(&self) -> CommandAmbientAuthority {
-        CommandAmbientAuthority::CURRENT
+    pub fn ambient_authority(&self) -> CommandAmbientAuthority {
+        CommandAmbientAuthority {
+            network_confined: !self.containment_config.allow_network,
+            ..CommandAmbientAuthority::CURRENT
+        }
     }
 
     /// Snapshot the canonical roots in which commands may start.
@@ -3647,17 +3742,30 @@ pub fn command_exec_tool(policy: Arc<CommandPolicy>) -> (ToolDescriptor, Handler
     let limits = policy.limits();
     let descriptor = ToolDescriptor {
         name: "command_exec".to_string(),
-        description: "Run one explicitly approved developer command as a literal argv array. \
-                      Kitsu never parses a shell command string. cwd is required and must be \
-                      inside an approved command root. Exact approval is separate from mandatory \
-                      OS containment: writable access is limited to approved command roots, \
-                      runtime mounts are read-only, network/PID/IPC/UTS namespaces are isolated, \
-                      and the environment is cleared to a fixed non-secret allowlist. Missing or \
-                      unsupported containment fails closed. Session approval binds the observed \
-                      executable filesystem identity and is revoked if it changes. Returns \
-                      bounded head/tail stdout/stderr previews, truthful byte \
-                      counts, and structured exit, signal, or timeout metadata."
-            .to_string(),
+        // The network clause tracks the policy so the model is not told the
+        // network is sealed when `--allow-network` lets a granted command
+        // reach it — the stale "isolated" wording is what makes a model refuse
+        // to even attempt ssh/curl.
+        description: format!(
+            "Run one explicitly approved developer command as a literal argv array. \
+             Kitsu never parses a shell command string. cwd is required and must be \
+             inside an approved command root. Exact approval is separate from mandatory \
+             OS containment: writable access is limited to approved command roots, \
+             runtime mounts are read-only, {network_clause}, \
+             and the environment is cleared to a fixed non-secret allowlist. Missing or \
+             unsupported containment fails closed. Session approval binds the observed \
+             executable filesystem identity and is revoked if it changes. Returns \
+             bounded head/tail stdout/stderr previews, truthful byte \
+             counts, and structured exit, signal, or timeout metadata.",
+            network_clause = if policy.ambient_authority().network_confined {
+                "network/PID/IPC/UTS namespaces are isolated"
+            } else {
+                "PID/IPC/UTS namespaces are isolated but the network is reachable \
+                 (--allow-network): you CAN run ssh/curl/git over the network, and \
+                 ~/.ssh/known_hosts and ~/.ssh/config are readable (private keys are not)"
+            },
+        )
+        .to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -5175,7 +5283,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn bubblewrap_plan_clears_environment_and_requests_all_required_namespaces() {
-        let arguments = base_bubblewrap_arguments(&[], &[])
+        let arguments = base_bubblewrap_arguments(&[], &[], false)
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
@@ -5188,6 +5296,24 @@ mod tests {
             "--disable-userns",
         ] {
             assert!(arguments.iter().any(|argument| argument == required));
+        }
+        // `--allow-network` drops ONLY the network namespace; every other
+        // isolation flag stays.
+        let net = base_bubblewrap_arguments(&[], &[], true)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !net.iter().any(|argument| argument == "--unshare-net"),
+            "network namespace dropped under --allow-network"
+        );
+        for still_isolated in [
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--disable-userns",
+        ] {
+            assert!(net.iter().any(|argument| argument == still_isolated));
         }
         assert!(!arguments
             .iter()
@@ -5212,6 +5338,7 @@ mod tests {
                 "HOME".to_string(),
                 "/tmp/kitsu-passthrough-home".to_string(),
             )],
+            false,
         )
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
@@ -6057,7 +6184,51 @@ mod tests {
             readonly_runtime_roots: Vec::new(),
             writable_command_roots: writable.iter().map(PathBuf::from).collect(),
             cwd: PathBuf::from(cwd),
+            allow_network: false,
         }
+    }
+
+    /// `--allow-network` on macOS: network is denied by default and allowed
+    /// with the flag, and the two SSH host files are re-allowed AFTER the
+    /// `~/.ssh` deny (later rule wins) while `~/.ssh` itself stays denied, so
+    /// private keys never become readable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_network_and_ssh_host_files_are_opt_in() {
+        let sealed = build_seatbelt_profile(&launch_inputs_for(
+            "/opt/tool/bin/ssh",
+            &["/work/project"],
+            "/work/project",
+        ))
+        .expect("profile builds");
+        assert!(sealed.contains("(deny network*)"), "default denies network");
+
+        let mut inputs =
+            launch_inputs_for("/opt/tool/bin/ssh", &["/work/project"], "/work/project");
+        inputs.allow_network = true;
+        let open = build_seatbelt_profile(&inputs).expect("profile builds");
+        assert!(
+            !open.contains("(deny network*)"),
+            "--allow-network drops the network deny: {open}"
+        );
+        // ~/.ssh is still denied; the two host files are re-allowed after it.
+        let deny_ssh = open.find("/.ssh\")").expect("~/.ssh still denied");
+        let allow_known = open
+            .find("/.ssh/known_hosts\")")
+            .expect("known_hosts re-allowed");
+        assert!(
+            allow_known > deny_ssh,
+            "the host-file allow must FOLLOW the ~/.ssh deny so it wins: {open}"
+        );
+        assert!(
+            open.contains("/.ssh/config\")"),
+            "config re-allowed: {open}"
+        );
+        // Only those two literals are carved out — no blanket ~/.ssh read.
+        assert!(
+            !open.contains("(allow file-read*\n    (subpath \""),
+            "no subtree re-allow under ~/.ssh: {open}"
+        );
     }
 
     /// The profile is deny-default, isolates the network, names the program for

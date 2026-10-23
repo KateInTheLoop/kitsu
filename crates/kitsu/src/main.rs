@@ -2020,6 +2020,7 @@ fn run() -> Result<(), CliError> {
             command_runtime_roots,
             command_env,
             allow_commands,
+            allow_network,
             script,
             resume,
             session,
@@ -2041,6 +2042,7 @@ fn run() -> Result<(), CliError> {
                 command_runtime_roots,
                 command_env,
                 allow_commands,
+                allow_network: *allow_network,
                 script: script.as_deref(),
                 resume: resume.as_deref(),
                 persist_session: *session,
@@ -2067,6 +2069,7 @@ struct ChatInvocation<'a> {
     command_runtime_roots: &'a [String],
     command_env: &'a [String],
     allow_commands: &'a [String],
+    allow_network: bool,
     script: Option<&'a str>,
     resume: Option<&'a str>,
     persist_session: bool,
@@ -2106,6 +2109,7 @@ async fn run_review(
             command_runtime_roots: &[],
             command_env: &[],
             allow_commands: &[],
+            allow_network: false,
             script: None,
             resume,
             persist_session,
@@ -3075,6 +3079,7 @@ async fn run_sessions(
                         command_runtime_roots: &[],
                         command_env: &[],
                         allow_commands: &[],
+                        allow_network: false,
                         script: None,
                         resume: Some(&saved.id),
                         persist_session: false,
@@ -12538,7 +12543,7 @@ fn permissions_payload(
             "cwd_roots": json_paths(session.command_roots.clone()),
             "exact_grants": command_grants,
             "revoked_invocation_grants": revoked_command_grants,
-            "ambient_authority_notice": session.command_policy.as_ref().map(|_| kitsu_tools::CommandAmbientAuthority::CURRENT.notice()),
+            "ambient_authority_notice": session.command_policy.as_ref().map(|policy| policy.ambient_authority().notice()),
             "containment": containment,
         },
         "artifact_policy": artifact_policy_receipt(
@@ -19551,6 +19556,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         command_runtime_roots,
         command_env,
         allow_commands,
+        allow_network,
         script,
         resume,
         persist_session: session_requested,
@@ -19584,7 +19590,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         || !command_roots.is_empty()
         || !command_runtime_roots.is_empty()
         || !allow_commands.is_empty()
-        || !command_env.is_empty();
+        || !command_env.is_empty()
+        || allow_network;
     // Interactive developer chat offers Git without exposing a general command
     // runner. Every Git invocation still uses the independent approval policy.
     let default_git = interactive
@@ -19875,12 +19882,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             reject_credential_command_root(&root, &setup.state_dir, "--command-root")?;
         }
         let mut readonly_runtime_roots = Vec::new();
-        if !command_runtime_roots.is_empty() {
+        if !command_runtime_roots.is_empty() || allow_network {
             // Toolchains outside /usr (rustup/cargo installs in particular)
             // are invisible to contained commands without an explicit
             // read-only mount. Every configured root is disclosed: a runtime
             // root discloses its readable contents to approved commands.
-            let mut containment = kitsu_tools::CommandContainmentConfig::default();
+            let mut containment = kitsu_tools::CommandContainmentConfig::default()
+                .with_network_allowed(allow_network);
             for root in command_runtime_roots {
                 containment = containment
                     .with_readonly_runtime_root(root)
@@ -19894,6 +19902,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 eprintln!(
                     "~ command containment: read-only runtime root {} (contents readable by approved commands)",
                     terminal_inline(&root.display().to_string())
+                );
+            }
+            if allow_network {
+                // The sandbox weakening is disclosed at startup, like every
+                // runtime root, so a session can never silently have network.
+                eprintln!(
+                    "~ command containment: --allow-network — approved commands may reach the network; ~/.ssh/known_hosts and ~/.ssh/config are readable (private keys stay denied)"
                 );
             }
             policy = policy.with_containment_config(containment);
@@ -32558,6 +32573,22 @@ mod tests {
         assert_eq!(after.theme.as_deref(), Some("forest"));
         assert!(after.no_artifacts);
         assert!(matches!(after.command, Some(Command::Chat { .. })));
+    }
+
+    #[test]
+    fn allow_network_parses_on_chat_and_defaults_off() {
+        let on = Cli::try_parse_from(["kitsu", "chat", "--allow-network", "--no-session"])
+            .expect("--allow-network parses on chat");
+        let Some(Command::Chat { allow_network, .. }) = on.command else {
+            panic!("expected a chat command");
+        };
+        assert!(allow_network, "the flag is set when passed");
+
+        let off = Cli::try_parse_from(["kitsu", "chat", "--no-session"]).expect("chat parses");
+        let Some(Command::Chat { allow_network, .. }) = off.command else {
+            panic!("expected a chat command");
+        };
+        assert!(!allow_network, "network is denied by default");
     }
 
     #[test]
