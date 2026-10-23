@@ -973,7 +973,7 @@ pub const GLYPH_TORII: &str = "⛩";
 /// `unicode-width` but was re-fitted at paint time with an approximate table,
 /// so a combining mark or an emoji the two disagreed on knocked the right
 /// border off. Control characters are removed by sanitization before this runs.
-pub(crate) fn char_display_width(ch: char) -> usize {
+fn char_display_width(ch: char) -> usize {
     if ch == '\t' {
         return 1;
     }
@@ -1881,13 +1881,14 @@ pub fn approval_options(always_label: &str) -> String {
 
 /// The command prompt's options: [`approval_options`] plus `[u]`, which turns
 /// auto mode on for the rest of the session.
-///
 /// Width-aware (review 7): a single fixed line is truncated to the pane width
 /// when it paints, and the fourth answer pushed `[n] deny` off the end on a
 /// narrow terminal. The widest spelling that fits `cols` is used, down to a
-/// tight floor (~22 cells) that still names every key with deny last — so for
-/// any pane wide enough to show the modal's provenance rows at all, a
-/// right-edge truncation never hides deny.
+/// ~19-cell floor (`  [y][a][u][n] deny`) that still names every key with deny
+/// last. Below that floor the whole modal is unusable anyway — its provenance
+/// rows (cwd and executable paths) are far wider and truncate first — so there
+/// is nothing shorter to fall back to; `deny` is protected for every pane wide
+/// enough to read the modal at all.
 pub fn command_approval_options(always_label: &str, cols: usize) -> String {
     let styled = stderr_style();
     let key = |k: &str| {
@@ -1897,39 +1898,23 @@ pub fn command_approval_options(always_label: &str, cols: usize) -> String {
             format!("[{k}]")
         }
     };
-    // Widest first. Each candidate is paired with its plain (unstyled) form,
-    // whose display width is the true on-screen width — styling is zero-width
-    // ANSI — so the choice does not depend on whether stderr is a TTY.
-    let verbose_plain = approval_options_with_mode(always_label, true, false);
-    let candidates = [
-        (
-            approval_options_with_mode(always_label, true, styled),
-            verbose_plain,
-        ),
-        (
-            format!(
-                "  {} once · {} session · {} auto · {} deny",
-                key("y"),
-                key("a"),
-                key("u"),
-                key("n")
-            ),
-            "  [y] once · [a] session · [u] auto · [n] deny".to_string(),
-        ),
-        (
-            format!("  {} {} {} {} deny", key("y"), key("a"), key("u"), key("n")),
-            "  [y] [a] [u] [n] deny".to_string(),
-        ),
-    ];
-    for (styled_line, plain) in &candidates {
-        if display_width(plain) <= cols {
-            return styled_line.clone();
-        }
+    // Widest first, each built only if it is the one returned (styling is
+    // zero-width ANSI, so the plain spelling's width is the true on-screen
+    // width and the choice does not depend on whether stderr is a TTY).
+    if display_width(&approval_options_with_mode(always_label, true, false)) <= cols {
+        return approval_options_with_mode(always_label, true, styled);
     }
-    // Narrower than the tight floor: return it anyway (the modal is degraded at
-    // this width regardless); the fitter truncates, but deny is last so it is
-    // the first thing room is found for as the pane grows back.
-    candidates.into_iter().next_back().unwrap().0
+    if display_width("  [y] once · [a] session · [u] auto · [n] deny") <= cols {
+        return format!(
+            "  {} once · {} session · {} auto · {} deny",
+            key("y"),
+            key("a"),
+            key("u"),
+            key("n")
+        );
+    }
+    // The floor: the shortest line that still names every key, deny last.
+    format!("  {}{}{}{} deny", key("y"), key("a"), key("u"), key("n"))
 }
 
 /// The `[u]` option's label, shared by the styled and plain prompts.
@@ -2716,15 +2701,16 @@ pub fn emit_usage(prompt_tokens: u64, completion_tokens: u64, total_tokens: u64)
 #[cfg(test)]
 mod tests {
     use super::{
-        approval_header_with_mode, approval_modal, approval_options_with_mode, context_lines,
-        deck_header_with_mode, deck_marker_with_mode, display_width, error_display_lines,
-        fit_banner_value, fit_row_to_width, format_message, grouped_count, human_turn_stats,
-        milestone_line_with_mode, sanitize_plain_inline, sanitize_terminal_inline,
-        sanitize_terminal_text, section_heading, spinner_mode, static_spinner_line, theme_row,
-        tool_activity_line, write_run_timing_with_mode, write_static_spinner, write_turn_stats,
-        write_turn_stats_with_mode, AgentViewState, AsyncNoticeLevel, DeckState, HumanRunReceipt,
-        LineStyler, PromptSafeAsyncNotice, RenderMode, RunTimingStatus, SpinnerMode, StreamBuffer,
-        TerminalTextSanitizer, AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES, SPINNER_VERBS, THEMES,
+        approval_header_with_mode, approval_modal, approval_options_with_mode, char_display_width,
+        context_lines, deck_header_with_mode, deck_marker_with_mode, display_width,
+        error_display_lines, fit_banner_value, fit_row_to_width, format_message, grouped_count,
+        human_turn_stats, milestone_line_with_mode, sanitize_plain_inline,
+        sanitize_terminal_inline, sanitize_terminal_text, section_heading, spinner_mode,
+        static_spinner_line, theme_row, tool_activity_line, write_run_timing_with_mode,
+        write_static_spinner, write_turn_stats, write_turn_stats_with_mode, AgentViewState,
+        AsyncNoticeLevel, DeckState, HumanRunReceipt, LineStyler, PromptSafeAsyncNotice,
+        RenderMode, RunTimingStatus, SpinnerMode, StreamBuffer, TerminalTextSanitizer, AMBER,
+        CREAM, EMBER, FOX, SPINNER_FRAMES, SPINNER_VERBS, THEMES,
     };
 
     fn sgr(rgb: (u8, u8, u8)) -> String {
@@ -3514,6 +3500,27 @@ mod tests {
         assert_eq!(display_width("( ･ᴥ･ )"), 7);
     }
 
+    /// `char_display_width` is the crate's single width authority (it backs both
+    /// the layout's wrap/pad and the paint-time `fit_row_to_width`), so pin the
+    /// cases where the retired approximate table disagreed with unicode-width:
+    /// a combining mark and a control char are zero cells (the table said one),
+    /// and a symbol-range emoji is two (the table, which only covered
+    /// 0x1F300..=0x1FAFF, said one). Banner/status padding rides on this, so a
+    /// regression here would bow the box border again (review round 2).
+    #[test]
+    fn char_display_width_is_unicode_width_not_the_old_table() {
+        assert_eq!(char_display_width('a'), 1);
+        assert_eq!(char_display_width('\t'), 1);
+        assert_eq!(char_display_width('\u{0301}'), 0, "combining acute");
+        assert_eq!(char_display_width('\u{200b}'), 0, "zero-width space");
+        assert_eq!(char_display_width('中'), 2);
+        assert_eq!(
+            char_display_width('\u{2705}'),
+            2,
+            "✅ outside the old table"
+        );
+    }
+
     #[test]
     fn fit_banner_value_keeps_short_values_exact() {
         assert_eq!(fit_banner_value("short", 20), "short");
@@ -3657,10 +3664,10 @@ mod tests {
             sanitize_terminal_text(&wide),
             "  [y] allow once · [a] exact argv/cwd for session · [u] auto mode · [n] deny"
         );
-        // Each pane width gets the widest spelling that fits, and every one
-        // keeps all four keys with deny last — a right-edge truncation must
-        // never be what hides deny.
-        for cols in [80, 50, 30, 22] {
+        // Each pane width gets the widest spelling that fits, down to the
+        // 19-cell floor; every one keeps all four keys with deny last and fits
+        // within `cols`, so a right-edge truncation never hides deny.
+        for cols in [80, 50, 30, 19] {
             let narrow = crate::command_approval_options(crate::COMMAND_ALWAYS_LABEL, cols);
             let plain = sanitize_terminal_text(&narrow);
             assert!(
@@ -3674,6 +3681,14 @@ mod tests {
             // deny is always the last option, so it is the last thing dropped.
             assert!(plain.trim_end().ends_with("[n] deny"), "{plain:?}");
         }
+        // The floor really fits in 19 cells: "  [y][a][u][n] deny".
+        assert_eq!(
+            display_width(&sanitize_terminal_text(&crate::command_approval_options(
+                crate::COMMAND_ALWAYS_LABEL,
+                19
+            ))),
+            19
+        );
         assert!(!approval_options_with_mode("always (/etc)", false, false).contains("[u]"));
     }
 

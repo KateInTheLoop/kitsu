@@ -1352,11 +1352,15 @@ pub(crate) fn clear_approval_modal() {
         return;
     };
     // Review 3: clone the live draft rather than take-then-restore it. Taking
-    // it out and re-storing through paint_turn_draft opened a window where a
-    // concurrent end_turn_draft() (the collector finishing its turn) was lost
-    // and a dead draft was resurrected. Cloning never writes TURN_DRAFT, so an
-    // end_turn_draft that wins the race leaves it `None` and the status row
-    // comes back, which is correct.
+    // it out and re-storing through paint_turn_draft resurrected a draft a
+    // concurrent end_turn_draft() had just cleared. Cloning never writes
+    // TURN_DRAFT, so an end_turn_draft that wins before the clone leaves it
+    // `None` here and the status row comes back. One window remains and is left
+    // open on purpose: an end_turn_draft landing *after* the clone repaints a
+    // during-turn box for a turn that just ended — but it is transient (the
+    // idle reader repaints the composer on its next frame) and closing it would
+    // mean holding TURN_DRAFT across terminal I/O, which is not worth it for a
+    // one-frame cosmetic flicker.
     let turn = lock(&TURN_DRAFT).clone();
     if let Some(t) = turn {
         paint_turn_draft_on(&pane, &t);
