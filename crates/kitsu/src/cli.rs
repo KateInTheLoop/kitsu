@@ -344,12 +344,14 @@ pub struct Cli {
     #[arg(long = "skill", value_name = "NAME", global = true)]
     pub skill: Vec<String>,
 
-    /// Which renderer interactive chat runs: `classic` (today's line
-    /// renderer), `inline` (the pinned viewport preview) or `fullscreen` (the
-    /// alternate screen, painted from the inline cell ring). Overrides the
-    /// config key `[tui] mode`; there is no environment variable — the
-    /// `KITSU_TUI` preview gate was retired, so this flag and the config key
-    /// are the only two sources, in that order.
+    /// Which renderer interactive chat runs: `inline` (the pinned viewport
+    /// with the framed input box; the default at a terminal), `fullscreen`
+    /// (the alternate screen, painted from the inline cell ring) or `classic`
+    /// (the plain line renderer). Overrides the config key `[tui] mode`; there
+    /// is no environment variable — the `KITSU_TUI` preview gate was retired,
+    /// so this flag and the config key are the only two sources, in that
+    /// order. Without either, a non-terminal carrier (piped, scripted,
+    /// `--jsonl`, `--plain`) always gets `classic`.
     #[arg(
         long = "tui",
         global = true,
@@ -357,6 +359,11 @@ pub struct Cli {
         value_parser = TuiModeParser
     )]
     pub tui: Option<String>,
+
+    /// Run the plain line renderer: shorthand for `--tui classic`. The
+    /// opt-out now that the inline viewport is the default at a terminal.
+    #[arg(long = "no-tui", global = true, conflicts_with = "tui")]
+    pub no_tui: bool,
 
     /// Never take the terminal's alternate screen. A one-way force: it beats
     /// any `[tui] alternate_screen` value, and omitting it forces nothing.
@@ -369,10 +376,14 @@ pub struct Cli {
 
 impl Cli {
     /// `--tui` as the config's own mode type, or `None` when the flag is
-    /// absent. clap has already rejected everything but the accepted
-    /// spellings in [`TUI_FLAG_MODES`], so an unreachable value is a bug here
-    /// rather than a silent fallback to classic.
+    /// absent. `--no-tui` is `--tui classic` spelled as a switch (clap
+    /// rejects the two together). clap has already rejected everything but
+    /// the accepted spellings in [`TUI_FLAG_MODES`], so an unreachable value
+    /// is a bug here rather than a silent fallback to classic.
     pub fn tui_mode(&self) -> Option<crate::config::TuiMode> {
+        if self.no_tui {
+            return Some(crate::config::TuiMode::Classic);
+        }
         match self.tui.as_deref() {
             Some("classic") => Some(crate::config::TuiMode::Classic),
             Some("inline") => Some(crate::config::TuiMode::Inline),

@@ -9,6 +9,16 @@ shapes may change in any minor release.
 
 ## [Unreleased]
 
+### Changed
+
+- **The inline TUI is now the default renderer at a terminal.** Interactive
+  chat starts in the pinned inline viewport with the framed input box; the
+  plain line renderer is one flag away with `--no-tui` (or `--tui classic`,
+  or `[tui] mode = "classic"`). The default is guarded by the carrier: a
+  piped, scripted, `--jsonl` or `--plain` run, or one whose stdout is
+  redirected, still gets the classic renderer unless `--tui` or `[tui] mode`
+  names one, so automation output is byte-for-byte what it was.
+
 ### Added
 
 - **macOS command containment via Apple Seatbelt.** Enabled developer commands

@@ -2157,7 +2157,9 @@ fn test_slash_palette_and_footer_fit_a_fifty_column_pty() {
         .stdin(unsafe { Stdio::from_raw_fd(child_stdin) })
         .stdout(unsafe { Stdio::from_raw_fd(child_stdout) })
         .stderr(unsafe { Stdio::from_raw_fd(slave) })
-        .args(["chat", "--no-session"]);
+        // This measures the classic slash palette's footer; the inline
+        // viewport is the default on a PTY now, so ask for classic by name.
+        .args(["chat", "--no-session", "--no-tui"]);
     let mut child = cmd.spawn().expect("spawn Kitsu in narrow PTY");
     // SAFETY: ownership of the remaining master descriptor transfers here.
     let mut terminal = unsafe { fs::File::from_raw_fd(master) };

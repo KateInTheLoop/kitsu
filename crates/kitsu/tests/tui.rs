@@ -392,6 +392,13 @@ struct Options {
     /// child's composer is always set explicitly so an ambient
     /// `KITSU_INPUT_BOX` in the runner's shell cannot choose it.
     input_box: bool,
+    /// Pass no renderer flag at all, so the child resolves the *default*.
+    ///
+    /// Off by default: with the inline viewport now the default at a
+    /// terminal, `tui: None` passes `--no-tui` to keep every classic-mode
+    /// measurement meaning what it meant. Only the test that measures the
+    /// default itself sets this.
+    default_renderer: bool,
 }
 
 impl Default for Options {
@@ -402,6 +409,7 @@ impl Default for Options {
             legacy_env_gate: false,
             size: (ROWS, COLS),
             input_box: false,
+            default_renderer: false,
         }
     }
 }
@@ -417,8 +425,10 @@ fn run_styled_chat_pty(home: &Path, tui: Option<&str>, script: &[Step]) -> Sessi
 /// The child gets all three descriptors on the PTY slave (one `dup` each, the
 /// same discipline `tests/cli.rs` uses) and no `--plain`/`--no-stream`, so
 /// styling and the viewport are live. `tui` is the value passed to the
-/// `--tui <MODE>` flag: `None` passes no flag at all, which is classic mode
-/// (plan row T3-S2 retired the `KITSU_TUI` gate).
+/// `--tui <MODE>` flag; `None` passes `--no-tui`, so every measurement that
+/// predates the inline default still runs the classic renderer it was
+/// written against (plan row T3-S2 retired the `KITSU_TUI` gate). The one
+/// way to run the *default* renderer is [`Options::default_renderer`].
 ///
 /// `options` carries everything that is not the script; see [`Options`].
 fn run_styled_chat_pty_with(
@@ -569,8 +579,19 @@ fn run_styled_chat_pty_core(
     if options.legacy_env_gate {
         command.env("KITSU_TUI", "inline");
     }
-    if let Some(mode) = tui {
-        command.args(["--tui", mode]);
+    // The inline viewport is the default at a terminal, and a PTY is one. The
+    // classic-mode measurements in this file were written when no flag meant
+    // classic, so `None` now says so explicitly with `--no-tui`; only
+    // `default_renderer` omits the flag, for the test that measures the
+    // default itself.
+    match tui {
+        Some(mode) => {
+            command.args(["--tui", mode]);
+        }
+        None if options.default_renderer => {}
+        None => {
+            command.arg("--no-tui");
+        }
     }
 
     let mut child = command.spawn().expect("spawn styled carrier chat");
@@ -6907,6 +6928,48 @@ fn tui_switch_back_into_inline_still_restores_on_a_signal() {
     assert!(
         !session.status.success(),
         "a signalled session does not exit successfully; it exited {:?}",
+        session.status
+    );
+}
+
+/// **The inline viewport is the default at a terminal.** With no `--tui`, no
+/// `--no-tui` and no `[tui] mode`, a session on a PTY pins the scroll region
+/// and releases it on exit -- the same bytes `--tui inline` produces. The
+/// classic measurements around this one all pass `--no-tui` (see
+/// `run_styled_chat_pty_with`), which is what keeps them meaningful now that
+/// silence no longer means classic. The piped/scripted side of the same
+/// default -- no escapes at all off a terminal -- is unit-tested on
+/// `TuiConfig::effective_mode_for_carrier` and measured by every piped test
+/// in `tests/cli.rs`, none of which passes a renderer flag.
+#[test]
+#[serial]
+fn default_renderer_on_a_pty_is_the_inline_viewport() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty_with(
+        home.path(),
+        None,
+        &help_then_quit(),
+        Options {
+            default_renderer: true,
+            ..Options::default()
+        },
+    );
+    let text = session.raw_text();
+
+    assert!(
+        session.raw_count(&tui_region()) >= 1,
+        "the default renderer pins a region; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.raw_count("\x1b[r") >= 1,
+        "and releases it on exit; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "a default session that quits cleanly exits 0; it exited {:?}",
         session.status
     );
 }

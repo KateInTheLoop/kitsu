@@ -20806,10 +20806,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let _agent_state_guard = agent_state_enabled
         .then(|| agent_state_file::StateFileGuard::new(agent_state_dir.clone(), agent_state_pid));
 
-    // The inline viewport preview (`--tui inline` or `[tui] mode = "inline"`,
-    // T0-S5a/T3-S2). Held for the whole session so the scroll region is
-    // released on every exit path. In classic mode — the default — `install`
-    // writes nothing and touches no global state, so the session is
+    // The inline viewport (T0-S5a/T3-S2): the default at a terminal, or
+    // selected by `--tui inline` / `[tui] mode = "inline"`. Held for the whole
+    // session so the scroll region is released on every exit path. In classic
+    // mode — `--no-tui`, and what every non-terminal carrier resolves to —
+    // `install` writes nothing and touches no global state, so the session is
     // byte-identical.
     // `mut` and reassignable, for card T3-S9: `/tui classic|inline` swaps the
     // renderer at the idle-prompt seam by dropping this guard (which runs the
@@ -20866,7 +20867,20 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // `enter_fullscreen` below, which is what lets that segment see the
         // session's push and add none of its own.
         let title_stack_guard = tui_bridge::TitleStackGuard::new(Box::new(std::io::stderr()));
-        let mode = match setup.tui.effective_mode(cli.tui_mode()) {
+        // The inline viewport is the default only where it can paint: stdin
+        // and stdout both terminals, plain mode off. Any other carrier --
+        // piped, scripted, `--jsonl`, `--plain`, a redirected stdout -- gets
+        // classic unless `--tui` or `[tui] mode` asked for a renderer by
+        // name, which keeps every automation byte stream exactly as it was
+        // before inline became the default. An explicit request is honoured
+        // as before; only the *default* is guarded.
+        let terminal_can_paint = interactive
+            && std::io::IsTerminal::is_terminal(&std::io::stdout())
+            && !kitsu_render::plain_mode();
+        let mode = match setup
+            .tui
+            .effective_mode_for_carrier(cli.tui_mode(), terminal_can_paint)
+        {
             crate::config::TuiMode::Classic => tui_bridge::TuiMode::Classic,
             crate::config::TuiMode::Inline => tui_bridge::TuiMode::Inline,
             crate::config::TuiMode::Fullscreen => tui_bridge::TuiMode::Fullscreen,
