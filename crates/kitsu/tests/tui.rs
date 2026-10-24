@@ -3697,11 +3697,19 @@ fn permission_receipts(session: &Session) -> Vec<String> {
         .collect()
 }
 
-/// The same, over only the bytes the child wrote **after** scripted action
-/// `step` -- R7's "afterwards".
+/// The committed-transcript receipts the child wrote **after** scripted
+/// action `step` -- R7's "afterwards".
+///
+/// This reads [`transcript_text`], not the raw byte stream: in inline mode the
+/// modal and the status row are *addressed* pinned-pane writes, so a spinner
+/// repaint that interleaves between the answer and the committed receipt glues
+/// onto it once `strip_csi` drops the cursor moves, hiding the receipt. That
+/// interleave is timing-dependent and showed up as a load-dependent flake.
+/// `transcript_text` drops every addressed row by construction, leaving
+/// exactly the committed receipts regardless of how the pane was repainted.
 fn permission_receipts_after(session: &Session, step: usize) -> Vec<String> {
     let tail = String::from_utf8_lossy(&session.raw[session.marks[step]..]).into_owned();
-    strip_csi(&tail)
+    transcript_text(&tail)
         .split(['\n', '\r'])
         .map(str::trim)
         .filter(|line| line.starts_with("◉ permission —"))
