@@ -7500,7 +7500,7 @@ struct FullscreenSuspendEffects<'a> {
 #[cfg(unix)]
 impl tui_bridge::SuspendEffects for FullscreenSuspendEffects<'_> {
     fn release_viewport(&mut self) {
-        self.segment.clear_composer(self.rows);
+        self.segment.release_for_suspend(self.rows);
     }
 
     fn restore_terminal_modes(&mut self) {
@@ -18870,6 +18870,11 @@ fn update_live_row(editor: &kitsu_editor::TypeaheadEditor, prompt: &str) {
     // answer is read, after which the collector repaints through here.
     if !approval_key_request_pending() {
         tui_bridge::paint_turn_draft(prompt, &buffer, editor.cursor(), &hint, hint_reserved);
+    }
+    // Fullscreen paints the draft into its framed box; the live row beside
+    // the spinner keeps the status and not a second copy of the draft.
+    if tui_bridge::fullscreen_turn_box_active() {
+        return;
     }
     kitsu_render::live::live_input_update(buffer, editor.cursor(), hint, hint_reserved);
 }

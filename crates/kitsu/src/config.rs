@@ -520,6 +520,7 @@ impl TuiConfig {
     }
 
     /// Whether `[tui] mode` was written in the file, as opposed to defaulted.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn mode_is_configured(&self) -> bool {
         self.mode.is_some()
     }
@@ -1602,7 +1603,11 @@ mod tests {
         // ...and each value above differs from the default, which is what
         // makes the assertions non-vacuous.
         let default = TuiConfig::default();
-        assert_ne!(default.mode, Some(TuiMode::Inline), "an absent key is None, not a typed inline");
+        assert_ne!(
+            default.mode,
+            Some(TuiMode::Inline),
+            "an absent key is None, not a typed inline"
+        );
         assert_ne!(default.alternate_screen, AlternateScreen::Always);
         assert_ne!(default.prefix, "ctrl+b");
         assert!(default.title);
@@ -1716,8 +1721,14 @@ mod tests {
     #[test]
     fn inline_default_falls_back_to_classic_off_a_terminal_but_named_modes_do_not() {
         let unset = TuiConfig::default();
-        assert_eq!(unset.effective_mode_for_carrier(None, true), TuiMode::Inline);
-        assert_eq!(unset.effective_mode_for_carrier(None, false), TuiMode::Classic);
+        assert_eq!(
+            unset.effective_mode_for_carrier(None, true),
+            TuiMode::Inline
+        );
+        assert_eq!(
+            unset.effective_mode_for_carrier(None, false),
+            TuiMode::Classic
+        );
 
         // `--tui inline` on a pipe: honoured, as it always was.
         assert_eq!(
