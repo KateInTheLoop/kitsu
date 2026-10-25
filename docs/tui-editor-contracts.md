@@ -1,8 +1,7 @@
 # Inline editor contracts (Stage 1A draft)
 
-This is the working contract for Stage 1B and the paste milestones in
-[next-development-plan.md](next-development-plan.md). It changes no terminal
-behavior. Stage 0 acceptance and executable layout fixtures remain open.
+This is the working contract for Stage 1B and the paste milestones. It
+changes no terminal behavior. Stage 0 acceptance and executable layout fixtures remain open.
 
 ## Ownership and coordinates
 

@@ -3899,7 +3899,7 @@ mod tests {
     ///
     /// `◉` is `GLYPH_APPROVAL`, already the permission glyph
     /// (`approval_header`), and already the glyph
-    /// `docs/tui-and-agent-view-design.md` §4.4 nominates for a blocked row.
+    /// the agent-view design nominates for a blocked row.
     /// Blocked is the only state left that is neither accent (live), ember
     /// (failed) nor amber (stopped), and `highlight`/cream is the palette's
     /// "look here" slot.
