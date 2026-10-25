@@ -9,6 +9,30 @@ shapes may change in any minor release.
 
 ## [Unreleased]
 
+### Changed
+
+- **The inline TUI is now the default renderer at a terminal.** Interactive
+  chat starts in the pinned inline viewport with the framed input box; the
+  plain line renderer is one flag away with `--no-tui` (or `--tui classic`,
+  or `[tui] mode = "classic"`). The default is guarded by the carrier: a
+  piped, scripted, `--jsonl` or `--plain` run, or one whose stdout is
+  redirected, still gets the classic renderer unless `--tui` or `[tui] mode`
+  names one, so automation output is byte-for-byte what it was.
+- **The fullscreen renderer has the framed input box too, and keeps it on
+  screen while a turn runs.** `--tui fullscreen` used to paint a bare one-row
+  `kitsu>` composer on the bottom row and erase it on Enter. It now paints
+  the same expanding framed box the inline composer does, pinned under a
+  scroll region of its own: the transcript scrolls above the box, a long
+  line or a pasted block grows the box (the window scrolls up to make room),
+  and what you type while the agent is still answering shows in the box
+  rather than beside the spinner. The submitted prompt is written into the
+  transcript window at once, above the answer it provokes, instead of
+  appearing only when the frame was next repainted. The idle-prompt repaint
+  from the transcript ring now runs only for a paged-back frame, so lines
+  that reach the screen directly (the banner, `/help`) are no longer wiped
+  at the next prompt. Screens shorter than five rows keep the one-row
+  composer.
+
 ### Added
 
 - **macOS command containment via Apple Seatbelt.** Enabled developer commands

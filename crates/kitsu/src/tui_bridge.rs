@@ -538,6 +538,75 @@ pub(crate) struct FullscreenSegment {
     /// second thing to put back, and a second teardown path is how the two
     /// come to differ.
     view: kitsu_tui::fullscreen::FullscreenView,
+    /// How many bottom rows the framed input box holds right now, and so how
+    /// many rows the frame's window gives up to it. `0` is the single-row
+    /// composer fallback on a screen too short for a box (fewer than five
+    /// rows), where the layout is the pre-box one: the window is the screen
+    /// minus the bottom row and no scroll region is pinned.
+    box_rows: u16,
+    /// Whether the DECSTBM region above the box is currently set on the
+    /// terminal. Cleared by a suspend and by `leave`, so the next composer
+    /// paint knows to pin it again.
+    region_set: bool,
+    /// The last box painted, so a frame repaint (which clears the whole
+    /// screen) can put it back without the caller re-composing it.
+    last_box: Option<live::InputBox>,
+    /// The composer prompt the last paint used, so the empty box painted at a
+    /// turn's start carries the same `kitsu> ` the idle box does.
+    prompt: String,
+    /// The first of the rows a box shrink freed during the idle read, still
+    /// blank because nothing has written to the window since. The submit
+    /// that ends the read parks the cursor there rather than on the region's
+    /// bottom row, so the echoed prompt follows the transcript without a gap.
+    /// Cleared by anything that writes the window: a grow, a frame repaint.
+    freed_top: Option<u16>,
+}
+
+/// The during-turn painter for the fullscreen box: the bottom rows the box
+/// holds, and the prompt to frame an empty draft with. Published by
+/// [`FullscreenSegment::clear_composer`] when the idle read ends and the turn
+/// begins, withdrawn by `leave`, and read by [`paint_turn_draft`] when no
+/// inline pane is installed -- which in fullscreen is always.
+#[derive(Clone)]
+struct FullscreenTurnBox {
+    box_rows: u16,
+    prompt: String,
+}
+
+static FULLSCREEN_TURN_BOX: std::sync::Mutex<Option<FullscreenTurnBox>> =
+    std::sync::Mutex::new(None);
+
+/// Whether a fullscreen segment is showing the during-turn box right now, so
+/// the classic live row's draft echo can stand down: the box is where the
+/// draft shows, and a second copy beside the spinner is noise.
+pub(crate) fn fullscreen_turn_box_active() -> bool {
+    lock(&FULLSCREEN_TURN_BOX).is_some()
+}
+
+/// The framed box's row budget on a `rows`-tall screen: at most half the
+/// screen, and never so many that the frame's window above it (one spare
+/// cursor row included) has fewer than one row. Below 3 the screen cannot
+/// hold a box and the caller falls back to the single composer row.
+fn fullscreen_box_budget(rows: u16) -> u16 {
+    (rows / 2).min(rows.saturating_sub(2))
+}
+
+/// The entry box height on a `rows`-tall screen: the empty three-row box, or
+/// `0` for the single-row fallback when the budget cannot hold one.
+fn initial_box_rows(rows: u16) -> u16 {
+    if fullscreen_box_budget(rows) >= 3 {
+        3
+    } else {
+        0
+    }
+}
+
+/// The frame's window above a `box_rows`-tall box: the screen minus the box
+/// and minus one spare row, which is where the cursor parks and the next
+/// transcript line starts. With no box (`0`) it is the screen minus the one
+/// composer row, exactly the pre-box layout.
+fn window_rows_above(rows: u16, box_rows: u16) -> u16 {
+    rows.saturating_sub(box_rows).saturating_sub(1).max(1)
 }
 
 /// The seam tap a live fullscreen segment installs: every transcript line the
@@ -625,20 +694,26 @@ impl Surface for FullscreenTap {
         lock(&self.ring).push_prompt(text);
     }
 
-    /// In fullscreen the frame is repainted from the ring, not written line by
-    /// line, so the prompt is **marked in the ring and no bytes are written** —
-    /// the next frame shows it. (The inline surface, which erased the composer
-    /// row, is the one that must also paint; here painting would double it.)
-    /// The prompt prefix is prepended per line so a `{`/`}` jump lands on the
-    /// same text the inline overlay shows.
+    /// The submitted line is **written into the transcript window and marked
+    /// in the ring**, exactly as the inline surface does: the box erased it on
+    /// Enter, and the frame is only repainted from the ring at the *next* idle
+    /// prompt, so a mark alone would leave the user's words invisible for the
+    /// whole turn they provoke. The write goes through the displaced surface
+    /// so it scrolls inside the region above the box like any other transcript
+    /// line; the next frame repaint clears the screen first, so nothing is
+    /// doubled. The prompt prefix is prepended per line so a `{`/`}` jump
+    /// lands on the same text the inline overlay shows.
     fn echo_prompt(&self, prompt: &str, text: &str) {
         let mut ring = lock(&self.ring);
         for (i, line) in text.lines().enumerate() {
-            if i == 0 {
-                ring.push_prompt(&format!("{prompt}{line}"));
+            let shown = if i == 0 {
+                format!("{prompt}{line}")
             } else {
-                ring.push_prompt(line);
-            }
+                line.to_string()
+            };
+            self.inner
+                .transcript_line(kitsu_render::surface::Fd::Stdout, &shown);
+            ring.push_prompt(&shown);
         }
     }
 }
@@ -686,14 +761,25 @@ impl FullscreenSegment {
             return;
         }
         self.painted_tap_lines = recorded.len();
+        // With the scroll region pinned above the box, a following frame is
+        // already right: every line the turn wrote scrolled into the window
+        // as it arrived, and lines that reached the screen *without* passing
+        // the seam (the banner, `/help`, every direct `eprintln!`) are on it
+        // too, which a repaint from the ring would erase. So the ring repaint
+        // is for the **pinned** frame only -- the one the streamed output
+        // scrolled away from -- and a following frame is left as the
+        // terminal scrolled it.
+        if self.box_rows != 0 && self.view.is_following() {
+            return;
+        }
         // From the segment's **own** anchor, not a fresh one: a view
         // constructed per paint would un-pin the frame on the next line the
         // session writes, which is paging that lasts until the next output.
         let frame = {
             let ring = frame_ring(&self.lines_now());
-            self.view.frame(&ring, window_rows(rows), cols)
+            self.view.frame(&ring, self.window_rows(rows), cols)
         };
-        self.paint_frame(&frame);
+        self.paint_frame(&frame, rows);
     }
 
     /// The lines one frame is painted from: the seed the entry paint used,
@@ -704,19 +790,156 @@ impl FullscreenSegment {
         lines
     }
 
-    /// Write one frame onto the screen the segment already holds.
+    /// The frame's window on a `rows`-tall screen, above this segment's box.
+    fn window_rows(&self, rows: u16) -> u16 {
+        window_rows_above(rows, self.box_rows)
+    }
+
+    /// Write one frame onto the screen the segment already holds, then pin
+    /// the scroll region above the box and paint the box back.
     ///
     /// The clear and the home cursor are the entry paint's, minus the
     /// alternate-screen enable: this is a repaint of a screen already held,
     /// so re-enabling it would be a second `ESC[?1049h` the leave has no
     /// counterpart for.
-    fn paint_frame(&mut self, frame: &[String]) {
+    fn paint_frame(&mut self, frame: &[String], rows: u16) {
         let _ = self.err.write_all(b"\x1b[2J\x1b[H");
+        self.freed_top = None;
+        self.paint_frame_rows(frame, rows);
+    }
+
+    /// The frame rows from the cursor's current home, each followed by its
+    /// own CRLF, then the region and the box ([`Self::paint_box_region`]).
+    /// Shared by the entry paint (whose clear is `ENTER_ALT_SCREEN`'s) and
+    /// [`Self::paint_frame`].
+    fn paint_frame_rows(&mut self, frame: &[String], rows: u16) {
         for row in frame {
             let _ = self.err.write_all(row.as_bytes());
             let _ = self.err.write_all(b"\r\n");
         }
+        self.paint_box_region(rows);
         let _ = self.err.flush();
+    }
+
+    /// Pin the DECSTBM region to the window above the box, park the cursor on
+    /// the region's bottom row -- the spare row where the next transcript
+    /// line starts -- and paint the box the segment last showed (or an empty
+    /// one). Writes nothing on a screen in the single-row fallback.
+    ///
+    /// The region is what keeps the box **visible while a turn streams**: the
+    /// turn's lines scroll inside the window, and the bottom rows the box
+    /// holds are never scrolled through. Cursor addressing reaches them
+    /// anyway (origin mode is off), which is how the box is painted.
+    fn paint_box_region(&mut self, rows: u16) {
+        if self.box_rows == 0 {
+            return;
+        }
+        let bottom = rows.saturating_sub(self.box_rows).max(1);
+        let _ = self
+            .err
+            .write_all(format!("\x1b[1;{bottom}r\x1b[{bottom};1H").as_bytes());
+        self.region_set = true;
+        if self.last_box.is_none() {
+            let composed = self.empty_box(rows, live::terminal_columns());
+            self.last_box = Some(composed);
+        }
+        self.paint_box_rows(rows);
+        // Back on the spare row: the box paint moved the cursor into the box,
+        // and a transcript line written next belongs in the window.
+        let _ = self.err.write_all(format!("\x1b[{bottom};1H").as_bytes());
+    }
+
+    /// Give the box `height` rows, moving the window's scroll region to match,
+    /// **without repainting the window from the ring**: what is on the screen
+    /// stays on the screen, which matters because not every line on it passed
+    /// the seam (the banner and every direct `eprintln!` did not) and a ring
+    /// repaint would erase them.
+    ///
+    /// * **Growing** by `k` rows scrolls the window up by `k` inside the old
+    ///   region first, so the newest `k` lines move out from under the box
+    ///   instead of being covered; the `k` oldest visible lines leave the top,
+    ///   which is what a shorter window means.
+    /// * **Shrinking** by `k` rows extends the region downwards and blanks the
+    ///   `k` freed rows (they held the old box's top), so the next transcript
+    ///   line starts on the first of them.
+    ///
+    /// Returns the row the cursor belongs on afterwards for a writer that
+    /// continues the transcript: the first freed row after a shrink, the
+    /// region's bottom row otherwise.
+    fn resize_box(&mut self, height: u16, rows: u16) -> u16 {
+        let old = self.box_rows;
+        let new_bottom = rows.saturating_sub(height).max(1);
+        if height == old && self.region_set {
+            return self.freed_top.unwrap_or(new_bottom);
+        }
+        let mut out = String::new();
+        let park = if self.region_set && height > old {
+            let old_bottom = rows.saturating_sub(old).max(1);
+            out.push_str(&format!("\x1b[{old_bottom};1H"));
+            for _ in old..height {
+                out.push('\n');
+            }
+            self.freed_top = None;
+            new_bottom
+        } else if self.region_set && height < old {
+            // A shrink on top of an earlier shrink frees rows above rows that
+            // are already blank: the resume row stays the earlier one.
+            let first_freed = rows.saturating_sub(old).saturating_add(1);
+            for row in first_freed..=new_bottom {
+                out.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+            }
+            let resume = self
+                .freed_top
+                .map_or(first_freed, |top| top.min(first_freed));
+            self.freed_top = Some(resume);
+            resume
+        } else {
+            self.freed_top = None;
+            new_bottom
+        };
+        out.push_str(&format!("\x1b[1;{new_bottom}r\x1b[{park};1H"));
+        let _ = self.err.write_all(out.as_bytes());
+        self.box_rows = height;
+        self.region_set = true;
+        park
+    }
+
+    /// The empty framed box for this segment's prompt, fitted to the screen.
+    fn empty_box(&self, rows: u16, cols: usize) -> live::InputBox {
+        let draft = live::LiveDraft {
+            prompt: self.prompt.clone(),
+            buffer: String::new(),
+            cursor: 0,
+            hint: String::new(),
+            hint_reserved: false,
+        };
+        live::fit_input_box(
+            live::compose_input_box(&draft, cols),
+            usize::from(fullscreen_box_budget(rows)),
+        )
+    }
+
+    /// Paint `last_box` onto the bottom `box_rows` rows by absolute address,
+    /// and leave the cursor on its caret. Rows the box does not fill (a box
+    /// shorter than the rows reserved for it) are cleared above it so a taller
+    /// previous box leaves nothing behind.
+    fn paint_box_rows(&mut self, rows: u16) {
+        let Some(boxed) = self.last_box.as_ref() else {
+            return;
+        };
+        let reserved = usize::from(self.box_rows);
+        let top = usize::from(rows).saturating_sub(reserved).saturating_add(1);
+        let mut out = String::new();
+        let blank = reserved.saturating_sub(boxed.rows.len());
+        for i in 0..blank {
+            out.push_str(&format!("\x1b[{};1H\x1b[2K", top + i));
+        }
+        for (i, row) in boxed.rows.iter().enumerate() {
+            out.push_str(&format!("\x1b[{};1H\x1b[2K{row}", top + blank + i));
+        }
+        let caret_row = top + blank + boxed.caret.0.saturating_sub(1);
+        out.push_str(&format!("\x1b[{caret_row};{}H", boxed.caret.1));
+        let _ = self.err.write_all(out.as_bytes());
     }
 
     /// The lines the frame is painted from, oldest first: the seed plus
@@ -744,9 +967,9 @@ impl FullscreenSegment {
         }
         let frame = {
             let ring = frame_ring(&self.lines_now());
-            self.view.frame(&ring, window_rows(rows), cols)
+            self.view.frame(&ring, self.window_rows(rows), cols)
         };
-        self.paint_frame(&frame);
+        self.paint_frame(&frame, rows);
     }
 
     /// Whether this segment's frame is still following the newest line.
@@ -778,12 +1001,13 @@ impl FullscreenSegment {
         if self.left {
             return;
         }
+        let window = self.window_rows(rows);
         let frame = {
             let ring = frame_ring(&self.lines_now());
-            self.view.page(press, &ring, window_rows(rows));
-            self.view.frame(&ring, window_rows(rows), cols)
+            self.view.page(press, &ring, window);
+            self.view.frame(&ring, window, cols)
         };
-        self.paint_frame(&frame);
+        self.paint_frame(&frame, rows);
     }
 
     /// Paint the composer onto the **bottom row** of the alternate screen,
@@ -830,6 +1054,32 @@ impl FullscreenSegment {
         if self.left {
             return;
         }
+        self.prompt = draft.prompt.clone();
+        let budget = fullscreen_box_budget(rows);
+        if budget >= 3 && input_box_enabled() {
+            // The framed box, the same composition the inline composer paints
+            // (`compose_input_box`), fitted to this screen's budget. It grows
+            // with the draft -- a long line soft-wraps, a pasted block adds
+            // rows -- and when its height changes the window above it is
+            // repainted one size smaller or larger, so the frame never shows
+            // through the box and the box never covers a frame row.
+            let boxed =
+                live::fit_input_box(live::compose_input_box(draft, cols), usize::from(budget));
+            let height = u16::try_from(boxed.rows.len()).unwrap_or(u16::MAX);
+            self.last_box = Some(boxed);
+            self.resize_box(height, rows);
+            self.paint_box_rows(rows);
+            let _ = self.err.flush();
+            return;
+        }
+        if self.box_rows != 0 {
+            // The screen shrank below what a box needs: back to the single
+            // row, with the region released so the window is the screen.
+            self.box_rows = 0;
+            self.last_box = None;
+            let _ = self.err.write_all(b"\x1b[r");
+            self.region_set = false;
+        }
         let (row, caret) = live::compose_input_row(draft, cols);
         let bottom = rows.max(1);
         let _ = self
@@ -859,11 +1109,57 @@ impl FullscreenSegment {
         if self.left {
             return;
         }
+        if self.box_rows != 0 {
+            // The box stays on screen, emptied: the turn's output scrolls in
+            // the region above it, the during-turn collector paints what the
+            // user types next into it (`paint_turn_draft`), and the cursor is
+            // parked on the spare row where the turn's first line belongs.
+            // A box that had grown shrinks back here, which repaints the
+            // window at its larger size.
+            let empty = self.empty_box(rows, live::terminal_columns());
+            let height = u16::try_from(empty.rows.len()).unwrap_or(3);
+            self.last_box = Some(empty);
+            let park = self.resize_box(height, rows);
+            // The turn writes from here on; the freed rows are no longer blank
+            // once it has.
+            self.freed_top = None;
+            self.paint_box_rows(rows);
+            let _ = self.err.write_all(format!("\x1b[{park};1H").as_bytes());
+            let _ = self.err.flush();
+            *lock(&FULLSCREEN_TURN_BOX) = Some(FullscreenTurnBox {
+                box_rows: self.box_rows,
+                prompt: self.prompt.clone(),
+            });
+            return;
+        }
         let bottom = rows.max(1);
         let _ = self
             .err
             .write_all(format!("\x1b[{bottom};1H\x1b[2K").as_bytes());
         let _ = self.err.flush();
+    }
+
+    /// Release the screen for a suspend: the region is reset so the shell
+    /// writes on a whole screen, and the box rows are cleared. The next
+    /// composer paint pins the region and paints the box again.
+    pub(crate) fn release_for_suspend(&mut self, rows: u16) {
+        if self.left {
+            return;
+        }
+        *lock(&FULLSCREEN_TURN_BOX) = None;
+        if self.box_rows == 0 {
+            self.clear_composer(rows);
+            return;
+        }
+        let top = rows.saturating_sub(self.box_rows).saturating_add(1);
+        let mut out = String::from("\x1b[r");
+        for row in top..=rows.max(top) {
+            out.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+        }
+        out.push_str(&format!("\x1b[{top};1H"));
+        let _ = self.err.write_all(out.as_bytes());
+        let _ = self.err.flush();
+        self.region_set = false;
     }
 
     /// Give the terminal back: the alternate screen first, then the title.
@@ -877,6 +1173,7 @@ impl FullscreenSegment {
             return;
         }
         self.left = true;
+        *lock(&FULLSCREEN_TURN_BOX) = None;
         // Before the bytes, so `/tui`'s report cannot observe a renderer the
         // terminal has already been taken back from.
         FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
@@ -892,6 +1189,13 @@ impl FullscreenSegment {
             &(self.tap.clone() as Arc<dyn Surface>),
         ) {
             set_surface(self.previous_surface.clone());
+        }
+        // The region above the box is terminal state, not alternate-screen
+        // state: DECSTBM margins survive `ESC[?1049l`, so a region left pinned
+        // here would clip the primary screen the user is handed back.
+        if self.region_set {
+            let _ = self.err.write_all(b"\x1b[r");
+            self.region_set = false;
         }
         let _ = self.err.write_all(LEAVE_ALT_SCREEN);
         // The mirror of `enter_fullscreen`'s gate (cards H2-title and
@@ -957,7 +1261,8 @@ pub(crate) fn enter_fullscreen(
     cols: usize,
     ring_lines: usize,
 ) -> FullscreenSegment {
-    let frame = fullscreen_frame(lines, rows, cols);
+    let box_rows = initial_box_rows(rows);
+    let frame = fullscreen_frame(lines, rows, cols, box_rows);
 
     let mut err = err;
     // Card F94: **before** the bytes, and the opposite order to
@@ -984,10 +1289,6 @@ pub(crate) fn enter_fullscreen(
         let _ = err.write_all(PUSH_TITLE);
     }
     let _ = err.write_all(ENTER_ALT_SCREEN);
-    for row in &frame {
-        let _ = err.write_all(row.as_bytes());
-        let _ = err.write_all(b"\r\n");
-    }
     let _ = err.flush();
     // After the bytes: the terminal is held by the time anything can report
     // that it is.
@@ -1005,7 +1306,7 @@ pub(crate) fn enter_fullscreen(
         ring: std::sync::Mutex::new(kitsu_tui::cells::CellRing::new(ring_lines.max(1))),
     });
     let previous_surface = set_surface(tap.clone());
-    FullscreenSegment {
+    let mut segment = FullscreenSegment {
         err,
         left: false,
         seed: lines.to_vec(),
@@ -1014,7 +1315,18 @@ pub(crate) fn enter_fullscreen(
         painted_tap_lines: 0,
         pushed_title,
         view: kitsu_tui::fullscreen::FullscreenView::new(),
-    }
+        box_rows,
+        region_set: false,
+        last_box: None,
+        prompt: "kitsu> ".to_string(),
+        freed_top: None,
+    };
+    // The entry frame, then the region and the empty box under it: the box is
+    // on screen from the first frame, not from the first keystroke. The
+    // screen was cleared and homed by `ENTER_ALT_SCREEN`, so only the rows
+    // are written here.
+    segment.paint_frame_rows(&frame, rows);
+    segment
 }
 
 /// Whose words a submitted line is.
@@ -1092,9 +1404,18 @@ pub(crate) fn echo_submitted_prompt(prompt: &str, text: &str, origin: PromptOrig
 /// came from belongs to the surface the inline teardown already put back. Its
 /// limit is the line count, so nothing is evicted and the view's follow anchor
 /// resolves to the newest `rows - 1` lines.
-fn fullscreen_frame(lines: &[kitsu_tui::cells::CellLine], rows: u16, cols: usize) -> Vec<String> {
+fn fullscreen_frame(
+    lines: &[kitsu_tui::cells::CellLine],
+    rows: u16,
+    cols: usize,
+    box_rows: u16,
+) -> Vec<String> {
     let ring = frame_ring(lines);
-    kitsu_tui::fullscreen::FullscreenView::new().frame(&ring, window_rows(rows), cols)
+    kitsu_tui::fullscreen::FullscreenView::new().frame(
+        &ring,
+        window_rows_above(rows, box_rows),
+        cols,
+    )
 }
 
 /// The ring one frame is read through, rebuilt over the caller's copy of the
@@ -1112,15 +1433,6 @@ pub(crate) fn frame_ring(lines: &[kitsu_tui::cells::CellLine]) -> kitsu_tui::cel
         ring.push_retained(line);
     }
     ring
-}
-
-/// The frame's window: the screen minus the composer's bottom row.
-///
-/// One row is the composer's on every paint -- the entry frame's, the
-/// ring-grew repaint's and a page press's -- so the subtraction lives in one
-/// place rather than at each of the three.
-fn window_rows(rows: u16) -> u16 {
-    rows.saturating_sub(1)
 }
 
 /// The pinned pane: the inline viewport plus the geometry currently latched
@@ -1449,7 +1761,7 @@ pub(crate) fn paint_turn_draft(
     hint_reserved: bool,
 ) -> bool {
     let Some(pane) = lock(&MODAL_PANE).clone() else {
-        return false;
+        return paint_fullscreen_turn_draft(prompt, draft, cursor, hint, hint_reserved);
     };
     let turn = TurnDraft {
         prompt: prompt.to_string(),
@@ -1460,6 +1772,63 @@ pub(crate) fn paint_turn_draft(
     };
     *lock(&TURN_DRAFT) = Some(turn.clone());
     paint_turn_draft_on(&pane, &turn)
+}
+
+/// The fullscreen counterpart of the pinned pane's during-turn paint: the
+/// draft typed while a turn streams goes into the framed box the fullscreen
+/// segment left on the bottom rows (`FullscreenSegment::clear_composer`).
+///
+/// The box cannot grow mid-turn -- growing it means repainting the window,
+/// which the streaming turn owns -- so the draft is fitted to the rows the
+/// box already holds; the idle paint that follows the turn grows it. The
+/// cursor is saved and restored around the paint so the turn's output
+/// continues where it was, and the whole paint runs under the live row's
+/// suspension so it cannot interleave with a transcript write to the same
+/// terminal. Returns false when no fullscreen segment is live either.
+fn paint_fullscreen_turn_draft(
+    prompt: &str,
+    draft: &str,
+    cursor: usize,
+    hint: &str,
+    hint_reserved: bool,
+) -> bool {
+    let Some(turn_box) = lock(&FULLSCREEN_TURN_BOX).clone() else {
+        return false;
+    };
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let composed = live::LiveDraft {
+        prompt: if prompt.is_empty() {
+            turn_box.prompt.clone()
+        } else {
+            prompt.to_string()
+        },
+        buffer: draft.to_string(),
+        cursor,
+        hint: hint.to_string(),
+        hint_reserved,
+    };
+    let reserved = usize::from(turn_box.box_rows);
+    let boxed = live::fit_input_box(
+        live::compose_input_box(&composed, usize::from(cols)),
+        reserved,
+    );
+    let top = usize::from(rows).saturating_sub(reserved).saturating_add(1);
+    let blank = reserved.saturating_sub(boxed.rows.len());
+    let mut out = String::from("\x1b7");
+    for i in 0..blank {
+        out.push_str(&format!("\x1b[{};1H\x1b[2K", top + i));
+    }
+    for (i, row) in boxed.rows.iter().enumerate() {
+        out.push_str(&format!("\x1b[{};1H\x1b[2K{row}", top + blank + i));
+    }
+    out.push_str("\x1b8");
+    live::with_live_row_suspended(|| {
+        use std::io::Write as _;
+        let mut err = std::io::stderr();
+        let _ = err.write_all(out.as_bytes());
+        let _ = err.flush();
+    });
+    true
 }
 
 /// Paint one [`TurnDraft`] on `pane` without touching the stored `TURN_DRAFT`.

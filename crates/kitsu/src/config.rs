@@ -177,12 +177,15 @@ pub struct HooksConfig {
 /// tail through `kitsu_tui::fullscreen::FullscreenView`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TuiMode {
-    /// The line renderer kitsu has always had, and the default: the inline
-    /// viewport is a preview until the terminal matrix
-    /// (docs/roadmap/cycles/e11/terminal-matrix.md) has been run by a human.
-    #[default]
+    /// The line renderer kitsu has always had. No longer the default, but
+    /// still what every non-terminal carrier gets: a piped, scripted or
+    /// `--jsonl` run resolves to it regardless of the default, because the
+    /// inline viewport's escapes have no business in a pipe. `--no-tui` (or
+    /// `--tui classic`) selects it on a terminal.
     Classic,
-    /// The pinned inline viewport from `kitsu-tui`.
+    /// The pinned inline viewport from `kitsu-tui`, and the default when a
+    /// human is at a terminal (stdin and stdout are TTYs, plain mode off).
+    #[default]
     Inline,
     /// The fullscreen transcript renderer: the terminal's alternate screen,
     /// painted from the cell ring the inline viewport retains. A session can
@@ -412,9 +415,12 @@ where
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TuiConfig {
-    /// Which renderer the session runs. `--tui <MODE>` overrides.
-    #[serde(default, deserialize_with = "deserialize_tui_mode")]
-    pub mode: TuiMode,
+    /// Which renderer the session runs. `--tui <MODE>` overrides. `None` when
+    /// the key is absent: the caller then applies [`TuiMode::default`], but
+    /// only where the default can paint (see `mode_is_configured`), so an
+    /// absent key and an explicit `mode = "inline"` stay distinguishable.
+    #[serde(default, deserialize_with = "deserialize_tui_mode_present")]
+    pub mode: Option<TuiMode>,
     /// Whether the session takes the alternate screen. `--no-alt-screen`
     /// forces `never`.
     #[serde(default, deserialize_with = "deserialize_alternate_screen")]
@@ -466,6 +472,15 @@ fn default_true() -> bool {
 fn default_cell_ring_lines() -> usize {
     TuiConfig::DEFAULT_CELL_RING_LINES
 }
+/// `mode`'s presence-preserving deserializer: the same grammar and the same
+/// refusal as [`deserialize_tui_mode`], wrapped in `Some` so an absent key
+/// (serde's `default`, `None`) is not mistaken for a typed `mode = "inline"`.
+fn deserialize_tui_mode_present<'de, D>(deserializer: D) -> Result<Option<TuiMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_tui_mode(deserializer).map(Some)
+}
 
 // Hand-written rather than derived, for the reason `AgentsConfig` carries the
 // same note: every caller reads the table as `tui.unwrap_or_default()`, which
@@ -476,7 +491,7 @@ fn default_cell_ring_lines() -> usize {
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
-            mode: TuiMode::default(),
+            mode: None,
             alternate_screen: AlternateScreen::default(),
             prefix: default_tui_prefix(),
             title: true,
@@ -501,7 +516,32 @@ impl TuiConfig {
     /// default. There is no fourth source — the `KITSU_TUI` preview gate was
     /// retired with this card, so nothing here reads the environment.
     pub fn effective_mode(&self, flag: Option<TuiMode>) -> TuiMode {
-        flag.unwrap_or(self.mode)
+        flag.or(self.mode).unwrap_or_default()
+    }
+
+    /// Whether `[tui] mode` was written in the file, as opposed to defaulted.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn mode_is_configured(&self) -> bool {
+        self.mode.is_some()
+    }
+
+    /// [`effective_mode`](Self::effective_mode) with the default guarded by
+    /// the carrier: when neither `--tui` nor `[tui] mode` named a renderer,
+    /// the inline default applies only where it can paint
+    /// (`terminal_can_paint`: stdin and stdout are terminals and plain mode
+    /// is off). Every other carrier -- piped, scripted, `--jsonl`, `--plain`,
+    /// a redirected stdout -- falls back to classic, so automation byte
+    /// streams are exactly what they were before inline became the default.
+    /// A renderer asked for by name is honoured as typed, pipe or no pipe.
+    pub fn effective_mode_for_carrier(
+        &self,
+        flag: Option<TuiMode>,
+        terminal_can_paint: bool,
+    ) -> TuiMode {
+        if flag.is_none() && self.mode.is_none() && !terminal_can_paint {
+            return TuiMode::Classic;
+        }
+        self.effective_mode(flag)
     }
 
     /// The alternate-screen decision this run uses, or a refusal.
@@ -1553,7 +1593,7 @@ mod tests {
         )
         .expect("the full [tui] table must parse");
         let tui = parsed.tui.expect("[tui] must be present when written");
-        assert_eq!(tui.mode, TuiMode::Inline);
+        assert_eq!(tui.mode, Some(TuiMode::Inline));
         assert_eq!(tui.alternate_screen, AlternateScreen::Always);
         assert_eq!(tui.prefix, "ctrl+b");
         assert!(!tui.title);
@@ -1563,7 +1603,11 @@ mod tests {
         // ...and each value above differs from the default, which is what
         // makes the assertions non-vacuous.
         let default = TuiConfig::default();
-        assert_ne!(default.mode, TuiMode::Inline);
+        assert_ne!(
+            default.mode,
+            Some(TuiMode::Inline),
+            "an absent key is None, not a typed inline"
+        );
         assert_ne!(default.alternate_screen, AlternateScreen::Always);
         assert_ne!(default.prefix, "ctrl+b");
         assert!(default.title);
@@ -1589,10 +1633,11 @@ mod tests {
             ("struct default", TuiConfig::default()),
         ];
         for (label, tui) in tables {
-            // `mode` is classic until a human has run the Q1 terminal matrix
-            // (docs/roadmap/cycles/e11/terminal-matrix.md). Nothing in this
-            // card may make the preview renderer the default.
-            assert_eq!(tui.mode, TuiMode::Classic, "{label}: mode");
+            // An absent `mode` key stays `None`, so the renderer can tell "the
+            // user typed nothing" (default: inline at a terminal, classic on
+            // any other carrier) from a typed `mode = "inline"`.
+            assert_eq!(tui.mode, None, "{label}: mode");
+            assert!(!tui.mode_is_configured(), "{label}: mode not configured");
             assert_eq!(
                 tui.alternate_screen,
                 AlternateScreen::Auto,
@@ -1624,7 +1669,8 @@ mod tests {
     fn tui_keys_default_independently_of_one_another() {
         let parsed: Config = toml::from_str("[tui]\nmode = \"inline\"\n").unwrap();
         let tui = parsed.tui.unwrap_or_default();
-        assert_eq!(tui.mode, TuiMode::Inline);
+        assert_eq!(tui.mode, Some(TuiMode::Inline));
+        assert!(tui.mode_is_configured());
         assert_eq!(tui.alternate_screen, AlternateScreen::Auto);
         assert_eq!(tui.prefix, "ctrl+x");
         assert!(tui.title);
@@ -1637,9 +1683,12 @@ mod tests {
     /// T3-S2, "env gate removed"), so nothing reads the environment here.
     #[test]
     fn tui_mode_precedence_is_flag_then_config_then_default() {
-        let classic = TuiConfig::default();
+        let classic = TuiConfig {
+            mode: Some(TuiMode::Classic),
+            ..TuiConfig::default()
+        };
         let inline = TuiConfig {
-            mode: TuiMode::Inline,
+            mode: Some(TuiMode::Inline),
             ..TuiConfig::default()
         };
 
@@ -1659,8 +1708,46 @@ mod tests {
         assert_eq!(classic.effective_mode(None), TuiMode::Classic);
         assert_eq!(
             TuiConfig::default().effective_mode(None),
-            TuiMode::Classic,
-            "a config with no [tui] table must still be classic"
+            TuiMode::Inline,
+            "a config with no [tui] table defaults to inline"
+        );
+    }
+
+    /// The inline default is guarded by the carrier: with nothing named by
+    /// `--tui` or `[tui] mode`, a carrier that cannot paint (piped, scripted,
+    /// `--jsonl`, `--plain`, redirected stdout) gets classic, so automation
+    /// output is byte-identical to before. A renderer named by either source
+    /// is honoured as typed, whatever the carrier.
+    #[test]
+    fn inline_default_falls_back_to_classic_off_a_terminal_but_named_modes_do_not() {
+        let unset = TuiConfig::default();
+        assert_eq!(
+            unset.effective_mode_for_carrier(None, true),
+            TuiMode::Inline
+        );
+        assert_eq!(
+            unset.effective_mode_for_carrier(None, false),
+            TuiMode::Classic
+        );
+
+        // `--tui inline` on a pipe: honoured, as it always was.
+        assert_eq!(
+            unset.effective_mode_for_carrier(Some(TuiMode::Inline), false),
+            TuiMode::Inline
+        );
+        // `[tui] mode = "fullscreen"` on a pipe: honoured, as it always was.
+        let configured = TuiConfig {
+            mode: Some(TuiMode::Fullscreen),
+            ..TuiConfig::default()
+        };
+        assert_eq!(
+            configured.effective_mode_for_carrier(None, false),
+            TuiMode::Fullscreen
+        );
+        // `--no-tui` arrives here as `Some(Classic)` and wins over both.
+        assert_eq!(
+            configured.effective_mode_for_carrier(Some(TuiMode::Classic), true),
+            TuiMode::Classic
         );
     }
 
@@ -1799,7 +1886,7 @@ mod tests {
 
         // The accepted spelling, so the loop above is not rejecting everything.
         let parsed: Config = toml::from_str("[tui]\nmode = \"inline\"\n").unwrap();
-        assert_eq!(parsed.tui.unwrap_or_default().mode, TuiMode::Inline);
+        assert_eq!(parsed.tui.unwrap_or_default().mode, Some(TuiMode::Inline));
     }
 
     /// Fullscreen is T5's renderer, and **T5-S2 is where it arrives**, so
@@ -1836,7 +1923,7 @@ mod tests {
         // itself.
         assert_eq!(
             mode,
-            TuiMode::Fullscreen,
+            Some(TuiMode::Fullscreen),
             "`fullscreen` must parse as itself and must not be coerced onto \
              the inline viewport or onto classic — the silent fallback this \
              test has guarded since T3-S2"
@@ -2188,7 +2275,7 @@ mod tests {
         )
         .expect("all three tables must coexist");
         assert_eq!(parsed.agent_spawn_cap, Some(3));
-        assert_eq!(parsed.tui.unwrap_or_default().mode, TuiMode::Inline);
+        assert_eq!(parsed.tui.unwrap_or_default().mode, Some(TuiMode::Inline));
         assert_eq!(
             parsed.agents.unwrap_or_default().state_file,
             StateFileMode::On

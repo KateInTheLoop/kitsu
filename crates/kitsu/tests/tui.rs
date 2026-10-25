@@ -392,6 +392,13 @@ struct Options {
     /// child's composer is always set explicitly so an ambient
     /// `KITSU_INPUT_BOX` in the runner's shell cannot choose it.
     input_box: bool,
+    /// Pass no renderer flag at all, so the child resolves the *default*.
+    ///
+    /// Off by default: with the inline viewport now the default at a
+    /// terminal, `tui: None` passes `--no-tui` to keep every classic-mode
+    /// measurement meaning what it meant. Only the test that measures the
+    /// default itself sets this.
+    default_renderer: bool,
 }
 
 impl Default for Options {
@@ -402,6 +409,7 @@ impl Default for Options {
             legacy_env_gate: false,
             size: (ROWS, COLS),
             input_box: false,
+            default_renderer: false,
         }
     }
 }
@@ -417,8 +425,10 @@ fn run_styled_chat_pty(home: &Path, tui: Option<&str>, script: &[Step]) -> Sessi
 /// The child gets all three descriptors on the PTY slave (one `dup` each, the
 /// same discipline `tests/cli.rs` uses) and no `--plain`/`--no-stream`, so
 /// styling and the viewport are live. `tui` is the value passed to the
-/// `--tui <MODE>` flag: `None` passes no flag at all, which is classic mode
-/// (plan row T3-S2 retired the `KITSU_TUI` gate).
+/// `--tui <MODE>` flag; `None` passes `--no-tui`, so every measurement that
+/// predates the inline default still runs the classic renderer it was
+/// written against (plan row T3-S2 retired the `KITSU_TUI` gate). The one
+/// way to run the *default* renderer is [`Options::default_renderer`].
 ///
 /// `options` carries everything that is not the script; see [`Options`].
 fn run_styled_chat_pty_with(
@@ -569,8 +579,19 @@ fn run_styled_chat_pty_core(
     if options.legacy_env_gate {
         command.env("KITSU_TUI", "inline");
     }
-    if let Some(mode) = tui {
-        command.args(["--tui", mode]);
+    // The inline viewport is the default at a terminal, and a PTY is one. The
+    // classic-mode measurements in this file were written when no flag meant
+    // classic, so `None` now says so explicitly with `--no-tui`; only
+    // `default_renderer` omits the flag, for the test that measures the
+    // default itself.
+    match tui {
+        Some(mode) => {
+            command.args(["--tui", mode]);
+        }
+        None if options.default_renderer => {}
+        None => {
+            command.arg("--no-tui");
+        }
     }
 
     let mut child = command.spawn().expect("spawn styled carrier chat");
@@ -5746,10 +5767,14 @@ fn tui_switch_from_inline_into_fullscreen_repaints_the_ring() {
          not pin a second inline region; raw:\n{}",
         text.escape_debug()
     );
+    // Two releases: the inline segment's on the way into fullscreen, and the
+    // fullscreen segment's own on the way out -- fullscreen pins a region of
+    // its own above its framed input box, and gives it back with the screen.
     assert_eq!(
         session.raw_count(REGION_RESET),
-        1,
-        "and it is released exactly once; raw:\n{}",
+        2,
+        "the inline region is released once and the fullscreen box region \
+         once; raw:\n{}",
         text.escape_debug()
     );
     assert_eq!(
@@ -5868,10 +5893,13 @@ fn tui_switch_from_fullscreen_into_inline_re_pins_and_republishes_the_status_row
         "the switch into inline pins the region exactly once; raw:\n{}",
         text.escape_debug()
     );
+    // Two releases: the fullscreen segment's own box region on the way into
+    // inline, and the inline region's at exit.
     assert_eq!(
         session.raw_count(REGION_RESET),
-        1,
-        "and releases it exactly once, at exit; raw:\n{}",
+        2,
+        "the fullscreen box region is released at the switch and the inline \
+         region at exit; raw:\n{}",
         text.escape_debug()
     );
 
@@ -6157,24 +6185,29 @@ fn tui_fullscreen_frame_follows_the_ring_while_it_is_live() {
         text.escape_debug()
     );
 
-    // F97's assertion. Two occurrences is the single paint; three is a frame
-    // painted again after the ring grew.
+    // F97's assertion. The retained line is painted once by the inline
+    // transcript and once by the entry frame. The frame follows the ring from
+    // there by **scrolling**: fullscreen pins a region above its input box,
+    // so the second turn's line scrolls into the window as it is written and
+    // the following frame needs no repaint (a repaint from the ring would
+    // erase every line that reached the screen without passing the seam --
+    // the banner, `/help`, every direct `eprintln!`). Two occurrences, then,
+    // and the appended line written *after* the entry frame.
     assert!(
-        session.raw_count(RING_MARK) >= 3,
-        "the fullscreen frame must FOLLOW the ring: the retained line is \
-         painted once by the inline transcript and once by the entry frame, \
-         so a third occurrence is the repaint that a mode which paints one \
-         frame and returns can never produce (F97). Counted {}; \
+        session.raw_count(RING_MARK) >= 2,
+        "the fullscreen frame must hold the retained line: once in the inline \
+         transcript and once in the entry frame (F97). Counted {}; \
          everything from the alternate screen onwards:\n{}",
         session.raw_count(RING_MARK),
         text[entered_at..].escape_debug()
     );
 
-    // ...and that repaint is a frame, with the appended line below the
-    // retained one (`fullscreen`'s transition 10).
+    // ...and the appended line lands below the retained one (`fullscreen`'s
+    // transition 10): after the entry frame in the stream, which on a screen
+    // the region scrolls is below it.
     let last_mark = text
         .rfind(RING_MARK)
-        .expect("the marker was just counted at least three times");
+        .expect("the marker was just counted at least twice");
     assert!(
         last_mark > entered_at,
         "the last paint of the retained line must be inside the alternate \
@@ -6907,6 +6940,109 @@ fn tui_switch_back_into_inline_still_restores_on_a_signal() {
     assert!(
         !session.status.success(),
         "a signalled session does not exit successfully; it exited {:?}",
+        session.status
+    );
+}
+
+/// **Fullscreen's composer is the framed input box, under a region of its
+/// own.** A session started with `--tui fullscreen` paints the box's top
+/// border across the full width on the alternate screen, pins a DECSTBM
+/// region that stops three rows short of the bottom (the empty box's
+/// height), and releases that region on the way out.
+#[test]
+#[serial]
+fn fullscreen_idle_prompt_paints_the_framed_box_under_its_own_region() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty_with(
+        home.path(),
+        Some("fullscreen"),
+        &help_then_quit(),
+        Options::default(),
+    );
+    let text = session.raw_text();
+    let entered_at = text.find(ALT_SCREEN_ON).unwrap_or_else(|| {
+        panic!(
+            "`--tui fullscreen` must take the alternate screen; raw:\n{}",
+            text.escape_debug()
+        )
+    });
+    let after = &text[entered_at..];
+    let box_region = format!("\x1b[1;{}r", ROWS - 3);
+    assert!(
+        after.contains(&box_region),
+        "fullscreen pins a scroll region above the three-row empty box \
+         ({box_region:?}); everything from the alternate screen onwards:\n{}",
+        after.escape_debug()
+    );
+    let box_top = format!("╭{}╮", "─".repeat(usize::from(COLS) - 2));
+    assert!(
+        after.contains(&box_top),
+        "and paints the box's full-width top border on it; everything from \
+         the alternate screen onwards:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        after.contains("│ kitsu> "),
+        "with the prompt inside the frame; everything from the alternate \
+         screen onwards:\n{}",
+        after.escape_debug()
+    );
+    assert!(
+        session.raw_count(REGION_RESET) >= 1,
+        "the region is released on the way out; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "a fullscreen session that quits cleanly exits 0; it exited {:?}",
+        session.status
+    );
+    assert!(
+        session.raw_mode_off(),
+        "the pty must be canonical again after the session: {}",
+        session.termios_dump()
+    );
+}
+
+/// **The inline viewport is the default at a terminal.** With no `--tui`, no
+/// `--no-tui` and no `[tui] mode`, a session on a PTY pins the scroll region
+/// and releases it on exit -- the same bytes `--tui inline` produces. The
+/// classic measurements around this one all pass `--no-tui` (see
+/// `run_styled_chat_pty_with`), which is what keeps them meaningful now that
+/// silence no longer means classic. The piped/scripted side of the same
+/// default -- no escapes at all off a terminal -- is unit-tested on
+/// `TuiConfig::effective_mode_for_carrier` and measured by every piped test
+/// in `tests/cli.rs`, none of which passes a renderer flag.
+#[test]
+#[serial]
+fn default_renderer_on_a_pty_is_the_inline_viewport() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path());
+    let session = run_styled_chat_pty_with(
+        home.path(),
+        None,
+        &help_then_quit(),
+        Options {
+            default_renderer: true,
+            ..Options::default()
+        },
+    );
+    let text = session.raw_text();
+
+    assert!(
+        session.raw_count(&tui_region()) >= 1,
+        "the default renderer pins a region; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.raw_count("\x1b[r") >= 1,
+        "and releases it on exit; raw:\n{}",
+        text.escape_debug()
+    );
+    assert!(
+        session.status.success(),
+        "a default session that quits cleanly exits 0; it exited {:?}",
         session.status
     );
 }
