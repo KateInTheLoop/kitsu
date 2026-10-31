@@ -2126,7 +2126,7 @@ fn test_slash_palette_and_footer_fit_a_fifty_column_pty() {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0,
@@ -14769,7 +14769,7 @@ fn test_status_styled_deck_uses_narrow_layout_on_a_thirty_two_column_pty() {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0,
@@ -21373,6 +21373,13 @@ async fn run_dropped_tool_result(
             piped.push(PROMPT_READ_THE_EVIDENCE);
             let output = base_cmd(home.path())
                 .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+                // This fixture pins the ordinary non-TTY channel; plain and
+                // screen-reader carriers have separate cases below. Do not
+                // let the developer shell silently select another surface.
+                .env("TERM", "xterm-256color")
+                .env_remove("NO_COLOR")
+                .env_remove("KITSU_PLAIN")
+                .env_remove("KITSU_SCREEN_READER")
                 .current_dir(work.path())
                 .args(&piped)
                 .output()

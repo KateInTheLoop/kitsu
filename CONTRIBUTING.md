@@ -22,6 +22,19 @@ RUSTFLAGS=-Dunused-must-use cargo check --workspace --all-targets --locked
 cargo test --workspace --release --locked
 ```
 
+The `kitsu` package's unit tests run through its library target; `--bin kitsu`
+only selects the executable wrapper. For focused checks:
+
+```bash
+cargo test -p kitsu --lib --locked
+cargo test -p kitsu --test cli --locked
+cargo test -p kitsu --test tui --locked
+```
+
+Keep entry-point unit tests in `crates/kitsu/src/tests/`, grouped by behavior.
+Use `support.rs` for shared fixtures and `crates/kitsu/tests/` for process-level
+integration tests; do not put test bodies back into `main.rs`.
+
 HTTP and PTY tests require local sockets and terminal resources. If a sandbox
 blocks them, run with the required permissions rather than weakening the test.
 Some session fault-injection tests can interfere in parallel; when diagnosing
