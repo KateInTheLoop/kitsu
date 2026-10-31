@@ -95,7 +95,7 @@ pub(crate) fn split_command(command: &str) -> Option<Vec<String>> {
 /// The word for an agent's state. Byte-identical to the vocabulary `/jobs`
 /// prints, so one agent is never described two ways.
 pub(crate) fn agent_state_label(status: AgentProgressStatus) -> &'static str {
-    crate::agent_progress_status_label(status)
+    crate::agent_commands::agent_progress_status_label(status)
 }
 
 /// One agent as observed at a turn boundary: the input to [`transitions`].
@@ -377,7 +377,7 @@ mod tests {
         for status in ALL_STATUSES {
             assert_eq!(
                 agent_state_label(status),
-                crate::agent_progress_status_label(status),
+                crate::agent_commands::agent_progress_status_label(status),
                 "the hook and /jobs must agree about {status:?}"
             );
         }

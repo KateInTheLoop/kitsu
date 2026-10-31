@@ -99,7 +99,7 @@ pub(crate) struct BridgeGuard {
     /// Requirement **R5**'s live status row, once a session has one.
     ///
     /// `RefCell` because the guard is held by shared reference everywhere
-    /// (exactly as [`rows`](Self::rows) is a `Cell`) and the session that owns
+    /// (the pane's geometry is also shared through atomics) and the session that owns
     /// the fields does not exist yet when `install` runs: the viewport is
     /// installed before the prompt queue the queue tag counts.
     live_status: std::cell::RefCell<Option<Arc<StatusSource>>>,
@@ -1913,7 +1913,7 @@ pub(crate) const AMBIENT_LATENCY_BUDGET: std::time::Duration =
 ///
 /// The during-turn half of A8 was already met: `run_live_typeahead` syncs the counts
 /// and calls [`repaint_status_row`] once per `AMBIENT_TICK_POLL_MS`
-/// (`main.rs`) tick, for the whole of every foreground turn. The **idle**
+/// (`terminal::typeahead`) tick, for the whole of every foreground turn. The **idle**
 /// half was not, until this cadence. `read_line_inline_with_keys` blocks in `read()` with no
 /// timeout and nothing else repaints between turns, so a background agent
 /// that blocks while the user is sitting at the composer changes the registry
@@ -1928,7 +1928,7 @@ pub(crate) const AMBIENT_LATENCY_BUDGET: std::time::Duration =
 ///
 /// # What drives it
 ///
-/// [`spawn_idle_ambient_cadence`] (one production call site, `main.rs`, right
+/// [`spawn_idle_ambient_cadence`] (one production call site, `chat`, right
 /// where the session's [`StatusSource`] is built) subscribes to
 /// `AgentRegistry::subscribe` and runs [`idle_ambient_cadence_step`] for the
 /// life of the session. A registry change wakes the step, which calls
@@ -2017,7 +2017,7 @@ where
 /// Install the idle composer's ambient cadence for the session: card
 /// **T4-S8**, requirement **A8**.
 ///
-/// The **one** production caller is `main.rs`, beside the session's
+/// The **one** production caller is `chat::run_chat`, beside the session's
 /// [`StatusSource`]. Deliberately ungated — unlike the classic-mode
 /// external-printer notifier, which is behind `KITSU_LIVE_NOTICES` and an
 /// assistive-input check and therefore leaves a default TUI session with no
@@ -2178,7 +2178,7 @@ impl BridgeGuard {
     ///
     /// `rich` is a parameter rather than something read here because the
     /// surface's styling is the *renderer's* state, not this process's
-    /// stderr: `main.rs` passes what the renderer decided.
+    /// stderr: `terminal::input` passes what the renderer decided.
     ///
     /// The palette is recomputed on every call rather than cached. It is a
     /// few `format!`s over a static registry once per keystroke, and a cache
@@ -2213,7 +2213,7 @@ impl BridgeGuard {
     }
 
     /// A terminal resize that keeps the viewport's **current** height, for
-    /// `main.rs`'s `on_resize` to call instead of `resize(rows, 1)`.
+    /// `terminal::input`'s `on_resize` to call instead of `resize(rows, 1)`.
     ///
     /// The hardcoded one row is the defect: a resize with the palette open
     /// collapsed it to its bottom row and left the rest of the box inside the
@@ -2320,11 +2320,11 @@ impl PinnedPane {
             let boxed = live::fit_input_box(live::compose_input_box(&composed, columns), grant);
             let budget = u16::try_from(grant.saturating_sub(boxed.rows.len())).unwrap_or(0);
             let mut content = vec![status_row()];
-            if crate::slash_palette_adds_to_the_row(draft, hint) {
+            if crate::terminal::completion::slash_palette_adds_to_the_row(draft, hint) {
                 content.extend(palette_rows(
                     draft,
                     rich,
-                    crate::composer_surface_inner_width(Some(columns)),
+                    crate::terminal::completion::composer_surface_inner_width(Some(columns)),
                     budget,
                 ));
             }
@@ -2350,11 +2350,12 @@ impl PinnedPane {
         // call, not this module's: a draft that already names a command, or
         // whose hint points somewhere the list does not lead, gets the row
         // alone rather than a menu that contradicts it.
-        let mut content = if crate::slash_palette_adds_to_the_row(draft, hint) {
+        let mut content = if crate::terminal::completion::slash_palette_adds_to_the_row(draft, hint)
+        {
             palette_rows(
                 draft,
                 rich,
-                crate::composer_surface_inner_width(Some(columns)),
+                crate::terminal::completion::composer_surface_inner_width(Some(columns)),
                 budget,
             )
         } else {
@@ -2485,7 +2486,7 @@ impl PinnedPane {
     /// Returns whether a viewport is pinned once the resize has been applied.
     ///
     /// [`release_for_suspend`]: BridgeGuard::release_for_suspend
-    /// [`reinstall_after_resume`]: Self::reinstall_after_resume
+    /// [`reinstall_after_resume`]: BridgeGuard::reinstall_after_resume
     pub(crate) fn resize(&self, rows: u16, viewport_rows: u16) -> bool {
         // Exactly the suspend pair with new dimensions, minus the paint --
         // and *one* pair rather than four branches, because both halves are
@@ -3496,7 +3497,7 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
 
     let mut pages = pages;
 
-    /// The hint slot, derived exactly as `main.rs`'s `update_live_row`
+    /// The hint slot, derived exactly as `terminal::typeahead::update_live_row`
     /// derives it for the classic row: the reverse-search status while Ctrl+R
     /// is active (reserved, so it keeps its columns against a long matched
     /// draft), the inline slash-completion suffix otherwise (unreserved).
@@ -3512,7 +3513,9 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
         }
         let search_status = editor.search_status();
         let hint_reserved = search_status.is_some();
-        let hint = search_status.unwrap_or_else(|| crate::idle_slash_hint(&editor.buffer_string()));
+        let hint = search_status.unwrap_or_else(|| {
+            crate::terminal::completion::idle_slash_hint(&editor.buffer_string())
+        });
         (hint, hint_reserved)
     }
 
@@ -3721,7 +3724,7 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
                 // is painted: the signal and the terminal are the caller's.
                 EditorAction::Suspend => return Ok(InlineRead::Suspended(editor.buffer_string())),
                 // Tab accepts the inline slash hint, if one is showing --
-                // parity with the during-turn collector's arm in `main.rs`.
+                // parity with the during-turn collector in `terminal::typeahead`.
                 //
                 // The hint is recomputed from the buffer here rather than
                 // reusing `hint_of`: that helper returns the reverse-search
@@ -3733,7 +3736,7 @@ pub(crate) fn read_line_inline_with_keys<R: std::io::Read>(
                 // arm runs -- the difference is reachable, not theoretical.
                 EditorAction::CompleteRequest => {
                     let buffer = editor.buffer_string();
-                    let hint = crate::idle_slash_hint(&buffer);
+                    let hint = crate::terminal::completion::idle_slash_hint(&buffer);
                     if !hint.is_empty() {
                         editor.replace_buffer(&format!("{buffer}{hint}"));
                         // Set explicitly rather than leaning on the
@@ -3848,9 +3851,9 @@ pub(crate) const PALETTE_MIN_ROWS: u16 = 3;
 /// `buffer` is the composer's raw buffer, slash included: anything that is not
 /// a single-token slash prefix (an empty buffer, ordinary text, a buffer with
 /// whitespace or a newline) has no palette, exactly as `ChatHelper::hint`
-/// decides in `main.rs`. The content itself comes from
-/// [`crate::slash_palette_rows`] -- there is deliberately no second palette
-/// renderer, because two that drift would be worse than one.
+/// decides in `terminal::completion`. The content itself comes from
+/// [`crate::terminal::completion::slash_palette_rows`], keeping one palette
+/// renderer for both adapters.
 ///
 /// Returns at most `max_rows` complete lines, none of them newline-terminated,
 /// where the first is always the top border and the last always the footer
@@ -3881,14 +3884,14 @@ pub(crate) fn palette_rows(
     // frame character sets, the `no matching command` line and the
     // row-selection step -- lives there, so there is nothing here to drift
     // from it.
-    crate::slash_palette_rows(prefix, rich, inner_width, max_rows)
+    crate::terminal::completion::slash_palette_rows(prefix, rich, inner_width, max_rows)
 }
 
 /// The inline composer's completion host.
 ///
 /// This is the whole of the inline host: a delegate. Every candidate comes
-/// from [`crate::ComposerCompletion`], which is also the classic Rustyline
-/// `ChatHelper`'s only source, so the two cannot disagree -- there is nothing
+/// from [`crate::terminal::completion::ComposerCompletion`], which is also the
+/// classic Rustyline `ChatHelper`'s only source, so the two cannot disagree -- there is nothing
 /// here that could drift. The same holds for the re-hosted hinter and
 /// highlighter below.
 ///
@@ -3897,14 +3900,17 @@ pub(crate) fn palette_rows(
 /// kept here, beside `palette_rows`, rather than in a test module.
 #[allow(dead_code)]
 pub(crate) struct InlineComposerHost {
-    completion: crate::ComposerCompletion,
+    completion: crate::terminal::completion::ComposerCompletion,
     /// Rich terminals get color; `NO_COLOR` keeps the composer unstyled.
     rich: bool,
 }
 
 impl InlineComposerHost {
     #[allow(dead_code)]
-    pub(crate) fn new(completion: crate::ComposerCompletion, rich: bool) -> Self {
+    pub(crate) fn new(
+        completion: crate::terminal::completion::ComposerCompletion,
+        rich: bool,
+    ) -> Self {
         Self { completion, rich }
     }
 }
@@ -3921,21 +3927,21 @@ impl kitsu_tui::composer::ComposerDecoration for InlineComposerHost {
     /// row suffix are different things with different causes. The palette
     /// reaches the inline composer through [`palette_rows`] instead.
     fn hint(&self, line: &str) -> String {
-        crate::idle_slash_hint(line)
+        crate::terminal::completion::idle_slash_hint(line)
     }
 
     fn highlight_hint(&self, hint: &str) -> String {
-        crate::highlight_composer_hint(hint, self.rich)
+        crate::terminal::completion::highlight_composer_hint(hint, self.rich)
     }
 }
 
 /// Classify one agent thread into the agent view's A2 group.
 ///
 /// This is the **only** mapping from the thread lifecycle onto
-/// [`AgentViewState`]: `Blocked` is the group that needs you, `Done` splits on
+/// [`kitsu_render::AgentViewState`]: `Blocked` is the group that needs you, `Done` splits on
 /// whether its handoff is still `Ready` (nobody has looked) and the two
 /// terminal failures stay distinct. The order comes from
-/// [`AgentViewState::order`] and is never restated here.
+/// [`kitsu_render::AgentViewState::order`] and is never restated here.
 // T4-S2's overlay is this mapping's first non-test caller, so the deliberate
 // `allow(dead_code)` the T2-S3 lifecycle used is gone with this card.
 pub(crate) fn agent_view_state_of(
@@ -5714,7 +5720,7 @@ mod tests {
     // ---------------------------------------------------------------------
     // The hint slot (the third element of the seam).
     //
-    // `update_live_row` in `main.rs` computes the classic row's hint as:
+    // `terminal::typeahead::update_live_row` computes the classic row's hint as:
     // the reverse-search status when Ctrl+R is active (RESERVED, so it keeps
     // its columns even when the draft is windowed), and otherwise the inline
     // slash-completion suffix from `typeahead_slash_hint` (unreserved, so a
@@ -5810,8 +5816,8 @@ mod tests {
     // Tab at the idle prompt: accepting the showing slash hint.
     //
     // Parity with the during-turn collector's `CompleteRequest` arm in
-    // `main.rs`, which takes the buffer, computes `typeahead_slash_hint` on
-    // it, and -- only when that is non-empty -- replaces the buffer with
+    // `terminal::typeahead`, which computes `typeahead_slash_hint` on the buffer
+    // and -- only when that is non-empty -- replaces the buffer with
     // buffer + hint and asks for a redraw. Nothing else: no completion list,
     // no cycling, no `@file` paths.
     //
@@ -7209,7 +7215,7 @@ mod tests {
     // ---------------------------------------------------------------------
     // T0-S14: the viewport's height follows its content.
     //
-    // `install` is still called with a hardcoded `1` from `main.rs`, and the
+    // `install` is called with an initial `1` from `chat::run_chat`, and the
     // bordered slash palette needs several rows that grow and shrink as the
     // user types. The height therefore becomes a property of what a caller
     // hands the viewport rather than a constant.
@@ -7525,7 +7531,7 @@ mod tests {
     /// Derived from `slash_palette` itself rather than written out, so the two
     /// palettes cannot drift apart without a test failing.
     fn classic_rows(prefix: &str, rich: bool, inner_width: usize) -> Vec<String> {
-        crate::slash_palette(prefix, rich, inner_width)
+        crate::terminal::completion::slash_palette(prefix, rich, inner_width)
             .trim_start_matches('\n')
             .lines()
             .map(str::to_string)
@@ -7571,7 +7577,7 @@ mod tests {
             .count()
     }
 
-    const PALETTE_WIDTH: usize = crate::COMPOSER_SURFACE_DEFAULT_INNER_WIDTH;
+    const PALETTE_WIDTH: usize = crate::terminal::completion::COMPOSER_SURFACE_DEFAULT_INNER_WIDTH;
 
     /// Test S15-1. `granted_rows` is a **query** on the guard, not a second
     /// copy of F19's bound: for every terminal height and request it answers
@@ -7719,7 +7725,7 @@ mod tests {
     #[test]
     fn palette_rows_more_count_reflects_entries_hidden_by_the_height() {
         for (buffer, prefix) in [("/", ""), ("/s", "s"), ("/m", "m"), ("/mod", "mod")] {
-            let total = crate::matching_slash_commands(prefix).len();
+            let total = crate::command_registry::matching_slash_commands(prefix).len();
             for rich in [true, false] {
                 for max_rows in PALETTE_MIN_ROWS..=14 {
                     let rows = palette_rows(buffer, rich, PALETTE_WIDTH, max_rows);
@@ -7805,7 +7811,7 @@ mod tests {
     /// Test S15-8. No palette at all for a buffer that is not a single-token
     /// slash prefix: an empty buffer, ordinary text, a command with arguments,
     /// a multi-line paste, a leading space. These are exactly the cases
-    /// `ChatHelper::hint` declines in `main.rs`, and the two must agree.
+    /// `ChatHelper::hint` declines in `terminal::completion`, and the two must agree.
     #[test]
     fn palette_rows_is_empty_for_anything_that_is_not_a_slash_prefix() {
         for buffer in [
@@ -7869,7 +7875,7 @@ mod tests {
         let mut content = palette_rows(
             draft,
             rich,
-            crate::composer_surface_inner_width(Some(columns)),
+            crate::terminal::completion::composer_surface_inner_width(Some(columns)),
             budget,
         );
         let composed = live::LiveDraft {
@@ -7926,7 +7932,7 @@ mod tests {
         palette_rows(
             prefix,
             true,
-            crate::COMPOSER_SURFACE_DEFAULT_INNER_WIDTH,
+            crate::terminal::completion::COMPOSER_SURFACE_DEFAULT_INNER_WIDTH,
             u16::MAX,
         )
         .len()
@@ -8146,11 +8152,10 @@ mod tests {
 
     /// Test S16-5. A resize with the palette open keeps the palette's height.
     ///
-    /// `main.rs`'s `on_resize` calls `bridge.resize(rows, 1)` -- a hardcoded
-    /// one row, which silently collapses an open palette to its bottom row and
-    /// leaves the rest of the box inside the scroll region, where the next
-    /// transcript line scrolls it away. `resize_rows` is the same re-probe
-    /// with the *current* height preserved.
+    /// A hardcoded `bridge.resize(rows, 1)` silently collapses an open palette
+    /// to its bottom row and leaves the rest inside the scroll region, where
+    /// the next transcript line scrolls it away. The `terminal::input`
+    /// resize callback uses `resize_rows` to preserve the *current* height.
     #[test]
     #[serial]
     fn resize_rows_preserves_an_open_palettes_height() {
@@ -8268,7 +8273,7 @@ mod tests {
         let _state = GlobalState::capture();
         let (guard, _out, err) = install_inline(24, 1, "status: idle");
         let guard = guard.expect("inline mode installs a guard");
-        let hint = crate::idle_slash_hint("/s");
+        let hint = crate::terminal::completion::idle_slash_hint("/s");
         assert_eq!(hint, "ave", "the idle hint must complete the lead entry");
         let before = err.text().len();
 
@@ -8819,7 +8824,7 @@ mod tests {
     ///
     /// The detach half is deliberately driven by clearing the binding and
     /// nothing else, because that is the whole of what the composer loop's
-    /// detach arm does (`main.rs`, `InlineRead::Detached`: `*attached = None`)
+    /// detach arm does (`terminal::input`, `InlineRead::Detached`: `*attached = None`)
     /// — so if the row needed telling separately, it would be a second copy
     /// and this test would stay red.
     #[test]
@@ -9225,7 +9230,7 @@ mod tests {
 
         let mut seen = std::collections::HashSet::new();
         for (status, collected, state) in cases {
-            let heading = crate::jobs_view_group(&progress(status), collected);
+            let heading = crate::agent_commands::jobs_view_group(&progress(status), collected);
             let position = JOBS_VIEW_GROUPS
                 .iter()
                 .position(|group| *group == heading)
@@ -9940,7 +9945,7 @@ mod tests {
     /// The registry is stood in for by a plain `watch` channel, which is what
     /// `AgentRegistry::subscribe` hands out: the wake carries the counts and
     /// the fixture's cell carries the pull the painter reads, which is how
-    /// production is wired (`main.rs` projects `(blocked, running)` off the
+    /// production is wired (`chat::run_chat` projects `(blocked, running)` off the
     /// snapshot, and the `StatusSource` closure re-reads the registry at
     /// paint time). One registry change moves both.
     ///

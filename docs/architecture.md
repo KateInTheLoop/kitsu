@@ -1,12 +1,12 @@
 # Architecture
 
-Kitsu is a seven-crate Rust workspace. The binary owns configuration and user
-interaction; reusable crates implement the agent loop, providers, tools,
-editing, and rendering.
+Kitsu is a seven-package Rust workspace. The `kitsu` package contains a host
+library and a small executable entry point. Other crates implement the agent
+loop, providers, tools, editing, and rendering.
 
-| Crate | Responsibility |
+| Package | Responsibility |
 | --- | --- |
-| `kitsu` | CLI, gateway/config selection, credentials, chat, durable sessions, artifacts, and background agents |
+| `kitsu` | Host library and CLI adapter: configuration, credentials, chat, durable sessions, artifacts, and background agents |
 | `kitsu-core` | Agent loop, context budgeting/compaction, neutral run values, and canonical session types |
 | `kitsu-providers` | Provider interface, OpenAI-compatible and native Anthropic Messages adapters, streaming, retries, and discovery |
 | `kitsu-tools` | Filesystem permissions, tools, write journals, and contained developer-command execution |
@@ -34,7 +34,24 @@ versioned records; see [the protocol](jsonl-protocol.md).
 
 - `crates/kitsu/src/cli.rs`, `config.rs`, and `credential_store.rs`: flags,
   profile construction, and managed authentication.
-- `crates/kitsu/src/main.rs`: command dispatch and chat integration.
+- `crates/kitsu/src/main.rs`: executable entry point calling `kitsu::run_cli`.
+- `crates/kitsu/src/lib.rs`, `cli_app.rs`, `cli_error.rs`, and
+  `cli_runtime.rs`: module composition, CLI dispatch, errors, process lifecycle,
+  and JSONL delivery. These are CLI adapters, not browser-facing APIs.
+- `crates/kitsu/src/setup.rs`, `provider_diagnostics.rs`, `models.rs`,
+  `context_window.rs`, and `runtime_state.rs`: provider composition, safe
+  diagnostics, catalogs, context discovery, and private-state locations.
+- `crates/kitsu/src/chat/`: chat coordination, slash-command dispatch, and
+  live conversation state. `ask.rs`, `script.rs`, and `turn.rs` own one-shot,
+  scripted, and shared turn execution respectively.
+- `crates/kitsu/src/management.rs` and `doctor.rs`: management commands and
+  diagnostics. `command_policy.rs` owns command grants and environment policy;
+  `completion.rs` owns required-write checks and the final-answer file.
+- `crates/kitsu/src/review.rs`, `checkpoints.rs`, `session_catalog.rs`, and
+  `session_telemetry.rs`: evidence disclosure, verified undo, session inventory,
+  and status/context projections.
+- `crates/kitsu/src/terminal/`: input adapters, completion, transcript and
+  agent overlays, permission prompts, and type-ahead collection.
 - `crates/kitsu/src/session/`: physical session storage and transactions.
 - `crates/kitsu/src/subagent/`, `subagent.rs`, `agent_state_file.rs`, and
   `agent_hook.rs`: bounded background work, local state publication, and hooks.
@@ -96,3 +113,18 @@ Keep draft state separate from file descriptors and paint caches. Preserve
 bracketed-paste decoding across fragmented reads, and test layout geometry and
 key decoding independently from PTY behavior. Terminal integration tests live
 in `crates/kitsu/tests/tui.rs`.
+
+## Hosts and tests
+
+The library keeps host components available without importing the executable.
+Its public `run_cli` entry point owns argument parsing and process exit; it
+must not be called from an embedded or browser host. Such a host should compose
+provider/session/tool capabilities around the neutral core run values, supply
+its own input and approval adapters, and keep terminal guards and process-global
+CLI reporting out of request state. Chat setup and slash dispatch still accept
+CLI-specific configuration; the current library does not expose a web API.
+
+Unit tests extracted from the entry point live under `crates/kitsu/src/tests/`,
+grouped by responsibility, with shared fixtures in `support.rs`. Other modules
+retain their existing unit tests. Process-level CLI, JSONL, local-provider mock,
+and PTY tests remain under `crates/kitsu/tests/`.

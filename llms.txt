@@ -3,8 +3,11 @@
 > A Rust terminal coding agent for hosted gateways and local model servers,
 > with guarded tools, resumable sessions, automation, and background agents.
 
-The workspace has seven crates: `kitsu` owns CLI/configuration/session
-integration; `kitsu-core` owns the agent loop and context budgeting;
+The workspace has seven packages: the `kitsu` host library owns configuration,
+sessions, and application composition; its executable delegates to the CLI
+adapter. Chat coordination, provider setup, reporting, and terminal input live
+in separate modules; entry-point unit tests are in `crates/kitsu/src/tests/`.
+`kitsu-core` owns the agent loop and context budgeting;
 `kitsu-providers` owns compatible Chat and native Anthropic Messages adapters;
 `kitsu-tools` owns permission-gated tools and command containment;
 `kitsu-render` owns terminal/JSONL output; `kitsu-editor` owns shared input
