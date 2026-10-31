@@ -465,7 +465,7 @@ pub struct AgentTerminalStatus {
 pub const DEFAULT_AGENT_BLOCK_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30 * 60);
 
-/// Atomic encoding of [`AgentBlockingMode`]. `FailClosed` is zero so a
+/// Atomic encoding of [`crate::config::AgentBlockingMode`]. `FailClosed` is zero so a
 /// zero-initialized registry is fail-closed by construction.
 const BLOCKING_FAIL_CLOSED: u64 = 0;
 const BLOCKING_ASK: u64 = 1;
@@ -871,7 +871,7 @@ impl AgentRegistry {
     /// The receiver immediately contains the latest snapshot, including changes
     /// that completed before subscription. Call `borrow_and_update()` once to
     /// establish a baseline, then await `changed()`; after a wake, use
-    /// [`AgentRegistry::result`] or [`AgentRegistry::list`] for authoritative
+    /// [`AgentRegistry::result`] or [`AgentRegistry::progress_snapshot`] for authoritative
     /// details. Because the generation is monotonic, coalesced watch updates do
     /// not masquerade as a single agent completion.
     pub fn subscribe(&self) -> watch::Receiver<AgentRegistrySnapshot> {
@@ -5315,7 +5315,7 @@ mod tests {
     // ---- Card T4-S7, requirement A6: what admits a dispatch ----
     //
     // The view's half (the key, the parse, the painted refusal) is pinned in
-    // `main.rs`; this is the half that needs a provider, which is why the card
+    // `tests/agent_view_dispatch.rs`; this half needs a provider, so the card
     // splits here -- the same split T4-S4b and T4-S6b were made along.
 
     fn dispatcher_over(registry: Arc<AgentRegistry>, live: LiveModelWindow) -> ViewDispatcher {
@@ -5540,13 +5540,13 @@ mod tests {
     // here: a *steerable* agent is one with a live thread and an open
     // correction channel, and that needs a provider fixture
     // (`SteeringProvider`, `empty_profile_runtime`, `spawn_agent_bg_tool`)
-    // which exists only in this module. `main.rs`'s registry fixtures can
+    // which exists only in this module. `tests/support.rs`'s registry fixtures can
     // reach every refusal and the whole answer route, and pin those; the one
     // thing they cannot build is a steer that *succeeds*, which is this
     // test.
     //
-    // The routed function itself lives in `main.rs` (the crate root), beside
-    // the composer loop that calls it; a child module can reach it.
+    // The routed function lives in `terminal::agent_view`, alongside the
+    // terminal adapter that calls it, and is accessible within the crate.
     // ------------------------------------------------------------------
 
     /// Every transcript line painted through the renderer's surface seam.
@@ -5653,11 +5653,15 @@ mod tests {
         .expect("the spawned agent's correction channel opens");
 
         let probe = SurfaceProbe::install();
-        let submit = crate::route_attached_submission(&registry, 1, "focus on UTF-8 boundaries");
+        let submit = crate::terminal::agent_view::route_attached_submission(
+            &registry,
+            1,
+            "focus on UTF-8 boundaries",
+        );
 
         assert_eq!(
             submit.route,
-            crate::AttachedRoute::Steered,
+            crate::terminal::agent_view::AttachedRoute::Steered,
             "A5: while attached to a working agent, the composer steers it"
         );
         assert_eq!(

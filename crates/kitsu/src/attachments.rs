@@ -734,8 +734,9 @@ fn completion_entries_no_follow(_path: &Path) -> std::io::Result<Vec<CompletionF
 /// follow symlinks, and only exposes paths covered by an existing read grant.
 ///
 /// `base` is passed in rather than read from the process so that the one
-/// shared composer completion source (`crate::ComposerCompletion`) is a pure
-/// function of its inputs; [`complete`] is the launch-directory wrapper.
+/// shared composer completion source
+/// (`crate::terminal::completion::ComposerCompletion`) is a pure function of
+/// its inputs.
 pub(crate) fn complete_from(
     line: &str,
     pos: usize,

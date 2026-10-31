@@ -1545,7 +1545,7 @@ mod tests {
     }
 
     /// NON-VACUITY PROOF for every "the path does not appear" assertion in
-    /// this file and in `main.rs`.
+    /// this file and in the terminal agent-view tests.
     ///
     /// `sanitize_and_redact_text` redacts credentials. It does *not* redact a
     /// filesystem path, a URL path, or an argv word. So an implementation
