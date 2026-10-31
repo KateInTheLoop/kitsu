@@ -1,47 +1,13 @@
-//! The bridge between the binary and `kitsu-tui`'s inline viewport (T0-S5a).
+//! Unix terminal integration for the inline and fullscreen renderers.
 //!
-//! This module is the single place where the preview renderer is switched on.
-//! It does three things and deliberately nothing else: it decides the mode
-//! from one environment value, it installs [`InlineSurface`][iv] into
-//! `kitsu-render`'s process-wide surface slot, and it hands back a
-//! session-lifetime guard that puts everything back.
+//! Configuration resolves the mode before this bridge installs surfaces,
+//! reads composer input, handles overlays, and manages terminal guards.
+//! See docs/architecture.md for the editor and layout boundaries.
 //!
-//! [iv]: kitsu_tui::viewport::InlineSurface
-//!
-//! # Finding F15: the viewport replaces the live status row
-//!
-//! `ClassicSurface::transcript_line` wraps every write in
-//! `kitsu_render::live::with_live_row_suspended`, which clears a row at the
-//! cursor and repaints it afterwards. The inline viewport suspends nothing,
-//! because its rows are pinned *outside* the DECSTBM scroll region and the
-//! transcript scrolls underneath them. Run both and the live row is painted
-//! inside the scroll region, so it either scrolls away with the transcript or
-//! fights the viewport's parked cursor for the same cells.
-//!
-//! The resolution is not to coordinate them but to retire one: the viewport's
-//! bottom rows are exactly where the spinner, the draft and the status belong,
-//! so painting a live row as well is duplication before it is a conflict. So
-//! [`install`] disables the live row for as long as the viewport is installed
-//! and [`BridgeGuard`]'s `Drop` restores whatever the setting was before.
-//!
-//! # Failing closed
-//!
-//! [`mode_from_value`] returns [`TuiMode::Inline`] for the exact value
-//! `"inline"` and [`TuiMode::Classic`] for everything else — a missing value,
-//! an empty one, an unknown word, a different case, a stray trailing space. A
-//! typo must not silently move a user into a preview renderer, so the match is
-//! byte-exact rather than forgiving.
-//!
-//! # Unix only
-//!
-//! The whole module is gated with an inner `#![cfg(unix)]` rather than a
-//! `cfg(unix)` on each item. The viewport is only ever reached through a raw
-//! terminal mode and a `TIOCGWINSZ` geometry probe, both of which are unix-only
-//! in this workspace (`kitsu-render`'s own `terminal_cols` is already
-//! `cfg(unix)`), so there is no item here that would be meaningful on its own
-//! elsewhere. One attribute at the top gates every present and future item
-//! uniformly; a per-item list drifts the moment someone adds an item and
-//! forgets the attribute.
+//! [`install`] disables the classic live row while the inline viewport owns
+//! the pinned rows. [`BridgeGuard`] restores the prior surface and live-row
+//! setting on drop. Fullscreen uses a separate alternate-screen guard; mode
+//! changes and process exits must return terminal ownership exactly once.
 
 #![cfg(unix)]
 
@@ -54,8 +20,7 @@ use kitsu_tui::viewport::{
     clamp_viewport_rows, fit_viewport_rows, plan_resize, InlineSurface, ResizePlan,
 };
 
-/// Which renderer a session runs: the classic line renderer, or the inline
-/// viewport preview.
+/// Which terminal renderer a session runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TuiMode {
     /// The renderer kitsu has always had.

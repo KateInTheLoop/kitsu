@@ -54,10 +54,12 @@ tokenizer, but reported usage continuously corrects their scale.
 
 Kitsu applies cheaper and more recoverable reductions before more lossy ones:
 
-1. **Offload large tool results.** A successful tool result above 8 KiB of text
-   is written to a private session artifact when an artifact directory is
-   available. The conversation retains the exact path, size, re-read guidance,
-   and a 500-character preview.
+1. **Offload large tool results.** Above the default 8 KiB threshold
+   (configurable with `--offload-cap`), a tool result can be written to a private
+   artifact when storage is available. The conversation retains the exact path,
+   size, re-read guidance, and a 500-character preview. With `--no-artifacts`,
+   oversized results become bounded, lossy inline previews with byte counts
+   and no recoverable pointer. Existing artifacts remain intact.
 2. **Elide old tool bodies.** Under pressure, older tool-result bodies become a
    short marker. An existing offload pointer is retained so the result remains
    re-readable.
@@ -69,7 +71,7 @@ Kitsu applies cheaper and more recoverable reductions before more lossy ones:
 `--compaction trim` deterministically drops eligible old exchanges. It is the
 default and makes no extra provider call.
 
-`--compaction summarize` asks the active model for a compact continuation note.
+`--compaction summarize` asks the active model for a lossy continuation note.
 The summarizer request is non-streaming, capped at 1024 output tokens (and at
 half the actual model window), and locally shortened if its input would not fit.
 The returned summary is admitted only when the rebuilt main request fits the
@@ -130,28 +132,10 @@ are **not followed or fetched automatically**. The exact source is disclosed in
 `/status` and `/context`. `--no-project-context` also prevents saved project text
 from being silently reintroduced when resuming a session.
 
-## Verification boundary
+On Unix, discovery and reads use descriptor-relative traversal and reject
+symlink retargeting. Platforms without that primitive do not load implicit
+project files. Context management runs client-side; it does not use a
+provider-specific server compaction extension.
 
-The local contract is covered by context-meter/budget unit tests, orchestrator
-tests for every cascade and preflight branch, provider discovery/cache tests,
-CLI tests for context provenance and JSONL telemetry, and session/artifact
-regressions. The release gates are:
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
-
-Live-provider smoke tests are supplementary: their result depends on credentials,
-billing, catalog metadata, provider availability, and model behavior.
-
-## Deliberate limits
-
-- Accounting is a hybrid estimate, not model-specific tokenization.
-- Cold discovery improves a later run; it never changes a request already being
-  prepared with the 8192 fallback.
-- Summaries are lossy and model-dependent, which is why trim remains the default.
-- Project-context links and remote resources are never fetched automatically.
-- Context management is client-side; Kitsu does not rely on a provider-specific
-  server-side compaction extension.
+Development checks and the local-fixture testing policy are in
+[Contributing](../CONTRIBUTING.md).

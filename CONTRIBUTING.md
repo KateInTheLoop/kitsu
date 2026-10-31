@@ -48,3 +48,7 @@ README.
 
 Describe the problem, resulting behavior, and validation in the pull request.
 Use [the release guide](docs/releasing.md) when cutting a release.
+
+Check flags against the current CLI help and behavior against source and tests.
+Keep each detailed contract in one maintained reference; link to the JSONL
+protocol and schema instead of repeating event definitions in user workflows.

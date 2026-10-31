@@ -1,11 +1,11 @@
-//! Pure source↔cell layout for the inline composer (Stage 1A).
+//! Pure source↔cell layout for the inline composer.
 //!
 //! This is the single authority the renderer and vertical navigation share:
 //! given the draft's source text, the first-row prompt, the cell width, and a
 //! display projection, it computes where every source boundary lands in
 //! terminal cells and the reverse. It depends on nothing terminal — no ANSI,
 //! no `InlineSurface`, no file descriptors. Contracts live in
-//! `docs/tui-editor-contracts.md`.
+//! `docs/architecture.md` under "Editor and layout".
 //!
 //! Source offsets are Unicode scalar (`char`) boundaries, matching
 //! `TypeaheadEditor::cursor()`. Visual positions are zero-based cells within

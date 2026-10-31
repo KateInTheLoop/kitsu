@@ -9,6 +9,11 @@ integration; `kitsu-core` owns the agent loop and context budgeting;
 `kitsu-tools` owns permission-gated tools and command containment;
 `kitsu-render` owns terminal/JSONL output; `kitsu-editor` owns shared input
 editing; `kitsu-tui` owns terminal lifecycle and inline viewport primitives.
+On Unix, interactive terminals default to the framed inline composer;
+`--tui` or `[tui] mode` selects classic, inline, or fullscreen. Interactive
+chat grants the launch directory read+write. General commands are opt-in;
+Git is offered interactively. Commands require separate approval and Linux
+Bubblewrap or macOS Seatbelt containment, with network denied by default.
 
 Preserve credential redaction, private-state exclusions, filesystem authority,
 and fail-closed command containment. Keep neutral run/session values in core
@@ -29,8 +34,7 @@ and audit transcripts belong in issues or pull requests, not the source tree.
 
 - [Context management](docs/context.md): windows, compaction, and project context.
 - [JSONL protocol](docs/jsonl-protocol.md): automation contract and schema.
-- [Verified review](docs/verified-review.md): Git evidence and checkpoints.
-- [Workspace diff](docs/workspace-diff-tool.md): model-callable Git evidence.
+- [Verified review](docs/verified-review.md): Git evidence, workspace-diff tool, and checkpoints.
 - [Releases](docs/releasing.md): packaging and publishing.
 
 Kitsu loads this file's text as project context; linked documents are not

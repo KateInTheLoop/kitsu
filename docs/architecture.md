@@ -39,7 +39,12 @@ versioned records; see [the protocol](jsonl-protocol.md).
 - `crates/kitsu/src/subagent/`, `subagent.rs`, `agent_state_file.rs`, and
   `agent_hook.rs`: bounded background work, local state publication, and hooks.
 - `crates/kitsu/src/workspace.rs`: host-verified Git evidence.
-- `crates/kitsu/src/tui_bridge.rs`: Unix inline preview integration.
+- `crates/kitsu/src/tui_bridge.rs`: Unix inline/fullscreen integration,
+  composer input, overlays, and terminal restoration.
+- `crates/kitsu-render/src/layout.rs` and `live.rs`: source-to-cell layout
+  and the framed composer.
+- `crates/kitsu-editor/src/lib.rs`: input decoding, draft state, history,
+  and reverse search without terminal I/O.
 - `crates/kitsu-core/src/orchestrator.rs` and `context.rs`: model/tool rounds
   and request budgeting.
 - `crates/kitsu-tools/src/permissions.rs` and `builtins/`: filesystem policy
@@ -54,16 +59,40 @@ versioned records; see [the protocol](jsonl-protocol.md).
 - Credentials and Kitsu-private state must stay out of tool reads and review
   evidence. Never log bearer values or raw credential-bearing provider data.
 - Developer commands require literal argv, exact approval, and the existing
-  containment backend. Preserve fail-closed behavior.
+  containment backend: Bubblewrap on Linux or Seatbelt on macOS. Session
+  command auto mode can waive foreground prompts; it preserves containment
+  and does not grant background agents the same approval. Preserve fail-closed
+  behavior and network isolation unless `--allow-network` is explicit.
 - Display host-verified diffs and journal snapshots as evidence; keep model
   claims distinct. See [verified review](verified-review.md).
 - Honor plain and screen-reader modes. Sanitize untrusted terminal content,
   stop animation outside terminals, and restore terminal modes on exit.
-- The inline viewport is opt-in through `KITSU_TUI=inline` on Unix. It shares
-  the editor and output surface, disables the classic live row while active,
-  and restores state on teardown. Resize and multi-row completion remain
-  preview limitations.
+- On Unix, inline is the default for interactive terminals. `--tui` overrides
+  `[tui] mode`; `--no-tui` selects classic. An unnamed mode falls back to
+  classic for non-terminal and plain output. The bridge disables the classic
+  live row while the viewport is active and restores it on teardown.
 
 Run/session boundary scripts enforce the first two boundaries. See
 [Contributing](../CONTRIBUTING.md) for checks and
 [context management](context.md) for project-context loading and compaction.
+
+## Editor and layout
+
+`kitsu-editor` owns the source text and scalar cursor. The terminal collector
+feeds bytes into it and handles the resulting submit, completion, interrupt,
+and navigation actions. Bracketed-paste newlines stay inside one draft;
+submission and history contain the source text.
+
+`kitsu-render::layout` computes the entire draft before viewport clipping.
+Source offsets are Unicode scalar boundaries; visual positions are terminal
+cells. The layout accounts for wide and combining characters, explicit
+newlines, a first-row prompt, and tabs displayed as `⇥`. Painting and injected
+vertical motion share this mapping and its display-width policy. Up/Down move
+through visual rows before crossing into history.
+
+Frame builders return rows and caret coordinates without terminal I/O. The
+bridge owns scrolling, resize, overlays, raw mode, and signal restoration.
+Keep draft state separate from file descriptors and paint caches. Preserve
+bracketed-paste decoding across fragmented reads, and test layout geometry and
+key decoding independently from PTY behavior. Terminal integration tests live
+in `crates/kitsu/tests/tui.rs`.

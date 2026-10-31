@@ -58,5 +58,4 @@ discovered mid-release.
 
 macOS binaries are unsigned and unnotarized; users clear the quarantine bit on
 first run. Signing needs an Apple Developer ID certificate in the repo secrets
-plus a `codesign`/`notarytool` step in the `macos` job — worth doing once the
-project has enough Mac users to make the $99/year worthwhile.
+plus a `codesign`/`notarytool` step in the `macos` job.

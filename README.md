@@ -56,15 +56,17 @@ kitsu --help                           # commands and flags
 ```
 
 In chat, use `/help`, `/permissions`, `/diff`, `/review`, `/jobs`, and
-`/context`. Filesystem access requires permission; developer commands are
-opt-in and require Linux containment. Review evidence can be disclosed without
-granting a standing filesystem read root. See the
+`/context`. Interactive chat grants read and write access to the launch
+directory; access outside it asks for permission. Git is available with command
+approval, and `--enable-commands` adds general developer commands. Commands
+require OS containment on Linux or macOS. See the
 [tool and permission reference](docs/usage.md#tools-in-chat).
 
 `--plain` and `--screen-reader` select literal input and plain output.
 `NO_COLOR` disables styling while retaining interactive editing.
-`KITSU_TUI=inline` enables the Unix-only inline viewport preview; terminal
-resize and completion menus remain limitations of that preview.
+On Unix, interactive terminals use the inline viewport with a framed input
+box. Use `--tui fullscreen` for the fullscreen view or `--no-tui` for the
+classic line renderer. See [terminal modes](docs/usage.md#terminal-modes).
 
 ## Documentation
 
@@ -73,8 +75,7 @@ resize and completion menus remain limitations of that preview.
 | [User guide](docs/usage.md) | Installation, configuration, providers, auth, CLI flags, chat, sessions, and skills |
 | [Context management](docs/context.md) | Model windows, compaction, and project instructions |
 | [JSONL protocol](docs/jsonl-protocol.md) | Automation events and compatibility; includes the JSON schema |
-| [Verified review](docs/verified-review.md) | Diff scopes, checkpoints, and evidence boundaries |
-| [Workspace diff tool](docs/workspace-diff-tool.md) | Model-requested Git evidence and disclosure |
+| [Verified review](docs/verified-review.md) | Diff scopes, workspace-diff tool, checkpoints, and evidence boundaries |
 | [Architecture](docs/architecture.md) | Source map and implementation boundaries |
 | [Contributing](CONTRIBUTING.md) | Development and checks |
 | [Release guide](docs/releasing.md) | Packaging and publishing |

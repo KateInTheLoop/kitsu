@@ -151,7 +151,7 @@ guarantees requires a new schema identifier.
   `review_disclosure` field set generalized to the tool surface, plus
   `source: "workspace_diff"`. It marks the moment bounded host-verified diff
   bytes entered the model prompt; `model_read_root_granted` is always `false`
-  (see docs/workspace-diff-tool.md).
+  (see [workspace diff tool](verified-review.md#workspace-diff-tool)).
 - A top-level `kitsu review --jsonl` emits exactly one `review_disclosure`
   after `run_started` and before the review's `turn_started`. It carries the
   same bounded evidence metadata as scripted `/review`, plus

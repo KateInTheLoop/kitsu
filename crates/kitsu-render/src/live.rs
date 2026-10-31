@@ -304,8 +304,7 @@ const STATUS_METER_CELLS: u64 = 8;
 /// are hidden.
 const DRAFT_CONTEXT_ROWS: usize = 12;
 
-/// A full-width framed input box (Phase 1 of the Claude-CLI-style composer,
-/// see docs/tui-input-box-requirements.md). Renders the draft inside a
+/// A full-width framed input box. Renders the draft inside a
 /// kitsu-banner frame that is ALWAYS present (even empty), so the input region
 /// and its caret exist from launch rather than appearing only once typing
 /// starts. Pure: returns the frame rows plus the caret's (row, col) *within the
@@ -320,14 +319,9 @@ const DRAFT_CONTEXT_ROWS: usize = 12;
 /// to [`DRAFT_CONTEXT_ROWS`], older ones collapsing into a `⋮` marker inside the
 /// frame. Returns at least 3 rows (top border, one content row, bottom border).
 ///
-/// NOTE: unused until Phase 2 wires it into the composer painter. The correct
-/// wiring site is `tui_bridge::paint_composer` → `compose_input_row` (the
-/// pinned-viewport bottom row that actually draws the idle `kitsu>` prompt),
-/// NOT the typeahead `render_region`. Wiring a multi-row box there means
-/// growing the pinned DECSTBM viewport region to the box height — a viewport
-/// change that must be verified on a real terminal. Built and unit-tested first
-/// so the geometry is correct before the un-testable wiring.
-/// See docs/tui-input-box-requirements.md.
+/// The composer painter and during-turn draft renderer use the same geometry.
+/// The bridge owns viewport resizing and hardware-cursor placement; see
+/// docs/architecture.md under "Editor and layout".
 pub struct InputBox {
     pub rows: Vec<String>,
     /// 1-based (row, col) of the caret within `rows`.
