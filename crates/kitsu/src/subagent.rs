@@ -1,4 +1,4 @@
-//! Subagents (design docs/subagents-design.md, Stage A): the `spawn_agent` tool
+//! Subagents (see docs/architecture.md): the `spawn_agent` tool
 //! runs a nested, ISOLATED agent loop on a delegated task and returns only the
 //! conclusion to the parent — so a big exploration stays out of the main context.
 //!
@@ -4741,9 +4741,8 @@ mod tests {
 
     /// Parking writes a request entry naming the permission kind, and only
     /// the kind: the path `/work/notes.txt` and the grant dir `/work` that
-    /// `park_path_request` sends must not reach the timeline (N8, and the
-    /// documented absolute in `docs/functionality.md` that tool arguments are
-    /// never copied into the inspection record).
+    /// `park_path_request` sends must not reach the timeline (the N8
+    /// absolute: tool arguments are never copied into the inspection record).
     #[tokio::test]
     async fn parking_a_path_request_records_an_argument_free_approval_entry() {
         let registry = AgentRegistry::new();

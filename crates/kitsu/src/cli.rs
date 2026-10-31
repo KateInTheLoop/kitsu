@@ -617,12 +617,12 @@ pub enum Command {
         enable_commands: bool,
 
         /// Constrain command working directories to this existing directory
-        /// (repeatable). These become writable mounts inside mandatory Linux
+        /// (repeatable). These become writable roots inside mandatory
         /// OS containment; exact argv/cwd approval remains a separate gate.
         /// Implies --enable-commands. With no explicit root, --enable-commands
         /// uses the launch directory. If the approved executable itself lives
-        /// outside every command root, containment denies it — pass its own
-        /// directory too (the denial names the exact directory to add).
+        /// outside the standard runtime paths, it may need an explicit
+        /// --command-runtime-root so containment can read and execute it.
         #[arg(long = "command-root", value_name = "PATH")]
         command_roots: Vec<String>,
 
@@ -645,9 +645,7 @@ pub enum Command {
         /// `~/.ssh/config` become readable so a host key verifies — private
         /// keys (`~/.ssh/id_*`) stay denied. Everything else is unchanged:
         /// write-confinement to command roots, the executable allow-list,
-        /// and exact argv/cwd approval all still apply. A name-based host also
-        /// needs DNS, which this does not add; an IP works on its own. Implies
-        /// --enable-commands.
+        /// and exact argv/cwd approval all still apply. Implies --enable-commands.
         #[arg(long = "allow-network")]
         allow_network: bool,
 

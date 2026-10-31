@@ -2,14 +2,13 @@
 //!
 //! Command execution is intentionally a separate authority from filesystem
 //! [`crate::permissions::Permissions`]. Every exact `(argv, canonical cwd)`
-//! invocation must be pre-granted or approved through a [`CommandPrompter`],
-//! and that approval is only one gate: production execution additionally
-//! requires fail-closed operating-system containment. On Linux, Kitsu launches
-//! through bubblewrap with writable approved command roots, a small read-only
-//! runtime, isolated network/PID/IPC/UTS namespaces, and a fixed minimal
-//! environment. A session grant records the executable path and filesystem
-//! identity observed when it was approved; a changed or retargeted executable
-//! invalidates that grant. There is deliberately no auto-allow mode.
+//! invocation requires a pregrant, a [`CommandPrompter`] decision, or an
+//! applicable auto-allow policy. Foreground session auto mode does not approve
+//! background requests. Execution also requires fail-closed OS containment:
+//! Bubblewrap on Linux or Seatbelt on macOS. Network access is denied unless
+//! explicitly enabled. A session grant records the executable path and
+//! filesystem identity observed when it was approved; a changed or retargeted
+//! executable invalidates that grant.
 //!
 //! Input is an argv array, not a command-line string. Kitsu invokes the
 //! requested program directly without an intermediary shell or argument

@@ -1,5 +1,4 @@
-//! kitsu — CLI entry. MVP target: `kitsu ask --gateway example "hello"` runs the
-//! agent loop against the gateway (Mistral). See docs/architecture.md §6.
+//! kitsu CLI entry point and chat integration. See docs/architecture.md.
 
 mod agent_hook;
 mod agent_state_file;
@@ -4615,7 +4614,7 @@ struct ChatSetup {
     endpoint: String,
     auth_status: String,
     /// Config-level opt-out for the model-callable `workspace_diff` evidence
-    /// tool (docs/workspace-diff-tool.md). Defaults to enabled.
+    /// tool (docs/verified-review.md). Defaults to enabled.
     workspace_evidence: bool,
     /// Config-level per-turn subagent spawn cap (`agent_spawn_cap`). `None`
     /// falls back to the mode default (interactive 8, scripted/piped 2);
@@ -11096,17 +11095,15 @@ fn top_level_review_disclosure_event(evidence: &workspace::ReviewEvidence) -> se
 
 /// Turn-scoped JSONL event for a `workspace_diff` tool disclosure — the same
 /// record `/review` emits as a command-frame result, generalized to the tool
-/// surface (docs/workspace-diff-tool.md).
+/// surface (docs/verified-review.md).
 fn workspace_evidence_disclosure_event(evidence: &workspace::ReviewEvidence) -> serde_json::Value {
     let mut fields = evidence_disclosure_fields(evidence);
     fields.insert("source".to_string(), "workspace_diff".into());
     serde_json::Value::Object(fields)
 }
 
-/// Parse the model-supplied `workspace_diff` arguments. Mirrors `/diff`'s
-/// scopes minus `checkpoint` (a human surface over Kitsu's own write journal).
-/// Parsed manually so a malformed scope gets a precise, correctable error
-/// instead of an untagged-enum shrug.
+/// Parse `workspace_diff` arguments, accepting `/diff` scopes except the
+/// host-only checkpoint scope.
 fn parse_workspace_diff_request(args: &str) -> Result<ReviewRequest, String> {
     const SCOPE_USAGE: &str = "expected \"working\", \"staged\", \"unstaged\", \
                                {\"base\": REV}, or {\"commit\": REV}";
@@ -11165,13 +11162,10 @@ fn parse_workspace_diff_request(args: &str) -> Result<ReviewRequest, String> {
     Ok(ReviewRequest { scope, path })
 }
 
-/// The model-callable `workspace_diff` tool: a bounded DISCLOSURE of
-/// host-gathered diff evidence to the provider, exactly like `/review` — never
-/// a filesystem read by the model. It consults no model read root, creates
-/// none, and excludes Kitsu-private paths identically to `/diff`; every call
-/// prints/emits the standing disclosure announcement. Returns `None` (tool not
-/// registered) when the directory is not inside a Git worktree or the worktree
-/// sits inside Kitsu-private state. Design: docs/workspace-diff-tool.md.
+/// Disclose bounded Git evidence without consulting or granting filesystem
+/// read roots. Every call excludes private paths and announces disclosure.
+/// Returns `None` outside a worktree or inside Kitsu-private state.
+/// See docs/verified-review.md.
 fn workspace_diff_tool(
     directory: &std::path::Path,
     private: Vec<std::path::PathBuf>,
@@ -11286,19 +11280,11 @@ fn verified_review_prompt(evidence: &workspace::ReviewEvidence) -> String {
     )
 }
 
-/// Host-owned authority to gather verified workspace evidence for `/diff`,
-/// `/review`, `kitsu review`, and `/checkpoint`.
-///
-/// It never consults, creates, or widens a model read root. The evidence is
-/// produced by Kitsu's own `git` (workspace.rs), not by a model tool, so the
-/// confidentiality boundary is `review_evidence_excluding`'s private-path
-/// exclusion — not the model's standing read authority. Coupling the two only
-/// ever trained users to widen model authority in order to look at their own
-/// diff, which is the consent anti-pattern this type exists to remove.
-///
-/// Scope is fixed by the directory Kitsu was launched in; a caller-supplied
-/// path can only narrow it. `for_session` must never accept a caller-named
-/// root — that would turn it into an arbitrary-read primitive.
+/// Host-owned evidence authority for review commands and `workspace_diff`.
+/// Private-path exclusions enforce confidentiality independently of model read
+/// roots, which this authority never consults or changes. Bind the repository
+/// at construction from the launch directory; caller-supplied paths may only
+/// narrow it. Accepting a caller-named root would permit arbitrary reads.
 struct WorkspaceEvidenceAuthority {
     root: std::path::PathBuf,
     directory: std::path::PathBuf,
@@ -16594,7 +16580,7 @@ fn format_write_checkpoint(
     undo_hint: bool,
 ) -> String {
     let label = terminal_inline(&report.label);
-    // `◈` is the receipt glyph (design.md §8): a durable artifact was created.
+    // `◈` is the receipt glyph: a durable artifact was created.
     let marker = if kitsu_render::plain_mode() {
         "#"
     } else {
@@ -20112,7 +20098,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     agent_registry.set_blocking(setup.agent_blocking);
     agent_registry.set_block_timeout(setup.agent_block_timeout);
 
-    // G3 (docs/chat-ux-cycle-10.md): per-turn subagent spawn budget. Prompt
+    // Per-turn subagent spawn budget. Prompt
     // guidance demonstrably does not restrain small local models from agent
     // storms, so the cap is enforced at the tool boundary; the orchestrator
     // resets it each main-conversation turn. Scripted/piped automation gets a
@@ -20750,7 +20736,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // First-contact orientation (cycle-11 audit): one torii line at the
         // session gate — the model/gateway you are talking to and the two
         // things a new user needs (`/help`, how to leave). The torii is the
-        // session-boundary marker (docs/ui_guidelines.md), and opening the
+        // session-boundary marker (see docs/architecture.md), and opening the
         // session is its most natural gate.
         kitsu_render::milestone(&format!(
             "kitsu chat — {} via {} · /help for commands · Ctrl+D exits",

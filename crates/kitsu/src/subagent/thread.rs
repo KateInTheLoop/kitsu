@@ -136,8 +136,8 @@ impl AgentTimelineKind {
 
 /// What a parked permission request is asking for, *without its arguments*.
 ///
-/// Deliberately argument-free. `docs/functionality.md` states as an absolute
-/// that tool arguments and output are never copied into the inspection
+/// Deliberately argument-free. By an absolute invariant (N8), tool arguments
+/// and output are never copied into the inspection
 /// record, and a permission request is precisely a tool plus its arguments,
 /// so only the kind crosses into the timeline. `/jobs explain`'s question
 /// ("what is this agent waiting on") is answered by the kind alone.
@@ -1617,7 +1617,7 @@ mod tests {
             "the request precedes its decision"
         );
 
-        // N8 / docs/functionality.md: no tool argument crosses into the
+        // N8: no tool argument crosses into the
         // inspection record. See `redaction_does_not_remove_a_path_or_an_argv_word`
         // for why this cannot pass vacuously.
         let encoded = serde_json::to_string(&snapshot).unwrap();

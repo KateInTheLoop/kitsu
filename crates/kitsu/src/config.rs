@@ -1,4 +1,4 @@
-//! Config model + loading (docs/architecture.md §2). Parses the
+//! Config model + loading (docs/architecture.md). Parses the
 //! `[gateways.<name>]` profiles and `default_gateway`, resolves a profile by
 //! name, and validates flavor/model per the design's rules.
 
@@ -27,7 +27,7 @@ pub struct Config {
     #[serde(default)]
     pub default_gateway: Option<String>,
     /// Register the model-callable `workspace_diff` evidence tool in chat when
-    /// the launch directory is a Git worktree (docs/workspace-diff-tool.md).
+    /// the launch directory is a Git worktree (docs/verified-review.md).
     /// `false` disables registration entirely, like `--no-workspace-evidence`.
     #[serde(default)]
     pub workspace_evidence: Option<bool>,
@@ -431,22 +431,10 @@ pub struct TuiConfig {
         deserialize_with = "deserialize_tui_prefix"
     )]
     pub prefix: String,
-    /// Whether kitsu sets and restores the **terminal window title** (H2).
-    ///
-    /// **Corrected in F139.** This said "whether the viewport paints its title
-    /// row", which is wrong and was the only artefact in the repository saying
-    /// so -- the design (H2), the plan (T1-S4), §4.8's sample config and
-    /// `README.md` all describe the window title, and **no viewport title row
-    /// exists anywhere**. That one sentence was enough to send a card off to
-    /// refuse this key's designed default; a doc comment that misnames its own
-    /// referent is worse than one that says nothing.
-    ///
-    /// **H2 is specified and half-built, and this key gates neither half.**
-    /// `tui_bridge` pushes and pops the title *stack* in production without
-    /// consulting this flag, and the OSC 2 title string -- `kitsu ·
-    /// working|blocked|idle|N agents` -- is never written at all, because
-    /// `TuiRuntime::enter` has no non-test caller. So the honest status is an
-    /// **unimplemented requirement**, not a value to refuse.
+    /// Whether Unix interactive sessions publish the terminal window title
+    /// with the current state and agent count. The bridge gates title writes
+    /// and title-stack restoration together; this does not control a viewport
+    /// status row.
     #[serde(default = "default_true", deserialize_with = "deserialize_tui_title")]
     pub title: bool,
     /// Whether Left opens the agents pane.

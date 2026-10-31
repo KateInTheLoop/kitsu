@@ -24,14 +24,10 @@ no-tools turn. The top-level `kitsu review` command exposes every live Git scope
 for one-shot human or JSONL automation and supports additional user focus
 instructions plus opt-in saved-session continuity.
 
-Every review disclosure is auditable without granting the model a standing
-read capability. Human top-level review prints the bounded evidence byte count
-and the absence of a read root. JSONL top-level review instead emits exactly
-one `review_disclosure` after `run_started` and before `turn_started`, with
-`source: "top_level_review"`, target/revision metadata, truncation and byte
-counts, `model_disclosed: true`, and `model_read_root_granted: false`. The event
-does not repeat the diff body. Scripted `/review` retains the same field set in
-its command-scoped `review_disclosure` result.
+`/diff` displays evidence locally. `/review` and `kitsu review` disclose it to
+the provider without granting standing filesystem read access. Each disclosure
+announces its bounded byte count and scope. JSONL event fields and ordering
+are defined in the [protocol reference](jsonl-protocol.md).
 
 Live Git revisions are resolved as commits with `git rev-parse --verify
 --end-of-options`. The resulting hexadecimal object ID, rather than the
@@ -48,6 +44,33 @@ bounded to 256 KiB and records whether truncation occurred.
 User-entered paths should first be converted with
 `workspace::pathspec_from_directory`; this preserves the launch-directory
 meaning while rejecting paths outside the repository.
+
+## Workspace diff tool
+
+`workspace_diff` lets the model request the same Git evidence during chat.
+It is registered only inside a worktree outside Kitsu-private state, including
+in scripted and piped chat. It is omitted from tool-free reviews and
+background-agent tool sets. `chat --no-tools`, `--no-workspace-evidence`, or
+top-level `workspace_evidence = false` disables its registration.
+
+For example:
+
+```json
+{"scope": {"base": "main"}, "path": "src"}
+```
+
+`scope` defaults to `"working"`. It also accepts `"staged"`, `"unstaged"`,
+`{"base": "REV"}`, and `{"commit": "REV"}`. Checkpoints remain host-only.
+The optional literal `path` narrows evidence relative to the launch directory;
+it cannot select another repository or escape the bound root. The result
+contains `target`, `resolved_revision`, `merge_base`, `truncated`, and `diff`,
+with the same size cap and private-path exclusions as the other review surfaces.
+
+Each call discloses evidence to the provider and announces that disclosure.
+It neither consults nor changes filesystem read roots, and it raises no
+filesystem approval prompt. It cannot modify files, checkpoints, or artifacts.
+JSONL emits `workspace_evidence_disclosure` between the matching tool events;
+see the [protocol reference](jsonl-protocol.md) for its payload.
 
 ## Write checkpoints
 
